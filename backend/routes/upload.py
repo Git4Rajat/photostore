@@ -847,8 +847,14 @@ def upload_client_processing_results():
             client_asset_id=str(data.get('clientAssetId') or data.get('uploadId') or ''),
             thumbnail_already_uploaded=bool(data.get('thumbnailAlreadyUploaded')),
             claimed_steps=claimed_steps,
+            lease_owner=data.get('leaseId'),
+            expected_processing_revision=data.get('processingRevision'),
+            expected_processing_fence=data.get('processingFence'),
         )
     except Exception as exc:
+        from processing_completion import StaleProcessingResult
+        if isinstance(exc, StaleProcessingResult):
+            return app.jsonify({'error': str(exc), 'code': 'stale_processing_result'}), 409
         app.app.logger.exception('Late browser processing update failed for %s', filename)
         message = str(exc)
         if 'deleted' in message.lower():
@@ -1008,7 +1014,8 @@ def upload_processing_heartbeat():
     filename = app._validate_media_filename(str(data.get('filename') or '')) or ''
     lease_id = str(data.get('leaseId') or '')
     try:
-        lease = app.heartbeat_processing_lease(user_id, filename, lease_id, lease_seconds=120)
+        fence_options = {'expected_processing_fence': data['processingFence']} if 'processingFence' in data else {}
+        lease = app.heartbeat_processing_lease(user_id, filename, lease_id, lease_seconds=120, **fence_options)
     except Exception as exc:
         app.app.logger.exception('Processing lease heartbeat failed')
         return app.jsonify({'ok': False, 'reason': 'lease_missing'}), 409
@@ -1025,7 +1032,8 @@ def upload_processing_release():
     data = app.request.get_json(silent=True) or {}
     filename = app._validate_media_filename(str(data.get('filename') or '')) or ''
     lease_id = str(data.get('leaseId') or '')
-    app.release_processing_lease(user_id, filename, lease_id)
+    fence_options = {'expected_processing_fence': data['processingFence']} if 'processingFence' in data else {}
+    app.release_processing_lease(user_id, filename, lease_id, **fence_options)
     return app.jsonify({'ok': True})
 
 @upload_bp.route('/upload/cancel', methods=['POST'])

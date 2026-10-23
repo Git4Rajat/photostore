@@ -386,3 +386,39 @@ def test_readiness_covers_members_across_pages_and_never_skips_unsettled_tail(wo
     settle(store, wave, 'photo-24')
     result = finish_scan(store, wave)
     assert result['state'] == 'ready' and result['memberCount'] == 25
+
+
+def test_retry_session_links_to_existing_parent_without_changing_its_manifest(world):
+    store, _, _ = world
+    original = store.open_session('original', 901)
+    retry = store.open_session('retry', 1, resumed_from='original')
+    assert retry['waveId'] == original['waveId']
+    assert retry['resumedFromSessionId'] == 'original'
+    assert store.open_session('retry', 1, resumed_from='original') == retry
+    with pytest.raises(Conflict):
+        store.open_session('retry', 1)
+    assert store._required(store.session_key('original'))['declaredCount'] == 901
+
+
+def test_retry_cannot_reference_an_unknown_or_cross_library_parent(world):
+    store, table, _ = world
+    store.open_session('original', 1)
+    other = ShadowWaves(table, 'library-B')
+    with pytest.raises(Conflict):
+        other.open_session('retry', 1, resumed_from='original')
+    with pytest.raises(Conflict):
+        store.open_session('retry', 1, resumed_from='missing')
+
+
+def test_conflict_retries_yield_before_rereading_without_weakening_bounds(world, monkeypatch):
+    import upload_waves
+    store, _, _ = world
+    pauses, attempts = [], []
+    monkeypatch.setattr(upload_waves.time, 'sleep', pauses.append)
+    def competing_write():
+        attempts.append(1)
+        if len(attempts) < 4:
+            raise ResourceModifiedError('another request committed')
+        return 'committed'
+    assert store._retry(competing_write) == 'committed'
+    assert len(pauses) == 3 and all(0 < pause <= .05 for pause in pauses)

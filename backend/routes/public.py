@@ -138,6 +138,9 @@ def public_thumbnail(token: str, filename: str):
     # album owner. The thumbnail blob shares the image's anonymous id.
     owner_id = str(entity.get('PartitionKey') or '')
     blob_name_to_serve = app.resolve_physical_blob_name(owner_id, safe_name, 'image') if owner_id else safe_name
+    metadata = app._get_metadata_entity(owner_id, safe_name) if owner_id else None
+    if metadata:
+        blob_name_to_serve = app._derivative_blob_from_metadata(metadata, safe_name, 'thumbnail', physical=blob_name_to_serve)
 
     try:
         props = app.get_media_properties('thumbnail', blob_name_to_serve)
@@ -246,7 +249,8 @@ def public_preview(token: str, filename: str):
         owner_id = str(entity.get('PartitionKey') or '')
         cached_blob_name = app.resolve_physical_blob_name(owner_id, safe_name, 'image') if owner_id else safe_name
         try:
-            cached = app._stream_cached_preview(safe_name, cache_control='public, max-age=3600', blob_name=cached_blob_name)
+            cached = app._stream_cached_preview(safe_name, cache_control='public, max-age=3600', blob_name=cached_blob_name,
+                                                metadata=app._get_metadata_entity(owner_id, safe_name))
         except Exception:
             app.app.logger.exception('Failed to stream cached public preview for %s', safe_name)
             cached = None

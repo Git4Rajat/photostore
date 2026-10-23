@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import random
 import time
 import uuid
 from itertools import islice
@@ -91,6 +92,10 @@ class ShadowWaves:
                     raise
             if attempt + 1 == MAX_RETRIES:
                 raise Conflict('Concurrent wave mutation; retry the request')
+            # Immediate retries can repeatedly lose to another request on the
+            # library control row. Yield with bounded jitter; still fail closed
+            # after MAX_RETRIES rather than weakening the conditional commit.
+            time.sleep(random.uniform(0.001, min(0.05, 0.002 * (2 ** attempt))))
 
     def _page(self, prefix, after='', *, size=MAX_PAGE):
         # RowKey range + service paging: never materialize an entire library.
@@ -113,22 +118,59 @@ class ShadowWaves:
     def item_key(session, item):
         return 'item!' + identifier(session) + '!' + identifier(item)
 
-    def open_session(self, session, declared_count):
+    def accept_source_completion(self, intent):
+        """Durably/idempotently accept an intent, without asserting readiness.
+
+        This inbox is independent of admission timing: completion may precede
+        the upload item's resolve request. Artifact qualification is separate.
+        """
+        from processing_completion import validate_intent
+        payload = validate_intent(intent, self.library)
+        artifacts_qualified = False
+        if payload.get('artifactReceipt') is not None:
+            from processing_receipts import ArtifactReceipts
+            ArtifactReceipts(self.table, self.library).verify_reference(payload['artifactReceipt'], payload)
+            artifacts_qualified = True
+        body = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+        key = 'source-completion!' + digest([payload['photoId'], payload['revision']]) + '!' + intent['id']
+        def run():
+            previous = self._get(key)
+            if previous:
+                if previous.get('payload') != body:
+                    raise Conflict('Source completion identity cannot be rebound')
+                return dict(previous)
+            row = self._row(key, completionId=intent['id'], photoId=payload['photoId'],
+                processingRevision=payload['revision'], payload=body, completionQualified=False, artifactReceiptQualified=artifacts_qualified,
+                acceptedAt=self.clock())
+            self.table.submit_transaction([('create', row)])
+            return row
+        return self._retry(run)
+
+    def open_session(self, session, declared_count, *, resumed_from=''):
         key = self.session_key(session)
+        if resumed_from:
+            identifier(resumed_from)
+            if resumed_from == session:
+                raise ValueError('A session cannot resume itself')
         if type(declared_count) is not int or not 0 <= declared_count <= 1_000_000:
             raise ValueError('declaredCount must be an integer between 0 and 1000000')
 
         def run():
             existing = self._get(key)
             if existing:
-                if existing['declaredCount'] != declared_count:
+                if existing['declaredCount'] != declared_count or existing.get('resumedFromSessionId', '') != resumed_from:
                     raise Conflict('A session declaration is immutable')
                 return dict(existing)
+            if resumed_from:
+                self._required(self.session_key(resumed_from))
             control = self._get('control')
             wave_id = (control or {}).get('collectingWaveId') or uuid.uuid4().hex
             old_wave = self._get(self.wave_key(wave_id))
+            predecessor = self._get(self.wave_key(control['tailWaveId'])) if (
+                old_wave is None and control and control.get('tailWaveId')) else None
             wave = dict(old_wave or self._row(self.wave_key(wave_id), waveId=wave_id,
                 predecessorWaveId=(control or {}).get('tailWaveId', ''), state='collecting',
+                predecessorFrozenRevision=(predecessor or {}).get('frozenRevision', ''),
                 createdAt=self.clock(), openSessions=0, sessionCount=0, memberCount=0,
                 intakeEpoch=0, evaluation='', stateEnteredAt=self.clock(), lastProgressAt=self.clock()))
             if wave['state'] == 'ready':
@@ -140,7 +182,7 @@ class ShadowWaves:
                         evaluation='', updatedAt=self.clock(), lastProgressAt=self.clock(),
                         visionPendingKey='', waitReason='intake_open')
             row = self._row(key, sessionId=session, waveId=wave_id, declaredCount=declared_count,
-                registeredCount=0, resolvedCount=0, state='open', manifestRevision=uuid.uuid4().hex,
+                registeredCount=0, resolvedCount=0, state='open', resumedFromSessionId=resumed_from, manifestRevision=uuid.uuid4().hex,
                 createdAt=self.clock())
             # Session evidence is separately paged with the member manifest.
             evidence = self._row(f'e!{wave_id}!s!{session}', kind='session', sessionId=session,
@@ -286,13 +328,13 @@ class ShadowWaves:
 
     def promote_successor(self, wave_id):
         """Advances a wave out of `waiting_predecessor` once its predecessor
-        has reached `ready` (this module's terminal state). Mirrors exactly
+        has committed exact indexing-completion evidence. Mirrors exactly
         what close() does for a wave with no predecessor -- the same target
         state and outbox shape -- so there is one processing_pending/
         visionPending transition in this module, not two parallel ones.
 
         Idempotent and safe to call speculatively: a wave not currently in
-        `waiting_predecessor`, or whose predecessor isn't ready yet, is a
+        `waiting_predecessor`, or whose predecessor is incomplete, is a
         no-op that returns the wave unchanged (not an error). Callers
         (the opt-in execution layer, or its recovery sweep) can call this on
         every `waiting_predecessor` wave they see without first checking.
@@ -305,7 +347,14 @@ class ShadowWaves:
             if wave['state'] != 'waiting_predecessor':
                 return dict(wave)
             predecessor = self._get(self.wave_key(wave['predecessorWaveId']))
-            if predecessor is None or predecessor['state'] != 'ready':
+            if predecessor is None or predecessor['state'] != 'complete':
+                return dict(wave)
+            completion = self._get('completion!' + predecessor['waveId'])
+            if (not completion or not wave.get('predecessorFrozenRevision')
+                    or completion.get('frozenRevision') != wave['predecessorFrozenRevision']
+                    or completion.get('frozenRevision') != predecessor.get('frozenRevision')
+                    or completion.get('requiredSetId') != predecessor.get('requiredPublicationId')
+                    or completion.get('receiptId') != predecessor.get('completionReceiptId')):
                 return dict(wave)
             next_wave = dict(wave, state='processing_pending', waitReason='',
                              predecessorSatisfiedAt=self.clock(),
@@ -319,6 +368,45 @@ class ShadowWaves:
             return next_wave
         return self._retry(run)
 
+    def complete_indexing(self, wave_id, ledger):
+        """Commit exact publication coverage and predecessor completion together.
+
+        The future index-stage owner must first bind requiredPublicationId and
+        enter indexing. Shadow-ready or assignment-only states cannot complete.
+        """
+        identifier(wave_id)
+        proof = ledger.completion_proof()
+        receipt_id = digest(proof)
+        def run():
+            control = self._required('control')
+            wave = self._required(self.wave_key(wave_id))
+            if (proof['libraryId'] != self.library or proof['waveId'] != wave_id
+                    or proof['frozenRevision'] != wave.get('frozenRevision')
+                    or proof['requiredSetId'] != wave.get('requiredPublicationId')):
+                raise Conflict('Publication coverage does not match the wave frontier')
+            if wave['state'] == 'complete' and wave.get('completionReceiptId') == receipt_id:
+                return dict(wave)
+            if wave['state'] != 'indexing':
+                raise Conflict('Only the indexing stage can commit wave completion')
+            receipt = self._row('completion!' + wave_id,
+                **{key: value for key, value in proof.items() if key != 'libraryId'}, receiptId=receipt_id)
+            next_wave = dict(wave, state='complete', completionReceiptId=receipt_id,
+                stateEnteredAt=self.clock(), lastProgressAt=self.clock(), updatedAt=self.clock())
+            self._commit(control, [self._change(wave, next_wave), ('create', receipt)])
+            return next_wave
+        return self._retry(run)
+
+    @staticmethod
+    def outbox_eligible(wave, outbox):
+        if outbox.get('destination') == 'vision':
+            return (wave['state'] == 'processing_pending'
+                    and wave.get('visionPendingKey') == outbox['RowKey']
+                    and wave['intakeEpoch'] == outbox.get('intakeEpoch'))
+        if outbox.get('destination') == 'cluster':
+            return (wave['state'] == 'ready'
+                    and wave.get('frozenRevision') == outbox.get('inputRevision'))
+        return False
+
     def set_dispatchable(self, key, *, dispatchable=True):
         """Flips an existing outbox row's `dispatchable` flag under CAS.
 
@@ -329,11 +417,15 @@ class ShadowWaves:
         no-op that still returns the current row.
         """
         def run():
+            control = self._required('control')
             row = self._required(key)
+            wave = self._required(self.wave_key(row['waveId']))
+            if dispatchable and not self.outbox_eligible(wave, row):
+                raise Conflict('Stage release is no longer eligible')
             if bool(row.get('dispatchable')) == bool(dispatchable):
                 return dict(row)
             updated = dict(row, dispatchable=bool(dispatchable))
-            self.table.submit_transaction([self._change(row, updated)])
+            self._commit(control, [self._change(row, updated)], advance=False)
             return updated
         return self._retry(run)
 

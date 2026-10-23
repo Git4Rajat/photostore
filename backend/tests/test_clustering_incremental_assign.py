@@ -580,7 +580,9 @@ def test_partial_failed_pass_queues_only_persisted_embeddings(monkeypatch, store
 # docs/indexing-clustering-target-state.md step 7, "per-library cutover")
 # must not also feed this legacy incremental buffer/maintenance trigger --
 # old and new paths must never own the same faces.
-def test_cut_over_library_skips_the_legacy_trigger_entirely(monkeypatch):
+def test_cut_over_library_skips_the_legacy_trigger_only_with_live_consumers(monkeypatch):
+    import upload_wave_execution
+    monkeypatch.setattr(upload_wave_execution, 'live_consumers_available', lambda: True)
     monkeypatch.setattr(app, '_people_features_available', lambda: True)
     monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED', 'true')
     monkeypatch.setenv('UPLOAD_WAVE_CUTOVER_LIBRARIES', 'lib-A, lib-B')
@@ -594,6 +596,7 @@ def test_cut_over_library_skips_the_legacy_trigger_entirely(monkeypatch):
     ('false', 'lib-A'),  # Execution flag off: cutover list is irrelevant.
     ('true', 'lib-B'),   # Execution on, but this library isn't listed.
     ('true', ''),        # Execution on, nothing cut over yet.
+    ('true', 'lib-A'),   # No live consumer: a config flag cannot strand faces.
 ])
 def test_non_cut_over_library_still_uses_the_legacy_trigger(monkeypatch, execution_enabled, cutover_libraries):
     monkeypatch.setattr(app, '_people_features_available', lambda: True)

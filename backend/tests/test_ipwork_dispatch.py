@@ -353,3 +353,30 @@ def test_current_face_embedding_version_still_skips_done_step(monkeypatch, dispa
     assert outcome == 'noop'
     assert ran_steps == []
     assert ('ipwork', 'skipped') in dispatch_ctx.job_statuses
+
+
+@pytest.mark.parametrize('outage', [False, True])
+def test_receipt_only_retry_skips_models_and_preserves_legacy_clustering(monkeypatch, dispatch_ctx, outage):
+    import storage_utils
+    monkeypatch.setenv('UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED', 'true')
+    lease = {'ownerId': 'ipworker-retry', 'statuses': {'faceStatus': 'done'},
+             'entity': {'processingFence': 'attempt'}}
+    monkeypatch.setattr(app, 'claim_processing_lease', lambda *a, **k: lease)
+    monkeypatch.setattr(app, '_browser_processing_face_version_stale', lambda *a: False)
+    monkeypatch.setattr(app, '_run_ipwork_steps', lambda *a, **k: pytest.fail('models rerun'))
+    released, clustered = [], []
+    monkeypatch.setattr(app, 'release_processing_lease', lambda *a, **k: released.append((a, k)))
+    monkeypatch.setattr(app, '_queue_people_clustering_after_face_processing', lambda *a: clustered.append(a))
+    def qualify(*a):
+        assert a == ('lib-A', 'photo.jpg', lease)
+        if outage: raise OSError('receipt still unavailable')
+        return {'face_status': 'done', 'faceCount': 1}
+    monkeypatch.setattr(storage_utils, 'qualify_completed_processing', qualify)
+    if outage:
+        with pytest.raises(OSError):
+            app._handle_ipwork_queue_payload({'filename': 'photo.jpg', 'steps': ['face']}, 'retry', 'lib-A')
+        assert not clustered and ('ipwork', 'done') not in dispatch_ctx.job_statuses
+    else:
+        assert app._handle_ipwork_queue_payload({'filename': 'photo.jpg', 'steps': ['face']}, 'retry', 'lib-A') == 'done'
+        assert len(clustered) == 1
+    assert released[0][1] == {'expected_processing_fence': 'attempt'}

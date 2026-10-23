@@ -1670,6 +1670,8 @@ def _init_storage_clients():
         # importing) sidesteps that ordering issue.
         face_summary_lookup=lambda uid: _load_user_face_summary_by_id(uid),
         face_summary_cache_writer=lambda uid, rows: _face_summary_scan_cache.set(uid, rows),
+        source_completion_delivery=lambda uid, intent: _accept_upload_source_completion(uid, intent),
+        source_artifact_receipt_capture=lambda uid, metadata: _capture_upload_artifacts(uid, metadata),
     )
     _prime_vector_indexes_on_startup()
 
@@ -2311,6 +2313,13 @@ def _direct_media_requested() -> bool:
         return False
 
 
+def _derivative_blob_from_metadata(metadata, filename, kind, *, physical=None):
+    from processing_artifacts import derivative_blob
+    physical = physical or _blob_name_from_metadata(metadata, filename)
+    fallback = physical if kind == 'thumbnail' else _preview_cache_blob_name(physical)
+    return derivative_blob(metadata or {}, kind, fallback)
+
+
 def _direct_thumbnail_blob(metadata: Dict, filename: str) -> str:
     """Physical blob name the client uses to build thumbnail/preview/full-res
     URLs directly from its container tokens (see /api/photos/media-token),
@@ -2325,7 +2334,7 @@ def _direct_thumbnail_blob(metadata: Dict, filename: str) -> str:
     /api/photos/access-batch traffic (see the 2026-10-09 HAR investigation)."""
     if not _direct_media_requested():
         return ''
-    return _blob_name_from_metadata(metadata, filename)
+    return _derivative_blob_from_metadata(metadata, filename, 'thumbnail')
 
 
 def _thumbnail_url_from_metadata(metadata: Dict, filename: str) -> str:
@@ -2343,14 +2352,14 @@ def _thumbnail_url_from_metadata(metadata: Dict, filename: str) -> str:
         if str(meta.get('preview_status') or '').strip().lower() == 'done':
             return make_proxy_url(filename, 'preview')
         return ''
-    return make_media_url(filename, 'thumbnail', blob_name=_blob_name_from_metadata(metadata, filename))
+    return make_media_url(filename, 'thumbnail', blob_name=_derivative_blob_from_metadata(metadata, filename, 'thumbnail'))
 
 
 def _private_photo_media_urls(filename: str, metadata: Optional[Dict] = None) -> Dict[str, str]:
     blob_name = _blob_name_from_metadata(metadata, filename)
     return {
         'url': make_media_url(filename, 'image', blob_name=blob_name),
-        'thumbnailUrl': make_media_url(filename, 'thumbnail', blob_name=blob_name),
+        'thumbnailUrl': make_media_url(filename, 'thumbnail', blob_name=_derivative_blob_from_metadata(metadata, filename, 'thumbnail')),
     }
 
 
@@ -4258,6 +4267,17 @@ def _enqueue_processing_steps(
 
     if entity.get('processingIsolated') is True:
         return {step: {'status': 'skipped', 'reason': 'upload_only_benchmark'} for step in steps}
+
+    if force:
+        # Forced reprocessing is an explicit supersession, not an ordinary
+        # retry: it must allocate a fresh processing generation/contract
+        # (see processing_generation.py) so a stale in-flight result from
+        # the old generation is fenced out rather than silently accepted.
+        try:
+            entity = storage_utils_module.supersede_processing_generation(user_id, filename)
+        except Exception:
+            app.logger.exception('Forced reprocess could not allocate a new processing generation for %s/%s', user_id, filename)
+            return {step: {'status': 'error', 'reason': 'generation_allocation_failed'} for step in steps}
 
     visibility_timeout = max(0, min(int(visibility_timeout or 0), 7 * 24 * 60 * 60))
     for step in steps:
@@ -11350,8 +11370,9 @@ def _preview_cache_blob_name(blob_name: str) -> str:
     return f'preview/{blob_name}.jpg'
 
 
-def _stream_cached_preview(filename: str, *, cache_control: str, blob_name: Optional[str] = None):
-    preview_blob = _preview_cache_blob_name(blob_name or filename)
+def _stream_cached_preview(filename: str, *, cache_control: str, blob_name: Optional[str] = None, metadata=None):
+    preview_blob = (_derivative_blob_from_metadata(metadata, filename, 'preview', physical=blob_name) if metadata is not None
+                    else _preview_cache_blob_name(blob_name or filename))
     try:
         props = get_media_properties('thumbnail', preview_blob)
     except Exception as exc:
@@ -12663,18 +12684,29 @@ def _incremental_assignment_skip_reason(metadata) -> Optional[str]:
     return 'face_not_ready'
 
 
+def _capture_upload_artifacts(user_id, metadata):
+    import storage_utils
+    from processing_receipts import ArtifactReceipts
+    return ArtifactReceipts(jobs_table_client, user_id).capture(storage_utils, metadata)
+
+
+def _accept_upload_source_completion(user_id, intent):
+    from upload_waves import ShadowWaves
+    if jobs_table_client is None:
+        raise RuntimeError('Source completion inbox storage unavailable')
+    return ShadowWaves(jobs_table_client, user_id).accept_source_completion(intent)
+
+
 def _library_cut_over_to_waves(user_id: str) -> bool:
-    """True once this library has been explicitly migrated to wave-based
-    automatic clustering (docs/indexing-clustering-target-state.md's
-    delivery-sequence step 4, "per-library cutover"). Comma-separated env
-    list, same convention as INDEX_BUILD_ROLES. A real durable per-library
-    cutover record (and the wave dispatcher that would actually own these
-    faces -- see upload_wave_execution.py/clustering_wave.py's module
-    docstrings on what still has no real queue consumer) is follow-up infra
-    work; this is the code-level gate that prevents legacy and wave-based
-    automatic clustering from ever owning the same faces once a library is
-    listed here, so the two paths cannot both claim a photo's faces.
+    """Future per-library cutover gate, held off until live consumers exist.
+
+    Environment flags alone must not suppress the currently functioning
+    assignment path. Durable cohort ownership and consumer validation are
+    still required before live cutover can be enabled.
     """
+    from upload_wave_execution import live_consumers_available
+    if not live_consumers_available():
+        return False
     if os.getenv('UPLOAD_WAVE_EXECUTION_ENABLED', '').strip().lower() != 'true':
         return False
     cut_over = {name.strip() for name in os.getenv('UPLOAD_WAVE_CUTOVER_LIBRARIES', '').split(',') if name.strip()}
@@ -13258,6 +13290,8 @@ def _claim_processing_lease_response(
     response = {
         'claimed': True,
         'leaseId': lease_owner,
+        'processingRevision': lease.get('processingRevision') or '',
+        'processingFence': lease.get('processingFence') or '',
         'expiresAt': lease.get('leaseExpiresAt') or '',
     }
     try:
@@ -13274,6 +13308,12 @@ def _claim_processing_lease_response(
         # (the image itself is untouched since that upload path already uses the
         # client-echoed blobName; only this thumbnail-claim path still had the gap).
         physical_name = _validate_client_blob_name(client_blob_name) or _resolve_media_blob_name(user_id, filename)
+        from processing_completion import completion_capture_enabled
+        if completion_capture_enabled():
+            from processing_artifacts import staging_name
+            source = lease['entity']
+            physical_name = staging_name(user_id, source['anonymousImageId'], source['processingRevision'],
+                                         source['processingFence'], 'thumbnail')
         thumbnail_url, thumbnail_expires_at = _create_direct_thumbnail_upload_blob_url(physical_name)
         response['thumbnailUploadUrl'] = thumbnail_url
         response['thumbnailUploadExpiresAt'] = thumbnail_expires_at
@@ -16508,7 +16548,21 @@ def _handle_ipwork_queue_payload_impl(payload: Dict, job_id: str, user_id: str) 
             runnable_steps.append('face')
             reprocessing = True
     if not runnable_steps:
-        release_processing_lease(user_id, filename, lease_owner)
+        from processing_completion import completion_capture_enabled
+        if completion_capture_enabled():
+            from storage_utils import qualify_completed_processing
+            try:
+                recovered_metadata = qualify_completed_processing(user_id, filename, lease)
+            finally:
+                release_processing_lease(user_id, filename, lease_owner,
+                    expected_processing_fence=lease['entity'].get('processingFence'))
+            if 'face' in steps:
+                _queue_people_clustering_after_face_processing(user_id, filename, recovered_metadata)
+            _upsert_job_status(job_id, user_id, 'ipwork', 'done', reason='artifact_receipt_recovered')
+            return 'done'
+        release_processing_lease(user_id, filename, lease_owner,
+                **({'expected_processing_fence': lease['entity']['processingFence']}
+                   if (lease.get('entity') or {}).get('processingFence') else {}))
         _upsert_job_status(job_id, user_id, 'ipwork', 'skipped', reason='already_done')
         _ipwork_metric('already_processed')
         return 'noop'
@@ -16537,6 +16591,8 @@ def _handle_ipwork_queue_payload_impl(payload: Dict, job_id: str, user_id: str) 
             origin='ipworker',
             claimed_steps=runnable_steps,
             lease_owner=lease_owner,
+            expected_processing_revision=(lease.get('entity') or {}).get('processingRevision'),
+            expected_processing_fence=(lease.get('entity') or {}).get('processingFence'),
         )
         apply_ms = round((time.monotonic() - apply_started) * 1000)
         # apply_client_processing_results_for_file already clears the lease
@@ -16632,7 +16688,9 @@ def _handle_ipwork_queue_payload_impl(payload: Dict, job_id: str, user_id: str) 
         # leave the lease held until it naturally expires after
         # IPWORKER_LEASE_SECONDS.
         if not lease_cleared_by_apply:
-            release_processing_lease(user_id, filename, lease_owner)
+            release_processing_lease(user_id, filename, lease_owner,
+                **({'expected_processing_fence': lease['entity']['processingFence']}
+                   if (lease.get('entity') or {}).get('processingFence') else {}))
     return 'done'
 
 

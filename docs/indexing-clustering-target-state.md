@@ -2,12 +2,11 @@
 
 Date: 23 October 2026 (Europe/Stockholm).
 
-Status: target and implementation gap analysis. The first index-ownership
-implementation is now in the working tree; see the delivery progress below.
-An opt-in backend shadow intake/barrier foundation is also implemented locally;
-browser integration, qualified source completion and sequential stage residency
-remain unimplemented.
-No live deployment has been performed by this work.
+Status: target and implementation gap analysis. Index ownership, opt-in shadow
+intake, per-session browser diagnostics, and standalone clustering/publication
+protocol modules are implemented locally. Whole-selection browser admission,
+qualified source completion, live stage consumers and sequential residency
+remain unimplemented. No live deployment has been performed by this work.
 
 ## 1. Required outcome and working decisions
 
@@ -795,23 +794,96 @@ durable protocol below. Local validation and baseline failures are recorded in
 
 ### Remaining delivery sequence
 
-The backend foundation for step 2 now lives in `upload_waves.py`, with an
+The backend foundation for step 2 lives in `upload_waves.py`, with an
 authenticated, disabled-by-default `/upload/waves/shadow/...` API and bounded
-source observation adapter. Sessions declare the entire parent selection;
-registration and resolution are idempotent, closure checks the exact manifest
-revision, and paginated readiness is fenced against concurrent admission and
-observations. Shadow Vision/cluster markers are durable and explicitly
-non-dispatchable. Successor waves retain an explicit predecessor blocker.
+source observation adapter. Registration, closure and paginated readiness use
+conditional control-record transactions. Optional browser diagnostics use one
+persisted parent for the whole selected operation, shared across 900-file
+transport children and linked retry subsets. They require both the client build
+flag `VITE_UPLOAD_WAVE_SHADOW_ENABLED=true` and server flag
+`UPLOAD_WAVE_SHADOW_ENABLED=true`. Wire item IDs are deterministic hashes and
+operations are serialized per parent. Enabled diagnostics await parent admission
+before child transfer, while failures are contained so legacy uploads continue.
+Live admission must require server acknowledgement and reservation recovery;
+shadow diagnostics are not yet production admission authority.
 
-This is **not yet automatic shadow tracking of browser uploads**. Existing
-browser sessions and production source writers have not been connected to these
-records. The legacy source adapter returns observational evidence, always marked
-`evidenceQualified=false`; its physical-photo/hash identity is not a processing
-generation fence. A shadow `ready` state is not a production completion receipt.
-The next work is persistent parent/item IDs across the browser's queued chunks,
-source generation/completion outboxes and recovery, then live shadow comparison.
-See [the shadow protocol implementation audit](audits/upload-wave-shadow-implementation-2026-10-23.md)
-for the API, validation and remaining cutover gates.
+`processingRevision` is now stamped by finalization and checked by the worker's
+existing source-change commit guard. This is not the complete source protocol:
+claimed browser reports now echo their source revision and lease ID, and use
+conditional result/status/lease-release commits. Vision also supplies its claim's
+revision rather than adopting a fresh result-application read's generation.
+Late/stale claims fail before result application and expired leases fail before
+metadata commit. Unclaimed legacy/finalize reports remain compatible; face,
+lookup and blob effects are not yet fully generation-fenced. Opt-in source-local
+completion intents (`UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED=true`) now share the
+terminal metadata CAS. Their bounded backlog retains older generations until
+exact-ID acknowledgement; lost notifications and racing newer completions do
+not consume those intents. Claimed work also carries an attempt token: live
+renewal retains it, while an expired same-owner claim receives a new token.
+Heartbeat and release validate the token as well, preventing an old attempt from
+renewing or releasing a newer same-owner claim. Opt-in face/embedding output writes
+use create-only or pinned-ETag conditional writes; source/attempt provenance is
+stamped on face, embedding and lookup rows. Destructive reconciliation is blocked
+in this opt-in path until its delete/person/membership writes are fenced.
+Terminal commits now opportunistically deliver to an idempotent source inbox;
+source acknowledgement requires an exact accepted receipt, and reconciliation
+pages retry lost delivery. The flag remains off. Versioned JPEG publication and immutable artifact snapshots
+now have an opt-in implementation: browser SAS targets staging, verified output
+uses create-only content-addressed blobs, and metadata CAS binds derivative
+pointers and snapshot references. Receipt-only retries preserve completed work
+without rerunning models. The inbox can mark artifacts qualified after verifying
+the immutable manifest and face snapshots, but it still cannot mark wave
+completion qualified or release clustering. Fixed processing/model generations,
+legacy qualification, generation-aware cleanup/retention, actual stage consumers
+and independently scheduled recovery remain release gates. See the
+[artifact receipt audit](audits/upload-artifact-receipts-2026-10-23.md).
+These intents and multi-table observations are not qualified production
+completion receipts. The adapter's `evidenceQualified` field reports presence of
+a source revision, not
+proof that a generation's complete results were durably committed. A shadow
+`ready` state is not a production completion receipt.
+
+The review of `63c5e31` adds the following local protocol hardening:
+
+- Wave stage intents use a separate pending partition, so ordinary indexer
+  recovery cannot dispatch them as catalog scope jobs. Old intake epochs cannot
+  be marked eligible after reopening. No live stage consumer is connected.
+- The publication ledger captures the whole immutable obligation set before
+  materializing rows; interrupted capture resumes without losing requirements.
+  Exact prerequisite IDs, output-generation or no-change-witness receipts and
+  conflicting-receipt rejection protect coverage. An explicitly captured empty
+  set is distinct from missing capture.
+- `complete_indexing` commits exact bound coverage with a completion record;
+  successor promotion requires that record and the predecessor's `complete`
+  state. `ready`, assignment completion and an unproved `complete` flag do not
+  release the successor. The real index-stage owner is not wired to this method.
+- The clustering journal binds the entire input, source-vector content and
+  chunk layout before assignment. It is an input/chunk ledger, **not yet a
+  per-face decision journal**. The runner currently accepts an in-memory input
+  map; production streamed-manifest execution and renewed stage fencing remain
+  prerequisites.
+- Live cutover remains disabled while live consumers are absent. Configuration
+  flags alone cannot suppress the functioning legacy assignment trigger.
+
+See [the shadow protocol audit](audits/upload-wave-shadow-implementation-2026-10-23.md)
+for historical validation, and [the integration review](audits/upload-wave-integration-review-2026-10-23.md)
+for current changes, commands and remaining gates. The next implementation work
+now completes generation fencing for face/lookup/blob outputs and connects
+source completion delivery, followed by actual stage consumers, independent
+recovery and cloud residency proof.
+
+The browser's opt-in admission now persists the **entire selected operation**
+before splitting its 900-file transport children. Child checkpoints retain parent
+and item identities, server-acknowledged resolution markers survive reload, and
+only the last acknowledged item permits intake close. Queued cancellation settles
+its parent items explicitly. Retrying unfinished files opens a fresh linked parent
+without changing cached blob keys. Finalization and hash-shortcut duplicates bind
+to their canonical accepted filenames. If the complete parent cannot be persisted,
+shadow admission is suppressed for every child rather than falling back to
+independent 900-file admissions. This is implemented in the shadow path; live
+cutover, reservation-deadline recovery and parent checkpoint garbage collection
+remain release requirements. See the [implementation sequence audit](audits/upload-wave-sequence-2026-10-23.md)
+for exact validation commands and the seven-item progress checklist.
 
 1. **Indexer boundary:** enumerate publishers and repair paths; enforce ownership;
    route vector/manual repairs; validate dependency and failure behavior. Deploy

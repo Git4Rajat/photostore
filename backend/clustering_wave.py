@@ -1,5 +1,5 @@
-"""One wave-scoped clustering job: canonical order, bounded chunks, a durable
-decision journal, and resumability -- see docs/indexing-clustering-target-
+"""Wave assignment runner: canonical order, bounded assignment chunks, a durable
+frozen-input/chunk journal, and resumability -- see docs/indexing-clustering-target-
 state.md step 5 ("one-shot clustering").
 
 Drives the SAME FaissAssigner.batch/assign API the existing (non-wave) chunk
@@ -16,6 +16,10 @@ its output to the oracle's run_single_pass_reference), not yet wired to a
 queue consumer.
 """
 import json
+import hashlib
+
+from azure.core import MatchConditions
+from azure.data.tables import UpdateMode
 
 from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
 
@@ -27,8 +31,8 @@ DEFAULT_CHUNK_SIZE = 128
 
 def canonical_sort_key(face_id, face_row):
     vector = json.loads(face_row.get('embedding') or '[]')
-    return (face_row.get('alignmentMethod'), face_row.get('embeddingVersion'), len(vector),
-            face_row.get('filename'), face_id)
+    return (str(face_row.get('alignmentMethod') or ''), str(face_row.get('embeddingVersion') or ''), len(vector),
+            str(face_row.get('filename') or ''), face_id)
 
 
 def canonical_order(faces):
@@ -42,17 +46,19 @@ def canonical_order(faces):
 
 
 class ClusteringJournal:
-    """Durable per-wave, per-chunk decision journal.
+    """Durable input/chunk ledger; individual assignment decisions are not logged.
 
-    One owning job per wave at a time is enforced by the caller (the
-    WorkStore claim from upload_wave_execution.py), not here -- this class
-    only needs create-once-per-chunk idempotency, not cross-writer fencing.
+    The future live caller must supply renewed stage ownership and fencing.
+    This class binds the whole input and records chunk plans/commit markers;
+    it does not implement that ownership protocol.
     A chunk row is written exactly once, before that chunk's assignment
     calls, and marked committed exactly once after they succeed. Retrying an
     interrupted chunk re-plans the SAME row (face set must match -- the
     canonical order is deterministic and must not change between retries)
     and re-runs assign() for every face in it; FaissAssigner.assign already
-    treats an already-owned face as a no-op, so that replay is safe.
+    treats an already-owned face as a no-op. The small oracle fixtures qualify
+    those tested recovery cases; general decision-journal equivalence remains
+    a release prerequisite.
     """
 
     def __init__(self, table, wave_id):
@@ -62,6 +68,28 @@ class ClusteringJournal:
 
     def _key(self, chunk_index):
         return f'chunk-{chunk_index:08d}'
+
+    def bind_input(self, library, input_digest, chunk_size, face_count):
+        row = dict(PartitionKey=self.partition, RowKey='input-v1', libraryId=library,
+                   inputDigest=input_digest, chunkSize=chunk_size, faceCount=face_count)
+        try:
+            existing = self.table.get_entity(self.partition, 'input-v1')
+        except ResourceNotFoundError:
+            existing = None
+        if existing is None:
+            try:
+                self.table.get_entity(self.partition, self._key(0))
+            except ResourceNotFoundError:
+                pass
+            else:
+                raise RuntimeError('Legacy unbound chunk journal requires explicit migration')
+            try:
+                self.table.create_entity(row)
+                return
+            except ResourceExistsError:
+                existing = self.table.get_entity(self.partition, 'input-v1')
+        if any(existing.get(key) != value for key, value in row.items()):
+            raise RuntimeError('Frozen wave input or chunk layout changed between retries')
 
     def plan(self, chunk_index, face_ids):
         key = self._key(chunk_index)
@@ -89,7 +117,11 @@ class ClusteringJournal:
             if row.get('status') == 'committed':
                 return
             try:
-                self.table.update_entity(dict(row, status='committed'), etag=etag(row))
+                version = etag(row)
+                if not version:
+                    raise RuntimeError('Clustering journal commit requires an ETag')
+                self.table.update_entity(dict(row, status='committed'), etag=version,
+                    mode=UpdateMode.REPLACE, match_condition=MatchConditions.IfNotModified)
                 return
             except ResourceModifiedError:
                 continue
@@ -109,8 +141,27 @@ def run_wave_assignment(user_id, assigner, journal, members, face_rows, *, chunk
     chunk was already committed on entry -- a safe, idempotent no-op, which
     is exactly what a recovered/retried job should see on its final call.
     """
-    filename_by_face = {face_id: filename for filename, face_ids in members.items() for face_id in face_ids}
+    if type(chunk_size) is not int or not 0 < chunk_size <= 128:
+        raise ValueError('chunk_size must be between 1 and 128')
+    filename_by_face = {}
+    for filename, face_ids in members.items():
+        for face_id in face_ids:
+            if face_id in filename_by_face:
+                raise ValueError('Face appears more than once in frozen manifest')
+            filename_by_face[face_id] = filename
+    if set(filename_by_face) != set(face_rows):
+        raise ValueError('Face rows do not exactly cover the frozen manifest')
+    if any(row.get('filename') != filename_by_face[face_id] for face_id, row in face_rows.items()):
+        raise ValueError('Face/photo identity differs from the frozen manifest')
     work = canonical_order(face_rows)
+    fingerprint = hashlib.sha256()
+    for face_id in work:
+        row = face_rows[face_id]
+        payload = [face_id, canonical_sort_key(face_id, row), json.loads(row.get('embedding') or '[]'),
+                   row.get('processingRevision')]
+        fingerprint.update(json.dumps(payload, separators=(',', ':'), allow_nan=False).encode())
+        fingerprint.update(b'\n')
+    journal.bind_input(user_id, fingerprint.hexdigest(), chunk_size, len(work))
     newly_committed = 0
     for chunk_index, offset in enumerate(range(0, len(work), chunk_size)):
         chunk = work[offset:offset + chunk_size]

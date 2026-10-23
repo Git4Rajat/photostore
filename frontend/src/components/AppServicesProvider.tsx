@@ -1,3 +1,4 @@
+import { bindWaveChild, declareWaveSelection, retryWaveOperation, sliceWaveSelection } from '../services/uploadWaveOperations';
 import { hasPendingEdits } from '../services/pendingEdits';
 import { startIndexReadyPush } from '../services/indexReadyPush';
 import { reportIndexBuilding } from '../services/indexBuilding';
@@ -5,7 +6,7 @@ import { preloadLocalIndexes } from '../services/preloadLocalIndexes';
 import { startMediaTokenAutoRefresh } from '../services/mediaToken';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { get, getUpload, post, postTools, postUpload, resolveApiUrl } from '../services/apiClient';
-import { ensureWaveShadowSessionOpened, finalizeWaveShadowSession, resolveWaveShadowFile } from '../services/uploadWaveSync';
+import { ensureWaveShadowSessionOpened, finalizeWaveShadowSession, resolveWaveShadowFile, cancelQueuedWaveSelection } from '../services/uploadWaveSync';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
 import { getRuntimeConfig } from '../config/appConfig';
 import type {
@@ -2317,7 +2318,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             const processOnePendingItem = async (
                 item: any,
                 aiWorkerHandle?: BrowserAiWorkerHandle,
-                preClaimed?: { claimed?: boolean; leaseId?: string; thumbnailUploadUrl?: string; reason?: string },
+                preClaimed?: { claimed?: boolean; leaseId?: string; processingRevision?: string; processingFence?: string; thumbnailUploadUrl?: string; reason?: string },
             ): Promise<void> => {
                 if (browserProcessingCancelRef.current) {
                     return;
@@ -2351,7 +2352,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         return;
                     }
                 }
-                let claim: { claimed?: boolean; leaseId?: string; thumbnailUploadUrl?: string } | null = null;
+                let claim: { claimed?: boolean; leaseId?: string; processingRevision?: string; processingFence?: string; thumbnailUploadUrl?: string } | null = null;
                 if (preClaimed) {
                     // Already claimed in the batch call runDrainWorker made for this
                     // lane's first item -- skip the redundant per-item network call.
@@ -2403,7 +2404,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     const skipConvertedPreview = wasFreshlyUploaded
                         || shouldSkipConvertedRawPreview(Boolean(options.force), effectiveSteps);
                     const convertedPreview = skipConvertedPreview ? undefined : await fetchConvertedRawPreview(filename);
-                    await runGatedProcessingCall(() => postUpload('/upload/processing/heartbeat', { filename, leaseId: claim?.leaseId || '' })).catch(() => undefined);
+                    await runGatedProcessingCall(() => postUpload('/upload/processing/heartbeat', { filename, leaseId: claim?.leaseId || '', processingFence: claim?.processingFence })).catch(() => undefined);
                     const result = await runBrowserProcessing(
                         file,
                         `browser-${filename}`,
@@ -2449,6 +2450,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     }
                     await postClientProcessingGated({
                         filename,
+                        processingRevision: claim?.processingRevision, processingFence: claim?.processingFence, leaseId: claim?.leaseId,
                         clientProcessingSchemaVersion: CLIENT_PROCESSING_SCHEMA_VERSION,
                         clientProcessing: filteredResult.clientProcessing,
                         clientProcessingReport: filteredResult.clientProcessingReport,
@@ -2493,6 +2495,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         try {
                             await postClientProcessingGated({
                                 filename,
+                                processingRevision: claim?.processingRevision, processingFence: claim?.processingFence, leaseId: claim?.leaseId,
                                 clientProcessingSchemaVersion: CLIENT_PROCESSING_SCHEMA_VERSION,
                                 clientProcessing: {},
                                 clientProcessingReport: failureReport,
@@ -2508,7 +2511,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     syncBrowserProcessingNotification(browserProcessingNotification, `Failed ${filename}`);
                 } finally {
                     if (!leaseReleasedByReport) {
-                        await postUpload('/upload/processing/release', { filename, leaseId: claim?.leaseId || '' }).catch(() => undefined);
+                        await postUpload('/upload/processing/release', { filename, leaseId: claim?.leaseId || '', processingFence: claim?.processingFence }).catch(() => undefined);
                     }
                 }
             };
@@ -2536,7 +2539,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // only one lane and one first item, so there's nothing to batch.
             // Falls back to each lane's own per-item claim call (unchanged)
             // if this fails or a filename isn't in the response.
-            const preClaimedByFilename = new Map<string, { claimed?: boolean; leaseId?: string; thumbnailUploadUrl?: string; reason?: string }>();
+            const preClaimedByFilename = new Map<string, { claimed?: boolean; leaseId?: string; processingRevision?: string; processingFence?: string; thumbnailUploadUrl?: string; reason?: string }>();
             if (workerCount > 1) {
                 const firstWaveSteps = restrictStepsForModel(
                     restrictStepsForProcessingMode(requestedSteps, getRuntimeConfig().processingMode || 'browser'),
@@ -2867,7 +2870,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             chunkSizeBytes?: number;
             blockConcurrency?: number;
         },
-    ): Promise<{ skippedDuplicate: true } | { skippedDuplicate: false; sha256: string; uploadId: string }> => {
+    ): Promise<{ skippedDuplicate: true; filename: string } | { skippedDuplicate: false; sha256: string; uploadId: string }> => {
         if (uploadStopRequestedRef.current || options?.signal?.aborted) {
             throw new Error(UPLOAD_STOPPED_ERROR);
         }
@@ -2880,7 +2883,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // transfer entirely (no /upload/init, no blob staging, no finalize).
             // The backend's own finalize-time check is what actually enforces
             // this for real; this is purely an earlier, cheaper exit.
-            return { skippedDuplicate: true };
+            return { skippedDuplicate: true, filename: knownHashesRef.current.get(sha256) || libraryHashesRef.current.get(sha256) || file.name };
         }
         // Claim this hash immediately, synchronously with the check above (no
         // await in between) -- otherwise two concurrent lanes uploading
@@ -3226,7 +3229,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         // on a fully successful run before the `finally` block below runs --
         // relying on that ref there would read every file back as whatever
         // stale status `normalized`/`session` captured at the start.
-        const waveShadowFileOutcomes = new Map<string, Pick<PersistedUploadFile, 'status' | 'skippedDuplicate'>>();
+        const waveShadowFileOutcomes = new Map<string, Pick<PersistedUploadFile, 'status' | 'skippedDuplicate' | 'waveAcceptedFilename'>>();
         try {
             persistSession(normalized);
             const pendingFiles = normalized.files.filter((file) => (
@@ -3262,7 +3265,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     return;
                 }
                 const task: Promise<void> = (async () => {
-                    let claim: { claimed?: boolean; leaseId?: string; thumbnailUploadUrl?: string } | null;
+                    let claim: { claimed?: boolean; leaseId?: string; processingRevision?: string; processingFence?: string; thumbnailUploadUrl?: string } | null;
                     try {
                         // blobName: the blob THIS file's bytes actually landed on
                         // (from its own /upload/init response), echoed the same way
@@ -3344,6 +3347,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         }
                         await postClientProcessingGated({
                             filename,
+                            processingRevision: claim?.processingRevision, processingFence: claim?.processingFence, leaseId: claim?.leaseId,
                             clientProcessingSchemaVersion: CLIENT_PROCESSING_SCHEMA_VERSION,
                             clientProcessing: filteredResult.clientProcessing,
                             clientProcessingReport: filteredResult.clientProcessingReport,
@@ -3363,7 +3367,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         console.warn(`Parallel thumbnail generation failed for ${filename}.`, err);
                     } finally {
                         if (!leaseReleasedByReport) {
-                            await postUpload('/upload/processing/release', { filename, leaseId: claim?.leaseId || '' }).catch(() => undefined);
+                            await postUpload('/upload/processing/release', { filename, leaseId: claim?.leaseId || '', processingFence: claim?.processingFence }).catch(() => undefined);
                         }
                     }
                 })();
@@ -3483,8 +3487,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         skippedDuplicate,
                         error: undefined,
                     });
-                    waveShadowFileOutcomes.set(fileMeta.key, { status: 'done', skippedDuplicate });
-                    void resolveWaveShadowFile(session, { ...fileMeta, status: 'done', skippedDuplicate });
+                    const waveAcceptedFilename = completeResponse?.filename || fileMeta.name;
+                    waveShadowFileOutcomes.set(fileMeta.key, { status: 'done', skippedDuplicate, waveAcceptedFilename });
+                    updatePersistedFile(fileMeta.key, { waveAcceptedFilename });
+                    void resolveWaveShadowFile(session, { ...fileMeta, status: 'done', skippedDuplicate, waveAcceptedFilename });
                     if (!skippedDuplicate) {
                         freshlyUploadedFilenamesRef.current.add(fileMeta.name);
                         if (!prepared.clientProcessing?.thumbnail) kickOffThumbnailForFile(file, fileMeta.name, fileMeta.blobName);
@@ -3669,7 +3675,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                             uploadAbortControllersRef.current.delete(controller);
                             totalUploaded += 1;
                             totalSkippedDuplicates += 1;
+                            const waveAcceptedFilename = staged.filename;
+                            waveShadowFileOutcomes.set(fileMeta.key, { status: 'done', skippedDuplicate: true, waveAcceptedFilename });
+                            void resolveWaveShadowFile(session, { ...fileMeta, status: 'done', skippedDuplicate: true, waveAcceptedFilename });
                             updatePersistedFile(fileMeta.key, {
+                                waveAcceptedFilename,
                                 status: 'done',
                                 uploadedBytes: fileMeta.size,
                                 skippedDuplicate: true,
@@ -4098,7 +4108,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }, [loadPersistedSession, pendingUploadSession, persistSession, setPendingUploadSessionLive, updatePersistedFile]);
 
     const retryPersistedUploadSession = useCallback(async () => {
-        const session = pendingUploadSessionRef.current || pendingUploadSession || loadPersistedSession();
+        let session = pendingUploadSessionRef.current || pendingUploadSession || loadPersistedSession();
         // isResumingUploadRef, not just `uploading`: runUploadSession now flips
         // `uploading` false as soon as bytes finish transferring, while its own
         // background finalize/retry tail (guarded by isResumingUploadRef) can
@@ -4145,8 +4155,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
         uploadStopRequestedRef.current = false;
         const retryableKeys = new Set(retryableFiles.map((file) => file.key));
+        session = retryWaveOperation(session);
+        persistSession(session);
+        await ensureWaveShadowSessionOpened(session);
         await runUploadSession(session, { resumed: true, fileKeys: retryableKeys });
-    }, [addNotification, loadPersistedSession, pendingUploadSession, runUploadSession, setUploadError, uploading]);
+    }, [addNotification, loadPersistedSession, pendingUploadSession, persistSession, runUploadSession, setUploadError, uploading]);
 
     const discardPersistedUploadSession = useCallback(async () => {
         if (uploading) {
@@ -4174,6 +4187,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         await clearPersistedSession();
         if (session) {
             await cleanupUnfinishedUploadArtifacts(session);
+            void finalizeWaveShadowSession(session);
             void requestUploadHashRefresh('discarded');
         }
         setUploadError(null);
@@ -4189,6 +4203,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         uploadStartInProgressRef.current = false;
         uploadAbortControllersRef.current.forEach((controller) => controller.abort());
         const queuedCount = queuedUploadBatchesRef.current.reduce((sum, batch) => sum + batch.length, 0);
+        queuedUploadBatchesRef.current.forEach(files => { void cancelQueuedWaveSelection(files); });
         queuedUploadBatchesRef.current = [];
         setQueuedUploadFileCount(0);
         addNotification(
@@ -4283,6 +4298,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             showToast(message, { variant: 'error' });
             return;
         }
+        const parent = declareWaveSelection(filesToUpload);
+        if (parent) void ensureWaveShadowSessionOpened(parent);
         // isResumingUploadRef, not just `uploading` -- see the comment on the
         // same check in retryPersistedUploadSession. Without it, a selection
         // made while a previous session's finalize/retry tail is still
@@ -4405,6 +4422,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 status: 'pending',
             })),
         };
+        bindWaveChild(filesToUpload, session);
         const keyedHandles = new Map<string, FileSystemFileHandle>();
         if (handlesToUpload) {
             filesToUpload.forEach((file, index) => {
@@ -4418,9 +4436,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         let uploadRunStarted = false;
         try {
             persistSession(session);
-            // Best-effort, fire-and-forget -- see uploadWaveSync.ts. Never
-            // awaited and never allowed to affect the real upload path below.
-            void ensureWaveShadowSessionOpened(session);
+            // Serialize optional parent admission before this child starts bytes.
+            // Shadow failures are contained by the sync client.
+            await ensureWaveShadowSessionOpened(session);
             uploadSourceFilesRef.current = new Map(session.files.map((meta, index) => [meta.key, filesToUpload[index]]));
             uploadHandlesRef.current = keyedHandles;
             // Not awaited: the actual upload only needs uploadSourceFilesRef
@@ -4567,19 +4585,27 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (files.length === 0) {
             return;
         }
+        const parent = declareWaveSelection(files);
+        if (parent) void ensureWaveShadowSessionOpened(parent);
         for (let i = 0; i < files.length; i += MAX_FRESH_UPLOAD_BATCH_SIZE) {
-            queuedUploadBatchesRef.current.push(files.slice(i, i + MAX_FRESH_UPLOAD_BATCH_SIZE));
+            queuedUploadBatchesRef.current.push(sliceWaveSelection(files, i, i + MAX_FRESH_UPLOAD_BATCH_SIZE));
         }
         setQueuedUploadFileCount((count) => count + files.length);
     }, []);
 
     const startUploadInBatches = useCallback((files: File[]) => {
+        if (pendingUploadSessionRef.current || uploadStartInProgressRef.current) {
+            void startUpload(files);
+            return;
+        }
+        const parent = declareWaveSelection(files);
+        if (parent) void ensureWaveShadowSessionOpened(parent);
         if (files.length <= MAX_FRESH_UPLOAD_BATCH_SIZE) {
             void startUpload(files);
             return;
         }
-        const firstBatch = files.slice(0, MAX_FRESH_UPLOAD_BATCH_SIZE);
-        const remainder = files.slice(MAX_FRESH_UPLOAD_BATCH_SIZE);
+        const firstBatch = sliceWaveSelection(files, 0, MAX_FRESH_UPLOAD_BATCH_SIZE);
+        const remainder = sliceWaveSelection(files, MAX_FRESH_UPLOAD_BATCH_SIZE);
         enqueueUploadFilesInBatches(remainder);
         addNotification(
             'Large selection split into batches',

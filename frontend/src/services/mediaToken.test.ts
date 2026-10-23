@@ -15,6 +15,14 @@ const tokenResponse = (minutes = 9) => ({
     image: { baseUrl: 'https://acct.blob.core.windows.net/images', sas: 'sp=r&sr=c&sig=def' },
 });
 
+beforeEach(() => {
+    const values = new Map<string, string>();
+    const storage = { getItem: (key: string) => values.get(key) ?? null,
+        setItem: (key: string, value: string) => values.set(key, value),
+        removeItem: (key: string) => values.delete(key), clear: () => values.clear() };
+    vi.stubGlobal('localStorage', storage);
+});
+
 describe('mediaToken', () => {
     beforeEach(() => {
         getMock.mockReset();
@@ -76,4 +84,13 @@ describe('mediaToken', () => {
         const token = { baseUrl: 'https://a/b', sas: 's=1', expiresAt: futureMin(9), previewPrefix: 'preview/' };
         expect(thumbnailUrlForBlob('my photo#1.jpg', token)).toBe('https://a/b/my%20photo%231.jpg?s=1');
     });
+});
+
+it('loads versioned thumbnails directly but resolves other tiers independently', async () => {
+    getMock.mockResolvedValue(tokenResponse());
+    const token = await getMediaToken();
+    const blob = 'derived/v1/source/thumbnail/digest.jpg';
+    expect(thumbnailUrlForBlob(blob, token)).toContain('/derived/v1/source/thumbnail/digest.jpg?');
+    expect(previewUrlForBlob(blob, token)).toBe('');
+    expect(imageUrlForBlob(blob, token)).toBe('');
 });

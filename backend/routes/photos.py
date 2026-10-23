@@ -54,7 +54,8 @@ def proxy_thumbnail(filename: str):
         return app.jsonify({'error': 'Not found'}), 404
 
     # Resolve the blob name: use anonymous ID if available, fallback to original filename
-    blob_name_to_serve = app._resolve_media_blob_name(user_id, safe_name, metadata_entity)
+    physical = app._resolve_media_blob_name(user_id, safe_name, metadata_entity)
+    blob_name_to_serve = app._derivative_blob_from_metadata(metadata_entity, safe_name, 'thumbnail', physical=physical)
 
     try:
         props = app.get_media_properties('thumbnail', blob_name_to_serve)
@@ -104,8 +105,8 @@ def photo_access_url(kind: str, filename: str):
         return app.jsonify({'error': 'Invalid media kind'}), 400
     try:
         blob_name = app._blob_name_from_metadata(metadata, safe_name)
-        if kind == 'preview':
-            blob_name = app._preview_cache_blob_name(blob_name)
+        if kind in ('thumbnail', 'preview'):
+            blob_name = app._derivative_blob_from_metadata(metadata, safe_name, kind)
         url, expires_at = app._create_stable_read_sas_url(
             container,
             blob_name,
@@ -211,8 +212,8 @@ def photo_access_url_batch():
                 continue
         try:
             blob_name = app._blob_name_from_metadata(metadata, safe_name)
-            if kind == 'preview':
-                blob_name = app._preview_cache_blob_name(blob_name)
+            if kind in ('thumbnail', 'preview'):
+                blob_name = app._derivative_blob_from_metadata(metadata, safe_name, kind)
             url, expires_at = app._create_stable_read_sas_url(
                 container,
                 blob_name,
@@ -256,7 +257,7 @@ def proxy_preview(filename: str):
     # and is used elsewhere for that narrower question.
     if not app.is_video_file(safe_name):
         try:
-            cached = app._stream_cached_preview(safe_name, cache_control='private, max-age=3600', blob_name=preview_blob_name)
+            cached = app._stream_cached_preview(safe_name, cache_control='private, max-age=3600', blob_name=preview_blob_name, metadata=preview_metadata)
         except Exception:
             app.app.logger.exception('Failed to stream cached preview for %s', safe_name)
             cached = None

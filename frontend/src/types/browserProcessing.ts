@@ -39,6 +39,8 @@ export interface FilterOptions {
 type PersistedUploadFileStatus = 'pending' | 'uploading' | 'finalizing' | 'done' | 'failed';
 
 export interface PersistedUploadFile {
+    waveItemKey?: string;
+    waveAcceptedFilename?: string;
     key: string;
     name: string;
     size: number;
@@ -61,6 +63,10 @@ export interface PersistedUploadFile {
 }
 
 export interface PersistedUploadSession {
+    resumedFromSessionId?: string;
+    waveAdmissionFailed?: boolean;
+    waveOperationId?: string;
+    waveScope?: string;
     id: string;
     createdAt: number;
     files: PersistedUploadFile[];

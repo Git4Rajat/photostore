@@ -57,7 +57,8 @@ def register_routes(blueprint):
     @blueprint.route('/upload/waves/shadow/sessions', methods=['POST'])
     @endpoint
     def wave_shadow_open(store, data):
-        return store.open_session(data['sessionId'], data['declaredCount'])
+        return store.open_session(data['sessionId'], data['declaredCount'],
+                                  resumed_from=data.get('resumedFromSessionId', ''))
 
     @blueprint.route('/upload/waves/shadow/sessions/<session>/items', methods=['POST'])
     @endpoint

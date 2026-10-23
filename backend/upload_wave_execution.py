@@ -1,23 +1,24 @@
-"""Opt-in real dispatch for upload_waves.py's shadow outbox rows.
+"""Prepare isolated stage intents; live wave consumers are not implemented.
 
-Disabled by default (UPLOAD_WAVE_EXECUTION_ENABLED). Reuses index_work.
-WorkStore for durable claim/lease/renew/release/recover-on-expiry rather than
-inventing new lease machinery -- see docs/indexing-clustering-target-
-state.md step 4 ("wave execution").
-
-Scope of this module today: durably *requesting* work for an existing
-outbox row (index_work.WorkStore.request persists the intent) and
-promoting a `waiting_predecessor` successor once its predecessor is ready.
-It deliberately does NOT call WorkStore.notify()/recover() to wake a real
-queue consumer -- there is no Vision/cluster wave worker to wake yet (that
-is step 5, one-shot clustering, and the equivalent Vision-side work). Wiring
-request() through to an actual queue wakeup is follow-up work once that
-consumer exists; until then, a durable, unclaimed WorkStore row is the
-correct and complete state, not a bug.
+Enabling intent preparation does not permit live cutover or queue dispatch.
+Stage intents must never enter the index-maintenance recovery partition.
 """
 import os
 
+from index_work import WorkStore
+
+STAGE_PARTITION = 'upload-wave-stage-pending'
 MAX_SWEEP_PAGES = 50
+
+
+def stage_work_store(table, **kwargs):
+    return WorkStore(table, partition=STAGE_PARTITION, **kwargs)
+
+
+def live_consumers_available():
+    # Replace with a validated durable cutover/capability protocol when the
+    # real Vision/cluster/index consumers and source fencing are implemented.
+    return False
 
 
 def execution_enabled():
@@ -25,18 +26,31 @@ def execution_enabled():
 
 
 def dispatch_outbox(work_store, store, library, outbox_key, destination):
-    """Durably requests real work for an existing shadow outbox row, then
-    marks it dispatchable. Returns True only the first time it actually
-    does that for this outbox -- False when execution is disabled, the
+    """Prepare an isolated intent for an eligible outbox, without queue send.
+
+    The historical dispatchable flag records preparation, not a live claim.
+    Returns True for a new preparation; False when execution is disabled, the
     outbox row doesn't exist yet, or it was already dispatched (so a caller
-    like sweep_library can tell "newly dispatched" from "nothing to do").
+    like sweep_library can distinguish a new preparation from a replay).
     """
     if not execution_enabled():
         return False
+    if work_store.partition != STAGE_PARTITION:
+        raise ValueError('Wave stage intents require an isolated work partition')
+    if library != store.library:
+        raise ValueError('Wave library identity mismatch')
     outbox = store._get(outbox_key)
     if outbox is None or outbox.get('dispatchable'):
         return False
-    scope = f'wave-{destination}:{outbox["waveId"]}'
+    if destination not in ('vision', 'cluster') or outbox.get('destination') != destination:
+        raise ValueError('Wave stage destination mismatch')
+    wave = store._required(store.wave_key(outbox['waveId']))
+    if not store.outbox_eligible(wave, outbox):
+        return False
+    # Closing a reopened intake creates a new revision-specific intent, not
+    # an alias of a possibly leased, obsolete Vision release.
+    from upload_waves import digest
+    scope = f'wave-{destination}:{outbox["waveId"]}:{digest(outbox_key)}'
     work_store.request(library, scope, advance=False)
     store.set_dispatchable(outbox_key, dispatchable=True)
     return True

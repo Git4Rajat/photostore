@@ -344,3 +344,19 @@ def test_api_exposes_bounded_evaluation_progress_until_last_page(api):
     second = client.post(ROOT + '/' + wave + '/evaluate', json={})
     assert second.json['scanInProgress'] is False and second.json['state'] == 'ready'
     assert second.json['scannedSessions'] == 21
+
+
+def test_reconcile_retries_source_completion_delivery_without_running_stage_work(source_world, monkeypatch):
+    from fakes import FakeTable
+    from processing_completion import prepare_completion
+    store, table, wave, member = source_world
+    metadata = FakeTable()
+    row = dict(table.rows['library-A', 'original.jpg'], processingRevision=member['processingRevision'],
+              processingGeneration='f' * 64)
+    prepare_completion(row); metadata.upsert_entity(row)
+    monkeypatch.setenv('UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED', 'true')
+    reconcile_page(store, wave, metadata, table, lambda *a: [])
+    assert metadata.get_entity('library-A', 'original.jpg')['processingCompletionPending'] == ''
+    received = store._page('source-completion!')
+    assert len(received) == 1 and received[0]['completionQualified'] is False
+    assert not any(row.get('dispatchable') for row in table.rows.values())

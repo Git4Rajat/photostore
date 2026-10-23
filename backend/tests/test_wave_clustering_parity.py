@@ -111,3 +111,46 @@ def test_canonical_order_matches_oracle_ordering():
     faces = {face_id: h.faces.rows['u', face_id] for face_id in ids}
     from clustering_reference_oracle import canonical_work
     assert tuple(canonical_order(faces)) == canonical_work(h, ids)
+
+
+@pytest.mark.parametrize('change', ['vector', 'chunk_size', 'library', 'added_face'])
+def test_resume_rejects_changed_frozen_input_before_assignment(change):
+    h, ids = seeded()
+    members, rows = manifest(h, ids)
+    journal = ClusteringJournal(EtagTable(), 'wave-1')
+    run_wave_assignment('u', h.assigner, journal, members, rows, chunk_size=3)
+    import copy
+    rows = copy.deepcopy(rows)
+    members = copy.deepcopy(members)
+    chunk_size, library = 3, 'u'
+    if change == 'vector':
+        rows[ids[0]]['embedding'] = '[0,1,0]'
+    elif change == 'chunk_size':
+        chunk_size = 2
+    elif change == 'library':
+        library = 'different-library'
+    else:
+        rows['new-face'] = dict(rows[ids[0]])
+        members[rows['new-face']['filename']].append('new-face')
+    before = assignment_snapshot(h)
+    with pytest.raises(RuntimeError, match='Frozen wave input'):
+        run_wave_assignment(library, h.assigner, journal, members, rows, chunk_size=chunk_size)
+    assert assignment_snapshot(h) == before
+
+
+@pytest.mark.parametrize('change', ['missing', 'extra', 'wrong_filename', 'duplicate'])
+def test_frozen_manifest_must_exactly_match_assignment_inputs(change):
+    h, ids = seeded()
+    members, rows = manifest(h, ids)
+    if change == 'missing':
+        rows.pop(ids[0])
+    elif change == 'extra':
+        rows['foreign-face'] = dict(rows[ids[0]])
+    elif change == 'wrong_filename':
+        rows[ids[0]] = dict(rows[ids[0]], filename='other.jpg')
+    else:
+        members[rows[ids[0]]['filename']].append(ids[0])
+    table = EtagTable()
+    with pytest.raises(ValueError):
+        run_wave_assignment('u', h.assigner, ClusteringJournal(table, 'wave-1'), members, rows)
+    assert not table.rows

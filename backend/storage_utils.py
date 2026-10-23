@@ -90,7 +90,7 @@ PHOTO_LIST_SELECT_FIELDS = [
     'preview_status', 'thumbnail_status', 'exif_status', 'ocr_status',
     'face_status', 'ai_vision_status', 'map_detection_status',
     'processing_lease_owner', 'processing_lease_expires_at',
-    'anonymousImageId', 'processing_state', 'deletedAt',
+    'anonymousImageId', 'thumbnailArtifact', 'previewArtifact', 'processing_state', 'deletedAt',
     'uploadDate', 'upload_started_at', 'last_processing_update', 'clientLastModified',
 ]
 SUSPICIOUS_FACE_CONFIDENCE = float(os.getenv('SUSPICIOUS_FACE_CONFIDENCE', '0.60'))
@@ -376,7 +376,7 @@ _VECTOR_INDEX_RELEVANT_FIELDS = {
 _SORT_INDEX_RELEVANT_FIELDS = {
     'rating', 'likes', 'likedBy', 'rotation', 'tags', 'peopleIds',
     'processing_metadata', 'processing_state', 'anonymousImageId',
-    'preview_status', 'thumbnail_status', 'exif_status', 'ocr_status',
+    'preview_status', 'thumbnail_status', 'thumbnailArtifact', 'previewArtifact', 'exif_status', 'ocr_status',
     'face_status', 'ai_vision_status', 'map_detection_status',
     'exifData', 'clientLastModified', 'uploadDate', 'tagMetadata',
     'address', 'locationCity', 'locationCountry', 'locationRegion',
@@ -540,6 +540,8 @@ def configure_storage(
     queue_map_on_upload: bool = False,
     face_summary_lookup=None,
     face_summary_cache_writer=None,
+    source_completion_delivery=None,
+    source_artifact_receipt_capture=None,
 ) -> None:
     _CTX['metadata_table_client'] = metadata_table_client
     _CTX['face_table_client'] = face_table_client
@@ -565,6 +567,8 @@ def configure_storage(
     # read or republish whole-user summaries; writes invalidate via the client.
     _CTX['face_summary_lookup'] = face_summary_lookup
     _CTX['face_summary_cache_writer'] = face_summary_cache_writer
+    _CTX['source_completion_delivery'] = source_completion_delivery
+    _CTX['source_artifact_receipt_capture'] = source_artifact_receipt_capture
 
 
 def _require_context() -> None:
@@ -899,7 +903,7 @@ def metadata_index_kinds(updates):
     sort_fields = _SORT_INDEX_RELEVANT_FIELDS - {'address', 'locationCity', 'locationCountry', 'locationRegion'}
     if fields.intersection(sort_fields):
         kinds.add('sort')
-    if fields.intersection({'anonymousImageId', 'thumbnail_status', 'preview_status'}):
+    if fields.intersection({'anonymousImageId', 'thumbnail_status', 'preview_status', 'thumbnailArtifact', 'previewArtifact'}):
         kinds.add('access')
     if fields.intersection(_VECTOR_META_COLUMNS):
         kinds.add('vector')
@@ -972,6 +976,20 @@ def publish_metadata_index_intent(user_id, filename, entity):
         return False
 
 
+def publish_source_completion_intent(user_id, filename, entity):
+    from processing_completion import completion_capture_enabled, relay_completion
+    deliver = _CTX.get('source_completion_delivery')
+    if not completion_capture_enabled() or not deliver or not json.loads(entity.get('processingCompletionOutbox') or '[]'):
+        return False
+    try:
+        return relay_completion(_CTX['metadata_table_client'], user_id, filename,
+                                lambda intent: deliver(user_id, intent))
+    except Exception:
+        # Result commit already succeeded. Retain outbox evidence for recovery.
+        _LOGGER.warning('Source completion intent retained user=%s file=%s', user_id, filename, exc_info=True)
+        return False
+
+
 def _update_metadata_fields(user_id: str, filename: str, updates: Dict) -> Dict:
     _require_context()
     metadata_table_client = _CTX['metadata_table_client']
@@ -995,12 +1013,16 @@ def _update_metadata_fields(user_id: str, filename: str, updates: Dict) -> Dict:
         prepare_metadata_index_intent(entity, changed)
         entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
         entity['processing_complete'] = complete
+        from processing_completion import completion_capture_enabled, prepare_completion
+        if completion_capture_enabled():
+            prepare_completion(entity)
         try:
             # Conditional on the etag just read -- a concurrent writer (another
             # processing step, a user edit, a lease race) between our get_entity
             # above and this write now loses this attempt instead of silently
             # clobbering it, and gets retried against a fresh read.
             metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
+            publish_source_completion_intent(user_id, filename, entity)
             if DURABLE_INDEX_UPDATES:
                 publish_metadata_index_intent(user_id, filename, entity)
             elif metadata_updates_affect_search_indexes(updates):
@@ -1237,6 +1259,11 @@ def _begin_face_filename_write(user_id: str, filename: str):
             'leaseExpiresAt': (datetime.now(timezone.utc) + timedelta(
                 seconds=_FACE_FILENAME_LEASE_SECONDS)).isoformat(),
         }
+        from processing_fence import current_fence
+        fence = current_fence(user_id, filename)
+        if fence:
+            fence.check()
+            entity.update(fence.headers())
         try:
             if previous is None:
                 table.create_entity(entity)
@@ -1276,6 +1303,11 @@ def _finish_face_filename_write(user_id: str, filename: str, generation: str,
                   faceIds=json.dumps(sorted(set(face_ids or []))), leaseExpiresAt='')
     if face_ids is not None and extra:
         entity.update(extra)
+    from processing_fence import current_fence
+    fence = current_fence(user_id, filename)
+    if fence:
+        fence.check()
+        entity.update(fence.headers())
     table.update_entity(entity, mode=UpdateMode.REPLACE,
                         etag=_face_filename_etag(current),
                         match_condition=MatchConditions.IfNotModified)
@@ -1291,6 +1323,10 @@ def _renew_face_filename_write(user_id: str, filename: str, generation: str) -> 
             or current.get('state') != 'writing'
             or not _face_filename_lease_active(current)):
         raise FaceFilenameLookupRetryableError('Filename face writer lost its lease')
+    from processing_fence import current_fence
+    fence = current_fence(user_id, filename)
+    if fence:
+        fence.check()
     etag = _face_filename_etag(current)
     now = datetime.now(timezone.utc)
     try:
@@ -1504,6 +1540,9 @@ def _store_client_face_entities(user_id: str, filename: str, faces, *, force_rec
     generation = None
     outcome = 'error'
     try:
+        from processing_fence import current_fence
+        if force_reconcile and current_fence(user_id, filename):
+            raise FaceFilenameLookupRetryableError('Fenced destructive face reconciliation is not yet supported')
         generation, previous_ids = _begin_face_filename_write(user_id, filename)
         _face_storage_phase(diagnostics, 'prepare')
         diagnostics.update(path='indexed_point_reads' if previous_ids is not None else 'filename_query',
@@ -1721,7 +1760,8 @@ def _store_client_face_generation(user_id: str, filename: str, faces, *,
         _renew_face_filename_write(user_id, filename, generation)
         _extract_and_store_face_embedding(user_id, face_id, entity, strict=True)
         _renew_face_filename_write(user_id, filename, generation)
-        face_table_client.upsert_entity(entity)
+        from processing_fence import write_artifact
+        write_artifact(face_table_client, entity, previous=existing, previous_known=True)
         stored_ids.append(face_id)
         if diagnostics is not None:
             diagnostics['stored_face_count'] = len(stored_ids)
@@ -5082,7 +5122,7 @@ _SORT_INDEX_SOURCE_FIELDS = [
     'PartitionKey', 'RowKey', 'processing_state',
     'rating', 'likes', 'uploadDate',
     'exifData', 'clientLastModified', 'upload_started_at', 'last_processing_update',
-    'anonymousImageId', 'thumbnail_status',
+    'anonymousImageId', 'thumbnail_status', 'thumbnailArtifact', 'previewArtifact',
     'likedBy', 'rotation', 'tags', 'tagMetadata', 'peopleIds', 'processing_metadata',
     'preview_status', 'exif_status', 'ocr_status', 'face_status',
     'ai_vision_status', 'map_detection_status',
@@ -5230,6 +5270,7 @@ def _serialize_sort_index(snapshot: LexicalIndexSnapshot) -> bytes:
 
 
 def _sort_index_row(entity: Dict) -> Optional[Dict[str, object]]:
+    from processing_artifacts import derivative_blob
     filename = str(entity.get('RowKey') or '').strip()
     if not filename:
         return None
@@ -5256,7 +5297,7 @@ def _sort_index_row(entity: Dict) -> Optional[Dict[str, object]]:
         # thumbnail_status/preview_status=='done': the client attempts the
         # blob directly and treats a 404 as "still generating" instead of
         # asking this index whether it's ready first.
-        'thumb': str(entity.get('anonymousImageId') or filename),
+        'thumb': derivative_blob(entity, 'thumbnail', str(entity.get('anonymousImageId') or filename)),
         'gallery': {
             'liked': str(entity.get('PartitionKey') or '') in _json_list(entity.get('likedBy')),
             'rotation': rotation(entity.get('rotation')),
@@ -5714,7 +5755,7 @@ _ACCESS_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
 # other derived index here, this one never filters on it, so there's nothing
 # to select it for.
 _ACCESS_INDEX_SOURCE_FIELDS = [
-    'PartitionKey', 'RowKey', 'anonymousImageId', 'thumbnail_status', 'preview_status',
+    'PartitionKey', 'RowKey', 'anonymousImageId', 'thumbnail_status', 'preview_status', 'thumbnailArtifact', 'previewArtifact',
 ]
 
 
@@ -5855,6 +5896,7 @@ def _access_index_row(entity: Dict) -> Optional[Dict[str, object]]:
         'blobName': str(entity.get('anonymousImageId') or '').strip(),
         'thumbnailStatus': str(entity.get('thumbnail_status') or '').strip(),
         'previewStatus': str(entity.get('preview_status') or '').strip(),
+        **{key: entity[key] for key in ('thumbnailArtifact', 'previewArtifact') if entity.get(key)},
     }
 
 
@@ -6083,7 +6125,7 @@ def lookup_access_entries(user_id: str, filenames) -> Optional[Dict[str, Dict[st
         if snapshot is None:
             return None
         compact = {
-            str(row['RowKey']): (str(row.get('blobName') or ''), str(row.get('thumbnailStatus') or ''), str(row.get('previewStatus') or ''))
+            str(row['RowKey']): (str(row.get('blobName') or ''), str(row.get('thumbnailStatus') or ''), str(row.get('previewStatus') or ''), row.get('thumbnailArtifact'), row.get('previewArtifact'))
             for row in snapshot.rows if row.get('RowKey')
         }
         del snapshot
@@ -6095,7 +6137,9 @@ def lookup_access_entries(user_id: str, filenames) -> Optional[Dict[str, Dict[st
     for name in filenames:
         entry = table.get(name)
         if entry is not None:
-            out[name] = {'anonymousImageId': entry[0], 'thumbnail_status': entry[1], 'preview_status': entry[2]}
+            out[name] = {'anonymousImageId': entry[0], 'thumbnail_status': entry[1], 'preview_status': entry[2],
+                         **({'thumbnailArtifact': entry[3]} if entry[3] else {}),
+                         **({'previewArtifact': entry[4]} if entry[4] else {})}
     return out
 
 
@@ -8875,6 +8919,20 @@ def _apply_browser_exiftool_result(
     return status_updates
 
 
+def _publish_processing_derivative(metadata, kind, data=None, *, staged=False, filename=None, content_type=None):
+    import sys
+    from processing_fence import current_fence
+    if current_fence():
+        current_fence(metadata['PartitionKey'], metadata['RowKey'])
+        from processing_artifacts import publish
+        return publish(sys.modules[__name__], metadata, kind, data=data, staged=staged)
+    physical = str(metadata.get('anonymousImageId') or '').strip() or metadata.get('RowKey') or filename
+    name = physical if kind == 'thumbnail' else f'preview/{physical}.jpg'
+    if data is not None:
+        upload_media_file('thumbnail', name, data, content_type or 'image/jpeg')
+    return None
+
+
 def _apply_server_thumbnail_fallback(
     user_id: str,
     filename: str,
@@ -8901,7 +8959,7 @@ def _apply_server_thumbnail_fallback(
         status_updates['thumbnail_status'] = 'failed'
         return status_updates
     thumbnail_blob_name = str(metadata.get('anonymousImageId') or '').strip() or filename
-    upload_media_file('thumbnail', thumbnail_blob_name, thumbnail_bytes, 'image/jpeg')
+    _publish_processing_derivative(metadata, 'thumbnail', thumbnail_bytes, filename=filename)
     mark_step_done(user_id, filename, 'thumbnail', result={
         'source': 'server',
         'reason': fallback_for,
@@ -8936,7 +8994,7 @@ def _apply_server_preview_fallback(
         return status_updates
     thumbnail_blob_name = str(metadata.get('anonymousImageId') or '').strip() or filename
     preview_blob_name = f'preview/{thumbnail_blob_name}.jpg'
-    upload_media_file('thumbnail', preview_blob_name, preview_bytes, 'image/jpeg')
+    _publish_processing_derivative(metadata, 'preview', preview_bytes, filename=filename)
     mark_step_done(user_id, filename, 'preview', result={
         'source': 'server',
         'reason': fallback_for,
@@ -9101,12 +9159,19 @@ def _apply_client_processing_results(
     # the image; fall back to the original filename for pre-anonymization photos.
     thumbnail_blob_name = str(metadata.get('anonymousImageId') or '').strip() or filename
     thumbnail_payload = payload.get('thumbnail')
+    from processing_fence import current_fence
+    fenced_derivatives = current_fence(user_id, filename) is not None
+    if fenced_derivatives and thumbnail_already_uploaded and not had_thumbnail_before:
+        _publish_processing_derivative(metadata, 'thumbnail', staged=True)
     thumbnail_verification_failed = False
     if isinstance(thumbnail_payload, dict) and thumbnail_payload.get('alreadyUploaded') and not had_thumbnail_before:
         import sys
         from benchmark_upload import verify_jpeg
         try:
-            verify_jpeg(sys.modules[__name__], thumbnail_blob_name, byte_cap=512_000, edge_cap=120)
+            if fenced_derivatives:
+                _publish_processing_derivative(metadata, 'thumbnail', staged=True)
+            else:
+                verify_jpeg(sys.modules[__name__], thumbnail_blob_name, byte_cap=512_000, edge_cap=120)
             thumbnail_already_uploaded = True
         except Exception as exc:
             from upload_preparation_diagnostics import rejection_reason
@@ -9139,7 +9204,10 @@ def _apply_client_processing_results(
         # incident). Verify before trusting it; self-heal via the same
         # fallback path used for an explicit failure report if it's missing.
         try:
-            get_media_properties('thumbnail', thumbnail_blob_name)
+            if fenced_derivatives:
+                _publish_processing_derivative(metadata, 'thumbnail', staged=True)
+            else:
+                get_media_properties('thumbnail', thumbnail_blob_name)
         except Exception:
             source_bytes = _try_get_image_bytes(get_image_bytes)
             if source_bytes is not None:
@@ -9168,7 +9236,8 @@ def _apply_client_processing_results(
             try:
                 thumbnail_bytes = base64.b64decode(thumbnail_data)
                 if thumbnail_bytes:
-                    upload_media_file('thumbnail', thumbnail_blob_name, thumbnail_bytes, str(thumbnail_payload.get('contentType') or 'image/jpeg'))
+                    _publish_processing_derivative(metadata, 'thumbnail', thumbnail_bytes, filename=filename,
+                                                   content_type=str(thumbnail_payload.get('contentType') or 'image/jpeg'))
                     thumbnail_already_uploaded = True
             except Exception:
                 pass
@@ -9226,7 +9295,10 @@ def _apply_client_processing_results(
         from benchmark_upload import verify_jpeg
         import sys
         try:
-            verify_jpeg(sys.modules[__name__], preview_blob_name, byte_cap=1_500_000, edge_cap=2048)
+            if fenced_derivatives:
+                _publish_processing_derivative(metadata, 'preview', staged=True)
+            else:
+                verify_jpeg(sys.modules[__name__], preview_blob_name, byte_cap=1_500_000, edge_cap=2048)
             preview_already_uploaded = True
         except Exception as exc:
             from upload_preparation_diagnostics import rejection_reason
@@ -9247,7 +9319,8 @@ def _apply_client_processing_results(
             try:
                 preview_bytes = base64.b64decode(preview_data)
                 if preview_bytes:
-                    upload_media_file('thumbnail', preview_blob_name, preview_bytes, str(preview_payload.get('contentType') or 'image/jpeg'))
+                    _publish_processing_derivative(metadata, 'preview', preview_bytes, filename=filename,
+                                                   content_type=str(preview_payload.get('contentType') or 'image/jpeg'))
                     preview_already_uploaded = True
             except Exception:
                 pass
@@ -9985,6 +10058,8 @@ def apply_client_processing_results_for_file(
     origin: str = 'browser',
     claimed_steps: Optional[List[str]] = None,
     lease_owner: Optional[str] = None,
+    expected_processing_revision: Optional[str] = None,
+    expected_processing_fence: Optional[str] = None,
 ) -> Dict:
     """Validate and apply late processing results to an existing asset.
 
@@ -10003,7 +10078,27 @@ def apply_client_processing_results_for_file(
     metadata = timed_call('metadata_read', metadata_table_client.get_entity, partition_key=user_id, row_key=filename)
     if str(metadata.get('processing_state') or '').strip().lower() == 'deleted':
         raise RuntimeError('Photo has been deleted.')
-    consolidated = origin == 'ipworker'
+    from processing_completion import check_revision, StaleProcessingResult
+    check_revision(metadata, expected_processing_revision)
+    if expected_processing_fence is not None and (
+            not expected_processing_revision or not expected_processing_fence
+            or metadata.get('processingFence') != expected_processing_fence):
+        raise StaleProcessingResult('Processing artifact attempt token changed or missing.')
+    if expected_processing_revision is not None:
+        from processing_completion import StaleProcessingResult
+        if not lease_owner or _metadata_lease_owner(metadata) != lease_owner or _processing_is_expired(metadata):
+            raise StaleProcessingResult('Processing result lease is no longer owned.')
+    from processing_fence import ResultFence, result_fence
+    from processing_completion import completion_capture_enabled
+    artifact_fence = None
+    if expected_processing_revision is not None and completion_capture_enabled():
+        if not expected_processing_fence or metadata.get('processingFence') != expected_processing_fence:
+            raise StaleProcessingResult('Processing artifact attempt token changed or missing.')
+        artifact_fence = ResultFence(metadata_table_client, user_id, filename,
+            expected_processing_revision, expected_processing_fence, lease_owner,
+            str(metadata.get('anonymousImageId') or ''),
+            generation=str(metadata.get('processingGeneration') or ''))
+    consolidated = origin == 'ipworker' or expected_processing_revision is not None
     baseline = metadata
     if consolidated:
         if lease_owner is None:
@@ -10039,10 +10134,13 @@ def apply_client_processing_results_for_file(
 
     exif_baseline = {key: metadata.get(key) for key in _EXIF_RESULT_FIELDS}
     batch = []
+    apply_completed = False
+    if artifact_fence:
+        metadata['artifactReceipt'] = ''
     try:
         # Workers own the final status flush; browser callers retain the
         # separate on-exit flush, including partial progress on exceptions.
-        with batched_processing_status_updates(user_id, filename, flush=not consolidated) as batch:
+        with result_fence(artifact_fence), batched_processing_status_updates(user_id, filename, flush=not consolidated) as batch:
             options = {'persist_result': False} if consolidated else {}
             _apply_client_processing_results(
                 user_id,
@@ -10057,12 +10155,26 @@ def apply_client_processing_results_for_file(
                 claimed_steps=claimed_steps,
                 **options,
             )
+            apply_completed = True
+            if artifact_fence and _CTX.get('source_artifact_receipt_capture'):
+                candidate = dict(metadata)
+                _apply_processing_status_updates(candidate, batch)
+                receipt = _CTX['source_artifact_receipt_capture'](user_id, candidate)
+                if receipt:
+                    metadata['artifactReceipt'] = json.dumps(receipt, sort_keys=True, separators=(',', ':'))
     except Exception as exc:
         if consolidated:
+            partial_updates = batch
+            if artifact_fence and not apply_completed:
+                # Aggregate result fields were not completed. Do not publish
+                # done statuses without their corresponding output fields.
+                incomplete = set(claimed_steps if claimed_steps is not None else BROWSER_PROCESSING_STEPS)
+                partial_updates = [update for update in batch if update['step'] not in incomplete]
             try:
                 timed_call('persistence', _commit_worker_processing_results,
-                           user_id, filename, baseline, dict(baseline), batch, lease_owner,
-                           failed_steps=claimed_steps, error=str(exc))
+                           user_id, filename, baseline, metadata if apply_completed else dict(baseline), partial_updates, lease_owner,
+                           failed_steps=claimed_steps, error=str(exc),
+                           require_unexpired=expected_processing_revision is not None)
             except Exception:
                 _LOGGER.warning('Worker partial-status commit failed')
         else:
@@ -10070,7 +10182,8 @@ def apply_client_processing_results_for_file(
         raise
     if consolidated:
         return timed_call('persistence', _commit_worker_processing_results,
-                          user_id, filename, baseline, metadata, batch, lease_owner)
+                          user_id, filename, baseline, metadata, batch, lease_owner,
+                          require_unexpired=expected_processing_revision is not None)
     exif_updates = {key: metadata.get(key) for key in _EXIF_RESULT_FIELDS
                     if metadata.get(key) != exif_baseline[key]}
     timed_call('persistence', refresh_metadata_entity, user_id, filename, {
@@ -10082,21 +10195,43 @@ def apply_client_processing_results_for_file(
     return metadata
 
 
+def qualify_completed_processing(user_id, filename, lease):
+    """Retry artifact capture/delivery for terminal results without rerunning models."""
+    from processing_fence import ResultFence, result_fence
+    from processing_completion import check_revision, StaleProcessingResult
+    current = _CTX['metadata_table_client'].get_entity(user_id, filename)
+    claimed = lease['entity']
+    check_revision(current, claimed['processingRevision'])
+    if current.get('processingFence') != claimed.get('processingFence'):
+        raise StaleProcessingResult('Processing artifact attempt changed')
+    fence = ResultFence(_CTX['metadata_table_client'], user_id, filename, claimed['processingRevision'],
+        claimed['processingFence'], lease['ownerId'], claimed['anonymousImageId'],
+        generation=str(claimed.get('processingGeneration') or ''))
+    with result_fence(fence):
+        fence.check()
+        reference = _CTX['source_artifact_receipt_capture'](user_id, dict(current))
+        if reference is None:
+            raise ValueError('Processing outputs are not terminal')
+        result = dict(current, artifactReceipt=json.dumps(reference, sort_keys=True, separators=(',', ':')))
+        return _commit_worker_processing_results(user_id, filename, current, result, [], lease['ownerId'], require_unexpired=True)
+
+
 def _metadata_lease_owner(entity: Dict) -> str:
     return str(entity.get('processing_lease_owner') or entity.get('processing_lease') or '').strip()
 
 
 def _check_result_lease(entity: Dict, owner: str) -> None:
+    from processing_completion import StaleProcessingResult
     if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
-        raise RuntimeError('Photo has been deleted.')
+        raise StaleProcessingResult('Photo has been deleted.')
     if entity.get('processingIsolated') is True:
-        raise RuntimeError('Photo is isolated from processing.')
+        raise StaleProcessingResult('Photo is isolated from processing.')
     if _metadata_lease_owner(entity) != owner:
-        raise RuntimeError('Processing result lease owner changed.')
+        raise StaleProcessingResult('Processing result lease owner changed.')
 
 
 def _commit_worker_processing_results(user_id, filename, baseline, result, updates, owner,
-                                      *, failed_steps=None, error=None):
+                                      *, failed_steps=None, error=None, require_unexpired=False):
     """CAS only this attempt's delta, statuses and release in one row write.
 
     External face/embedding/blob work is never replayed on conflict. The first
@@ -10117,15 +10252,25 @@ def _commit_worker_processing_results(user_id, filename, baseline, result, updat
     try:
         for attempt in range(_METADATA_UPDATE_MAX_RETRIES):
             _check_result_lease(current, owner)
-            # processingRevision is additive (storage_utils.finalize_uploaded_file
-            # stamps it once, immutably); rows written before it existed read as
-            # None on both sides and this check is a no-op for them. Folded into
-            # the same existing source-changed guard rather than a new kwarg --
-            # a real future reprocess/reupload would change this field exactly
-            # like anonymousImageId/fileHash do today.
+            if require_unexpired and _processing_is_expired(current):
+                from processing_completion import StaleProcessingResult
+                raise StaleProcessingResult('Processing result lease expired before commit.')
+            # processingRevision/processingGeneration are additive
+            # (storage_utils.finalize_uploaded_file/claim_processing_lease
+            # stamp them once, immutably per generation); rows written
+            # before they existed read as None on both sides and this check
+            # is a no-op for them. Folded into the same existing
+            # source-changed guard rather than a new kwarg -- a real
+            # reprocess/reupload or a forced-reprocess supersession changes
+            # these fields exactly like anonymousImageId/fileHash do today.
+            # processingGeneration specifically catches a result computed
+            # under a now-superseded model/required-step contract (see
+            # processing_generation.py) landing after that contract moved on.
             if any(current.get(key) != baseline.get(key)
-                   for key in ('anonymousImageId', 'fileHash', 'processingRevision')):
-                raise RuntimeError('Processing source changed during result application.')
+                   for key in ('anonymousImageId', 'fileHash', 'processingRevision',
+                               'processingFence', 'processingGeneration')):
+                from processing_completion import StaleProcessingResult
+                raise StaleProcessingResult('Processing source changed during result application.')
             touched_steps = {key[:-7] for key in fields if key.endswith('_status')}
             touched_steps.update(update['step'] for update in updates)
             if any(_step_locked_done(current, step) and not _step_locked_done(baseline, step)
@@ -10150,6 +10295,17 @@ def _commit_worker_processing_results(user_id, filename, baseline, result, updat
                 entity['last_error'] = f'processing_failed_before_status_commit: {error}'[:1000]
             entity.update(processing_lease_owner='', processing_lease='', processing_lease_expires_at='')
             entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
+            from processing_completion import completion_capture_enabled, prepare_completion
+            if completion_capture_enabled():
+                from processing_artifacts import validate_receipt
+                for kind in ('thumbnail', 'preview'):
+                    if entity.get(kind + '_status') == 'done':
+                        try:
+                            validate_receipt(entity, kind)
+                        except (ValueError, KeyError, TypeError):
+                            entity[kind + '_status'] = 'failed'
+                            entity['last_error'] = 'missing_or_invalid_' + kind + '_artifact_receipt'
+                prepare_completion(entity)
             entity['processing_complete'] = _photo_processing_complete(entity)
             try:
                 writes += 1
@@ -10163,6 +10319,7 @@ def _commit_worker_processing_results(user_id, filename, baseline, result, updat
                 reads += 1
                 current = table.get_entity(partition_key=user_id, row_key=filename)
                 continue
+            publish_source_completion_intent(user_id, filename, entity)
             outcome = 'partial' if error is not None else 'success'
             with processing_diagnostics.apply_phase(user_id, filename, 'index_dirty'):
                 touch_user_search_indexes_state(user_id, filenames=filename)
@@ -10250,16 +10407,22 @@ def finalize_uploaded_file(
     # without an uploadDate. Persist one here so the gallery has a stable
     # "recently uploaded" sort key instead of falling back to a volatile field.
     metadata.setdefault('uploadDate', datetime.now(timezone.utc).isoformat())
+    previous_source = (metadata.get('fileHash'), metadata.get('anonymousImageId'))
     metadata['fileHash'] = file_hash
     metadata['mimeType'] = content_type
-    # Immutable source-owned processing generation, stamped once at the same
-    # point fileHash/anonymousImageId are set. Never rewritten for the life
-    # of this photo identity; a real reprocess/reupload gets a fresh
-    # revision at its own finalize. Additive: nothing reads this yet except
-    # upload_wave_shadow.py's opt-in evidence qualification and the optional
-    # expected_processing_revision fencing kwarg below -- every existing
-    # caller that omits it is unaffected.
-    metadata.setdefault('processingRevision', uuid.uuid4().hex)
+    # Keep finalize retries on the same generation, but fence results computed
+    # for replaced bytes or a different physical photo at this filename.
+    next_source = (file_hash, anonymous_blob_name or metadata.get('anonymousImageId'))
+    if not metadata.get('processingRevision') or previous_source != next_source:
+        from processing_generation import allocate_generation
+        new_revision = uuid.uuid4().hex
+        # Ordinary (non-anonymized) uploads have no anonymousImageId; the
+        # filename itself is the physical photo identity then -- same
+        # fallback used throughout this module (e.g. source_blob above).
+        metadata.update(allocate_generation(new_revision, photo_id=next_source[1] or final_filename,
+            file_hash=next_source[0], is_video=is_video))
+        metadata['artifactReceipt'] = ''
+        metadata['processingCompletionPending'] = ''
     apply_upload_hash_result(metadata, file_hash)
     metadata.setdefault('peopleIds', json.dumps([]))
 
@@ -10551,6 +10714,7 @@ def claim_processing_lease(
     lease_seconds: int = CLIENT_PROCESSING_LEASE_SECONDS,
     steps: Optional[List[str]] = None,
     mark_running: bool = True,
+    expected_processing_fence: Optional[str] = None,
 ) -> Dict:
     """Claim (or renew) the processing lease on a photo.
 
@@ -10581,6 +10745,11 @@ def claim_processing_lease(
 
         lease_expired = _processing_is_expired(entity)
         current_owner = str(entity.get('processing_lease_owner') or '').strip()
+        if expected_processing_fence is not None and (
+                not expected_processing_fence or entity.get('processingFence') != expected_processing_fence
+                or current_owner != owner_id or lease_expired):
+            from processing_completion import StaleProcessingResult
+            raise StaleProcessingResult('Processing heartbeat attempt expired or changed.')
         if current_owner and current_owner != owner_id and not lease_expired:
             raise RuntimeError('Processing lease is already held by another client.')
 
@@ -10593,6 +10762,24 @@ def claim_processing_lease(
                 if current_status not in {'done', 'no_data', 'deleted', 'skipped', 'unsupported'}:
                     entity[field] = 'running'
 
+        if lease_expired or current_owner != owner_id or not entity.get('processingFence'):
+            # A fresh attempt token only -- the generation/contract below are
+            # deliberately untouched by a renewal, retry or new attempt on
+            # the SAME revision; only finalize's source-change branch (or an
+            # explicit forced reprocess) may allocate a new one.
+            entity['processingFence'] = uuid.uuid4().hex
+        entity.setdefault('processingRevision', uuid.uuid4().hex)
+        if not entity.get('processingGeneration') and entity.get('fileHash'):
+            # Defensive backfill for a row that predates this field (mirrors
+            # processingRevision's own setdefault above) -- never
+            # overwrites an already-allocated generation. A row with no
+            # fileHash yet (not finalized) has no source identity to bind;
+            # finalize allocates the generation once that identity exists.
+            from processing_generation import allocate_generation
+            entity.update(allocate_generation(entity['processingRevision'],
+                photo_id=str(entity.get('anonymousImageId') or '').strip() or filename,
+                file_hash=entity['fileHash'], is_video=is_video_file(filename)))
+        entity['processingCompletionPending'] = ''
         entity['processing_lease_owner'] = owner_id
         entity['processing_lease'] = owner_id
         entity['processing_lease_expires_at'] = expires_at.isoformat()
@@ -10612,6 +10799,9 @@ def claim_processing_lease(
     return {
         'filename': filename,
         'ownerId': owner_id,
+        'processingRevision': entity.get('processingRevision', ''),
+        'processingGeneration': entity.get('processingGeneration', ''),
+        'processingFence': entity.get('processingFence', ''),
         'leaseExpiresAt': entity.get('processing_lease_expires_at', ''),
         'statuses': {f'{step}Status': entity.get(f'{step}_status', 'pending') for step in PROCESSING_STEPS},
         # The full row this call already paid for, exactly as left after the
@@ -10626,9 +10816,57 @@ def claim_processing_lease(
     }
 
 
-def heartbeat_processing_lease(user_id: str, filename: str, owner_id: str, *, lease_seconds: int = CLIENT_PROCESSING_LEASE_SECONDS) -> Dict:
+def supersede_processing_generation(user_id: str, filename: str) -> Dict:
+    """Explicit forced-reprocess entry point: allocates a fresh processing
+    generation/contract for this exact photo/source and resets every
+    required step for its media type to pending, clearing any in-flight
+    lease/attempt/artifact-receipt pointer.
+
+    An in-flight result already computed under the superseded generation is
+    not actively cancelled -- it is safely rejected by
+    _commit_worker_processing_results' source-changed fence (which includes
+    processingGeneration) once this commits. Ordinary retry must never call
+    this: see processing_generation.supersede's own contract.
+    """
     _require_context()
     metadata_table_client = _CTX['metadata_table_client']
+    from processing_generation import supersede
+    for attempt in range(_METADATA_UPDATE_MAX_RETRIES):
+        try:
+            entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+        except Exception:
+            raise PhotoNotFoundError('Photo not found.')
+        if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
+            raise PhotoNotFoundError('Photo has been deleted.')
+        if entity.get('processingIsolated') is True:
+            raise PhotoNotFoundError('Photo is isolated for an upload-only benchmark.')
+        entity.update(supersede(entity, uuid.uuid4().hex, is_video=is_video_file(filename)))
+        entity['processingFence'] = ''
+        entity['processing_lease_owner'] = ''
+        entity['processing_lease'] = ''
+        entity['processing_lease_expires_at'] = ''
+        entity['processingCompletionPending'] = ''
+        entity['artifactReceipt'] = ''
+        entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
+        try:
+            metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
+            return entity
+        except ResourceModifiedError:
+            import time
+            time.sleep(_METADATA_UPDATE_RETRY_BASE_SECONDS * (2 ** attempt))
+            continue
+        except ResourceNotFoundError as exc:
+            raise PhotoNotFoundError('Photo has been deleted.') from exc
+    raise RuntimeError(f'Concurrent modification superseding generation on {user_id}/{filename}')
+
+
+def heartbeat_processing_lease(user_id: str, filename: str, owner_id: str, *, lease_seconds: int = CLIENT_PROCESSING_LEASE_SECONDS,
+                               expected_processing_fence: Optional[str] = None) -> Dict:
+    _require_context()
+    metadata_table_client = _CTX['metadata_table_client']
+    if expected_processing_fence is not None:
+        return claim_processing_lease(user_id, filename, owner_id, lease_seconds=lease_seconds,
+            mark_running=False, expected_processing_fence=expected_processing_fence)
     try:
         entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
     except Exception:
@@ -10641,7 +10879,8 @@ def heartbeat_processing_lease(user_id: str, filename: str, owner_id: str, *, le
     return claim_processing_lease(user_id, filename, owner_id, lease_seconds=lease_seconds, mark_running=False)
 
 
-def release_processing_lease(user_id: str, filename: str, owner_id: str) -> None:
+def release_processing_lease(user_id: str, filename: str, owner_id: str, *,
+                             expected_processing_fence: Optional[str] = None) -> None:
     """Ownership re-checked against a fresh read on every retry attempt (see
     claim_processing_lease's docstring) -- otherwise a stale pre-check could
     release a lease someone else has since (re)claimed."""
@@ -10656,6 +10895,10 @@ def release_processing_lease(user_id: str, filename: str, owner_id: str) -> None
             return
         current_owner = str(entity.get('processing_lease_owner') or entity.get('processing_lease') or '').strip()
         if current_owner and current_owner != owner_id:
+            return
+        if expected_processing_fence is not None and (
+                not expected_processing_fence or entity.get('processingFence') != expected_processing_fence
+                or current_owner != owner_id):
             return
         entity['processing_lease_owner'] = ''
         entity['processing_lease'] = ''
@@ -10952,7 +11195,8 @@ def _extract_and_store_face_embedding(user_id: str, face_id: str, entity: Dict, 
         entity.update({k: v for k, v in values.items() if v is not None})
         return
     try:
-        face_embeddings_table_client.upsert_entity({
+        from processing_fence import write_artifact
+        write_artifact(face_embeddings_table_client, {
             'PartitionKey': user_id,
             'RowKey': face_id,
             **{k: v for k, v in values.items() if v is not None},

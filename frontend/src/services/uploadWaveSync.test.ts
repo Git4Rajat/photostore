@@ -125,17 +125,18 @@ describe('finalizeWaveShadowSession', () => {
         expect(mocks.close).toHaveBeenCalledTimes(1);
     });
 
-    it('does nothing if the session was never opened', async () => {
+    it('retries opening before finalization if the initial open was missed', async () => {
         const s = session(1, 'sess-i');
         await finalizeWaveShadowSession(s);
-        expect(mocks.resolve).not.toHaveBeenCalled();
-        expect(mocks.close).not.toHaveBeenCalled();
+        expect(mocks.open).toHaveBeenCalled();
+        expect(mocks.resolve).toHaveBeenCalled();
+        expect(mocks.close).toHaveBeenCalled();
     });
 
     it('does not close when no manifest revision was ever observed', async () => {
         const s = session(1, 'sess-j');
         mocks.open.mockResolvedValueOnce({ waveId: 'wave-1', manifestRevision: undefined });
-        mocks.register.mockResolvedValueOnce(null); // shadow call failed
+        mocks.register.mockResolvedValue(null); // shadow call failed
         mocks.resolve.mockResolvedValue(null); // shadow call failed
         await ensureWaveShadowSessionOpened(s);
         s.files[0].status = 'done';
@@ -151,4 +152,36 @@ describe('finalizeWaveShadowSession', () => {
         await finalizeWaveShadowSession(s);
         expect(mocks.close).toHaveBeenCalledTimes(1);
     });
+});
+
+it('serializes a delayed open, registration, live resolution and close', async () => {
+    const s = session(1, 'serialized-session');
+    const events: string[] = [];
+    let releaseOpen!: (value: { waveId: string; manifestRevision: string }) => void;
+    mocks.open.mockImplementation(() => new Promise(resolve => { releaseOpen = resolve; }));
+    mocks.register.mockImplementation(async () => {
+        events.push('registered');
+        return { manifestRevision: 'registered', registeredCount: 1 };
+    });
+    let nextRevision = 0;
+    mocks.resolve.mockImplementation(async () => {
+        events.push('resolved');
+        return { manifestRevision: `resolved-${++nextRevision}` };
+    });
+    mocks.close.mockImplementation(async (_id: string, revision: string) => {
+        events.push('closed');
+        expect(revision).toBe(`resolved-${nextRevision}`);
+        return { state: 'closed' };
+    });
+    const opening = ensureWaveShadowSessionOpened(s);
+    const file = { ...s.files[0], status: 'done' as const };
+    const resolving = resolveWaveShadowFile(s, file);
+    const closing = finalizeWaveShadowSession({ ...s, files: [file] });
+    await Promise.resolve();
+    expect(events).toEqual([]);
+    expect(mocks.resolve).not.toHaveBeenCalled();
+    releaseOpen({ waveId: 'wave', manifestRevision: 'opened' });
+    await Promise.all([opening, resolving, closing]);
+    expect(events).toEqual(['registered', 'resolved', 'resolved', 'closed']);
+    expect(mocks.open).toHaveBeenCalledTimes(1);
 });

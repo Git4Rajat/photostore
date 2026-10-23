@@ -297,6 +297,7 @@ def worker_commit_ctx(racy_ctx, monkeypatch):
     _seed(table, 'u1', 'a.jpg', ocr_status='running', map_detection_status='running',
           processing_lease_owner='worker-A', processing_lease='worker-A',
           processing_lease_expires_at='2099-01-01T00:00:00+00:00', rating=1)
+    monkeypatch.setitem(storage_utils._CTX, 'source_completion_delivery', None)
     monkeypatch.setattr(storage_utils, '_refresh_semantic_fields', lambda *a: None)
     monkeypatch.setattr(storage_utils, 'touch_user_search_indexes_state', lambda *a, **k: None)
     monkeypatch.setattr(storage_utils, 'touch_user_sort_index_dirty', lambda *a, **k: None)
@@ -501,3 +502,122 @@ def test_worker_retry_count_is_applied_once_after_cas_conflict(worker_commit_ctx
     monkeypatch.setattr(storage_utils, '_apply_client_processing_results', work)
     result = _apply_worker()
     assert result['retry_count'] == 1 and result['rating'] == 5
+
+
+@pytest.mark.parametrize('expected,owner', [('old-generation', 'worker-A'), ('generation', 'worker-B'), ('generation', '')])
+def test_fenced_browser_rejects_stale_source_or_owner_before_any_result_effect(worker_commit_ctx, monkeypatch, expected, owner):
+    from processing_completion import StaleProcessingResult
+    table = worker_commit_ctx
+    table.rows['u1', 'a.jpg']['processingRevision'] = 'generation'
+    monkeypatch.setattr(storage_utils, '_apply_client_processing_results', lambda *a, **k: pytest.fail('stale result reached effects'))
+    with pytest.raises(StaleProcessingResult):
+        storage_utils.apply_client_processing_results_for_file('u1', 'a.jpg', origin='browser',
+            lease_owner=owner, expected_processing_revision=expected)
+    assert table.update_calls == 0
+
+
+def test_fenced_browser_result_uses_conditional_status_and_release_commit(worker_commit_ctx):
+    table = worker_commit_ctx
+    table.rows['u1', 'a.jpg']['processingRevision'] = 'generation'
+    result = storage_utils.apply_client_processing_results_for_file('u1', 'a.jpg', origin='browser',
+        lease_owner='worker-A', expected_processing_revision='generation', claimed_steps=['ocr'],
+        client_processing={'ocr': {'hasData': True, 'text': 'browser text'}})
+    assert result['ocrText'] == 'browser text'
+    assert result['ocr_status'] == 'done'
+    assert result['processing_lease_owner'] == ''
+    assert table.get_calls == table.update_calls == 1
+
+
+def test_completion_intent_and_terminal_status_share_worker_commit(worker_commit_ctx, monkeypatch):
+    monkeypatch.setenv("UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED", "true")
+    from processing_completion import STEPS
+    table = worker_commit_ctx
+    row = table.rows['u1', 'a.jpg']
+    row.update(anonymousImageId='photo', processingRevision='generation', processingGeneration='d' * 64,
+        faceCount=0, **{step + '_status': 'no_data' for step in STEPS})
+    row['ocr_status'] = 'running'
+    result = _apply_worker(claimed_steps=['ocr'], client_processing={'ocr': {'hasData': True, 'text': 'text'}})
+    assert result['processingCompletionPending'] == result['processingCompletionId']
+    assert result['processingCompletionRevision'] == 'generation'
+    assert table.update_calls == 1
+
+
+def test_fenced_browser_cannot_commit_after_lease_expires_during_result_application(worker_commit_ctx, monkeypatch):
+    from processing_completion import StaleProcessingResult
+    table = worker_commit_ctx
+    table.rows['u1', 'a.jpg']['processingRevision'] = 'generation'
+    def expire(*_):
+        row = dict(table.rows['u1', 'a.jpg'])
+        row['processing_lease_expires_at'] = '2000-01-01T00:00:00+00:00'
+        table.upsert_entity(row)
+    monkeypatch.setattr(storage_utils, '_refresh_semantic_fields', expire)
+    with pytest.raises(StaleProcessingResult, match='expired'):
+        storage_utils.apply_client_processing_results_for_file('u1', 'a.jpg', origin='browser',
+            lease_owner='worker-A', expected_processing_revision='generation', claimed_steps=['ocr'],
+            client_processing={'ocr': {'hasData': True, 'text': 'late text'}})
+    assert table.rows['u1', 'a.jpg']['ocr_status'] == 'running'
+    assert 'ocrText' not in table.rows['u1', 'a.jpg']
+
+
+def test_expired_same_owner_claim_gets_a_new_attempt_but_live_renewal_keeps_it(worker_commit_ctx):
+    table = worker_commit_ctx
+    table.rows['u1', 'a.jpg'].update(processingFence='old-attempt',
+        processing_lease_expires_at='2000-01-01T00:00:00+00:00')
+    claimed = storage_utils.claim_processing_lease('u1', 'a.jpg', 'worker-A', steps=['ocr'])
+    assert claimed['processingFence'] and claimed['processingFence'] != 'old-attempt'
+    renewed = storage_utils.claim_processing_lease('u1', 'a.jpg', 'worker-A', steps=['ocr'])
+    assert renewed['processingFence'] == claimed['processingFence']
+
+
+def test_same_owner_reclaim_rejects_old_attempt_before_applying_result(worker_commit_ctx, monkeypatch):
+    from processing_completion import StaleProcessingResult
+    table = worker_commit_ctx
+    table.rows['u1', 'a.jpg'].update(processingRevision='revision', processingFence='new-attempt')
+    monkeypatch.setattr(storage_utils, '_apply_client_processing_results', lambda *a, **k: pytest.fail('stale attempt reached effects'))
+    with pytest.raises(StaleProcessingResult, match='token changed'):
+        _apply_worker(expected_processing_revision='revision', expected_processing_fence='old-attempt')
+    assert table.update_calls == 0
+
+
+def test_terminal_worker_commit_automatically_delivers_before_ack(worker_commit_ctx, monkeypatch):
+    from processing_completion import STEPS
+    from test_upload_waves import AtomicTable
+    from upload_waves import ShadowWaves
+    monkeypatch.setenv('UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED', 'true')
+    inbox_table = AtomicTable(); inbox = ShadowWaves(inbox_table, 'u1')
+    table = worker_commit_ctx
+    table.rows['u1', 'a.jpg'].update(anonymousImageId='photo', processingRevision='revision',
+        processingGeneration='e' * 64, faceCount=0, **{step + '_status': 'no_data' for step in STEPS})
+    table.rows['u1', 'a.jpg']['ocr_status'] = 'running'
+    def deliver(library, intent):
+        # Terminal result and recoverable intent are visible before inbox delivery.
+        committed = table.get_entity('u1', 'a.jpg')
+        assert committed['ocr_status'] == 'done' and committed['processing_lease_owner'] == ''
+        assert committed['processingCompletionPending'] == intent['id']
+        return inbox.accept_source_completion(intent)
+    monkeypatch.setitem(storage_utils._CTX, 'source_completion_delivery', deliver)
+    _apply_worker(claimed_steps=['ocr'], client_processing={'ocr': {'hasData': True, 'text': 'text'}})
+    assert table.get_entity('u1', 'a.jpg')['processingCompletionPending'] == ''
+    assert len(inbox_table.rows) == 1
+    assert next(iter(inbox_table.rows.values()))['completionQualified'] is False
+
+
+def test_old_same_owner_attempt_cannot_release_or_heartbeat_successor(worker_commit_ctx):
+    from processing_completion import StaleProcessingResult
+    table = worker_commit_ctx
+    table.rows['u1', 'a.jpg']['processingFence'] = 'new-attempt'
+    storage_utils.release_processing_lease('u1', 'a.jpg', 'worker-A', expected_processing_fence='old-attempt')
+    assert table.rows['u1', 'a.jpg']['processing_lease_owner'] == 'worker-A'
+    assert table.update_calls == 0
+    with pytest.raises(StaleProcessingResult):
+        storage_utils.heartbeat_processing_lease('u1', 'a.jpg', 'worker-A', expected_processing_fence='old-attempt')
+    assert table.update_calls == 0
+
+
+def test_fenced_heartbeat_does_not_reanimate_expired_attempt(worker_commit_ctx):
+    from processing_completion import StaleProcessingResult
+    table = worker_commit_ctx
+    table.rows['u1', 'a.jpg'].update(processingFence='attempt', processing_lease_expires_at='2000-01-01T00:00:00+00:00')
+    with pytest.raises(StaleProcessingResult):
+        storage_utils.heartbeat_processing_lease('u1', 'a.jpg', 'worker-A', expected_processing_fence='attempt')
+    assert table.update_calls == 0

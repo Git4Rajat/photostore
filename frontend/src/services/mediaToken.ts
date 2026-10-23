@@ -167,12 +167,12 @@ export const thumbnailUrlForBlob = (blob: string | undefined | null, token: Medi
 
 /** Direct preview URL (previews live under `preview/` in the same container). */
 export const previewUrlForBlob = (blob: string | undefined | null, token: MediaToken | null = getCachedMediaToken()): string => (
-    blob && token ? `${token.baseUrl}/${token.previewPrefix}${encodeBlobPath(blob)}.jpg?${token.sas}` : ''
+    blob && !blob.startsWith('derived/v1/') && token ? `${token.baseUrl}/${token.previewPrefix}${encodeBlobPath(blob)}.jpg?${token.sas}` : ''
 );
 
 /** Direct full-resolution original URL (separate container token from thumbnail/preview), or '' when unavailable. */
 export const imageUrlForBlob = (blob: string | undefined | null, token: MediaToken | null = getCachedMediaToken()): string => (
-    blob && token?.image ? `${token.image.baseUrl}/${encodeBlobPath(blob)}?${token.image.sas}` : ''
+    blob && !blob.startsWith('derived/v1/') && token?.image ? `${token.image.baseUrl}/${encodeBlobPath(blob)}?${token.image.sas}` : ''
 );
 
 const FACE_CROP_PATH = /^\/api\/faces\/crop\/([^/?#]+)$/;

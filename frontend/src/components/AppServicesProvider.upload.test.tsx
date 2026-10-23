@@ -154,6 +154,7 @@ afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
 });
 
 function select(files: File[]) {
@@ -873,11 +874,21 @@ describe('browser upload selection and startup', () => {
 // block, delay, or fail the real upload, which the last test in this block
 // exercises directly.
 describe('upload wave shadow protocol wiring', () => {
+    let waveUUIDSequence = 0;
     const shadowCalls = (suffix: string) => mocks.postUpload.mock.calls
         .filter(([url]) => typeof url === 'string' && url.startsWith('/upload/waves/shadow/') && url.endsWith(suffix));
     const opens = () => mocks.postUpload.mock.calls.filter(([url]) => url === '/upload/waves/shadow/sessions');
 
     beforeEach(() => {
+        vi.stubEnv('VITE_UPLOAD_WAVE_SHADOW_ENABLED', 'true');
+        vi.stubGlobal('crypto', {
+            randomUUID: () => `${(++waveUUIDSequence).toString(16).padStart(8, '0')}-1234-4234-8234-123456789abc`,
+            subtle: { digest: async (_algorithm: string, bytes: Uint8Array) => {
+                const hash = new Uint8Array(32);
+                bytes.forEach((value, index) => { hash[index % 32] ^= value; });
+                return hash.buffer;
+            } },
+        });
         const original = mocks.postUpload.getMockImplementation()!;
         mocks.postUpload.mockImplementation(async (url: string, payload: any) => {
             if (url.startsWith('/upload/waves/shadow/')) {
@@ -906,6 +917,21 @@ describe('upload wave shadow protocol wiring', () => {
         expect(resolveCalls).toHaveLength(4);
         expect(new Set(resolveCalls.map(([, body]) => body.itemId)).size).toBe(2);
         expect(shadowCalls('/close')).toHaveLength(1);
+    });
+
+    it('declares one 901-file selection across both transport chunks before the first init', async () => {
+        select(filesFor(901));
+        for (let tick = 0; tick < 20 && finalizedFiles().length < 901; tick += 1) await advance(1000);
+        await advance(2000);
+        expect(finalizedFiles()).toHaveLength(901);
+        expect(opens()).toHaveLength(1);
+        expect(opens()[0][1]).toMatchObject({ declaredCount: 901 });
+        expect(shadowCalls('/items')).toHaveLength(46);
+        expect(shadowCalls('/close')).toHaveLength(1);
+        const calls = mocks.postUpload.mock.calls;
+        expect(calls.findIndex(([url]) => url.endsWith('/items')))
+            .toBeLessThan(calls.findIndex(([url]) => url === '/upload/init-batch'));
+        expect(new Set(shadowCalls('/resolve').map(([, body]) => body.itemId)).size).toBe(901);
     });
 
     it('resolves a finalize failure as failed, not accepted', async () => {

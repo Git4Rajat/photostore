@@ -154,6 +154,12 @@ def reconcile_page(store, wave_id, metadata_table, face_table, face_ids, *, afte
     members = store._page(prefix, after)
     qualified_flags = []
     for member in members:
+        from processing_completion import completion_capture_enabled, relay_completion
+        if completion_capture_enabled():
+            try:
+                relay_completion(metadata_table, store.library, member['filename'], store.accept_source_completion)
+            except ResourceNotFoundError:
+                pass  # Missing source is still a pending observation below.
         observation = observe_source(store, member, metadata_table, face_table, face_ids)
         qualified_flags.append(bool(observation.get('evidence_qualified')))
         store.observe(wave_id, member['photoId'], member['processingRevision'], **observation)

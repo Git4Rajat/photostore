@@ -77,7 +77,10 @@ class Claim:
 
 
 class WorkStore:
-    def __init__(self, table, *, clock=time.time, lease_seconds=180, wake_seconds=60):
+    def __init__(self, table, *, clock=time.time, lease_seconds=180, wake_seconds=60, partition=PARTITION):
+        if not isinstance(partition, str) or not partition or any(c not in 'abcdefghijklmnopqrstuvwxyz0123456789-' for c in partition):
+            raise ValueError('Invalid work partition')
+        self.partition = partition
         self.table = table
         self.clock = clock
         self.lease_seconds = lease_seconds
@@ -89,7 +92,7 @@ class WorkStore:
 
     def _get(self, key):
         try:
-            return self.table.get_entity(PARTITION, key)
+            return self.table.get_entity(self.partition, key)
         except ResourceNotFoundError:
             return None
 
@@ -110,7 +113,7 @@ class WorkStore:
             current = self._get(key)
             if current is not None and not advance:
                 return key
-            row = dict(current or {}, PartitionKey=PARTITION, RowKey=key,
+            row = dict(current or {}, PartitionKey=self.partition, RowKey=key,
                        libraryId=library, scope=scope, revision=revision,
                        requestedAt=self.clock(), failed=False)
             row.setdefault('leaseUntil', 0.0)
@@ -216,7 +219,7 @@ class WorkStore:
             newer = current['revision'] != claim.revision
             try:
                 if not failed and not newer:
-                    self.table.delete_entity(PARTITION, claim.key, etag=etag(current),
+                    self.table.delete_entity(self.partition, claim.key, etag=etag(current),
                                              match_condition=MatchConditions.IfNotModified)
                 else:
                     self._replace(current, dict(current, owner='', leaseUntil=0, wakeUntil=0,
@@ -227,7 +230,7 @@ class WorkStore:
         raise RuntimeError('Maintenance completion contention')
 
     def recover(self, send, *, limit=100, library=None):
-        query = f"PartitionKey eq '{PARTITION}' and failed eq false"
+        query = f"PartitionKey eq '{self.partition}' and failed eq false"
         if library is not None:
             query += " and libraryId eq '" + library.replace("'", "''") + "'"
         # Exclude reserved work server-side before applying the bounded page.
