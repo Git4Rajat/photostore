@@ -119,6 +119,69 @@ def test_recover_library_is_the_same_mechanism_the_opportunistic_route_nudge_use
     assert any(record['event']=='wave_recovery' for record in events)
 
 
+def test_stale_open_session_is_auto_abandoned_so_its_wave_can_advance(monkeypatch):
+    """A session with no real activity (browser tab closed mid-upload) must
+    not keep its wave stuck in 'collecting' forever -- recovery reaps it using
+    the WAVE's lastProgressAt, not the session's own unchanging createdAt."""
+    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED','true')
+    table=RuntimeTable()
+    now=[1000.0]
+    store=ShadowWaves(table,'a',clock=lambda:now[0])
+    store.open_session('s',3)  # declares 3 items, registers/resolves none
+    now[0]+=4000  # past STALE_SESSION_SECONDS
+    recover_library(table,'a',lambda *a:None,clock=lambda:now[0])
+    session=store._required(store.session_key('s'))
+    assert session['state']=='abandoned'
+
+
+def test_recent_open_session_is_left_alone(monkeypatch):
+    """An upload still genuinely in progress (recent wave activity) must not
+    be auto-abandoned just because it's been open for a while in wall time."""
+    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED','true')
+    table=RuntimeTable()
+    now=[1000.0]
+    store=ShadowWaves(table,'a',clock=lambda:now[0])
+    store.open_session('s',3)
+    now[0]+=60  # well under STALE_SESSION_SECONDS
+    recover_library(table,'a',lambda *a:None,clock=lambda:now[0])
+    session=store._required(store.session_key('s'))
+    assert session['state']=='open'
+
+
+def test_stale_failed_dispatch_gets_one_more_attempt(monkeypatch):
+    """A stage dispatch that gave up after 5 attempts (failed=True) must not
+    be abandoned forever -- after enough time for an operator to plausibly
+    have noticed and fixed the underlying cause, recovery gives it exactly
+    one more try instead of requiring a manual /repair call indefinitely."""
+    from upload_wave_execution import stage_work_store
+    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED','true')
+    table=RuntimeTable()
+    now=[1000.0]
+    work=stage_work_store(table,clock=lambda:now[0])
+    key=work.request('a','wave-vision:w1:deadbeef')
+    claim=work.claim(key)
+    work.finish(claim,failed=True)
+    assert table.get_entity(work.partition,key)['failed']
+    now[0]+=4000  # past STALE_FAILED_DISPATCH_SECONDS
+    store=ShadowWaves(table,'a',clock=lambda:now[0])
+    recover_library(table,'a',lambda *a:None,clock=lambda:now[0])
+    assert table.get_entity(work.partition,key)['failed'] is False
+
+
+def test_recently_failed_dispatch_is_not_retried_yet(monkeypatch):
+    from upload_wave_execution import stage_work_store
+    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED','true')
+    table=RuntimeTable()
+    now=[1000.0]
+    work=stage_work_store(table,clock=lambda:now[0])
+    key=work.request('a','wave-vision:w1:deadbeef')
+    claim=work.claim(key)
+    work.finish(claim,failed=True)
+    now[0]+=60  # well under STALE_FAILED_DISPATCH_SECONDS
+    recover_library(table,'a',lambda *a:None,clock=lambda:now[0])
+    assert table.get_entity(work.partition,key)['failed']
+
+
 def test_live_stage_lease_is_not_reported_as_an_unsent_handoff():
     from execution_lease import ExecutionLeases
     from wave_recovery import metrics

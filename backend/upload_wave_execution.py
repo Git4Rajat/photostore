@@ -176,6 +176,45 @@ def recover_releases(work_store, store, send, *, limit=100):
     return work_store.recover(guarded_send, limit=limit, library=store.library)
 
 
+# A stage dispatch gives up after 5 delivery attempts (see wave_runtime.consume's
+# `claim.attempt>5` check) and is marked failed=True -- excluded from every
+# future recover_releases call, by design: a wave stuck mid-dispatch shouldn't
+# spin retrying something genuinely broken forever with no one ever finding
+# out. But "forever, with nothing short of an operator running the manual
+# /repair endpoint" is also too strong a failure mode for something that could
+# just as easily be a transient infra blip (a worker crash loop during a
+# deploy, a brief storage outage) that happened to coincide with all 5
+# attempts. This gives it exactly one more try after enough time has passed
+# for a human to plausibly have noticed and fixed the underlying cause, while
+# still emitting a distinct, visible event every time it happens so chronic
+# flapping isn't silent either.
+STALE_FAILED_DISPATCH_SECONDS = 3600
+
+
+def revive_stale_failed_dispatches(work_store, store, *, limit=20, clock=None):
+    """Give each stage dispatch that's been failed=True for a long time one
+    more chance: resets it to a fresh revision (failed=False, no lease/wake),
+    making it eligible for the very next recover_releases call in the same
+    pass. recover_releases' own outbox_eligible re-check still protects
+    against resending for a wave that's since moved past that stage.
+    """
+    if not execution_enabled():
+        return 0
+    if work_store.partition != STAGE_PARTITION:
+        raise ValueError('Invalid stage recovery partition')
+    now = (clock or work_store.clock)()
+    query = (f"PartitionKey eq '{work_store.partition}' and failed eq true"
+             f" and libraryId eq '{store.library.replace(chr(39), chr(39)*2)}'")
+    import itertools
+    revived = 0
+    for row in itertools.islice(work_store.table.query_entities(query), limit):
+        if now - float(row.get('requestedAt') or 0) < STALE_FAILED_DISPATCH_SECONDS:
+            continue
+        work_store.request(store.library, row['scope'], advance=True)
+        revived += 1
+    return revived
+
+
 def _release_input_revision(outbox, wave):
     if outbox['destination'] == 'vision':
         return f"{wave['waveId']}:{outbox.get('intakeEpoch')}"

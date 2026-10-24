@@ -13,9 +13,51 @@ from azure.core.exceptions import ResourceNotFoundError
 from azure.data.tables import UpdateMode
 
 from upload_waves import ShadowWaves, digest
-from upload_wave_execution import execution_enabled, stage_work_store, advance_wave, release_and_relay, recover_releases
+from upload_wave_execution import (execution_enabled, stage_work_store, advance_wave, release_and_relay,
+    recover_releases, revive_stale_failed_dispatches)
 
 DIRECTORY='upload-wave-directory'
+# A session with no real activity for this long (a browser tab closed mid
+# upload, a dropped connection) is abandoned, not just slow. Measured against
+# the WAVE's own lastProgressAt (bumped by every register()/resolve() call
+# across every session feeding that wave), not the session row's createdAt --
+# createdAt never changes after open_session, so using it would misfire on a
+# large, genuinely still-active upload that simply takes a long time.
+STALE_SESSION_SECONDS=3600
+
+
+def _reap_stale_sessions(store,library,clock,emit,*,deadline,pages=2):
+    """Abandon sessions nothing is ever going to finish, so their wave can
+    advance instead of sitting in 'collecting' forever. Bounded and
+    best-effort: a session still genuinely in flight (recent wave progress,
+    or a finalize lease in flight per abandon()'s own guard) is left alone.
+    """
+    from wave_settlement import abandon
+    reaped=0;after=''
+    for _ in range(pages):
+        if clock()>=deadline:break
+        rows=store._page('session!',after)
+        if not rows:break
+        for row in rows:
+            if clock()>=deadline:break
+            after=row['RowKey']
+            if row.get('state')!='open' or row.get('abandoning'):continue
+            wave=store._get(store.wave_key(row['waveId']))
+            last=wave.get('lastProgressAt',wave.get('createdAt',0)) if wave else 0
+            if clock()-last<STALE_SESSION_SECONDS:continue
+            try:
+                abandon(store,row['sessionId'],row['manifestRevision'],
+                    reason=f'Auto-abandoned: no activity for over {STALE_SESSION_SECONDS}s')
+                reaped+=1
+                emit(event='wave_session_abandoned',library_id=digest(library),
+                    session_id=digest(row['sessionId']),wave_id=row['waveId'])
+            except Exception as error:
+                # A finalize lease still in flight, or someone closed/abandoned
+                # it a moment ago -- both fine, not a real failure to report.
+                emit(event='wave_session_reap_skipped',library_id=digest(library),
+                    session_id=digest(row['sessionId']),reason=type(error).__name__)
+        if len(rows)<20:break
+    return reaped
 
 
 def register_library(table,library):
@@ -136,7 +178,10 @@ def recover_library(table,library,send,*,after='',wave_pages=2,release_limit=100
     try:
         policy=store._get('policy')
         if clock()<deadline and not (policy and policy.get('cleanupState')):
+            revived=revive_stale_failed_dispatches(work,store,clock=clock)
+            if revived:emit(event='wave_dispatch_revived',library_id=digest(library),count=revived)
             recover_releases(work,store,send,limit=release_limit)
+            _reap_stale_sessions(store,library,clock,emit,deadline=deadline)
         if cleanup_send is not None and clock()<deadline:
             from processing_cleanup import relay_artifact_cleanup
             relay_artifact_cleanup(table,library,cleanup_send)
