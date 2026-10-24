@@ -226,6 +226,14 @@ logging.basicConfig(
 # not another logger's already-set level.
 logging.getLogger('azure').setLevel(logging.WARNING)
 app = Flask(__name__)
+
+
+@app.before_request
+def _wave_install_barrier():
+    if (os.getenv('UPLOAD_WAVE_BOOTSTRAP_PENDING','').lower()=='true'
+            and request.path.rstrip('/')!='/health'):
+        return jsonify(error='Wave deployment bootstrap is pending'),503
+
 # Belt-and-suspenders alongside the basicConfig(force=True) above: Flask's
 # own app.logger can carry an independent level/handler (attached lazily by
 # Flask/Werkzeug) that would otherwise keep filtering out INFO regardless of
@@ -1377,7 +1385,7 @@ def _bootstrap_owner_account() -> None:
     while the legacy config-table credential remains the source of truth until
     the multi-account cutover. No-op after the first run.
     """
-    if library_store is None or AUTH_MODE != 'password':
+    if library_store is None or AUTH_MODE != 'password' or os.getenv('UPLOAD_WAVE_BOOTSTRAP_PENDING','').lower()=='true':
         return
     try:
         cred = password_auth.get_owner_credential(config_table_client) or {}

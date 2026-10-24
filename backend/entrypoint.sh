@@ -3,6 +3,13 @@ set -e
 
 ROLE="${APP_ROLE:-core}"
 
+# Provisioning may expose queue scalers before the certificate is seeded.
+# Keep workers idle without importing app or consuming pre-existing messages.
+if [ "${UPLOAD_WAVE_BOOTSTRAP_PENDING:-false}" = "true" ] && \
+   { [ "$ROLE" = "vision" ] || [ "$ROLE" = "cluster" ] || [ "$ROLE" = "index-worker" ]; }; then
+    exec python -u -c 'import signal, threading; ready=threading.Event(); signal.signal(signal.SIGTERM, lambda *_: ready.set()); signal.signal(signal.SIGINT, lambda *_: ready.set()); print("Wave bootstrap pending; worker intake blocked.", flush=True); ready.wait()'
+fi
+
 echo "EXIF runtime version=$(exiftool -ver)"
 
 if [ "${ROLE}" = "wave-recovery" ]; then

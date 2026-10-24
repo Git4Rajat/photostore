@@ -2,6 +2,7 @@
 from contextvars import ContextVar
 from functools import wraps
 import os
+import re
 import uuid
 import json
 
@@ -90,6 +91,8 @@ def require_capability(store,role,*,allow_cleanup=False):
 
 
 def enroll_new(table,library,metadata=None):
+    if os.getenv('UPLOAD_WAVE_BOOTSTRAP_PENDING','').lower()=='true':
+        raise RuntimeError('Wave deployment bootstrap is pending')
     if os.getenv('UPLOAD_WAVE_NEW_LIBRARIES_ENABLED','').lower()!='true':return
     if not configuration_ready():raise RuntimeError('New wave libraries require backend processing and source fencing')
     if metadata is None:raise RuntimeError('New-library emptiness proof unavailable')
@@ -97,6 +100,8 @@ def enroll_new(table,library,metadata=None):
     if next(iter(metadata.query_entities(query,results_per_page=1)),None) is not None:
         raise Conflict('Wave enrollment requires a new empty library')
     certificate=os.getenv('UPLOAD_WAVE_CAPABILITY_ID','')
+    if not re.fullmatch(r'[a-f0-9]{64}',certificate):
+        raise RuntimeError('A valid wave capability ID is required before enrollment')
     try:proof=table.get_entity(CAPABILITIES,certificate)
     except ResourceNotFoundError:raise RuntimeError('Qualified wave capabilities are missing')
     builds=json.loads(proof.get('deployments') or '{}')

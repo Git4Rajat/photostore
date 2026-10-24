@@ -85,12 +85,15 @@ param enableWaveRecovery bool = true
 @description('Opt in to wave portal alerts; requires an existing logging workspace and activated recovery execution.')
 param enableWaveAlerts bool = false
 
-@description('Enable qualified wave stage execution. Keep false until the isolated qualification deployment is ready.')
+@description('Enable qualified wave execution after certificate seeding; fresh installs use deploy/fresh_wave.py.')
 param enableWaveExecution bool = true
 @description('Enroll newly created empty libraries only. Existing libraries never change ownership.')
 param enableNewWaveLibraries bool = true
-@description('Content-addressed capability certificate ID for the qualified immutable role images. Empty by default.')
+@description('Exact-image capability ID. Fresh wave activation requires the seeded release certificate; never leave empty.')
 param waveCapabilityId string = ''
+
+@description('Fresh-install preparation only: block upload intake and run certificate seeding as a manual recovery job. Activate only after that job succeeds.')
+param waveBootstrapPending bool = false
 
 
 @description('Enable managed WebSocket index-ready notifications. Adds a Web PubSub Standard unit; polling remains the fallback.')
@@ -411,6 +414,7 @@ resource indexPush 'Microsoft.SignalRService/webPubSub@2024-03-01' = if (enableI
 
 // Shared backend/worker environment variables.
 var backendEnv = [
+  { name: 'UPLOAD_WAVE_BOOTSTRAP_PENDING', value: waveBootstrapPending ? 'true' : 'false' }
   { name: 'UPLOAD_WAVE_EXECUTION_ENABLED', value: enableWaveExecution ? 'true' : 'false' }
   { name: 'UPLOAD_WAVE_NEW_LIBRARIES_ENABLED', value: enableNewWaveLibraries ? 'true' : 'false' }
   { name: 'UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED', value: (enableWaveExecution || enableNewWaveLibraries) ? 'true' : 'false' }
@@ -1978,11 +1982,12 @@ resource waveRecovery 'Microsoft.App/jobs@2025-01-01' = if (enableWaveRecovery) 
           image: coreImage
           command: ['python', '-u', '-m', 'wave_recovery']
           resources: { cpu: json('0.5'), memory: '1Gi' }
-          // Common wave settings default off; the qualification deployment opts in.
+          // Bootstrap seeds the certificate before any owner library is created.
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'wave-recovery' }
             { name: 'UPLOAD_WAVE_DEPLOYMENT_ID', value: coreImage }
-            { name: 'UPLOAD_WAVE_RECOVERY_ENABLED', value: 'true' }
+            { name: 'UPLOAD_WAVE_RECOVERY_ENABLED', value: waveBootstrapPending ? 'false' : 'true' }
+            { name: 'UPLOAD_WAVE_BOOTSTRAP_VISION_IMAGE', value: visionImage }
             { name: 'VECTOR_INDEX_PRIME_ON_STARTUP', value: 'false' }
           ])
         }

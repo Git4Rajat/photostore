@@ -77,12 +77,13 @@ param enableWaveRecovery bool = true
 @description('Opt in to wave portal alerts after activating recovery; requires logAnalyticsWorkspaceName.')
 param enableWaveAlerts bool = false
 
-@description('Enable qualified wave stage execution. Keep false until the isolated qualification deployment is ready.')
+@description('Enable qualified wave execution after certificate seeding; fresh installs use deploy/fresh_wave.py.')
 param enableWaveExecution bool = true
 @description('Enroll newly created empty libraries only. Existing libraries never change ownership.')
 param enableNewWaveLibraries bool = true
-@description('Content-addressed capability certificate ID for the qualified immutable role images. Empty by default.')
+@description('Exact-image capability ID. Fresh wave activation requires the seeded release certificate; never leave empty.')
 param waveCapabilityId string = ''
+param waveBootstrapPending bool = false
 
 @description('Provision managed WebSocket notifications when library indexes are published.')
 param enableIndexPush bool = false
@@ -119,6 +120,7 @@ module app 'resources.bicep' = {
     enableWaveExecution: enableWaveExecution
     enableNewWaveLibraries: enableNewWaveLibraries
     waveCapabilityId: waveCapabilityId
+    waveBootstrapPending: waveBootstrapPending
     logAnalyticsWorkspaceName: logAnalyticsWorkspaceName
   }
 }

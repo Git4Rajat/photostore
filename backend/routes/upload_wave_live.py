@@ -1,5 +1,6 @@
 """Authoritative admission fences for libraries born into the wave protocol."""
 from flask import g
+import os
 from azure.core.exceptions import AzureError
 from upload_waves import ShadowWaves,Conflict
 import wave_policy
@@ -9,6 +10,8 @@ def install(blueprint):
     import app
     @blueprint.route('/upload/waves/protocol',methods=['GET'])
     def upload_wave_protocol():
+        if os.getenv('UPLOAD_WAVE_BOOTSTRAP_PENDING','').lower()=='true':
+            return app.jsonify(error='Wave deployment bootstrap is pending'),503
         library,error=app._require_user_id(require_auth=True)
         if error:return error
         if app.jobs_table_client is None:return app.jsonify(error='Wave policy storage unavailable'),503
@@ -22,12 +25,19 @@ def install(blueprint):
     def wave_upload_guard():
         path=app.request.path.rstrip('/')
         operation=path.rsplit('/',1)[-1]
+        if os.getenv('UPLOAD_WAVE_BOOTSTRAP_PENDING','').lower()=='true':
+            return app.jsonify(error='Wave deployment bootstrap is pending'),503
         if operation not in ('init','init-batch','finalize','finalize-batch','claim','claim-batch','client-processing'):
             return
         library,error=app._require_user_id()
         if error or not library:return
         try:
-            if not wave_policy.owned(app.jobs_table_client,library):return
+            if not wave_policy.owned(app.jobs_table_client,library):
+                if (os.getenv('UPLOAD_WAVE_NEW_LIBRARIES_ENABLED','').lower()=='true'
+                        and app.library_store is not None
+                        and app.library_store.get_library(library) is None):
+                    return app.jsonify(error='Library bootstrap is incomplete'),503
+                return
             if not wave_policy.configuration_ready():raise Conflict('Wave source capabilities are unavailable')
             store=ShadowWaves(app.jobs_table_client,library)
             wave_policy.require_capability(store,'upload')

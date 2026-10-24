@@ -118,17 +118,39 @@ jobs:
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Build and push
+        id: image
         uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
           push: true
           provenance: false
+          platforms: linux/amd64
           tags: |
             ${{ inputs.publish_latest && format('ghcr.io/{0}/photostore-{1}:latest', steps.owner.outputs.owner, matrix.name) || '' }}
             ghcr.io/${{ steps.owner.outputs.owner }}/photostore-${{ matrix.name }}:${{ github.sha }}
             ghcr.io/${{ steps.owner.outputs.owner }}/photostore-${{ matrix.name }}:${{ steps.ts.outputs.tag }}
             ${{ inputs.tag != '' && format('ghcr.io/{0}/photostore-{1}:{2}', steps.owner.outputs.owner, matrix.name, inputs.tag) || '' }}
+
+      - name: Record immutable release image
+        env:
+          RELEASE_IMAGE: ghcr.io/${{ steps.owner.outputs.owner }}/photostore-${{ matrix.name }}@${{ steps.image.outputs.digest }}
+          RELEASE_NAME: ${{ matrix.name }}
+          RELEASE_SOURCE: ${{ github.sha }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os
+          from pathlib import Path
+          Path('release-images').mkdir(exist_ok=True)
+          name = os.environ['RELEASE_NAME']
+          Path('release-images', name + '.json').write_text(json.dumps(dict(
+              name=name, image=os.environ['RELEASE_IMAGE'], sourceCommit=os.environ['RELEASE_SOURCE'])))
+          PYTHON
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wave-image-${{ matrix.name }}
+          path: release-images/*.json
 
       - name: Summary
         run: |
@@ -136,9 +158,37 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "ghcr.io/${{ steps.owner.outputs.owner }}/photostore-${{ matrix.name }}:${{ steps.ts.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "To roll your live deployment onto this exact, pinned image (recommended over :latest — see deploy/resources.bicep param docs):" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "az deployment group create -g <resource-group> -f deploy/resources.bicep \\" >> "$GITHUB_STEP_SUMMARY"
-          echo "  --parameters coreImage=ghcr.io/${{ steps.owner.outputs.owner }}/photostore-backend:${{ steps.ts.outputs.tag }} \\" >> "$GITHUB_STEP_SUMMARY"
-          echo "  --parameters webImage=ghcr.io/${{ steps.owner.outputs.owner }}/photostore-frontend:${{ steps.ts.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "After all image jobs and wave qualification pass, download the wave-release artifact." >> "$GITHUB_STEP_SUMMARY"
+          echo "Fresh deployment: see deploy/fresh-wave.md. Do not activate waves with a blank capability ID." >> "$GITHUB_STEP_SUMMARY"
+
+  wave-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wave-image-*
+          path: release-images
+          merge-multiple: true
+      - name: Qualify wave code in the exact backend image
+        run: |
+          BACKEND_IMAGE=$(python3 -c "import json; print(json.load(open('release-images/backend.json'))['image'])")
+          docker pull "$BACKEND_IMAGE"
+          docker run --rm --entrypoint sh \
+            -v "$PWD/backend/tests:/app/tests:ro" \
+            -v "$PWD/backend/scripts:/app/scripts:ro" \
+            -v "$PWD/deploy:/deploy:ro" \
+            "$BACKEND_IMAGE" -c 'python -m pytest tests/test_wave*.py tests/test_upload_wave*.py tests/test_fresh_wave*.py -q'
+      - name: Create tested release contract
+        run: python3 deploy/wave_release.py --image-dir release-images --source "${{ github.sha }}" --output wave-release.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wave-release
+          path: wave-release.json
+      - name: Deployment instructions
+        run: |
+          echo "Download wave-release.json and follow deploy/fresh-wave.md for a new sandbox." >> "$GITHUB_STEP_SUMMARY"
+          echo "The artifact binds all three immutable images and the exact wave capability ID." >> "$GITHUB_STEP_SUMMARY"

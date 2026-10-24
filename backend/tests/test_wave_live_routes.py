@@ -171,3 +171,12 @@ def test_partial_finalize_batch_replays_and_keeps_unadmitted_sources_publishable
     assert parent['resolvedCount']==2 and parent['state']=='closed'
     assert all(store._required(store.item_key('partial',k))['outcome']=='accepted' for k in 'ab')
     assert all(member['needsProjection'] for member in store._page('e!'+parent['waveId']+'!m!'))
+
+
+@pytest.mark.parametrize('path',['/upload/waves/protocol','/upload/init','/upload/finalize-batch'])
+def test_fresh_preparation_blocks_intake_instead_of_legacy_fallback(live_api,monkeypatch,path):
+    client,store,metadata,library=live_api
+    monkeypatch.setenv('UPLOAD_WAVE_BOOTSTRAP_PENDING','true')
+    response=client.get(path) if path.endswith('/protocol') else client.post(path,json={})
+    assert response.status_code==503
+    assert not metadata.rows
