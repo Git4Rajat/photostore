@@ -10,6 +10,7 @@ import argparse
 import json
 import subprocess
 import time
+from urllib.parse import quote
 
 ROLES = ('core','web','upload','vision','cluster','indexer','archive','recovery')
 PHASES = {'upload': set(), 'vision': {'vision'}, 'cluster': {'cluster'},
@@ -29,12 +30,24 @@ def collect(group,prefix,phase,entered_at,subscription):
         found=next((a for a in apps if a['name']==name),None)
         if not found:raise ValueError('Missing app inventory: '+role)
         scale=found['scale']
-        revisions=az('containerapp','revision','list','-g',group,'-n',name,'--subscription',subscription)
+        url=(f'https://management.azure.com/subscriptions/{subscription}/resourceGroups/{quote(group)}'
+             f'/providers/Microsoft.App/containerApps/{name}/revisions?api-version=2025-01-01')
         replicas=0
-        for revision in revisions:
-            if revision['properties'].get('active'):
-                replicas+=len(az('containerapp','replica','list','-g',group,'-n',name,
-                                 '--revision',revision['name'],'--subscription',subscription))
+        while True:
+            page=az('rest','--method','get','--url',url)
+            for revision in page['value']:
+                if revision['properties'].get('active'):
+                    # Replica-list can retain a stopped container as "Running".
+                    # The revision's count reflects ScaledToZero; missing is not zero.
+                    count=revision['properties'].get('replicas')
+                    if type(count) is not int or count<0:
+                        raise ValueError('Missing or invalid live replica count: '+name)
+                    replicas+=count
+            link=page.get('nextLink')
+            if not link:break
+            if not link.startswith(url.split('?')[0]+'?'):
+                raise ValueError('Revision pagination escaped app scope')
+            url=link
         roles[role]={'replicas':replicas,'min':scale.get('minReplicas',0),
                      'cooldown':scale.get('cooldownPeriod')}
     return dict(at=time.time(),phase=phase,enteredAt=entered_at,foreground=False,roles=roles)

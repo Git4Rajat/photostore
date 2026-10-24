@@ -1,5 +1,10 @@
 # Dev wave activation and canary — 2026-10-24
 
+Follow-up: the fixes were subsequently committed and deployed as `ff12cf0`.
+The six-photo retry passed source, positive-face assignment, publication and
+serving checks. See [the fixed canary audit](upload-wave-fixed-canary-2026-10-24.md)
+for the current outcome; the failed initial run below is historical evidence.
+
 **Result: activation worked, but the canary found two real integration defects.
 Wave execution and new-library enrollment were subsequently paused. The fixes
 are local and tested; they are not in the deployed images. Cloud qualification
