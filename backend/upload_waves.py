@@ -20,7 +20,7 @@ from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, Re
 from azure.data.tables import TableTransactionError, UpdateMode
 
 MAX_PAGE = 20
-MAX_RETRIES = 8
+MAX_RETRIES = 16
 EMPTY_DIGEST = hashlib.sha256(b'upload-wave-shadow-v1').hexdigest()
 
 
@@ -107,7 +107,7 @@ class ShadowWaves:
             # Immediate retries can repeatedly lose to another request on the
             # library control row. Yield with bounded jitter; still fail closed
             # after MAX_RETRIES rather than weakening the conditional commit.
-            time.sleep(random.uniform(0.001, min(0.05, 0.002 * (2 ** attempt))))
+            time.sleep(random.uniform(0.001, min(0.5, 0.002 * (2 ** attempt))))
 
     def _page(self, prefix, after='', *, size=MAX_PAGE):
         # RowKey range + service paging: never materialize an entire library.

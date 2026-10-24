@@ -86,3 +86,88 @@ def test_protocol_discovery_is_authenticated_library_scoped(live_api):
     assert live.json=={'protocol':'live'} and live.headers['Cache-Control']=='no-store'
     library[0]='old'
     assert client.get('/upload/waves/protocol').json=={'protocol':'legacy'}
+
+
+def test_finalize_contention_returns_retryable_response_not_tuple_500(live_api, monkeypatch):
+    from flask import Blueprint, Flask, jsonify
+    from routes.upload_wave_live import install
+    from upload_waves import Conflict
+    import upload_wave_shadow
+    _, store, metadata, _ = live_api
+    store.open_session('batch', 1)
+    store.register('batch', [dict(itemId='i', filename='a.jpg')])
+    bp = Blueprint('contention_upload', __name__)
+    install(bp)
+
+    @bp.route('/upload/finalize-batch', methods=['POST'])
+    def finalize():
+        return jsonify(results=[dict(complete=True, filename='a.jpg', duplicates=[])])
+
+    api = Flask('contention_test')
+    api.register_blueprint(bp)
+    def conflict(*args, **kwargs):
+        raise Conflict('Concurrent wave mutation; retry the request')
+    monkeypatch.setattr(upload_wave_shadow, 'resolve_source', conflict)
+    response = api.test_client().post('/upload/finalize-batch', json=dict(files=[dict(
+        filename='a.jpg', sha256='a'*64, waveSessionId='batch', waveItemId='i')]))
+    assert response.status_code == 503
+    assert response.json['code'] == 'wave_admission_retry'
+    assert not wave_policy.source_change_active()
+    assert wave_policy.finalization_check() is False
+
+
+def test_successful_replay_keeps_committed_outcome_and_source_fence(live_api):
+    from upload_waves import Conflict
+    from upload_wave_shadow import resolve_source
+    _, store, metadata, _ = live_api
+    store.open_session('batch', 2)
+    store.register('batch', [dict(itemId='a',filename='a.jpg'),dict(itemId='b',filename='b.jpg')])
+    for item in ('a','b'):
+        metadata.create_entity(dict(PartitionKey='u',RowKey=item+'.jpg',anonymousImageId=item,
+                                    processingRevision='r-'+item))
+    # First batch committed A, then lost the response before B was admitted.
+    first = resolve_source(store,metadata,'batch','a','accepted','a.jpg')
+    # Re-running dedup on a finalize retry can now report A as a duplicate.
+    replay = resolve_source(store,metadata,'batch','a','duplicate','a.jpg')
+    assert replay['resolvedCount'] == first['resolvedCount'] == 1
+    assert store._required(store.item_key('batch','a'))['outcome'] == 'accepted'
+    resolve_source(store,metadata,'batch','b','accepted','b.jpg')
+    assert store._required('session!batch')['resolvedCount'] == 2
+    assert store.status(first['waveId'])['memberCount'] == 2
+    metadata.rows['u','a.jpg']['processingRevision'] = 'changed'
+    with pytest.raises(Conflict, match='cannot be rebound'):
+        resolve_source(store,metadata,'batch','a','duplicate','a.jpg')
+
+
+def test_partial_finalize_batch_replays_and_keeps_unadmitted_sources_publishable(live_api, monkeypatch):
+    from flask import Blueprint, Flask, jsonify
+    from routes.upload_wave_live import install
+    from upload_waves import Conflict
+    import upload_wave_shadow
+    _, store, metadata, _ = live_api
+    store.open_session('partial', 2)
+    store.register('partial',[dict(itemId=k,filename=k+'.jpg') for k in 'ab'])
+    for k in 'ab':
+        metadata.create_entity(dict(PartitionKey='u',RowKey=k+'.jpg',anonymousImageId=k,processingRevision='r-'+k))
+    bp=Blueprint('partial_upload',__name__);install(bp)
+    @bp.route('/upload/finalize-batch',methods=['POST'])
+    def finalized():
+        # Sources already persisted; their hash index can report themselves.
+        return jsonify(results=[dict(complete=True,filename=k+'.jpg',duplicates=[dict(filename=k+'.jpg')]) for k in 'ab'])
+    api=Flask('partial_test');api.register_blueprint(bp)
+    original=upload_wave_shadow.resolve_source;fail=[True]
+    def resolve(store,table,session,item,*args):
+        if item=='b' and fail[0]:
+            fail[0]=False
+            raise Conflict('Concurrent wave mutation; retry the request')
+        return original(store,table,session,item,*args)
+    monkeypatch.setattr(upload_wave_shadow,'resolve_source',resolve)
+    body=dict(files=[dict(filename=k+'.jpg',sha256=k*64,waveSessionId='partial',waveItemId=k) for k in 'ab'])
+    client=api.test_client()
+    assert client.post('/upload/finalize-batch',json=body).status_code==503
+    assert store._required('session!partial')['resolvedCount']==1
+    assert client.post('/upload/finalize-batch',json=body).status_code==200
+    parent=store._required('session!partial')
+    assert parent['resolvedCount']==2 and parent['state']=='closed'
+    assert all(store._required(store.item_key('partial',k))['outcome']=='accepted' for k in 'ab')
+    assert all(member['needsProjection'] for member in store._page('e!'+parent['waveId']+'!m!'))

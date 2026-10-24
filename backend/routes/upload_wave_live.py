@@ -58,12 +58,20 @@ def install(blueprint):
             from routes.upload_wave_shadow import close_resolved_intake
             for binding,entry in zip(bindings,results):
                 if entry.get('error') or not entry.get('complete'):continue
+                # Finalization wrote this source's metadata, so it requires
+                # publication even if dedup finds identical bytes (including
+                # itself on a retry). No-write duplicate selections use the
+                # explicit resolve endpoint instead.
                 session=resolve_source(store,app.metadata_table_client,*binding,
-                    'duplicate' if entry.get('duplicates') else 'accepted',entry['filename'])
+                    'accepted',entry['filename'])
                 close_resolved_intake(store,session)
         except (AzureError,Conflict,ValueError):
             app.app.logger.exception('Wave finalize admission must be retried')
-            return app.jsonify(error='Wave source admission requires retry',code='wave_admission_retry'),503
+            # after_request hooks must return a Response, unlike route handlers.
+            retry=app.jsonify(error='Wave source admission requires retry',code='wave_admission_retry')
+            retry.status_code=503
+            retry.headers['Retry-After']='1'
+            return retry
         return response
 
     @blueprint.teardown_request

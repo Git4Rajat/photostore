@@ -422,3 +422,22 @@ def test_conflict_retries_yield_before_rereading_without_weakening_bounds(world,
         return 'committed'
     assert store._retry(competing_write) == 'committed'
     assert len(pauses) == 3 and all(0 < pause <= .05 for pause in pauses)
+
+
+def test_contention_beyond_old_retry_budget_can_finish_without_partial_writes(world, monkeypatch):
+    import upload_waves
+    store, table, _ = world
+    attempts, pauses = [], []
+    original = table.submit_transaction
+    monkeypatch.setattr(upload_waves.time, 'sleep', pauses.append)
+    def competing(ops):
+        attempts.append(1)
+        if len(attempts) <= 10:
+            raise ResourceModifiedError('busy library control row')
+        return original(ops)
+    monkeypatch.setattr(table, 'submit_transaction', competing)
+    result = store.open_session('after-contention', 0)
+    assert result['state'] == 'open'
+    assert len(attempts) == 12  # ten conflicts, directory create, intake commit
+    assert len(pauses) == 10 and all(0 < pause <= .5 for pause in pauses)
+    assert len(table.transactions) == 2  # directory registration, then atomic intake

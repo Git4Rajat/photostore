@@ -233,3 +233,20 @@ def test_supersession_recovers_after_generation_commit_before_successor_admissio
     successor=store._page('supersession!')[0]['successorWaveId']
     assert store.status(successor)['state']=='waiting_predecessor'
     assert store.status(successor)['memberCount']==1
+
+
+def test_live_admission_reuses_healthy_lease_without_control_write():
+    table=RuntimeTable();now=[1000.0]
+    store=active(table);store.clock=lambda:now[0]
+    store.open_session('s',1);store.register('s',[dict(itemId='i',filename='a.jpg')])
+    data=dict(filename='a.jpg',sha256='a'*64,waveSessionId='s',waveItemId='i')
+    policy.validate_admission(store,data,finalizing=True)
+    initial=store._required('control')['revision']
+    now[0]+=1
+    policy.validate_admission(store,data,finalizing=True)
+    assert store._required('control')['revision']==initial
+    with pytest.raises(Conflict):policy.validate_admission(store,dict(data,sha256='b'*64),finalizing=True)
+    now[0]+=500
+    policy.validate_admission(store,data,finalizing=True)
+    assert store._required('control')['revision']!=initial
+    assert store._required(store.item_key('s','i'))['finalizeLeaseUntil']==now[0]+600

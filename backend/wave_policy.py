@@ -132,6 +132,10 @@ def validate_admission(store,data,*,finalizing=False):
         if row.get('sourceHash'):
             if row['sourceHash']!=sha:raise Conflict('Upload reservation cannot change source bytes')
             if not finalizing:return
+            # Init already reserves ten minutes for this exact source. Avoid
+            # making every finalize/retry compete for the library control row
+            # just to extend an otherwise healthy reservation by a few seconds.
+            if row.get('finalizeLeaseUntil',0)-store.clock()>=120:return
         control=store._required('control')
         store._commit(control,[store._change(row,dict(row,sourceHash=sha,
             finalizeLeaseUntil=store.clock()+600 if finalizing else 0))])

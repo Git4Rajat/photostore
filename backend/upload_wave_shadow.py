@@ -40,6 +40,12 @@ def resolve_source(store, metadata_table, session, item, outcome, filename):
         return store.resolve(session, item, outcome=outcome)
     row = metadata_table.get_entity(store.library, filename)
     photo, revision, _qualified = source_identity(row)
+    previous = store._required(store.item_key(session, item))
+    if previous['outcome'] in ('accepted', 'duplicate'):
+        # Finalize retries can discover their own prior upload in the dedup
+        # index. Keep the committed classification; resolve still checks the
+        # complete photo/revision/filename/policy binding below.
+        outcome = previous['outcome']
     return store.resolve(session, item, outcome=outcome, filename=filename,
                          photo_id=photo, processing_revision=revision,
                          required_steps=required_steps_for_media(is_video_file(filename)))

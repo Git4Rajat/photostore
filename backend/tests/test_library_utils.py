@@ -89,6 +89,34 @@ def test_invite_expiry_and_revoke():
     assert s.pending_invite_count('owner') == 0
 
 
+
+def test_reinvite_after_revoke_keeps_old_link_invalid(monkeypatch):
+    now = [10000]
+    monkeypatch.setattr(library_utils, '_now', lambda: now[0])
+    s = make_store()
+    assert s.invite_send_allowed('owner')
+    old_token = s.create_invite(library_id='owner', email='friend@example.com',
+                                target_type='fresh', invited_by='owner')
+    old_invite = s.get_invite_by_token(old_token)
+    now[0] += 5
+    assert s.revoke_invite('owner', old_invite['RowKey'])
+    assert s.find_pending_invite_for_email('owner', 'FRIEND@example.com') is None
+    # Revocation must not bypass the email-send cooldown.
+    assert not s.invite_send_allowed('owner')
+    now[0] = 10030
+    assert s.invite_send_allowed('owner')
+    new_token = s.create_invite(library_id='owner', email='FRIEND@example.com',
+                                target_type='fresh', invited_by='owner')
+    assert new_token != old_token
+    replacement = s.get_invite_by_token(new_token)
+    assert replacement['emailNorm'] == 'friend@example.com'
+    assert replacement['RowKey'] != old_invite['RowKey']
+    assert s.get_invite_by_token(old_token) is None
+    assert s.pending_invite_count('owner') == 1
+    s.mark_invite_accepted(replacement)
+    assert s.get_invite_by_token(new_token) is None
+    assert s.get_invite_by_token(old_token) is None
+
 def test_capacity_cap_counts_members_and_pending():
     s = make_store()
     s.create_user(email='o@x.com', user_id='o', password_hash='h')
