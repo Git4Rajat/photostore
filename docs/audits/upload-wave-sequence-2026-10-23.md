@@ -226,3 +226,10 @@ Azure inventory is verified and missing deployment wiring is implemented with
 activation still default off. The existing dev deployment cannot exercise the
 new flow yet. Actual cloud qualification awaits the environment choice and a
 source-bound candidate deployment; it is not marked complete.
+
+## Approved dev deployment
+
+The [initial dev rollout](upload-wave-dev-rollout-2026-10-24.md) is deployed and
+verified in `forenklaprep1-dev-rg`: all eight app revisions ready, Indexer worker
+running, scheduled recovery host and approved scoped permissions present.
+Wave execution/enrollment remain disabled; item 6 still requires canary evidence.

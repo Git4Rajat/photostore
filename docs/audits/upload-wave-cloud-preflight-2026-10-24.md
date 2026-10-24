@@ -172,3 +172,11 @@ The completed working-tree source is published on a qualification branch; the
 previous automatic-review rejection remains a historical event, not a denial of
 this later authorization. Image publication and Azure deployment are separate
 follow-on actions and have not been performed by the commit/push step.
+
+## Approved initial rollout completed
+
+The user explicitly approved the exact app/job/storage-role changes. The initial
+rollout of commit `805b50c` has now succeeded and live verification passed; see
+[the dev rollout audit](upload-wave-dev-rollout-2026-10-24.md). Execution and
+enrollment remain disabled. The earlier pending/rejection sections are
+historical, and cloud canary qualification remains incomplete.

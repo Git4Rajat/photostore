@@ -4764,6 +4764,11 @@ def touch_user_search_indexes_state(
     function, so hooking in here instead of at each call site individually
     is the same "can't drift apart" reasoning as the rest of this
     docstring."""
+    from wave_policy import source_change_active
+    if source_change_active() and _CTX.get('wave_owned') and _CTX['wave_owned'](user_id):
+        # Wave publication covers these source changes after Vision/clustering.
+        # Legacy dirty-manifest writes can poison the current stage's guard.
+        return
     touch_user_vector_index_state(user_id, embedding_version=embedding_version)
     touch_user_lexical_index_state(user_id)
     touch_user_tag_embedding_index_state(user_id)
@@ -9803,6 +9808,11 @@ def _apply_client_processing_results(
                 # preserve-and-flag 'failed' path below instead of claiming the
                 # photo has no faces. Genuine runtime failures
                 # (postprocessing_failed) also still fall through to 'failed'.
+                if fenced_derivatives:
+                    # This terminal empty result still needs an attempt-bound
+                    # lookup for the source receipt. The init-time empty lookup
+                    # cannot prove what this processing generation examined.
+                    _store_client_face_entities(user_id, filename, [], force_reconcile=False)
                 metadata['faces'] = '[]'
                 status_updates['faceCount'] = 0
                 status_updates['face_status'] = 'no_data'

@@ -74,6 +74,36 @@ def test_empty_face_lookup_is_explicit_and_missing_lookup_cannot_qualify(blobs):
         assert receipts.capture(storage_utils, row)
 
 
+def test_quality_rejected_face_result_publishes_qualified_empty_lookup(blobs, monkeypatch):
+    """A completed quality rejection must carry proof, not the init-time lookup."""
+    (metadata, _, _, lookup, _), _ = blobs
+    row = metadata.rows['lib', 'photo.jpg']
+    terminal(row)
+    row['face_status'] = 'running'
+    # Upload initialization's empty lookup predates the processing attempt.
+    storage_utils._store_client_face_entities('lib', 'photo.jpg', [])
+    assert not lookup.get_entity('lib', 'photo.jpg').get('sourcePhotoId')
+    receipts = ArtifactReceipts(AtomicTable(), 'lib')
+    monkeypatch.setenv('UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED', 'true')
+    monkeypatch.setitem(storage_utils._CTX, 'embeddings_table_client', None)
+    monkeypatch.setitem(storage_utils._CTX, 'source_completion_delivery', None)
+    monkeypatch.setitem(storage_utils._CTX, 'source_artifact_receipt_capture',
+                        lambda library, candidate: receipts.capture(storage_utils, candidate))
+    monkeypatch.setattr(storage_utils, '_refresh_semantic_fields', lambda *a: None)
+    result = storage_utils.apply_client_processing_results_for_file(
+        'lib', 'photo.jpg', origin='ipworker', claimed_steps=['face'],
+        lease_owner='owner', expected_processing_revision='rev', expected_processing_fence='attempt',
+        client_processing={'face': dict(hasData=False, faces=[], rawFaceCount=1,
+            filteredFaceCount=1, faceFailureStage='quality_filter_rejected',
+            filteredReason='landmark_detection_failed')})
+    assert result['face_status'] == 'no_data' and result['faceCount'] == 0
+    published = lookup.get_entity('lib', 'photo.jpg')
+    assert published['state'] == 'complete' and json.loads(published['faceIds']) == []
+    assert published['sourcePhotoId'] == 'photo' and published['processingRevision'] == 'rev'
+    assert published['processingFence'] == 'attempt'
+    assert result['artifactReceipt']
+
+
 def test_receipt_storage_outage_preserves_completed_outputs_and_retries_without_models(blobs, monkeypatch):
     import base64
     from test_processing_artifacts import jpeg

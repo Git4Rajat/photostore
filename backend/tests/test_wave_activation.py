@@ -30,6 +30,28 @@ def test_enrollment_requires_certificate_and_new_empty_library(monkeypatch):
     with pytest.raises(Conflict):policy.enroll_new(table,'existing',metadata)
 
 
+@pytest.mark.parametrize('owned,source_change', [(True, True), (True, False), (False, True)])
+def test_wave_source_commit_defers_legacy_dirty_manifests_but_crud_does_not(monkeypatch, owned, source_change):
+    import storage_utils as storage
+    touched = []
+    monkeypatch.setitem(storage._CTX, 'wave_owned', lambda library: owned)
+    for name in ('vector', 'lexical', 'tag_embedding', 'sort', 'access'):
+        monkeypatch.setattr(storage, 'touch_user_' + name + '_index_state',
+                            lambda *a, _name=name, **k: touched.append(_name))
+    monkeypatch.setattr(storage, '_mark_search_index_dirty_filenames',
+                        lambda *a, **k: touched.append('dirty_files'))
+    monkeypatch.setattr(storage, 'sort_index_skipped', lambda library: False)
+    def touch():
+        storage.touch_user_search_indexes_state('u', filenames='photo.jpg')
+    if source_change:
+        policy.source_change(touch)()
+    else:
+        touch()
+    assert bool(touched) is not (owned and source_change)
+    if touched:
+        assert 'tag_embedding' in touched and 'dirty_files' in touched
+
+
 def test_reservation_cannot_change_source_or_accept_an_old_client():
     table=RuntimeTable();store=active(table)
     store.open_session('s',1);store.register('s',[dict(itemId='i',filename='a.jpg')])
