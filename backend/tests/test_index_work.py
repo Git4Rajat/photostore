@@ -66,7 +66,9 @@ class EtagTable:
             rows = [row for row in rows if row.get('libraryId') == library]
         if 'failed eq false' in query:
             rows = [row for row in rows if not row.get('failed')]
-        for field in ('leaseUntil', 'wakeUntil'):
+        if 'failed eq true' in query:
+            rows = [row for row in rows if row.get('failed')]
+        for field in ('leaseUntil', 'wakeUntil', 'requestedAt', 'failedAt'):
             match = re.search(rf'{field} le ([0-9.]+)', query)
             if match:
                 rows = [row for row in rows if float(row.get(field) or 0) <= float(match[1])]

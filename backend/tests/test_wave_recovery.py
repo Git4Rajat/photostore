@@ -194,3 +194,40 @@ def test_live_stage_lease_is_not_reported_as_an_unsent_handoff():
     leases.claim('a',wave['waveId'],'vision','revision')
     after=metrics(store,wave)
     assert after['handoff_pending_count']==0 and after['stage_lease_active']
+
+
+def test_abandonment_continues_past_twenty_items_and_dispatches(monkeypatch):
+    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED','true')
+    table=RuntimeTable();now=[1000.0];store=ShadowWaves(table,'a',clock=lambda:now[0])
+    opened=store.open_session('s',21)
+    for start,end in ((0,20),(20,21)):
+        store.register('s',[dict(itemId=f'i{i:02}',filename=f'{i}.jpg') for i in range(start,end)])
+    now[0]+=4000;sent=[]
+    recover_library(table,'a',lambda *a:sent.append(a),clock=lambda:now[0])
+    assert store._required(store.session_key('s'))['resolvedCount']==20
+    recover_library(table,'a',lambda *a:sent.append(a),clock=lambda:now[0])
+    assert store._required(store.session_key('s'))['state']=='abandoned'
+    assert store.status(opened['waveId'])['openSessions']==0 and sent
+
+
+def test_session_survey_resumes_after_closed_history(monkeypatch):
+    from wave_recovery import _reap_stale_sessions
+    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED','true')
+    table=RuntimeTable();now=[1000.0];store=ShadowWaves(table,'a',clock=lambda:now[0])
+    for i in range(40):
+        opened=store.open_session(f'a{i:02}',0);close(store,f'a{i:02}',opened)
+    store.open_session('z',1);now[0]+=4000
+    for _ in range(2):
+        _reap_stale_sessions(store,'a',lambda:now[0],lambda **kw:None,deadline=now[0]+100)
+    assert store._required(store.session_key('z'))['state']=='abandoned'
+
+
+def test_dispatch_cooldown_starts_when_it_failed_not_when_requested(monkeypatch):
+    from upload_wave_execution import stage_work_store,revive_stale_failed_dispatches
+    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED','true')
+    table=RuntimeTable();now=[1000.0];work=stage_work_store(table,clock=lambda:now[0])
+    key=work.request('a','wave-vision:w:key');now[0]+=4000
+    work.finish(work.claim(key),failed=True)
+    assert revive_stale_failed_dispatches(work,ShadowWaves(table,'a'),clock=lambda:now[0])==0
+    now[0]+=3601
+    assert revive_stale_failed_dispatches(work,ShadowWaves(table,'a'),clock=lambda:now[0])==1

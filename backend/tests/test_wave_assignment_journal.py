@@ -430,3 +430,24 @@ def test_progress_reports_only_the_applied_prefix(monkeypatch):
     monkeypatch.setattr(wave,'run_frozen_assignment',runner)
     execute(h,snapshots,store,frozen,leases,page_size=2)
     assert recorded==[2,4,6,8,9]
+
+
+@pytest.mark.parametrize('after_decision',[False,True])
+def test_foreground_face_curation_is_witnessed_without_overwriting_or_stalling(after_decision,monkeypatch):
+    h,snapshots,store,frozen,leases=setup()
+    if after_decision:
+        original=wave._apply
+        def interrupt(*args):raise OSError('before materialization')
+        with monkeypatch.context() as patch:
+            patch.setattr(wave,'_apply',interrupt)
+            with pytest.raises(OSError):execute(h,snapshots,store,frozen,leases)
+    h.faces.rows['u','a'].update(reviewStatus='confirmed',personId='alice',rejected=False)
+    h.faces.versions['u','a']+=1
+    first=execute(h,snapshots,store,frozen,leases)
+    assert h.faces.rows['u','a']['reviewStatus']=='confirmed'
+    assert h.faces.rows['u','a']['personId']=='alice'
+    journal=wave.WaveAssignmentJournal(store,frozen['waveId'],lambda:None)
+    override=journal.get('curation!000000000000')
+    assert override and override['outcome']=='curated' and override['originalDecisionId']
+    for table in (h.faces,h.people,h.members):table.after_write=lambda row:pytest.fail('reapplied curation')
+    assert execute(h,snapshots,store,frozen,leases)==first

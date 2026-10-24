@@ -322,3 +322,46 @@ def test_watchdog_recycles_blocked_tasks_without_ack_or_thread_replacement(monke
     assert len(executors) == (1 if phase == 'rollback_photo' else 2)
     assert all(ex.shutdown_calls == [{'wait': False, 'cancel_futures': True}] for ex in executors)
     assert 'ipwork watchdog timeout' in caplog.text
+
+def test_wave_source_progress_extends_watchdog_and_ack_uses_renewed_receipt(monkeypatch):
+    now=[0.0];futures=[];renewals=[];acked=[];exits=[]
+    msg=SimpleNamespace(id='wave',pop_receipt='initial',dequeue_count=1,
+        content=json.dumps(dict(type='upload_wave_stage',userId='u',waveId='w',stage='vision')))
+    class Queue:
+        received=False
+        def create_queue(self):pass
+        def receive_messages(self,**kw):
+            if self.received:return []
+            self.received=True;return [msg]
+        def update_message(self,message,**kw):
+            renewals.append(message.pop_receipt)
+            return SimpleNamespace(id=message.id,pop_receipt='renewed-'+str(len(renewals)),dequeue_count=1)
+        def delete_message(self,message):acked.append(message.pop_receipt)
+    class Executor:
+        def __init__(self,**kw):pass
+        def submit(self,function,*args):
+            function(*args)
+            future=Future();futures.append(future);return future
+        def shutdown(self,**kw):pass
+    queue=Queue();_prepare_queue(monkeypatch,queue)
+    monkeypatch.setattr(app,'ThreadPoolExecutor',Executor)
+    monkeypatch.setattr(app,'IPWORKER_TASK_TIMEOUT_SECONDS',120)
+    monkeypatch.setattr(app,'IPWORKER_VISIBILITY_TIMEOUT_SECONDS',300)
+    monkeypatch.setattr(app,'IPWORKER_CONCURRENCY',1)
+    monkeypatch.setattr(app.time,'monotonic',lambda:now[0])
+    monkeypatch.setattr(app.time,'sleep',lambda *a:(_ for _ in ()).throw(_StopLoop()))
+    monkeypatch.setattr(app.os,'_exit',exits.append)
+    def process(message):
+        now[0]=90;app._ipwork_metrics_context.wave_progress()
+        return 'done'
+    waits=[0]
+    def wait(pending,**kw):
+        waits[0]+=1
+        if waits[0]==1:now[0]=150;return set(),set(pending)
+        now[0]=160
+        for future in pending:future.set_result('done')
+        return set(pending),set()
+    monkeypatch.setattr(app,'_process_ipwork_message',process)
+    monkeypatch.setattr(app,'wait',wait)
+    with pytest.raises(_StopLoop):app.run_ipworker()
+    assert not exits and renewals and acked==['renewed-'+str(len(renewals))]

@@ -13,7 +13,7 @@ from upload_waves import ShadowWaves, digest
 from execution_lease import ExecutionLeases
 from wave_policy import source_change
 from upload_wave_execution import (execution_enabled,stage_work_store,run_vision_release,
-    run_cluster_release,run_index_release,release_and_relay)
+    run_cluster_release,run_index_release,release_and_relay,advance_wave)
 
 TYPE='upload_wave_stage'
 ROLES={'vision':'vision','cluster':'cluster','index':'index-worker'}
@@ -88,7 +88,36 @@ def process_source(library,filename,revision,renew):
             expected_processing_fence=lease['entity']['processingFence'])
 
 
-def consume(payload):
+def invalidate_wave_tags(storage,library):
+    """Restore Vision-owned tag freshness suppressed by wave source writes."""
+    storage._clear_manifest_dirty_flag(library,'tag_embedding')
+    version=storage.touch_user_tag_embedding_index_state(library)
+    if storage._tag_embedding_index_container_name():
+        manifest=storage._load_tag_embedding_index_manifest(library)
+        if not version or manifest.get('sourceVersion')!=version:
+            raise RuntimeError('Wave tag invalidation was not durably published')
+
+
+def relay_successor(work,store,wave_id,send):
+    """Wake the direct successor; scheduled recovery also covers lost sends."""
+    from itertools import islice
+    query=(f"PartitionKey eq '{store.partition}' and RowKey ge 'wave!' and RowKey lt 'wave!~' "
+           f"and predecessorWaveId eq '{wave_id}'")
+    for successor in islice(store.table.query_entities(query,results_per_page=1),1):
+        wave,_=advance_wave(work,store,store.library,successor['waveId'])
+        relay_current(work,store,wave,send)
+
+
+def relay_current(work,store,wave,send):
+    state=wave['state'];wave_id=wave['waveId']
+    stage=('vision' if state in ('processing_pending','processing') else
+           'cluster' if state=='ready' else 'index' if state=='indexing' else None)
+    key=(wave.get('visionPendingKey') if stage=='vision' else
+         'shadow-cluster!'+wave_id if stage=='cluster' else wave.get('indexPendingKey'))
+    if stage and key:release_and_relay(work,store,store.library,key,stage,send)
+
+
+def consume(payload,*,deadline=None,progress=None):
     if not execution_enabled(): return 'noop'
     import app
     import storage_utils as storage
@@ -122,12 +151,21 @@ def consume(payload):
         # Dispatcher bookkeeping is renewed separately from stage ownership.
         with publication(work,claim):
             if stage=='vision':
+                def invalidate_tags():
+                    # Wave source writes bypass legacy invalidation. Vision's
+                    # model-owned sweep must not reuse a clean, older tag set.
+                    invalidate_wave_tags(storage,library)
                 result=run_vision_release(leases,work,store,library,wave_id,key,
-                    app.metadata_table_client,None,None,send_stage,process_source=process_source)
+                    app.metadata_table_client,None,None,send_stage,process_source=process_source,
+                    deadline=deadline,progress=progress,before_freeze=invalidate_tags)
             elif stage=='cluster':
-                result=run_cluster_release(leases,store,library,wave_id,key,
-                    assigner=app._get_live_faiss_assigner(),journal=None,obligations_table=store.table,
-                    face_table=None,face_ids=None)
+                # Bounded zero-face probes continue on Cluster wakes without
+                # loading FAISS. The release remains eligible while probing.
+                result,_=advance_wave(work,store,library,wave_id)
+                if result['state']=='ready' and not result.get('zeroFaceProbePending'):
+                    result=run_cluster_release(leases,store,library,wave_id,key,
+                        assigner=app._get_live_faiss_assigner(),journal=None,obligations_table=store.table,
+                        face_table=None,face_ids=None)
             else:
                 ledger=ObligationLedger(store.table,wave_id,library=library,
                     frozen_revision=wave['frozenRevision'],assignment_revision=wave.get('assignmentReceiptId',''))
@@ -146,16 +184,16 @@ def consume(payload):
                 from index_publication import catalog_serialization
                 with catalog_serialization(store.table,library,app.blob_service_client,app.BLOB_LEXICAL_INDEX_CONTAINER):
                     result=run_index_release(leases,store,library,wave_id,key,ledger,publisher=publish,prepare=prepare)
-        if result and result['state'] in ('processing_pending','processing'):
-            work.release(claim,deferred=True)
+        if result and result['state'] in ('processing_pending','processing','ready'):
+            work.release(claim,deferred=True,retry_delay=5)
         else:
             work.finish(claim)
         current=store._required(store.wave_key(wave_id))
-        if current['state']=='indexing':
-            release_and_relay(work,store,library,current['indexPendingKey'],'index',send_stage)
+        relay_current(work,store,current,send_stage)
         if current['state']=='complete':
             import index_events
             index_events.publish(library,'wave',current['completionReceiptId'])
+            relay_successor(work,store,wave_id,send_stage)
         return 'done'
     except Exception:
         try: work.release(claim)

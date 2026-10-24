@@ -152,7 +152,7 @@ def inventory(r,pending):
     c=container('wave-recovery');c['command']=['python','-u','-m','wave_recovery']
     c['env']+= [dict(name='UPLOAD_WAVE_RECOVERY_ENABLED',value=str(not pending).lower()),
         dict(name='UPLOAD_WAVE_BOOTSTRAP_VISION_IMAGE',value=r['images']['ipworker'])]
-    job=dict(properties=dict(configuration=dict(triggerType='Manual'),
+    job=dict(properties=dict(configuration=dict(triggerType='Schedule',scheduleTriggerConfig=dict(cronExpression='*/5 * * * *')),
         template=dict(containers=[c])))
     return apps,job
 
@@ -249,3 +249,10 @@ def test_activation_waits_for_durable_bootstrap(monkeypatch,tmp_path,bootstrap_s
         fresh_wave.main()
         assert events==['test-wave-bootstrap','certificate-Succeeded','test-wave-activate']
         assert json.loads((output/'state.json').read_text())['phase']=='verified'
+
+
+def test_inventory_rejects_manual_recovery_without_an_idle_repair_schedule():
+    r=release();apps,job=inventory(r,False)
+    job['properties']['configuration']['triggerType']='Manual'
+    with pytest.raises(RuntimeError,match='Recovery/bootstrap job mismatch'):
+        fresh_wave.verify_inventory(apps,job,r,False)

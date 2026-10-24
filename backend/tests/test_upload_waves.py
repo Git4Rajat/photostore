@@ -62,7 +62,8 @@ class AtomicTable:
         with self.lock:
             return iter([Entity(row, self.versions[key]) for key, row in sorted(self.rows.items())
                          if key[0] == pk and lower <= key[1] < upper
-                         and (not after_match or key[1] > after_match[1])][:results_per_page])
+                         and (not after_match or key[1] > after_match[1])
+                         and ("predecessorWaveId eq '" not in query or row.get('predecessorWaveId') == re.search(r"predecessorWaveId eq '([^']+)'", query)[1])][:results_per_page])
 
 
 @pytest.fixture

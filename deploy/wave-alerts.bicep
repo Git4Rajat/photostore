@@ -3,19 +3,18 @@ param appName string
 param location string
 param workspaceId string
 param enabled bool = false
-// wave_recovery/wave_recovery_error telemetry now comes from two sources:
-// the '-upload' app's opportunistic per-event nudge (routes/upload_wave_shadow.py's
-// _maybe_recover_stuck_stages, the common case) and the '-wave-recovery' job
-// (only when an operator manually runs it via `containerapp job start`). There
-// is no longer a fixed cadence to be "missing" from -- the job is Manual-
-// triggered, not Scheduled -- so the old wave-recovery-missing heartbeat-
-// absence alert was removed rather than left to permanently false-positive.
+// Recovery telemetry comes from both the scheduled bounded job and upload nudges.
 var base = '''
 ContainerAppConsoleLogs_CL
 | where ContainerAppName_s in ('${appName}-wave-recovery', '${appName}-upload')
 | extend d = parse_json(extract(@'processing telemetry (\{.*\})', 1, Log_s))
 '''
 var rules = [
+  {
+    name: 'wave-recovery-missing'
+    query: '${base}\n| where tostring(d.event) == \'wave_recovery_run\' and tostring(d.disabled) != \'true\'\n| summarize runs=count()\n| where runs == 0'
+    operator: 'GreaterThan'
+  }
   {
     name: 'wave-stalled'
     query: '${base}\n| where tostring(d.event) == \'wave_recovery\'\n| summarize arg_max(TimeGenerated, *) by tostring(d.library_id), tostring(d.wave_id)\n| where (tostring(d.state) == \'collecting\' and todouble(d.no_progress_seconds) > 86400) or (tostring(d.state) == \'waiting_predecessor\' and todouble(d.state_age_seconds) > 7200) or ((toint(d.outstanding_leases) > 0 or toint(d.outstanding_members) > 0) and todouble(d.barrier_wait_seconds) > 1800) or (toint(d.handoff_pending_count) > 0 and todouble(d.handoff_age_seconds) > 900) or todouble(d.stage_no_progress_seconds) > 1800 or toint(d.dispatch_failed_count) > 0'

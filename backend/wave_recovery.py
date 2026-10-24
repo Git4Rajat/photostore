@@ -26,37 +26,52 @@ DIRECTORY='upload-wave-directory'
 STALE_SESSION_SECONDS=3600
 
 
-def _reap_stale_sessions(store,library,clock,emit,*,deadline,pages=2):
-    """Abandon sessions nothing is ever going to finish, so their wave can
-    advance instead of sitting in 'collecting' forever. Bounded and
-    best-effort: a session still genuinely in flight (recent wave progress,
-    or a finalize lease in flight per abandon()'s own guard) is left alone.
-    """
+def _reap_stale_sessions(store,library,clock,emit,*,deadline,pages=2,work=None,send=None):
+    """Resume both the session survey and paged abandonment durably."""
     from wave_settlement import abandon
-    reaped=0;after=''
+    cursor_key='session-recovery-cursor'
+    saved=store._get(cursor_key)
+    after=(saved or {}).get('after','')
+    def checkpoint(value):
+        def commit():
+            old=store._get(cursor_key)
+            store.table.submit_transaction([store._change(old,store._row(cursor_key,after=value)),
+                *store._policy_guard()])
+        store._retry(commit)
+    reaped=0
     for _ in range(pages):
         if clock()>=deadline:break
         rows=store._page('session!',after)
-        if not rows:break
+        if not rows:
+            checkpoint('');break
         for row in rows:
-            if clock()>=deadline:break
+            if clock()>=deadline:return reaped
+            previous=after
+            if row.get('state')=='open':
+                wave=store._get(store.wave_key(row['waveId']))
+                last=wave.get('lastProgressAt',wave.get('createdAt',0)) if wave else clock()
+                if row.get('abandoning') or clock()-last>=STALE_SESSION_SECONDS:
+                    try:
+                        result=abandon(store,row['sessionId'],row['manifestRevision'],
+                            reason=row.get('abandonReason') or f'Auto-abandoned: no activity for over {STALE_SESSION_SECONDS}s')
+                        if result.get('abandonmentNeedsMore'):
+                            checkpoint(previous)  # Resume this parent's next page.
+                            return reaped
+                        reaped+=1
+                        emit(event='wave_session_abandoned',library_id=digest(library),
+                            session_id=digest(row['sessionId']),wave_id=row['waveId'])
+                        if work is not None and send is not None:
+                            from wave_runtime import relay_current,relay_successor
+                            wave,_=advance_wave(work,store,library,row['waveId'])
+                            relay_current(work,store,wave,send)
+                            if wave['state']=='complete':relay_successor(work,store,wave['waveId'],send)
+                    except Exception as error:
+                        emit(event='wave_session_reap_skipped',library_id=digest(library),
+                            session_id=digest(row['sessionId']),reason=type(error).__name__)
             after=row['RowKey']
-            if row.get('state')!='open' or row.get('abandoning'):continue
-            wave=store._get(store.wave_key(row['waveId']))
-            last=wave.get('lastProgressAt',wave.get('createdAt',0)) if wave else 0
-            if clock()-last<STALE_SESSION_SECONDS:continue
-            try:
-                abandon(store,row['sessionId'],row['manifestRevision'],
-                    reason=f'Auto-abandoned: no activity for over {STALE_SESSION_SECONDS}s')
-                reaped+=1
-                emit(event='wave_session_abandoned',library_id=digest(library),
-                    session_id=digest(row['sessionId']),wave_id=row['waveId'])
-            except Exception as error:
-                # A finalize lease still in flight, or someone closed/abandoned
-                # it a moment ago -- both fine, not a real failure to report.
-                emit(event='wave_session_reap_skipped',library_id=digest(library),
-                    session_id=digest(row['sessionId']),reason=type(error).__name__)
-        if len(rows)<20:break
+            checkpoint(after)
+        if len(rows)<20:
+            checkpoint('');break
     return reaped
 
 
@@ -158,7 +173,7 @@ def recover_library(table,library,send,*,after='',wave_pages=2,release_limit=100
                 if not paused:wave,_=advance_wave(work,store,library,wave['waveId'])
                 state=wave['state']
                 destination=('vision' if state in ('processing_pending','processing') else
-                             'cluster' if state=='ready' and not wave.get('zeroFaceProbePending') else 'index' if state=='indexing' else None)
+                             'cluster' if state=='ready' else 'index' if state=='indexing' else None)
                 if paused:destination=None
                 key=(wave.get('visionPendingKey') if destination=='vision' else
                      'shadow-cluster!'+wave['waveId'] if destination=='cluster' else wave.get('indexPendingKey'))
@@ -181,7 +196,7 @@ def recover_library(table,library,send,*,after='',wave_pages=2,release_limit=100
             revived=revive_stale_failed_dispatches(work,store,clock=clock)
             if revived:emit(event='wave_dispatch_revived',library_id=digest(library),count=revived)
             recover_releases(work,store,send,limit=release_limit)
-            _reap_stale_sessions(store,library,clock,emit,deadline=deadline)
+            _reap_stale_sessions(store,library,clock,emit,deadline=deadline,work=work,send=send)
         if cleanup_send is not None and clock()<deadline:
             from processing_cleanup import relay_artifact_cleanup
             relay_artifact_cleanup(table,library,cleanup_send)

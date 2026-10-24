@@ -16824,7 +16824,15 @@ def _process_ipwork_message_impl(message) -> str:
             user_id = str(payload.get('user_id') or payload.get('userId') or '').strip()
             if payload.get('type') == 'upload_wave_stage':
                 from wave_runtime import consume
-                return consume(payload)
+                # Same budget the ipwork watchdog below uses to decide when to
+                # kill a stuck task -- minus a safety margin, so a large wave
+                # voluntarily checkpoints and returns before the watchdog can
+                # kill this whole message mid-pass (which would otherwise burn
+                # one of the stage's 5 delivery attempts on a wave that was
+                # simply too large, not actually stuck).
+                task_limit = min(IPWORKER_TASK_TIMEOUT_SECONDS, max(1, IPWORKER_VISIBILITY_TIMEOUT_SECONDS - 30))
+                return consume(payload, deadline=time.monotonic() + max(0.1, task_limit - 20),
+                    progress=getattr(_ipwork_metrics_context, 'wave_progress', None))
             if _library_cut_over_to_waves(user_id):
                 return 'noop'
             if dequeue_count > IPWORKER_MAX_RETRIES:
@@ -17155,6 +17163,8 @@ def run_ipworker() -> None:
     batch_received_at = None
     in_flight = {}  # future -> message
     task_started = {}
+    task_progress = {}  # Progress at source/page boundaries, never lease heartbeats.
+    wave_receipts = {}  # future -> last queue visibility renewal
     task_receipts = {}  # bounded by executor slots, monotonic timestamps only
     throughput = _IpworkThroughputWindow()
     processing_diagnostics.ready('vision', concurrency=IPWORKER_CONCURRENCY,
@@ -17169,12 +17179,15 @@ def run_ipworker() -> None:
         collector.state(active_delta=1)
         previous = getattr(_ipwork_metrics_context, 'collector', None)
         _ipwork_metrics_context.collector = collector
+        previous_progress = getattr(_ipwork_metrics_context, 'wave_progress', None)
+        _ipwork_metrics_context.wave_progress = lambda: task_progress.__setitem__(message.id, time.monotonic())
         try:
             return _process_ipwork_message(message)
         finally:
             collector.observe('task', (time.monotonic() - started) * 1000)
             collector.state(active_delta=-1)
             _ipwork_metrics_context.collector = previous
+            _ipwork_metrics_context.wave_progress = previous_progress
 
     def prepare_measured(messages, cancelled):
         started = time.monotonic()
@@ -17251,9 +17264,22 @@ def run_ipworker() -> None:
                 # never detach a writer and ACK its message. Incomplete filename
                 # generations/processing leases expire; receipts redeliver.
                 now = time.monotonic()
+                # A healthy wave can finish its last source after its soft
+                # yield budget. Renew its queue receipt on the polling thread;
+                # acknowledgement must use the newest pop receipt.
+                for future, renewed_at in list(wave_receipts.items()):
+                    if not future.done() and now-renewed_at >= min(30, IPWORKER_VISIBILITY_TIMEOUT_SECONDS/3):
+                        current=in_flight[future]
+                        try:
+                            renewed=queue_client.update_message(current,visibility_timeout=IPWORKER_VISIBILITY_TIMEOUT_SECONDS)
+                            renewed.content=current.content
+                            in_flight[future]=renewed
+                            wave_receipts[future]=now
+                        except Exception:
+                            worker_logger.exception('Failed to renew wave Vision queue receipt')
                 stuck_preparation = preparing is not None and now >= prepare_deadline + 20
                 task_limit = min(IPWORKER_TASK_TIMEOUT_SECONDS, max(1, IPWORKER_VISIBILITY_TIMEOUT_SECONDS - 30))
-                stuck_tasks = sum(not future.done() and now - started >= task_limit
+                stuck_tasks = sum(not future.done() and now - max(started, task_progress.get(in_flight[future].id, started)) >= task_limit
                                   for future, started in task_started.items())
                 if stuck_preparation or stuck_tasks:
                     throughput.record('watchdog_preparation', count=int(stuck_preparation))
@@ -17283,6 +17309,9 @@ def run_ipworker() -> None:
                         future = executor.submit(process_measured, message, wave_receipt_at)
                         in_flight[future] = message
                         task_started[future] = submitted_at
+                        try:
+                            if json.loads(message.content).get('type')=='upload_wave_stage':wave_receipts[future]=submitted_at
+                        except (ValueError,TypeError,AttributeError):pass
                         task_receipts[future] = wave_receipt_at
 
                 # Only fetch as many new messages as there are free worker
@@ -17351,6 +17380,9 @@ def run_ipworker() -> None:
                             future = executor.submit(process_measured, message, received_at)
                             in_flight[future] = message
                             task_started[future] = submitted_at
+                            try:
+                                if json.loads(message.content).get('type')=='upload_wave_stage':wave_receipts[future]=submitted_at
+                            except (ValueError,TypeError,AttributeError):pass
                             task_receipts[future] = received_at
 
                 if not in_flight and preparing is None and not ready:
@@ -17397,6 +17429,8 @@ def run_ipworker() -> None:
                         continue
                     message = in_flight.pop(future)
                     task_started.pop(future, None)
+                    task_progress.pop(message.id, None)
+                    wave_receipts.pop(future, None)
                     received_at = task_receipts.pop(future)
                     try:
                         outcome = future.result()

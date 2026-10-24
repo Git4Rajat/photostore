@@ -201,14 +201,8 @@ def _claim_recovery_nudge(store):
 
 
 def _maybe_recover_stuck_stages(store):
-    # Covers the common case: this library has ANY wave-lifecycle event
-    # (close/resolve-to-completion/repair/abandon) within the next recovery
-    # window. A library that goes fully idle after a wave gets stuck -- no
-    # further uploads, only browsing -- has no event left to hook and will
-    # not self-heal until its owner does something upload-related again;
-    # that gap is accepted in exchange for no standalone polling job (use
-    # `containerapp job start` on the wave-recovery job for a manual sweep
-    # of every library if one goes stale with nobody visiting).
+    # Opportunistic repair reduces handoff latency. The bounded scheduled
+    # recovery job also repairs libraries with no active browser.
     if not _claim_recovery_nudge(store):
         return
     import processing_diagnostics
@@ -232,13 +226,16 @@ def _drive(store,wave_id):
     wave,_=advance_wave(work,store,store.library,wave_id)
     state=wave['state']
     destination=('vision' if state in ('processing_pending','processing') else
-        'cluster' if state=='ready' and not wave.get('zeroFaceProbePending') else 'index' if state=='indexing' else None)
+        'cluster' if state=='ready' else 'index' if state=='indexing' else None)
     key=(wave.get('visionPendingKey') if destination=='vision' else
          'shadow-cluster!'+wave_id if destination=='cluster' else wave.get('indexPendingKey'))
     if destination and key:release_and_relay(work,store,store.library,key,destination,send_stage)
+    if state=='complete':
+        from wave_runtime import relay_successor
+        relay_successor(work,store,wave_id,send_stage)
     # Piggyback recovery of any OTHER stage this library left stuck (e.g. a
     # prior wave whose wake got lost to a worker scale-down race) on this
-    # genuine event, instead of a standalone polling job.
+    # genuine event; independent recovery covers browser and worker loss.
     _maybe_recover_stuck_stages(store)
 
 

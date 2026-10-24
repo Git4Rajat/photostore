@@ -69,18 +69,16 @@ health; owner-library creation and Vision/Cluster/Indexer worker intake wait.
 It starts an execution of the existing recovery job with its command overridden
 to `python -u -m wave_bootstrap`. The job verifies the storage is fresh and
 persists/read-verifies the exact certificate. The job's own command remains
-configured to run `wave_recovery` for any later manual invocation, with
+configured to run `wave_recovery` on its five-minute schedule, with
 recovery disabled during this phase. See Azure's
 [job execution template override](https://learn.microsoft.com/en-us/azure/container-apps/jobs).
 
 Only after bootstrap succeeds does the helper deploy activation parameters.
 Owner bootstrap can now create a wave-owned personal library. Subsequent new
-users' empty libraries use the same certified contract. Recovery itself is
-event-driven, not scheduled: it rides on real wave-lifecycle events (upload
-close/resolve/repair/abandon) in the `-upload` app, not a standalone timer —
-the job is `Manual`-triggered and only runs via an explicit operator
-`containerapp job start` (e.g. to sweep a library that's gone fully idle with
-a stuck wave and nobody visiting). No always-running coordinator is added.
+users' empty libraries use the same certified contract. Recovery runs every five
+minutes as a bounded job, in addition to event-driven upload recovery and explicit
+stage continuations. This covers abandoned tabs and lost queue sends while no
+browser is active. No always-running coordinator is added.
 
 Final verification checks all eight apps, the Indexer sidecar and recovery job,
 logs in as the owner, requires `/upload/waves/protocol` to return `live`, and

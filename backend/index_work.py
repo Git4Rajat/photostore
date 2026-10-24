@@ -193,7 +193,7 @@ class WorkStore:
                 continue
         raise RuntimeError('Maintenance lease renewal contention')
 
-    def release(self, claim, *, deferred=False):
+    def release(self, claim, *, deferred=False, retry_delay=None):
         for _ in range(12):
             current = self._get(claim.key)
             if current is None or current.get('owner') != claim.owner:
@@ -201,6 +201,10 @@ class WorkStore:
             try:
                 row = dict(current, owner='', leaseUntil=0,
                            wakeUntil=self.clock() + self.lease_seconds)
+                if retry_delay is not None:
+                    # Explicit continuation: notify reserves and sends the next
+                    # delayed wake before the current queue message is ACKed.
+                    row.update(wakeUntil=0, notBefore=self.clock() + max(0, retry_delay))
                 # A healthy barrier wait (or obsolete wake) did not fail work.
                 # Preserve earlier failures without charging this claim again.
                 if deferred and current['revision'] == claim.revision:
@@ -217,7 +221,7 @@ class WorkStore:
             if current is None or current['revision'] != revision:
                 return
             try:
-                self._replace(current, dict(current, owner='', leaseUntil=0, wakeUntil=0, failed=True))
+                self._replace(current, dict(current, owner='', leaseUntil=0, wakeUntil=0, failed=True, failedAt=self.clock()))
                 return
             except ResourceModifiedError:
                 continue
@@ -237,7 +241,7 @@ class WorkStore:
                                              match_condition=MatchConditions.IfNotModified)
                 else:
                     self._replace(current, dict(current, owner='', leaseUntil=0, wakeUntil=0,
-                                                failed=bool(failed and not newer)))
+                                                failed=bool(failed and not newer), failedAt=self.clock() if failed and not newer else 0))
                 return newer
             except (ResourceModifiedError, ResourceNotFoundError):
                 continue

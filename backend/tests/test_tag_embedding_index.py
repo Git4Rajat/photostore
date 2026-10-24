@@ -198,3 +198,37 @@ def test_search_photos_surfaces_photo_via_tag_embedding_expansion(monkeypatch, t
     payload = response.get_json() if hasattr(response, 'get_json') else response[0].get_json()
     filenames = [p['filename'] for p in payload['photos']]
     assert 'dog.jpg' in filenames
+
+
+def test_next_wave_invalidates_clean_tag_snapshot_and_recovers_new_tags(tag_embedding_ctx,monkeypatch):
+    from test_wave_catalog import Blobs
+    from wave_runtime import invalidate_wave_tags
+    blobs=Blobs()
+    monkeypatch.setenv('APP_ROLE','vision')
+    monkeypatch.setattr(storage_utils,'DURABLE_INDEX_UPDATES',True)
+    monkeypatch.setattr(storage_utils,'_ROLE_MAY_BUILD_INDEXES',False)
+    monkeypatch.setitem(storage_utils._CTX,'blob_service_client',blobs)
+    monkeypatch.setitem(storage_utils._CTX,'blob_tag_embedding_index_container','tags')
+    monkeypatch.setattr(vision_utils,'image_encoder_available',lambda:True)
+    monkeypatch.setattr(vision_utils,'get_text_embedding_version',lambda:'clip-test')
+    monkeypatch.setattr(vision_utils,'encode_text_embeddings_batch',lambda tags:[[1.0,0.0] for tag in tags])
+    tag_embedding_ctx.upsert_entity(dict(PartitionKey='lib-A',RowKey='a.jpg',tags='["dog"]'))
+    assert storage_utils.refresh_user_tag_embedding_index('lib-A').tags==['dog']
+    tag_embedding_ctx.upsert_entity(dict(PartitionKey='lib-A',RowKey='b.jpg',tags='["beach"]'))
+    assert storage_utils.get_user_tag_embedding_index('lib-A',allow_refresh=False)['tags']==['dog']
+    invalidate_wave_tags(storage_utils,'lib-A')
+    assert storage_utils.get_user_tag_embedding_index('lib-A',allow_refresh=False) is None
+    assert storage_utils.get_user_tag_embedding_index('lib-A',allow_refresh=True)['tags']==['beach','dog']
+
+
+def test_wave_tag_invalidation_cannot_silently_lose_a_blob_write(tag_embedding_ctx,monkeypatch):
+    from test_wave_catalog import Blobs
+    from wave_runtime import invalidate_wave_tags
+    blobs=Blobs();blobs.fail='tag-embeddings'
+    monkeypatch.setitem(storage_utils._CTX,'blob_service_client',blobs)
+    monkeypatch.setitem(storage_utils._CTX,'blob_tag_embedding_index_container','tags')
+    monkeypatch.setattr(vision_utils,'get_text_embedding_version',lambda:'clip-test')
+    # Fail every tag-manifest upload regardless of its library-derived name.
+    monkeypatch.setattr(storage_utils,'touch_user_tag_embedding_index_state',lambda library:'unpublished-version')
+    with pytest.raises(RuntimeError,match='not durably published'):
+        invalidate_wave_tags(storage_utils,'lib-A')

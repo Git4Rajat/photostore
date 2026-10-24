@@ -263,6 +263,39 @@ def _write(table, row, previous, guard):
                             match_condition=MatchConditions.IfNotModified)
 
 
+SOURCE_FIELDS = ('filename', 'sourcePhotoId', 'processingRevision', 'processingGeneration',
+                 'processingFence', 'embeddingVersion', 'alignmentMethod')
+
+
+def _curation_override(journal, position, assigner, library, face, decision, guard):
+    """Witness foreground curation before an unapplied decision takes effect.
+
+    No later decision can exist past this position's missing applied marker.
+    The override participates in the decision chain, and never changes source
+    identity, embeddings, the frozen manifest or an already-applied decision.
+    """
+    key=f'curation!{position:012d}'
+    previous=journal.get(key)
+    if previous is not None:
+        if previous.get('originalDecisionId')!=digest(decision):
+            raise ValueError('Curation witness belongs to another assignment decision')
+        return previous
+    if journal.get(f'applied!{position:012d}') is not None:return decision
+    guard.check()
+    live=_point(assigner.face_table,library,face['RowKey'])
+    if live is None or any(live.get(k)!=face.get(k) for k in SOURCE_FIELDS):return decision
+    changed=(any(live.get(k)!=face.get(k) for k in ('rejected','reviewStatus'))
+             or (live.get('personId') or '') not in ((face.get('personId') or ''),(decision.get('personId') or '')))
+    if not changed:return decision
+    if journal.decision(position+1) is not None:
+        raise ValueError('Cannot override curation after dependent decisions')
+    override=dict(decision,outcome='curated',candidate=None,person=None,
+        originalDecisionId=digest(decision),
+        curationWitness={k:live.get(k) for k in ('personId','rejected','reviewStatus','_assignment_etag')})
+    journal.put(key,override)
+    return override
+
+
 def _apply(assigner, library, face, decision, decision_id, guard, wave_id):
     if decision['outcome'] == 'excluded':
         return
@@ -270,10 +303,18 @@ def _apply(assigner, library, face, decision, decision_id, guard, wave_id):
     if live is None:
         raise ValueError('Frozen face was deleted before assignment')
     # Source replacement and curation must not be overwritten by old work.
-    for key in ('filename', 'sourcePhotoId', 'processingRevision', 'processingGeneration',
-                'processingFence', 'embeddingVersion', 'alignmentMethod', 'rejected', 'reviewStatus'):
+    for key in SOURCE_FIELDS:
         if live.get(key) != face.get(key):
             raise ValueError('Frozen face source or curation changed')
+    if decision['outcome']=='curated':
+        actual=assigner._embedding(library,live)
+        frozen=_vector(face.get('embedding'))
+        if actual is None or frozen is None or not (actual==frozen).all():
+            raise ValueError('Frozen face embedding changed')
+        return  # Explicit witnessed preservation, never an assignment success.
+    for key in ('rejected','reviewStatus'):
+        if live.get(key)!=face.get(key):
+            raise ValueError('Face curation raced materialization; retry with a witness')
     if live.get('assignmentDecisionId') == decision_id:
         return  # Face is written last; its stamp proves prerequisite effects landed.
     expected = face.get('personId') or ''
@@ -394,6 +435,7 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
                             or decision.get('manifestId') != digest(header)
                             or decision.get('position') != position or decision.get('previousDigest') != chain):
                         raise ValueError('Decision is bound to another frozen face')
+                    decision = _curation_override(journal,position,assigner,store.library,face,decision,guard)
                     identity = digest(decision)
                     if not journal.applied(position, identity):
                         if not begun:
