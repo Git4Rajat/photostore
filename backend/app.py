@@ -687,6 +687,7 @@ BLOB_LEXICAL_INDEX_CONTAINER = os.getenv('BLOB_LEXICAL_INDEX_CONTAINER', 'lexica
 # refresh_user_people_index, a LexicalIndexSnapshot of names/cover photos, not
 # embeddings). See PeopleEmbeddingIndexSnapshot in storage_utils.py.
 BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER = os.getenv('BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER', 'people-embedding-index').strip()
+BLOB_TAG_EMBEDDING_INDEX_CONTAINER = os.getenv('BLOB_TAG_EMBEDDING_INDEX_CONTAINER', 'tag-embedding-index').strip()
 VECTOR_INDEX_PRIME_ON_STARTUP = os.getenv('VECTOR_INDEX_PRIME_ON_STARTUP', 'false').lower() in ('1', 'true', 'yes')
 VECTOR_INDEX_PRIME_MAX_USERS = max(0, int(os.getenv('VECTOR_INDEX_PRIME_MAX_USERS', '200')))
 SEMANTIC_SEARCH_ALLOW_QUERYTIME_ROW_EMBEDDINGS = os.getenv(
@@ -1665,6 +1666,7 @@ def _init_storage_clients():
         blob_vector_index_container=BLOB_VECTOR_INDEX_CONTAINER,
         blob_lexical_index_container=BLOB_LEXICAL_INDEX_CONTAINER,
         blob_people_embedding_index_container=BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER,
+        blob_tag_embedding_index_container=BLOB_TAG_EMBEDDING_INDEX_CONTAINER,
         image_names_table_client=image_names_table_client,
         hash_index_table_client=hash_index_table_client,
         filename_owners_table_client=filename_owners_table_client,
@@ -1846,7 +1848,7 @@ def create_albums_dirty_set_table() -> None:
 def create_blob_containers() -> None:
     if blob_service_client is None:
         return
-    for container_name in (BLOB_IMAGE_CONTAINER, BLOB_THUMBNAIL_CONTAINER, BLOB_VECTOR_INDEX_CONTAINER, BLOB_LEXICAL_INDEX_CONTAINER, BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER, BLOB_EXPORTS_CONTAINER, BLOB_MERGE_PAYLOADS_CONTAINER):
+    for container_name in (BLOB_IMAGE_CONTAINER, BLOB_THUMBNAIL_CONTAINER, BLOB_VECTOR_INDEX_CONTAINER, BLOB_LEXICAL_INDEX_CONTAINER, BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER, BLOB_TAG_EMBEDDING_INDEX_CONTAINER, BLOB_EXPORTS_CONTAINER, BLOB_MERGE_PAYLOADS_CONTAINER):
         if not container_name:
             continue
         try:

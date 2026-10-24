@@ -88,6 +88,23 @@ def test_expired_vision_budget_releases_ownership_and_sends_continuation(live):
     assert store.status(wave)['state']=='indexing'
 
 
+def test_tag_invalidation_failure_does_not_block_wave_completion(live,monkeypatch):
+    """A tag-embedding-index write failure (e.g. the blob container not
+    existing yet) must never abort the whole wave-vision completion -- it's a
+    minor, independently-recoverable staleness issue, not a reason to block
+    every upload's gallery visibility. Reproduces the real production
+    incident: invalidate_wave_tags raised, uncaught, out of before_freeze."""
+    import wave_runtime
+    def boom(storage,library):
+        raise RuntimeError('Wave tag invalidation was not durably published')
+    monkeypatch.setattr(wave_runtime,'invalidate_wave_tags',boom)
+    store,metadata,sent,_=live;wave=admit(store,metadata,1)
+    complete_source(store,metadata,'s-0.jpg')
+    payload=wake(store,wave,'vision')
+    assert wave_runtime.consume(payload)=='done'
+    assert store.status(wave)['state']=='indexing'
+
+
 def test_resume_skips_processed_prefix_but_revisits_unresolved_sources(live,monkeypatch):
     store,metadata,sent,_=live;wave=admit(store,metadata,3);calls=[];now=[0.0]
     monkeypatch.setattr(time,'monotonic',lambda:now[0])

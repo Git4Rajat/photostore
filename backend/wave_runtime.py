@@ -154,7 +154,20 @@ def consume(payload,*,deadline=None,progress=None):
                 def invalidate_tags():
                     # Wave source writes bypass legacy invalidation. Vision's
                     # model-owned sweep must not reuse a clean, older tag set.
-                    invalidate_wave_tags(storage,library)
+                    # Best-effort: stale tag-embedding search (missing a newly
+                    # uploaded tag until the next sweep) is a minor, recoverable
+                    # staleness issue. It must never be allowed to abort the
+                    # entire wave-vision completion -- which is exactly what
+                    # happened in production when this write's blob container
+                    # didn't exist yet (see create_blob_containers): every
+                    # upload's gallery visibility was blocked by a tag-search
+                    # freshness side effect. A later run (another upload event,
+                    # or the independent tag-embedding sweep) retries this.
+                    try:
+                        invalidate_wave_tags(storage,library)
+                    except Exception:
+                        try:app.app.logger.exception('Wave tag invalidation failed for %s; continuing without it',library)
+                        except Exception:pass
                 result=run_vision_release(leases,work,store,library,wave_id,key,
                     app.metadata_table_client,None,None,send_stage,process_source=process_source,
                     deadline=deadline,progress=progress,before_freeze=invalidate_tags)
