@@ -66,6 +66,42 @@ def test_owner_abandon_is_explicit_and_closes_cancelled_wave_without_worker(live
     assert store.status(opened['waveId'])['completionOutcome']=='no_work'
 
 
+def test_lifecycle_events_claim_the_opportunistic_recovery_nudge_at_most_once_per_window(live_api,monkeypatch):
+    """_drive() piggybacks an opportunistic recover_library() sweep on every
+    real wave-lifecycle event (close/resolve-to-completion/repair/abandon)
+    instead of a standalone polling job. The claim must be durable (a Table
+    Storage row other replicas/processes also see), not an in-process dict,
+    and bounded to one sweep per library per window even across several
+    separate lifecycle events in quick succession."""
+    client,store,metadata,library=live_api
+    root='/upload/waves/live/sessions'
+    calls=[]
+    import wave_recovery
+    monkeypatch.setattr(wave_recovery,'recover_library',
+        lambda *a,**k:(calls.append((a,k)) or (0,0,'')))
+    for session in ('s1','s2'):
+        opened=client.post(root,json=dict(sessionId=session,declaredCount=3)).json
+        manifest=store._required('session!'+session)['manifestRevision']
+        result=client.post(root+'/'+session+'/abandon',
+            json=dict(manifestRevision=manifest,reason='Desktop lost'))
+        assert result.status_code==200
+    assert len(calls)==1
+    assert calls[0][0][1]=='u'  # library id passed through unchanged
+    claim=store._get('recovery-nudge')
+    assert claim is not None and claim['nextEligibleAt']>store.clock()
+
+
+def test_opportunistic_nudge_claim_is_durable_not_per_process(live_api):
+    """A second ShadowWaves instance over the same table (standing in for a
+    different replica/worker process) must see and respect the same claim --
+    an in-process-only cooldown would not."""
+    from routes.upload_wave_shadow import _claim_recovery_nudge
+    client,store,metadata,library=live_api
+    assert _claim_recovery_nudge(store) is True
+    other_process_view=ShadowWaves(store.table,store.library)
+    assert _claim_recovery_nudge(other_process_view) is False
+
+
 def test_resolve_autocloses_and_replay_is_idempotent(live_api):
     client,store,metadata,library=live_api
     root='/upload/waves/live/sessions'

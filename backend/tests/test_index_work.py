@@ -206,6 +206,19 @@ def test_failure_budget_does_not_restart_until_new_request(work):
     assert store.claim(key) is not None
 
 
+def test_one_poison_row_does_not_abort_the_rest_of_the_batch(work):
+    store, _, _ = work
+    store.request('poison', 'people')
+    store.request('healthy', 'people')
+    sent = []
+    def send(library, *rest):
+        if library == 'poison':
+            raise RuntimeError('queue unavailable for this stage')
+        sent.append(library)
+    assert store.recover(send) == 1
+    assert sent == ['healthy']
+
+
 def test_old_failure_cannot_poison_a_new_revision(work):
     store, _, _ = work
     key = store.request('A', 'people')

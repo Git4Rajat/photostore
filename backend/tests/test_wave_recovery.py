@@ -1,6 +1,6 @@
 import pytest
 from upload_waves import ShadowWaves
-from wave_recovery import recover,DIRECTORY
+from wave_recovery import recover,recover_library,DIRECTORY
 from test_upload_waves import AtomicTable,close
 
 
@@ -72,6 +72,24 @@ def test_poison_library_does_not_starve_next_library(monkeypatch):
     assert result['errors']==1 and result['libraries']==2
     assert any(args[0]=='b' for args in sent)
     assert any(row['event']=='wave_recovery_error' for row in events)
+
+
+def test_recover_library_is_the_same_mechanism_the_opportunistic_route_nudge_uses(monkeypatch):
+    """The scheduled/manual cross-library sweep and the per-event inline nudge
+    in routes/upload_wave_shadow.py both call recover_library directly (no
+    DIRECTORY/cursor bookkeeping needed for a single already-known library),
+    so a stage dispatch lost to a worker scale-down race still gets retried
+    the next time this library's wave advances, without a standalone job."""
+    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED','true')
+    table=RuntimeTable()
+    store=ShadowWaves(table,'solo')
+    opened=store.open_session('s',0);close(store,'s',opened)
+    sent=[];events=[]
+    count,errors,after=recover_library(table,'solo',lambda *args:sent.append(args),
+        wave_pages=1,emit=lambda **fields:events.append(fields))
+    assert count==1 and errors==0
+    assert sent and sent[0][0]=='solo'
+    assert any(record['event']=='wave_recovery' for record in events)
 
 
 def test_live_stage_lease_is_not_reported_as_an_unsent_handoff():

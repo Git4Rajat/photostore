@@ -245,5 +245,12 @@ class WorkStore:
         import itertools
         sent = 0
         for row in itertools.islice(self.table.query_entities(query), limit):
-            sent += int(self.notify(row['RowKey'], send))
+            # One row's send() failing (e.g. a stage's queue client
+            # unavailable) must not abort the whole batch -- the untouched
+            # row stays eligible and a later recover() call retries it,
+            # same as any other advisory wake in this module.
+            try:
+                sent += int(self.notify(row['RowKey'], send))
+            except Exception:
+                continue
         return sent

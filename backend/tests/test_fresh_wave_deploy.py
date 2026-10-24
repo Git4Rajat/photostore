@@ -152,7 +152,7 @@ def inventory(r,pending):
     c=container('wave-recovery');c['command']=['python','-u','-m','wave_recovery']
     c['env']+= [dict(name='UPLOAD_WAVE_RECOVERY_ENABLED',value=str(not pending).lower()),
         dict(name='UPLOAD_WAVE_BOOTSTRAP_VISION_IMAGE',value=r['images']['ipworker'])]
-    job=dict(properties=dict(configuration=dict(triggerType='Schedule',scheduleTriggerConfig=dict(cronExpression='*/5 * * * *')),
+    job=dict(properties=dict(configuration=dict(triggerType='Manual'),
         template=dict(containers=[c])))
     return apps,job
 

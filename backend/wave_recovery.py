@@ -71,6 +71,73 @@ def metrics(store,wave,*,clock=time.time):
     return result
 
 
+def recover_library(table,library,send,*,after='',wave_pages=2,release_limit=100,
+                     clock=time.time,emit=lambda **fields:None,metadata=None,cleanup_send=None,
+                     deadline=None):
+    """Full recovery pass for one library: supersession settlement, every wave
+    in this page range advanced, any lost release notify retried, and orphaned
+    processing artifacts relayed for cleanup.
+
+    This is the single implementation shared by recover()'s cross-library
+    directory sweep (scheduled/manual job) and the opportunistic per-event
+    nudge in routes/upload_wave_shadow.py's _drive() -- so the two call sites
+    can never silently drift into different recovery behavior. Returns
+    (count, errors, after) where `after` is the wave-page cursor to resume
+    from on a later call (the directory sweep persists it; the per-event
+    caller discards it, since it always starts a fresh small pass).
+    """
+    if deadline is None:deadline=clock()+1e9
+    store=ShadowWaves(table,library,clock=clock);work=stage_work_store(table)
+    count=0;errors=0
+    for _ in range(wave_pages):
+        if clock()>=deadline:break
+        rows=store._page('wave!',after)
+        if not rows:
+            after=''; break
+        for wave in rows:
+            if clock()>=deadline:break
+            try:
+                from wave_policy import owned,require_capability
+                paused=False
+                if owned(table,library):
+                    policy=store._required('policy')
+                    paused=bool(policy.get('cleanupState'))
+                    if not paused:require_capability(store,'wave-recovery')
+                    if not paused and metadata is not None:
+                        from wave_settlement import recover_supersessions
+                        recover_supersessions(store,wave,metadata)
+                if not paused:wave,_=advance_wave(work,store,library,wave['waveId'])
+                state=wave['state']
+                destination=('vision' if state in ('processing_pending','processing') else
+                             'cluster' if state=='ready' and not wave.get('zeroFaceProbePending') else 'index' if state=='indexing' else None)
+                if paused:destination=None
+                key=(wave.get('visionPendingKey') if destination=='vision' else
+                     'shadow-cluster!'+wave['waveId'] if destination=='cluster' else wave.get('indexPendingKey'))
+                if destination and key:
+                    release_and_relay(work,store,library,key,destination,send)
+                if state!='complete':
+                    emit(event='wave_recovery',library_id=digest(library),wave_id=wave['waveId'],**metrics(store,wave,clock=clock))
+                count+=1
+            except Exception as error:
+                errors+=1
+                emit(event='wave_recovery_error',library_id=digest(library),wave_id=wave['waveId'],
+                     reason=type(error).__name__)
+            after=wave['RowKey']
+        if clock()>=deadline:break
+        if len(rows)<20: after=''; break
+    try:
+        policy=store._get('policy')
+        if clock()<deadline and not (policy and policy.get('cleanupState')):
+            recover_releases(work,store,send,limit=release_limit)
+        if cleanup_send is not None and clock()<deadline:
+            from processing_cleanup import relay_artifact_cleanup
+            relay_artifact_cleanup(table,library,cleanup_send)
+    except Exception as error:
+        errors+=1
+        emit(event='wave_recovery_error',library_id=digest(library),reason=type(error).__name__)
+    return count,errors,after
+
+
 def recover(table,send,*,max_libraries=20,wave_pages=2,clock=time.time,emit=lambda **fields:None,max_seconds=210,
             metadata=None,cleanup_send=None):
     if not execution_enabled() or os.getenv('UPLOAD_WAVE_RECOVERY_ENABLED','').lower()!='true':
@@ -89,56 +156,12 @@ def recover(table,send,*,max_libraries=20,wave_pages=2,clock=time.time,emit=lamb
     for entry in libraries:
         if clock()>=deadline:break
         processed.append(entry)
-        library=entry['libraryId']; store=ShadowWaves(table,library,clock=clock); work=stage_work_store(table)
-        after=entry.get('waveCursor') or ''
-        for _ in range(wave_pages):
-            rows=store._page('wave!',after)
-            if not rows:
-                after=''; break
-            for wave in rows:
-                if clock()>=deadline:break
-                try:
-                    from wave_policy import owned,require_capability
-                    paused=False
-                    if owned(table,library):
-                        policy=store._required('policy')
-                        paused=bool(policy.get('cleanupState'))
-                        if not paused:require_capability(store,'wave-recovery')
-                        if not paused and metadata is not None:
-                            from wave_settlement import recover_supersessions
-                            recover_supersessions(store,wave,metadata)
-                    if not paused:wave,_=advance_wave(work,store,library,wave['waveId'])
-                    state=wave['state']
-                    destination=('vision' if state in ('processing_pending','processing') else
-                                 'cluster' if state=='ready' and not wave.get('zeroFaceProbePending') else 'index' if state=='indexing' else None)
-                    if paused:destination=None
-                    key=(wave.get('visionPendingKey') if destination=='vision' else
-                         'shadow-cluster!'+wave['waveId'] if destination=='cluster' else wave.get('indexPendingKey'))
-                    if destination and key:
-                        release_and_relay(work,store,library,key,destination,send)
-                    if state!='complete':
-                        emit(event='wave_recovery',library_id=digest(library),wave_id=wave['waveId'],**metrics(store,wave,clock=clock))
-                    count+=1
-                except Exception as error:
-                    errors+=1
-                    emit(event='wave_recovery_error',library_id=digest(library),wave_id=wave['waveId'],
-                         reason=type(error).__name__)
-                after=wave['RowKey']
-                _save(table,table.get_entity(DIRECTORY,entry['RowKey']),waveCursor=after)
-            if clock()>=deadline:break
-            if len(rows)<20: after=''; break
+        library=entry['libraryId']
+        waves,library_errors,after=recover_library(table,library,send,after=entry.get('waveCursor') or '',
+            wave_pages=wave_pages,clock=clock,emit=emit,metadata=metadata,cleanup_send=cleanup_send,deadline=deadline)
+        count+=waves;errors+=library_errors
         # A missing response may repeat repairs, but cannot manufacture readiness.
         _save(table,table.get_entity(DIRECTORY,entry['RowKey']),waveCursor=after)
-        try:
-            policy=store._get('policy')
-            if clock()<deadline and not (policy and policy.get('cleanupState')):
-                recover_releases(work,store,send,limit=100)
-            if cleanup_send is not None and clock()<deadline:
-                from processing_cleanup import relay_artifact_cleanup
-                relay_artifact_cleanup(table,library,cleanup_send)
-        except Exception as error:
-            errors+=1
-            emit(event='wave_recovery_error',library_id=digest(library),reason=type(error).__name__)
     _save(table,table.get_entity(DIRECTORY,'scan-cursor'),after=processed[-1]['RowKey'] if processed and (len(libraries)==max_libraries or len(processed)<len(libraries)) else '')
     return dict(libraries=len(processed),waves=count,errors=errors,disabled=False)
 

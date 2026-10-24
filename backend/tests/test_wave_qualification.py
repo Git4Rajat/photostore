@@ -25,8 +25,8 @@ def deployment():
             scale=dict(minReplicas=0,cooldownPeriod=300,rules=[dict(custom=dict(type='azure-queue',
                 metadata=dict(queueName='photostore-index-maintenance')))])))
     job=dict(name='test-wave-recovery',identityType='SystemAssigned',containers=[container('wave-recovery','wave-recovery')],
-        configuration=dict(triggerType='Schedule',replicaTimeout=240,
-            scheduleTriggerConfig=dict(cronExpression='*/5 * * * *',parallelism=1)))
+        configuration=dict(triggerType='Manual',replicaTimeout=240,
+            manualTriggerConfig=dict(parallelism=1)))
     return dict(prefix='test',containerApps=apps,jobs=[job])
 
 
@@ -48,7 +48,7 @@ def test_missing_job_or_execution_pause_or_inferred_cooldown_blocks_readiness():
     snapshot['containerApps'][0]['scale'].pop('cooldownPeriod')
     snapshot['containerApps'][2]['containers'][0]['env']['UPLOAD_WAVE_EXECUTION_ENABLED']='false'
     errors=check(snapshot)['blockers']
-    assert any('scheduled job missing' in e for e in errors)
+    assert any('job missing' in e for e in errors)
     assert any('cooldown' in e for e in errors)
     assert any('not enabled' in e for e in errors)
 

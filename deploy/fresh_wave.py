@@ -76,8 +76,7 @@ def verify_inventory(apps,job,release,pending):
         or env.get('UPLOAD_WAVE_NEW_LIBRARIES_ENABLED')!=str(not pending).lower()
         or env.get('APP_ROLE')!='wave-recovery' or env.get('PROCESSING_MODE')!='backend'
         or env.get('UPLOAD_WAVE_BOOTSTRAP_VISION_IMAGE')!=release['images']['ipworker']
-        or config['triggerType']!='Schedule'
-        or config['scheduleTriggerConfig']['cronExpression']!='*/5 * * * *'
+        or config['triggerType']!='Manual'
         or c['command']!=['python','-u','-m','wave_recovery']):
         raise RuntimeError('Recovery/bootstrap job mismatch')
 

@@ -46,7 +46,7 @@ def clean(resource):
                 metadata={'queueName':((r.get('custom') or {}).get('metadata') or {}).get('queueName')}))
                 for r in (scale.get('rules') or [])]},
         configuration={key:props.get('configuration',{}).get(key) for key in
-            ('triggerType','replicaTimeout','scheduleTriggerConfig')},
+            ('triggerType','replicaTimeout','manualTriggerConfig')},
         identityType=(resource.get('identity') or {}).get('type',''),
         containers=[dict(name=c['name'],image=c['image'],
             env={e['name']:e.get('value') for e in (c.get('env') or []) if e['name'] in ENV_NAMES})
@@ -125,12 +125,13 @@ def check(snapshot):
                     ((r.get('custom') or {}).get('metadata') or {}).get('queueName')=='photostore-index-maintenance' for r in rules),
                     label+': dedicated index-maintenance queue scaler missing')
     job=next((row for row in snapshot['jobs'] if row['name']==prefix+'-wave-recovery'),None)
-    if job is None:errors.append(prefix+'-wave-recovery: scheduled job missing')
+    if job is None:errors.append(prefix+'-wave-recovery: job missing')
     else:
-        config=job['configuration'];schedule=config.get('scheduleTriggerConfig') or {}
-        require(config.get('triggerType')=='Schedule' and schedule.get('cronExpression')=='*/5 * * * *',
-            job['name']+': five-minute schedule missing')
-        require(schedule.get('parallelism')==1,job['name']+': recovery must be bounded to one replica')
+        config=job['configuration'];manual=config.get('manualTriggerConfig') or {}
+        require(config.get('triggerType')=='Manual',
+            job['name']+': must be manually triggered, not a standalone schedule -- '
+            'recovery rides on real wave-lifecycle events instead of a timer')
+        require(manual.get('parallelism')==1,job['name']+': recovery must be bounded to one replica')
         require(0<(config.get('replicaTimeout') or 0)<=240,job['name']+': bounded timeout required')
         require('SystemAssigned' in job['identityType'],job['name']+': managed identity missing')
         if len(job['containers'])!=1:errors.append(job['name']+': expected one recovery container')

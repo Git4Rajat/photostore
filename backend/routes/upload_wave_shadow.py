@@ -168,6 +168,62 @@ def register_routes(blueprint):
         return store.status(wave)
 
 
+# Durable, cross-replica-safe throttle for the opportunistic recovery sweep
+# below. A plain in-process dict was tried first and rejected: this app runs
+# multiple replicas/workers, each with its own independent memory, so an
+# in-process cooldown doesn't actually bound the cluster-wide sweep rate and
+# resets to zero on every restart or scale event. This claim row lives in the
+# same table as everything else wave-related, guarded by the existing
+# optimistic-concurrency (_change/ETag) pattern, so only one caller anywhere
+# in the fleet wins the claim for a given library in a given window.
+_RECOVERY_SWEEP_INTERVAL_SECONDS = 120
+
+
+def _claim_recovery_nudge(store):
+    """True if this caller should run the sweep now; False if another request
+    (this replica or another) already claimed the current window, or just
+    finished one. Best-effort: losing the race or the write is never an
+    error, since recovery is advisory and the next real event tries again."""
+    from azure.data.tables import TableTransactionError
+    key = 'recovery-nudge'
+    now = store.clock()
+    current = store._get(key)
+    if current and float(current.get('nextEligibleAt') or 0) > now:
+        return False
+    row = store._row(key, nextEligibleAt=now + _RECOVERY_SWEEP_INTERVAL_SECONDS)
+    try:
+        store.table.submit_transaction([store._change(current, row)])
+        return True
+    except TableTransactionError as error:
+        if error.status_code in (409, 412):
+            return False
+        raise
+
+
+def _maybe_recover_stuck_stages(store):
+    # Covers the common case: this library has ANY wave-lifecycle event
+    # (close/resolve-to-completion/repair/abandon) within the next recovery
+    # window. A library that goes fully idle after a wave gets stuck -- no
+    # further uploads, only browsing -- has no event left to hook and will
+    # not self-heal until its owner does something upload-related again;
+    # that gap is accepted in exchange for no standalone polling job (use
+    # `containerapp job start` on the wave-recovery job for a manual sweep
+    # of every library if one goes stale with nobody visiting).
+    if not _claim_recovery_nudge(store):
+        return
+    import processing_diagnostics
+    import processing_cleanup
+    from wave_recovery import recover_library
+    from wave_runtime import send_stage
+    try:
+        recover_library(store.table, store.library, send_stage, wave_pages=1,
+            release_limit=20, clock=store.clock, metadata=app.metadata_table_client,
+            cleanup_send=processing_cleanup.send_artifact_cleanup,
+            emit=lambda **fields: processing_diagnostics.emit(fields.pop('event'), **fields))
+    except Exception:
+        app.app.logger.exception('Opportunistic wave-stage recovery sweep failed for %s', store.library)
+
+
 def _drive(store,wave_id):
     from upload_wave_execution import advance_wave,stage_work_store,release_and_relay,execution_enabled
     if not execution_enabled():return
@@ -180,6 +236,10 @@ def _drive(store,wave_id):
     key=(wave.get('visionPendingKey') if destination=='vision' else
          'shadow-cluster!'+wave_id if destination=='cluster' else wave.get('indexPendingKey'))
     if destination and key:release_and_relay(work,store,store.library,key,destination,send_stage)
+    # Piggyback recovery of any OTHER stage this library left stuck (e.g. a
+    # prior wave whose wake got lost to a worker scale-down race) on this
+    # genuine event, instead of a standalone polling job.
+    _maybe_recover_stuck_stages(store)
 
 
 def close_resolved_intake(store,session):

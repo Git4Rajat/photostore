@@ -3,9 +3,16 @@ param appName string
 param location string
 param workspaceId string
 param enabled bool = false
+// wave_recovery/wave_recovery_error telemetry now comes from two sources:
+// the '-upload' app's opportunistic per-event nudge (routes/upload_wave_shadow.py's
+// _maybe_recover_stuck_stages, the common case) and the '-wave-recovery' job
+// (only when an operator manually runs it via `containerapp job start`). There
+// is no longer a fixed cadence to be "missing" from -- the job is Manual-
+// triggered, not Scheduled -- so the old wave-recovery-missing heartbeat-
+// absence alert was removed rather than left to permanently false-positive.
 var base = '''
 ContainerAppConsoleLogs_CL
-| where ContainerAppName_s == '${appName}-wave-recovery'
+| where ContainerAppName_s in ('${appName}-wave-recovery', '${appName}-upload')
 | extend d = parse_json(extract(@'processing telemetry (\{.*\})', 1, Log_s))
 '''
 var rules = [
@@ -18,11 +25,6 @@ var rules = [
     name: 'wave-recovery-failed'
     query: '${base}\n| where tostring(d.event) == \'wave_recovery_error\' or (tostring(d.event) == \'wave_recovery_run\' and toint(d.errors) > 0)'
     operator: 'GreaterThan'
-  }
-  {
-    name: 'wave-recovery-missing'
-    query: '${base}\n| where tostring(d.event) == \'wave_recovery_run\' and d.disabled == false'
-    operator: 'LessThanOrEqual'
   }
 ]
 resource alerts 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = [for rule in rules: {

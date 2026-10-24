@@ -1966,11 +1966,16 @@ resource waveRecovery 'Microsoft.App/jobs@2025-01-01' = if (enableWaveRecovery) 
   properties: {
     environmentId: managedEnvironment.id
     configuration: {
-      triggerType: 'Schedule'
+      // Manual, not Schedule: wave recovery now rides on real wave-lifecycle
+      // events (see _maybe_recover_stuck_stages in
+      // routes/upload_wave_shadow.py) instead of a standalone timer, so this
+      // job only ever runs via an explicit `containerapp job start` -- either
+      // deploy/fresh_wave.py's one-shot certificate-bootstrap override, or a
+      // manual operator recovery pass. It never auto-fires on its own.
+      triggerType: 'Manual'
       replicaTimeout: 240
       replicaRetryLimit: 1
-      scheduleTriggerConfig: {
-        cronExpression: '*/5 * * * *'
+      manualTriggerConfig: {
         parallelism: 1
         replicaCompletionCount: 1
       }
