@@ -149,6 +149,51 @@ def test_unverified_client_done_report_cannot_commit_success_in_fenced_mode(blob
     assert not result.get('processingCompletionPending')
 
 
+@pytest.mark.parametrize('converted', [
+    None, b'', b'undecodable raw', b'raw' * 600_000, jpeg(edge=2049), jpeg()[:100],
+])
+def test_invalid_server_preview_is_committed_as_failed_without_publication(blobs, monkeypatch, converted):
+    (metadata, *_, fence), objects = blobs
+    monkeypatch.setenv('UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED', 'true')
+    monkeypatch.setitem(storage_utils._CTX, 'source_completion_delivery', None)
+    monkeypatch.setitem(storage_utils._CTX, 'embeddings_table_client', None)
+    monkeypatch.setattr(storage_utils, '_refresh_semantic_fields', lambda *a: None)
+    monkeypatch.setattr(storage_utils, 'download_media_bytes', lambda *a: b'original raw')
+    monkeypatch.setattr(storage_utils, 'convert_image_to_jpeg', lambda *a: converted)
+    result = storage_utils.apply_client_processing_results_for_file('lib', 'photo.jpg',
+        lease_owner='owner', expected_processing_revision='rev', expected_processing_fence='attempt',
+        claimed_steps=['preview'], origin='ipworker',
+        client_processing={'preview': {'hasData': False, 'error': 'source_undecodable'}})
+    stored = metadata.get_entity('lib', 'photo.jpg')
+    assert result['preview_status'] == stored['preview_status'] == 'failed'
+    assert stored['processing_lease_owner'] == ''
+    assert not stored.get('previewArtifact') and not objects
+    assert not stored.get('processingCompletionPending')
+
+
+def test_valid_server_preview_publishes_verified_artifact(blobs, monkeypatch):
+    (metadata, *_, fence), objects = blobs
+    monkeypatch.setattr(storage_utils, 'convert_image_to_jpeg', lambda *a: jpeg())
+    row = metadata.get_entity('lib', 'photo.jpg')
+    with result_fence(fence):
+        result = storage_utils._apply_server_preview_fallback('lib', 'photo.jpg', row,
+            b'original raw', fallback_for='client_preview_failed')
+    assert result['preview_status'] == 'done'
+    receipt = json.loads(row['previewArtifact'])
+    assert objects[receipt['blob']].data == jpeg()
+
+
+@pytest.mark.parametrize('error', [OSError('storage unavailable'), StaleProcessingResult('replaced')])
+def test_server_preview_publication_errors_still_propagate(monkeypatch, error):
+    monkeypatch.setattr(storage_utils, 'convert_image_to_jpeg', lambda *a: jpeg())
+    def fail(*a, **k):
+        raise error
+    monkeypatch.setattr(storage_utils, '_publish_processing_derivative', fail)
+    with pytest.raises(type(error)):
+        storage_utils._apply_server_preview_fallback('lib', 'photo.jpg', {},
+            b'original raw', fallback_for='client_preview_failed')
+
+
 def test_sort_and_access_projections_preserve_versioned_derivative_pointers(blobs, monkeypatch):
     (metadata, *_, fence), _ = blobs
     row = metadata.get_entity('lib', 'photo.jpg')

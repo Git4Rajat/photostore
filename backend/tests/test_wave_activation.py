@@ -181,6 +181,54 @@ def test_five_failed_source_attempts_settle_as_failure_not_success(monkeypatch):
     assert not store._page('source-completion!')
 
 
+def test_undecodable_preview_fallback_can_exhaust_without_aborting_wave(monkeypatch):
+    import storage_utils
+    from test_wave_execution_consumers import FakeMetadata, settled_row, no_faces, publish_completion
+    from upload_wave_execution import run_vision_release
+    from wave_settlement import verified
+    world = execution_world(monkeypatch)
+    store, work, leases, table = world
+    from processing_generation import REQUIRED_STEPS
+    session = store.open_session('parent', 2)
+    wave_id = session['waveId']
+    store.register('parent', [dict(itemId=str(i), filename=name)
+        for i, name in enumerate(('original.jpg', 'healthy.jpg'))])
+    for i, (filename, photo) in enumerate([('original.jpg', 'photo-1'), ('healthy.jpg', 'photo-2')]):
+        session = store.resolve('parent', str(i), outcome='accepted', photo_id=photo,
+            processing_revision='revision-1', filename=filename, required_steps=REQUIRED_STEPS)
+    close(store, 'parent', session)
+    metadata = FakeMetadata()
+    metadata.put(store.library, 'original.jpg',
+        **dict(settled_row('photo-1', 'revision-1'), preview_status='pending'))
+    metadata.put(store.library, 'healthy.jpg', **settled_row('photo-2', 'revision-1', filename='healthy.jpg'))
+    # Mirrors convert_image_to_jpeg's undecodable RAW passthrough.
+    original = b'raw' * 1_437_000
+    monkeypatch.setattr(storage_utils, 'convert_image_to_jpeg', lambda data, name: data)
+    monkeypatch.setattr(storage_utils, '_publish_processing_derivative',
+        lambda *a, **k: pytest.fail('invalid RAW bytes reached publication'))
+    processed = []
+    def process(library, filename, revision, renew):
+        processed.append(filename)
+        if filename == 'healthy.jpg':
+            publish_completion(store, metadata, filename=filename)
+            return
+        row = metadata.rows[library, filename]
+        row.update(storage_utils._apply_server_preview_fallback(library, filename, row,
+            original, fallback_for='client_preview_failed'))
+    for count in range(5):
+        result = run_vision_release(leases, work, store, store.library, wave_id,
+            store.status(wave_id)['visionPendingKey'], metadata, None, no_faces,
+            lambda *args: None, process_source=process)
+        assert result['state'] == ('ready' if count == 4 else 'processing')
+    members = {row['filename']: row for row in store._page(f'e!{wave_id}!m!')}
+    member = members['original.jpg']
+    assert member['outcome'] == 'failed_exhausted' and verified(store, member)
+    assert members['healthy.jpg']['outcome'] == 'settled'
+    assert processed.count('healthy.jpg') == 1 and processed.count('original.jpg') == 5
+    assert result['failedMembers'] == 1
+    assert len(store._page('source-completion!')) == 1
+
+
 def test_automatic_source_wakes_suppressed_but_foreground_people_edit_still_queues(monkeypatch):
     import app
     table=RuntimeTable();store=active(table)

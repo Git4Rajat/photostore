@@ -64,10 +64,10 @@ def register_accepted(store):
     return row['waveId'], resolved
 
 
-def publish_completion(store, metadata, *, faces=()):
+def publish_completion(store, metadata, *, faces=(), filename='original.jpg'):
     from processing_completion import prepare_completion
     from processing_receipts import ArtifactReceipts
-    row = metadata.rows[store.library, 'original.jpg']
+    row = metadata.rows[store.library, filename]
     receipts = ArtifactReceipts(store.table, store.library)
     snapshots = []
     for face in faces:

@@ -8999,16 +8999,17 @@ def _apply_server_preview_fallback(
     # Mirrors _apply_server_thumbnail_fallback above -- same self-heal shape,
     # convert_image_to_jpeg does the actual resize/quality-ladder work
     # (image_utils.py), reused as-is from the RAW/HEIC-only preview route.
+    from processing_artifacts import validate_derivative_bytes
     status_updates: Dict[str, object] = {}
     try:
         preview_bytes = convert_image_to_jpeg(image_bytes, filename)
+        # Conversion can return the original RAW bytes when decoding fails.
+        # Persist a failed step so source retries can settle this member,
+        # rather than repeatedly aborting the entire wave at publication.
+        validate_derivative_bytes(preview_bytes, 'preview')
     except Exception:
-        preview_bytes = None
-    if not preview_bytes:
         status_updates['preview_status'] = 'failed'
         return status_updates
-    thumbnail_blob_name = str(metadata.get('anonymousImageId') or '').strip() or filename
-    preview_blob_name = f'preview/{thumbnail_blob_name}.jpg'
     _publish_processing_derivative(metadata, 'preview', preview_bytes, filename=filename)
     mark_step_done(user_id, filename, 'preview', result={
         'source': 'server',
