@@ -46,13 +46,13 @@ param adminPassword string
 ])
 param emailDataLocation string = 'Europe'
 
-@description('Where OCR/face/vision/geo processing runs. "browser" (default): entirely client-side, same as today -- no extra cost, works everywhere. "backend": the browser skips this work entirely and a new vision container processes every upload server-side instead -- better for low-power/mobile clients, and enables bulk background reprocessing of an existing library, at the cost of running vision (which needs meaningfully more CPU/memory than the rest of this deployment). "both": the browser and vision both attempt it and whichever finishes first for a given photo wins -- doubles compute cost per step, useful mainly for comparing the two paths.')
+@description('Where OCR/face/vision/geo processing runs. "browser": entirely client-side -- no extra cost, works everywhere. "backend" (default): the browser skips this work entirely and a new vision container processes every upload server-side instead -- better for low-power/mobile clients, and enables bulk background reprocessing of an existing library, at the cost of running vision (which needs meaningfully more CPU/memory than the rest of this deployment). "both": the browser and vision both attempt it and whichever finishes first for a given photo wins -- doubles compute cost per step, useful mainly for comparing the two paths.')
 @allowed([
   'browser'
   'backend'
   'both'
 ])
-param processingMode string = 'browser'
+param processingMode string = 'backend'
 
 @description('Prepare thumbnails, previews and metadata in the browser, and reuse accepted assets for backend processing.')
 param browserUploadPreparation bool = true
@@ -81,14 +81,14 @@ param clusterMinReplicas int = 0
 param dedicatedIndexWorker bool = true
 
 @description('Provision the independent bounded wave-recovery job. Does not enable wave cutover or execution.')
-param enableWaveRecovery bool = false
+param enableWaveRecovery bool = true
 @description('Opt in to wave portal alerts; requires an existing logging workspace and activated recovery execution.')
 param enableWaveAlerts bool = false
 
 @description('Enable qualified wave stage execution. Keep false until the isolated qualification deployment is ready.')
-param enableWaveExecution bool = false
+param enableWaveExecution bool = true
 @description('Enroll newly created empty libraries only. Existing libraries never change ownership.')
-param enableNewWaveLibraries bool = false
+param enableNewWaveLibraries bool = true
 @description('Content-addressed capability certificate ID for the qualified immutable role images. Empty by default.')
 param waveCapabilityId string = ''
 
