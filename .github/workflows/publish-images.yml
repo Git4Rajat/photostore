@@ -181,7 +181,7 @@ jobs:
             -v "$PWD/backend/tests:/app/tests:ro" \
             -v "$PWD/backend/scripts:/app/scripts:ro" \
             -v "$PWD/deploy:/deploy:ro" \
-            "$BACKEND_IMAGE" -c 'python -m pytest tests/test_wave*.py tests/test_upload_wave*.py tests/test_fresh_wave*.py -q'
+            "$BACKEND_IMAGE" -c 'python -m pytest tests/test_wave*.py tests/test_upload_wave*.py tests/test_fresh_wave*.py tests/test_processing_artifacts.py -q'
       - name: Create tested release contract
         run: python3 deploy/wave_release.py --image-dir release-images --source "${{ github.sha }}" --output wave-release.json
       - uses: actions/upload-artifact@v4
@@ -192,3 +192,4 @@ jobs:
         run: |
           echo "Download wave-release.json and follow deploy/fresh-wave.md for a new sandbox." >> "$GITHUB_STEP_SUMMARY"
           echo "The artifact binds all three immutable images and the exact wave capability ID." >> "$GITHUB_STEP_SUMMARY"
+          echo "For an existing same-protocol library, follow deploy/upgrade-wave.md; no cleanup or re-upload is required." >> "$GITHUB_STEP_SUMMARY"

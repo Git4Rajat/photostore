@@ -37,4 +37,5 @@ if __name__ == '__main__':
         raise ValueError('Mixed source commits or incomplete image publication')
     release=release_contract({r['name']:r['image'] for r in records},args.source)
     release['qualification']='wave-unit-tests-passed'
+    release['upgradeProtocol']=PROTOCOL
     Path(args.output).write_text(json.dumps(release,indent=2)+'\n')

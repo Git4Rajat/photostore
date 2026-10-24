@@ -97,22 +97,14 @@ intake manually to bypass a failed bootstrap. Fix bootstrap before activation.
 An activation or verification failure may leave apps active; inspect the failure
 and resume. This helper does not claim transactional rollback across Azure apps.
 
-**It does not rebind certificates for upgrades to existing libraries, and
-nothing else in this deployment does either.** Each wave-owned library's
-capability is permanently bound, at enrollment, to the exact image digest
-running on every role (`wave_policy.require_capability` — "Library ownership
-cannot be rebound"). Once this deployment is live and libraries are
-wave-enrolled, **do not** redeploy `coreImage`, `webImage`, or `visionImage`
-with `az deployment group create -f deploy/resources.bicep` or the portal
-"Redeploy" button for any reason — not even an unrelated bug fix. Doing so
-immediately and permanently fails every in-flight wave's next vision/cluster/
-index attempt with a generic "This app deployment is not qualified" conflict,
-since the deployed image no longer matches the sealed certificate, and there
-is no automatic or manual re-certification path: `fresh_wave.py` itself
-refuses to run against an existing resource group, so it cannot be reused to
-fix a deployment that's already live. Until a dedicated re-certify/migrate
-tool exists, the only supported way to pick up new code on a wave-active
-deployment is a fresh install via this guide, not an in-place image update.
+`fresh_wave.py` remains strictly for fresh installs. For an existing wave-owned
+library, use the explicit [same-protocol upgrade workflow](upgrade-wave.md).
+Do not update role images independently through the portal, Bicep or
+`az containerapp update`: a release binding still requires the exact qualified
+role images. The upgrade helper pauses all roles, verifies old revisions are
+inactive, drains leases, and atomically changes each library's binding with an
+audit receipt before activating the new release. It preserves source data,
+wave IDs, receipts and checkpoints; cleanup and re-upload are unnecessary.
 
 After successful deployment, qualify a real photo upload on the new owner's
 library and a second user's library: overlapping sessions, Vision completion,

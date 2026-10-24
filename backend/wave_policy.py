@@ -1,4 +1,4 @@
-"""One-way, new-library-only ownership. Pausing execution never restores legacy work."""
+"""One-way wave ownership; explicit paused upgrades may change the release binding."""
 from contextvars import ContextVar
 from functools import wraps
 import os
@@ -81,7 +81,8 @@ def require_capability(store,role,*,allow_cleanup=False):
     policy=store._required('policy')
     proof=store.table.get_entity(CAPABILITIES,policy['capabilityId'])
     builds=json.loads(proof['deployments'])
-    if (not configuration_ready() or proof.get('protocol')!=PROTOCOL
+    if (os.getenv('UPLOAD_WAVE_BOOTSTRAP_PENDING','').lower()=='true'
+            or not configuration_ready() or proof.get('protocol')!=PROTOCOL
             or set(builds)!=set(ROLES) or digest([PROTOCOL,builds])!=policy['capabilityId']
             or os.getenv('UPLOAD_WAVE_CAPABILITY_ID','')!=policy['capabilityId']
             or not os.getenv('UPLOAD_WAVE_DEPLOYMENT_ID','')
