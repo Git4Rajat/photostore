@@ -55,6 +55,33 @@ class RuntimeTable(AtomicTable):
         return EtagTable.query_entities(self,query,**options)
 
 
+def test_recover_library_checkpoints_each_advanced_wave(monkeypatch):
+    """recover_library's optional `checkpoint` callback must fire once per
+    advanced wave (with that wave's own RowKey), not only once when the whole
+    pass finishes -- that's what lets recover()'s directory cursor survive a
+    later page crashing without losing durable progress for waves already
+    advanced earlier in the pass."""
+    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED','true')
+    table=RuntimeTable()
+    store=ShadowWaves(table,'a')
+    opened=close(store,'s',store.open_session('s',0))
+    checkpoints=[]
+    count,errors,after=recover_library(table,'a',lambda *a:None,checkpoint=checkpoints.append)
+    assert count==1 and errors==0
+    assert checkpoints==[store.wave_key(opened['waveId'])]
+
+
+def test_recover_library_works_with_no_checkpoint_callback(monkeypatch):
+    """recover_library must work with no checkpoint at all (the opportunistic
+    per-event route path's usage) -- the parameter is optional, not required."""
+    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED','true')
+    table=RuntimeTable()
+    store=ShadowWaves(table,'a')
+    close(store,'s',store.open_session('s',0))
+    count,errors,after=recover_library(table,'a',lambda *a:None)
+    assert count==1 and errors==0
+
+
 def test_poison_library_does_not_starve_next_library(monkeypatch):
     import wave_recovery
     monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED','true')

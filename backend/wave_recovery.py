@@ -73,7 +73,7 @@ def metrics(store,wave,*,clock=time.time):
 
 def recover_library(table,library,send,*,after='',wave_pages=2,release_limit=100,
                      clock=time.time,emit=lambda **fields:None,metadata=None,cleanup_send=None,
-                     deadline=None):
+                     deadline=None,checkpoint=None):
     """Full recovery pass for one library: supersession settlement, every wave
     in this page range advanced, any lost release notify retried, and orphaned
     processing artifacts relayed for cleanup.
@@ -82,9 +82,16 @@ def recover_library(table,library,send,*,after='',wave_pages=2,release_limit=100
     directory sweep (scheduled/manual job) and the opportunistic per-event
     nudge in routes/upload_wave_shadow.py's _drive() -- so the two call sites
     can never silently drift into different recovery behavior. Returns
-    (count, errors, after) where `after` is the wave-page cursor to resume
-    from on a later call (the directory sweep persists it; the per-event
-    caller discards it, since it always starts a fresh small pass).
+    (count, errors, after) where `after` is the final wave-page cursor.
+
+    `checkpoint`, if given, is called with the cursor after every wave (not
+    just once at the end) so a caller that needs durable per-wave resume
+    (recover()'s cross-library directory sweep) doesn't lose already-advanced
+    progress if a later page in the same pass raises -- re-advancing an
+    already-advanced wave is safe/idempotent, but there is no reason to repeat
+    work a crash didn't actually undo. The per-event nudge in
+    routes/upload_wave_shadow.py omits it: it always starts a fresh small pass
+    and discards the final cursor, so per-wave durability doesn't apply there.
     """
     if deadline is None:deadline=clock()+1e9
     store=ShadowWaves(table,library,clock=clock);work=stage_work_store(table)
@@ -123,6 +130,7 @@ def recover_library(table,library,send,*,after='',wave_pages=2,release_limit=100
                 emit(event='wave_recovery_error',library_id=digest(library),wave_id=wave['waveId'],
                      reason=type(error).__name__)
             after=wave['RowKey']
+            if checkpoint is not None:checkpoint(after)
         if clock()>=deadline:break
         if len(rows)<20: after=''; break
     try:
@@ -157,8 +165,13 @@ def recover(table,send,*,max_libraries=20,wave_pages=2,clock=time.time,emit=lamb
         if clock()>=deadline:break
         processed.append(entry)
         library=entry['libraryId']
+        # Checkpoint after every wave, not just once at the end: if a later
+        # page in this same pass raises (e.g. a transient store._page error),
+        # already-advanced waves in earlier pages stay checkpointed instead of
+        # being re-processed (safe either way, but wasteful) on the next run.
         waves,library_errors,after=recover_library(table,library,send,after=entry.get('waveCursor') or '',
-            wave_pages=wave_pages,clock=clock,emit=emit,metadata=metadata,cleanup_send=cleanup_send,deadline=deadline)
+            wave_pages=wave_pages,clock=clock,emit=emit,metadata=metadata,cleanup_send=cleanup_send,deadline=deadline,
+            checkpoint=lambda cursor:_save(table,table.get_entity(DIRECTORY,entry['RowKey']),waveCursor=cursor))
         count+=waves;errors+=library_errors
         # A missing response may repeat repairs, but cannot manufacture readiness.
         _save(table,table.get_entity(DIRECTORY,entry['RowKey']),waveCursor=after)

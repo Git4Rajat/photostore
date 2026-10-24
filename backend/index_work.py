@@ -66,6 +66,15 @@ def _acknowledge_one(table, row):
         pass  # Re-marked during the build, or already acknowledged.
 
 
+class WakeupContention(RuntimeError):
+    """notify() couldn't win the reservation write after every retry -- this
+    row is under heavy concurrent write pressure, not a send() failure. A
+    distinct type so callers that want to tell contention apart from an
+    ordinary advisory-send failure (e.g. for metrics) can, without recover()
+    having to abort its batch over it -- skipping and retrying next pass is
+    correct either way, since every step here is idempotent."""
+
+
 @dataclass(frozen=True)
 class Claim:
     key: str
@@ -149,7 +158,7 @@ class WorkStore:
             # On failure the durable reservation expires; do not delete intent.
             send(row['libraryId'], row['scope'], row['revision'], delay)
             return True
-        raise RuntimeError('Maintenance wakeup contention')
+        raise WakeupContention('Maintenance wakeup contention')
 
     def claim(self, key):
         for _ in range(12):
@@ -248,9 +257,16 @@ class WorkStore:
             # One row's send() failing (e.g. a stage's queue client
             # unavailable) must not abort the whole batch -- the untouched
             # row stays eligible and a later recover() call retries it,
-            # same as any other advisory wake in this module.
+            # same as any other advisory wake in this module. Contention on
+            # the reservation write itself (WakeupContention) is handled the
+            # same way -- skip and let a later pass retry -- but kept as a
+            # distinct, nameable type rather than conflated with a generic
+            # send() failure, so a caller that wants to tell them apart (e.g.
+            # for metrics on a hot row) can.
             try:
                 sent += int(self.notify(row['RowKey'], send))
+            except WakeupContention:
+                continue
             except Exception:
                 continue
         return sent

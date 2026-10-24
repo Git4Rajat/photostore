@@ -4,7 +4,7 @@ import re
 import pytest
 from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
 
-from index_work import DirtySnapshot, WorkStore, acknowledge_dirty
+from index_work import DirtySnapshot, WorkStore, WakeupContention, acknowledge_dirty
 
 
 class Entity(dict):
@@ -204,6 +204,34 @@ def test_failure_budget_does_not_restart_until_new_request(work):
     assert store.recover(lambda *a: pytest.fail('poison retry')) == 0
     store.request('A', 'people')
     assert store.claim(key) is not None
+
+
+def test_notify_raises_a_distinct_type_for_reservation_contention(work):
+    store, _, _ = work
+    key = store.request('contended', 'people')
+    monkeypatched_replace_calls = []
+    def always_conflicts(current, row):
+        monkeypatched_replace_calls.append(1)
+        raise ResourceModifiedError('conflict')
+    store._replace = always_conflicts
+    with pytest.raises(WakeupContention):
+        store.notify(key, lambda *a: None)
+    assert len(monkeypatched_replace_calls) == 12
+
+
+def test_reservation_contention_does_not_abort_the_recover_batch(work):
+    store, _, _ = work
+    store.request('contended', 'people')
+    store.request('healthy', 'people')
+    original_replace = store._replace
+    def conflict_only_for_contended(current, row):
+        if row.get('libraryId') == 'contended':
+            raise ResourceModifiedError('conflict')
+        return original_replace(current, row)
+    store._replace = conflict_only_for_contended
+    sent = []
+    assert store.recover(lambda library, *rest: sent.append(library)) == 1
+    assert sent == ['healthy']
 
 
 def test_one_poison_row_does_not_abort_the_rest_of_the_batch(work):
