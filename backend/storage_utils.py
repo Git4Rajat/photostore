@@ -530,6 +530,7 @@ def configure_storage(
     blob_vector_index_container: Optional[str] = None,
     blob_lexical_index_container: Optional[str] = None,
     blob_people_embedding_index_container: Optional[str] = None,
+    blob_tag_embedding_index_container: Optional[str] = None,
     image_names_table_client=None,
     hash_index_table_client=None,
     filename_owners_table_client=None,
@@ -561,6 +562,7 @@ def configure_storage(
     _CTX['blob_vector_index_container'] = (blob_vector_index_container or '').strip()
     _CTX['blob_lexical_index_container'] = (blob_lexical_index_container or '').strip()
     _CTX['blob_people_embedding_index_container'] = (blob_people_embedding_index_container or '').strip()
+    _CTX['blob_tag_embedding_index_container'] = (blob_tag_embedding_index_container or '').strip()
     _CTX['image_names_table_client'] = image_names_table_client
     _CTX['hash_index_table_client'] = hash_index_table_client
     _CTX['filename_owners_table_client'] = filename_owners_table_client
