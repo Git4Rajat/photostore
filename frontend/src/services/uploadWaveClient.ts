@@ -1,17 +1,32 @@
 import { sessionScope } from './sessionScope';
-import { postUpload } from './apiClient';
+import { getRuntimeConfig } from '../config/appConfig';
+import { getUpload, postUpload } from './apiClient';
 
-// Thin wrapper over the backend's opt-in shadow wave API
-// (backend/routes/upload_wave_shadow.py). The shadow protocol is disabled by
-// default (UPLOAD_WAVE_SHADOW_ENABLED) and, even when enabled, never gates or
-// blocks the real upload path -- every call here is best-effort: a 404
-// (disabled), a network error, or any other failure is swallowed so it can
-// never affect uploading, finalizing, or resuming a real file. See
-// docs/indexing-clustering-target-state.md step 1 ("connect the browser").
+// Shadow calls are advisory. Live uploads separately require acknowledged
+// admission, and discover durable ownership per authenticated library so a
+// shared frontend build can continue uploading into legacy libraries.
 
-export const waveShadowEnabled = () => import.meta.env.VITE_UPLOAD_WAVE_SHADOW_ENABLED === 'true';
+export const waveLiveEnabled = () => getRuntimeConfig().uploadWaveExecutionEnabled === true
+    || import.meta.env.VITE_UPLOAD_WAVE_EXECUTION_ENABLED === 'true';
+export const waveShadowEnabled = () => waveLiveEnabled() || import.meta.env.VITE_UPLOAD_WAVE_SHADOW_ENABLED === 'true';
+const base = () => `/upload/waves/${waveLiveEnabled() ? 'live' : 'shadow'}`;
 
 const SHADOW_REQUEST_CONFIG = { singleAttempt: true, timeout: 15000 };
+const protocols = new Map<string, Promise<'live' | 'legacy'>>();
+export const waveProtocol = async (): Promise<'live' | 'legacy'> => {
+    const scope = sessionScope();
+    let pending = protocols.get(scope);
+    if (!pending) {
+        pending = getUpload<{ protocol: string }>('/upload/waves/protocol', SHADOW_REQUEST_CONFIG).then(result => {
+            if (sessionScope() !== scope || !['live', 'legacy'].includes(result.protocol)) {
+                throw new Error('Upload library protocol could not be verified.');
+            }
+            return result.protocol as 'live' | 'legacy';
+        }).catch(error => { protocols.delete(scope); throw error; });
+        protocols.set(scope, pending);
+    }
+    return pending;
+};
 
 const callShadow = async <T = unknown>(
     path: string, body: unknown | (() => Promise<unknown>),
@@ -19,6 +34,7 @@ const callShadow = async <T = unknown>(
     if (!waveShadowEnabled()) return null;
     try {
         const scope = sessionScope();
+        if (waveLiveEnabled() && await waveProtocol() === 'legacy') return null;
         const payload = typeof body === 'function' ? await body() : body;
         if (sessionScope() !== scope) return null;
         return await postUpload<T>(path, payload, SHADOW_REQUEST_CONFIG);
@@ -34,7 +50,7 @@ const callShadow = async <T = unknown>(
 
 // Persisted file keys include separators and filenames. Hash their complete
 // stable identity for transport; never truncate or modify the upload checkpoint.
-const wireItemId = async (key: string): Promise<string> => {
+export const wireItemId = async (key: string): Promise<string> => {
     const bytes = new TextEncoder().encode(key);
     const hash = await crypto.subtle.digest('SHA-256', bytes);
     return Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, '0')).join('');
@@ -52,13 +68,13 @@ export const WAVE_SHADOW_MAX_PAGE = 20;
 
 export const openWaveShadowSession = (sessionId: string, declaredCount: number, resumedFromSessionId?: string) =>
     callShadow<{ waveId: string; manifestRevision: string }>(
-        `/upload/waves/shadow/sessions`,
+        `${base()}/sessions`,
         { sessionId, declaredCount, ...(resumedFromSessionId ? { resumedFromSessionId } : {}) },
     );
 
 export const registerWaveShadowItems = (sessionId: string, items: WaveShadowItem[]) =>
     callShadow<{ manifestRevision: string; registeredCount: number }>(
-        `/upload/waves/shadow/sessions/${encodeURIComponent(sessionId)}/items`,
+        `${base()}/sessions/${encodeURIComponent(sessionId)}/items`,
         async () => ({ items: await Promise.all(items.map(async item => ({
             ...item, itemId: await wireItemId(item.itemId),
         }))) }),
@@ -71,12 +87,12 @@ export const resolveWaveShadowItem = (
     filename?: string,
 ) =>
     callShadow<{ manifestRevision: string }>(
-        `/upload/waves/shadow/sessions/${encodeURIComponent(sessionId)}/resolve`,
+        `${base()}/sessions/${encodeURIComponent(sessionId)}/resolve`,
         async () => ({ itemId: await wireItemId(itemId), outcome, filename }),
     );
 
 export const closeWaveShadowSession = (sessionId: string, manifestRevision: string, closeId: string) =>
     callShadow<{ state: string }>(
-        `/upload/waves/shadow/sessions/${encodeURIComponent(sessionId)}/close`,
+        `${base()}/sessions/${encodeURIComponent(sessionId)}/close`,
         { manifestRevision, closeId },
     );

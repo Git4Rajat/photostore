@@ -5,6 +5,10 @@ ROLE="${APP_ROLE:-core}"
 
 echo "EXIF runtime version=$(exiftool -ver)"
 
+if [ "${ROLE}" = "wave-recovery" ]; then
+    exec python -u -m wave_recovery
+fi
+
 if [ "${ROLE}" = "index-worker" ]; then
     echo "Starting index maintenance worker..."
     exec python -u -c "import app; app.run_index_worker()"

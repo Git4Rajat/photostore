@@ -1,10 +1,8 @@
 """Durable stage release/dispatch, and gated Vision/cluster/index consumer
 entry points -- see docs/indexing-clustering-target-state.md step 3.
 
-Enabling dispatch or the consumer entry points below does not permit live
-cutover: `live_consumers_available()` stays False until the remaining
-assignment/publication/recovery gates (step 5/6 publisher integration) are
-also satisfied. Stage intents must never enter the index-maintenance
+New libraries additionally require durable ownership and a qualified capability
+certificate; configuration alone never converts an existing library. Stage intents must never enter the index-maintenance
 recovery partition -- `stage_work_store` uses its own isolated partition,
 confirmed by test_indexer_recovery_cannot_see_wave_stage_intents.
 
@@ -32,9 +30,10 @@ def stage_work_store(table, **kwargs):
 
 
 def live_consumers_available():
-    # Replace with a validated durable cutover/capability protocol when the
-    # real Vision/cluster/index consumers and source fencing are implemented.
-    return False
+    # Configuration hint only: actual live admission/consumption also validates
+    # durable ownership and the role's certified deployment identity.
+    from wave_policy import configuration_ready
+    return configuration_ready() and bool(os.getenv('UPLOAD_WAVE_CAPABILITY_ID'))
 
 
 def execution_enabled():
@@ -80,11 +79,16 @@ def advance_wave(work_store, store, library, wave_id):
     state -- every branch is a no-op when not applicable.
     """
     wave = store.promote_successor(wave_id)
+    from wave_policy import owned
+    if owned(store.table,library):
+        from wave_no_work import advance_empty,advance_zero_faces
+        wave = advance_empty(store,wave_id)
+        wave = advance_zero_faces(store,wave_id)
     dispatched = []
     if wave['state'] in ('processing_pending', 'processing') and wave.get('visionPendingKey'):
         if dispatch_outbox(work_store, store, library, wave['visionPendingKey'], 'vision'):
             dispatched.append('vision')
-    if wave['state'] == 'ready':
+    if wave['state'] == 'ready' and not wave.get('zeroFaceProbePending'):
         if dispatch_outbox(work_store, store, library, 'shadow-cluster!' + wave_id, 'cluster'):
             dispatched.append('cluster')
     if wave['state'] == 'indexing' and wave.get('indexPendingKey'):
@@ -205,6 +209,9 @@ def _execution_check(leases, ownership, store, outbox_key):
     from execution_lease import OwnershipLost
     if not execution_enabled():
         raise OwnershipLost('Wave execution is disabled')
+    policy=store._get('policy')
+    if policy and policy.get('cleanupState'):
+        raise OwnershipLost('Library cleanup has fenced wave execution')
     wave = store._required(store.wave_key(ownership.waveId))
     outbox = store._required(outbox_key)
     if (not store.outbox_eligible(wave, outbox)
@@ -245,10 +252,12 @@ def _observe_qualified(store, member, metadata_table):
             or row.get('processingRevision') != member['processingRevision']
             or row.get('processing_state') == 'deleted' or row.get('processingIsolated')
             or is_superseded(row, is_video=is_video_file(member['filename']))
-            or any(row.get(k) for k in ('processing_lease_owner', 'processing_lease', 'processing_lease_expires_at'))):
+            ):
         # Never ask the adapter to process a replacement, deleted source or
         # somebody else's active source lease for this frozen obligation.
         return None, None
+    if any(row.get(k) for k in ('processing_lease_owner','processing_lease','processing_lease_expires_at')):
+        return None, row
     identity = row.get('processingCompletionId')
     if not identity:
         return None, row
@@ -291,7 +300,7 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
     def renew():
         _execution_check(leases, ownership, store, outbox_key)
         leases.renew(ownership)
-    with execution_scope(leases, ownership, store, lambda: _execution_check(leases, ownership, store, outbox_key)):
+    with execution_scope(leases, ownership, store, lambda: _execution_check(leases, ownership, store, outbox_key)), leases.keepalive(ownership):
         # Revisit earlier pending members on every pass; a cursor is not proof
         # their asynchronous processing completed.
         cursor = ''
@@ -300,18 +309,32 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
             members = store._page(f'e!{wave_id}!m!', cursor)
             for member in members:
                 renew()
+                from wave_settlement import source_state,attempt,exhausted,verified
+                if member['outcome'] not in ('pending','settled') and verified(store,member):
+                    continue
+                if source_state(store,wave_id,member,metadata_table):
+                    continue
                 completion, row = _observe_qualified(store, member, metadata_table)
-                if completion is None and row is not None:
+                from storage_utils import _processing_is_expired
+                source_leased=bool(row and any(row.get(k) for k in ('processing_lease_owner','processing_lease','processing_lease_expires_at')))
+                if completion is None and row is not None and (not source_leased or _processing_is_expired(row)):
                     if process_source is None:
                         leases.fail(ownership, 'source_adapter_required')
                         raise NotImplementedError('A fenced source-processing adapter is required')
-                    process_source(library, member['filename'], member['processingRevision'], renew)
+                    count=attempt(store,member)
+                    try:
+                        process_source(library, member['filename'], member['processingRevision'], renew)
+                    except Exception:
+                        if exhausted(store,wave_id,member,metadata_table,count):continue
+                        raise
                     renew()
                     completion, row = _observe_qualified(store, member, metadata_table)
+                    if completion is None and exhausted(store,wave_id,member,metadata_table,count):
+                        continue
                 store.observe(wave_id, member['photoId'], member['processingRevision'],
                     outcome='settled' if completion else 'pending',
                     evidence_id=completion[0]['id'] if completion else digest(['pending', member['photoId'], member['processingRevision']]),
-                    evidence_qualified=bool(completion))
+                    evidence_qualified=bool(completion),outstanding_leases=int(source_leased and completion is None))
             cursor = members[-1]['RowKey'] if len(members) == MAX_PAGE else ''
             leases.checkpoint(ownership, cursor)
             if not cursor:
@@ -325,55 +348,67 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
         leases.release(ownership)
         return wave
     leases.complete(ownership, wave['frozenRevision'])
-    release_and_relay(work_store, store, library, 'shadow-cluster!' + wave_id, 'cluster', cluster_send)
+    wave,_=advance_wave(work_store,store,library,wave_id)
+    if wave['state']=='indexing':
+        release_and_relay(work_store,store,library,wave['indexPendingKey'],'index',cluster_send)
+    elif wave['state']=='ready' and not wave.get('zeroFaceProbePending'):
+        release_and_relay(work_store, store, library, 'shadow-cluster!' + wave_id, 'cluster', cluster_send)
     return wave
 
 
-def _load_wave_faces(store, wave_id, face_table=None, face_ids=None, *, renew=lambda: None):
-    """Only immutable evidence selected at readiness may supply face inputs."""
+def _iter_wave_faces(store, wave_id, *, renew=lambda: None):
+    """Read one bounded member page and one immutable face snapshot at a time."""
     from processing_receipts import ArtifactReceipts
     from upload_waves import MAX_PAGE
     receipts = ArtifactReceipts(store.table, store.library)
-    members, face_rows, after = {}, {}, ''
+    after = ''
     while True:
         renew()
         page = store._page(f'e!{wave_id}!m!', after, size=MAX_PAGE)
         for member in page:
             renew()
+            if member['outcome']!='settled':
+                from wave_settlement import verified
+                if verified(store,member):continue
             if member['outcome'] != 'settled' or not member.get('evidenceQualified'):
                 raise ValueError('Frozen member lacks qualified completion evidence')
             completion = _completion(store, member, member['evidenceId'])
             if completion is None:
                 raise ValueError('Frozen completion receipt is missing')
             intent, manifest = completion
-            ids = []
+            count = 0
             for snapshot_id in manifest['faceSnapshots']:
+                renew()
                 row = json.loads(receipts._get('face!' + snapshot_id)['payload'])
-                face_id = row['RowKey']
                 if (row.get('filename') != member['filename']
                         or row.get('sourcePhotoId') != member['photoId']
-                        or row.get('processingRevision') != member['processingRevision']
-                        or face_id in face_rows):
+                        or row.get('processingRevision') != member['processingRevision']):
                     raise ValueError('Frozen face identity mismatch')
-                ids.append(face_id)
-                face_rows[face_id] = row
-            if len(ids) != manifest['faceCount']:
+                count += 1
+                yield row
+            if count != manifest['faceCount']:
                 raise ValueError('Frozen face coverage mismatch')
-            members[member['filename']] = ids
         if len(page) < MAX_PAGE:
-            return members, face_rows
+            return
         after = page[-1]['RowKey']
+
+
+def _load_wave_faces(store, wave_id, face_table=None, face_ids=None, *, renew=lambda: None):
+    # Compatibility for diagnostics/tests. The live runner uses the iterator.
+    members, faces = {}, {}
+    for row in _iter_wave_faces(store, wave_id, renew=renew):
+        face_id = row['RowKey']
+        if face_id in faces:
+            raise ValueError('Duplicate frozen face')
+        members.setdefault(row['filename'], []).append(face_id)
+        faces[face_id] = row
+    return members, faces
 
 
 def run_cluster_release(leases, store, library, wave_id, outbox_key, *,
                         assigner, journal, obligations_table, face_table, face_ids,
-                        required_scopes=('people',), chunk_size=None):
-    """Validate frozen inputs. Nonempty assignment stays blocked until step 4.
-
-    The legacy assigner reloads live rows and has no stage-fenced per-face
-    commit path. Passing snapshots as ordering inputs does not fix that;
-    reject it before any mutations rather than claim crash-safe execution.
-    """
+                        required_scopes=None, chunk_size=None):
+    """One journaled canonical pass over immutable inputs; no index builds."""
     from execution_lease import execution_scope
     from wave_publication import ObligationLedger, compute_obligations
     ownership, wave = claim_release(leases, store, library, wave_id, 'cluster', outbox_key, 'cluster')
@@ -389,19 +424,31 @@ def run_cluster_release(leases, store, library, wave_id, outbox_key, *,
         def renew():
             _execution_check(leases, ownership, store, outbox_key)
             leases.renew(ownership)
-        members, face_rows = _load_wave_faces(store, wave_id, renew=renew)
+        from wave_assignment import run_frozen_assignment
+        with leases.keepalive(ownership) as owned:
+            def check():
+                owned()
+                _execution_check(leases, ownership, store, outbox_key)
+            assignment_receipt = run_frozen_assignment(store, wave, assigner,
+                lambda: _iter_wave_faces(store, wave_id, renew=check), check,
+                page_size=128 if chunk_size is None else chunk_size,
+                progress=lambda count: leases.checkpoint(ownership, 'faces-applied:' + str(count)))
         renew()
-        if face_rows:
-            leases.fail(ownership, 'fenced_assignment_not_implemented')
-            raise NotImplementedError('Nonempty wave assignment requires the step 4 fenced journal')
-        ledger = ObligationLedger(obligations_table, wave_id, library=library, frozen_revision=wave['frozenRevision'])
-        frontier = ledger.record_required(compute_obligations(library, wave_id, wave['frozenRevision'], list(required_scopes)))
-        next_wave = store.commit_assignment(wave_id, frontier, manifest_digest=wave['manifestDigest'])
+        from wave_catalog import SCOPES, PREREQUISITES
+        scopes=tuple(SCOPES if required_scopes is None else required_scopes)
+        graph={scope:deps for scope,deps in PREREQUISITES.items() if scope in scopes}
+        ledger = ObligationLedger(obligations_table, wave_id, library=library,
+            frozen_revision=wave['frozenRevision'], assignment_revision=assignment_receipt)
+        obligations=compute_obligations(library,wave_id,wave['frozenRevision'],scopes,
+            prerequisite_scopes=graph,assignment_revision=assignment_receipt)
+        frontier=ledger.record_required(obligations,prerequisite_scopes=graph)
+        next_wave = store.commit_assignment(wave_id, frontier, manifest_digest=wave['manifestDigest'],
+            assignment_receipt=assignment_receipt)
     leases.complete(ownership, frontier)
     return next_wave
 
 
-def run_index_release(leases, store, library, wave_id, outbox_key, ledger):
+def run_index_release(leases, store, library, wave_id, outbox_key, ledger, *, publisher=None, prepare=None):
     from execution_lease import execution_scope
     ownership, wave = claim_release(leases, store, library, wave_id, 'index', outbox_key, 'index')
     if ownership is None:
@@ -409,9 +456,39 @@ def run_index_release(leases, store, library, wave_id, outbox_key, ledger):
     if ownership.status == 'succeeded':
         return wave
     with execution_scope(leases, ownership, store, lambda: _execution_check(leases, ownership, store, outbox_key)):
-        if not ledger.is_complete():
-            leases.fail(ownership, 'publication_incomplete')
+        if ledger.assignment_revision != (wave.get('assignmentReceiptId') or ''):
+            raise ValueError('Index obligations do not match the committed assignment receipt')
+        with leases.keepalive(ownership) as owned:
+            def check():
+                owned()
+                _execution_check(leases,ownership,store,outbox_key)
+            if publisher is not None:
+                if prepare is not None:
+                    prepare(check)
+                manifest,specs=ledger._specs()
+                if manifest is None or manifest['requiredSetId'] != wave.get('requiredPublicationId'):
+                    raise ValueError('Index obligation set is not the committed wave frontier')
+                remaining=dict(specs)
+                while remaining:
+                    advanced=False
+                    for scope,spec in list(remaining.items()):
+                        check()
+                        if any(not ledger._valid_receipt(ledger._get(parent),manifest) for parent in spec['prerequisites']):
+                            continue
+                        generation=publisher(scope,spec['id'],check)
+                        check()
+                        ledger.record_receipt(spec['id'],output_generation=generation)
+                        leases.checkpoint(ownership,'published:'+scope)
+                        del remaining[scope]; advanced=True
+                    if not advanced:
+                        raise RuntimeError('Publication prerequisites cannot advance')
+            incomplete=not ledger.is_complete()
+            if not incomplete:
+                from wave_no_work import record_publication_members
+                record_publication_members(store,wave,check)
+                result = store.complete_indexing(wave_id, ledger)
+        if incomplete:
+            leases.fail(ownership,'publication_incomplete')
             return wave
-        result = store.complete_indexing(wave_id, ledger)
     leases.complete(ownership, result.get('completionReceiptId', ''))
     return result

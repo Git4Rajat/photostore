@@ -16,6 +16,7 @@ from azure.data.tables import UpdateMode
 from processing_completion import StaleProcessingResult
 
 _ACTIVE = contextvars.ContextVar('processing_result_fence', default=None)
+POLICY_CHECK = None
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,8 @@ class ResultFence:
     generation: str = ''
 
     def check(self):
+        if POLICY_CHECK is not None:
+            POLICY_CHECK(self.library)
         row = self.table.get_entity(self.library, self.filename)
         try:
             expires = datetime.fromisoformat(str(row.get('processing_lease_expires_at') or '').replace('Z', '+00:00'))

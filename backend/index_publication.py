@@ -50,14 +50,20 @@ def publication(store, claim):
 class ConditionalBlob:
     def __init__(self, client, guard):
         self.client, self.guard = client, guard
+        self.catalog_guard = _CATALOG.get()
 
     def __getattr__(self, name):
         return getattr(self.client, name)
 
     def upload_blob(self, data, **kwargs):
+        if self.catalog_guard is not None:self.catalog_guard.check()
+        catalog_check()
         self.guard.check()
+        prepare = getattr(self.guard, 'before_upload', None)
+        if prepare is not None:
+            prepare(self.client, kwargs)
         # Search manifests already have their own CAS publication protocol.
-        if 'etag' not in kwargs and 'match_condition' not in kwargs:
+        if prepare is None and 'etag' not in kwargs and 'match_condition' not in kwargs:
             try:
                 props = self.client.get_blob_properties()
                 kwargs.update(etag=props.etag, match_condition=MatchConditions.IfNotModified)
@@ -73,7 +79,18 @@ class ConditionalBlob:
             self.guard.lost = error
             raise
         self.guard.check()
+        observed = getattr(self.guard, 'after_upload', None)
+        if self.catalog_guard is not None:self.catalog_guard.check()
+        catalog_check()
+        if observed is not None:
+            observed(self.client, result)
         return result
+
+    def upload_file(self, path, **kwargs):
+        # Preserve streaming through the wrapper; storage_utils must not fall
+        # back to reading an entire catalog file into Python memory.
+        with open(path, 'rb') as data:
+            return self.upload_blob(data, **kwargs)
 
     def delete_blob(self, **kwargs):
         self.guard.check()
@@ -93,3 +110,50 @@ def check():
     guard = _ACTIVE.get()
     if guard is not None:
         guard.check()
+
+
+@contextmanager
+def guarded_publication(guard):
+    """Use a wave stage guard with the same actual publisher blob wrappers."""
+    token = _ACTIVE.set(guard)
+    try:
+        yield guard
+        guard.check()
+    finally:
+        _ACTIVE.reset(token)
+
+
+_CATALOG = ContextVar('library_catalog_lease',default=None)
+
+
+def catalog_check():
+    guard=_CATALOG.get()
+    if guard is not None:guard.check()
+
+
+@contextmanager
+def catalog_serialization(table,library,blobs,container):
+    """Wave and foreground CRUD builders read/build/publish under one library lease.
+    This prevents a CRUD build started earlier from replacing a wave's aliases.
+    """
+    from wave_policy import owned
+    if not owned(table,library):
+        yield
+        return
+    from clustering_lease import BlobLibraryLeaseFactory
+    factory=BlobLibraryLeaseFactory(blobs,container,namespace='catalog-publication-locks')
+    with factory(library) as guard:
+        token=_CATALOG.set(guard)
+        try:
+            guard.check();yield;guard.check()
+        finally:_CATALOG.reset(token)
+
+
+def serialize_catalog(function):
+    from functools import wraps
+    @wraps(function)
+    def wrapped(library,*args,**kwargs):
+        import app
+        with catalog_serialization(app.jobs_table_client,library,app.blob_service_client,app.BLOB_LEXICAL_INDEX_CONTAINER):
+            return function(library,*args,**kwargs)
+    return wrapped

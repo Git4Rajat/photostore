@@ -299,7 +299,8 @@ def ready_wave(world, *, with_face=False):
     wave_id, resolved = register_accepted(store); close(store, 'parent', resolved)
     metadata = FakeMetadata()
     metadata.put(store.library, 'original.jpg', **settled_row('photo-1', 'revision-1'))
-    faces = [dict(RowKey='face-1', filename='original.jpg', sourcePhotoId='photo-1',
+    faces = [dict(PartitionKey=store.library, RowKey='face-1', filename='original.jpg', sourcePhotoId='photo-1',
+        alignmentMethod='5pt',
         processingRevision='revision-1', embedding='[1.0,2.0]',
         embeddingVersion=current_contract()['faceEmbeddingVersions'][0])] if with_face else []
     publish_completion(store, metadata, faces=faces)
@@ -326,7 +327,7 @@ def test_nonempty_cluster_does_not_call_unsafe_legacy_assigner(world):
     store, work, leases, *_ = world
     wave_id = ready_wave(world, with_face=True)
     assigner = FakeAssigner()
-    with pytest.raises(NotImplementedError, match='step 4'):
+    with pytest.raises(TypeError, match='FaissAssigner'):
         run_cluster_release(leases, store, store.library, wave_id, 'shadow-cluster!' + wave_id,
             assigner=assigner, journal=None, obligations_table=EtagTable(), face_table=None, face_ids=None)
     assert not assigner.calls and store.status(wave_id)['state'] == 'ready'
@@ -337,9 +338,10 @@ def test_zero_face_cluster_commits_index_handoff_but_index_requires_publication(
     wave_id = ready_wave(world)
     obligations = EtagTable()
     wave = run_cluster_release(leases, store, store.library, wave_id, 'shadow-cluster!' + wave_id,
-        assigner=FakeAssigner(), journal=None, obligations_table=obligations, face_table=None, face_ids=None)
+        assigner=real_wave_assigner().assigner, journal=None, obligations_table=obligations, face_table=None, face_ids=None)
     assert wave['state'] == 'indexing'
-    ledger = ObligationLedger(obligations, wave_id, library=store.library, frozen_revision=wave['frozenRevision'])
+    ledger = ObligationLedger(obligations, wave_id, library=store.library, frozen_revision=wave['frozenRevision'],
+        assignment_revision=wave['assignmentReceiptId'])
     result = run_index_release(leases, store, store.library, wave_id, wave['indexPendingKey'], ledger)
     assert result['state'] == 'indexing'
 
@@ -402,3 +404,81 @@ def test_replacement_source_is_never_sent_to_the_old_wave_adapter(world):
         lambda *a: pytest.fail('premature clustering'),
         process_source=lambda *a: pytest.fail('processed replacement for an old wave'))
     assert wave['state'] == 'processing'
+
+
+def real_wave_assigner():
+    from test_faiss_assignment import Harness
+    harness = Harness()
+    for attr, field in [('faces','face_table'), ('people','person_table'),
+                        ('embeddings','embedding_table'), ('members','member_table')]:
+        table = EtagTable()
+        setattr(harness, attr, table)
+        setattr(harness.assigner, field, table)
+    return harness
+
+
+def test_real_nonempty_cluster_executes_frozen_journal_and_commits_receipt(world):
+    from upload_wave_execution import _load_wave_faces
+    store, work, leases, *_ = world
+    wave_id = ready_wave(world, with_face=True)
+    h = real_wave_assigner()
+    _, frozen = _load_wave_faces(store, wave_id)
+    h.faces.create_entity(frozen['face-1'])
+    result = run_cluster_release(leases, store, store.library, wave_id, 'shadow-cluster!'+wave_id,
+        assigner=h.assigner, journal=None, obligations_table=EtagTable(), face_table=None, face_ids=None)
+    assert result['state'] == 'indexing' and result['assignmentReceiptId']
+    assert h.faces.rows[store.library, 'face-1']['personId']
+    assert store._get(f'assignment!{wave_id}!complete')['digest'] == result['assignmentReceiptId']
+    assert not h.metadata
+
+
+def test_index_handoff_cannot_rebind_an_assignment_receipt(world):
+    from upload_waves import Conflict
+    store, work, leases, *_ = world
+    wave_id = ready_wave(world)
+    result = run_cluster_release(leases, store, store.library, wave_id, 'shadow-cluster!'+wave_id,
+        assigner=real_wave_assigner().assigner, journal=None,
+        obligations_table=EtagTable(), face_table=None, face_ids=None)
+    with pytest.raises(Conflict, match='committed receipt'):
+        store.commit_assignment(wave_id, result['requiredPublicationId'],
+            manifest_digest=result['manifestDigest'], assignment_receipt='0'*64)
+
+
+def test_index_dag_completes_only_after_every_exact_receipt(world):
+    from wave_catalog import SCOPES, PREREQUISITES
+    store, _, leases, *_ = world
+    wave_id = ready_wave(world)
+    table = EtagTable()
+    wave = run_cluster_release(leases, store, store.library, wave_id, 'shadow-cluster!'+wave_id,
+        assigner=real_wave_assigner().assigner, journal=None,
+        obligations_table=table, face_table=None, face_ids=None)
+    ledger = ObligationLedger(table, wave_id, library=store.library,
+        frozen_revision=wave['frozenRevision'], assignment_revision=wave['assignmentReceiptId'])
+    published=[]
+    def publish(scope, obligation, check):
+        check()
+        assert set(PREREQUISITES.get(scope, ())) <= set(published)
+        assert store.status(wave_id)['state'] == 'indexing'
+        published.append(scope)
+        return digest([scope, obligation])
+    complete = run_index_release(leases, store, store.library, wave_id,
+        wave['indexPendingKey'], ledger, publisher=publish)
+    assert set(published) == set(SCOPES)
+    assert complete['state'] == 'complete'
+    assert ledger.completion_proof()['assignmentReceiptId'] == wave['assignmentReceiptId']
+
+
+def test_failed_publisher_never_completes_wave(world):
+    store, _, leases, *_ = world
+    wave_id = ready_wave(world)
+    table = EtagTable()
+    wave = run_cluster_release(leases, store, store.library, wave_id, 'shadow-cluster!'+wave_id,
+        assigner=real_wave_assigner().assigner, journal=None,
+        obligations_table=table, face_table=None, face_ids=None)
+    ledger = ObligationLedger(table, wave_id, library=store.library,
+        frozen_revision=wave['frozenRevision'], assignment_revision=wave['assignmentReceiptId'])
+    def failed(*args):raise OSError('publisher unavailable')
+    with pytest.raises(OSError):
+        run_index_release(leases, store, store.library, wave_id, wave['indexPendingKey'], ledger,publisher=failed)
+    assert store.status(wave_id)['state'] == 'indexing'
+    assert not ledger.is_complete()

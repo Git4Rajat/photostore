@@ -2,11 +2,14 @@
 import { webcrypto } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const mocks = vi.hoisted(() => ({ post: vi.fn() }));
-vi.mock('./apiClient', () => ({ postUpload: mocks.post }));
-import { closeWaveShadowSession, openWaveShadowSession, registerWaveShadowItems, resolveWaveShadowItem } from './uploadWaveClient';
+const mocks = vi.hoisted(() => ({ post: vi.fn(), get: vi.fn(), scope: 'test' }));
+vi.mock('./sessionScope', () => ({ sessionScope: () => mocks.scope }));
+vi.mock('./apiClient', () => ({ postUpload: mocks.post, getUpload: mocks.get }));
+import { waveLiveEnabled, waveProtocol, closeWaveShadowSession, openWaveShadowSession, registerWaveShadowItems, resolveWaveShadowItem } from './uploadWaveClient';
 
 beforeEach(() => {
+    mocks.scope = crypto.randomUUID();
+    mocks.get.mockReset().mockResolvedValue({ protocol: 'live' });
     vi.stubGlobal('crypto', webcrypto);
     vi.stubEnv('VITE_UPLOAD_WAVE_SHADOW_ENABLED', 'true');
     mocks.post.mockReset().mockResolvedValue({ manifestRevision: 'rev-1' });
@@ -46,4 +49,31 @@ describe('shadow wire protocol', () => {
         mocks.post.mockRejectedValue(new Error('offline'));
         expect(await openWaveShadowSession('parent', 1)).toBeNull();
     });
+});
+
+it('discovers live ownership per library and preserves legacy uploads in the same build', async () => {
+    vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
+    mocks.get.mockResolvedValueOnce({ protocol: 'legacy' });
+    expect(await waveProtocol()).toBe('legacy');
+    expect(await openWaveShadowSession('old', 1)).toBeNull();
+    expect(mocks.post).not.toHaveBeenCalled();
+    mocks.scope = 'another-library';
+    expect(await openWaveShadowSession('new', 1)).not.toBeNull();
+    expect(mocks.post.mock.calls[0][0]).toContain('/waves/live/');
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+});
+it('never guesses legacy ownership after a discovery error and permits retry', async () => {
+    mocks.get.mockRejectedValueOnce(new Error('storage unavailable'));
+    await expect(waveProtocol()).rejects.toThrow('storage unavailable');
+    await expect(waveProtocol()).resolves.toBe('live');
+});
+
+it('allows the deployed runtime flag to opt in without a special frontend image build', async () => {
+    vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'false');
+    vi.stubGlobal('window', { __APP_CONFIG__: { uploadWaveExecutionEnabled: true } });
+    expect(waveLiveEnabled()).toBe(true);
+    await openWaveShadowSession('runtime-parent', 1);
+    expect(mocks.post.mock.calls[0][0]).toContain('/waves/live/');
+    window.__APP_CONFIG__!.uploadWaveExecutionEnabled = false;
+    expect(waveLiveEnabled()).toBe(false);
 });

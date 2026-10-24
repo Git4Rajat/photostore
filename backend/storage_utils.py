@@ -542,8 +542,14 @@ def configure_storage(
     face_summary_cache_writer=None,
     source_completion_delivery=None,
     source_artifact_receipt_capture=None,
+    source_policy_check=None,
+    wave_owned=None,
 ) -> None:
     _CTX['metadata_table_client'] = metadata_table_client
+    _CTX['source_policy_check'] = source_policy_check
+    _CTX['wave_owned'] = wave_owned
+    import processing_fence
+    processing_fence.POLICY_CHECK = source_policy_check
     _CTX['face_table_client'] = face_table_client
     _CTX['person_table_client'] = person_table_client
     _CTX['albums_table_client'] = albums_table_client
@@ -917,6 +923,9 @@ def metadata_index_kinds(updates):
 def prepare_metadata_index_intent(entity, updates):
     """Stored atomically with the source row, before any queue/dirty-table write."""
     if not DURABLE_INDEX_UPDATES:
+        return
+    from wave_policy import source_change_active
+    if source_change_active() and _CTX.get('wave_owned') and _CTX['wave_owned'](entity['PartitionKey']):
         return
     kinds = metadata_index_kinds(updates)
     previous = _safe_json_load(entity.get('indexPending'))
@@ -3144,7 +3153,7 @@ def _build_user_people_embedding_index_snapshot(user_id: str, source_version: st
             select=['RowKey', 'name', 'faceIds', 'repEmbedding'],
         )
     except Exception:
-        person_rows = []
+        return None
 
     # Active-face cross-verification, same shape as app.py's
     # _active_face_ids_for_person: a person's faceIds list is only trusted
@@ -3158,7 +3167,7 @@ def _build_user_people_embedding_index_snapshot(user_id: str, source_version: st
             select=['RowKey', 'personId', 'rejected', 'reviewStatus'],
         ))
     except Exception:
-        face_rows = []
+        return None
     face_owner_by_id: Dict[str, str] = {}
     for row in face_rows:
         if row.get('rejected') or str(row.get('reviewStatus') or '').strip().lower() == 'rejected':
@@ -7254,7 +7263,7 @@ def _incremental_people_index_snapshot_by_ids(
 
 
 @catalog_publisher
-def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = None, affected_person_ids: Optional[set] = None) -> Optional[LexicalIndexSnapshot]:
+def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = None, affected_person_ids: Optional[set] = None, force_full: bool = False) -> Optional[LexicalIndexSnapshot]:
     """Refresh people index, optionally incrementally for specific people.
 
     If affected_person_ids is provided, only those people are recomputed and merged
@@ -7267,7 +7276,7 @@ def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = N
     started = datetime.now(timezone.utc)
 
     snapshot = None
-    previous_manifest = _load_people_index_manifest(key)
+    previous_manifest = {} if force_full else _load_people_index_manifest(key)
 
     # Try incremental with affected IDs first
     if affected_person_ids and len(affected_person_ids) <= 100:
@@ -10047,6 +10056,9 @@ _EXIF_RESULT_FIELDS = (
 )
 
 
+from wave_policy import source_change
+
+@source_change
 def apply_client_processing_results_for_file(
     user_id: str,
     filename: str,
@@ -10252,6 +10264,8 @@ def _commit_worker_processing_results(user_id, filename, baseline, result, updat
     try:
         for attempt in range(_METADATA_UPDATE_MAX_RETRIES):
             _check_result_lease(current, owner)
+            if _CTX.get('source_policy_check'):
+                _CTX['source_policy_check'](user_id)
             if require_unexpired and _processing_is_expired(current):
                 from processing_completion import StaleProcessingResult
                 raise StaleProcessingResult('Processing result lease expired before commit.')
@@ -10350,6 +10364,7 @@ def _commit_worker_processing_results(user_id, filename, baseline, result, updat
             status_updates=len(updates), milliseconds=(time.monotonic() - started) * 1000)
 
 
+@source_change
 def finalize_uploaded_file(
     user_id: str,
     filename: str,
@@ -10420,6 +10435,11 @@ def finalize_uploaded_file(
             pass
 
     metadata = timed_call('metadata_read', get_or_create_metadata, user_id, final_filename)
+    from wave_policy import finalization_check
+    live_finalization=finalization_check()
+    if live_finalization and metadata.get('processing_state')=='deleted':
+        raise ValueError('Photo deletion is in progress; retry upload after deletion completes')
+    finalize_etag=getattr(metadata,'metadata',{}).get('etag')
     from benchmark_upload import isolated
     benchmark_isolated = isolated(metadata)
     # The metadata row is usually pre-created at /upload/init (which records
@@ -10497,7 +10517,15 @@ def finalize_uploaded_file(
                 'reason': 'browser_assets_required', 'backendFallback': False}})
 
     with upload_phase('persistence'):
-        metadata_table_client.upsert_entity(metadata)
+        if live_finalization:
+            finalization_check()
+            if finalize_etag:
+                metadata_table_client.update_entity(metadata,mode=UpdateMode.REPLACE,etag=finalize_etag,
+                    match_condition=MatchConditions.IfNotModified,timeout=30,retry_total=0)
+            else:
+                metadata_table_client.create_entity(metadata,timeout=30,retry_total=0)
+        else:
+            metadata_table_client.upsert_entity(metadata)
     # Mark the new row dirty for the search/listing indexes immediately --
     # without this, a brand-new photo is invisible to /api/photos (and
     # search) until something ELSE later writes one of the
@@ -10749,6 +10777,8 @@ def claim_processing_lease(
     it.
     """
     _require_context()
+    if _CTX.get('source_policy_check'):
+        _CTX['source_policy_check'](user_id)
     metadata_table_client = _CTX['metadata_table_client']
     requested_steps = tuple(step for step in (steps or list(BROWSER_PROCESSING_STEPS)) if step in BROWSER_PROCESSING_STEPS)
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=max(30, int(lease_seconds or CLIENT_PROCESSING_LEASE_SECONDS)))
@@ -10836,7 +10866,7 @@ def claim_processing_lease(
     }
 
 
-def supersede_processing_generation(user_id: str, filename: str) -> Dict:
+def supersede_processing_generation(user_id: str, filename: str, *, record_supersession=False) -> Dict:
     """Explicit forced-reprocess entry point: allocates a fresh processing
     generation/contract for this exact photo/source and resets every
     required step for its media type to pending, clearing any in-flight
@@ -10860,6 +10890,11 @@ def supersede_processing_generation(user_id: str, filename: str) -> Dict:
             raise PhotoNotFoundError('Photo has been deleted.')
         if entity.get('processingIsolated') is True:
             raise PhotoNotFoundError('Photo is isolated for an upload-only benchmark.')
+        if record_supersession:
+            backlog=json.loads(entity.get('waveSupersessionBacklog') or '[]')
+            if len(backlog)>=16:raise RuntimeError('Supersession backlog requires recovery')
+            backlog.append(entity['processingRevision'])
+            entity['waveSupersessionBacklog']=json.dumps(backlog)
         entity.update(supersede(entity, uuid.uuid4().hex, is_video=is_video_file(filename)))
         entity['processingFence'] = ''
         entity['processing_lease_owner'] = ''
@@ -11398,6 +11433,12 @@ def reset_upload_tracking_and_reserve_blob(
     except Exception:
         entity = {'PartitionKey': user_id, 'RowKey': filename}
 
+    from wave_policy import finalization_check
+    live_intake=finalization_check()
+    intake_etag=getattr(entity,'metadata',{}).get('etag')
+    if live_intake and entity.get('processing_state')=='deleted':
+        raise ValueError('Photo deletion is in progress')
+
     # See reserve_pending_anonymous_blob's docstring: only the transient pending
     # field is reusable here, and only when its recorded content hash matches
     # this upload's -- otherwise it belongs to a different, still-in-flight
@@ -11419,9 +11460,15 @@ def reset_upload_tracking_and_reserve_blob(
     entity.update(initial_metadata or {})
 
     try:
-        metadata_table_client.upsert_entity(entity)
+        if live_intake:
+            finalization_check()
+            if intake_etag:
+                metadata_table_client.update_entity(entity,mode=UpdateMode.REPLACE,etag=intake_etag,
+                    match_condition=MatchConditions.IfNotModified,timeout=30,retry_total=0)
+            else:metadata_table_client.create_entity(entity,timeout=30,retry_total=0)
+        else:metadata_table_client.upsert_entity(entity)
     except Exception:
-        if initial_metadata:
+        if live_intake or initial_metadata:
             raise
         return anonymous_blob_name
     return anonymous_blob_name
@@ -11446,6 +11493,9 @@ def reset_upload_tracking_and_reserve_blobs_batch(
     if not user_id or not files:
         return {}
 
+    from wave_policy import finalization_check
+    live_intake=finalization_check()
+
     filenames = [str(f['filename']) for f in files]
     existing_by_name: Dict[str, Dict] = {}
     or_clause = ' or '.join(f"RowKey eq '{_escape_odata(name)}'" for name in filenames)
@@ -11454,8 +11504,9 @@ def reset_upload_tracking_and_reserve_blobs_batch(
             f"PartitionKey eq '{_escape_odata(user_id)}' and ({or_clause})"
         )
         for row in rows:
-            existing_by_name[str(row.get('RowKey') or '')] = dict(row)
+            existing_by_name[str(row.get('RowKey') or '')] = row if live_intake else dict(row)
     except Exception:
+        if live_intake:raise
         existing_by_name = {}
 
     anonymous_blob_names: Dict[str, str] = {}
@@ -11463,6 +11514,8 @@ def reset_upload_tracking_and_reserve_blobs_batch(
     for f in files:
         filename = str(f['filename'])
         entity = existing_by_name.get(filename) or {'PartitionKey': user_id, 'RowKey': filename}
+        intake_etag=getattr(entity,'metadata',{}).get('etag')
+        if live_intake and entity.get('processing_state')=='deleted':raise ValueError('Photo deletion is in progress')
         expected_hash = f.get('expected_hash')
 
         # See reserve_pending_anonymous_blob's docstring: never fall back to a
@@ -11488,11 +11541,18 @@ def reset_upload_tracking_and_reserve_blobs_batch(
         entity[PENDING_ANONYMOUS_BLOB_FIELD] = anonymous_blob_name
         entity.update(f.get('initial_metadata') or {})
         anonymous_blob_names[filename] = anonymous_blob_name
-        operations.append(('upsert', entity))
+        if live_intake:
+            operations.append(('update',entity,dict(mode=UpdateMode.REPLACE,etag=intake_etag,
+                match_condition=MatchConditions.IfNotModified)) if intake_etag else ('create',entity))
+        else:operations.append(('upsert', entity))
 
     try:
-        metadata_table_client.submit_transaction(operations)
+        if live_intake:
+            finalization_check()
+            metadata_table_client.submit_transaction(operations,timeout=30,retry_total=0)
+        else:metadata_table_client.submit_transaction(operations)
     except Exception:
+        if live_intake:raise
         # A transaction is all-or-nothing -- if the batch itself failed (rare:
         # a real Azure error, not an app bug), fall back to committing each
         # entity individually so this chunk's files still work, just without

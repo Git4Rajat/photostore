@@ -149,6 +149,7 @@ class LibraryStore:
         invites_table,
         audit_table,
         clean_requests_table=None,
+        before_create=None,
     ) -> None:
         self.users = users_table
         self.libraries = libraries_table
@@ -156,6 +157,7 @@ class LibraryStore:
         self.invites = invites_table
         self.audit_table = audit_table
         self.clean_requests = clean_requests_table
+        self.before_create = before_create
 
     # -- generic table helpers ------------------------------------------------
     @staticmethod
@@ -423,6 +425,11 @@ class LibraryStore:
             return []
 
     def create_library(self, library_id: str, *, name: str, owner_user_id: str) -> Dict:
+        existing = self._get_checked(self.libraries, _LIBRARY_PK, str(library_id))
+        if existing:
+            return existing
+        if self.before_create is not None:
+            self.before_create(str(library_id))
         entity = {
             'PartitionKey': _LIBRARY_PK,
             'RowKey': str(library_id),

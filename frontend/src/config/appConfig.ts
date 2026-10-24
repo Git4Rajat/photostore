@@ -32,6 +32,8 @@ export interface AppConfig {
     processingMode?: 'browser' | 'backend' | 'both';
     /** Default-off upload preparation, independent of browser AI processing. */
     browserUploadPreparation?: boolean;
+    /** Deployment opt-in; durable per-library ownership is still discovered by Upload. */
+    uploadWaveExecutionEnabled?: boolean;
 }
 
 declare global {

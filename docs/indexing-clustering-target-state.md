@@ -843,6 +843,14 @@ a source revision, not
 proof that a generation's complete results were durably committed. A shadow
 `ready` state is not a production completion receipt.
 
+Current step-4 follow-on: the gated cluster consumer now uses a disk-ordered
+frozen manifest and baseline, transaction-fenced per-face decisions, replayable
+conditional materialization and exact assignment coverage. It does not run
+metadata/index publication. See [the decision-journal audit](audits/upload-wave-decision-journal-2026-10-23.md)
+for the implementation, validation and remaining integration/scale gates.
+Live cutover remains disabled. The following bullets describe the earlier
+checkpoint, not the current per-face runner.
+
 The review of `63c5e31` adds the following local protocol hardening:
 
 - Wave stage intents use a separate pending partition, so ordinary indexer
@@ -1699,3 +1707,30 @@ PYTHONPATH=backend:backend/tests .venv-photostore-tools/bin/python -m pytest \
 These validate the current mechanisms only. They do not prove the proposed
 wave protocol, which does not yet exist. Live inspection was read-only;
 nothing was deployed.
+
+### Steps 5–7 implementation checkpoint (2026-10-23)
+
+Real wave publishers, assignment-bound receipts, the source-worker adapter, bounded scheduled recovery, optional portal alerts and foreground-demand gates are now connected in the disabled path. See the [implementation/qualification audit](audits/upload-wave-publication-recovery-residency-2026-10-23.md) for exact behavior and limitations. Explicit 300-second cooldowns and a read-only residency collector/verifier are implemented; live five-minute behavior remains unmeasured. `live_consumers_available()` remains false. This checkpoint does not authorize or qualify production cutover.
+
+### October 24 lifecycle integration checkpoint
+
+Remaining items 1–4 now have opt-in code for new-library durable ownership and
+capability validation, authoritative direct-upload admission, sealed live intake
+and predecessor promotion, explicit failure/supersession/abandonment settlement,
+control-only no-work proofs, and reference-aware permanent-delete/clean/purge
+integration. The browser discovers the current library's protocol so existing
+libraries can retain legacy uploads. Foreground and wave catalog publishers share
+a renewable publication lease. See the [ownership and cleanup audit](audits/upload-wave-live-ownership-cleanup-2026-10-24.md)
+for exact behavior, conservative deletion deferral, operator repair, configuration,
+reproducible tests and limits. Historical migration is out of scope because users
+will move data into new libraries. Item 6 cloud qualification remains required;
+no production certificate, enrollment, execution flag or deployment was changed.
+
+### Cloud qualification preflight
+
+The [October 24 cloud preflight](audits/upload-wave-cloud-preflight-2026-10-24.md)
+records the actual current Azure inventory, missing deployment prerequisites,
+new default-off deployment/runtime flag wiring and the remaining measured run.
+The preflight explicitly separates configuration readiness from cloud qualification.
+Qualification is not complete; no cloud state was changed. The residency collector
+now requires an explicit subscription and reads cooldowns from ARM 2025-01-01.

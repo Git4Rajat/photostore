@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { noteForegroundActivity } from './foregroundDemand';
 const mocks = vi.hoisted(() => ({ post: vi.fn(), library: 'A', user: 'u1', authenticated: true }));
 vi.mock('./apiClient', () => ({ postTools: mocks.post }));
 vi.mock('./passwordAuthClient', () => ({ getActiveLibraryFromToken: () => mocks.library }));
@@ -14,6 +15,7 @@ class FakeSocket {
 const flush = async () => { await Promise.resolve(); await Promise.resolve(); };
 beforeEach(() => {
     vi.useFakeTimers(); sockets.length = 0; mocks.library = 'A'; mocks.user = 'u1'; mocks.authenticated = true;
+    noteForegroundActivity();
     mocks.post.mockReset().mockResolvedValue({ available: true, url: 'wss://service/client', libraryId: 'A' });
     vi.stubGlobal('WebSocket', FakeSocket);
 });
@@ -100,17 +102,44 @@ describe('index publication push foreground-demand gate', () => {
         stop();
     });
 
-    it('a brief background dip under the threshold never gates negotiation', async () => {
+    it('pauses while hidden and catches up after a brief background dip', async () => {
         const { startIndexReadyPush } = await import('./indexReadyPush');
         const stop = startIndexReadyPush(vi.fn()); await flush();
+        const beforeHidden=mocks.post.mock.calls.length;
         hide();
         await vi.advanceTimersByTimeAsync(60000); // well under the 5-minute gate
+        expect(mocks.post.mock.calls.length).toBe(beforeHidden);
         show();
         await flush();
         sockets[sockets.length - 1].onopen?.();
-        // Connection still negotiates/opens normally -- a short background
-        // dip (e.g. switching tabs briefly) is not treated as idle.
-        expect(sockets.length).toBeGreaterThan(0);
+        expect(mocks.post.mock.calls.length).toBe(beforeHidden+1);
+        stop();
+    });
+});
+
+describe('visible unattended upload page', () => {
+    it('stops reconnects and invalidations after inactivity, then catches up on input', async () => {
+        const { startIndexReadyPush }=await import('./indexReadyPush');
+        const ready=vi.fn();const stop=startIndexReadyPush(ready);await flush();
+        const old=sockets[0];old.onopen?.();
+        await vi.advanceTimersByTimeAsync(301000);
+        const requests=mocks.post.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(300000);
+        old.onmessage?.({data:JSON.stringify({type:'index-ready',libraryId:'A'})});
+        expect(mocks.post.mock.calls.length).toBe(requests);
+        expect(ready).toHaveBeenCalledTimes(1);
+        window.dispatchEvent(new Event('pointerdown'));await flush();
+        expect(mocks.post.mock.calls.length).toBe(requests+1);
+        stop();
+    });
+    it('ignores negotiation responses that arrive after the idle cutoff', async () => {
+        let resolve!: (value: unknown) => void;
+        mocks.post.mockReturnValue(new Promise(done=>{resolve=done;}));
+        const {startIndexReadyPush}=await import('./indexReadyPush');
+        const stop=startIndexReadyPush(vi.fn());
+        await vi.advanceTimersByTimeAsync(301000);
+        resolve({available:true,url:'wss://service/client',libraryId:'A'});await flush();
+        expect(sockets).toHaveLength(0);
         stop();
     });
 });

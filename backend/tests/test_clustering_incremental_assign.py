@@ -580,12 +580,13 @@ def test_partial_failed_pass_queues_only_persisted_embeddings(monkeypatch, store
 # docs/indexing-clustering-target-state.md step 7, "per-library cutover")
 # must not also feed this legacy incremental buffer/maintenance trigger --
 # old and new paths must never own the same faces.
-def test_cut_over_library_skips_the_legacy_trigger_only_with_live_consumers(monkeypatch):
-    import upload_wave_execution
-    monkeypatch.setattr(upload_wave_execution, 'live_consumers_available', lambda: True)
-    monkeypatch.setattr(app, '_people_features_available', lambda: True)
-    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED', 'true')
-    monkeypatch.setenv('UPLOAD_WAVE_CUTOVER_LIBRARIES', 'lib-A, lib-B')
+def test_owned_library_suppresses_legacy_trigger_even_while_execution_is_paused(monkeypatch):
+    from test_wave_recovery import RuntimeTable
+    from test_wave_activation import active
+    table=RuntimeTable();active(table,'lib-A')
+    monkeypatch.setattr(app,'jobs_table_client',table)
+    monkeypatch.setattr(app,'_people_features_available',lambda:True)
+    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED','false')
     queued = []
     monkeypatch.setattr(app, '_buffer_incremental_assign_filename', lambda *args: queued.append(args))
     result = app._queue_people_clustering_after_face_processing('lib-A', 'photo.jpg', {'faceCount': 1, 'face_status': 'done'})

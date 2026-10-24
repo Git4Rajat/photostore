@@ -198,7 +198,7 @@ class BlobLibraryLeaseFactory:
     tuple, stable only while both tokens remain unchanged.
     """
 
-    def __init__(self, blob_service_client, container, *, duration=60, renew_seconds=15):
+    def __init__(self, blob_service_client, container, *, duration=60, renew_seconds=15, namespace='faiss-assignment-locks'):
         if type(duration) is not int or not 15 <= duration <= 60:
             raise ValueError('duration must be an integer from 15 to 60')
         if (type(renew_seconds) not in (int, float)
@@ -211,12 +211,15 @@ class BlobLibraryLeaseFactory:
         self._duration = duration
         self._renew_seconds = renew_seconds
         self._owner = str(uuid.uuid4())
+        if namespace not in ('faiss-assignment-locks','catalog-publication-locks'):
+            raise ValueError('Unknown library lease namespace')
+        self._namespace = namespace
 
     @contextmanager
     def __call__(self, user_id):
         if not isinstance(user_id, str) or not user_id:
             raise ValueError('user_id must be a nonempty library ID string')
-        name = 'faiss-assignment-locks/' + hashlib.sha256(user_id.encode('utf-8')).hexdigest() + '.json'
+        name = self._namespace+'/' + hashlib.sha256(user_id.encode('utf-8')).hexdigest() + '.json'
         blob = self._client.get_blob_client(container=self._container, blob=name)
         initial = {'owner': '', 'generation': str(uuid.uuid4())}
         try:

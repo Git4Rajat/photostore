@@ -1,3 +1,5 @@
+import { hasForegroundDemand, onForegroundReturn } from '../services/foregroundDemand';
+import { waveLiveEnabled } from '../services/uploadWaveClient';
 import { bindWaveChild, declareWaveSelection, retryWaveOperation, sliceWaveSelection } from '../services/uploadWaveOperations';
 import { hasPendingEdits } from '../services/pendingEdits';
 import { startIndexReadyPush } from '../services/indexReadyPush';
@@ -6,7 +8,7 @@ import { preloadLocalIndexes } from '../services/preloadLocalIndexes';
 import { startMediaTokenAutoRefresh } from '../services/mediaToken';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { get, getUpload, post, postTools, postUpload, resolveApiUrl } from '../services/apiClient';
-import { ensureWaveShadowSessionOpened, finalizeWaveShadowSession, resolveWaveShadowFile, cancelQueuedWaveSelection } from '../services/uploadWaveSync';
+import { liveWaveAdmission, ensureWaveShadowSessionOpened, finalizeWaveShadowSession, resolveWaveShadowFile, cancelQueuedWaveSelection } from '../services/uploadWaveSync';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
 import { getRuntimeConfig } from '../config/appConfig';
 import type {
@@ -1123,6 +1125,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         filename: string;
         totalSize: number;
         sha256: string;
+        waveAdmission?: Record<string,string>;
         resolve: (value: any) => void;
         reject: (err: unknown) => void;
     }>>([]);
@@ -1146,6 +1149,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         clientMetadata?: UploadMetadataDescriptor;
         preparationReport?: PreparedUpload['preparationReport'];
         uploadBatchId?: string;
+        waveSessionId?: string;
+        waveItemId?: string;
         resolve: (value: any) => void;
         reject: (err: unknown) => void;
     }>>([]);
@@ -1364,6 +1369,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }, [flushClusterCompletions]);
 
     const pollJobStatusesOnce = useCallback(async (): Promise<boolean> => {
+        if (!hasForegroundDemand()) return false;
         // Resolves to whether any jobs are still in flight (so the caller knows
         // whether to keep polling).
         if (jobPollInFlightRef.current) {
@@ -1568,12 +1574,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 startJobPolling();
             }
         };
+        const foregroundReturn = onForegroundReturn(startJobPolling);
         window.addEventListener('focus', startJobPolling);
         document.addEventListener('visibilitychange', handleVisibility);
         // Catch up on anything that finished while the app wasn't open.
         startJobPolling();
         return () => {
             unsubscribe();
+            foregroundReturn();
             window.removeEventListener('focus', startJobPolling);
             document.removeEventListener('visibilitychange', handleVisibility);
             stopJobPolling();
@@ -2058,7 +2066,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const batch = pendingBatchInitRef.current;
         pendingBatchInitRef.current = [];
         runGatedRequestWithRetry(gate, '/upload/init-batch', {
-            files: batch.map(({ filename, totalSize, sha256 }) => ({ filename, totalSize, sha256,
+            files: batch.map(({ filename, totalSize, sha256, waveAdmission }) => ({ filename, totalSize, sha256, ...waveAdmission,
                 ...(isVideoFilename(filename) ? {includeMetadata: true} : getRuntimeConfig().browserUploadPreparation ? {includePreview: true, includeMetadata: true} : {}),
             })),
         })
@@ -2078,7 +2086,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             });
     };
 
-    const requestBatchedInit = (filename: string, totalSize: number, sha256: string): Promise<any> => (
+    const requestBatchedInit = (filename: string, totalSize: number, sha256: string, waveAdmission?: Record<string,string>): Promise<any> => (
         new Promise((resolve, reject) => {
             // Never let two entries for the identical filename land in the same
             // /upload/init-batch request -- the backend reserves blob names keyed
@@ -2092,7 +2100,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             if (pendingBatchInitRef.current.some((req) => req.filename === filename)) {
                 flushInitBatch(true);
             }
-            pendingBatchInitRef.current.push({ filename, totalSize, sha256, resolve, reject });
+            pendingBatchInitRef.current.push({ filename, totalSize, sha256, waveAdmission, resolve, reject });
             if (pendingBatchInitRef.current.length >= INIT_BATCH_MAX_SIZE) {
                 flushInitBatch(true);
                 return;
@@ -2150,8 +2158,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const batch = pendingBatchFinalizeRef.current;
         pendingBatchFinalizeRef.current = [];
         runGatedRequestWithRetry(gate, '/upload/finalize-batch', {
-            files: batch.map(({ filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId, blobName, clientLastModified, clientMetadata, preparationReport, uploadBatchId }) => ({
+            files: batch.map(({ filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId, blobName, clientLastModified, clientMetadata, preparationReport, uploadBatchId, waveSessionId, waveItemId }) => ({
                 filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId, blobName, clientLastModified, clientMetadata, preparationReport, uploadBatchId,
+                ...(waveSessionId ? {waveSessionId,waveItemId} : {}),
             })),
         })
             .then((response) => {
@@ -2184,6 +2193,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         clientMetadata?: UploadMetadataDescriptor;
         preparationReport?: PreparedUpload['preparationReport'];
         uploadBatchId?: string;
+        waveSessionId?: string;
+        waveItemId?: string;
     }): Promise<any> => (
         new Promise((resolve, reject) => {
             // Same same-filename guard as requestBatchedInit -- two entries
@@ -2854,6 +2865,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             startByte?: number;
             existingUploadId?: string;
             existingBlockIds?: string[];
+            waveAdmission?: Record<string,string>;
             existingBlobName?: string;
             onChunkCommitted?: (bytesReceived: number) => void;
             onUploadInitialized?: (uploadId: string, blobName: string, sha256: string, targets: UploadAssetTargets) => void;
@@ -2905,9 +2917,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     sha256,
                     directToBlob: true,
                     uploadId: options.existingUploadId,
+                    ...options.waveAdmission,
                     ...(isVideoFilename(file.name) ? {includeMetadata: true} : getRuntimeConfig().browserUploadPreparation ? {includePreview: true, includeMetadata: true} : {}),
                 }, options?.signal)
-                : await requestBatchedInit(file.name, file.size, sha256);
+                : await requestBatchedInit(file.name, file.size, sha256, options?.waveAdmission);
             options?.onInitLatencyMs?.(performance.now() - initStartedAt);
             const blobName = typeof initResponse?.blobName === 'string' ? initResponse.blobName : '';
             if (typeof initResponse?.uploadId === 'string' && initResponse.uploadId) {
@@ -3448,6 +3461,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     // in flight runs to completion rather than being torn down
                     // mid-request on Stop).
                     const completeResponse = await requestBatchedFinalize({
+                        ...(waveLiveEnabled() ? await liveWaveAdmission(normalized,fileMeta) : {}),
                         uploadBatchId,
                         filename: file.name,
                         uploadId: staged.uploadId,
@@ -3602,6 +3616,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         let preparation: Promise<PreparedUpload> = Promise.resolve({});
                         try {
                             staged = await uploadFileInChunks(resolvedFile, {
+                                waveAdmission: waveLiveEnabled() ? await liveWaveAdmission(normalized,fileMeta) : undefined,
                                 startByte: fileMeta.uploadedBytes,
                                 existingUploadId: fileMeta.uploadId,
                                 existingBlockIds: fileMeta.blockIds,
@@ -4910,6 +4925,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             browserProcessingTimerRef.current = window.setTimeout(tick, delayMs);
         };
         const tick = () => {
+            if (!hasForegroundDemand()) { schedule(MAX_DELAY_MS); return; }
             void startBrowserProcessing().then((processedCount) => {
                 if (cancelled) {
                     return;

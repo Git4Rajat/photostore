@@ -1,19 +1,9 @@
-"""Wave assignment runner: canonical order, bounded assignment chunks, a durable
-frozen-input/chunk journal, and resumability -- see docs/indexing-clustering-target-
-state.md step 5 ("one-shot clustering").
+"""Canonical ordering and the legacy chunk-runner qualification harness.
 
-Drives the SAME FaissAssigner.batch/assign API the existing (non-wave) chunk
-orchestrator already uses -- this module adds scheduling/journaling around
-real, unchanged assignment code, not a new matcher. canonical_order is the
-one production-shared implementation of the ordering
-backend/tests/clustering_reference_oracle.py's canonical_work also uses, so
-a real wave job and that oracle can never silently drift apart.
-
-No real dispatcher calls this yet -- see upload_wave_execution.py's module
-docstring on the remaining scope of step 4. This module is itself the next,
-independently parity-tested layer (test_wave_clustering_parity.py compares
-its output to the oracle's run_single_pass_reference), not yet wired to a
-queue consumer.
+Live wave consumers use wave_assignment.run_frozen_assignment: immutable
+streamed inputs, per-face decisions and transaction-fenced stage ownership.
+The chunk journal below remains for legacy parity tests and callers; a chunk
+commit marker alone is not a production wave assignment receipt.
 """
 import json
 import hashlib

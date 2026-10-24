@@ -6,7 +6,7 @@ as app.<name> throughout, matching the exact late-binding lookup semantics
 the code relied on when these functions lived in app.py directly, so
 test-time monkeypatching of app.<name> globals still works unchanged).
 """
-from flask import Blueprint
+from flask import Blueprint, g
 import processing_diagnostics
 import re
 from upload_diagnostics import instrument_upload, timed_call, upload_count, upload_finalized, upload_results, upload_teardown
@@ -160,7 +160,9 @@ def init_upload():
     is_fresh_upload = not data.get('uploadId')
     if benchmark_fields and (not direct or not is_fresh_upload):
         return app.jsonify({'error': 'Benchmark requires a fresh direct upload'}), 400
-    if is_fresh_upload:
+    live_admission=getattr(g,'wave_upload',None) is not None
+    if live_admission and not direct:return app.jsonify(error='Live uploads require direct storage transfer'),409
+    if is_fresh_upload and not live_admission:
         try:
             timed_call('cleanup', app._cleanup_failed_upload, user_id, filename)
         except Exception:
@@ -171,7 +173,7 @@ def init_upload():
     # the browser keeps staging blocks to the same blob — a fresh UUID per call
     # would orphan already-staged blocks (InvalidBlockList) and break retry/resume.
     anonymous_blob_name = None
-    if is_fresh_upload and direct:
+    if direct and (is_fresh_upload or live_admission):
         # Fast path for the common case (new upload, direct-to-blob): one read
         # + one write against the metadata row instead of reset_received_ranges
         # and reserve_pending_anonymous_blob each separately re-reading and
@@ -182,6 +184,7 @@ def init_upload():
                 initial_metadata=benchmark_fields or None,
             )
         except Exception:
+            if live_admission:return app.jsonify(error='Live upload reservation requires retry'),503
             app.app.logger.debug('Failed to reset tracking / reserve anonymous blob name for %s', filename)
     else:
         if is_fresh_upload:
@@ -329,6 +332,8 @@ def init_upload_batch():
             )
         except Exception:
             app.app.logger.exception('Batch upload-tracking reservation failed for %s files', len(valid))
+            if getattr(g,'wave_upload',None) is not None:
+                return app.jsonify(error='Live upload reservations require retry'),503
 
     results = []
     for p in parsed:
@@ -1215,3 +1220,6 @@ def processing_status():
 # The shadow protocol is explicitly feature-gated and never alters legacy intake.
 from routes.upload_wave_shadow import register_routes as _register_wave_shadow_routes
 _register_wave_shadow_routes(upload_bp)
+
+from routes.upload_wave_live import install as _install_live_wave_admission
+_install_live_wave_admission(upload_bp)

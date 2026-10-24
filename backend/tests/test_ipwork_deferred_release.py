@@ -1,5 +1,6 @@
 """Vision work is deferred at finalize and released once when the upload ends/goes quiet."""
 from __future__ import annotations
+from azure.core.exceptions import ResourceNotFoundError
 
 from datetime import datetime, timedelta, timezone
 
@@ -110,7 +111,7 @@ class _JobsTable:
         try:
             return self.rows[(partition_key, row_key)]
         except KeyError:
-            raise KeyError(row_key)
+            raise ResourceNotFoundError(row_key)
 
 
 class _Queue:

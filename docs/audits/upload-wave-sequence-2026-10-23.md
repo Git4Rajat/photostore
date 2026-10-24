@@ -7,11 +7,11 @@ shadow-path test does not qualify the end-to-end production cutover.
 | --- | --- | --- |
 | 1 | Whole-selection parent before 900-file transport children | Implemented in opt-in shadow upload path; reload, stop, retry, overlapping selections, duplicate canonical names and storage failure handled. Production admission authority, reservation deadlines and checkpoint retention still require integration. |
 | 2 | Source generation fencing and durable completion | Claimed browser/Vision revisions and attempt tokens checked before result application. Opt-in face/embedding writes use create-only or pinned-version CAS; lookups carry source/attempt provenance. Completion backlog delivers to a durable idempotent inbox, with exact receipt acknowledgement and reconcile-page retry. Versioned JPEG publication and immutable artifact receipts are now implemented in the opt-in path; see the artifact audit below. Fixed required-step/model generations, legacy qualification, generation-aware retention/cleanup and independently scheduled recovery remain. |
-| 3 | Real stage consumers and renewable stage ownership | Outstanding; prepared intents are isolated from index maintenance recovery, but no runnable stage dispatch or consumer exists. |
-| 4 | Per-face decision journal and manifest streaming | Outstanding; current runner has bound inputs/chunks and oracle comparisons, not a durable per-face decision log. |
-| 5 | Actual projection obligations, receipts and wave completion | Outstanding; exact-coverage ledger and conditional completion exist, real publishers are not connected. |
-| 6 | Independent bounded recovery and alerts | Outstanding; no independently scheduled recovery host is wired. Source relay and library sweeps are primitives, not unattended recovery. |
-| 7 | Activity gating and measured five-minute sleep behavior | Outstanding; live residency proof and cloud rollout not attempted. |
+| 3 | Real stage consumers and renewable stage ownership | Gated relay and consumer entry points, renewable stage ownership and transaction-fenced transitions exist. Source-worker adapter, actual publishers and optional scheduled recovery are now connected locally; durable cohort cutover and live qualification remain gates. See the steps 5–7 audit below. |
+| 4 | Per-face decision journal and manifest streaming | Implemented in the gated consumer: disk-ordered immutable inputs/baseline, fenced write-ahead per-face decisions, conditional materialization, replay and exact assignment coverage. See [decision-journal audit](upload-wave-decision-journal-2026-10-23.md) for validation and scale/retention limits. |
+| 5 | Actual projection obligations, receipts and wave completion | Implemented in the disabled wave path: all eight real publishers, assignment-bound obligations, immutable output proofs and exact completion. |
+| 6 | Independent bounded recovery and alerts | Implemented locally: durable directory/cursors, bounded independent scheduled job and opt-in portal alerts. Job execution, ingestion and alerts remain unqualified in Azure. |
+| 7 | Activity gating and measured five-minute sleep behavior | Foreground gates, explicit cooldowns and a control-plane capture/verifier are implemented. Measured residency and cloud rollout remain outstanding. |
 
 ## Implemented behavior
 
@@ -206,3 +206,23 @@ no-model retry behavior, validation commands and remaining release gates.
 Artifact-qualified inbox evidence still cannot release a wave. Item 2 remains
 open for the generation/model contract and lifecycle/recovery integration;
 items 3–7 retain their checklist status above.
+
+## Steps 5–7 integration update
+
+See [publication, recovery and residency audit](upload-wave-publication-recovery-residency-2026-10-23.md) for current behavior, exact validation commands and remaining activation gates. Earlier validation/status descriptions above are historical. No live cutover was enabled.
+
+## Remaining items 1–4: new-library activation and lifecycle integration
+
+See [the October 24 ownership/cleanup audit](upload-wave-live-ownership-cleanup-2026-10-24.md)
+for durable new-library ownership, authoritative upload admission, explicit
+settlement/repair, no-work proofs, destructive cleanup, regression commands and
+release limitations. Historical migration is excluded by the user's new-library
+rollout choice. Cloud qualification remains next; live cutover is still disabled.
+
+## Item 6 preflight
+
+See [cloud preflight and controlled-run requirements](upload-wave-cloud-preflight-2026-10-24.md).
+Azure inventory is verified and missing deployment wiring is implemented with
+activation still default off. The existing dev deployment cannot exercise the
+new flow yet. Actual cloud qualification awaits the environment choice and a
+source-bound candidate deployment; it is not marked complete.

@@ -70,3 +70,20 @@ def test_existing_search_manifest_cas_is_not_replaced(lease):
         publication.fenced(client).upload_blob(
             b'data', etag='search-v1', match_condition=MatchConditions.IfNotModified)
     assert client.upload_blob.call_args.kwargs['etag'] == 'search-v1'
+
+
+def test_catalog_and_assignment_locks_are_independent_and_catalog_loss_blocks_publish(lease):
+    from test_clustering_lease import FakeService
+    from test_wave_activation import active
+    from test_wave_recovery import RuntimeTable
+    from clustering_lease import BlobLibraryLeaseFactory,RetryableLibraryLeaseError
+    table=RuntimeTable();active(table,'A');blobs=FakeService()
+    store,claim,_=lease
+    client=SimpleNamespace(upload_blob=Mock(),get_blob_properties=lambda:SimpleNamespace(etag='v1'))
+    with publication.catalog_serialization(table,'A',blobs,'catalog'):
+        # Independent namespaces permit the same library's FAISS lease.
+        with BlobLibraryLeaseFactory(blobs,'catalog')('A'):
+            with publication.publication(store,claim):wrapped=publication.fenced(client)
+    with pytest.raises(RetryableLibraryLeaseError,match='closed'):
+        wrapped.upload_blob(b'stale snapshot')
+    client.upload_blob.assert_not_called()

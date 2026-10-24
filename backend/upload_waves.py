@@ -75,12 +75,23 @@ class ShadowWaves:
         return ('update', new, dict(mode=UpdateMode.REPLACE, etag=_etag(old),
                                     match_condition=MatchConditions.IfNotModified))
 
-    def _commit(self, control, changes, *, advance=True):
+    def _policy_guard(self,changes=(),*,maintenance=False):
+        policy=self._get('policy')
+        if policy is None:return []
+        if (policy.get('cleanupState') or policy.get('gcUntil',0)>self.clock()) and not maintenance:
+            raise Conflict('Library cleanup has fenced wave mutations')
+        if any(op[1]['RowKey']=='policy' for op in changes):return []
+        return [self._change(policy,dict(policy))]
+
+    def _commit(self, control, changes, *, advance=True,maintenance=False,control_updates=None):
+        changes=list(changes)
         new = dict(control or self._row('control', revision='', collectingWaveId='', tailWaveId=''))
         if advance:
             new.update(revision=uuid.uuid4().hex, updatedAt=self.clock())
+        if control_updates:new.update(control_updates)
         from execution_lease import guard_operations
-        self.table.submit_transaction([self._change(control, new), *changes, *guard_operations(self)])
+        self.table.submit_transaction([self._change(control, new), *changes,
+            *self._policy_guard(changes,maintenance=maintenance),*guard_operations(self)])
 
     def _retry(self, action):
         for attempt in range(MAX_RETRIES):
@@ -140,10 +151,14 @@ class ShadowWaves:
                 if previous.get('payload') != body:
                     raise Conflict('Source completion identity cannot be rebound')
                 return dict(previous)
+            policy=self._get('policy')
+            if policy and (policy.get('cleanupState') or policy.get('gcUntil',0)>self.clock()):
+                raise Conflict('Artifact cleanup has paused new completion references')
             row = self._row(key, completionId=intent['id'], photoId=payload['photoId'],
                 processingRevision=payload['revision'], payload=body, completionQualified=False, artifactReceiptQualified=artifacts_qualified,
                 acceptedAt=self.clock())
-            self.table.submit_transaction([('create', row)])
+            self.table.submit_transaction([('create', row),
+                *([self._change(policy,dict(policy))] if policy else [])])
             return row
         return self._retry(run)
 
@@ -155,6 +170,9 @@ class ShadowWaves:
                 raise ValueError('A session cannot resume itself')
         if type(declared_count) is not int or not 0 <= declared_count <= 1_000_000:
             raise ValueError('declaredCount must be an integer between 0 and 1000000')
+
+        from wave_recovery import register_library
+        self._retry(lambda: register_library(self.table,self.library))
 
         def run():
             existing = self._get(key)
@@ -182,6 +200,7 @@ class ShadowWaves:
                         sessionCount=wave['sessionCount'] + 1, intakeEpoch=wave['intakeEpoch'] + 1,
                         evaluation='', updatedAt=self.clock(), lastProgressAt=self.clock(),
                         visionPendingKey='', waitReason='intake_open')
+            wave.update(noWorkProbe='',noWorkImpossible=False)
             row = self._row(key, sessionId=session, waveId=wave_id, declaredCount=declared_count,
                 registeredCount=0, resolvedCount=0, state='open', resumedFromSessionId=resumed_from, manifestRevision=uuid.uuid4().hex,
                 createdAt=self.clock())
@@ -193,7 +212,7 @@ class ShadowWaves:
             # Control fields and the admission itself must commit atomically.
             new_control.update(revision=uuid.uuid4().hex, updatedAt=self.clock())
             self.table.submit_transaction([self._change(control, new_control),
-                self._change(old_wave, wave), ('create', row), ('create', evidence)])
+                self._change(old_wave, wave), ('create', row), ('create', evidence),*self._policy_guard()])
             return row
         return self._retry(run)
 
@@ -224,7 +243,7 @@ class ShadowWaves:
                     sessionId=session, waveId=old['waveId'], filename=item['filename'], outcome='reserved')))
             if not changes:
                 return dict(old)
-            if old['state'] != 'open':
+            if old['state'] != 'open' or old.get('abandoning'):
                 raise Conflict('Session is closed')
             if old['registeredCount'] + len(changes) > old['declaredCount']:
                 raise Conflict('Registration exceeds declared parent selection')
@@ -276,9 +295,16 @@ class ShadowWaves:
                     member = self._row(member_key, kind='member', waveId=wave_id,
                         photoId=photo_id, processingRevision=processing_revision, filename=filename,
                         requiredSteps=binding['requiredSteps'], outcome='pending', evidenceId='',
+                        needsProjection=outcome=='accepted',
                         outstandingLeases=0, evidenceQualified=False, observedAt=0.0)
                     next_wave['memberCount'] += 1
                     changes.append(('create', member))
+                elif outcome=='accepted' and not existing.get('needsProjection',True):
+                    changes.append(self._change(existing,dict(existing,needsProjection=True)))
+                source_key='admitted-source!'+digest([photo_id,processing_revision])
+                if self._get(source_key) is None:
+                    changes.append(('create',self._row(source_key,waveId=wave_id,
+                        photoId=photo_id,processingRevision=processing_revision,filename=filename)))
             row = dict(old_session, resolvedCount=old_session['resolvedCount'] + 1,
                        manifestRevision=uuid.uuid4().hex)
             self._commit(control, [*changes, self._change(old_session, row), self._change(wave, next_wave)])
@@ -292,13 +318,18 @@ class ShadowWaves:
             control = self._required('control')
             old = self._required(self.session_key(session))
             if old['state'] != 'open':
+                if old.get('closeId')=='auto-complete' and old['manifestRevision']==manifest_revision and not abandoned:
+                    return dict(old)
                 if (old.get('closeId') == close_id and old['manifestRevision'] == manifest_revision
                         and old['state'] == ('abandoned' if abandoned else 'closed')):
                     return dict(old)
                 raise Conflict('Session already closed with another request')
             if old['manifestRevision'] != manifest_revision:
                 raise Conflict('Close manifest revision is stale')
-            if old['registeredCount'] != old['declaredCount'] or old['resolvedCount'] != old['declaredCount']:
+            complete = (old['registeredCount'] == old['declaredCount'] and old['resolvedCount'] == old['declaredCount'])
+            if abandoned and old.get('abandonScanComplete'):
+                complete = old['resolvedCount'] == old['registeredCount']
+            if not complete:
                 raise Conflict('Declared items or reservations remain unresolved')
             row = dict(old, state='abandoned' if abandoned else 'closed', closeId=close_id,
                        closedAt=self.clock())
@@ -324,8 +355,13 @@ class ShadowWaves:
                     destination='vision', dispatchable=False, createdAt=self.clock())
                 next_wave['visionPendingKey'] = outbox['RowKey']
                 changes.append(('create', outbox))
+            # Live intake is sealed before Vision is released. Later selections
+            # join a successor; they cannot reopen a wave already doing work.
+            policy=self._get('policy')
+            detach=not open_sessions and policy and policy.get('protocol')=='library-wave-v1' and control.get('collectingWaveId')==wave['waveId']
             self._commit(control, [self._change(old, row), self._change(wave, next_wave),
-                                   self._change(prior, evidence), *changes])
+                                   self._change(prior, evidence), *changes],
+                         control_updates={'collectingWaveId':''} if detach else None)
             return row
         return self._retry(run)
 
@@ -353,13 +389,14 @@ class ShadowWaves:
             if predecessor is None or predecessor['state'] != 'complete':
                 return dict(wave)
             completion = self._get('completion!' + predecessor['waveId'])
-            if (not completion or not wave.get('predecessorFrozenRevision')
-                    or completion.get('frozenRevision') != wave['predecessorFrozenRevision']
+            if (not completion or not predecessor.get('frozenRevision')
+                    or (wave.get('predecessorFrozenRevision') and completion.get('frozenRevision') != wave['predecessorFrozenRevision'])
                     or completion.get('frozenRevision') != predecessor.get('frozenRevision')
                     or completion.get('requiredSetId') != predecessor.get('requiredPublicationId')
                     or completion.get('receiptId') != predecessor.get('completionReceiptId')):
                 return dict(wave)
             next_wave = dict(wave, state='processing_pending', waitReason='',
+                             predecessorFrozenRevision=predecessor['frozenRevision'],
                              predecessorSatisfiedAt=self.clock(),
                              stateEnteredAt=self.clock(), lastProgressAt=self.clock(),
                              updatedAt=self.clock())
@@ -367,11 +404,12 @@ class ShadowWaves:
                 waveId=wave_id, intakeEpoch=wave['intakeEpoch'],
                 destination='vision', dispatchable=False, createdAt=self.clock())
             next_wave['visionPendingKey'] = outbox['RowKey']
-            self._commit(control, [self._change(wave, next_wave), ('create', outbox)])
+            self._commit(control, [self._change(wave, next_wave), ('create', outbox),
+                self._change(predecessor,dict(predecessor)),self._change(completion,dict(completion))])
             return next_wave
         return self._retry(run)
 
-    def commit_assignment(self, wave_id, required_publication_id, *, manifest_digest):
+    def commit_assignment(self, wave_id, required_publication_id, *, manifest_digest, assignment_receipt=None):
         """Commits the cluster consumer's handoff: the frozen (ready) wave's
         transition to 'indexing', binding the exact obligation-set id it
         captured via wave_publication.ObligationLedger.record_required, and
@@ -387,16 +425,32 @@ class ShadowWaves:
             control = self._required('control')
             wave = self._required(self.wave_key(wave_id))
             if wave['state'] == 'indexing' and wave.get('requiredPublicationId') == required_publication_id:
+                if (wave.get('manifestDigest') != manifest_digest
+                        or (assignment_receipt is not None and wave.get('assignmentReceiptId') != assignment_receipt)):
+                    raise Conflict('Assignment replay does not match the committed receipt')
                 return dict(wave)
             if wave['state'] != 'ready':
                 raise Conflict('Only a frozen (ready) wave can commit its assignment')
             if wave.get('manifestDigest') != manifest_digest:
                 raise Conflict('Assignment input no longer matches the frozen manifest')
+            if assignment_receipt is not None:
+                receipt = self._required(f'assignment!{wave_id}!complete')
+                payload = json.loads(receipt['payload'])
+                manifest = self._required(f'assignment!{wave_id}!manifest')
+                manifest_payload = json.loads(manifest['payload'])
+                if (payload.get('manifestId') != digest(manifest_payload)
+                        or manifest.get('digest') != payload.get('manifestId')
+                        or payload.get('faceCount') != manifest_payload.get('faceCount')
+                        or digest(payload) != assignment_receipt or receipt.get('digest') != assignment_receipt
+                        or payload.get('waveId') != wave_id or payload.get('libraryId') != self.library
+                        or payload.get('frozenRevision') != wave.get('frozenRevision')):
+                    raise Conflict('Assignment coverage does not match this frozen wave')
             outbox = self._row(f'shadow-index!{wave_id}', waveId=wave_id,
                 inputRevision=required_publication_id, destination='index',
                 dispatchable=False, createdAt=self.clock())
             next_wave = dict(wave, state='indexing', requiredPublicationId=required_publication_id,
-                             indexPendingKey=outbox['RowKey'], stateEnteredAt=self.clock(),
+                             indexPendingKey=outbox['RowKey'], assignmentReceiptId=assignment_receipt or '',
+                             stateEnteredAt=self.clock(),
                              lastProgressAt=self.clock(), updatedAt=self.clock())
             self._commit(control, [self._change(wave, next_wave), ('create', outbox)])
             return next_wave
@@ -416,7 +470,8 @@ class ShadowWaves:
             wave = self._required(self.wave_key(wave_id))
             if (proof['libraryId'] != self.library or proof['waveId'] != wave_id
                     or proof['frozenRevision'] != wave.get('frozenRevision')
-                    or proof['requiredSetId'] != wave.get('requiredPublicationId')):
+                    or proof['requiredSetId'] != wave.get('requiredPublicationId')
+                    or proof.get('assignmentReceiptId','') != wave.get('assignmentReceiptId','')):
                 raise Conflict('Publication coverage does not match the wave frontier')
             if wave['state'] == 'complete' and wave.get('completionReceiptId') == receipt_id:
                 return dict(wave)
@@ -425,6 +480,7 @@ class ShadowWaves:
             receipt = self._row('completion!' + wave_id,
                 **{key: value for key, value in proof.items() if key != 'libraryId'}, receiptId=receipt_id)
             next_wave = dict(wave, state='complete', completionReceiptId=receipt_id,
+                completionOutcome='applied_with_failures' if wave.get('failedMembers',0) else 'applied',
                 stateEnteredAt=self.clock(), lastProgressAt=self.clock(), updatedAt=self.clock())
             self._commit(control, [self._change(wave, next_wave), ('create', receipt)])
             return next_wave
@@ -495,11 +551,14 @@ class ShadowWaves:
             wave = self._required(self.wave_key(wave_id))
             key = f'e!{wave_id}!m!' + digest([photo_id, processing_revision])
             old = self._required(key)
+            if old['outcome'] in ('deleted','superseded','failed_exhausted','excluded') and old.get('evidenceQualified'):
+                from wave_settlement import verified
+                if verified(self,old):return dict(old)
             if (old['outcome'] == outcome and old['evidenceId'] == evidence_id
                     and old['outstandingLeases'] == outstanding_leases
                     and bool(old.get('evidenceQualified')) == bool(evidence_qualified)):
                 return dict(old)
-            if wave['state'] == 'ready':
+            if wave['state'] in ('ready','indexing','complete'):
                 raise Conflict('Frozen wave evidence cannot change')
             row = dict(old, outcome=outcome, evidenceId=evidence_id,
                        outstandingLeases=outstanding_leases, evidenceQualified=bool(evidence_qualified),
@@ -522,7 +581,7 @@ class ShadowWaves:
         def run():
             control = self._required('control')
             wave = self._required(self.wave_key(wave_id))
-            if wave['state'] in ('collecting', 'waiting_predecessor', 'ready'):
+            if wave['state'] in ('collecting', 'waiting_predecessor', 'ready','indexing','complete','cancelled'):
                 return dict(wave)
             evaluation = json.loads(wave.get('evaluation') or '{}')
             if evaluation.get('revision') != control['revision']:
@@ -558,11 +617,12 @@ class ShadowWaves:
                         inputRevision=revision, manifestDigest=evaluation['digest'],
                         destination='cluster', dispatchable=False, createdAt=self.clock())
                     changes.append(('create', outbox))
-                    next_control = dict(control, collectingWaveId='', revision=uuid.uuid4().hex,
+                    next_control = dict(control, revision=uuid.uuid4().hex,
                                         updatedAt=self.clock())
+                    if next_control.get('collectingWaveId')==wave_id:next_control['collectingWaveId']=''
                     from execution_lease import guard_operations
                     self.table.submit_transaction([self._change(control, next_control),
-                        self._change(wave, next_wave), *changes, *guard_operations(self)])
+                        self._change(wave, next_wave), *changes,*self._policy_guard(), *guard_operations(self)])
                     return next_wave
                 next_wave.update(state='processing', evaluation='')
                 if wave['state'] != 'processing':

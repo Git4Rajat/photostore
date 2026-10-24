@@ -22,6 +22,10 @@ BLAZE_FACE_MODEL_URL="${APP_CONFIG_BLAZE_FACE_MODEL_URL:-/models/browser-ai/mode
 ARC_FACE_MODEL_URL="${APP_CONFIG_ARC_FACE_MODEL_URL:-/models/browser-ai/models/adaface/model.onnx}"
 ARC_FACE_WASM_PATH="${APP_CONFIG_ARC_FACE_WASM_PATH:-/models/browser-ai/runtime/}"
 PROCESSING_MODE="${APP_CONFIG_PROCESSING_MODE:-browser}"
+WAVE_EXECUTION=false
+if [ "${APP_CONFIG_UPLOAD_WAVE_EXECUTION_ENABLED:-false}" = "true" ]; then
+  WAVE_EXECUTION=true
+fi
 UPLOAD_PREPARATION=false
 if [ "${APP_CONFIG_BROWSER_UPLOAD_PREPARATION:-false}" = "true" ]; then
   UPLOAD_PREPARATION=true
@@ -55,6 +59,7 @@ window.__APP_CONFIG__ = {
   arcFaceWasmPath: "${ARC_FACE_WASM_PATH}",
   buildTimestamp: "${BUILD_TS}",
   processingMode: "${PROCESSING_MODE}",
+  uploadWaveExecutionEnabled: ${WAVE_EXECUTION},
   browserUploadPreparation: ${UPLOAD_PREPARATION}
 };
 EOF

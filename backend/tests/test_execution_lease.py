@@ -147,3 +147,18 @@ def test_expired_owner_cannot_mark_failure_without_a_replacement(leases):
     leases.clock.value += 101
     with pytest.raises(OwnershipLost, match='expired'):
         leases.fail(ownership, 'late failure')
+
+
+def test_keepalive_renews_while_the_main_thread_is_in_a_blocking_operation(leases,monkeypatch):
+    import threading
+    ownership=leases.claim('lib','wave','cluster','rev')
+    leases.lease_seconds=.03
+    renewed=threading.Event()
+    original=leases.renew
+    def renew(owner):
+        original(owner)
+        renewed.set()
+    monkeypatch.setattr(leases,'renew',renew)
+    with leases.keepalive(ownership) as check:
+        assert renewed.wait(timeout=1)
+        check()

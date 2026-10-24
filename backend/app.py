@@ -45,6 +45,7 @@ import email_utils
 import library_utils
 from index_ownership import catalog_publisher
 import processing_diagnostics
+from index_publication import serialize_catalog
 from ipworker_metrics import Metrics as IpworkerMetrics, replica_identity, resource_sample
 from ordering_utils import (
     order_photo_entries,
@@ -1625,6 +1626,7 @@ def _init_storage_clients():
         invites_table=invites_table_client,
         audit_table=audit_table_client,
         clean_requests_table=clean_requests_table_client,
+        before_create=lambda library: __import__('wave_policy').enroll_new(jobs_table_client, library, metadata_table_client),
     )
 
     # Password-mode: seed the initial owner credential from
@@ -1672,6 +1674,8 @@ def _init_storage_clients():
         face_summary_cache_writer=lambda uid, rows: _face_summary_scan_cache.set(uid, rows),
         source_completion_delivery=lambda uid, intent: _accept_upload_source_completion(uid, intent),
         source_artifact_receipt_capture=lambda uid, metadata: _capture_upload_artifacts(uid, metadata),
+        source_policy_check=lambda uid: __import__('processing_cleanup').check_source_policy(jobs_table_client,uid),
+        wave_owned=lambda uid: _library_cut_over_to_waves(uid),
     )
     _prime_vector_indexes_on_startup()
 
@@ -3615,6 +3619,7 @@ def _enqueue_clustering_job(
     payload: Optional[Dict] = None,
     coalesce_on_conflict: bool = False,
 ) -> Dict[str, str]:
+    if job_type == 'people_cluster' and _library_cut_over_to_waves(user_id): return {'status': 'wave_owned'}
     if not force:
         existing_job_id = _has_active_clustering_job(user_id)
         if existing_job_id:
@@ -3705,6 +3710,7 @@ def _enqueue_incremental_assign_job(user_id: str, filenames: List[str]) -> Dict[
     request path. No jobId means the worker's own status/coalesced-rerun
     bookkeeping (which all key off a truthy job_id) is a no-op for these.
     """
+    if _library_cut_over_to_waves(user_id): return {'status': 'wave_owned'}
     if not filenames:
         return {'status': 'noop'}
     if clustering_queue_client is None:
@@ -4022,6 +4028,7 @@ def _recover_stranded_cluster_buffer_checkpoints() -> None:
 
 def _buffer_incremental_assign_filename(user_id: str, filename: str, face_count: int = 1) -> None:
     """Accumulate per-library photos until the face cap or oldest deadline."""
+    if _library_cut_over_to_waves(user_id): return
     processing_diagnostics.file_event('cluster_buffered', user_id, filename, role='vision')
     to_flush: Optional[List[str]] = None
     started_at = None
@@ -4269,6 +4276,10 @@ def _enqueue_processing_steps(
         return {step: {'status': 'skipped', 'reason': 'upload_only_benchmark'} for step in steps}
 
     import processing_generation
+    if force and _library_cut_over_to_waves(user_id):
+        from wave_policy import require_capability
+        from upload_waves import ShadowWaves
+        require_capability(ShadowWaves(jobs_table_client,user_id),os.getenv('APP_ROLE','core'))
     if force and processing_generation.enforcement_enabled():
         # Partial forced reprocessing needs explicit carry-forward receipts.
         # Reject it in enforced mode rather than reuse the old proof identity.
@@ -4277,11 +4288,20 @@ def _enqueue_processing_steps(
             return {step: {'status': 'error', 'reason': 'partial_force_requires_full_reprocess'} for step in steps}
         if required and required.issubset(steps):
             try:
-                entity = storage_utils_module.supersede_processing_generation(user_id, filename)
+                if _library_cut_over_to_waves(user_id):
+                    entity = storage_utils_module.supersede_processing_generation(user_id, filename,record_supersession=True)
+                else:
+                    entity = storage_utils_module.supersede_processing_generation(user_id, filename)
             except Exception:
                 app.logger.exception('Forced reprocess could not allocate a new processing generation for %s/%s', user_id, filename)
                 return {step: {'status': 'error', 'reason': 'generation_allocation_failed'} for step in steps}
 
+    if _library_cut_over_to_waves(user_id):
+        if force:
+            from wave_settlement import reconcile_supersession
+            from upload_waves import ShadowWaves
+            reconcile_supersession(ShadowWaves(jobs_table_client,user_id),metadata_table_client,entity)
+        return {step: {'status': 'wave_owned'} for step in steps}
     visibility_timeout = max(0, min(int(visibility_timeout or 0), 7 * 24 * 60 * 60))
     for step in steps:
         status_field = f'{step}_status'
@@ -9832,6 +9852,7 @@ def _cleanup_library_shadow_rows(library_id: str) -> None:
         raise
 
 
+@serialize_catalog
 def _purge_library_data(library_id: str) -> None:
     """Best-effort delete of every data row in a library's partition across the
     photo tables. Image/thumbnail blobs are content-addressed (and may be shared
@@ -9839,6 +9860,8 @@ def _purge_library_data(library_id: str) -> None:
 
     The image_names table is included so no anonymous_id -> original_filename
     mapping (which still holds the plaintext filename) outlives the library."""
+    import processing_cleanup
+    processing_cleanup.begin_library_cleanup(jobs_table_client,metadata_table_client,library_id)
     pk = _escape_odata(library_id)
     _cleanup_library_shadow_rows(library_id)
     for client in (metadata_table_client, face_table_client, person_table_client,
@@ -9850,10 +9873,14 @@ def _purge_library_data(library_id: str) -> None:
                 _cleanup_delete_row(client, row)
         except Exception as exc:
             app.logger.warning('Purge skipped a table for %s: %s', library_id, exc)
+            if _library_cut_over_to_waves(library_id):raise
     try:
         invalidate_image_names_cache(library_id)
     except Exception:
         pass
+
+    processing_cleanup.collect_library_artifacts(jobs_table_client,storage_utils_module,metadata_table_client,library_id,purge=True)
+    processing_cleanup.finish_library_cleanup(jobs_table_client,library_id,purged=True)
 
 
 # ---------------------------------------------------------------------------
@@ -10105,11 +10132,14 @@ def _library_cleanup_block_reason(library_id: str) -> Optional[str]:
     return 'Cleanup is still running for this library. Please wait until it finishes before uploading.'
 
 
+@serialize_catalog
 def _execute_library_clean(library_id: str) -> Dict:
     """Delete every photo/video and its derived data for a library. Runs on the
     queue-scaled worker (see _enqueue_library_clean_job) since it walks the
     library's full metadata partition, mirroring the existing clustering jobs'
     "don't do full scans inline" rule."""
+    import processing_cleanup
+    processing_cleanup.begin_library_cleanup(jobs_table_client,metadata_table_client,library_id)
     pk = _escape_odata(library_id)
     try:
         # _clean_one_photo below only reads RowKey/anonymousImageId per row --
@@ -10234,6 +10264,8 @@ def _execute_library_clean(library_id: str) -> Dict:
     delete_user_people_index_data(library_id)
     _invalidate_metadata_scan_cache(library_id)
 
+    processing_cleanup.collect_library_artifacts(jobs_table_client,storage_utils_module,metadata_table_client,library_id)
+    processing_cleanup.finish_library_cleanup(jobs_table_client,library_id)
     return {'photosDeleted': photos_deleted, 'blobsDeleted': blobs_deleted, 'blobErrors': blob_errors}
 
 
@@ -10803,10 +10835,19 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, 
     Returns 'queued', 'already_active' or 'unavailable'. Library-ops and cluster
     are never a fallback for failed/missing index queue publication.
     """
+    from wave_policy import source_change_active
+    if (source_change_active() or reason.startswith(('upload', 'ipwork', 'post-finalize'))) and _library_cut_over_to_waves(user_id):
+        return 'wave_owned'
     key = str(user_id or '').strip()
     if not key:
         return 'unavailable'
     import index_updates
+    if _library_cut_over_to_waves(user_id) and reason in index_updates.READ_REASONS:
+        from upload_waves import ShadowWaves
+        waves=ShadowWaves(jobs_table_client,user_id)
+        control=waves._get('control')
+        tail=waves._get(waves.wave_key(control['tailWaveId'])) if control and control.get('tailWaveId') else None
+        if tail and tail['state'] not in ('complete','cancelled'):return 'wave_owned'
     scope = index_updates.validate_scope(scope)
     if INDEX_MAINTENANCE_QUEUE_NAME:
         if index_maintenance_queue_client is None or jobs_table_client is None:
@@ -11187,6 +11228,7 @@ def _drain_incremental_search_db(user_id: str, scope: str) -> Dict[str, object]:
         f'incremental search database refresh did not converge after {INDEX_BUILD_INCREMENTAL_MAX_PASSES} passes')
 
 
+@serialize_catalog
 def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None:
     """Worker-side body of an index_build message. A heartbeat thread keeps the
     job row's updatedAt fresh while a long single step (full table scan,
@@ -12368,6 +12410,7 @@ def _queue_ipwork_processing(user_id: str, filename: str, steps: Optional[List[s
     to `{"steps": ["ocr"]}`) can pass it explicitly so ipworker doesn't
     silently redo more than was asked.
     """
+    if _library_cut_over_to_waves(user_id): return {'status': 'wave_owned'}
     if is_video_file(filename):
         processing_diagnostics.file_event('vision_excluded', user_id, filename, reason='video_browser_only')
         return {'status': 'skipped', 'reason': 'video_browser_only'}
@@ -12445,6 +12488,7 @@ def _queue_ipwork_release_check(user_id: str) -> None:
     # all converging on the same (idempotent, so harmless) release. Dedupe the
     # same way _run_index_build_job's dedup-idle job does: a deterministic job_id,
     # skip scheduling a second chain while one is already fresh/in flight.
+    if _library_cut_over_to_waves(user_id): return
     job_id = _ipwork_release_check_job_id(user_id)
     if _job_row_fresh_active(user_id, job_id):
         return
@@ -12560,6 +12604,7 @@ def _run_ipwork_release_job(user_id: str, reason: str, force: bool = False) -> N
 
 
 def enqueue_ipwork_release(user_id: str, reason: str, force: bool = False) -> str:
+    if _library_cut_over_to_waves(user_id): return 'wave_owned'
     if library_ops_queue_client is None:
         return 'unavailable'
     try:
@@ -12701,19 +12746,9 @@ def _accept_upload_source_completion(user_id, intent):
 
 
 def _library_cut_over_to_waves(user_id: str) -> bool:
-    """Future per-library cutover gate, held off until live consumers exist.
-
-    Environment flags alone must not suppress the currently functioning
-    assignment path. Durable cohort ownership and consumer validation are
-    still required before live cutover can be enabled.
-    """
-    from upload_wave_execution import live_consumers_available
-    if not live_consumers_available():
-        return False
-    if os.getenv('UPLOAD_WAVE_EXECUTION_ENABLED', '').strip().lower() != 'true':
-        return False
-    cut_over = {name.strip() for name in os.getenv('UPLOAD_WAVE_CUTOVER_LIBRARIES', '').split(',') if name.strip()}
-    return user_id in cut_over
+    """Durable library ownership; pausing execution never restores legacy work."""
+    from wave_policy import owned
+    return owned(jobs_table_client, user_id)
 
 
 def _queue_people_clustering_after_face_processing(user_id: str, filename: str, metadata: Optional[Dict]) -> Optional[Dict[str, str]]:
@@ -13991,6 +14026,8 @@ def _hard_delete_photos_chunk(user_id: str, filenames: List[str]) -> Tuple[List[
     failed cleanup remains discoverable and retryable instead of reporting
     deletion success with hidden faces. Returns (deleted, errors, deleted_person_ids).
     """
+    import processing_cleanup
+    processing_cleanup.fence_photo_deletion(jobs_table_client,metadata_table_client,user_id,filenames)
     deleted: List[str] = []
     errors: List[str] = []
     if not filenames:
@@ -14091,6 +14128,7 @@ def _hard_delete_photos_chunk(user_id: str, filenames: List[str]) -> Tuple[List[
     except Exception as exc:
         app.logger.warning('Batch album cleanup failed for %s: %s', user_id, exc)
 
+    processing_cleanup.opportunistic_artifact_cleanup(jobs_table_client,storage_utils_module,metadata_table_client,user_id)
     return deleted, errors, deleted_person_ids
 
 
@@ -14787,6 +14825,15 @@ def _maybe_enqueue_coalesced_rerun(job_id: Optional[str], user_id: str) -> None:
 
 def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, job_type: str,
                                      *, incremental_assign=None, prepared=None) -> None:
+    if payload.get('type') == 'upload_wave_stage':
+        from wave_runtime import consume
+        return consume(payload)
+    if payload.get('type') == 'processing_artifact_cleanup':
+        from processing_cleanup import run_artifact_cleanup
+        return run_artifact_cleanup(payload)
+    from wave_policy import legacy_message_suppressed
+    if legacy_message_suppressed(jobs_table_client,user_id,payload):
+        return
     if not user_id:
         return
     if job_type == PREVIEW_JOB_TYPE:
@@ -15664,6 +15711,11 @@ def _process_clustering_user_group(user, indices, messages, take, queue_client, 
     many of message i's work items are still outstanding across chunks; the
     message is only acked once every chunk touching it has succeeded.
     """
+    if _library_cut_over_to_waves(user):
+        for i in indices:
+            _process_clustering_queue_message(take(i),queue_client,queue_name,max_retries,deadletter_queue_client,
+                dispatch=lambda *args,**kwargs: None)
+        return
 
     def prepare(i):
         try:
@@ -15893,7 +15945,7 @@ def run_index_worker() -> None:
     last_recovery = -60.0
     processing_diagnostics.ready('indexer', queue=INDEX_MAINTENANCE_QUEUE_NAME)
     def dispatch(payload, job_id, user_id, job_type):
-        if job_type != INDEX_BUILD_JOB_TYPE:
+        if job_type not in (INDEX_BUILD_JOB_TYPE, 'upload_wave_stage'):
             raise ValueError('Index queue cannot dispatch other job types')
         _handle_clustering_queue_payload(payload, job_id, user_id, job_type)
     while not stop.is_set():
@@ -16762,6 +16814,11 @@ def _process_ipwork_message_impl(message) -> str:
         if isinstance(payload, dict):
             job_id = str(payload.get('jobId') or payload.get('correlationId') or '').strip()
             user_id = str(payload.get('user_id') or payload.get('userId') or '').strip()
+            if payload.get('type') == 'upload_wave_stage':
+                from wave_runtime import consume
+                return consume(payload)
+            if _library_cut_over_to_waves(user_id):
+                return 'noop'
             if dequeue_count > IPWORKER_MAX_RETRIES:
                 if job_id and user_id:
                     try:
@@ -16922,6 +16979,8 @@ def _trigger_indexer_rebuild(user_id: str, reason: str = 'trigger', scope: str =
     The optional HTTP fallback asks indexer's API to persist the same intent;
     neither the caller nor the HTTP handler builds catalog artifacts inline.
     """
+    if str(reason).startswith(('upload','ipwork','post-finalize')) and _library_cut_over_to_waves(user_id):
+        return
     indexer_url = os.getenv('INDEXER_INTERNAL_URL', '').strip()
     key = str(user_id or '').strip()
     if not key or (not indexer_url and index_maintenance_queue_client is None):
@@ -16985,6 +17044,8 @@ def _prepare_ipwork_face_indexes(messages, cancelled) -> None:
         user_id = str(payload.get('user_id') or payload.get('userId') or '').strip()
         filename = str(payload.get('filename') or '').strip()
         if not user_id or not filename:
+            continue
+        if _library_cut_over_to_waves(user_id):
             continue
         try:
             metadata = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)

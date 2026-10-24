@@ -155,3 +155,17 @@ export const cancelQueuedWaveSelection = (files: File[]): Promise<void> => {
 export const __resetWaveShadowStateForTests = (): void => {
     sessionState.clear();
 };
+
+// Live uploads fail closed before init; advisory shadow diagnostics retain their
+// existing behavior. Each binding uses the original whole-selection item key.
+export const liveWaveAdmission = async (session: PersistedUploadSession, file: PersistedUploadFile): Promise<Record<string,string>> => {
+    const {waveLiveEnabled,waveProtocol,wireItemId}=await import('./uploadWaveClient');
+    if (!waveLiveEnabled() || await waveProtocol()==='legacy') return {};
+    await ensureWaveShadowSessionOpened(session);
+    const parent=waveParentFor(session);
+    if (!parent || !session.waveOperationId || !waveFileBelongs(session,file)
+        || !stateFor(parent.id).registered || session.waveAdmissionFailed) {
+        throw new Error('Upload wave admission is unavailable. Retry before uploading files.');
+    }
+    return {waveSessionId:parent.id,waveItemId:await wireItemId(file.waveItemKey || file.key)};
+};

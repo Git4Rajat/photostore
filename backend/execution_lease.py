@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import time
 import contextvars
+import threading
 from contextlib import contextmanager
 import uuid
 from dataclasses import dataclass
@@ -181,6 +182,35 @@ class ExecutionLeases:
             except ResourceModifiedError:
                 continue
         raise RuntimeError('Execution renewal contention')
+
+    @contextmanager
+    def keepalive(self, ownership):
+        """Renew through native FAISS training and other long blocking calls.
+
+        A stalled SDK call cannot bless expired ownership: check() still reads
+        the durable lease and rejects expiry before the next effect.
+        """
+        stop, errors = threading.Event(), []
+        def heartbeat():
+            while not stop.wait(min(30, self.lease_seconds / 3)):
+                try:
+                    self.renew(ownership)
+                except Exception as error:
+                    errors.append(error)
+                    stop.set()
+        def check():
+            if errors:
+                raise OwnershipLost('Execution heartbeat failed') from errors[0]
+            self.check(ownership)
+        check()
+        thread = threading.Thread(target=heartbeat, name='wave-stage-lease', daemon=True)
+        thread.start()
+        try:
+            yield check
+            check()
+        finally:
+            stop.set()
+            thread.join(timeout=1)
 
     def checkpoint(self, ownership, progress):
         """Persists progress so recovery does not redo completed work.

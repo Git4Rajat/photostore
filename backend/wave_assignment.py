@@ -9,10 +9,8 @@ A private FAISS runtime is rebuilt from the frozen baseline on each attempt,
 then committed decisions are replayed in order. No checkpoint can introduce
 unrecorded candidates, and each face enters the private runtime at most once.
 """
-from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime
-import hashlib
 import json
 import sqlite3
 import tempfile
@@ -23,7 +21,7 @@ from azure.data.tables import UpdateMode
 
 from clustering_wave import canonical_sort_key
 from execution_lease import guard_operations
-from faiss_assignment import _point, _vector, _rejected, invalidate, _LOCK
+from faiss_assignment import FaissAssigner, _point, _vector, _rejected, invalidate, _LOCK
 from clustering_runtime import LiveFaceIndex, RebuildNeeded
 from upload_waves import digest
 
@@ -134,7 +132,7 @@ class WaveAssignmentJournal:
                 return
             after = page[-1]['RowKey']
 
-    def prepare(self, workspace, inputs, assigner, binding):
+    def prepare(self, workspace, inputs, assigner, binding, baseline_revision):
         header = self.get('manifest')
         if header is not None:
             if header['binding'] != binding:
@@ -148,10 +146,22 @@ class WaveAssignmentJournal:
             if self._description(workspace, binding) != header:
                 raise ValueError('Frozen assignment manifest coverage mismatch')
             return header
+        # A failed initial capture cannot silently switch to a different
+        # library baseline. No assignment effects exist before publication.
+        self.put('capture', dict(binding=binding, baselineRevision=json.loads(encoded(baseline_revision))))
         # Input iterator reads only immutable receipt snapshots, never live rows.
         for row in inputs():
             self.check()
             workspace.input(clean(row))
+        # UUID5 person rows can predate their face stamps after an interrupted
+        # legacy write. Freeze those too: the reference reuses them rather than
+        # treating them as a new-person collision on recovery.
+        for face in workspace.inputs():
+            self.check()
+            person_id = assigner.person_id(self.store.library, face['RowKey'])
+            person = _point(assigner.person_table, self.store.library, person_id)
+            if person is not None:
+                workspace.put('people', person_id, clean(person))
         # Empty waves need no candidate scan.
         if workspace.count('inputs'):
             for candidate in assigner._cold_rows(self.store.library):
@@ -159,9 +169,8 @@ class WaveAssignmentJournal:
                 person = workspace.get('people', candidate['personId'])
                 if person is None:
                     person = _point(assigner.person_table, self.store.library, candidate['personId'])
-                    if person is None:
-                        continue  # Same missing-person exclusion as legacy validation.
-                    workspace.put('people', candidate['personId'], clean(person))
+                    if person is not None:
+                        workspace.put('people', candidate['personId'], clean(person))
                 workspace.put('candidates', candidate['faceId'], dict(candidate,
                     embedding=candidate['embedding'].tolist()))
         # Deterministic keys also detect a changed partial manifest on retry.
@@ -203,12 +212,13 @@ class WaveAssignmentJournal:
         return self.put('complete', receipt)
 
 
-def _runtime_rows(workspace):
+def _runtime_rows(workspace, guard):
     for row in workspace.rows('candidates'):
+        guard.check()
         yield row
 
 
-def _decide(assigner, library, face, workspace, runtime):
+def _decide(assigner, library, face, workspace, runtime, guard):
     face_id = face['RowKey']
     result = dict(faceId=face_id, inputDigest=digest(face), outcome='excluded', person=None,
                   newPerson=False, candidate=None)
@@ -221,6 +231,10 @@ def _decide(assigner, library, face, workspace, runtime):
     if not assigner._allowed(face) or vector is None:
         return result
     tier, version = assigner.tier(face), assigner.version(face)
+    if runtime.needs_rebuild:
+        guard.check()
+        runtime.rebuild()
+        guard.check()
     def valid(face_id, person_id):
         candidate = workspace.get('candidates', face_id)
         return (candidate is not None and candidate['personId'] == person_id
@@ -310,19 +324,23 @@ def _replay(workspace, runtime, decision, guard):
     previous = workspace.get('candidates', candidate['faceId'])
     if previous != candidate:
         if runtime.needs_rebuild:
-            guard.check(); runtime.rebuild(); guard.check()
+            guard.check()
+            runtime.rebuild()
+            guard.check()
         try:
             runtime.upsert(candidate['faceId'], candidate['personId'], candidate['embedding'],
                            candidate['tier'], candidate['embeddingVersion'])
         except RebuildNeeded:
-            guard.check(); runtime.rebuild(); guard.check()
+            guard.check()
+            runtime.rebuild()
+            guard.check()
             runtime.upsert(candidate['faceId'], candidate['personId'], candidate['embedding'],
                            candidate['tier'], candidate['embeddingVersion'])
         workspace.put('candidates', candidate['faceId'], candidate)
     workspace.put('people', decision['personId'], decision['person'])
 
 
-def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128):
+def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128, progress=lambda count: None):
     """One logical pass; page_size changes neither decisions nor recovery IDs.
 
     inputs is a callable yielding frozen face dictionaries, used only while
@@ -331,6 +349,8 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
     """
     if type(page_size) is not int or not 1 <= page_size <= 128:
         raise ValueError('Assignment page size must be between 1 and 128')
+    if not isinstance(assigner, FaissAssigner):
+        raise TypeError('Wave execution requires the snapshot-aware FaissAssigner path')
     config = assigner.config
     binding = dict(libraryId=store.library, waveId=wave['waveId'],
         frozenRevision=wave['frozenRevision'], manifestDigest=wave['manifestDigest'],
@@ -351,12 +371,13 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
             workspace = Workspace(directory + '/manifest.sqlite3')
             runtime = None
             try:
-                header = journal.prepare(workspace, inputs, assigner, binding)
+                header = journal.prepare(workspace, inputs, assigner, binding,
+                    getattr(library_guard, 'checkpoint_revision', None))
                 guard.check()
                 runtime = LiveFaceIndex(directory + '/runtime', config=config.index_config,
                     candidates=config.candidates, nprobe=config.nprobe,
                     delta_limit=config.delta_limit, threads=config.threads)
-                runtime.build(_runtime_rows(workspace))
+                runtime.build(_runtime_rows(workspace, guard))
                 guard.check()
                 chain = digest(['wave-decisions-v1', digest(header)])
                 begun = False
@@ -366,9 +387,12 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
                         workspace.db.commit()
                     decision = journal.decision(position)
                     if decision is None:
-                        decision = _decide(assigner, store.library, face, workspace, runtime)
+                        decision = _decide(assigner, store.library, face, workspace, runtime, guard)
+                        decision.update(manifestId=digest(header), position=position, previousDigest=chain)
                         journal.put(f'decision!{position:012d}', decision)
-                    if decision['faceId'] != face['RowKey'] or decision['inputDigest'] != digest(face):
+                    if (decision['faceId'] != face['RowKey'] or decision['inputDigest'] != digest(face)
+                            or decision.get('manifestId') != digest(header)
+                            or decision.get('position') != position or decision.get('previousDigest') != chain):
                         raise ValueError('Decision is bound to another frozen face')
                     identity = digest(decision)
                     if not journal.applied(position, identity):
@@ -379,6 +403,8 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
                         journal.put(f'applied!{position:012d}', {'decisionId': identity})
                     _replay(workspace, runtime, decision, guard)
                     chain = digest([chain, position, identity])
+                    if (position + 1) % page_size == 0 or position + 1 == header['faceCount']:
+                        progress(position + 1)
                 guard.check()
                 return journal.finish(header, chain)
             finally:

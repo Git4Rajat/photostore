@@ -14,6 +14,7 @@ import time
 import zipfile
 
 import pytest
+from azure.core.exceptions import ResourceNotFoundError
 
 import app
 from routes.library import library_download_request, library_download_status
@@ -33,7 +34,7 @@ class _FakeTable:
         try:
             return dict(self.rows[(partition_key, row_key)])
         except KeyError:
-            raise Exception('not found')
+            raise ResourceNotFoundError('not found')
 
     def query_entities(self, filter_str, select=None):
         import re

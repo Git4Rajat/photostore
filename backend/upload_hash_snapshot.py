@@ -106,11 +106,22 @@ def read_snapshot(user_id):
 
 
 @catalog_publisher
-def rebuild_snapshot(user_id):
+def rebuild_snapshot(user_id, *, publication_check=None):
     """Stream one library's hash partition into a gzip file on the build worker."""
     table = su._CTX.get('hash_index_table_client')
     if table is None:
         return None
+    epoch_row = None
+    if publication_check is not None:
+        publication_check()
+        epoch_row = _row(table, user_id, DELETE_EPOCH_ROW)
+        if not epoch_row:
+            from azure.core.exceptions import ResourceExistsError
+            try:
+                table.create_entity({'PartitionKey': user_id, 'RowKey': DELETE_EPOCH_ROW, 'epoch': uuid.uuid4().hex})
+            except ResourceExistsError:
+                pass
+            epoch_row = _row(table, user_id, DELETE_EPOCH_ROW)
     container = su._lexical_index_container_name()
     epoch = _epoch(table, user_id)
     previous = _row(table, user_id, SNAPSHOT_ROW)
@@ -143,7 +154,7 @@ def rebuild_snapshot(user_id):
                     out.write(b'}}')
                 if epoch != _epoch(table, user_id):
                     raise RuntimeError('library hashes deleted during snapshot build; retry')
-                su._upload_file_to_blob(blob, path, overwrite=True, content_settings=su.BlobContentSettings(
+                su._upload_file_to_blob(blob, path, overwrite=publication_check is None, content_settings=su.BlobContentSettings(
                     content_type='application/json', content_encoding='gzip'))
                 compressed_bytes = os.path.getsize(path)
             # Publish only after the immutable data file is fully stored.
@@ -153,7 +164,20 @@ def rebuild_snapshot(user_id):
                 'updatedAt': datetime.now(timezone.utc).isoformat(), 'compressedBytes': compressed_bytes,
                 'sourceReadStartedAt': source_read_started_at,
             }
-            table.upsert_entity(manifest)
+            if publication_check is None:
+                table.upsert_entity(manifest)
+            else:
+                from azure.core import MatchConditions
+                from azure.data.tables import UpdateMode
+                def replace(row):
+                    version = getattr(row, 'metadata', {}).get('etag')
+                    if not version:raise RuntimeError('Snapshot publication requires native ETags')
+                    return dict(mode=UpdateMode.REPLACE, etag=version, match_condition=MatchConditions.IfNotModified)
+                publication_check()
+                table.submit_transaction([
+                    ('update', dict(epoch_row), replace(epoch_row)),
+                    ('update', manifest, replace(previous)) if previous else ('create', manifest),
+                ])
             published = True
             perf_instrumentation.log_event('upload_hash_snapshot_built', user=user_id,
                                            rows=count, bytes=compressed_bytes)

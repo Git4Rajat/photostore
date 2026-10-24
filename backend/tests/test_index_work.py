@@ -241,3 +241,21 @@ def test_ack_subset_does_not_clear_other_work():
 def test_unversioned_snapshot_fails_closed():
     with pytest.raises(RuntimeError, match='ETag'):
         acknowledge_dirty(EtagTable(), DirtySnapshot([{'PartitionKey': 'A', 'RowKey': 'one'}]))
+
+
+def test_healthy_deferred_barrier_waits_do_not_exhaust_work_attempts(work):
+    store,table,now=work
+    key=store.request('u','wave-vision:w:key')
+    for _ in range(10):
+        claim=store.claim(key)
+        assert claim.attempt==1
+        store.release(claim,deferred=True)
+        now[0]+=200
+    claim=store.claim(key)
+    store.release(claim)  # A real error remains charged.
+    now[0]+=200
+    claim=store.claim(key)
+    assert claim.attempt==2
+    store.release(claim,deferred=True)
+    now[0]+=200
+    assert store.claim(key).attempt==2

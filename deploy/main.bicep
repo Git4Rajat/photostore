@@ -70,6 +70,20 @@ param clusterMinReplicas int = 0
 @allowed([true])
 param dedicatedIndexWorker bool = true
 
+
+
+@description('Provision the dormant scheduled wave-recovery job; does not enable cutover.')
+param enableWaveRecovery bool = false
+@description('Opt in to wave portal alerts after activating recovery; requires logAnalyticsWorkspaceName.')
+param enableWaveAlerts bool = false
+
+@description('Enable qualified wave stage execution. Keep false until the isolated qualification deployment is ready.')
+param enableWaveExecution bool = false
+@description('Enroll newly created empty libraries only. Existing libraries never change ownership.')
+param enableNewWaveLibraries bool = false
+@description('Content-addressed capability certificate ID for the qualified immutable role images. Empty by default.')
+param waveCapabilityId string = ''
+
 @description('Provision managed WebSocket notifications when library indexes are published.')
 param enableIndexPush bool = false
 
@@ -100,6 +114,11 @@ module app 'resources.bicep' = {
     clusterMinReplicas: clusterMinReplicas
     dedicatedIndexWorker: dedicatedIndexWorker
     enableIndexPush: enableIndexPush
+    enableWaveRecovery: enableWaveRecovery
+    enableWaveAlerts: enableWaveAlerts
+    enableWaveExecution: enableWaveExecution
+    enableNewWaveLibraries: enableNewWaveLibraries
+    waveCapabilityId: waveCapabilityId
     logAnalyticsWorkspaceName: logAnalyticsWorkspaceName
   }
 }

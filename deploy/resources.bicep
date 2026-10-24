@@ -80,6 +80,19 @@ param clusterMinReplicas int = 0
 @allowed([true])
 param dedicatedIndexWorker bool = true
 
+@description('Provision the independent bounded wave-recovery job. Does not enable wave cutover or execution.')
+param enableWaveRecovery bool = false
+@description('Opt in to wave portal alerts; requires an existing logging workspace and activated recovery execution.')
+param enableWaveAlerts bool = false
+
+@description('Enable qualified wave stage execution. Keep false until the isolated qualification deployment is ready.')
+param enableWaveExecution bool = false
+@description('Enroll newly created empty libraries only. Existing libraries never change ownership.')
+param enableNewWaveLibraries bool = false
+@description('Content-addressed capability certificate ID for the qualified immutable role images. Empty by default.')
+param waveCapabilityId string = ''
+
+
 @description('Enable managed WebSocket index-ready notifications. Adds a Web PubSub Standard unit; polling remains the fallback.')
 param enableIndexPush bool = false
 
@@ -398,6 +411,12 @@ resource indexPush 'Microsoft.SignalRService/webPubSub@2024-03-01' = if (enableI
 
 // Shared backend/worker environment variables.
 var backendEnv = [
+  { name: 'UPLOAD_WAVE_EXECUTION_ENABLED', value: enableWaveExecution ? 'true' : 'false' }
+  { name: 'UPLOAD_WAVE_NEW_LIBRARIES_ENABLED', value: enableNewWaveLibraries ? 'true' : 'false' }
+  { name: 'UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED', value: (enableWaveExecution || enableNewWaveLibraries) ? 'true' : 'false' }
+  { name: 'PROCESSING_GENERATION_ENFORCEMENT_ENABLED', value: (enableWaveExecution || enableNewWaveLibraries) ? 'true' : 'false' }
+  { name: 'UPLOAD_WAVE_CAPABILITY_ID', value: waveCapabilityId }
+
   { name: 'INDEX_EVENTS_ENDPOINT', value: enableIndexPush ? 'https://${indexPush!.properties.hostName}' : '' }
   { name: 'INDEX_MAINTENANCE_QUEUE_NAME', value: 'photostore-index-maintenance' }
   { name: 'INDEX_BUILD_ROLES', value: 'index-worker' }
@@ -641,7 +660,7 @@ var backendEnv = [
   { name: 'PEOPLE_CLUSTER_MAINTENANCE_COOLDOWN_SECONDS', value: '1800' }
 ]
 
-resource core 'Microsoft.App/containerApps@2024-03-01' = {
+resource core 'Microsoft.App/containerApps@2025-01-01' = {
   name: coreAppName
   location: location
   identity: {
@@ -749,6 +768,7 @@ resource core 'Microsoft.App/containerApps@2024-03-01' = {
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'core' }
+            { name: 'UPLOAD_WAVE_DEPLOYMENT_ID', value: coreImage }
             // Shared Azure Files volume: index blobs are cached here by ETag so a
             // restart/scale-out re-reads from disk instead of re-downloading them.
             { name: 'INDEX_DISK_CACHE_DIR', value: '/mnt/photostore/shared/index-cache' }
@@ -888,6 +908,7 @@ resource core 'Microsoft.App/containerApps@2024-03-01' = {
         { name: 'search-db', storageType: 'EmptyDir' }
       ]
       scale: {
+        cooldownPeriod: 300
         minReplicas: 0
         // Was 3. Raised to 5 after a real HAR capture showed the client-side
         // upload-parallelism fix (effectiveRtt cross-check, see
@@ -990,6 +1011,7 @@ resource indexer 'Microsoft.App/containerApps@2025-01-01' = {
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'indexer' }
+            { name: 'UPLOAD_WAVE_DEPLOYMENT_ID', value: coreImage }
             // Shared Azure Files volume: index blobs are cached here by ETag so a
             // restart/scale-out re-reads from disk instead of re-downloading them.
             { name: 'INDEX_DISK_CACHE_DIR', value: '/mnt/photostore/shared/index-cache' }
@@ -1014,6 +1036,7 @@ resource indexer 'Microsoft.App/containerApps@2025-01-01' = {
           ]
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'index-worker' }
+            { name: 'UPLOAD_WAVE_DEPLOYMENT_ID', value: coreImage }
             { name: 'INDEX_DISK_CACHE_DIR', value: '/mnt/photostore/shared/index-cache' }
             { name: 'INDEX_BUILD_WORK_DIR', value: '/mnt/photostore/shared/index-build' }
             { name: 'SEARCH_DB_DIR', value: '/tmp/photostore-index-search' }
@@ -1029,6 +1052,7 @@ resource indexer 'Microsoft.App/containerApps@2025-01-01' = {
         { name: 'index-cache', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
       ]
       scale: {
+        cooldownPeriod: 300
         minReplicas: 0
         // One publisher process during migration; API and queue work are
         // isolated containers, while work leases protect restart overlap.
@@ -1076,7 +1100,7 @@ resource indexer 'Microsoft.App/containerApps@2025-01-01' = {
 // backend-cpu-optimization-2026-09 memory. Isolating this onto its own app
 // also keeps its mutate-everything endpoints off the gallery-facing
 // replica's attack surface.
-resource recovery 'Microsoft.App/containerApps@2024-03-01' = {
+resource recovery 'Microsoft.App/containerApps@2025-01-01' = {
   name: recoveryAppName
   location: location
   identity: {
@@ -1111,6 +1135,7 @@ resource recovery 'Microsoft.App/containerApps@2024-03-01' = {
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'recovery' }
+            { name: 'UPLOAD_WAVE_DEPLOYMENT_ID', value: coreImage }
             { name: 'GUNICORN_WORKERS', value: '1' }
             { name: 'GUNICORN_THREADS', value: '4' }
             { name: 'VECTOR_INDEX_PRIME_ON_STARTUP', value: 'false' }
@@ -1121,6 +1146,7 @@ resource recovery 'Microsoft.App/containerApps@2024-03-01' = {
         }
       ]
       scale: {
+        cooldownPeriod: 300
         minReplicas: 0
         maxReplicas: 2
         rules: [
@@ -1169,7 +1195,7 @@ resource recovery 'Microsoft.App/containerApps@2024-03-01' = {
 // outright rather than carried along, since they were the only genuinely
 // unbounded-by-design reads in this blueprint. 'archive' now carries only
 // library/public.
-resource archive 'Microsoft.App/containerApps@2024-03-01' = {
+resource archive 'Microsoft.App/containerApps@2025-01-01' = {
   name: archiveAppName
   location: location
   identity: {
@@ -1222,6 +1248,7 @@ resource archive 'Microsoft.App/containerApps@2024-03-01' = {
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'archive' }
+            { name: 'UPLOAD_WAVE_DEPLOYMENT_ID', value: coreImage }
             { name: 'INDEX_DISK_CACHE_DIR', value: '/mnt/photostore/shared/index-cache' }
             { name: 'GUNICORN_WORKERS', value: '1' }
             { name: 'GUNICORN_THREADS', value: '4' }
@@ -1236,6 +1263,7 @@ resource archive 'Microsoft.App/containerApps@2024-03-01' = {
         { name: 'index-cache', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
       ]
       scale: {
+        cooldownPeriod: 300
         minReplicas: 0
         maxReplicas: 3
         rules: [
@@ -1278,7 +1306,7 @@ resource archive 'Microsoft.App/containerApps@2024-03-01' = {
 // lightweight coordination calls (the actual image bytes go browser->Blob
 // directly, never through this app), so this resize carries materially less
 // risk than the sibling apps' below.
-resource upload 'Microsoft.App/containerApps@2024-03-01' = {
+resource upload 'Microsoft.App/containerApps@2025-01-01' = {
   name: uploadAppName
   location: location
   identity: {
@@ -1319,6 +1347,7 @@ resource upload 'Microsoft.App/containerApps@2024-03-01' = {
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'upload' }
+            { name: 'UPLOAD_WAVE_DEPLOYMENT_ID', value: coreImage }
             { name: 'GUNICORN_WORKERS', value: '1' }
             { name: 'GUNICORN_THREADS', value: '4' }
             { name: 'GUNICORN_MAX_REQUESTS', value: '4000' }
@@ -1331,6 +1360,7 @@ resource upload 'Microsoft.App/containerApps@2024-03-01' = {
         }
       ]
       scale: {
+        cooldownPeriod: 300
         minReplicas: 0
         maxReplicas: 5
         rules: [
@@ -1348,7 +1378,7 @@ resource upload 'Microsoft.App/containerApps@2024-03-01' = {
   }
 }
 
-resource web 'Microsoft.App/containerApps@2024-03-01' = {
+resource web 'Microsoft.App/containerApps@2025-01-01' = {
   name: webAppName
   location: location
   properties: {
@@ -1389,6 +1419,7 @@ resource web 'Microsoft.App/containerApps@2024-03-01' = {
             // (core container, above) were wired correctly; this was the
             // missing piece on the web side.
             { name: 'APP_CONFIG_PROCESSING_MODE', value: processingMode }
+            { name: 'APP_CONFIG_UPLOAD_WAVE_EXECUTION_ENABLED', value: enableWaveExecution ? 'true' : 'false' }
             { name: 'APP_CONFIG_BROWSER_UPLOAD_PREPARATION', value: browserUploadPreparation ? 'true' : 'false' }
             { name: 'APP_CONFIG_FACE_API_MODEL_URL', value: '/models/face-api' }
             // Explicit pin, added with the AdaFace swap: docker-entrypoint.sh
@@ -1404,6 +1435,7 @@ resource web 'Microsoft.App/containerApps@2024-03-01' = {
         }
       ]
       scale: {
+        cooldownPeriod: 300
         // Scale-to-zero: nginx serving the SPA cold-starts in a couple of
         // seconds, and an idle deployment should cost nothing.
         minReplicas: 0
@@ -1462,6 +1494,7 @@ resource cluster 'Microsoft.App/containerApps@2025-01-01' = {
           ]
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'cluster' }
+            { name: 'UPLOAD_WAVE_DEPLOYMENT_ID', value: coreImage }
             { name: 'PEOPLE_FAISS_WORK_DIR', value: '/var/lib/photostore/faiss-work' }
             { name: 'PEOPLE_FAISS_CHECKPOINT_DIR', value: '/mnt/photostore/faiss-checkpoints' }
             // Same share the backend/tools mount at /mnt/photostore/shared -- worker builds the
@@ -1532,13 +1565,12 @@ resource cluster 'Microsoft.App/containerApps@2025-01-01' = {
         { name: 'faiss-checkpoints', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
       ]
       scale: {
+        cooldownPeriod: 300
         // Live FAISS cannot amortize training if queue lulls destroy its only
         // replica. A replica floor, not merely cooldown, prevents this teardown.
         // It does not prevent deployment/platform/OOM restarts or cache changes.
         minReplicas: clusterMinReplicas
         maxReplicas: 1
-        // Relevant only when explicitly opting back into a zero-replica floor.
-        cooldownPeriod: 300
         rules: [
           {
             name: 'clustering-queue'
@@ -1634,6 +1666,7 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
           ]
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'vision' }
+            { name: 'UPLOAD_WAVE_DEPLOYMENT_ID', value: visionImage }
             { name: 'IPWORKER_POLL_SECONDS', value: '2' }
             // Shared Azure Files volume, same share indexer/worker/clustering
             // already mount: a crash (SIGKILL/OOM, not a graceful SIGTERM
@@ -1720,6 +1753,7 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
         { name: 'index-cache', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
       ]
       scale: {
+        cooldownPeriod: 300
         minReplicas: 0
         // 1: uploads release their vision work in one burst at upload end
         // (IPWORK_DEFER_UNTIL_UPLOAD_END), and a measured 1809-file run used
@@ -1917,3 +1951,63 @@ output recoveryUrl string = 'https://${recovery.properties.configuration.ingress
 
 @description('Archive (people/library/public) API URL.')
 output archiveUrl string = 'https://${archive.properties.configuration.ingress.fqdn}'
+
+
+// Scheduled recovery is a separate execution host, not a loop in the HTTP
+// recovery/admin app. No ingress, no permanent replica, no heavy stage work.
+resource waveRecovery 'Microsoft.App/jobs@2025-01-01' = if (enableWaveRecovery) {
+  name: '${appName}-wave-recovery'
+  location: location
+  identity: { type: 'SystemAssigned' }
+  properties: {
+    environmentId: managedEnvironment.id
+    configuration: {
+      triggerType: 'Schedule'
+      replicaTimeout: 240
+      replicaRetryLimit: 1
+      scheduleTriggerConfig: {
+        cronExpression: '*/5 * * * *'
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+    }
+    template: {
+      containers: [
+        {
+          name: 'wave-recovery'
+          image: coreImage
+          command: ['python', '-u', '-m', 'wave_recovery']
+          resources: { cpu: json('0.5'), memory: '1Gi' }
+          // Common wave settings default off; the qualification deployment opts in.
+          env: concat(backendEnv, [
+            { name: 'APP_ROLE', value: 'wave-recovery' }
+            { name: 'UPLOAD_WAVE_DEPLOYMENT_ID', value: coreImage }
+            { name: 'UPLOAD_WAVE_RECOVERY_ENABLED', value: 'true' }
+            { name: 'VECTOR_INDEX_PRIME_ON_STARTUP', value: 'false' }
+          ])
+        }
+      ]
+    }
+  }
+}
+resource waveRecoveryStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for roleId in storageRoleIds: if (enableWaveRecovery) {
+  name: guid(storage.id, waveRecovery!.id, roleId)
+  scope: storage
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
+    principalId: waveRecovery!.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}]
+
+// Optional portal alerts. Enable only once recovery execution and log ingestion
+// are qualified; absence alerts intentionally fail when that heartbeat stops.
+module waveAlerts 'wave-alerts.bicep' = if (enableWaveAlerts && !empty(logAnalyticsWorkspaceName)) {
+  name: '${appName}-wave-alerts'
+  params: {
+    appName: appName
+    location: location
+    workspaceId: logAnalyticsWorkspace!.id
+    enabled: true
+  }
+}

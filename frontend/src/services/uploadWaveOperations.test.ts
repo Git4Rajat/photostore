@@ -2,13 +2,15 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import type { PersistedUploadSession } from '../types/browserProcessing';
 const mocks = vi.hoisted(() => ({ scope: 'library-a', open: vi.fn(), register: vi.fn(), resolve: vi.fn(), close: vi.fn() }));
 vi.mock('./sessionScope', () => ({ sessionScope: () => mocks.scope }));
-vi.mock('./uploadWaveClient', () => ({ waveShadowEnabled: () => true, WAVE_SHADOW_MAX_PAGE: 20,
+vi.mock('./uploadWaveClient', () => ({ waveShadowEnabled: () => true, waveLiveEnabled: () => true,
+    waveProtocol: async () => 'live',
+    wireItemId: async (key: string) => `wire:${key}`, WAVE_SHADOW_MAX_PAGE: 20,
     openWaveShadowSession: mocks.open, registerWaveShadowItems: mocks.register,
     resolveWaveShadowItem: mocks.resolve, closeWaveShadowSession: mocks.close }));
 import { bindWaveChild, clearWaveOperationCachesForTests, declareWaveSelection, loadWaveOperation,
     retryWaveOperation, sliceWaveSelection } from './uploadWaveOperations';
 import { __resetWaveShadowStateForTests, ensureWaveShadowSessionOpened, finalizeWaveShadowSession,
-    cancelQueuedWaveSelection } from './uploadWaveSync';
+    cancelQueuedWaveSelection, liveWaveAdmission } from './uploadWaveSync';
 const child = (files: File[], id: string): PersistedUploadSession => {
     const session: PersistedUploadSession = { id, createdAt: 1, files: files.map((file, index) => ({
         key: `${id}:${index}`, name: file.name, size: file.size, type: file.type, lastModified: file.lastModified,
@@ -107,4 +109,25 @@ it('can admit a fresh retry after parent storage becomes available again', async
     const retried = retryWaveOperation(session);
     await ensureWaveShadowSessionOpened(retried);
     expect(mocks.open).toHaveBeenCalledWith(retried.waveOperationId, 1);
+});
+
+it('binds live upload children across the 900 boundary to the same fully registered parent', async () => {
+    const files = Array.from({ length: 901 }, (_, i) => new File(['x'], `${i}.jpg`));
+    const parent = declareWaveSelection(files)!;
+    const first = child(sliceWaveSelection(files, 0, 900), 'first-live');
+    const last = child(sliceWaveSelection(files, 900), 'last-live');
+    const a = await liveWaveAdmission(first, first.files[0]);
+    const b = await liveWaveAdmission(last, last.files[0]);
+    expect(a.waveSessionId).toBe(parent.id); expect(b.waveSessionId).toBe(parent.id);
+    expect(a.waveItemId).not.toBe(b.waveItemId);
+    expect(mocks.register).toHaveBeenCalledTimes(46);
+    expect(mocks.open).toHaveBeenCalledTimes(1);
+});
+it('refuses live bytes when parent registration fails or the library changes', async () => {
+    const files = [new File(['x'], 'a.jpg')]; declareWaveSelection(files);
+    const current = child(files, 'failed-live'); mocks.register.mockResolvedValue(null);
+    await expect(liveWaveAdmission(current, current.files[0])).rejects.toThrow('admission is unavailable');
+    mocks.register.mockResolvedValue({ manifestRevision: 'registered' });
+    mocks.scope = 'other-library';
+    await expect(liveWaveAdmission(current, current.files[0])).rejects.toThrow('admission is unavailable');
 });

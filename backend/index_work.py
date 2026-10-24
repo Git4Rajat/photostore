@@ -184,14 +184,19 @@ class WorkStore:
                 continue
         raise RuntimeError('Maintenance lease renewal contention')
 
-    def release(self, claim):
+    def release(self, claim, *, deferred=False):
         for _ in range(12):
             current = self._get(claim.key)
             if current is None or current.get('owner') != claim.owner:
                 raise RuntimeError('Maintenance lease lost')
             try:
-                self._replace(current, dict(current, owner='', leaseUntil=0,
-                                            wakeUntil=self.clock() + self.lease_seconds))
+                row = dict(current, owner='', leaseUntil=0,
+                           wakeUntil=self.clock() + self.lease_seconds)
+                # A healthy barrier wait (or obsolete wake) did not fail work.
+                # Preserve earlier failures without charging this claim again.
+                if deferred and current['revision'] == claim.revision:
+                    row['attempts'] = max(0, int(current.get('attempts') or 0) - 1)
+                self._replace(current, row)
                 return
             except ResourceModifiedError:
                 continue
