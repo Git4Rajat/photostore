@@ -12,6 +12,7 @@ import re
 import uuid
 import base64
 import shutil
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -10179,6 +10180,8 @@ def apply_client_processing_results_for_file(
             )
             apply_completed = True
             if artifact_fence and _CTX.get('source_artifact_receipt_capture'):
+                from processing_artifacts import promote_prepared
+                promote_prepared(sys.modules[__name__], metadata)
                 candidate = dict(metadata)
                 _apply_processing_status_updates(candidate, batch)
                 receipt = _CTX['source_artifact_receipt_capture'](user_id, candidate)
@@ -10231,10 +10234,13 @@ def qualify_completed_processing(user_id, filename, lease):
         generation=str(claimed.get('processingGeneration') or ''))
     with result_fence(fence):
         fence.check()
-        reference = _CTX['source_artifact_receipt_capture'](user_id, dict(current))
+        from processing_artifacts import promote_prepared
+        result = dict(current)
+        promote_prepared(sys.modules[__name__], result)
+        reference = _CTX['source_artifact_receipt_capture'](user_id, result)
         if reference is None:
             raise ValueError('Processing outputs are not terminal')
-        result = dict(current, artifactReceipt=json.dumps(reference, sort_keys=True, separators=(',', ':')))
+        result['artifactReceipt'] = json.dumps(reference, sort_keys=True, separators=(',', ':'))
         return _commit_worker_processing_results(user_id, filename, current, result, [], lease['ownerId'], require_unexpired=True)
 
 

@@ -89,6 +89,31 @@ def publish(storage, metadata, kind, *, data=None, staged=False):
     return receipt
 
 
+def promote_prepared(storage, metadata):
+    """Qualify browser-prepared JPEGs before a worker publishes completion.
+
+    Upload finalization can mark the shared preparation blobs done without an
+    attempt receipt. Read bounded, ETag-pinned bytes, then publish a create-only
+    copy under the current source fence. The caller commits the new pointers
+    with its normal result CAS; never overwrite an existing receipt or blob.
+    """
+    from image_utils import is_video_file
+    from processing_fence import current_fence
+    fence = current_fence(metadata['PartitionKey'], metadata['RowKey'])
+    if fence is None:
+        raise ValueError('Prepared derivative promotion requires a processing fence')
+    fence.check()
+    if is_video_file(metadata['RowKey']):
+        return  # Video preparation remains browser-owned.
+    for kind in ('thumbnail', 'preview'):
+        if metadata.get(kind + '_status') != 'done' or metadata.get(kind + 'Artifact'):
+            continue
+        name = fence.photo if kind == 'thumbnail' else f'preview/{fence.photo}.jpg'
+        blob = storage._get_blob_client(storage._CTX['blob_thumbnail_container'], name)
+        data, _ = _read(blob, kind)
+        publish(storage, metadata, kind, data=data)
+
+
 def derivative_blob(metadata, kind, fallback):
     raw = (metadata or {}).get(kind + 'Artifact')
     if not raw:
