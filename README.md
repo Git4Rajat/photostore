@@ -118,6 +118,21 @@ images, seeds the durable capability certificate before owner-library creation,
 then enables execution and enrollment. The portal button does not run that
 bootstrap sequence.
 
+**Updating images on a wave-active deployment is not supported.** Each
+wave-owned library's capability is permanently bound, at enrollment, to the
+exact image digest running on every role (`wave_policy.require_capability` —
+"Library ownership cannot be rebound"). Redeploying `coreImage`, `webImage`,
+or `visionImage` on an existing deployment — even an ordinary bug-fix bump,
+not a deliberate wave change — immediately and permanently fails every
+in-flight wave's next vision/cluster/index attempt with a generic "This app
+deployment is not qualified" conflict, since the deployed image no longer
+matches the sealed certificate. There is currently no tool to re-certify or
+migrate an existing, populated deployment onto new images (`fresh_wave.py`
+explicitly refuses to run against an existing resource group, so it can't be
+reused for this). Until such a tool exists, treat a wave-enabled deployment's
+images as fixed: the only supported way to pick up new code is a fresh
+install via `fresh-wave.md`, not an in-place image update.
+
 The template deploys at **subscription scope** and **creates its own resource
 group** (`<appName>-rg` by default), so you're only asked for a subscription,
 a region, and a few details — no need to pick or create a resource group first.

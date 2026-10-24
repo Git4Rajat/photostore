@@ -60,7 +60,7 @@ action. It never deletes or adopts an existing group.
 | Execution and new-library enrollment | `false` | `true` |
 | Processing mode | `backend` | `backend` |
 | Dedicated Indexer worker and recovery job provisioned | `true` | `true` |
-| Scheduled recovery work enabled | `false` | `true` |
+| Recovery work enabled | `false` | `true` |
 | Browser thumbnail/preview/EXIF preparation | `true` | `true` |
 
 The helper validates and deploys the preparation parameters, then verifies the
@@ -68,14 +68,19 @@ actual app images, flags and ready revisions. HTTP APIs return `503` except for
 health; owner-library creation and Vision/Cluster/Indexer worker intake wait.
 It starts an execution of the existing recovery job with its command overridden
 to `python -u -m wave_bootstrap`. The job verifies the storage is fresh and
-persists/read-verifies the exact certificate. The scheduled job remains configured
-to run `wave_recovery`, with recovery disabled during this phase. See Azure's
+persists/read-verifies the exact certificate. The job's own command remains
+configured to run `wave_recovery` for any later manual invocation, with
+recovery disabled during this phase. See Azure's
 [job execution template override](https://learn.microsoft.com/en-us/azure/container-apps/jobs).
 
 Only after bootstrap succeeds does the helper deploy activation parameters.
 Owner bootstrap can now create a wave-owned personal library. Subsequent new
-users' empty libraries use the same certified contract. The normal recovery job
-runs every five minutes. No extra always-running coordinator is added.
+users' empty libraries use the same certified contract. Recovery itself is
+event-driven, not scheduled: it rides on real wave-lifecycle events (upload
+close/resolve/repair/abandon) in the `-upload` app, not a standalone timer —
+the job is `Manual`-triggered and only runs via an explicit operator
+`containerapp job start` (e.g. to sweep a library that's gone fully idle with
+a stuck wave and nobody visiting). No always-running coordinator is added.
 
 Final verification checks all eight apps, the Indexer sidecar and recovery job,
 logs in as the owner, requires `/upload/waves/protocol` to return `live`, and
@@ -93,7 +98,23 @@ intake manually to bypass a failed bootstrap. Fix bootstrap before activation.
 
 An activation or verification failure may leave apps active; inspect the failure
 and resume. This helper does not claim transactional rollback across Azure apps.
-It does not rebind certificates for upgrades to existing libraries.
+
+**It does not rebind certificates for upgrades to existing libraries, and
+nothing else in this deployment does either.** Each wave-owned library's
+capability is permanently bound, at enrollment, to the exact image digest
+running on every role (`wave_policy.require_capability` — "Library ownership
+cannot be rebound"). Once this deployment is live and libraries are
+wave-enrolled, **do not** redeploy `coreImage`, `webImage`, or `visionImage`
+with `az deployment group create -f deploy/resources.bicep` or the portal
+"Redeploy" button for any reason — not even an unrelated bug fix. Doing so
+immediately and permanently fails every in-flight wave's next vision/cluster/
+index attempt with a generic "This app deployment is not qualified" conflict,
+since the deployed image no longer matches the sealed certificate, and there
+is no automatic or manual re-certification path: `fresh_wave.py` itself
+refuses to run against an existing resource group, so it cannot be reused to
+fix a deployment that's already live. Until a dedicated re-certify/migrate
+tool exists, the only supported way to pick up new code on a wave-active
+deployment is a fresh install via this guide, not an in-place image update.
 
 After successful deployment, qualify a real photo upload on the new owner's
 library and a second user's library: overlapping sessions, Vision completion,
