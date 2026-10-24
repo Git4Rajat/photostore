@@ -237,7 +237,11 @@ export const requestJson = async <T = any>(
                 // place -- hand off to the global session-expiry handler, which
                 // clears the dead session and reloads into login exactly once.
                 // Guarded there against public routes and no-auth deployments.
-                if (axios.isAxiosError(error) && error.response?.status === 401) {
+                // The perf-telemetry beacon is exempt: it's best-effort background
+                // reporting, and a single dropped/missing-header beacon (seen on a
+                // mobile network handover) is not evidence the session is dead --
+                // it must not force-logout an otherwise active session.
+                if (axios.isAxiosError(error) && error.response?.status === 401 && !url.includes(PERF_REPORT_PATH)) {
                     reportUnauthorized();
                 }
                 // Terminal outcome: classify once, then feed the app-wide
