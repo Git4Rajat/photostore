@@ -39,6 +39,22 @@ test('only successful uploads are attached to finalization', async () => {
     pipeline.dispose();
 });
 
+test.each([
+    'photo.HEIC', 'photo.heif', 'photo.HIF',
+    'photo.jpg', 'photo.jpeg', 'photo.png', 'photo.webp', 'photo.tiff',
+    'photo.cr3', 'photo.nef', 'photo.dng',
+])('generates the offered thumbnail for %s without a preview target', async name => {
+    const pipeline = new UploadPreparationPipeline();
+    const file = new File(['source'], name);
+    const result = await pipeline.start(file, 'a'.repeat(64), {thumbnailBlobUrl: targets.thumbnailBlobUrl}, new AbortController().signal);
+    expect(mocks.prepare).toHaveBeenCalledWith(file, expect.anything());
+    expect(result.clientProcessing?.thumbnail).toMatchObject({alreadyUploaded: true});
+    expect(result.preparationReport?.assets.thumbnail).toMatchObject({target: true, generation: 'generated', upload: 'uploaded'});
+    expect(result.preparationReport?.assets.preview).toMatchObject({target: false, generation: 'skipped', generationReason: 'missing_target'});
+    expect(mocks.fetch).toHaveBeenCalledTimes(1);
+    pipeline.dispose();
+});
+
 test('asset PUTs are marked high priority so they are not stuck behind slower chunk PUTs sharing the same origin', async () => {
     const pipeline = new UploadPreparationPipeline();
     await pipeline.start(source(), 'a'.repeat(64), targets, new AbortController().signal);
@@ -102,6 +118,28 @@ test('browser EXIF is not run for videos', async () => {
     const pipeline = new UploadPreparationPipeline();
     await pipeline.start(new File(['video'], 'clip.mkv'), 'a'.repeat(64), {thumbnailBlobUrl: 'https://storage/thumb'}, new AbortController().signal);
     expect(mocks.exif).not.toHaveBeenCalled();
+    pipeline.dispose();
+});
+
+test.each(['photo.HEIC', 'photo.heif', 'photo.HIF', 'photo.jpg', 'photo.png', 'photo.webp', 'photo.tiff', 'photo.cr3', 'photo.nef', 'photo.dng'])(
+    'metadata-only target for %s uploads metadata and extracts EXIF without image generation', async name => {
+    metadataWorker();
+    const pipeline = new UploadPreparationPipeline();
+    const result = await pipeline.start(new File(['source'], name), 'a'.repeat(64), {
+        metadataBlobUrl: 'https://storage/metadata', uploadPreparationEnabled: true,
+    }, new AbortController().signal);
+    expect(mocks.prepare).not.toHaveBeenCalled();
+    expect(mocks.exif).toHaveBeenCalledTimes(1);
+    expect(result.clientProcessing?.exif).toEqual(browserVerdict.result);
+    expect(result.clientMetadata).toBeDefined();
+    expect(result.clientProcessing?.preview).toBeUndefined();
+    expect(result.clientProcessing?.thumbnail).toBeUndefined();
+    expect(result.preparationReport?.assets.metadata).toMatchObject({target: true, generation: 'generated', upload: 'uploaded'});
+    for (const kind of ['preview', 'thumbnail'] as const) {
+        expect(result.preparationReport?.assets[kind]).toMatchObject({target: false, generation: 'skipped', generationReason: 'missing_target'});
+    }
+    expect(mocks.fetch).toHaveBeenCalledTimes(1);
+    expect(mocks.fetch.mock.calls[0][0]).toBe('https://storage/metadata');
     pipeline.dispose();
 });
 

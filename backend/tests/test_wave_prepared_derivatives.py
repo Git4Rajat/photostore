@@ -68,6 +68,21 @@ def test_real_wave_adapter_qualifies_browser_prepared_derivatives(blobs, monkeyp
         assert verify_receipt(storage_utils, retried, kind)['sha256'] == manifest['derivatives'][kind]['sha256']
 
 
+def test_thumbnail_only_preparation_is_promoted_without_requiring_preview(blobs):
+    (metadata, _, _, _, fence), objects = blobs
+    row = dict(metadata.get_entity('lib', 'photo.jpg'), thumbnail_status='done', preview_status='pending')
+    thumbnail = Blob(); thumbnail.data = jpeg(); thumbnail.version = 1
+    objects['photo'] = thumbnail
+    with result_fence(fence):
+        promote_prepared(storage_utils, row)
+        proof = verify_receipt(storage_utils, row, 'thumbnail')
+    assert objects[proof['blob']].data == jpeg()
+    assert row['thumbnail_status'] == 'done'
+    assert row['preview_status'] == 'pending'
+    assert not row.get('previewArtifact')
+    assert 'preview/photo.jpg' not in objects
+
+
 @pytest.mark.parametrize('bad_bytes', [b'not-a-jpeg', jpeg(edge=121)])
 def test_preparation_done_does_not_bypass_byte_validation(blobs, bad_bytes):
     (metadata, _, _, _, fence), objects = blobs

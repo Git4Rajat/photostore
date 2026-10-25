@@ -222,12 +222,16 @@ export class UploadPreparationPipeline {
     private async run(file: File, sha256: string, targets: UploadAssetTargets, signal: AbortSignal, report: UploadPreparationReport): Promise<PreparedUpload> {
         const assetsStarted = performance.now();
         const result: PreparedUpload = {preparationReport: report};
-        const assetsPromise = targets.previewBlobUrl || (isVideoFilename(file.name) && targets.thumbnailBlobUrl)
+        const assetsPromise = targets.previewBlobUrl || targets.thumbnailBlobUrl
             ? this.preparer.prepare(file, {signal}).then(async assets => {
                 for (const kind of ['preview', 'thumbnail'] as const) {
                     const diagnostic = report.assets[kind];
                     if (isVideoFilename(file.name) && kind === 'preview') {
                         Object.assign(diagnostic, {generation: 'skipped', generationReason: 'not_requested'});
+                        continue;
+                    }
+                    if (!diagnostic.target) {
+                        Object.assign(diagnostic, {generation: 'skipped', generationReason: 'missing_target'});
                         continue;
                     }
                     diagnostic.generationMs = Math.round(performance.now() - assetsStarted);
