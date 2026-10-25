@@ -61,9 +61,9 @@ param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker:latest'
 @maxValue(5120)
 param clusterFileShareQuotaGiB int = 100
 
-@description('Minimum clustering replicas. Default 0 scales to zero while idle; fresh graceful checkpoints support recovery. Set 1 to keep the index warm at continuous cost. Missing or stale checkpoints require a cold rebuild.')
+@description('Clustering replica floor. Must remain zero; queued and in-flight work keep the worker active. Checkpoints support recovery after idle scale-down.')
 @minValue(0)
-@maxValue(1)
+@maxValue(0)
 param clusterMinReplicas int = 0
 
 @description('Required: run derived-index maintenance on the indexer queue sidecar. Cluster publishing is no longer supported.')

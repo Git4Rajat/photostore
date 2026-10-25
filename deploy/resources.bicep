@@ -71,9 +71,9 @@ param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker:latest'
 @maxValue(5120)
 param clusterFileShareQuotaGiB int = 100
 
-@description('Minimum clustering replicas. Default 0 scales to zero while idle; fresh graceful checkpoints support recovery. Set 1 to keep the index warm at continuous cost. Missing or stale checkpoints require a cold rebuild.')
+@description('Clustering replica floor. Must remain zero; queued and in-flight work keep the worker active. Checkpoints support recovery after idle scale-down.')
 @minValue(0)
-@maxValue(1)
+@maxValue(0)
 param clusterMinReplicas int = 0
 
 @description('Required: run index maintenance on the indexer sidecar; cluster only forwards legacy index messages.')
@@ -1079,7 +1079,8 @@ resource indexer 'Microsoft.App/containerApps@2025-01-01' = {
                 accountName: storageAccountName
                 queueName: 'photostore-index-maintenance'
                 queueLength: '1'
-                queueLengthStrategy: 'visibleonly'
+                // Claimed messages remain work until ACK, including long builds.
+                queueLengthStrategy: 'all'
               }
               identity: 'system'
             }
@@ -1570,9 +1571,8 @@ resource cluster 'Microsoft.App/containerApps@2025-01-01' = {
       ]
       scale: {
         cooldownPeriod: 300
-        // Live FAISS cannot amortize training if queue lulls destroy its only
-        // replica. A replica floor, not merely cooldown, prevents this teardown.
-        // It does not prevent deployment/platform/OOM restarts or cache changes.
+        // Queued and claimed work keep this worker active. Once queues drain,
+        // scale to zero; checkpoints support the next cold start.
         minReplicas: clusterMinReplicas
         maxReplicas: 1
         rules: [
@@ -1584,13 +1584,8 @@ resource cluster 'Microsoft.App/containerApps@2025-01-01' = {
                 accountName: storageAccountName
                 queueName: 'photostore-clustering'
                 queueLength: '1'
-                // Defensive, mirroring library-ops-queue's fix below: nothing
-                // sends a deliberately-delayed message here today, but a
-                // future self-rescheduling batch trigger (e.g. the planned
-                // "N faces or N minutes" cluster-batch check) would hit the
-                // exact same false-wake bug if this is left on the KEDA
-                // default ('all', which counts invisible/delayed messages).
-                queueLengthStrategy: 'visibleonly'
+                // Renewing visibility must not hide active clustering from KEDA.
+                queueLengthStrategy: 'all'
               }
               identity: 'system'
             }
@@ -1607,20 +1602,10 @@ resource cluster 'Microsoft.App/containerApps@2025-01-01' = {
                 accountName: storageAccountName
                 queueName: 'photostore-library-ops'
                 queueLength: '1'
-                // _queue_ipwork_release_check (backend/app.py) deliberately
-                // delays its self-rescheduling "is upload quiet yet?" message
-                // with visibility_timeout=IPWORK_RELEASE_IDLE_SECONDS so it
-                // isn't receivable until that window elapses. The KEDA
-                // default strategy ('all') counts that message anyway via
-                // Azure's approximate-message-count, which includes
-                // not-yet-visible messages -- so this rule was scaling the
-                // cluster app up for the ENTIRE duration of every upload,
-                // not just when real library-ops work existed. 'visibleonly'
-                // (same fix as ipwork-queue above) makes KEDA ignore the
-                // delayed message until it's actually receivable, so cluster
-                // only wakes for the ~instant it takes to re-send the check
-                // every IPWORK_RELEASE_IDLE_SECONDS, not continuously.
-                queueLengthStrategy: 'visibleonly'
+                // Includes claimed work and delayed release checks. Delayed
+                // checks retain the worker until handled; hiding them would
+                // also hide an actively running library operation.
+                queueLengthStrategy: 'all'
               }
               identity: 'system'
             }
@@ -1785,19 +1770,11 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
                 // drain latency regresses under a much bigger burst than this
                 // one.
                 queueLength: '2'
-                // Default strategy ('all') counts messages that are dequeued
-                // but not yet deleted, not just genuinely unclaimed ones. In
-                // 'both' processing mode, a message ipworker lost the
-                // per-photo lease race on is deliberately left undeleted so
-                // Azure redelivers and retries it later (see
-                // IPWORK_LEASE_RETRY_LIMIT in backend/app.py) -- with the
-                // default strategy that retry-pending message still counts
-                // as backlog, scaling ipworker up to handle photos the
-                // browser already finished. 'visibleonly' (falls back to
-                // 'all' above 32 messages, so real large backlogs still scale
-                // correctly) fixes that without touching genuine backlog
-                // handling.
-                queueLengthStrategy: 'visibleonly'
+                // A wave message can own hundreds of images. It remains
+                // invisible while its receipt is renewed, so count it until
+                // ACK; otherwise KEDA scales down during healthy processing.
+                // Delayed retries also count until handled or expired.
+                queueLengthStrategy: 'all'
               }
               identity: 'system'
             }

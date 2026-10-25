@@ -254,9 +254,10 @@ enqueues a message after each upload with whichever steps are outstanding.
 Two independent levels of concurrency:
 
 **Across replicas** — KEDA `azure-queue` scale rule on `photostore-ipwork`,
-target `queueLength: 1` with `queueLengthStrategy: visibleonly` (counts only
-genuinely unclaimed messages, not ones deliberately left undeleted for a
-lease-race retry — see §5). 0 to 4 replicas.
+target `queueLength: 2` with `queueLengthStrategy: all`. Counts queued and
+claimed messages so active work survives an empty visible queue. Delayed
+retries also count until handled or expired. The current template permits
+0 to 1 replicas; the minimum remains zero.
 
 **Within a replica** — `IPWORKER_CONCURRENCY` (currently `2`, `backend/app.py:441`,
 default `1` if unset) sizes a `ThreadPoolExecutor` in `run_ipworker()`
@@ -314,10 +315,10 @@ If ipworker loses the lease race (browser already claimed it) but the browser
 tab then closes mid-processing, ipworker's queue message is deliberately left
 **undeleted** so Azure redelivers it — retried up to `IPWORK_LEASE_RETRY_LIMIT`
 (3) times, each retry costing one `IPWORKER_VISIBILITY_TIMEOUT_SECONDS` (300s)
-wait. This is also why the KEDA scale rule needs `queueLengthStrategy:
-visibleonly` — the default strategy would count these deliberately-undeleted
-retry messages as real backlog and over-scale ipworker for work the browser
-already finished.
+wait. These undeleted messages also count toward the KEDA `all` scale
+signal. Counting claimed work prevents a long-running wave from losing its
+worker when its queue receipt is made invisible. The worker scales to zero
+after the pending messages are handled or expire and cooldown completes.
 
 `IPWORKER_VISIBILITY_TIMEOUT_SECONDS` also guards against a subtler bug: with
 no visibility timeout, Azure defaults to 30s, and one ipwork pass can exceed

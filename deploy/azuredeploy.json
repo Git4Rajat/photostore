@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.37.4.10188",
-      "templateHash": "17958858038355040114"
+      "templateHash": "10558217554315544850"
     }
   },
   "parameters": {
@@ -104,9 +104,9 @@
       "type": "int",
       "defaultValue": 0,
       "minValue": 0,
-      "maxValue": 1,
+      "maxValue": 0,
       "metadata": {
-        "description": "Minimum clustering replicas. Default 0 scales to zero while idle; fresh graceful checkpoints support recovery. Set 1 to keep the index warm at continuous cost. Missing or stale checkpoints require a cold rebuild."
+        "description": "Clustering replica floor. Must remain zero; queued and in-flight work keep the worker active. Checkpoints support recovery after idle scale-down."
       }
     },
     "dedicatedIndexWorker": {
@@ -259,7 +259,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.37.4.10188",
-              "templateHash": "745986881902761522"
+              "templateHash": "14637627663132285659"
             }
           },
           "parameters": {
@@ -365,9 +365,9 @@
               "type": "int",
               "defaultValue": 0,
               "minValue": 0,
-              "maxValue": 1,
+              "maxValue": 0,
               "metadata": {
-                "description": "Minimum clustering replicas. Default 0 scales to zero while idle; fresh graceful checkpoints support recovery. Set 1 to keep the index warm at continuous cost. Missing or stale checkpoints require a cold rebuild."
+                "description": "Clustering replica floor. Must remain zero; queued and in-flight work keep the worker active. Checkpoints support recovery after idle scale-down."
               }
             },
             "dedicatedIndexWorker": {
@@ -924,7 +924,7 @@
                     "cooldownPeriod": 300,
                     "minReplicas": 0,
                     "maxReplicas": "[if(parameters('dedicatedIndexWorker'), 1, 2)]",
-                    "rules": "[concat(createArray(createObject('name', 'http-scaler', 'http', createObject('metadata', createObject('concurrentRequests', '10')))), if(parameters('dedicatedIndexWorker'), createArray(createObject('name', 'index-maintenance-queue', 'custom', createObject('type', 'azure-queue', 'metadata', createObject('accountName', variables('storageAccountName'), 'queueName', 'photostore-index-maintenance', 'queueLength', '1', 'queueLengthStrategy', 'visibleonly'), 'identity', 'system'))), createArray()))]"
+                    "rules": "[concat(createArray(createObject('name', 'http-scaler', 'http', createObject('metadata', createObject('concurrentRequests', '10')))), if(parameters('dedicatedIndexWorker'), createArray(createObject('name', 'index-maintenance-queue', 'custom', createObject('type', 'azure-queue', 'metadata', createObject('accountName', variables('storageAccountName'), 'queueName', 'photostore-index-maintenance', 'queueLength', '1', 'queueLengthStrategy', 'all'), 'identity', 'system'))), createArray()))]"
                   }
                 }
               },
@@ -1334,7 +1334,7 @@
                             "accountName": "[variables('storageAccountName')]",
                             "queueName": "photostore-clustering",
                             "queueLength": "1",
-                            "queueLengthStrategy": "visibleonly"
+                            "queueLengthStrategy": "all"
                           },
                           "identity": "system"
                         }
@@ -1347,7 +1347,7 @@
                             "accountName": "[variables('storageAccountName')]",
                             "queueName": "photostore-library-ops",
                             "queueLength": "1",
-                            "queueLengthStrategy": "visibleonly"
+                            "queueLengthStrategy": "all"
                           },
                           "identity": "system"
                         }
@@ -1421,7 +1421,7 @@
                             "accountName": "[variables('storageAccountName')]",
                             "queueName": "photostore-ipwork",
                             "queueLength": "2",
-                            "queueLengthStrategy": "visibleonly"
+                            "queueLengthStrategy": "all"
                           },
                           "identity": "system"
                         }
@@ -1616,10 +1616,11 @@
               "properties": {
                 "environmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]",
                 "configuration": {
-                  "triggerType": "Manual",
+                  "triggerType": "Schedule",
                   "replicaTimeout": 240,
                   "replicaRetryLimit": 1,
-                  "manualTriggerConfig": {
+                  "scheduleTriggerConfig": {
+                    "cronExpression": "*/5 * * * *",
                     "parallelism": 1,
                     "replicaCompletionCount": 1
                   }
@@ -1701,7 +1702,7 @@
                     "_generator": {
                       "name": "bicep",
                       "version": "0.37.4.10188",
-                      "templateHash": "3908463942544428278"
+                      "templateHash": "4952026937604244867"
                     }
                   },
                   "parameters": {
@@ -1722,6 +1723,11 @@
                   "variables": {
                     "base": "ContainerAppConsoleLogs_CL\n| where ContainerAppName_s in ('${appName}-wave-recovery', '${appName}-upload')\n| extend d = parse_json(extract(@'processing telemetry (\\{.*\\})', 1, Log_s))\n",
                     "rules": [
+                      {
+                        "name": "wave-recovery-missing",
+                        "query": "[format('{0}\n| where tostring(d.event) == ''wave_recovery_run'' and tostring(d.disabled) != ''true''\n| summarize runs=count()\n| where runs == 0', variables('base'))]",
+                        "operator": "GreaterThan"
+                      },
                       {
                         "name": "wave-stalled",
                         "query": "[format('{0}\n| where tostring(d.event) == ''wave_recovery''\n| summarize arg_max(TimeGenerated, *) by tostring(d.library_id), tostring(d.wave_id)\n| where (tostring(d.state) == ''collecting'' and todouble(d.no_progress_seconds) > 86400) or (tostring(d.state) == ''waiting_predecessor'' and todouble(d.state_age_seconds) > 7200) or ((toint(d.outstanding_leases) > 0 or toint(d.outstanding_members) > 0) and todouble(d.barrier_wait_seconds) > 1800) or (toint(d.handoff_pending_count) > 0 and todouble(d.handoff_age_seconds) > 900) or todouble(d.stage_no_progress_seconds) > 1800 or toint(d.dispatch_failed_count) > 0', variables('base'))]",

@@ -7,7 +7,7 @@ def test_compiled_worker_scales_to_zero_by_default():
     template = json.loads((Path(__file__).parents[2] / 'deploy' / 'azuredeploy.json').read_text())
     parameter = template['parameters']['clusterMinReplicas']
     assert parameter['defaultValue'] == 0
-    assert (parameter['minValue'], parameter['maxValue']) == (0, 1)
+    assert (parameter['minValue'], parameter['maxValue']) == (0, 0)
     deployment = next(r for r in template['resources']
                       if r['type'] == 'Microsoft.Resources/deployments')
     assert deployment['properties']['parameters']['clusterMinReplicas']['value'] == (
@@ -41,7 +41,7 @@ def test_dedicated_index_queue_wakes_an_isolated_single_publisher_sidecar():
     assert "'image', parameters('coreImage')" in containers
     rules = spec['scale']['rules']
     assert "'azure-queue'" in rules and "'photostore-index-maintenance'" in rules
-    assert "'identity', 'system'" in rules and "'queueLengthStrategy', 'visibleonly'" in rules
+    assert "'identity', 'system'" in rules and "'queueLengthStrategy', 'all'" in rules
 
 
 def test_all_container_apps_allow_scale_to_zero_by_default():
@@ -56,3 +56,32 @@ def test_all_container_apps_allow_scale_to_zero_by_default():
         if minimum == "[parameters('clusterMinReplicas')]":
             minimum = template['parameters']['clusterMinReplicas']['defaultValue']
         assert minimum == 0, app['name']
+
+
+def test_every_queue_scaler_counts_claimed_work_until_ack():
+    """A single invisible long-running message must keep its worker active."""
+    root = Path(__file__).parents[2]
+    template = json.loads((root / 'deploy' / 'azuredeploy.json').read_text())
+    module = next(r for r in template['resources']
+                  if r['type'] == 'Microsoft.Resources/deployments')['properties']['template']
+    seen = set()
+    for app in module['resources']:
+        if app['type'].lower() != 'microsoft.app/containerapps':
+            continue
+        rules = app['properties']['template']['scale'].get('rules', [])
+        if isinstance(rules, str):
+            # The indexer combines HTTP and conditional queue rules in ARM.
+            assert app['name'] == "[variables('indexerAppName')]"
+            assert "'queueLengthStrategy', 'all'" in rules
+            assert 'visibleonly' not in rules
+            seen.add('photostore-index-maintenance')
+        else:
+            for rule in rules:
+                custom = rule.get('custom', {})
+                if custom.get('type') == 'azure-queue':
+                    assert custom['metadata']['queueLengthStrategy'] == 'all', rule['name']
+                    assert custom['identity'] == 'system'
+                    seen.add(custom['metadata']['queueName'])
+    assert seen == {'photostore-ipwork', 'photostore-clustering',
+                    'photostore-library-ops', 'photostore-index-maintenance'}
+    assert 'visibleonly' not in (root / 'deploy' / 'resources.bicep').read_text()
