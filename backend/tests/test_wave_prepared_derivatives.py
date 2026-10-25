@@ -68,6 +68,66 @@ def test_real_wave_adapter_qualifies_browser_prepared_derivatives(blobs, monkeyp
         assert verify_receipt(storage_utils, retried, kind)['sha256'] == manifest['derivatives'][kind]['sha256']
 
 
+@pytest.mark.parametrize('extension', ['mov', 'mp4', 'mxf'])
+def test_video_completion_without_face_count_does_not_run_models_or_read_original(blobs, monkeypatch, extension):
+    from execution_lease import ExecutionLeases
+    from test_processing_completion import video_source
+    from test_wave_recovery import RuntimeTable
+    from upload_waves import ShadowWaves
+    from upload_wave_execution import run_vision_release, stage_work_store, _iter_wave_faces
+    from wave_policy import certify, PROTOCOL, ROLES
+
+    (metadata, _, _, _, _), objects = blobs
+    filename = 'dnxhd100_cid1260.' + extension
+    row = dict(metadata.get_entity('lib', 'photo.jpg'))
+    row.update(video_source(), RowKey=filename, fileHash='a' * 64,
+        processing_lease_owner='', processing_lease_expires_at='')
+    row.pop('faceCount')
+    row.update(allocate_generation('video-rev', photo_id='photo', file_hash=row['fileHash'], is_video=True))
+    metadata.upsert_entity(row)
+    table = RuntimeTable(); store = ShadowWaves(table, 'lib'); receipts = ArtifactReceipts(table, 'lib')
+    monkeypatch.setenv('UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED', 'true')
+    monkeypatch.setenv('PROCESSING_GENERATION_ENFORCEMENT_ENABLED', 'true')
+    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED', 'true')
+    certificate = certify(table, {role: 'build' for role in ROLES})
+    table.create_entity(store._row('policy', protocol=PROTOCOL, capabilityId=certificate, cleanupState=''))
+    monkeypatch.setitem(storage_utils._CTX, 'source_completion_delivery', None)
+    monkeypatch.setitem(storage_utils._CTX, 'source_artifact_receipt_capture',
+        lambda library, candidate: receipts.capture(storage_utils, candidate))
+    monkeypatch.setattr(app, '_run_ipwork_steps', lambda *a, **k: pytest.fail('Video ran backend models'))
+    monkeypatch.setattr(storage_utils, 'download_media_bytes', lambda *a, **k: pytest.fail('Video original downloaded'))
+    opened = store.open_session('videos', 1)
+    store.register('videos', [dict(itemId='video', filename=filename)])
+    resolved = store.resolve('videos', 'video', outcome='accepted', filename=filename,
+        photo_id='photo', processing_revision='video-rev', required_steps=())
+    store.close('videos', resolved['manifestRevision'], 'done')
+    wave_id = opened['waveId']; leases = ExecutionLeases(table, partition=store.partition)
+    result = run_vision_release(leases, stage_work_store(table), store, 'lib', wave_id,
+        store.status(wave_id)['visionPendingKey'], metadata, None, None, lambda *a: None,
+        process_source=wave_runtime.process_source)
+    assert result['state'] == 'indexing'
+    stored = metadata.get_entity('lib', filename)
+    assert stored['faceCount'] == 0 and stored['artifactReceipt']
+    assert not stored['processing_lease_owner']
+    assert list(_iter_wave_faces(store, wave_id)) == []
+    assert not objects
+    successor = store.open_session('photos', 1)
+    store.register('photos', [dict(itemId='photo', filename='next.jpg')])
+    from processing_generation import REQUIRED_STEPS
+    resolved = store.resolve('photos', 'photo', outcome='accepted', filename='next.jpg',
+        photo_id='next-photo', processing_revision='next-rev', required_steps=REQUIRED_STEPS)
+    store.close('photos', resolved['manifestRevision'], 'done')
+    assert store.status(successor['waveId'])['state'] == 'waiting_predecessor'
+    from upload_wave_execution import run_index_release
+    from wave_publication import ObligationLedger
+    ledger = ObligationLedger(table, wave_id, library='lib', frozen_revision=result['frozenRevision'],
+        assignment_revision=result['assignmentReceiptId'])
+    completed = run_index_release(leases, store, 'lib', wave_id, result['indexPendingKey'], ledger,
+        publisher=lambda scope, obligation, check: 'published-' + scope)
+    assert completed['state'] == 'complete'
+    assert store.promote_successor(successor['waveId'])['state'] == 'processing_pending'
+
+
 def test_thumbnail_only_preparation_is_promoted_without_requiring_preview(blobs):
     (metadata, _, _, _, fence), objects = blobs
     row = dict(metadata.get_entity('lib', 'photo.jpg'), thumbnail_status='done', preview_status='pending')

@@ -149,17 +149,47 @@ def test_incomplete_aggregate_cannot_leave_done_status_without_fields(blobs, mon
     assert row['face_status'] == 'failed' and not row.get('artifactReceipt')
 
 
-def test_video_artifact_receipt_does_not_require_browser_owned_failed_steps(blobs):
+@pytest.mark.parametrize('face_count', ['missing', None, 0])
+def test_video_artifact_receipt_does_not_require_browser_owned_failed_steps(blobs, face_count):
     from dataclasses import replace
     from test_processing_completion import video_source
     (metadata, _, _, _, fence), _ = blobs
     row = dict(metadata.get_entity('lib', 'photo.jpg'))
     row.update(video_source(), processingRevision=fence.revision, anonymousImageId=fence.photo,
         processingGeneration=fence.generation)
+    if face_count == 'missing':
+        row.pop('faceCount', None)
+    else:
+        row['faceCount'] = face_count
     metadata.rows['lib', 'clip.mp4'] = dict(row,
         processing_lease_owner='owner', processingFence=fence.attempt,
         processing_lease_expires_at=metadata.get_entity('lib', 'photo.jpg')['processing_lease_expires_at'])
     receipts = ArtifactReceipts(AtomicTable(), 'lib')
     with result_fence(replace(fence, filename='clip.mp4')):
         reference = receipts.capture(storage_utils, row)
-    assert reference and json.loads(receipts._get('manifest!' + reference['id'])['payload'])['faceSnapshots'] == []
+    manifest = json.loads(receipts._get('manifest!' + reference['id'])['payload'])
+    assert manifest['faceSnapshots'] == [] and manifest['faceCount'] == 0
+    assert row['faceCount'] == 0
+    row.update(artifactReceipt=json.dumps(reference), processing_lease_owner='', processing_lease_expires_at='')
+    prepare_completion(row)
+    intent = json.loads(row['processingCompletionOutbox'])[-1]
+    assert intent['requiredSteps'] == [] and intent['faceCount'] == 0
+    assert receipts.verify_reference(reference, intent)['faceCount'] == 0
+
+
+@pytest.mark.parametrize('video,face_count', [(True, 1), (False, None), (False, 1)])
+def test_skipped_face_receipt_still_rejects_unproven_image_counts_and_existing_faces(blobs, video, face_count):
+    from dataclasses import replace
+    from test_processing_completion import video_source
+    (metadata, _, _, _, fence), _ = blobs
+    row = terminal(dict(metadata.get_entity('lib', 'photo.jpg')))
+    if video:
+        row.update(video_source())
+    row.update(face_status='skipped', faceCount=face_count,
+        processingRevision=fence.revision, processingGeneration=fence.generation)
+    filename = row['RowKey']
+    metadata.rows['lib', filename] = dict(row)
+    receipts = ArtifactReceipts(AtomicTable(), 'lib')
+    with result_fence(replace(fence, filename=filename)), pytest.raises(ValueError, match='explicit prior receipt'):
+        receipts.capture(storage_utils, row)
+    assert not receipts.table.rows

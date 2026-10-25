@@ -67,6 +67,12 @@ class ArtifactReceipts:
         required = required_steps_for_media(is_video_file(metadata['RowKey']))
         if any(statuses[step] not in TERMINAL for step in required):
             return None
+        # Browser-owned video never runs face detection and can omit its
+        # count entirely. Persist the contract's zero-face result with the
+        # receipt so completion and frozen face coverage use the same value.
+        # Required image face work and positive counts still need proof.
+        if 'face' not in required and metadata.get('faceCount') is None:
+            metadata['faceCount'] = 0
         derivatives = {kind: verify_receipt(storage, metadata, kind) for kind in ('thumbnail', 'preview')
                        if statuses[kind] == 'done' and (kind in required or metadata.get(kind + 'Artifact'))}
         snapshot_ids = []
