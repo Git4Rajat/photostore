@@ -13,7 +13,7 @@ from azure.core.exceptions import ResourceModifiedError
 from azure.data.tables import UpdateMode
 
 STEPS = ('preview', 'thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face')
-TERMINAL = {'done', 'no_data', 'skipped', 'unsupported'}
+TERMINAL = {'done', 'no_data', 'skipped', 'unsupported', 'unrecoverable'}
 SCHEMA_VERSION = 5
 
 # Distinct provenance for a terminal step outcome -- missing provenance,
@@ -21,17 +21,25 @@ SCHEMA_VERSION = 5
 # collapsed into one undifferentiated "terminal" bucket at the completion
 # layer. 'verified' is real model output; 'no_data' is a legitimate empty
 # result (e.g. zero faces); 'policy_excluded' is skipped/unsupported by
-# policy on a step that IS required for this media type. 'not_required' is
-# a step outside this media type's required-step set entirely (every step,
-# for video -- see processing_generation.required_steps_for_media) -- its
-# status is a browser-ownership signal, not a backend outcome, and is not
-# constrained to TERMINAL at all (video's finalize-time overrides leave
-# thumbnail/exif at 'failed', which is not itself a terminal value). There
-# is deliberately no 'retry_exhausted' outcome yet: a REQUIRED step stuck
-# at 'failed' is not in TERMINAL and blocks completion entirely -- the
-# retry-exhaustion settlement path is still open (see the artifact-
-# receipts audit's remaining release gates).
-PROVENANCE = {'done': 'verified', 'no_data': 'no_data', 'skipped': 'policy_excluded', 'unsupported': 'policy_excluded'}
+# policy on a step that IS required for this media type. 'unrecoverable' is a
+# step that ran and determined -- deterministically, not via a crash -- that
+# this file's data is missing, incomplete, or corrupted for that step (e.g. a
+# preview/thumbnail conversion that produced unusable output, an undecodable
+# image for OCR/face). Re-running the same code on the same bytes will reach
+# the same verdict, so it is terminal on the first attempt rather than
+# retried, but unlike 'no_data' (a clean, expected empty result) it is a
+# genuine failure the user may want to see and manually retry from Tools.
+# 'not_required' is a step outside this media type's required-step set
+# entirely (every step, for video -- see processing_generation.
+# required_steps_for_media) -- its status is a browser-ownership signal, not
+# a backend outcome, and is not constrained to TERMINAL at all (video's
+# finalize-time overrides leave thumbnail/exif at 'failed', which is not
+# itself a terminal value). A REQUIRED step still stuck at 'failed' (an
+# actual exception -- OOM, a transient infra/environment error) is NOT in
+# TERMINAL and blocks completion until the source's own retry budget is
+# exhausted (wave_settlement.MAX_SOURCE_ATTEMPTS).
+PROVENANCE = {'done': 'verified', 'no_data': 'no_data', 'skipped': 'policy_excluded', 'unsupported': 'policy_excluded',
+              'unrecoverable': 'unrecoverable'}
 
 
 class StaleProcessingResult(RuntimeError):

@@ -48,6 +48,7 @@ interface Photo {
     thumbnailUrl?: string;
     uploadDate?: string;
     processing?: {
+        preview?: string;
         thumbnail?: string;
         exif?: string;
         ocr?: string;
@@ -55,6 +56,9 @@ interface Photo {
         mapDetection?: string;
         face?: string | { status?: string; source?: string; detectionSource?: string };
         faceSource?: string;
+        /** Human-diagnosable reason per non-'done' step, keyed the same as
+         * the status fields above. Only present for steps that have one. */
+        reasons?: Record<string, string>;
     };
     rating?: number;
     likes?: number;
@@ -99,7 +103,7 @@ interface ToolPhotoMetadata {
 }
 
 type ToolAction = BrowserProcessingAction | 'peopleIndex' | 'vectorIndex' | 'suppressSuspicious' | 'dedupeFaces' | 'rebuildPeopleIndex' | 'repairMemberships' | 'unblockFaces' | 'backfillPhotos' | 'purgeOrphaned' | 'restoreSnapshot';
-type ProcessingFilterState = 'all' | 'failed' | 'no_data';
+type ProcessingFilterState = 'all' | 'failed' | 'no_data' | 'unrecoverable';
 type ProcessingFilterProcess = 'all' | 'preview' | 'thumbnail' | 'exif' | 'ocr' | 'aiVision' | 'mapDetection' | 'face';
 type ChipStepKey = 'preview' | 'thumbnail' | 'exif' | 'ocr' | 'aiVision' | 'mapDetection' | 'face';
 type QueueStageKey = keyof QueueStatus;
@@ -130,6 +134,7 @@ const processingStateLabels: Record<ProcessingFilterState, string> = {
     all: 'All',
     failed: 'Failed',
     no_data: 'No data',
+    unrecoverable: 'Needs review',
 };
 
 const processingProcessLabels: Record<ProcessingFilterProcess, string> = {
@@ -241,27 +246,34 @@ const getStatusTone = (status: string) => {
     if (status === 'done') return 'good';
     if (status === 'queued' || status === 'pending' || status === 'running') return 'pending';
     if (status === 'no_data') return 'warning';
-    if (status === 'failed') return 'bad';
+    // 'unrecoverable': the step ran and determined -- deterministically, not
+    // via a crash -- that this file's data is missing/incomplete/corrupted
+    // for that step, so it won't be retried automatically. Same visual
+    // severity as 'failed' (a real problem worth a look), but filterable
+    // separately since it won't resolve on its own without a manual retry.
+    if (status === 'failed' || status === 'unrecoverable') return 'bad';
     return 'unknown';
 };
 
 const hasProcessingAttention = (photo: Photo) => (
     (Object.keys(processingServiceLabels) as ChipStepKey[]).some((step) => {
         const status = getProcessingStatus(photo, step);
-        return status === 'failed' || status === 'no_data';
+        return status === 'failed' || status === 'no_data' || status === 'unrecoverable';
     })
 );
 
-const PhotoProcessingChip = ({ label, status, step }: { label: string; status: string; step: ChipStepKey }) => {
+const PhotoProcessingChip = ({ label, status, step, reason }: { label: string; status: string; step: ChipStepKey; reason?: string | null }) => {
     const normalized = String(status || 'unqueued').toLowerCase();
     const tone = getStatusTone(normalized);
     const StatusIcon = processingStageIcons[step];
+    const statusText = normalized.replace('_', ' ');
+    const title = reason ? `${label}: ${statusText} (${reason})` : `${label}: ${statusText}`;
     return (
-        <span className={`tools-photo-status-chip tone-${tone} status-${normalized.replace(/[^a-z0-9_-]/g, '-')}`} title={`${label}: ${normalized.replace('_', ' ')}`} aria-label={`${label}: ${normalized.replace('_', ' ')}`}>
+        <span className={`tools-photo-status-chip tone-${tone} status-${normalized.replace(/[^a-z0-9_-]/g, '-')}`} title={title} aria-label={title}>
             <span className="tools-status-indicator" aria-hidden="true">
                 <StatusIcon className="tools-status-indicator-icon" />
             </span>
-            <span className="sr-only">{label}: {normalized.replace('_', ' ')}</span>
+            <span className="sr-only">{title}</span>
         </span>
     );
 };
@@ -1581,13 +1593,13 @@ const ToolsPage: React.FC = () => {
 
     const renderPhotoStatusRow = (photo: Photo, index: number, withOpenButton: boolean) => (
         <div className="tools-photo-status-row" aria-label={`Processing status for ${photo.filename}`}>
-            <PhotoProcessingChip label="Preview" status={getProcessingStatus(photo, 'preview')} step="preview" />
-            <PhotoProcessingChip label="Thumbnail" status={getProcessingStatus(photo, 'thumbnail')} step="thumbnail" />
-            <PhotoProcessingChip label="EXIF" status={getProcessingStatus(photo, 'exif')} step="exif" />
-            <PhotoProcessingChip label="OCR" status={getProcessingStatus(photo, 'ocr')} step="ocr" />
-            <PhotoProcessingChip label="Vision" status={getProcessingStatus(photo, 'aiVision')} step="aiVision" />
-            <PhotoProcessingChip label="Map" status={getProcessingStatus(photo, 'mapDetection')} step="mapDetection" />
-            <PhotoProcessingChip label="Face" status={getProcessingStatus(photo, 'face')} step="face" />
+            <PhotoProcessingChip label="Preview" status={getProcessingStatus(photo, 'preview')} step="preview" reason={photo.processing?.reasons?.preview} />
+            <PhotoProcessingChip label="Thumbnail" status={getProcessingStatus(photo, 'thumbnail')} step="thumbnail" reason={photo.processing?.reasons?.thumbnail} />
+            <PhotoProcessingChip label="EXIF" status={getProcessingStatus(photo, 'exif')} step="exif" reason={photo.processing?.reasons?.exif} />
+            <PhotoProcessingChip label="OCR" status={getProcessingStatus(photo, 'ocr')} step="ocr" reason={photo.processing?.reasons?.ocr} />
+            <PhotoProcessingChip label="Vision" status={getProcessingStatus(photo, 'aiVision')} step="aiVision" reason={photo.processing?.reasons?.aiVision} />
+            <PhotoProcessingChip label="Map" status={getProcessingStatus(photo, 'mapDetection')} step="mapDetection" reason={photo.processing?.reasons?.mapDetection} />
+            <PhotoProcessingChip label="Face" status={getProcessingStatus(photo, 'face')} step="face" reason={photo.processing?.reasons?.face} />
             <button type="button" className="btn btn-soft icon-btn" onClick={(event) => { event.stopPropagation(); void toggleInfo(photo.filename); }} aria-label={`Toggle info for ${photo.filename}`} title={`Toggle info for ${photo.filename}`}>
                 <InformationCircleIcon className="toolbar-icon" />
                 <span className="sr-only">Toggle info for {photo.filename}</span>

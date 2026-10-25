@@ -152,7 +152,10 @@ def test_unverified_client_done_report_cannot_commit_success_in_fenced_mode(blob
 @pytest.mark.parametrize('converted', [
     None, b'', b'undecodable raw', b'raw' * 600_000, jpeg(edge=2049), jpeg()[:100],
 ])
-def test_invalid_server_preview_is_committed_as_failed_without_publication(blobs, monkeypatch, converted):
+def test_invalid_server_preview_is_committed_as_unrecoverable_without_publication(blobs, monkeypatch, converted):
+    # Deterministic on these bytes (same conversion, same input, every time),
+    # so this resolves to terminal 'unrecoverable' on the first attempt
+    # instead of a retryable 'failed'.
     (metadata, *_, fence), objects = blobs
     monkeypatch.setenv('UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED', 'true')
     monkeypatch.setitem(storage_utils._CTX, 'source_completion_delivery', None)
@@ -165,7 +168,7 @@ def test_invalid_server_preview_is_committed_as_failed_without_publication(blobs
         claimed_steps=['preview'], origin='ipworker',
         client_processing={'preview': {'hasData': False, 'error': 'source_undecodable'}})
     stored = metadata.get_entity('lib', 'photo.jpg')
-    assert result['preview_status'] == stored['preview_status'] == 'failed'
+    assert result['preview_status'] == stored['preview_status'] == 'unrecoverable'
     assert stored['processing_lease_owner'] == ''
     assert not stored.get('previewArtifact') and not objects
     assert not stored.get('processingCompletionPending')

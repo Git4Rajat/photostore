@@ -625,14 +625,18 @@ def _process_face(user_id: str, filename: str, image_bytes: bytes, *, recovery=F
         # non-transient value -- storage_utils._apply_client_processing_results'
         # face block only resolves face_status to a terminal state when
         # isinstance(faces, list) is true; omitting it here left face_status
-        # stuck at 'running' forever instead of surfacing as a retryable
-        # 'failed' on the Tools page.
+        # stuck at 'running' forever instead of surfacing as a terminal state
+        # on the Tools page. Distinct 'image_undecodable' (not the detection
+        # step's 'unsupported_runtime' below): these bytes genuinely can't be
+        # decoded, so re-running this same input reaches the same verdict
+        # every time -- storage_utils resolves it to 'unrecoverable' (one
+        # attempt, surfaced for manual retry) rather than retrying forever.
         return {
             'hasData': False,
             'faces': [],
             'rawFaceCount': 0,
             'error': str(exc),
-            'faceFailureStage': 'unsupported_runtime',
+            'faceFailureStage': 'image_undecodable',
             'faceFailureDetail': f'ipworker_decode_failed: {exc}',
         }
     finally:

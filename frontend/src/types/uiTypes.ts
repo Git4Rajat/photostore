@@ -46,6 +46,10 @@ export interface Photo {
         aiVision?: string | null;
         mapDetection?: string | null;
         activeWorker?: 'ipworker' | null;
+        /** Human-diagnosable reason per non-'done' step (e.g. thumbnail's
+         * 'raw_preview_extraction_failed'), keyed the same as the status
+         * fields above. Only present for steps that have one. */
+        reasons?: Record<string, string> | null;
     };
 }
 

@@ -170,7 +170,7 @@ def test_verified_absence_lock_requires_backend_provenance_and_allows_forced_rep
     ({'hasData': False}, 'no_data', ''),
     ({'hasData': True, 'text': 'hello'}, 'done', ''),
     ({'hasData': False, 'error': 'engine error'}, 'failed', 'ocr_processing_failed'),
-    ({'hasData': False, 'errorCode': 'ocr_decode_failed'}, 'failed', 'ocr_decode_failed'),
+    ({'hasData': False, 'errorCode': 'ocr_decode_failed'}, 'unrecoverable', 'ocr_decode_failed'),
     ({'hasData': True, 'text': 'partial', 'error': 'engine error', 'errorCode': 'ocr_engine_failed'}, 'failed', 'ocr_engine_failed'),
     ({'hasData': False, 'errorCode': 'private filename or secret'}, 'failed', 'ocr_processing_failed'),
     ({'hasData': False, 'errorCode': {'untrusted': 'object'}}, 'failed', 'ocr_processing_failed'),

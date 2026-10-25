@@ -72,4 +72,7 @@ def test_shared_decode_failure_preserves_processor_failure_shape(monkeypatch):
     monkeypatch.setattr(ipwork_vision, '_load_vocabulary', lambda: True)
     with image_job(True):
         result = ipwork_vision.process_vision('lib-A', 'broken.jpg', b'not-an-image')
-    assert result == {'hasData': False, 'error': 'image_embedding_failed'}
+    # Deterministic on these bytes -- distinct from 'image_embedding_failed'
+    # (decode succeeded but the model produced nothing usable), which keeps
+    # retrying.
+    assert result == {'hasData': False, 'error': 'image_undecodable'}

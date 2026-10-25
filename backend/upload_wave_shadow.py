@@ -9,11 +9,10 @@ import math
 from azure.core.exceptions import ResourceNotFoundError
 
 from storage_utils import BROWSER_PROCESSING_STEPS as STEPS
+from processing_completion import TERMINAL
 from processing_generation import required_steps_for_media
 from image_utils import is_video_file
 from upload_waves import MAX_PAGE, Conflict, digest
-
-TERMINAL = {'done', 'no_data', 'skipped', 'unsupported'}
 
 
 def source_identity(row):

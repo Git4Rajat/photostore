@@ -110,7 +110,13 @@ def process_vision(user_id: str, filename: str, image_bytes: bytes) -> Optional[
             with rgb_image(image_bytes, filename, _decodable_image_bytes) as image:
                 image_embedding = vision_utils.encode_rgb_image_embedding(image)
         except Exception:
-            return {'hasData': False, 'error': 'image_embedding_failed'}
+            # The image itself couldn't be decoded -- deterministic on these
+            # bytes (same class as ipwork_face.py's 'image_undecodable'), so
+            # storage_utils resolves it to a terminal 'unrecoverable' rather
+            # than retrying. Distinct from 'image_embedding_failed' below,
+            # where decode succeeded but the model produced nothing usable --
+            # that's not proven deterministic, so it keeps retrying.
+            return {'hasData': False, 'error': 'image_undecodable'}
     else:
         image_embedding = vision_utils.encode_image_embedding(_decodable_image_bytes(image_bytes, filename))
     if not image_embedding:

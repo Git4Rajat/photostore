@@ -107,7 +107,7 @@ def test_process_face_returns_diagnosable_shape_on_decode_failure():
     assert result['hasData'] is False
     assert result['faces'] == []
     assert result['rawFaceCount'] == 0
-    assert result['faceFailureStage'] == 'unsupported_runtime'
+    assert result['faceFailureStage'] == 'image_undecodable'
     assert 'error' in result
 
 

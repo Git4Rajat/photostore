@@ -146,7 +146,7 @@ BROWSER_PROCESSING_STEPS = ('preview', 'thumbnail', 'exif', 'ocr', 'ai_vision', 
 # GPS-less photo's map_detection step or a text-less photo's ocr step, not a
 # failure -- excluding it here would mean most real photos' processing_complete
 # below never flips true.
-_PROCESSING_STEP_TERMINAL_STATUSES = {'done', 'no_data', 'deleted', 'skipped', 'unsupported', 'failed', 'timeout'}
+_PROCESSING_STEP_TERMINAL_STATUSES = {'done', 'no_data', 'deleted', 'skipped', 'unsupported', 'failed', 'timeout', 'unrecoverable'}
 
 
 def _photo_processing_complete(entity: Dict) -> bool:
@@ -1703,14 +1703,31 @@ def _store_client_face_generation(user_id: str, filename: str, faces, *,
             face.get('embeddingVersion') or face.get('modelTaxonomyVersion') or '',
             100,
         )
+        # A non-numeric imageWidth/imageHeight/confidence (a buggy or corrupted
+        # client report) must not raise here -- this writes inside the same
+        # call as every other step's status update, so an uncaught exception
+        # would abort the whole photo's processing-results write, not just
+        # this one face.
+        try:
+            face_image_width = int(face.get('imageWidth', 0) or 0)
+        except Exception:
+            face_image_width = 0
+        try:
+            face_image_height = int(face.get('imageHeight', 0) or 0)
+        except Exception:
+            face_image_height = 0
+        try:
+            face_confidence = float(face.get('confidence', 0.0) or 0.0)
+        except Exception:
+            face_confidence = 0.0
         entity = {
             'PartitionKey': user_id,
             'RowKey': face_id,
             'filename': filename,
             'bbox': json.dumps(bbox),
-            'imageWidth': int(face.get('imageWidth', 0) or 0),
-            'imageHeight': int(face.get('imageHeight', 0) or 0),
-            'confidence': float(face.get('confidence', 0.0) or 0.0),
+            'imageWidth': face_image_width,
+            'imageHeight': face_image_height,
+            'confidence': face_confidence,
             'embedding': json.dumps(embedding_values),
             'identityKey': _face_identity_key(user_id, filename, face),
             'identityVersion': 'face-v1',
@@ -8769,18 +8786,7 @@ def _apply_server_exif_fallback(
             status_updates['map_detection_status'] = 'failed'
         return status_updates
     if server_exif:
-        invalid_gps = False
-        try:
-            from ipwork_geo import geo_coordinates_from_exif
-            geo_coordinates_from_exif(server_exif)
-        except (ValueError, TypeError, OverflowError):
-            invalid_gps = True
-        if invalid_gps:
-            lat, lon = '', ''
-            metadata['exifData'] = json.dumps(server_exif, ensure_ascii=False, separators=(',', ':'))
-            metadata['exifCount'] = len(server_exif)
-        else:
-            lat, lon = _apply_exif_metadata(metadata, server_exif)
+        lat, lon = _apply_exif_metadata(metadata, server_exif)
         _merge_processing_metadata(metadata, 'server_exif', {
             'source': 'server',
             'acceptedAt': _utc_now(),
@@ -8788,12 +8794,7 @@ def _apply_server_exif_fallback(
             'hasGps': bool(lat and lon),
         })
         status_updates['exif_status'] = 'done'
-        if apply_geo and invalid_gps and not _step_locked_done(metadata, 'map_detection'):
-            status_updates['map_detection_status'] = 'failed'
-            _merge_processing_metadata(metadata, 'server_geo', {
-                'source': 'server', 'acceptedAt': _utc_now(), 'errorCode': 'geo_invalid_result',
-            })
-        elif apply_geo and not invalid_gps and lat and lon and not _CTX.get('queue_map_on_upload'):
+        if apply_geo and lat and lon and not _CTX.get('queue_map_on_upload'):
             place = _reverse_geocode_fallback(lat, lon)
             if place:
                 if place.get('address'):
@@ -8809,7 +8810,7 @@ def _apply_server_exif_fallback(
                 'longitude': lon,
             })
             status_updates['map_detection_status'] = 'done'
-        elif apply_geo and not invalid_gps and (not lat or not lon):
+        elif apply_geo and (not lat or not lon):
             mark_step_no_data(user_id, filename, 'map_detection')
             status_updates['map_detection_status'] = 'no_data'
     else:
@@ -8894,29 +8895,13 @@ def _apply_browser_exiftool_result(
             status_updates['map_detection_status'] = 'no_data'
         return status_updates
 
-    invalid_gps = False
-    try:
-        from ipwork_geo import geo_coordinates_from_exif
-        geo_coordinates_from_exif(exif_data)
-    except (ValueError, TypeError, OverflowError):
-        invalid_gps = True
-    if invalid_gps:
-        lat, lon = '', ''
-        metadata['exifData'] = json.dumps(exif_data, ensure_ascii=False, separators=(',', ':'))
-        metadata['exifCount'] = len(exif_data)
-    else:
-        lat, lon = _apply_exif_metadata(metadata, exif_data)
+    lat, lon = _apply_exif_metadata(metadata, exif_data)
     _merge_processing_metadata(metadata, 'client_exif', {
         'source': 'browser_exiftool', 'acceptedAt': _utc_now(),
         'clientAssetId': client_asset_id, 'hasGps': bool(lat and lon), **provenance,
     })
     status_updates['exif_status'] = 'done'
-    if apply_geo and invalid_gps:
-        status_updates['map_detection_status'] = 'failed'
-        _merge_processing_metadata(metadata, 'server_geo', {
-            'source': 'browser_exiftool', 'acceptedAt': _utc_now(), 'errorCode': 'geo_invalid_result',
-        })
-    elif apply_geo and lat and lon and not _CTX.get('queue_map_on_upload'):
+    if apply_geo and lat and lon and not _CTX.get('queue_map_on_upload'):
         place = _reverse_geocode_fallback(lat, lon)
         if place:
             if place.get('address'):
@@ -8966,14 +8951,15 @@ def _apply_server_thumbnail_fallback(
     if not thumbnail_bytes:
         # Same class of gap as _apply_server_exif_fallback below: a RAW file
         # whose embedded preview genuinely can't be extracted (unsupported
-        # compression variant, corrupt container, ...) left thumbnail_status
-        # stuck at whatever it was before this call ('running', from the lease
-        # claim) forever -- retries hit the exact same deterministic failure,
-        # so it never reached a terminal state and was invisible to the Tools
-        # page's "failed"/"no data" filters (found via RAW photos with no
-        # thumbnail not appearing under either filter). Resolve to 'failed' so
-        # it surfaces there instead of retrying silently forever.
-        status_updates['thumbnail_status'] = 'failed'
+        # compression variant, corrupt container, ...) is deterministic on
+        # this file's bytes -- retrying hits the exact same failure every
+        # time. Terminal immediately ('unrecoverable', not 'failed') so it
+        # settles on the first attempt and surfaces in Tools for a manual
+        # retry, instead of waiting out the source's retry budget.
+        status_updates['thumbnail_status'] = 'unrecoverable'
+        _merge_processing_metadata(metadata, 'client_thumbnail_rejected', {
+            'source': 'server', 'rejectedAt': _utc_now(), 'reason': 'raw_preview_extraction_failed',
+        })
         return status_updates
     thumbnail_blob_name = str(metadata.get('anonymousImageId') or '').strip() or filename
     _publish_processing_derivative(metadata, 'thumbnail', thumbnail_bytes, filename=filename)
@@ -9005,12 +8991,16 @@ def _apply_server_preview_fallback(
     status_updates: Dict[str, object] = {}
     try:
         preview_bytes = convert_image_to_jpeg(image_bytes, filename)
-        # Conversion can return the original RAW bytes when decoding fails.
-        # Persist a failed step so source retries can settle this member,
-        # rather than repeatedly aborting the entire wave at publication.
+        # Conversion can return the original RAW bytes when decoding fails --
+        # deterministic on this file's bytes, so re-running it later reaches
+        # the same verdict. Terminal immediately, not retried; surfaced to
+        # the user as 'unrecoverable' rather than silently retried forever.
         validate_derivative_bytes(preview_bytes, 'preview')
     except Exception:
-        status_updates['preview_status'] = 'failed'
+        status_updates['preview_status'] = 'unrecoverable'
+        _merge_processing_metadata(metadata, 'client_preview_rejected', {
+            'source': 'server', 'rejectedAt': _utc_now(), 'reason': 'preview_conversion_failed',
+        })
         return status_updates
     _publish_processing_derivative(metadata, 'preview', preview_bytes, filename=filename)
     mark_step_done(user_id, filename, 'preview', result={
@@ -9450,12 +9440,6 @@ def _apply_client_processing_results(
                     for key, value in (exif_result.get('data') or {}).items()})
             else:
                 exif_data = _sanitize_client_exif(exif_result.get('data') or {})
-            invalid_exif_gps = False
-            try:
-                from ipwork_geo import geo_coordinates_from_exif
-                geo_coordinates_from_exif(exif_data)
-            except (ValueError, TypeError, OverflowError):
-                invalid_exif_gps = True
             lat = _valid_decimal(exif_result.get('latitude') or exif_data.get('GPS.LatitudeDecimal'), -90.0, 90.0)
             lon = _valid_decimal(exif_result.get('longitude') or exif_data.get('GPS.LongitudeDecimal'), -180.0, 180.0)
             if lat and lon:
@@ -9476,10 +9460,7 @@ def _apply_client_processing_results(
             })
             # An explicit geo result is applied below. Do not geocode twice or
             # queue an EXIF-derived status that would overwrite it on batch flush.
-            if map_result is None and invalid_exif_gps:
-                if not _step_locked_done(metadata, 'map_detection'):
-                    status_updates['map_detection_status'] = 'failed'
-            elif map_result is None and lat and lon and not _CTX.get('queue_map_on_upload'):
+            if map_result is None and lat and lon and not _CTX.get('queue_map_on_upload'):
                 # Reverse geocode the EXIF GPS coordinates to populate location names
                 place = _reverse_geocode_fallback(lat, lon)
                 if place:
@@ -9521,8 +9502,13 @@ def _apply_client_processing_results(
     elif isinstance(ocr_result, dict):
         ocr_text = _sanitize_client_text(ocr_result.get('text'), 2048)
         if ocr_result.get('error') or ocr_result.get('errorCode'):
-            status_updates['ocr_status'] = 'failed'
             code = ocr_result.get('errorCode')
+            # 'ocr_decode_failed' means the image itself couldn't be decoded --
+            # deterministic on these bytes, so it's terminal on the first
+            # attempt. 'tesserocr_unavailable' (deploy/environment) and
+            # 'ocr_engine_failed' (ambiguous libtesseract/thread-state failure,
+            # not proven deterministic) keep retrying as 'failed'.
+            status_updates['ocr_status'] = 'unrecoverable' if code == 'ocr_decode_failed' else 'failed'
             if not isinstance(code, str) or code not in {'tesserocr_unavailable', 'ocr_decode_failed', 'ocr_engine_failed'}:
                 code = 'ocr_processing_failed'
             _merge_processing_metadata(metadata, 'client_ocr', {
@@ -9820,6 +9806,10 @@ def _apply_client_processing_results(
                 metadata['faces'] = '[]'
                 status_updates['faceCount'] = 0
                 status_updates['face_status'] = 'no_data'
+            elif face_failure_stage == 'image_undecodable':
+                # Deterministic on these bytes (ipwork_face.py's own decode
+                # step raised) -- terminal on the first attempt, not retried.
+                status_updates['face_status'] = 'unrecoverable'
             elif face_failure_stage:
                 status_updates['face_status'] = 'failed'
             elif not detection_genuinely_ran:
@@ -9856,7 +9846,7 @@ def _apply_client_processing_results(
     elif face_result is not None:
         status_updates['face_status'] = 'failed'
 
-    if str(status_updates.get('face_status') or '').strip().lower() in {'done', 'no_data', 'failed', 'unsupported'}:
+    if str(status_updates.get('face_status') or '').strip().lower() in {'done', 'no_data', 'failed', 'unsupported', 'unrecoverable'}:
         metadata['processing_lease_owner'] = ''
         metadata['processing_lease'] = ''
         metadata['processing_lease_expires_at'] = ''
@@ -9989,7 +9979,14 @@ def _apply_client_processing_results(
                 **ai_source_provenance,
                 **ai_model_provenance,
             })
-            status_updates['ai_vision_status'] = 'failed'
+            # 'image_undecodable' means the image itself couldn't be decoded --
+            # deterministic on these bytes, terminal on the first attempt.
+            # Every other path here (model/vocabulary unavailable, embedding
+            # produced nothing usable, an unhandled exception) stays 'failed'
+            # and retryable -- none of those are proven deterministic on the
+            # file's data.
+            status_updates['ai_vision_status'] = (
+                'unrecoverable' if ai_result.get('error') == 'image_undecodable' else 'failed')
 
     derivatives_only = bool(payload) and not report and set(payload) <= {'preview', 'thumbnail'} and all(
         isinstance(value, dict) and value.get('alreadyUploaded') is True for value in payload.values())
@@ -10828,7 +10825,7 @@ def claim_processing_lease(
                 current_status = str(entity.get(field) or 'pending').strip().lower()
                 if current_status == 'running' and lease_expired:
                     current_status = 'pending'
-                if current_status not in {'done', 'no_data', 'deleted', 'skipped', 'unsupported'}:
+                if current_status not in {'done', 'no_data', 'deleted', 'skipped', 'unsupported', 'unrecoverable'}:
                     entity[field] = 'running'
 
         if lease_expired or current_owner != owner_id or not entity.get('processingFence'):

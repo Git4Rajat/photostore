@@ -2555,6 +2555,12 @@ def _build_photo_summary(user_id: str, filename: str, metadata: Dict, include_pr
             # uses 'ipworker-<jobId>', /upload/processing/claim uses
             # 'browser-<uuid>' by default).
             'activeWorker': _active_processing_worker(metadata),
+            # Human-diagnosable reason per non-'done' step (e.g. 'unrecoverable'
+            # thumbnail's 'raw_preview_extraction_failed'), so the Tools page can
+            # show *why* a step didn't complete instead of just a status color --
+            # computed server-side from processing_metadata breadcrumbs already,
+            # just not previously attached to the photo payload the frontend reads.
+            'reasons': _processing_step_reasons(metadata) or None,
         },
     }
 
@@ -4641,8 +4647,14 @@ def _face_passes_auto_store_quality(face: Dict, confidence: Optional[float] = No
     bbox = normalized or _normalize_face_bbox(face)
     if bbox.get('width', 0) <= 0 or bbox.get('height', 0) <= 0:
         return False
-    image_width = max(0, int(bbox.get('imageWidth', 0) or face.get('imageWidth', 0) or 0))
-    image_height = max(0, int(bbox.get('imageHeight', 0) or face.get('imageHeight', 0) or 0))
+    try:
+        image_width = max(0, int(bbox.get('imageWidth', 0) or face.get('imageWidth', 0) or 0))
+    except Exception:
+        image_width = 0
+    try:
+        image_height = max(0, int(bbox.get('imageHeight', 0) or face.get('imageHeight', 0) or 0))
+    except Exception:
+        image_height = 0
     if image_width <= 0 or image_height <= 0 or confidence_value >= FACE_LOW_CONFIDENCE_REJECT_BELOW:
         return True
     image_area = max(1, image_width * image_height)
@@ -4661,12 +4673,28 @@ def _face_payload_for_metadata(face_id: str, face: Dict) -> Dict:
             bbox = json.loads(bbox or '{}')
         except Exception:
             bbox = {}
+    # Callers build this payload in a list comprehension over every stored
+    # face for a photo/library -- a non-numeric field on one corrupted row
+    # must not raise, or it takes down the whole response instead of just
+    # that one face.
+    try:
+        face_image_width = int(face.get('imageWidth', 0) or 0)
+    except Exception:
+        face_image_width = 0
+    try:
+        face_image_height = int(face.get('imageHeight', 0) or 0)
+    except Exception:
+        face_image_height = 0
+    try:
+        face_confidence = float(face.get('confidence', 0.0) or 0.0)
+    except Exception:
+        face_confidence = 0.0
     payload = {
         'faceId': face_id,
         'bbox': bbox,
-        'imageWidth': int(face.get('imageWidth', 0) or 0),
-        'imageHeight': int(face.get('imageHeight', 0) or 0),
-        'confidence': float(face.get('confidence', 0.0) or 0.0),
+        'imageWidth': face_image_width,
+        'imageHeight': face_image_height,
+        'confidence': face_confidence,
     }
     if face.get('personId'):
         payload['personId'] = face.get('personId')
@@ -8407,14 +8435,28 @@ def _face_summary_for_person_list(face_id: str, face: Dict, user_id: str = '') -
             bbox_value = {}
     if not isinstance(bbox_value, dict):
         bbox_value = {}
+    # Same list-comprehension exposure as _face_payload_for_metadata above:
+    # one corrupted row must not take down the whole people-list response.
+    try:
+        face_image_width = int(face.get('imageWidth', 0) or 0)
+    except Exception:
+        face_image_width = 0
+    try:
+        face_image_height = int(face.get('imageHeight', 0) or 0)
+    except Exception:
+        face_image_height = 0
+    try:
+        face_confidence = float(face.get('confidence', 0.0) or 0.0)
+    except Exception:
+        face_confidence = 0.0
     return {
         'faceId': face_id,
         'filename': face.get('filename'),
         'thumbnailUrl': _face_thumbnail_url(str(face.get('filename') or ''), user_id),
         'bbox': bbox_value,
-        'imageWidth': int(face.get('imageWidth', 0) or 0),
-        'imageHeight': int(face.get('imageHeight', 0) or 0),
-        'confidence': float(face.get('confidence', 0.0) or 0.0),
+        'imageWidth': face_image_width,
+        'imageHeight': face_image_height,
+        'confidence': face_confidence,
         'reviewStatus': face.get('reviewStatus') or '',
         'suspiciousReason': face.get('suspiciousReason') or '',
     }
@@ -12036,7 +12078,11 @@ def _merge_persons_core(
             face_ent.pop('suspiciousReason', None)
             face_ent.pop('rejectedReason', None)
             face_ent.pop('rejectedAt', None)
-            face_ent['confidence'] = max(float(face_ent.get('confidence', 0.0) or 0.0), 1.0)
+            try:
+                existing_confidence = float(face_ent.get('confidence', 0.0) or 0.0)
+            except Exception:
+                existing_confidence = 0.0
+            face_ent['confidence'] = max(existing_confidence, 1.0)
             face_updates[fid] = face_ent
 
     for owner_id, fid in external_removals:
@@ -12853,7 +12899,7 @@ BROWSER_PROCESSING_STATUS_FIELDS = (
     ('map_detection_status', 'mapDetection'),
     ('face_status', 'face'),
 )
-BROWSER_PROCESSING_TERMINAL_STATUSES = {'done', 'no_data', 'deleted', 'skipped', 'unsupported', 'failed', 'timeout'}
+BROWSER_PROCESSING_TERMINAL_STATUSES = {'done', 'no_data', 'deleted', 'skipped', 'unsupported', 'failed', 'timeout', 'unrecoverable'}
 BROWSER_PROCESSING_PENDING_SELECT = [
     'RowKey',
     'processingIsolated',
@@ -16591,7 +16637,7 @@ def _handle_ipwork_queue_payload_impl(payload: Dict, job_id: str, user_id: str) 
     runnable_steps = [
         step for step in steps
         if str(lease_statuses.get(f'{step}Status') or '').strip().lower() not in (
-            {'done'} if step == 'thumbnail' else {'done', 'no_data', 'skipped', 'unsupported'}
+            {'done', 'unrecoverable'} if step == 'thumbnail' else {'done', 'no_data', 'skipped', 'unsupported', 'unrecoverable'}
         )
     ]
     # claim_processing_lease reads the raw face_status field, which doesn't
@@ -17071,7 +17117,7 @@ def _prepare_ipwork_face_indexes(messages, cancelled) -> None:
             continue
         if str(metadata.get('processing_state') or '').strip().lower() == 'deleted':
             continue
-        if (str(metadata.get('face_status') or '').strip().lower() in {'done', 'no_data', 'skipped', 'unsupported'}
+        if (str(metadata.get('face_status') or '').strip().lower() in {'done', 'no_data', 'skipped', 'unsupported', 'unrecoverable'}
                 and not _browser_processing_face_version_stale(metadata)):
             continue
         by_user.setdefault(user_id, set()).add(filename)
