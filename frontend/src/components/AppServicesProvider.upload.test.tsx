@@ -69,6 +69,7 @@ vi.mock('@azure/storage-blob', () => ({
 
 import { AppServicesProvider, useAppServices } from './AppServicesProvider';
 import { UPLOAD_SESSION_STORAGE_KEY } from './browserAiShared';
+import * as largeFileHash from '../utils/largeFileHash';
 
 let services: ReturnType<typeof useAppServices>;
 function Probe() {
@@ -868,6 +869,36 @@ describe('browser upload selection and startup', () => {
     });
 });
 
+describe('large upload hashing', () => {
+    it('uses the bounded hasher before uploading a large file', async () => {
+        const file = filesFor(1)[0];
+        Object.defineProperty(file, 'size', { value: 2381066480 });
+        const hash = vi.spyOn(largeFileHash, 'hashLargeFile').mockResolvedValue('a'.repeat(64));
+        select([file]);
+        await advance(4000);
+        expect(hash).toHaveBeenCalledWith(file, expect.any(AbortSignal));
+        expect(finalizedFiles()).toHaveLength(1);
+        expect(finalizedFiles()[0]).toMatchObject({ sha256: 'a'.repeat(64), totalSize: 2381066480 });
+    });
+
+    it('aborts large-file hashing on Stop without admitting or finalizing bytes', async () => {
+        const file = filesFor(1)[0];
+        Object.defineProperty(file, 'size', { value: 2381066480 });
+        const hash = vi.spyOn(largeFileHash, 'hashLargeFile').mockImplementation((_file, signal) =>
+            new Promise((_resolve, reject) => signal!.addEventListener('abort', () =>
+                reject(new DOMException('Stopped', 'AbortError')), { once: true })));
+        select([file]);
+        await advance(1000);
+        expect(hash).toHaveBeenCalledTimes(1);
+        act(() => services.stopActiveUpload());
+        await advance(3000);
+        expect(initFiles()).toHaveLength(0);
+        expect(finalizedFiles()).toHaveLength(0);
+        expect(services.uploading).toBe(false);
+        expect(services.pendingUploadSummary).toBeNull();
+    });
+});
+
 // Connects the real upload path to the backend's opt-in shadow wave protocol
 // (backend/routes/upload_wave_shadow.py) -- see uploadWaveClient.ts/
 // uploadWaveSync.ts. These calls are entirely best-effort: they must never
@@ -876,8 +907,8 @@ describe('browser upload selection and startup', () => {
 describe('upload wave shadow protocol wiring', () => {
     let waveUUIDSequence = 0;
     const shadowCalls = (suffix: string) => mocks.postUpload.mock.calls
-        .filter(([url]) => typeof url === 'string' && url.startsWith('/upload/waves/shadow/') && url.endsWith(suffix));
-    const opens = () => mocks.postUpload.mock.calls.filter(([url]) => url === '/upload/waves/shadow/sessions');
+        .filter(([url]) => typeof url === 'string' && /^\/upload\/waves\/(shadow|live)\//.test(url) && url.endsWith(suffix));
+    const opens = () => mocks.postUpload.mock.calls.filter(([url]) => /^\/upload\/waves\/(shadow|live)\/sessions$/.test(url));
 
     beforeEach(() => {
         vi.stubEnv('VITE_UPLOAD_WAVE_SHADOW_ENABLED', 'true');
@@ -891,7 +922,7 @@ describe('upload wave shadow protocol wiring', () => {
         });
         const original = mocks.postUpload.getMockImplementation()!;
         mocks.postUpload.mockImplementation(async (url: string, payload: any) => {
-            if (url.startsWith('/upload/waves/shadow/')) {
+            if (/^\/upload\/waves\/(shadow|live)\//.test(url)) {
                 if (url.endsWith('/items')) return { manifestRevision: 'rev-items', registeredCount: payload.items.length };
                 if (url.endsWith('/resolve')) return { manifestRevision: 'rev-resolve' };
                 if (url.endsWith('/close')) return { state: 'closed' };
@@ -932,6 +963,66 @@ describe('upload wave shadow protocol wiring', () => {
         expect(calls.findIndex(([url]) => url.endsWith('/items')))
             .toBeLessThan(calls.findIndex(([url]) => url === '/upload/init-batch'));
         expect(new Set(shadowCalls('/resolve').map(([, body]) => body.itemId)).size).toBe(901);
+    });
+
+    it.each([[50, 'shadow'], [901, 'shadow'], [50, 'live'], [901, 'live']] as const)(
+        'closes a stopped %i-file %s selection while preserving accepted photos', async (count, protocol) => {
+        if (protocol === 'live') {
+            vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
+            mocks.getUpload.mockImplementation(async (url) => url === '/upload/waves/protocol' ? { protocol: 'live' } : { hashes: {} });
+        }
+        mocks.staged.mockResolvedValueOnce(undefined).mockImplementation((_id, _data, _size, options) =>
+            new Promise((_resolve, reject) => {
+                const abort = () => reject(new Error('upload_stopped_by_user'));
+                if (options.abortSignal.aborted) abort();
+                else options.abortSignal.addEventListener('abort', abort, { once: true });
+            }));
+        select(filesFor(count));
+        await advance(1000);
+        expect(finalizedFiles()).toHaveLength(1);
+        act(() => services.stopActiveUpload());
+        await advance(4000);
+        const outcomes = new Map(shadowCalls('/resolve').map(([, body]) => [body.itemId, body.outcome]));
+        expect(outcomes.size).toBe(count);
+        expect(Array.from(outcomes.values()).filter(outcome => outcome === 'accepted')).toHaveLength(1);
+        expect(Array.from(outcomes.values()).filter(outcome => outcome === 'cancelled')).toHaveLength(count - 1);
+        expect(shadowCalls('/close')).toHaveLength(1);
+        expect(services.uploading).toBe(false);
+    });
+
+    it.each(['shadow', 'live'])('does not cancel committed photos while their %s finalization is still pending on Stop', async (protocol) => {
+        if (protocol === 'live') {
+            vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
+            mocks.getUpload.mockImplementation(async (url) => url === '/upload/waves/protocol' ? { protocol: 'live' } : { hashes: {} });
+        }
+        let releaseFinalize!: () => void;
+        const gate = new Promise<void>(resolve => { releaseFinalize = resolve; });
+        const original = mocks.postUpload.getMockImplementation()!;
+        mocks.postUpload.mockImplementation(async (url, payload) => {
+            if (url === '/upload/finalize-batch') await gate;
+            return original(url, payload);
+        });
+        mocks.staged.mockResolvedValueOnce(undefined).mockImplementation((_id, _data, _size, options) =>
+            new Promise((_resolve, reject) => {
+                const abort = () => reject(new Error('upload_stopped_by_user'));
+                if (options.abortSignal.aborted) abort();
+                else options.abortSignal.addEventListener('abort', abort, { once: true });
+            }));
+        select(filesFor(50));
+        await advance(1000);
+        const committedFilename = finalizedFiles()[0].filename;
+        act(() => services.stopActiveUpload());
+        await advance(3000);
+        const cancelledFiles = () => mocks.postUpload.mock.calls.filter(([url]) => url === '/upload/cancel')
+            .flatMap(([, body]) => body.files);
+        expect(cancelledFiles().some(file => file.filename === committedFilename)).toBe(false);
+        expect(shadowCalls('/close')).toHaveLength(0);
+        await act(async () => { releaseFinalize(); });
+        await advance(4000);
+        expect(cancelledFiles().length).toBeGreaterThan(0);
+        expect(cancelledFiles().some(file => file.filename === committedFilename)).toBe(false);
+        expect(shadowCalls('/resolve').some(([, body]) => body.outcome === 'accepted')).toBe(true);
+        expect(shadowCalls('/close')).toHaveLength(1);
     });
 
     it('resolves a finalize failure as failed, not accepted', async () => {

@@ -116,6 +116,28 @@ def test_resolve_autocloses_and_replay_is_idempotent(live_api):
     assert store.status(opened['waveId'])['memberCount']==1
 
 
+def test_stopped_selection_keeps_accepted_member_and_dispatches_vision(live_api,monkeypatch):
+    client,store,metadata,library=live_api
+    import wave_runtime
+    sent=[]
+    monkeypatch.setattr(wave_runtime,'send_stage',lambda *args:sent.append(args))
+    root='/upload/waves/live/sessions'
+    opened=client.post(root,json=dict(sessionId='stopped',declaredCount=3)).json
+    assert client.post(root+'/stopped/items',json=dict(items=[
+        dict(itemId=str(i),filename=f'{i}.jpg') for i in range(3)])).status_code==200
+    metadata.create_entity(dict(PartitionKey='u',RowKey='0.jpg',anonymousImageId='p',processingRevision='r'))
+    accepted=client.post(root+'/stopped/resolve',json=dict(itemId='0',outcome='accepted',filename='0.jpg'))
+    assert accepted.status_code==200 and accepted.json['state']=='open'
+    for item in ('1','2'):
+        response=client.post(root+'/stopped/resolve',json=dict(itemId=item,outcome='cancelled'))
+        assert response.status_code==200
+    assert response.json['state']=='closed'
+    wave=store.status(opened['waveId'])
+    assert wave['state']=='processing_pending' and wave['memberCount']==1
+    assert metadata.get_entity('u','0.jpg')['anonymousImageId']=='p'
+    assert any(message[1].startswith('wave-vision:') for message in sent)
+
+
 def test_protocol_discovery_is_authenticated_library_scoped(live_api):
     client,store,metadata,library=live_api
     live=client.get('/upload/waves/protocol')

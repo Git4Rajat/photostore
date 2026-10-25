@@ -9,6 +9,7 @@ import { startMediaTokenAutoRefresh } from '../services/mediaToken';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { get, getUpload, post, postTools, postUpload, resolveApiUrl } from '../services/apiClient';
 import { liveWaveAdmission, ensureWaveShadowSessionOpened, finalizeWaveShadowSession, resolveWaveShadowFile, cancelQueuedWaveSelection } from '../services/uploadWaveSync';
+import { hashLargeFile, LARGE_FILE_HASH_THRESHOLD } from '../utils/largeFileHash';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
 import { getRuntimeConfig } from '../config/appConfig';
 import type {
@@ -1842,8 +1843,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         persistSession(null);
     }, [persistSession]);
 
-    const computeSha256 = async (file: File): Promise<string> => (
-        sha256ArrayBuffer(await readBlobArrayBuffer(file))
+    const computeSha256 = async (file: File, signal?: AbortSignal): Promise<string> => (
+        file.size > LARGE_FILE_HASH_THRESHOLD
+            ? hashLargeFile(file, signal)
+            : sha256ArrayBuffer(await readBlobArrayBuffer(file))
     );
 
     // Best-effort prefetch of the library's dedup snapshot so uploadFileInChunks
@@ -2886,7 +2889,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (uploadStopRequestedRef.current || options?.signal?.aborted) {
             throw new Error(UPLOAD_STOPPED_ERROR);
         }
-        const sha256 = await computeSha256(file);
+        const sha256 = await computeSha256(file, options?.signal);
         if (uploadStopRequestedRef.current || options?.signal?.aborted) {
             throw new Error(UPLOAD_STOPPED_ERROR);
         }
@@ -3243,6 +3246,16 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         // relying on that ref there would read every file back as whatever
         // stale status `normalized`/`session` captured at the start.
         const waveShadowFileOutcomes = new Map<string, Pick<PersistedUploadFile, 'status' | 'skippedDuplicate' | 'waveAcceptedFilename'>>();
+        const cleanupStoppedUpload = (latest: PersistedUploadSession) => {
+            // Committed files may still be finalizing when Stop rejects the
+            // transfer workers. Never delete their reservations/blobs while
+            // finalization is using them. Keep the UI responsive and use this
+            // run's outcomes even after its persisted session has been cleared.
+            void Promise.allSettled(Array.from(pendingFinalizeTasks)).then(() => cleanupUnfinishedUploadArtifacts({
+                ...latest,
+                files: latest.files.map(file => ({ ...file, ...waveShadowFileOutcomes.get(file.key) })),
+            }));
+        };
         try {
             persistSession(normalized);
             const pendingFiles = normalized.files.filter((file) => (
@@ -3871,7 +3884,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
             if (uploadStopRequestedRef.current) {
                 const latest = uploadSessionRef.current || normalized;
-                await cleanupUnfinishedUploadArtifacts(latest);
+                cleanupStoppedUpload(latest);
                 await clearPersistedSession();
                 setPendingUploadSessionLive(null);
                 updateNotification(notificationId, {
@@ -3927,7 +3940,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             }
             if (uploadStopRequestedRef.current || isUploadStoppedError(err)) {
                 const latest = uploadSessionRef.current || session;
-                await cleanupUnfinishedUploadArtifacts(latest);
+                cleanupStoppedUpload(latest);
                 await clearPersistedSession();
                 setPendingUploadSessionLive(null);
                 updateNotification(notificationId, {

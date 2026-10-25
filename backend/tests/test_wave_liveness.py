@@ -147,6 +147,36 @@ def test_twenty_zero_face_members_continue_on_cluster_queue_without_faiss(live,m
     assert store.status(wave)['state']=='indexing' and sent[-1][1].startswith('wave-index:')
 
 
+def test_stopped_selection_processes_accepted_prefix_through_publication(live,monkeypatch):
+    store,metadata,sent,_=live
+    opened=store.open_session('stopped',25)
+    for start in (0,20):
+        store.register('stopped',[dict(itemId=str(i),filename=f'{i}.jpg') for i in range(start,min(start+20,25))])
+    for i in range(25):
+        if i<20:
+            row=store.resolve('stopped',str(i),outcome='accepted',filename=f'{i}.jpg',
+                photo_id=f'p{i}',processing_revision=f'r{i}',required_steps=REQUIRED_STEPS)
+            metadata.rows[store.library,f'{i}.jpg']=settled_row(f'p{i}',f'r{i}',filename=f'{i}.jpg')
+        else:
+            row=store.resolve('stopped',str(i),outcome='cancelled')
+    close(store,'stopped',row)
+    wave=opened['waveId']
+    assert store.status(wave)['memberCount']==20
+    for i in range(20):complete_source(store,metadata,f'{i}.jpg')
+    wave_runtime.consume(wake(store,wave,'vision'))
+    monkeypatch.setenv('APP_ROLE','cluster')
+    wave_runtime.consume(wake(store,wave,'cluster'))
+    assert store.status(wave)['state']=='indexing'
+    import index_publication,wave_catalog,index_events
+    monkeypatch.setattr(index_publication,'catalog_serialization',lambda *a:nullcontext())
+    monkeypatch.setattr(wave_catalog,'CatalogPublisher',lambda *a:SimpleNamespace(publish=lambda *a:'generation'))
+    monkeypatch.setattr(index_events,'publish',lambda *a:None)
+    monkeypatch.setenv('APP_ROLE','index-worker')
+    wave_runtime.consume(wake(store,wave,'index'))
+    assert store.status(wave)['state']=='complete'
+    assert store.status(wave)['memberCount']==20
+
+
 def test_two_failed_sources_each_receive_their_full_retry_budget(live,monkeypatch):
     store,metadata,sent,_=live;wave=admit(store,metadata,2);payload=wake(store,wave,'vision');calls=Counter()
     def failed(library,filename,revision,renew):
