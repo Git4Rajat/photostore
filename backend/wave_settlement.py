@@ -74,6 +74,19 @@ def attempt(store,member):
 
 
 def exhausted(store,wave_id,member,metadata,count):
+    """Force a terminal settlement once a source has had its full retry budget,
+    regardless of whether a required step ever recorded 'failed'.
+
+    A recorded step failure used to be the only accepted evidence, but a
+    source with no required steps (browser-owned video) or a retry attempt
+    that fails before producing any step result (e.g. an exception in
+    completion/receipt capture, unrelated to any single step) can repeat
+    forever under that rule -- this exact gap let a video source retry
+    unbounded in production (wave_runtime.process_source -> an uncaught
+    receipt-capture exception, with no required step to ever show 'failed').
+    Attempt count alone is now sufficient: every source reaches a terminal
+    state after MAX_SOURCE_ATTEMPTS, no matter what kept failing.
+    """
     if count<MAX_SOURCE_ATTEMPTS:return False
     row=metadata.get_entity(store.library,member['filename'])
     from storage_utils import _processing_is_expired
@@ -81,8 +94,9 @@ def exhausted(store,wave_id,member,metadata,count):
         or (row.get('processing_lease_owner') and not _processing_is_expired(row))):return False
     steps=json.loads(member['requiredSteps'])
     statuses={step:row.get(step+'_status','pending') for step in steps}
-    if not any(status=='failed' for status in statuses.values()):return False
-    settle(store,wave_id,member,'failed_exhausted','required_step_retries_exhausted',
+    reason=('required_step_retries_exhausted' if any(status=='failed' for status in statuses.values())
+            else 'source_retries_exhausted')
+    settle(store,wave_id,member,'failed_exhausted',reason,
            witness=dict(attempts=count,statuses=statuses,generation=row.get('processingGeneration','')))
     return True
 

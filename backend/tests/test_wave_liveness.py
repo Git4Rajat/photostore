@@ -188,6 +188,41 @@ def test_two_failed_sources_each_receive_their_full_retry_budget(live,monkeypatc
     assert store.status(wave)['state']=='indexing' and store.status(wave)['failedMembers']==2
 
 
+def test_source_with_no_required_steps_exhausts_without_blocking_its_wave_mate(live,monkeypatch):
+    """Browser-owned video has an empty requiredSteps contract, so a bare
+    exception from process_source -- the production incident: an uncaught
+    crash in completion/receipt capture, unrelated to any step's own status
+    -- has no required step that could ever be recorded 'failed'. Before this
+    fix exhausted() could never fire for such a source no matter the attempt
+    count, and the uncaught exception aborted the whole pass, starving every
+    other member in the same page too. A healthy sibling must still resolve
+    on the very first wake, and the broken source must still give up after
+    its full retry budget instead of retrying forever."""
+    store,metadata,sent,_=live
+    opened=store.open_session('mixed',2)
+    store.register('mixed',[dict(itemId='0',filename='poison.mp4'),dict(itemId='1',filename='healthy.jpg')])
+    store.resolve('mixed','0',outcome='accepted',filename='poison.mp4',
+        photo_id='p-poison',processing_revision='r-poison',required_steps=[])
+    resolved=store.resolve('mixed','1',outcome='accepted',filename='healthy.jpg',
+        photo_id='p-healthy',processing_revision='r-healthy',required_steps=REQUIRED_STEPS)
+    metadata.rows[store.library,'poison.mp4']=settled_row('p-poison','r-poison',filename='poison.mp4')
+    metadata.rows[store.library,'healthy.jpg']=settled_row('p-healthy','r-healthy',filename='healthy.jpg')
+    close(store,'mixed',resolved)
+    wave=resolved['waveId'];payload=wake(store,wave,'vision');calls=Counter()
+    def process(library,filename,revision,renew):
+        calls[filename]+=1
+        if filename=='poison.mp4':
+            raise ValueError('Skipped face work with existing faces requires an explicit prior receipt')
+        complete_source(store,metadata,filename)
+    monkeypatch.setattr(wave_runtime,'process_source',process)
+    wave_runtime.consume(payload)
+    assert calls=={'poison.mp4':1,'healthy.jpg':1}
+    for _ in range(4):wave_runtime.consume(payload)
+    assert calls['poison.mp4']==5 and calls['healthy.jpg']==1
+    assert store.status(wave)['state']=='indexing'
+    assert store.status(wave)['failedMembers']==1
+
+
 def test_index_completion_wakes_a_waiting_successor(live,monkeypatch):
     store,metadata,sent,_=live;first=admit(store,metadata,1)
     intent=complete_source(store,metadata,'s-0.jpg')

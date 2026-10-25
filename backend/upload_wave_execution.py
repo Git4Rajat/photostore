@@ -344,14 +344,14 @@ def _process_vision_member(store, wave_id, member, metadata_table, process_sourc
             process_source(store.library, member['filename'], member['processingRevision'], renew)
         except Exception:
             renew()  # Ownership failures are never source failures.
+            # exhausted() is the single authority on whether this source still
+            # has budget left -- it settles terminally once count reaches
+            # MAX_SOURCE_ATTEMPTS, independent of what kept failing (a step
+            # result, or a bare exception with no step to blame). Below budget,
+            # re-raise: the caller isolates this one member so the exception
+            # never blocks its wave-mates, and the next wake retries.
             if not exhausted(store, wave_id, member, metadata_table, count):
-                row = metadata_table.get_entity(store.library, member['filename'])
-                if (row.get('anonymousImageId') != member['photoId']
-                        or row.get('processingRevision') != member['processingRevision']
-                        or not any(row.get(step + '_status') == 'failed' for step in json.loads(member['requiredSteps']))
-                        or (row.get('processing_lease_owner') and not _processing_is_expired(row))):
-                    raise
-                # A recorded step failure consumes this source's retry budget.
+                raise
         renew()
         completion, row = _observe_qualified(store, member, metadata_table)
         if completion is None: exhausted(store, wave_id, member, metadata_table, count)
@@ -401,8 +401,29 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
                 for member in members:
                     if expired(): return store._required(store.wave_key(wave_id))
                     renew()
-                    _process_vision_member(store, wave_id, member, metadata_table,
-                        process_source, renew, progressed)
+                    try:
+                        _process_vision_member(store, wave_id, member, metadata_table,
+                            process_source, renew, progressed)
+                    except (OwnershipLost, NotImplementedError):
+                        raise  # Ownership loss and a missing adapter are never per-source outcomes.
+                    except Exception:
+                        # No single member may abort the whole pass -- the exact
+                        # production incident this closes: one source's
+                        # exception used to propagate out of this loop
+                        # uncaught, so every other member in the page never
+                        # got its turn. Only reaches here while this source is
+                        # still under its retry budget (_process_vision_member
+                        # re-raises in that case only -- once exhausted() fires
+                        # it settles the source terminally and does not
+                        # re-raise), so the next wake simply retries it; this
+                        # pass moves on to the rest of the page now.
+                        import app
+                        try:
+                            app.app.logger.exception(
+                                'Vision member processing failed for %s/%s; continuing wave',
+                                library, member.get('filename'))
+                        except Exception:
+                            pass
                     cursor = member['RowKey']
                     checkpoint('sources', cursor)
                     progressed()
