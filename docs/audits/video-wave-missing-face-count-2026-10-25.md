@@ -49,3 +49,50 @@ claim about existing faces is misleading for this record.
 
 Changes are local; no deployment, live repair, or data mutation has been
 performed.
+
+## Follow-up after rollout: optional derivative mismatch
+
+Read-only monitoring confirmed revision `0000005` with commit `c22ff07` became
+ready. Automatic recovery revived the dispatch at 19:05:28 UTC, and at
+19:07:17 UTC the source committed `faceCount=0` with an empty face snapshot
+manifest. Qualification then failed with `Artifact manifest does not cover
+this completion`: the immutable manifest recorded `thumbnail=done`, while
+the committed completion recorded `thumbnail=failed`. Evidence is retained
+under `.azure/video-wave-watch/20261025T190548Z.json`.
+
+The proactive follow-up found and fixed three local issues:
+
+1. Result commit required a worker derivative receipt for a browser-owned
+   legacy video thumbnail, despite capture and prepared-derivative promotion
+   explicitly allowing that output without a worker receipt. Commit now
+   preserves those optional video statuses. Explicit receipts still undergo
+   validation, and image requirements are unchanged.
+2. The rejected completion remains at the head of the durable outbox. Merely
+   fixing new commits cannot unblock this persisted state: observation tries
+   to relay it before source qualification. Observation now recognizes the
+   exact historical video mismatch and permits source requalification.
+   Capture retires only same-source, same-generation invalid intents whose
+   intact manifest proves the sole difference is an unreceipted optional
+   derivative downgraded from done to failed. A fresh manifest and replacement
+   outbox commit together under the source fence. Valid receipts, unrelated
+   failures, corrupt/missing proof, and other generations are preserved.
+   Concurrent outbox changes abort the commit rather than lose evidence.
+3. The result-application path captured receipts from a separate candidate
+   dictionary but did not copy capture's normalized face count into the result.
+   It now commits the exact normalized count and any qualified recovery outbox
+   delta together with the manifest reference.
+
+Validation: **586 tests passed** across processing, wave execution/recovery,
+publication, and video upload suites; `git diff --check` passed. MOV, MP4,
+and MXF tests cover missing counts, successful browser derivatives without
+worker receipts, and the persisted rejected outbox. Each advances through
+zero-face assignment, publication, an empty retry successor, and release of
+a waiting photo wave, without model inference or original downloads. Real
+catalog publisher tests exercise all eight scopes with a video present;
+sort, access, search, and dedup artifacts include the video filename.
+
+No additional blocker was reproduced in these checks. End-to-end wave tests
+use a fake publisher, while separate tests exercise the real catalog
+publishers with in-memory storage. Production resolution still requires a
+rollout and observed publication receipts; no live repair or deployment was
+performed by this follow-up.

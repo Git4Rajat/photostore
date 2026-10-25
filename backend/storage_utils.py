@@ -10186,6 +10186,12 @@ def apply_client_processing_results_for_file(
                 _apply_processing_status_updates(candidate, batch)
                 receipt = _CTX['source_artifact_receipt_capture'](user_id, candidate)
                 if receipt:
+                    # Capture can normalize the video zero-face contract and
+                    # retire a known invalid video outbox entry. Commit those
+                    # exact values along with its immutable manifest pointer.
+                    for key in ('faceCount', 'processingCompletionOutbox'):
+                        if key in candidate:
+                            metadata[key] = candidate[key]
                     metadata['artifactReceipt'] = json.dumps(receipt, sort_keys=True, separators=(',', ':'))
     except Exception as exc:
         if consolidated:
@@ -10335,6 +10341,10 @@ def _commit_worker_processing_results(user_id, filename, baseline, result, updat
             # Preserve TableEntity's genuine ETag while rebuilding from fresh
             # values on every retry; do not mutate the baseline/result delta.
             entity = copy.copy(current)
+            if ('processingCompletionOutbox' in fields
+                    and current.get('processingCompletionOutbox') != baseline.get('processingCompletionOutbox')):
+                from processing_completion import StaleProcessingResult
+                raise StaleProcessingResult('Source completion outbox changed during artifact recovery.')
             entity.update(fields)
             entity['processing_metadata'] = json.dumps(processing, ensure_ascii=False, separators=(',', ':'))
             _apply_processing_status_updates(entity, updates)
@@ -10350,6 +10360,8 @@ def _commit_worker_processing_results(user_id, filename, baseline, result, updat
                 from processing_artifacts import validate_receipt
                 for kind in ('thumbnail', 'preview'):
                     if entity.get(kind + '_status') == 'done':
+                        if is_video_file(filename) and not entity.get(kind + 'Artifact'):
+                            continue  # Browser-owned legacy video output has no worker receipt.
                         try:
                             validate_receipt(entity, kind)
                         except (ValueError, KeyError, TypeError):

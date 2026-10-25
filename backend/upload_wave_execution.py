@@ -303,6 +303,13 @@ def _observe_qualified(store, member, metadata_table):
     completion = _completion(store, member, identity)
     if completion is None and row.get('processingCompletionOutbox'):
         from processing_completion import relay_completion
+        from processing_receipts import ArtifactReceipts
+        head = json.loads(row['processingCompletionOutbox'])[0]
+        if (all(head.get(key) == value for key, value in dict(library=store.library,
+                filename=member['filename'], photoId=member['photoId'],
+                revision=member['processingRevision'], generation=row.get('processingGeneration')).items())
+                and ArtifactReceipts(store.table, store.library).is_video_status_mismatch(head)):
+            return None, row  # Requalify under a source lease before replacing this invalid intent.
         relay_completion(metadata_table, store.library, member['filename'], store.accept_source_completion)
         completion = _completion(store, member, identity)
     if completion is None or completion[0]['generation'] != row.get('processingGeneration'):

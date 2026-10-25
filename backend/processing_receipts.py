@@ -115,7 +115,51 @@ class ArtifactReceipts:
             faceSnapshots=snapshot_ids, faceLookupGeneration=lookup_generation)
         identity = self._put('manifest', payload)
         fence.check()
+        # Replace only the known, unacceptably mismatched video intents. The
+        # caller commits this outbox delta with the newly captured proof under
+        # the same source fence. Valid and other-generation intents survive.
+        backlog = json.loads(metadata.get('processingCompletionOutbox') or '[]')
+        remaining = [intent for intent in backlog if not (
+            all(intent.get(key) == value for key, value in dict(library=self.library,
+                filename=fence.filename, photoId=fence.photo, revision=fence.revision,
+                generation=fence.generation).items())
+            and self.is_video_status_mismatch(intent))]
+        if remaining != backlog:
+            metadata['processingCompletionOutbox'] = json.dumps(remaining, sort_keys=True, separators=(',', ':'))
         return dict(id=identity, library=self.library, filename=fence.filename, photoId=fence.photo, revision=fence.revision)
+
+    def is_video_status_mismatch(self, intent):
+        """Recognize the historical post-capture optional-derivative downgrade.
+
+        This is not a general invalid-receipt escape hatch: require a valid
+        envelope and immutable manifest, with only unreceipted video derivative
+        statuses changed from done to failed. No face or derivative proof may
+        be discarded, and no missing/corrupt manifest is recoverable here.
+        """
+        from image_utils import is_video_file
+        from processing_completion import validate_intent
+        if not is_video_file(intent.get('filename') or ''):
+            return False
+        try:
+            validate_intent(intent, self.library)
+            reference = intent['artifactReceipt']
+            if not isinstance(reference, dict):
+                return False
+            row = self._get('manifest!' + str(reference.get('id')))
+            if row is None:
+                return False
+            manifest = json.loads(row['payload'])
+            differences = {step for step in STEPS
+                if manifest['statuses'].get(step) != intent['statuses'].get(step)}
+            if (not differences or not differences <= {'thumbnail', 'preview'}
+                    or manifest.get('faceCount') != 0 or manifest.get('faceSnapshots') != []
+                    or any(manifest['statuses'][step] != 'done' or intent['statuses'][step] != 'failed'
+                        or step in manifest['derivatives'] or step in intent['derivatives'] for step in differences)):
+                return False
+            self.verify_reference(reference, dict(intent, statuses=manifest['statuses']))
+            return True
+        except (ValueError, KeyError, TypeError):
+            return False
 
     def verify_reference(self, reference, intent):
         if (not isinstance(reference, dict) or any(reference.get(key) != intent.get(key)

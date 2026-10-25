@@ -69,7 +69,8 @@ def test_real_wave_adapter_qualifies_browser_prepared_derivatives(blobs, monkeyp
 
 
 @pytest.mark.parametrize('extension', ['mov', 'mp4', 'mxf'])
-def test_video_completion_without_face_count_does_not_run_models_or_read_original(blobs, monkeypatch, extension):
+@pytest.mark.parametrize('preparation', ['failed', 'done', 'rejected_outbox'])
+def test_video_completion_without_face_count_does_not_run_models_or_read_original(blobs, monkeypatch, extension, preparation):
     from execution_lease import ExecutionLeases
     from test_processing_completion import video_source
     from test_wave_recovery import RuntimeTable
@@ -86,6 +87,28 @@ def test_video_completion_without_face_count_does_not_run_models_or_read_origina
     row.update(allocate_generation('video-rev', photo_id='photo', file_hash=row['fileHash'], is_video=True))
     metadata.upsert_entity(row)
     table = RuntimeTable(); store = ShadowWaves(table, 'lib'); receipts = ArtifactReceipts(table, 'lib')
+    if preparation == 'done':
+        row.update(thumbnail_status='done', preview_status='done', exif_status='done')
+        metadata.upsert_entity(row)
+    elif preparation == 'rejected_outbox':
+        # Production state: capture saw a browser-owned done thumbnail, then
+        # the commit downgraded it without updating the immutable manifest.
+        from dataclasses import replace
+        from processing_fence import ResultFence
+        from processing_completion import prepare_completion
+        row.update(faceCount=0, thumbnail_status='done')
+        metadata.upsert_entity(row)
+        fence = ResultFence(metadata, 'lib', filename, 'video-rev', row['processingFence'],
+            '', 'photo', generation=row['processingGeneration'])
+        # Capture with an ordinary owned source lease, then reproduce the
+        # historical bad commit after lease release.
+        row.update(processing_lease_owner='owner', processing_lease_expires_at='2099-01-01T00:00:00+00:00')
+        metadata.upsert_entity(row)
+        with result_fence(replace(fence, owner='owner')):
+            row['artifactReceipt'] = json.dumps(receipts.capture(storage_utils, row))
+        row.update(thumbnail_status='failed', processing_lease_owner='', processing_lease_expires_at='')
+        prepare_completion(row)
+        metadata.upsert_entity(row)
     monkeypatch.setenv('UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED', 'true')
     monkeypatch.setenv('PROCESSING_GENERATION_ENFORCEMENT_ENABLED', 'true')
     monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED', 'true')
@@ -108,9 +131,15 @@ def test_video_completion_without_face_count_does_not_run_models_or_read_origina
     assert result['state'] == 'indexing'
     stored = metadata.get_entity('lib', filename)
     assert stored['faceCount'] == 0 and stored['artifactReceipt']
+    assert not json.loads(stored['processingCompletionOutbox'])
+    assert stored['processingCompletionAck'] == stored['processingCompletionId']
+    if preparation == 'done':
+        assert stored['thumbnail_status'] == stored['preview_status'] == 'done'
     assert not stored['processing_lease_owner']
     assert list(_iter_wave_faces(store, wave_id)) == []
     assert not objects
+    retry = store.open_session('retry', 0)
+    store.close('retry', retry['manifestRevision'], 'done')
     successor = store.open_session('photos', 1)
     store.register('photos', [dict(itemId='photo', filename='next.jpg')])
     from processing_generation import REQUIRED_STEPS
@@ -125,6 +154,9 @@ def test_video_completion_without_face_count_does_not_run_models_or_read_origina
     completed = run_index_release(leases, store, 'lib', wave_id, result['indexPendingKey'], ledger,
         publisher=lambda scope, obligation, check: 'published-' + scope)
     assert completed['state'] == 'complete'
+    from upload_wave_execution import advance_wave
+    retried, _ = advance_wave(stage_work_store(table), store, 'lib', retry['waveId'])
+    assert retried['state'] == 'complete' and retried['completionOutcome'] == 'no_work'
     assert store.promote_successor(successor['waveId'])['state'] == 'processing_pending'
 
 

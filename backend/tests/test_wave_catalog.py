@@ -143,6 +143,41 @@ def test_real_remaining_publishers_commit_empty_library_generations(world,monkey
         assert CatalogPublisher(store,wave['waveId'],su,check).publish(scope,'a'*64)
 
 
+@pytest.mark.parametrize('scope', ['sort', 'access', 'people', 'albums', 'search', 'vector', 'people_embedding', 'dedup'])
+def test_real_catalog_publishers_include_browser_owned_video_without_inference(world, monkeypatch, scope):
+    import gzip
+    import app
+    from test_wave_recovery import RuntimeTable
+    store, wave, leases, owner, blobs, check = world
+    metadata, hashes = RuntimeTable(), RuntimeTable()
+    metadata.create_entity(dict(PartitionKey='u', RowKey='clip.mov', anonymousImageId='video',
+        mimeType='video/quicktime', videoBrowserOnly=True, processing_state='active',
+        faceCount=0, face_status='skipped', preview_status='skipped',
+        thumbnail_status='failed', exif_status='failed', fileHash='d'*64,
+        uploadDate='2026-10-25T18:00:00+00:00'))
+    hashes.create_entity(dict(PartitionKey='u', RowKey='d'*64, filename='clip.mov'))
+    monkeypatch.setitem(su._CTX, 'metadata_table_client', metadata)
+    monkeypatch.setitem(su._CTX, 'hash_index_table_client', hashes)
+    for name in ('albums_table_client', 'embeddings_table_client'):
+        monkeypatch.setitem(su._CTX, name, RuntimeTable())
+    monkeypatch.setitem(su._CTX, 'blob_vector_index_container', 'vectors')
+    monkeypatch.setitem(su._CTX, 'blob_people_embedding_index_container', 'people-embeddings')
+    monkeypatch.setattr(su.vision_utils, 'get_text_embedding_version', lambda: 'test')
+    monkeypatch.setattr(su.vision_utils, 'get_text_embedding_dimension', lambda: su.PHOTO_EMBEDDING_DIMENSION)
+    monkeypatch.setattr(su, 'LEXICAL_BUILD_HOOK', app._streaming_lexical_build)
+    monkeypatch.setattr(su, 'download_media_bytes', lambda *a, **k: pytest.fail('Index downloaded video original'))
+    with execution_scope(leases, owner, store, check):
+        assert CatalogPublisher(store, wave['waveId'], su, check).publish(scope, 'd'*64)
+    proof = json.loads(store._get(f"publication!{wave['waveId']}!"+'d'*64)['payload'])
+    assert proof['scope'] == scope and proof['outputs']
+    contents = []
+    for output in proof['outputs']:
+        data = blobs.rows[output['container'], output['blob']][0]
+        contents.append(gzip.decompress(data) if data.startswith(b'\x1f\x8b') else data)
+    if scope in ('sort', 'access', 'search', 'dedup'):
+        assert any(b'clip.mov' in content for content in contents)
+
+
 def test_people_embedding_scan_failure_cannot_publish_an_empty_success(world,monkeypatch):
     store,wave,leases,owner,blobs,check=world
     def failed(*args,**kwargs):raise OSError('scan failed')

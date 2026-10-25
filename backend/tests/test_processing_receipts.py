@@ -193,3 +193,70 @@ def test_skipped_face_receipt_still_rejects_unproven_image_counts_and_existing_f
     with result_fence(replace(fence, filename=filename)), pytest.raises(ValueError, match='explicit prior receipt'):
         receipts.capture(storage_utils, row)
     assert not receipts.table.rows
+
+
+@pytest.mark.parametrize('change', ['none', 'face_count', 'exif', 'photo', 'corrupt_manifest', 'valid'])
+def test_video_status_mismatch_recovery_is_narrowly_scoped(blobs, change):
+    from dataclasses import replace
+    from processing_completion import completion_identity
+    from test_processing_completion import video_source
+    (metadata, _, _, _, fence), _ = blobs
+    row = dict(metadata.get_entity('lib', 'photo.jpg'))
+    row.update(video_source(), processingRevision=fence.revision, processingGeneration=fence.generation,
+        thumbnail_status='done')
+    metadata.rows['lib', row['RowKey']] = dict(row)
+    receipts = ArtifactReceipts(AtomicTable(), 'lib')
+    with result_fence(replace(fence, filename=row['RowKey'])):
+        reference = receipts.capture(storage_utils, row)
+    row.update(artifactReceipt=json.dumps(reference), processing_lease_owner='', processing_lease_expires_at='')
+    if change != 'valid':
+        row['thumbnail_status'] = 'failed'
+    prepare_completion(row)
+    intent = json.loads(row['processingCompletionOutbox'])[0]
+    if change == 'face_count': intent['faceCount'] = 1
+    if change == 'exif': intent['statuses']['exif'] = 'done'
+    if change == 'photo': intent['photoId'] = 'replacement'
+    if change == 'corrupt_manifest':
+        receipts.table.rows[receipts.partition, 'manifest!' + reference['id']]['payload'] = '{}'
+    intent['id'] = completion_identity({k: v for k, v in intent.items() if k != 'id'})
+    assert receipts.is_video_status_mismatch(intent) is (change == 'none')
+    row['processingCompletionOutbox'] = json.dumps([intent])
+    with result_fence(replace(fence, filename=row['RowKey'])):
+        receipts.capture(storage_utils, row)
+    assert json.loads(row['processingCompletionOutbox']) == ([] if change == 'none' else [intent])
+
+
+def test_video_result_application_commits_capture_zero_face_normalization(blobs, monkeypatch):
+    from test_processing_completion import video_source
+    (metadata, _, _, _, fence), _ = blobs
+    row = dict(metadata.get_entity('lib', 'photo.jpg'))
+    row.update(video_source(), processingRevision=fence.revision, processingGeneration=fence.generation)
+    row.pop('faceCount')
+    metadata.upsert_entity(row)
+    receipts = ArtifactReceipts(AtomicTable(), 'lib')
+    monkeypatch.setenv('UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED', 'true')
+    monkeypatch.setitem(storage_utils._CTX, 'source_completion_delivery', None)
+    monkeypatch.setitem(storage_utils._CTX, 'source_artifact_receipt_capture',
+        lambda library, candidate: receipts.capture(storage_utils, candidate))
+    monkeypatch.setattr(storage_utils, '_apply_client_processing_results', lambda *a, **k: None)
+    result = storage_utils.apply_client_processing_results_for_file('lib', row['RowKey'], claimed_steps=[],
+        lease_owner='owner', expected_processing_revision=fence.revision, expected_processing_fence=fence.attempt)
+    intent = json.loads(result['processingCompletionOutbox'])[-1]
+    assert result['faceCount'] == intent['faceCount'] == 0
+    assert receipts.verify_reference(json.loads(result['artifactReceipt']), intent)['faceCount'] == 0
+
+
+def test_outbox_recovery_cannot_overwrite_a_concurrent_completion(blobs, monkeypatch):
+    from processing_completion import StaleProcessingResult
+    (metadata, _, _, _, _), _ = blobs
+    baseline = metadata.get_entity('lib', 'photo.jpg')
+    result = dict(baseline, processingCompletionOutbox='[]')
+    update = metadata.update_entity
+    def concurrent_completion(entity, **kwargs):
+        current = metadata.get_entity('lib', 'photo.jpg')
+        metadata.upsert_entity(dict(current, processingCompletionOutbox='[{"id":"concurrent"}]'))
+        return update(entity, **kwargs)
+    monkeypatch.setattr(metadata, 'update_entity', concurrent_completion)
+    with pytest.raises(StaleProcessingResult, match='outbox changed'):
+        storage_utils._commit_worker_processing_results('lib', 'photo.jpg', baseline, result, [], 'owner')
+    assert json.loads(metadata.get_entity('lib', 'photo.jpg')['processingCompletionOutbox']) == [{'id': 'concurrent'}]
