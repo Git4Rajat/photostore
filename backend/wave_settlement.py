@@ -4,7 +4,7 @@ from azure.core.exceptions import ResourceNotFoundError
 from execution_lease import guard_operations
 from upload_waves import Conflict,digest
 
-MAX_SOURCE_ATTEMPTS=5
+MAX_SOURCE_ATTEMPTS=1
 
 
 def settle(store,wave_id,member,outcome,reason,*,witness,maintenance=False):

@@ -253,16 +253,26 @@ def test_pending_vision_resumes_through_the_same_release(world):
         metadata, None, no_faces, lambda *a: None)['state'] == 'ready'
 
 
-def test_unqualified_terminal_statuses_do_not_release_cluster(world):
+def test_unqualified_terminal_statuses_settle_as_failed_after_one_attempt(world):
+    """Terminal-looking step statuses ('no_data') are not proof of success
+    without a backing qualified completion/receipt. With the retry budget at
+    one attempt, process_source succeeding without ever producing a
+    completion settles this source as failed_exhausted immediately, rather
+    than leaving it 'pending' forever waiting on an attempt that may never
+    come -- the wave still reaches 'ready' (with a recorded failure) and
+    releases to cluster exactly like any other fully-settled wave."""
     store, work, leases, *_ = world
     wave_id, resolved = register_accepted(store); close(store, 'parent', resolved)
     metadata = FakeMetadata()
     metadata.put(store.library, 'original.jpg', **settled_row('photo-1', 'revision-1'))
     called = []
+    released = []
     wave = run_vision_release(leases, work, store, store.library, wave_id,
         store.status(wave_id)['visionPendingKey'], metadata, None, no_faces,
-        lambda *a: pytest.fail('unqualified cluster release'), process_source=lambda *a: called.append(a))
-    assert called and wave['state'] == 'processing'
+        lambda *a: released.append(a), process_source=lambda *a: called.append(a))
+    assert called and wave['state'] == 'ready'
+    assert store.status(wave_id)['failedMembers'] == 1
+    assert released
 
 
 def test_vision_calls_source_adapter_then_verifies_its_receipt(world):

@@ -166,16 +166,15 @@ def test_zero_face_assignment_uses_control_proof_then_duplicate_wave_skips_all_s
     assert not store._get('shadow-cluster!'+session['waveId'])
 
 
-def test_five_failed_source_attempts_settle_as_failure_not_success(monkeypatch):
+def test_one_failed_source_attempt_settles_as_failure_not_success(monkeypatch):
     from test_wave_execution_consumers import register_accepted,FakeMetadata,settled_row,no_faces
     from upload_wave_execution import run_vision_release,_iter_wave_faces
     world=execution_world(monkeypatch);store,work,leases,table=world
     wave_id,session=register_accepted(store);close(store,'parent',session)
     metadata=FakeMetadata();metadata.put(store.library,'original.jpg',**dict(settled_row('photo-1','revision-1'),face_status='failed'))
-    for count in range(5):
-        result=run_vision_release(leases,work,store,store.library,wave_id,store.status(wave_id)['visionPendingKey'],
-            metadata,None,no_faces,lambda *args:None,process_source=lambda *args:None)
-        assert result['state']==('ready' if count==4 else 'processing')
+    result=run_vision_release(leases,work,store,store.library,wave_id,store.status(wave_id)['visionPendingKey'],
+        metadata,None,no_faces,lambda *args:None,process_source=lambda *args:None)
+    assert result['state']=='ready'
     assert result['failedMembers']==1
     assert list(_iter_wave_faces(store,wave_id))==[]
     assert not store._page('source-completion!')
