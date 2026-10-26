@@ -10285,90 +10285,93 @@ def _commit_worker_processing_results(user_id, filename, baseline, result, updat
     started = time.monotonic()
     try:
         for attempt in range(_METADATA_UPDATE_MAX_RETRIES):
-            _check_result_lease(current, owner)
-            if _CTX.get('source_policy_check'):
-                _CTX['source_policy_check'](user_id)
-            if require_unexpired and _processing_is_expired(current):
-                from processing_completion import StaleProcessingResult
-                raise StaleProcessingResult('Processing result lease expired before commit.')
-            # processingRevision/processingGeneration are additive
-            # (storage_utils.finalize_uploaded_file/claim_processing_lease
-            # stamp them once, immutably per generation); rows written
-            # before they existed read as None on both sides and this check
-            # is a no-op for them. Folded into the same existing
-            # source-changed guard rather than a new kwarg -- a real
-            # reprocess/reupload or a forced-reprocess supersession changes
-            # these fields exactly like anonymousImageId/fileHash do today.
-            # processingGeneration specifically catches a result computed
-            # under a now-superseded model/required-step contract (see
-            # processing_generation.py) landing after that contract moved on.
-            if any(current.get(key) != baseline.get(key)
-                   for key in ('anonymousImageId', 'fileHash', 'processingRevision',
-                               'processingFence', 'processingGeneration')):
-                from processing_completion import StaleProcessingResult
-                raise StaleProcessingResult('Processing source changed during result application.')
-            # The check above only catches a MUTATION of the row's own
-            # generation between baseline and this attempt -- it cannot
-            # catch a deployment-wide model/policy version bump that
-            # happened before this claim/attempt even started (baseline
-            # would already carry the same now-stale generation, so it
-            # would match `current` and pass silently). Gated behind
-            # enforcement_enabled(): an ordinary, routine model-version bump
-            # already happens independently of this feature (see
-            # FACE_CLUSTER_EMBEDDING_VERSION's own revision history in
-            # app.py) and must not start rejecting unrelated in-flight
-            # commits while live cutover is disabled. Only checked when the
-            # row already carries a generation at all -- a legacy/
-            # unmigrated row with none is unaffected (see processing_
-            # generation.is_superseded's own "missing provenance" handling).
-            if current.get('processingGeneration'):
-                import processing_generation
-                if (processing_generation.enforcement_enabled()
-                        and processing_generation.is_superseded(current, is_video=is_video_file(filename))):
+            with processing_diagnostics.apply_phase(user_id, filename, 'lease_and_policy_check'):
+                _check_result_lease(current, owner)
+                if _CTX.get('source_policy_check'):
+                    _CTX['source_policy_check'](user_id)
+                if require_unexpired and _processing_is_expired(current):
                     from processing_completion import StaleProcessingResult
-                    raise StaleProcessingResult('Processing model/policy contract changed during result application.')
-            touched_steps = {key[:-7] for key in fields if key.endswith('_status')}
-            touched_steps.update(update['step'] for update in updates)
-            if any(_step_locked_done(current, step) and not _step_locked_done(baseline, step)
-                   for step in touched_steps):
-                raise RuntimeError('Processing step completed during result application.')
-            processing = _safe_json_load(current.get('processing_metadata'))
-            for key in changed_keys:
-                if key in after:
-                    processing[key] = after[key]
-                else:
-                    processing.pop(key, None)
-            # Preserve TableEntity's genuine ETag while rebuilding from fresh
-            # values on every retry; do not mutate the baseline/result delta.
-            entity = copy.copy(current)
-            if ('processingCompletionOutbox' in fields
-                    and current.get('processingCompletionOutbox') != baseline.get('processingCompletionOutbox')):
-                from processing_completion import StaleProcessingResult
-                raise StaleProcessingResult('Source completion outbox changed during artifact recovery.')
-            entity.update(fields)
-            entity['processing_metadata'] = json.dumps(processing, ensure_ascii=False, separators=(',', ':'))
-            _apply_processing_status_updates(entity, updates)
-            if error is not None:
-                for step in failed_steps if failed_steps is not None else BROWSER_PROCESSING_STEPS:
-                    if step in BROWSER_PROCESSING_STEPS and entity.get(f'{step}_status') == 'running':
-                        entity[f'{step}_status'] = 'failed'
-                entity['last_error'] = f'processing_failed_before_status_commit: {error}'[:1000]
-            entity.update(processing_lease_owner='', processing_lease='', processing_lease_expires_at='')
-            entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
-            from processing_completion import completion_capture_enabled, prepare_completion
-            if completion_capture_enabled():
-                from processing_artifacts import validate_receipt
-                for kind in ('thumbnail', 'preview'):
-                    if entity.get(kind + '_status') == 'done':
-                        if is_video_file(filename) and not entity.get(kind + 'Artifact'):
-                            continue  # Browser-owned legacy video output has no worker receipt.
-                        try:
-                            validate_receipt(entity, kind)
-                        except (ValueError, KeyError, TypeError):
-                            entity[kind + '_status'] = 'failed'
-                            entity['last_error'] = 'missing_or_invalid_' + kind + '_artifact_receipt'
-                prepare_completion(entity)
-            entity['processing_complete'] = _photo_processing_complete(entity)
+                    raise StaleProcessingResult('Processing result lease expired before commit.')
+                # processingRevision/processingGeneration are additive
+                # (storage_utils.finalize_uploaded_file/claim_processing_lease
+                # stamp them once, immutably per generation); rows written
+                # before they existed read as None on both sides and this check
+                # is a no-op for them. Folded into the same existing
+                # source-changed guard rather than a new kwarg -- a real
+                # reprocess/reupload or a forced-reprocess supersession changes
+                # these fields exactly like anonymousImageId/fileHash do today.
+                # processingGeneration specifically catches a result computed
+                # under a now-superseded model/required-step contract (see
+                # processing_generation.py) landing after that contract moved on.
+                if any(current.get(key) != baseline.get(key)
+                       for key in ('anonymousImageId', 'fileHash', 'processingRevision',
+                                   'processingFence', 'processingGeneration')):
+                    from processing_completion import StaleProcessingResult
+                    raise StaleProcessingResult('Processing source changed during result application.')
+                # The check above only catches a MUTATION of the row's own
+                # generation between baseline and this attempt -- it cannot
+                # catch a deployment-wide model/policy version bump that
+                # happened before this claim/attempt even started (baseline
+                # would already carry the same now-stale generation, so it
+                # would match `current` and pass silently). Gated behind
+                # enforcement_enabled(): an ordinary, routine model-version bump
+                # already happens independently of this feature (see
+                # FACE_CLUSTER_EMBEDDING_VERSION's own revision history in
+                # app.py) and must not start rejecting unrelated in-flight
+                # commits while live cutover is disabled. Only checked when the
+                # row already carries a generation at all -- a legacy/
+                # unmigrated row with none is unaffected (see processing_
+                # generation.is_superseded's own "missing provenance" handling).
+                if current.get('processingGeneration'):
+                    import processing_generation
+                    if (processing_generation.enforcement_enabled()
+                            and processing_generation.is_superseded(current, is_video=is_video_file(filename))):
+                        from processing_completion import StaleProcessingResult
+                        raise StaleProcessingResult('Processing model/policy contract changed during result application.')
+                touched_steps = {key[:-7] for key in fields if key.endswith('_status')}
+                touched_steps.update(update['step'] for update in updates)
+                if any(_step_locked_done(current, step) and not _step_locked_done(baseline, step)
+                       for step in touched_steps):
+                    raise RuntimeError('Processing step completed during result application.')
+            with processing_diagnostics.apply_phase(user_id, filename, 'metadata_merge'):
+                processing = _safe_json_load(current.get('processing_metadata'))
+                for key in changed_keys:
+                    if key in after:
+                        processing[key] = after[key]
+                    else:
+                        processing.pop(key, None)
+                # Preserve TableEntity's genuine ETag while rebuilding from fresh
+                # values on every retry; do not mutate the baseline/result delta.
+                entity = copy.copy(current)
+                if ('processingCompletionOutbox' in fields
+                        and current.get('processingCompletionOutbox') != baseline.get('processingCompletionOutbox')):
+                    from processing_completion import StaleProcessingResult
+                    raise StaleProcessingResult('Source completion outbox changed during artifact recovery.')
+                entity.update(fields)
+                entity['processing_metadata'] = json.dumps(processing, ensure_ascii=False, separators=(',', ':'))
+                _apply_processing_status_updates(entity, updates)
+                if error is not None:
+                    for step in failed_steps if failed_steps is not None else BROWSER_PROCESSING_STEPS:
+                        if step in BROWSER_PROCESSING_STEPS and entity.get(f'{step}_status') == 'running':
+                            entity[f'{step}_status'] = 'failed'
+                    entity['last_error'] = f'processing_failed_before_status_commit: {error}'[:1000]
+                entity.update(processing_lease_owner='', processing_lease='', processing_lease_expires_at='')
+                entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
+            with processing_diagnostics.apply_phase(user_id, filename, 'completion_validation'):
+                from processing_completion import completion_capture_enabled, prepare_completion
+                if completion_capture_enabled():
+                    from processing_artifacts import validate_receipt
+                    for kind in ('thumbnail', 'preview'):
+                        if entity.get(kind + '_status') == 'done':
+                            if is_video_file(filename) and not entity.get(kind + 'Artifact'):
+                                continue  # Browser-owned legacy video output has no worker receipt.
+                            try:
+                                validate_receipt(entity, kind)
+                            except (ValueError, KeyError, TypeError):
+                                entity[kind + '_status'] = 'failed'
+                                entity['last_error'] = 'missing_or_invalid_' + kind + '_artifact_receipt'
+                    prepare_completion(entity)
+                entity['processing_complete'] = _photo_processing_complete(entity)
             try:
                 writes += 1
                 with processing_diagnostics.apply_phase(user_id, filename, 'metadata_cas'):
