@@ -12,6 +12,14 @@ from upload_waves import ShadowWaves, Conflict, digest
 PROTOCOL = 'library-wave-v1'
 ROLES = ('core','upload','vision','cluster','index-worker','archive','recovery')
 CAPABILITIES = 'upload-wave-capabilities'
+
+
+def _supported_certificate_roles(builds):
+    # Existing immutable v1 certificates predate removal of the standing job.
+    # Keep validating their complete digest, but do not require that job to run.
+    return set(builds) in (set(ROLES), set(ROLES) | {'wave-recovery'})
+
+
 _SOURCE = ContextVar('wave_source_change', default=False)
 _FINALIZE = ContextVar('wave_finalization_check', default=None)
 
@@ -83,7 +91,7 @@ def require_capability(store,role,*,allow_cleanup=False):
     builds=json.loads(proof['deployments'])
     if (os.getenv('UPLOAD_WAVE_BOOTSTRAP_PENDING','').lower()=='true'
             or not configuration_ready() or proof.get('protocol')!=PROTOCOL
-            or set(builds)!=set(ROLES) or digest([PROTOCOL,builds])!=policy['capabilityId']
+            or not _supported_certificate_roles(builds) or digest([PROTOCOL,builds])!=policy['capabilityId']
             or os.getenv('UPLOAD_WAVE_CAPABILITY_ID','')!=policy['capabilityId']
             or not os.getenv('UPLOAD_WAVE_DEPLOYMENT_ID','')
             or builds.get(role)!=os.getenv('UPLOAD_WAVE_DEPLOYMENT_ID')):
@@ -106,7 +114,7 @@ def enroll_new(table,library,metadata=None):
     try:proof=table.get_entity(CAPABILITIES,certificate)
     except ResourceNotFoundError:raise RuntimeError('Qualified wave capabilities are missing')
     builds=json.loads(proof.get('deployments') or '{}')
-    if (proof.get('protocol')!=PROTOCOL or set(builds)!=set(ROLES)
+    if (proof.get('protocol')!=PROTOCOL or not _supported_certificate_roles(builds)
             or digest([PROTOCOL,builds])!=certificate):
         raise RuntimeError('Unsupported wave capability')
     store=ShadowWaves(table,library)

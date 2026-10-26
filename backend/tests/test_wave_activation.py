@@ -1,5 +1,6 @@
 import json
 import pytest
+from azure.core import MatchConditions
 from azure.core.exceptions import ResourceNotFoundError
 from test_wave_recovery import RuntimeTable
 from test_upload_waves import close
@@ -28,6 +29,44 @@ def test_enrollment_requires_certificate_and_new_empty_library(monkeypatch):
     assert policy.owned(table,'u')  # Paused execution never restores legacy ownership.
     metadata.create_entity(dict(PartitionKey='existing',RowKey='photo'))
     with pytest.raises(Conflict):policy.enroll_new(table,'existing',metadata)
+
+
+@pytest.mark.parametrize('retired_role', [False, True])
+def test_certificate_enrollment_and_admission_preserve_existing_release_bindings(monkeypatch, retired_role):
+    table=RuntimeTable();metadata=RuntimeTable()
+    builds={role:'build-1' for role in policy.ROLES}
+    if retired_role:builds['wave-recovery']='retired-job-build'
+    certificate=digest([policy.PROTOCOL,builds])
+    table.create_entity(dict(PartitionKey=policy.CAPABILITIES,RowKey=certificate,
+        protocol=policy.PROTOCOL,deployments=json.dumps(builds)))
+    for name in ('UPLOAD_WAVE_NEW_LIBRARIES_ENABLED','UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED',
+                 'PROCESSING_GENERATION_ENFORCEMENT_ENABLED'):
+        monkeypatch.setenv(name,'true')
+    monkeypatch.setenv('PROCESSING_MODE','backend')
+    monkeypatch.setenv('UPLOAD_WAVE_CAPABILITY_ID',certificate)
+    monkeypatch.setenv('UPLOAD_WAVE_DEPLOYMENT_ID','build-1')
+    policy.enroll_new(table,'u',metadata)
+    store=ShadowWaves(table,'u')
+    for role in policy.ROLES:policy.require_capability(store,role)
+    assert store._required('policy')['capabilityId']==certificate
+    monkeypatch.setenv('UPLOAD_WAVE_DEPLOYMENT_ID','other-build')
+    with pytest.raises(Conflict):policy.require_capability(store,'upload')
+    monkeypatch.setenv('UPLOAD_WAVE_DEPLOYMENT_ID','build-1')
+    # The immutable digest still covers the retired entry too.
+    proof=table.get_entity(policy.CAPABILITIES,certificate)
+    proof['deployments']=json.dumps(dict(builds,**{'wave-recovery':'tampered'}))
+    table.update_entity(proof,etag=proof.metadata['etag'],match_condition=MatchConditions.IfNotModified)
+    with pytest.raises(Conflict):policy.require_capability(store,'upload')
+    with pytest.raises(RuntimeError):policy.enroll_new(table,'new',metadata)
+
+
+@pytest.mark.parametrize('change', ['missing', 'unknown'])
+def test_certificate_roles_reject_missing_workers_and_unknown_roles(change):
+    builds={role:'build-1' for role in policy.ROLES}
+    if change=='missing':del builds['vision']
+    else:builds['unknown-worker']='build-1'
+    assert not policy._supported_certificate_roles(builds)
+    with pytest.raises(ValueError):policy.certify(RuntimeTable(),builds)
 
 
 @pytest.mark.parametrize('owned,source_change', [(True, True), (True, False), (False, True)])
