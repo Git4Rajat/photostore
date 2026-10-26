@@ -80,11 +80,6 @@ param clusterMinReplicas int = 0
 @allowed([true])
 param dedicatedIndexWorker bool = true
 
-@description('Provision the independent bounded wave-recovery job. Does not enable wave cutover or execution.')
-param enableWaveRecovery bool = true
-@description('Opt in to wave portal alerts; requires an existing logging workspace and activated recovery execution.')
-param enableWaveAlerts bool = false
-
 @description('Enable qualified wave execution after certificate seeding; fresh installs use deploy/fresh_wave.py.')
 param enableWaveExecution bool = true
 @description('Enroll newly created empty libraries only. Existing libraries never change ownership.')
@@ -1934,63 +1929,11 @@ output recoveryUrl string = 'https://${recovery.properties.configuration.ingress
 output archiveUrl string = 'https://${archive.properties.configuration.ingress.fqdn}'
 
 
-// Scheduled recovery is a separate execution host, not a loop in the HTTP
-// recovery/admin app. No ingress, no permanent replica, no heavy stage work.
-resource waveRecovery 'Microsoft.App/jobs@2025-01-01' = if (enableWaveRecovery) {
-  name: '${appName}-wave-recovery'
-  location: location
-  identity: { type: 'SystemAssigned' }
-  properties: {
-    environmentId: managedEnvironment.id
-    configuration: {
-      // Independent recovery also runs when browsers and workers are idle.
-      triggerType: 'Schedule'
-      replicaTimeout: 240
-      replicaRetryLimit: 1
-      scheduleTriggerConfig: {
-        cronExpression: '*/5 * * * *'
-        parallelism: 1
-        replicaCompletionCount: 1
-      }
-    }
-    template: {
-      containers: [
-        {
-          name: 'wave-recovery'
-          image: coreImage
-          command: ['python', '-u', '-m', 'wave_recovery']
-          resources: { cpu: json('0.5'), memory: '1Gi' }
-          // Bootstrap seeds the certificate before any owner library is created.
-          env: concat(backendEnv, [
-            { name: 'APP_ROLE', value: 'wave-recovery' }
-            { name: 'UPLOAD_WAVE_DEPLOYMENT_ID', value: coreImage }
-            { name: 'UPLOAD_WAVE_RECOVERY_ENABLED', value: waveBootstrapPending ? 'false' : 'true' }
-            { name: 'UPLOAD_WAVE_BOOTSTRAP_VISION_IMAGE', value: visionImage }
-            { name: 'VECTOR_INDEX_PRIME_ON_STARTUP', value: 'false' }
-          ])
-        }
-      ]
-    }
-  }
-}
-resource waveRecoveryStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for roleId in storageRoleIds: if (enableWaveRecovery) {
-  name: guid(storage.id, waveRecovery!.id, roleId)
-  scope: storage
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
-    principalId: waveRecovery!.identity.principalId
-    principalType: 'ServicePrincipal'
-  }
-}]
-
-// Optional portal alerts. Enable only once recovery execution and log ingestion
-// are qualified; absence alerts intentionally fail when that heartbeat stops.
-module waveAlerts 'wave-alerts.bicep' = if (enableWaveAlerts && !empty(logAnalyticsWorkspaceName)) {
-  name: '${appName}-wave-alerts'
-  params: {
-    appName: appName
-    location: location
-    workspaceId: logAnalyticsWorkspace!.id
-    enabled: true
-  }
-}
+// There is no standing wave-recovery compute host: no scheduled sweep, no
+// persistent job resource. Recovery rides on real wave-lifecycle events
+// (routes/upload_wave_shadow.py's opportunistic nudge) and explicit manual
+// repair; a library with no activity and nobody visiting self-heals only
+// when one of those happens again. Fresh-install certificate bootstrap and
+// same-protocol upgrade migration each provision a throwaway Manual-trigger
+// job of their own at deploy time (see deploy/fresh_wave.py, deploy/
+// upgrade_wave.py) instead of reusing a pre-declared standing resource.

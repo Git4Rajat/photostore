@@ -171,9 +171,6 @@ class ShadowWaves:
         if type(declared_count) is not int or not 0 <= declared_count <= 1_000_000:
             raise ValueError('declaredCount must be an integer between 0 and 1000000')
 
-        from wave_recovery import register_library
-        self._retry(lambda: register_library(self.table,self.library))
-
         def run():
             existing = self._get(key)
             if existing:

@@ -72,11 +72,6 @@ param dedicatedIndexWorker bool = true
 
 
 
-@description('Provision the dormant scheduled wave-recovery job; does not enable cutover.')
-param enableWaveRecovery bool = true
-@description('Opt in to wave portal alerts after activating recovery; requires logAnalyticsWorkspaceName.')
-param enableWaveAlerts bool = false
-
 @description('Enable qualified wave execution after certificate seeding; fresh installs use deploy/fresh_wave.py.')
 param enableWaveExecution bool = true
 @description('Enroll newly created empty libraries only. Existing libraries never change ownership.')
@@ -115,8 +110,6 @@ module app 'resources.bicep' = {
     clusterMinReplicas: clusterMinReplicas
     dedicatedIndexWorker: dedicatedIndexWorker
     enableIndexPush: enableIndexPush
-    enableWaveRecovery: enableWaveRecovery
-    enableWaveAlerts: enableWaveAlerts
     enableWaveExecution: enableWaveExecution
     enableNewWaveLibraries: enableNewWaveLibraries
     waveCapabilityId: waveCapabilityId

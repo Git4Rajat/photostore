@@ -143,13 +143,15 @@ def main():
     parser.add_argument('--release', required=True, help='Qualified release JSON supplied by the deployment helper')
     parser.add_argument('--rollback', action='store_true')
     args = parser.parse_args()
-    # Use only the existing recovery job's identity. There is no API endpoint,
-    # automatic recertification, account-key fallback, or grant of new roles.
+    # Runs only as a throwaway ad-hoc job the deployment helper provisions for
+    # this one execution and deletes afterward (see deploy/fresh_wave.py's
+    # run_adhoc_job). There is no API endpoint, automatic recertification,
+    # account-key fallback, or grant of new roles.
     if (os.getenv('APP_ROLE') != 'wave-recovery'
             or os.getenv('UPLOAD_WAVE_BOOTSTRAP_PENDING') != 'true'
             or any(os.getenv(k) != 'false' for k in ('UPLOAD_WAVE_EXECUTION_ENABLED',
-                'UPLOAD_WAVE_NEW_LIBRARIES_ENABLED', 'UPLOAD_WAVE_RECOVERY_ENABLED'))):
-        raise RuntimeError('Upgrade requires the explicit paused recovery job phase')
+                'UPLOAD_WAVE_NEW_LIBRARIES_ENABLED'))):
+        raise RuntimeError('Upgrade requires the explicit paused activation phase')
     release = json.loads(args.release)
     if (release.get('protocol') != PROTOCOL or release.get('qualification') != 'wave-unit-tests-passed'
             or (not args.rollback and release.get('upgradeProtocol') != PROTOCOL)):

@@ -10,7 +10,7 @@ from azure.core.exceptions import ResourceNotFoundError, ResourceExistsError
 from upload_waves import ShadowWaves, Conflict, digest
 
 PROTOCOL = 'library-wave-v1'
-ROLES = ('core','upload','vision','cluster','index-worker','wave-recovery','archive','recovery')
+ROLES = ('core','upload','vision','cluster','index-worker','archive','recovery')
 CAPABILITIES = 'upload-wave-capabilities'
 _SOURCE = ContextVar('wave_source_change', default=False)
 _FINALIZE = ContextVar('wave_finalization_check', default=None)
@@ -119,8 +119,6 @@ def enroll_new(table,library,metadata=None):
         table.submit_transaction([('create',store._row('policy',protocol=PROTOCOL,
             capabilityId=certificate,activationId=uuid.uuid4().hex,cleanupState='',createdAt=store.clock()))])
     store._retry(commit)
-    from wave_recovery import register_library
-    store._retry(lambda:register_library(table,library))
 
 
 def validate_admission(store,data,*,finalizing=False):

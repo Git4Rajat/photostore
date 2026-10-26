@@ -15,8 +15,7 @@ def deployment():
             'UPLOAD_WAVE_EXECUTION_ENABLED':'true','UPLOAD_WAVE_NEW_LIBRARIES_ENABLED':'true',
             'UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED':'true','PROCESSING_GENERATION_ENFORCEMENT_ENABLED':'true',
             'UPLOAD_WAVE_CAPABILITY_ID':certificate,'UPLOAD_WAVE_DEPLOYMENT_ID':image,
-            'UPLOAD_WAVE_RECOVERY_ENABLED':'true','APP_CONFIG_UPLOAD_WAVE_EXECUTION_ENABLED':'true',
-            'APP_CONFIG_PROCESSING_MODE':'backend'})
+            'APP_CONFIG_UPLOAD_WAVE_EXECUTION_ENABLED':'true','APP_CONFIG_PROCESSING_MODE':'backend'})
     apps=[]
     for role in ROLES:
         containers=[container(role,role)]
@@ -24,10 +23,7 @@ def deployment():
         apps.append(dict(name='test-'+role,provisioning='Succeeded',revision='ready',containers=containers,
             scale=dict(minReplicas=0,cooldownPeriod=300,rules=[dict(custom=dict(type='azure-queue',
                 metadata=dict(queueName='photostore-index-maintenance')))])))
-    job=dict(name='test-wave-recovery',identityType='SystemAssigned',containers=[container('wave-recovery','wave-recovery')],
-        configuration=dict(triggerType='Manual',replicaTimeout=240,
-            manualTriggerConfig=dict(parallelism=1)))
-    return dict(prefix='test',containerApps=apps,jobs=[job])
+    return dict(prefix='test',containerApps=apps,jobs=[])
 
 
 def test_configuration_pass_still_requires_measured_cloud_evidence():
@@ -43,19 +39,21 @@ def test_current_single_container_indexer_cannot_qualify():
     assert any('missing container index-maintenance' in e for e in check(snapshot)['blockers'])
 
 
-def test_missing_job_or_execution_pause_or_inferred_cooldown_blocks_readiness():
-    snapshot=deployment();snapshot['jobs']=[]
+def test_standing_job_or_inferred_cooldown_blocks_readiness():
+    snapshot=deployment()
+    snapshot['jobs']=[dict(name='test-wave-recovery',identityType='SystemAssigned',containers=[],
+        configuration=dict(triggerType='Schedule',replicaTimeout=240))]
     snapshot['containerApps'][0]['scale'].pop('cooldownPeriod')
     snapshot['containerApps'][2]['containers'][0]['env']['UPLOAD_WAVE_EXECUTION_ENABLED']='false'
     errors=check(snapshot)['blockers']
-    assert any('job missing' in e for e in errors)
+    assert any('standing job must not exist' in e for e in errors)
     assert any('cooldown' in e for e in errors)
     assert any('not enabled' in e for e in errors)
 
 
 def test_tagged_images_and_foreign_certificates_are_not_accepted():
     snapshot=deployment();snapshot['containerApps'][0]['containers'][0]['image']='registry/image:latest'
-    snapshot['jobs'][0]['containers'][0]['env']['UPLOAD_WAVE_CAPABILITY_ID']='a'*64
+    snapshot['containerApps'][1]['containers'][0]['env']['UPLOAD_WAVE_CAPABILITY_ID']='a'*64
     result=check(snapshot)
     assert not result['configurationReady']
     assert any('immutable' in e for e in result['blockers'])

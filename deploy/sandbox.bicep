@@ -55,7 +55,6 @@ module app 'resources.bicep' = {
     browserUploadPreparation: browserUploadPreparation
     adminPassword: adminPassword
     dedicatedIndexWorker: true
-    enableWaveRecovery: true
     enableWaveExecution: enableWaveExecution
     enableNewWaveLibraries: enableNewWaveLibraries
     waveBootstrapPending: waveBootstrapPending

@@ -10,12 +10,24 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import time
 import urllib.request
 import uuid
 from wave_release import validate_release
 
 ROOT=Path(__file__).resolve().parent
+
+# Same grants deploy/resources.bicep gives every backend app's managed
+# identity (Storage Blob/Table/Queue Data Contributor, Storage Blob
+# Delegator) -- an ad-hoc job needs the identical access to run bootstrap or
+# upgrade code against the same storage account.
+STORAGE_ROLE_IDS = (
+    'ba92f5b4-2d11-453d-a403-e96b0029c9fe',
+    '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3',
+    '974c5e8b-45b9-4653-ba55-5f855dd0fb88',
+    'db58b8e5-c6ad-4a2a-8342-4190687cbf4a',
+)
 
 
 def save(path,value):
@@ -40,7 +52,57 @@ def az(*args):
     return json.loads(result.stdout) if result.stdout.strip() else None
 
 
-def verify_inventory(apps,job,release,pending):
+def run_adhoc_job(common,resource_group,location,environment_id,storage_account_id,*,name,image,command,env):
+    """Provision a throwaway Manual-trigger Container App Job with the same
+    storage access every backend app's managed identity gets, run it once,
+    wait for completion, then delete it -- regardless of success or failure.
+
+    Used for a one-time script (certificate bootstrap, upgrade migration)
+    that needs a qualified-image compute host with storage access but must
+    never exist as a standing, always-declared resource.
+    """
+    job_id=('/subscriptions/'+common[1]+'/resourceGroups/'+resource_group
+        +'/providers/Microsoft.App/jobs/'+name)
+    body=dict(location=location,identity=dict(type='SystemAssigned'),properties=dict(
+        environmentId=environment_id,
+        configuration=dict(triggerType='Manual',replicaTimeout=900,replicaRetryLimit=0,
+            manualTriggerConfig=dict(parallelism=1,replicaCompletionCount=1)),
+        template=dict(containers=[dict(name=name,image=image,command=command,
+            resources=dict(cpu='0.5',memory='1Gi'),
+            env=[dict(name=k,value=v) for k,v in env.items()])])))
+    with tempfile.NamedTemporaryFile('w',suffix='.json',delete=False) as handle:
+        json.dump(body,handle);path=handle.name
+    try:
+        az('rest','--method','put','--url',job_id+'?api-version=2025-01-01','--body','@'+path,*common)
+        deadline=time.monotonic()+120
+        while True:
+            created=az('rest','--method','get','--url',job_id+'?api-version=2025-01-01',*common)
+            principal_id=(created.get('identity') or {}).get('principalId')
+            if principal_id:break
+            if time.monotonic()>=deadline:raise TimeoutError('Job managed identity did not provision in time: '+name)
+            time.sleep(3)
+        for role_id in STORAGE_ROLE_IDS:
+            az('role','assignment','create','--role',role_id,'--assignee-object-id',principal_id,
+                '--assignee-principal-type','ServicePrincipal','--scope',storage_account_id,*common)
+        execution=az('containerapp','job','start','-g',resource_group,'-n',name,*common)
+        execution_name=execution['name'];deadline=time.monotonic()+900
+        while True:
+            current=az('containerapp','job','execution','show','-g',resource_group,'-n',name,
+                '--job-execution-name',execution_name,*common)
+            status=current['properties']['status']
+            if status=='Succeeded':return
+            if status in ('Failed','Stopped','Degraded'):raise RuntimeError(name+' job failed; inspect logs before retrying')
+            if time.monotonic()>=deadline:raise TimeoutError(name+' job did not finish in time')
+            time.sleep(5)
+    finally:
+        os.unlink(path)
+        az('rest','--method','delete','--url',job_id+'?api-version=2025-01-01',*common)
+
+
+def verify_inventory(apps,release,pending):
+    """No standing job to verify: certificate bootstrap runs as a throwaway
+    ad-hoc job (see run_adhoc_job), created, run and deleted in the 'seed'
+    phase, so there is nothing left over here to check against."""
     found=set()
     for app in apps:
         role=app['name'].rsplit('-',1)[-1]
@@ -63,23 +125,8 @@ def verify_inventory(apps,job,release,pending):
                 UPLOAD_WAVE_NEW_LIBRARIES_ENABLED=str(not pending).lower(),PROCESSING_MODE='backend')
             if not pending:flags.update(UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED='true',PROCESSING_GENERATION_ENFORCEMENT_ENABLED='true')
             if any(env.get(k)!=v for k,v in flags.items()):raise RuntimeError('Wave environment mismatch: '+app['name'])
-    expected_roles=set(release['deployments'])-{'wave-recovery'}
-    if not expected_roles.issubset(found):raise RuntimeError('Missing wave app role')
+    if not set(release['deployments']).issubset(found):raise RuntimeError('Missing wave app role')
     if not any(a['name'].endswith('-web') for a in apps):raise RuntimeError('Missing web app')
-    config=job['properties']['configuration'];c=job['properties']['template']['containers'][0]
-    env={e['name']:e.get('value') for e in c['env']}
-    if (c['image']!=release['images']['backend'] or env.get('UPLOAD_WAVE_CAPABILITY_ID')!=release['capabilityId']
-        or env.get('UPLOAD_WAVE_DEPLOYMENT_ID')!=c['image']
-        or env.get('UPLOAD_WAVE_BOOTSTRAP_PENDING')!=str(pending).lower()
-        or env.get('UPLOAD_WAVE_RECOVERY_ENABLED')!=str(not pending).lower()
-        or env.get('UPLOAD_WAVE_EXECUTION_ENABLED')!=str(not pending).lower()
-        or env.get('UPLOAD_WAVE_NEW_LIBRARIES_ENABLED')!=str(not pending).lower()
-        or env.get('APP_ROLE')!='wave-recovery' or env.get('PROCESSING_MODE')!='backend'
-        or env.get('UPLOAD_WAVE_BOOTSTRAP_VISION_IMAGE')!=release['images']['ipworker']
-        or config['triggerType']!='Schedule'
-        or config.get('scheduleTriggerConfig',{}).get('cronExpression')!='*/5 * * * *'
-        or c['command']!=['python','-u','-m','wave_recovery']):
-        raise RuntimeError('Recovery/bootstrap job mismatch')
 
 
 def probe(outputs,email,password):
@@ -150,27 +197,29 @@ def main():
     def inventory(pending):
         base=f'https://management.azure.com/subscriptions/{args.subscription}/resourceGroups/{args.resource_group}/providers/Microsoft.App/'
         apps=az('rest','--method','get','--url',base+'containerApps?api-version=2025-01-01',*common)['value']
-        job=az('containerapp','job','show','-g',args.resource_group,'-n',args.app_name+'-wave-recovery',*common)
-        verify_inventory(apps,job,release,pending)
-        return job
+        verify_inventory(apps,release,pending)
+        return apps
     if state['phase']=='provisioning':
         print('Provisioning with intake blocked.',flush=True);deploy('bootstrap');inventory(True)
         state['phase']='seed';save(statefile,state)
     if state['phase']=='seed':
-        job=inventory(True)
-        template=job['properties']['template']
-        template['containers'][0]['command']=['python','-u','-m','wave_bootstrap']
-        # JSON is valid YAML; use the documented per-execution template override.
-        override=output/'bootstrap-job.yaml';save(override,template)
-        execution=az('containerapp','job','start','-g',args.resource_group,'-n',args.app_name+'-wave-recovery','--yaml',str(override),*common)
-        name=execution['name'];deadline=time.monotonic()+600
-        while time.monotonic()<deadline:
-            result=az('containerapp','job','execution','show','-g',args.resource_group,'-n',args.app_name+'-wave-recovery','--job-execution-name',name,*common)
-            status=result['properties']['status']
-            if status=='Succeeded':break
-            if status in ('Failed','Stopped','Degraded'):raise RuntimeError('Certificate bootstrap failed; intake remains blocked')
-            time.sleep(5)
-        else:raise TimeoutError('Bootstrap did not finish; intake remains blocked')
+        apps=inventory(True)
+        core=next(a for a in apps if a['name']==args.app_name+'-core')
+        storage_account=next(e['value'] for c in core['properties']['template']['containers']
+            for e in c.get('env',[]) if e['name']=='STORAGE_ACCOUNT_NAME')
+        storage_id=az('storage','account','show','-n',storage_account,'-g',args.resource_group,*common)['id']
+        try:
+            run_adhoc_job(common,args.resource_group,args.location,core['properties']['environmentId'],storage_id,
+                name=args.app_name+'-wave-bootstrap',image=release['images']['backend'],
+                command=['python','-u','-m','wave_bootstrap'],
+                env=dict(APP_ROLE='wave-recovery',UPLOAD_WAVE_BOOTSTRAP_PENDING='true',
+                    UPLOAD_WAVE_EXECUTION_ENABLED='false',UPLOAD_WAVE_NEW_LIBRARIES_ENABLED='false',
+                    UPLOAD_WAVE_DEPLOYMENT_ID=release['images']['backend'],
+                    UPLOAD_WAVE_BOOTSTRAP_VISION_IMAGE=release['images']['ipworker'],
+                    UPLOAD_WAVE_CAPABILITY_ID=release['capabilityId'],
+                    STORAGE_ACCOUNT_NAME=storage_account,USE_MANAGED_IDENTITY='true'))
+        except (RuntimeError,TimeoutError) as error:
+            raise RuntimeError('Certificate bootstrap failed; intake remains blocked') from error
         state['phase']='activate';save(statefile,state)
     if state['phase']=='activate':
         print('Certificate persisted. Activating wave execution/enrollment.',flush=True)

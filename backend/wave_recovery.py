@@ -1,22 +1,18 @@
-"""Bounded independently scheduled wave recovery; no API traffic is needed.
+"""Wave recovery: repairs one library's releases, settlement and sessions.
 
-Durable directory and per-library cursors prevent repeatedly scanning the first
-page. Repairs only existing releases; no missing source is called successful,
-no poison work is silently reset, and no catalog is built by recovery.
+No standing scheduled host. Called from routes/upload_wave_shadow.py's
+opportunistic per-event nudge (piggybacked on real wave-lifecycle events) and,
+for a one-off operator sweep, a throwaway Manual-trigger job provisioned and
+torn down on the fly by deploy/fresh_wave.py or deploy/upgrade_wave.py. Repairs
+only existing releases; no missing source is called successful, no poison work
+is silently reset, and no catalog is built by recovery.
 """
-import os
 import time
-from itertools import islice
-
-from azure.core import MatchConditions
-from azure.core.exceptions import ResourceNotFoundError
-from azure.data.tables import UpdateMode
 
 from upload_waves import ShadowWaves, digest
-from upload_wave_execution import (execution_enabled, stage_work_store, advance_wave, release_and_relay,
+from upload_wave_execution import (stage_work_store, advance_wave, release_and_relay,
     recover_releases, revive_stale_failed_dispatches)
 
-DIRECTORY='upload-wave-directory'
 # A session with no real activity for this long (a browser tab closed mid
 # upload, a dropped connection) is abandoned, not just slow. Measured against
 # the WAVE's own lastProgressAt (bumped by every register()/resolve() call
@@ -75,28 +71,6 @@ def _reap_stale_sessions(store,library,clock,emit,*,deadline,pages=2,work=None,s
     return reaped
 
 
-def register_library(table,library):
-    key='library!'+digest(library)
-    try:
-        return table.get_entity(DIRECTORY,key)
-    except ResourceNotFoundError:
-        pass
-    from azure.core.exceptions import ResourceExistsError
-    from azure.data.tables import TableTransactionError
-    row=dict(PartitionKey=DIRECTORY,RowKey=key,libraryId=library,waveCursor='')
-    try:
-        table.submit_transaction([('create',row)])
-    except (ResourceExistsError,TableTransactionError) as error:
-        if isinstance(error,TableTransactionError) and error.status_code != 409: raise
-    return table.get_entity(DIRECTORY,key)
-
-
-def _save(table,current,**fields):
-    row=dict(current,**fields)
-    table.submit_transaction([('update',row,dict(mode=UpdateMode.REPLACE,
-        etag=current.metadata['etag'],match_condition=MatchConditions.IfNotModified))])
-
-
 def metrics(store,wave,*,clock=time.time):
     now=clock(); state=wave['state']
     result=dict(state=state,wave_age_seconds=max(0,now-wave['createdAt']),
@@ -135,20 +109,20 @@ def recover_library(table,library,send,*,after='',wave_pages=2,release_limit=100
     in this page range advanced, any lost release notify retried, and orphaned
     processing artifacts relayed for cleanup.
 
-    This is the single implementation shared by recover()'s cross-library
-    directory sweep (scheduled/manual job) and the opportunistic per-event
-    nudge in routes/upload_wave_shadow.py's _drive() -- so the two call sites
-    can never silently drift into different recovery behavior. Returns
-    (count, errors, after) where `after` is the final wave-page cursor.
+    Called from the opportunistic per-event nudge in routes/upload_wave_shadow.py's
+    _drive() (small pass, discards the final cursor -- see `checkpoint` below).
+    A library with no further wave-lifecycle events (idle, nobody visiting)
+    has no automatic path back here; there is no standing scheduled sweep and
+    no manual-trigger UI/endpoint today. Returns (count, errors, after) where
+    `after` is the final wave-page cursor.
 
     `checkpoint`, if given, is called with the cursor after every wave (not
     just once at the end) so a caller that needs durable per-wave resume
-    (recover()'s cross-library directory sweep) doesn't lose already-advanced
-    progress if a later page in the same pass raises -- re-advancing an
-    already-advanced wave is safe/idempotent, but there is no reason to repeat
-    work a crash didn't actually undo. The per-event nudge in
-    routes/upload_wave_shadow.py omits it: it always starts a fresh small pass
-    and discards the final cursor, so per-wave durability doesn't apply there.
+    doesn't lose already-advanced progress if a later page in the same pass
+    raises -- re-advancing an already-advanced wave is safe/idempotent, but
+    there is no reason to repeat work a crash didn't actually undo. The
+    per-event nudge always starts a fresh small pass and has no durable
+    resume state of its own, so it omits this.
     """
     if deadline is None:deadline=clock()+1e9
     store=ShadowWaves(table,library,clock=clock);work=stage_work_store(table)
@@ -166,7 +140,7 @@ def recover_library(table,library,send,*,after='',wave_pages=2,release_limit=100
                 if owned(table,library):
                     policy=store._required('policy')
                     paused=bool(policy.get('cleanupState'))
-                    if not paused:require_capability(store,'wave-recovery')
+                    if not paused:require_capability(store,'upload')
                     if not paused and metadata is not None:
                         from wave_settlement import recover_supersessions
                         recover_supersessions(store,wave,metadata)
@@ -204,51 +178,3 @@ def recover_library(table,library,send,*,after='',wave_pages=2,release_limit=100
         errors+=1
         emit(event='wave_recovery_error',library_id=digest(library),reason=type(error).__name__)
     return count,errors,after
-
-
-def recover(table,send,*,max_libraries=20,wave_pages=2,clock=time.time,emit=lambda **fields:None,max_seconds=210,
-            metadata=None,cleanup_send=None):
-    if not execution_enabled() or os.getenv('UPLOAD_WAVE_RECOVERY_ENABLED','').lower()!='true':
-        return dict(libraries=0,waves=0,disabled=True)
-    if not 1<=max_libraries<=100 or not 1<=wave_pages<=10:
-        raise ValueError('Recovery bounds exceeded')
-    try:
-        cursor=table.get_entity(DIRECTORY,'scan-cursor')
-    except ResourceNotFoundError:
-        table.submit_transaction([('create',dict(PartitionKey=DIRECTORY,RowKey='scan-cursor',after=''))])
-        cursor=table.get_entity(DIRECTORY,'scan-cursor')
-    query=f"PartitionKey eq '{DIRECTORY}' and RowKey ge 'library!' and RowKey lt 'library!~'"
-    if cursor['after']: query+=f" and RowKey gt '{cursor['after']}'"
-    libraries=list(islice(table.query_entities(query,results_per_page=max_libraries),max_libraries))
-    count=0;errors=0;processed=[];deadline=clock()+max_seconds
-    for entry in libraries:
-        if clock()>=deadline:break
-        processed.append(entry)
-        library=entry['libraryId']
-        # Checkpoint after every wave, not just once at the end: if a later
-        # page in this same pass raises (e.g. a transient store._page error),
-        # already-advanced waves in earlier pages stay checkpointed instead of
-        # being re-processed (safe either way, but wasteful) on the next run.
-        waves,library_errors,after=recover_library(table,library,send,after=entry.get('waveCursor') or '',
-            wave_pages=wave_pages,clock=clock,emit=emit,metadata=metadata,cleanup_send=cleanup_send,deadline=deadline,
-            checkpoint=lambda cursor:_save(table,table.get_entity(DIRECTORY,entry['RowKey']),waveCursor=cursor))
-        count+=waves;errors+=library_errors
-        # A missing response may repeat repairs, but cannot manufacture readiness.
-        _save(table,table.get_entity(DIRECTORY,entry['RowKey']),waveCursor=after)
-    _save(table,table.get_entity(DIRECTORY,'scan-cursor'),after=processed[-1]['RowKey'] if processed and (len(libraries)==max_libraries or len(processed)<len(libraries)) else '')
-    return dict(libraries=len(processed),waves=count,errors=errors,disabled=False)
-
-
-def main():
-    # Dedicated scheduled-job host; importing app configures storage only.
-    import app
-    from wave_runtime import send_stage
-    import processing_diagnostics
-    result=recover(app.jobs_table_client,send_stage,
-        metadata=app.metadata_table_client,
-        cleanup_send=__import__('processing_cleanup').send_artifact_cleanup,
-        emit=lambda **fields:processing_diagnostics.emit(fields.pop('event'),**fields))
-    processing_diagnostics.emit('wave_recovery_run',**result)
-
-
-if __name__=='__main__': main()

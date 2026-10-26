@@ -2,7 +2,10 @@
 """Pause, verify, migrate and resume an existing same-protocol Azure wave deployment.
 
 Default is a local plan. --deploy executes; --resume repeats only unfinished
-phases. No resource provisioning, password changes, data deletion or role grants.
+phases. No password changes or data deletion. The 'migrate' phase provisions
+a throwaway Manual-trigger job to run the migration script against the same
+storage account every app already uses, then deletes it -- no standing job
+resource is created or reused.
 """
 import argparse
 import copy
@@ -12,7 +15,7 @@ import re
 import time
 import uuid
 
-from fresh_wave import az, save, verify_inventory
+from fresh_wave import az, run_adhoc_job, save, verify_inventory
 from wave_release import PROTOCOL, validate_release
 
 ROOT = Path(__file__).resolve().parent
@@ -31,11 +34,10 @@ def set_env(container, values):
     container['env'] = list(env.values())
 
 
-def target_template(resource, release, pending, *, job=False, suffix=''):
+def target_template(resource, release, pending, *, suffix=''):
     template = copy.deepcopy(resource['properties']['template'])
-    role = 'wave-recovery' if job else resource['name'].rsplit('-', 1)[-1]
-    if not job:
-        template['revisionSuffix'] = suffix
+    role = resource['name'].rsplit('-', 1)[-1]
+    template['revisionSuffix'] = suffix
     for container in template['containers']:
         image = release['images']['frontend' if role == 'web' else 'ipworker' if role == 'vision' else 'backend']
         container['image'] = image
@@ -47,9 +49,6 @@ def target_template(resource, release, pending, *, job=False, suffix=''):
             UPLOAD_WAVE_BOOTSTRAP_PENDING=str(pending).lower(), UPLOAD_WAVE_EXECUTION_ENABLED=str(not pending).lower(),
             UPLOAD_WAVE_NEW_LIBRARIES_ENABLED=str(not pending).lower(), PROCESSING_MODE='backend',
             UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED='true', PROCESSING_GENERATION_ENFORCEMENT_ENABLED='true')
-        if job:
-            flags.update(UPLOAD_WAVE_RECOVERY_ENABLED=str(not pending).lower(),
-                UPLOAD_WAVE_BOOTSTRAP_VISION_IMAGE=release['images']['ipworker'])
         set_env(container, flags)
     return template
 
@@ -111,21 +110,17 @@ def main():
     common = ('--subscription', args.subscription)
     base = ('https://management.azure.com/subscriptions/' + args.subscription + '/resourceGroups/'
         + args.resource_group + '/providers/Microsoft.App/')
-    job_name = args.app_name + '-wave-recovery'
     def inventory():
         apps = az('rest', '--method', 'get', '--url', base + 'containerApps?api-version=2025-01-01', *common)['value']
         apps = [app for app in apps if app['name'] in {args.app_name + '-' + role for role in APP_ROLES}]
         if len(apps) != len(APP_ROLES):
             raise RuntimeError('Expected all eight existing app roles')
-        job = az('containerapp', 'job', 'show', '-g', args.resource_group, '-n', job_name, *common)
-        return apps, job
-    def patch(resource, template, *, job=False):
+        return apps
+    def patch(resource, template):
         if resource['properties']['template'] == template:
             return
         body = output / 'request.json'
-        payload = dict(properties=dict(template=template))
-        if not job:
-            payload['location'] = resource['location']
+        payload = dict(properties=dict(template=template), location=resource['location'])
         save(body, payload)
         try:
             az('rest', '--method', 'patch', '--url', resource['id'] + '?api-version=2025-01-01',
@@ -133,98 +128,61 @@ def main():
         finally:
             body.unlink(missing_ok=True)
     def apply(selected, pending, label):
-        apps, job = inventory()
-        print(label + ': pausing recovery job first' if pending else label + ': updating paused recovery job', flush=True)
-        # Activation of the scheduled job happens AFTER every app is ready.
-        if pending:
-            patch(job, target_template(job, selected, True, job=True), job=True)
-        for app in apps:
+        for app in inventory():
             print(label + ': ' + app['name'], flush=True)
             patch(app, target_template(app, selected, pending, suffix='u' + state['upgradeId'][:12] + label))
-        if not pending:
-            # Keep job disabled until the app readiness verification below.
-            return
     def wait_ready(selected, pending):
         deadline = time.monotonic() + 1200
         while time.monotonic() < deadline:
-            apps, job = inventory()
             try:
-                # While app activation is in progress the job remains paused.
-                job_check = copy.deepcopy(job)
-                if not pending:
-                    job_check['properties']['template'] = target_template(job, selected, False, job=True)
-                verify_inventory(apps, job_check, selected, pending)
+                apps = inventory()
+                verify_inventory(apps, selected, pending)
                 revisions = {app['name']: az('containerapp', 'revision', 'list', '-g', args.resource_group,
                     '-n', app['name'], *common) for app in apps}
                 verify_revisions(apps, revisions)
-                return apps, job
+                return apps
             except RuntimeError as error:
                 print('Waiting: ' + str(error), flush=True)
                 time.sleep(15)
         raise TimeoutError('Roles are not ready; deployment remains at its saved phase')
-    def stop_old_jobs():
-        executions = az('containerapp', 'job', 'execution', 'list', '-g', args.resource_group, '-n', job_name, *common)
-        for execution in executions:
-            if execution.get('properties', {}).get('status') in ('Running', 'Processing', 'Pending'):
-                az('containerapp', 'job', 'stop', '-g', args.resource_group, '-n', job_name,
-                    '--job-execution-name', execution['name'], *common)
     if state['phase'] == 'prepared':
-        apps, job = inventory()
-        verify_inventory(apps, job, previous, False)
+        apps = inventory()
+        verify_inventory(apps, previous, False)
         if any(app['properties']['configuration'].get('activeRevisionsMode') != 'Single' for app in apps):
             raise RuntimeError('Upgrade requires Single revision mode for every app')
-        save(output / 'before-apps.json', apps); save(output / 'before-job.json', job)
+        save(output / 'before-apps.json', apps)
         state['phase'] = 'pause'; save(statefile, state)
     if state['phase'] == 'pause':
-        apply(previous, True, 'p'); wait_ready(previous, True); stop_old_jobs()
+        apply(previous, True, 'p'); wait_ready(previous, True)
         state['phase'] = 'stage'; save(statefile, state)
     if state['phase'] == 'stage':
-        apply(release, True, 's'); wait_ready(release, True); stop_old_jobs()
+        apply(release, True, 's'); wait_ready(release, True)
         state['phase'] = 'migrate'; save(statefile, state)
     if state['phase'] == 'migrate':
-        apps, job = wait_ready(release, True)
-        template = copy.deepcopy(job['properties']['template'])
-        container = template['containers'][0]
-        container['image'] = migrator['images']['backend']
-        container['command'] = ['python', '-u', '-m', 'wave_upgrade', '--from-capability', previous['capabilityId'],
+        apps = wait_ready(release, True)
+        core = next(a for a in apps if a['name'] == args.app_name + '-core')
+        storage_account = next(e['value'] for c in core['properties']['template']['containers']
+            for e in c.get('env', []) if e['name'] == 'STORAGE_ACCOUNT_NAME')
+        storage_id = az('storage', 'account', 'show', '-n', storage_account, '-g', args.resource_group, *common)['id']
+        command = ['python', '-u', '-m', 'wave_upgrade', '--from-capability', previous['capabilityId'],
             '--upgrade-id', state['upgradeId'], '--release', json.dumps(release, separators=(',', ':'))]
         if args.rollback:
-            container['command'].append('--rollback')
-        # Job args override any inherited entrypoint arguments.
-        container['args'] = []
-        override = output / 'upgrade-job.yaml'; save(override, template)
-        execution_name = state.get('execution')
-        if execution_name:
-            current = az('containerapp', 'job', 'execution', 'show', '-g', args.resource_group, '-n', job_name,
-                '--job-execution-name', execution_name, *common)
-            if current['properties']['status'] in ('Failed', 'Stopped', 'Degraded'):
-                execution_name = None
-        if not execution_name:
-            execution = az('containerapp', 'job', 'start', '-g', args.resource_group, '-n', job_name,
-                '--yaml', str(override), *common)
-            execution_name = execution['name']; state['execution'] = execution_name; save(statefile, state)
-        deadline = time.monotonic() + 900
-        while time.monotonic() < deadline:
-            current = az('containerapp', 'job', 'execution', 'show', '-g', args.resource_group, '-n', job_name,
-                '--job-execution-name', execution_name, *common)
-            status = current['properties']['status']
-            if status == 'Succeeded':
-                break
-            if status in ('Failed', 'Stopped', 'Degraded'):
-                raise RuntimeError('Upgrade job failed; keep roles paused, inspect logs, then --resume')
-            time.sleep(10)
-        else:
-            raise TimeoutError('Upgrade job still pending; keep paused and --resume')
+            command.append('--rollback')
+        try:
+            run_adhoc_job(common, args.resource_group, core['location'], core['properties']['environmentId'],
+                storage_id, name=args.app_name + '-wave-upgrade', image=migrator['images']['backend'],
+                command=command, env=dict(APP_ROLE='wave-recovery', UPLOAD_WAVE_BOOTSTRAP_PENDING='true',
+                    UPLOAD_WAVE_EXECUTION_ENABLED='false', UPLOAD_WAVE_NEW_LIBRARIES_ENABLED='false',
+                    UPLOAD_WAVE_CAPABILITY_ID=release['capabilityId'],
+                    UPLOAD_WAVE_DEPLOYMENT_ID=migrator['images']['backend'],
+                    STORAGE_ACCOUNT_NAME=storage_account, USE_MANAGED_IDENTITY='true'))
+        except (RuntimeError, TimeoutError) as error:
+            raise RuntimeError('Upgrade job failed; keep roles paused, inspect logs, then --resume') from error
         state['phase'] = 'activate'; save(statefile, state)
     if state['phase'] == 'activate':
-        apply(release, False, 'a'); apps, job = wait_ready(release, False)
-        patch(job, target_template(job, release, False, job=True), job=True)
-        apps, job = inventory(); verify_inventory(apps, job, release, False)
-        # Give preserved releases an immediate recovery wake instead of waiting
-        # for the next five-minute schedule. This is the ordinary recovery job.
-        az('containerapp', 'job', 'start', '-g', args.resource_group, '-n', job_name, *common)
+        apply(release, False, 'a'); wait_ready(release, False)
         state['phase'] = 'verified'; save(statefile, state)
-    apps, job = inventory(); verify_inventory(apps, job, release, False)
+    apps = inventory(); verify_inventory(apps, release, False)
     print(json.dumps(dict(verified=True, upgradeId=state['upgradeId'], capabilityId=release['capabilityId'],
         appUrl='https://' + next(app for app in apps if app['name'].endswith('-web'))['properties']['configuration']['ingress']['fqdn'])), flush=True)
 

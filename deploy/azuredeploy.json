@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.37.4.10188",
-      "templateHash": "10558217554315544850"
+      "templateHash": "8901441546037465805"
     }
   },
   "parameters": {
@@ -119,20 +119,6 @@
         "description": "Required: run derived-index maintenance on the indexer queue sidecar. Cluster publishing is no longer supported."
       }
     },
-    "enableWaveRecovery": {
-      "type": "bool",
-      "defaultValue": true,
-      "metadata": {
-        "description": "Provision the dormant scheduled wave-recovery job; does not enable cutover."
-      }
-    },
-    "enableWaveAlerts": {
-      "type": "bool",
-      "defaultValue": false,
-      "metadata": {
-        "description": "Opt in to wave portal alerts after activating recovery; requires logAnalyticsWorkspaceName."
-      }
-    },
     "enableWaveExecution": {
       "type": "bool",
       "defaultValue": true,
@@ -230,12 +216,6 @@
           "enableIndexPush": {
             "value": "[parameters('enableIndexPush')]"
           },
-          "enableWaveRecovery": {
-            "value": "[parameters('enableWaveRecovery')]"
-          },
-          "enableWaveAlerts": {
-            "value": "[parameters('enableWaveAlerts')]"
-          },
           "enableWaveExecution": {
             "value": "[parameters('enableWaveExecution')]"
           },
@@ -259,7 +239,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.37.4.10188",
-              "templateHash": "14637627663132285659"
+              "templateHash": "11776922962609103909"
             }
           },
           "parameters": {
@@ -378,20 +358,6 @@
               ],
               "metadata": {
                 "description": "Required: run index maintenance on the indexer sidecar; cluster only forwards legacy index messages."
-              }
-            },
-            "enableWaveRecovery": {
-              "type": "bool",
-              "defaultValue": true,
-              "metadata": {
-                "description": "Provision the independent bounded wave-recovery job. Does not enable wave cutover or execution."
-              }
-            },
-            "enableWaveAlerts": {
-              "type": "bool",
-              "defaultValue": false,
-              "metadata": {
-                "description": "Opt in to wave portal alerts; requires an existing logging workspace and activated recovery execution."
               }
             },
             "enableWaveExecution": {
@@ -1603,187 +1569,6 @@
                 "[resourceId('Microsoft.App/containerApps', variables('indexerAppName'))]",
                 "[resourceId('Microsoft.SignalRService/webPubSub', format('{0}-index-events', parameters('appName')))]"
               ]
-            },
-            {
-              "condition": "[parameters('enableWaveRecovery')]",
-              "type": "Microsoft.App/jobs",
-              "apiVersion": "2025-01-01",
-              "name": "[format('{0}-wave-recovery', parameters('appName'))]",
-              "location": "[parameters('location')]",
-              "identity": {
-                "type": "SystemAssigned"
-              },
-              "properties": {
-                "environmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]",
-                "configuration": {
-                  "triggerType": "Schedule",
-                  "replicaTimeout": 240,
-                  "replicaRetryLimit": 1,
-                  "scheduleTriggerConfig": {
-                    "cronExpression": "*/5 * * * *",
-                    "parallelism": 1,
-                    "replicaCompletionCount": 1
-                  }
-                },
-                "template": {
-                  "containers": [
-                    {
-                      "name": "wave-recovery",
-                      "image": "[parameters('coreImage')]",
-                      "command": [
-                        "python",
-                        "-u",
-                        "-m",
-                        "wave_recovery"
-                      ],
-                      "resources": {
-                        "cpu": "[json('0.5')]",
-                        "memory": "1Gi"
-                      },
-                      "env": "[concat(createArray(createObject('name', 'UPLOAD_WAVE_BOOTSTRAP_PENDING', 'value', if(parameters('waveBootstrapPending'), 'true', 'false')), createObject('name', 'UPLOAD_WAVE_EXECUTION_ENABLED', 'value', if(parameters('enableWaveExecution'), 'true', 'false')), createObject('name', 'UPLOAD_WAVE_NEW_LIBRARIES_ENABLED', 'value', if(parameters('enableNewWaveLibraries'), 'true', 'false')), createObject('name', 'UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED', 'value', if(or(parameters('enableWaveExecution'), parameters('enableNewWaveLibraries')), 'true', 'false')), createObject('name', 'PROCESSING_GENERATION_ENFORCEMENT_ENABLED', 'value', if(or(parameters('enableWaveExecution'), parameters('enableNewWaveLibraries')), 'true', 'false')), createObject('name', 'UPLOAD_WAVE_CAPABILITY_ID', 'value', parameters('waveCapabilityId')), createObject('name', 'INDEX_EVENTS_ENDPOINT', 'value', if(parameters('enableIndexPush'), format('https://{0}', reference(resourceId('Microsoft.SignalRService/webPubSub', format('{0}-index-events', parameters('appName'))), '2024-03-01').hostName), '')), createObject('name', 'INDEX_MAINTENANCE_QUEUE_NAME', 'value', 'photostore-index-maintenance'), createObject('name', 'INDEX_BUILD_ROLES', 'value', 'index-worker'), createObject('name', 'STORAGE_ACCOUNT_NAME', 'value', variables('storageAccountName')), createObject('name', 'USE_MANAGED_IDENTITY', 'value', 'true'), createObject('name', 'MEDIA_URL_MODE', 'value', 'sas'), createObject('name', 'MAX_UPLOAD_FILE_BYTES', 'value', '5368709120'), createObject('name', 'BLOB_IMAGE_CONTAINER', 'value', 'images'), createObject('name', 'BLOB_THUMBNAIL_CONTAINER', 'value', 'thumbnails'), createObject('name', 'BLOB_COVER_CONTAINER', 'value', 'covers'), createObject('name', 'METADATA_TABLE', 'value', 'photometadata'), createObject('name', 'ALBUMS_TABLE', 'value', 'photoalbums'), createObject('name', 'PUBLIC_ALBUM_ATTEMPTS_TABLE', 'value', 'publicalbumattempts'), createObject('name', 'ALLOWED_ORIGINS', 'value', '*'), createObject('name', 'AUTH_REQUIRED', 'value', 'true'), createObject('name', 'AUTH_MODE', 'value', 'password'), createObject('name', 'OWNER_EMAIL', 'value', parameters('adminEmail')), createObject('name', 'ACS_SENDER_ADDRESS', 'value', format('DoNotReply@{0}', reference(resourceId('Microsoft.Communication/emailServices/domains', format('{0}-email', parameters('appName')), 'AzureManagedDomain'), '2023-04-01').fromSenderDomain)), createObject('name', 'PUBLIC_APP_BASE_URL', 'value', format('https://{0}.{1}', variables('webAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)), createObject('name', 'SPA_BASE_URL', 'value', format('https://{0}.{1}', variables('webAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)), createObject('name', 'AZURE_SUBSCRIPTION_ID', 'value', subscription().subscriptionId), createObject('name', 'PROCESSING_MODE', 'value', parameters('processingMode')), createObject('name', 'BROWSER_UPLOAD_PREPARATION', 'value', if(parameters('browserUploadPreparation'), 'true', 'false')), createObject('name', 'IPWORK_REUSE_PREVIEW', 'value', if(parameters('browserUploadPreparation'), 'true', 'false')), createObject('name', 'IPWORK_REUSE_EXIF', 'value', if(parameters('browserUploadPreparation'), 'true', 'false')), createObject('name', 'IPWORK_REUSE_METADATA_PACKET', 'value', if(parameters('browserUploadPreparation'), 'true', 'false')), createObject('name', 'IPWORK_SHARED_DECODE', 'value', if(parameters('browserUploadPreparation'), 'true', 'false')), createObject('name', 'FACE_CLUSTER_EMBEDDING_VERSION', 'value', 'browser-adaface-ir101-v1-fixed'), createObject('name', 'PEOPLE_CLUSTER_EPS_2PT', 'value', '0.60'), createObject('name', 'FACE_CLUSTER_EMBEDDING_DIMENSIONS', 'value', '512'), createObject('name', 'SUSPICIOUS_FACE_CONFIDENCE', 'value', '0.55'), createObject('name', 'FACE_MIN_STORE_CONFIDENCE', 'value', '0.30'), createObject('name', 'FACE_LOW_CONFIDENCE_REJECT_BELOW', 'value', '0.36'), createObject('name', 'FACE_LOW_CONFIDENCE_MAX_AREA_RATIO', 'value', '0.08'), createObject('name', 'FACE_LOW_CONFIDENCE_MAX_SIDE_RATIO', 'value', '0.42'), createObject('name', 'PEOPLE_CLUSTER_PRESET', 'value', 'loose'), createObject('name', 'PEOPLE_CLUSTER_EPS', 'value', '0.42'), createObject('name', 'PEOPLE_CLUSTER_ABSOLUTE_MAX_PAIR_DISTANCE', 'value', '0.40'), createObject('name', 'PEOPLE_CLUSTER_MAX_PAIR_DISTANCE', 'value', '0.40'), createObject('name', 'PEOPLE_MATCH_THRESHOLD', 'value', '0.60'), createObject('name', 'PEOPLE_CLUSTER_ASSIGN_THRESHOLD', 'value', '0.62'), createObject('name', 'MIN_AUTO_FACE_MERGE_SIMILARITY', 'value', '0.60'), createObject('name', 'PEOPLE_PROPAGATE_AUTO_THRESHOLD', 'value', '0.74'), createObject('name', 'PEOPLE_PROPAGATE_REVIEW_THRESHOLD', 'value', '0.58'), createObject('name', 'MAPS_ON_UPLOAD', 'value', 'true'), createObject('name', 'MAPS_QUEUE_ON_UPLOAD', 'value', 'true'), createObject('name', 'PEOPLE_CLUSTER_MAINTENANCE_COOLDOWN_SECONDS', 'value', '1800')), createArray(createObject('name', 'APP_ROLE', 'value', 'wave-recovery'), createObject('name', 'UPLOAD_WAVE_DEPLOYMENT_ID', 'value', parameters('coreImage')), createObject('name', 'UPLOAD_WAVE_RECOVERY_ENABLED', 'value', if(parameters('waveBootstrapPending'), 'false', 'true')), createObject('name', 'UPLOAD_WAVE_BOOTSTRAP_VISION_IMAGE', 'value', parameters('visionImage')), createObject('name', 'VECTOR_INDEX_PRIME_ON_STARTUP', 'value', 'false')))]"
-                    }
-                  ]
-                }
-              },
-              "dependsOn": [
-                "[resourceId('Microsoft.Communication/emailServices/domains', format('{0}-email', parameters('appName')), 'AzureManagedDomain')]",
-                "[resourceId('Microsoft.SignalRService/webPubSub', format('{0}-index-events', parameters('appName')))]",
-                "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]"
-              ]
-            },
-            {
-              "copy": {
-                "name": "waveRecoveryStorageRoles",
-                "count": "[length(variables('storageRoleIds'))]"
-              },
-              "condition": "[parameters('enableWaveRecovery')]",
-              "type": "Microsoft.Authorization/roleAssignments",
-              "apiVersion": "2022-04-01",
-              "scope": "[format('Microsoft.Storage/storageAccounts/{0}', variables('storageAccountName'))]",
-              "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), resourceId('Microsoft.App/jobs', format('{0}-wave-recovery', parameters('appName'))), variables('storageRoleIds')[copyIndex()])]",
-              "properties": {
-                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('storageRoleIds')[copyIndex()])]",
-                "principalId": "[reference(resourceId('Microsoft.App/jobs', format('{0}-wave-recovery', parameters('appName'))), '2025-01-01', 'full').identity.principalId]",
-                "principalType": "ServicePrincipal"
-              },
-              "dependsOn": [
-                "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]",
-                "[resourceId('Microsoft.App/jobs', format('{0}-wave-recovery', parameters('appName')))]"
-              ]
-            },
-            {
-              "condition": "[and(parameters('enableWaveAlerts'), not(empty(parameters('logAnalyticsWorkspaceName'))))]",
-              "type": "Microsoft.Resources/deployments",
-              "apiVersion": "2022-09-01",
-              "name": "[format('{0}-wave-alerts', parameters('appName'))]",
-              "properties": {
-                "expressionEvaluationOptions": {
-                  "scope": "inner"
-                },
-                "mode": "Incremental",
-                "parameters": {
-                  "appName": {
-                    "value": "[parameters('appName')]"
-                  },
-                  "location": {
-                    "value": "[parameters('location')]"
-                  },
-                  "workspaceId": {
-                    "value": "[resourceId('Microsoft.OperationalInsights/workspaces', parameters('logAnalyticsWorkspaceName'))]"
-                  },
-                  "enabled": {
-                    "value": true
-                  }
-                },
-                "template": {
-                  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-                  "contentVersion": "1.0.0.0",
-                  "metadata": {
-                    "_generator": {
-                      "name": "bicep",
-                      "version": "0.37.4.10188",
-                      "templateHash": "4952026937604244867"
-                    }
-                  },
-                  "parameters": {
-                    "appName": {
-                      "type": "string"
-                    },
-                    "location": {
-                      "type": "string"
-                    },
-                    "workspaceId": {
-                      "type": "string"
-                    },
-                    "enabled": {
-                      "type": "bool",
-                      "defaultValue": false
-                    }
-                  },
-                  "variables": {
-                    "base": "ContainerAppConsoleLogs_CL\n| where ContainerAppName_s in ('${appName}-wave-recovery', '${appName}-upload')\n| extend d = parse_json(extract(@'processing telemetry (\\{.*\\})', 1, Log_s))\n",
-                    "rules": [
-                      {
-                        "name": "wave-recovery-missing",
-                        "query": "[format('{0}\n| where tostring(d.event) == ''wave_recovery_run'' and tostring(d.disabled) != ''true''\n| summarize runs=count()\n| where runs == 0', variables('base'))]",
-                        "operator": "GreaterThan"
-                      },
-                      {
-                        "name": "wave-stalled",
-                        "query": "[format('{0}\n| where tostring(d.event) == ''wave_recovery''\n| summarize arg_max(TimeGenerated, *) by tostring(d.library_id), tostring(d.wave_id)\n| where (tostring(d.state) == ''collecting'' and todouble(d.no_progress_seconds) > 86400) or (tostring(d.state) == ''waiting_predecessor'' and todouble(d.state_age_seconds) > 7200) or ((toint(d.outstanding_leases) > 0 or toint(d.outstanding_members) > 0) and todouble(d.barrier_wait_seconds) > 1800) or (toint(d.handoff_pending_count) > 0 and todouble(d.handoff_age_seconds) > 900) or todouble(d.stage_no_progress_seconds) > 1800 or toint(d.dispatch_failed_count) > 0', variables('base'))]",
-                        "operator": "GreaterThan"
-                      },
-                      {
-                        "name": "wave-recovery-failed",
-                        "query": "[format('{0}\n| where tostring(d.event) == ''wave_recovery_error'' or (tostring(d.event) == ''wave_recovery_run'' and toint(d.errors) > 0)', variables('base'))]",
-                        "operator": "GreaterThan"
-                      }
-                    ]
-                  },
-                  "resources": [
-                    {
-                      "copy": {
-                        "name": "alerts",
-                        "count": "[length(variables('rules'))]"
-                      },
-                      "type": "Microsoft.Insights/scheduledQueryRules",
-                      "apiVersion": "2023-12-01",
-                      "name": "[format('{0}-{1}', parameters('appName'), variables('rules')[copyIndex()].name)]",
-                      "location": "[parameters('location')]",
-                      "kind": "LogAlert",
-                      "properties": {
-                        "displayName": "[format('{0}: {1}', parameters('appName'), variables('rules')[copyIndex()].name)]",
-                        "description": "Wave safety signal; inspect the durable wave, stage lease and outbox before repair.",
-                        "enabled": "[parameters('enabled')]",
-                        "severity": 2,
-                        "evaluationFrequency": "PT5M",
-                        "windowSize": "PT30M",
-                        "scopes": [
-                          "[parameters('workspaceId')]"
-                        ],
-                        "autoMitigate": true,
-                        "criteria": {
-                          "allOf": [
-                            {
-                              "query": "[variables('rules')[copyIndex()].query]",
-                              "timeAggregation": "Count",
-                              "operator": "[variables('rules')[copyIndex()].operator]",
-                              "threshold": 0,
-                              "failingPeriods": {
-                                "numberOfEvaluationPeriods": 1,
-                                "minFailingPeriodsToAlert": 1
-                              }
-                            }
-                          ]
-                        },
-                        "actions": {
-                          "actionGroups": []
-                        }
-                      }
-                    }
-                  ]
-                }
-              }
             }
           ],
           "outputs": {

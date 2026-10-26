@@ -20,10 +20,10 @@ API='2025-01-01'
 ENV_NAMES={'APP_ROLE','PROCESSING_MODE','STORAGE_ACCOUNT_NAME','JOBS_TABLE',
     'UPLOAD_WAVE_EXECUTION_ENABLED','UPLOAD_WAVE_NEW_LIBRARIES_ENABLED',
     'UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED','PROCESSING_GENERATION_ENFORCEMENT_ENABLED',
-    'UPLOAD_WAVE_CAPABILITY_ID','UPLOAD_WAVE_DEPLOYMENT_ID','UPLOAD_WAVE_RECOVERY_ENABLED',
+    'UPLOAD_WAVE_CAPABILITY_ID','UPLOAD_WAVE_DEPLOYMENT_ID',
     'APP_CONFIG_UPLOAD_WAVE_EXECUTION_ENABLED','APP_CONFIG_PROCESSING_MODE'}
 STILL_REQUIRED=['durable capability certificate verification',
-    'managed identity data-plane and scheduled recovery execution',
+    'managed identity data-plane execution',
     'whole-selection admission across 900-file transport children and overlapping uploads',
     'real SDK/queue crash, duplicate delivery and stale-owner rejection',
     'assignment oracle and projection receipt coverage on controlled input',
@@ -70,7 +70,11 @@ def collect(subscription,group,prefix):
             if not link:break
             if not link.startswith(base+kind+'?'):raise ValueError('Inventory pagination escaped target scope')
             page=az('rest','--method','get','--url',link)
-        names={prefix+'-'+role for role in ROLES}|{prefix+'-wave-recovery'}
+        # No standing wave-recovery job is expected at all: recovery rides on
+        # real wave-lifecycle events and a throwaway ad-hoc job a deploy/
+        # upgrade script provisions and deletes for its own one-off run, never
+        # a resource this preflight should find lingering.
+        names={prefix+'-'+role for role in ROLES} if kind=='containerApps' else {prefix+'-wave-recovery'}
         inventory[kind]=[clean(row) for row in rows if row['name'] in names]
     return dict(at=time.time(),subscription=subscription,group=group,prefix=prefix,
         apiVersion=API,**inventory)
@@ -124,20 +128,8 @@ def check(snapshot):
                 require(any((r.get('custom') or {}).get('type')=='azure-queue' and
                     ((r.get('custom') or {}).get('metadata') or {}).get('queueName')=='photostore-index-maintenance' for r in rules),
                     label+': dedicated index-maintenance queue scaler missing')
-    job=next((row for row in snapshot['jobs'] if row['name']==prefix+'-wave-recovery'),None)
-    if job is None:errors.append(prefix+'-wave-recovery: job missing')
-    else:
-        config=job['configuration'];manual=config.get('manualTriggerConfig') or {}
-        require(config.get('triggerType')=='Manual',
-            job['name']+': must be manually triggered, not a standalone schedule -- '
-            'recovery rides on real wave-lifecycle events instead of a timer')
-        require(manual.get('parallelism')==1,job['name']+': recovery must be bounded to one replica')
-        require(0<(config.get('replicaTimeout') or 0)<=240,job['name']+': bounded timeout required')
-        require('SystemAssigned' in job['identityType'],job['name']+': managed identity missing')
-        if len(job['containers'])!=1:errors.append(job['name']+': expected one recovery container')
-        else:
-            container=job['containers'][0];backend(container,'wave-recovery',job['name'])
-            require(container['env'].get('UPLOAD_WAVE_RECOVERY_ENABLED')=='true',job['name']+': recovery scanner disabled')
+    require(not snapshot['jobs'],prefix+'-wave-recovery: a standing job must not exist -- recovery rides on real '
+        'wave-lifecycle events, and bootstrap/upgrade scripts provision their own throwaway job and delete it')
     if set(deployments)==set(CAPABILITY_ROLES):
         expected=digest([PROTOCOL,deployments])
         require(certificates=={expected},'Capability ID does not bind the exact deployed role images')

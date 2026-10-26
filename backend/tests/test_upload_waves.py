@@ -439,6 +439,6 @@ def test_contention_beyond_old_retry_budget_can_finish_without_partial_writes(wo
     monkeypatch.setattr(table, 'submit_transaction', competing)
     result = store.open_session('after-contention', 0)
     assert result['state'] == 'open'
-    assert len(attempts) == 12  # ten conflicts, directory create, intake commit
+    assert len(attempts) == 11  # ten conflicts, then the atomic intake commit
     assert len(pauses) == 10 and all(0 < pause <= .5 for pause in pauses)
-    assert len(table.transactions) == 2  # directory registration, then atomic intake
+    assert len(table.transactions) == 1  # the atomic intake commit

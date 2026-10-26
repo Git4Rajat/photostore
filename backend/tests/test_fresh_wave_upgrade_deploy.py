@@ -1,4 +1,4 @@
-"""Exercise the full helper state machine against a fake ARM/job boundary."""
+"""Exercise the full helper state machine against a fake ARM/ad-hoc-job boundary."""
 import copy
 import json
 from pathlib import Path
@@ -9,64 +9,65 @@ import pytest
 from test_fresh_wave_deploy import inventory
 from test_wave_upgrade import release
 import upgrade_wave
+import fresh_wave
 from fresh_wave import verify_inventory
 
 
 class Cloud:
     def __init__(self, old, new):
-        self.apps, self.job = inventory(old, False)
+        self.apps = inventory(old, False)
         for resource in self.apps:
             resource['id'] = '/fake/apps/' + resource['name']
             resource['location'] = 'westeurope'
             resource['properties']['configuration'] = dict(activeRevisionsMode='Single', ingress=dict(fqdn='example.test'))
-        self.job.update(id='/fake/jobs/test-wave-recovery', name='test-wave-recovery')
         self.events = []
         self.new = new
         self.statuses = {}
         self.fail_migration = False
+        self.command = None
 
     def az(self, *args):
         if args[:2] == ('rest', '--method'):
             method = args[2]
             url = args[args.index('--url') + 1]
             if method == 'get':
-                return dict(value=copy.deepcopy(self.apps))
+                if 'containerApps' in url:
+                    return dict(value=copy.deepcopy(self.apps))
+                return dict(identity=dict(principalId='11111111-1111-1111-1111-111111111111'))
+            if method == 'put':
+                body = json.loads(Path(args[args.index('--body') + 1][1:]).read_text())
+                self.command = body['properties']['template']['containers'][0]['command']
+                return None
+            if method == 'delete':
+                return None
             assert method == 'patch'
             resource_id = url.split('?')[0]
-            resource = next((app for app in self.apps if app['id'] == resource_id), self.job)
+            resource = next(app for app in self.apps if app['id'] == resource_id)
             body = json.loads(Path(args[args.index('--body') + 1][1:]).read_text())
             resource['properties']['template'] = body['properties']['template']
-            if resource is not self.job:
-                revision = resource['name'] + '--' + body['properties']['template']['revisionSuffix']
-                resource['properties'].update(latestRevisionName=revision, latestReadyRevisionName=revision)
-            self.events.append(('patch', resource.get('name', 'job')))
+            revision = resource['name'] + '--' + body['properties']['template']['revisionSuffix']
+            resource['properties'].update(latestRevisionName=revision, latestReadyRevisionName=revision)
+            self.events.append(('patch', resource['name']))
             return copy.deepcopy(resource)
+        if args[:2] == ('role', 'assignment'):
+            return None
+        if args[:3] == ('storage', 'account', 'show'):
+            return dict(id='storage-id')
         if args[:3] == ('containerapp', 'revision', 'list'):
             name = args[args.index('-n') + 1]
             app = next(app for app in self.apps if app['name'] == name)
             return [dict(name=app['properties']['latestReadyRevisionName'], properties=dict(active=True))]
-        if args[:4] == ('containerapp', 'job', 'execution', 'list'):
-            return []
+        if args[:3] == ('containerapp', 'job', 'start'):
+            name = 'execution-' + str(len(self.statuses))
+            assert self.command[:4] == ['python', '-u', '-m', 'wave_upgrade']
+            assert json.loads(self.command[self.command.index('--release') + 1]) == self.new
+            verify_inventory(self.apps, self.new, True)
+            self.events.append(('migrate', name))
+            self.statuses[name] = 'Failed' if self.fail_migration else 'Succeeded'
+            return dict(name=name)
         if args[:4] == ('containerapp', 'job', 'execution', 'show'):
             name = args[args.index('--job-execution-name') + 1]
             return dict(properties=dict(status=self.statuses[name]))
-        if args[:3] == ('containerapp', 'job', 'show'):
-            return copy.deepcopy(self.job)
-        if args[:3] == ('containerapp', 'job', 'start'):
-            name = 'execution-' + str(len(self.statuses))
-            if '--yaml' in args:
-                verify_inventory(self.apps, self.job, self.new, True)
-                template = json.loads(Path(args[args.index('--yaml') + 1]).read_text())
-                command = template['containers'][0]['command']
-                assert command[:4] == ['python', '-u', '-m', 'wave_upgrade']
-                assert json.loads(command[command.index('--release') + 1]) == self.new
-                self.events.append(('migrate', name))
-                self.statuses[name] = 'Failed' if self.fail_migration else 'Succeeded'
-            else:
-                verify_inventory(self.apps, self.job, self.new, False)
-                self.events.append(('recover', name))
-                self.statuses[name] = 'Succeeded'
-            return dict(name=name)
         pytest.fail('Unexpected Azure call: ' + str(args))
 
 
@@ -84,6 +85,7 @@ def plan(monkeypatch, tmp_path):
         '--release', str(tmp_path / 'new.json'), '--output-dir', str(output)]
     cloud = Cloud(old, new)
     monkeypatch.setattr(upgrade_wave, 'az', cloud.az)
+    monkeypatch.setattr(fresh_wave, 'az', cloud.az)
     monkeypatch.setattr(sys, 'argv', argv)
     upgrade_wave.main()
     assert not cloud.events
@@ -97,9 +99,9 @@ def test_binding_migration_occurs_only_after_both_paused_inventory_checks(plan):
     upgrade_wave.main()
     assert json.loads((output / 'state.json').read_text())['phase'] == 'verified'
     migration_index = next(i for i, event in enumerate(cloud.events) if event[0] == 'migrate')
-    # Both pauses patch recovery + all eight apps before the binding job.
-    assert migration_index == 18
-    assert cloud.events[-1][0] == 'recover'
+    # Both pauses patch all eight apps before the ad-hoc migration job runs.
+    assert migration_index == 16
+    assert cloud.events[-1][0] == 'patch'
     assert (output / 'before-apps.json').stat().st_mode & 0o777 == 0o600
 
 
@@ -109,13 +111,13 @@ def test_failed_migration_never_activates_and_resume_does_not_repeat_completed_r
     with pytest.raises(RuntimeError, match='keep roles paused'):
         upgrade_wave.main()
     assert json.loads((output / 'state.json').read_text())['phase'] == 'migrate'
-    verify_inventory(cloud.apps, cloud.job, cloud.new, True)
-    assert not any(event[0] == 'recover' for event in cloud.events)
+    verify_inventory(cloud.apps, cloud.new, True)
+    assert not any(event[0] == 'migrate' and cloud.statuses[event[1]] == 'Succeeded' for event in cloud.events)
     patches = sum(event[0] == 'patch' for event in cloud.events)
     cloud.fail_migration = False
     upgrade_wave.main()
-    # Resume migrates then activates each app and finally the recovery job.
-    assert sum(event[0] == 'patch' for event in cloud.events) == patches + 9
+    # Resume re-runs the migration job then activates each app.
+    assert sum(event[0] == 'patch' for event in cloud.events) == patches + 8
     assert json.loads((output / 'state.json').read_text())['phase'] == 'verified'
 
 

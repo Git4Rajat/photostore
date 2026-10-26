@@ -4,7 +4,7 @@ import json
 import re
 
 PROTOCOL = 'library-wave-v1'
-ROLES = ('core','upload','vision','cluster','index-worker','wave-recovery','archive','recovery')
+ROLES = ('core','upload','vision','cluster','index-worker','archive','recovery')
 IMAGE = re.compile(r'ghcr\.io/[a-z0-9_./-]+@sha256:[a-f0-9]{64}')
 
 

@@ -139,7 +139,9 @@ def inventory(r,pending):
         PROCESSING_GENERATION_ENFORCEMENT_ENABLED='true')
     def container(role):
         image=r['images']['ipworker' if role=='vision' else 'backend']
-        return dict(image=image,env=[dict(name=k,value=v) for k,v in dict(flags,APP_ROLE=role,UPLOAD_WAVE_DEPLOYMENT_ID=image).items()])
+        env=dict(flags,APP_ROLE=role,UPLOAD_WAVE_DEPLOYMENT_ID=image)
+        if role=='core':env['STORAGE_ACCOUNT_NAME']='teststorage'
+        return dict(image=image,env=[dict(name=k,value=v) for k,v in env.items()])
     apps=[]
     for role in ('core','upload','vision','cluster','indexer','archive','recovery','web'):
         containers=[container(role)]
@@ -148,29 +150,21 @@ def inventory(r,pending):
             dict(name='APP_CONFIG_UPLOAD_WAVE_EXECUTION_ENABLED',value=str(not pending).lower()),
             dict(name='APP_CONFIG_PROCESSING_MODE',value='backend')])]
         apps.append(dict(name='test-'+role,properties=dict(provisioningState='Succeeded',latestRevisionName='r',
-            latestReadyRevisionName='r',template=dict(containers=containers))))
-    c=container('wave-recovery');c['command']=['python','-u','-m','wave_recovery']
-    c['env']+= [dict(name='UPLOAD_WAVE_RECOVERY_ENABLED',value=str(not pending).lower()),
-        dict(name='UPLOAD_WAVE_BOOTSTRAP_VISION_IMAGE',value=r['images']['ipworker'])]
-    job=dict(properties=dict(configuration=dict(triggerType='Schedule',scheduleTriggerConfig=dict(cronExpression='*/5 * * * *')),
-        template=dict(containers=[c])))
-    return apps,job
+            latestReadyRevisionName='r',environmentId='test-env',template=dict(containers=containers))))
+    return apps
 
 
 @pytest.mark.parametrize('pending',[True,False])
 def test_inventory_requires_every_role_and_exact_certificate(pending):
     from copy import deepcopy
-    r=release();apps,job=inventory(r,pending)
-    fresh_wave.verify_inventory(apps,job,r,pending)
+    r=release();apps=inventory(r,pending)
+    fresh_wave.verify_inventory(apps,r,pending)
     broken=deepcopy(apps)
     broken[0]['properties']['template']['containers'][0]['image']='ghcr.io/test/backend:latest'
-    with pytest.raises(RuntimeError,match='Wrong image'):fresh_wave.verify_inventory(broken,job,r,pending)
+    with pytest.raises(RuntimeError,match='Wrong image'):fresh_wave.verify_inventory(broken,r,pending)
     broken=deepcopy(apps)
     broken[4]['properties']['template']['containers'].pop()
-    with pytest.raises(RuntimeError,match='Missing wave app role'):fresh_wave.verify_inventory(broken,job,r,pending)
-    broken=deepcopy(job)
-    next(e for e in broken['properties']['template']['containers'][0]['env'] if e['name']=='UPLOAD_WAVE_CAPABILITY_ID')['value']=''
-    with pytest.raises(RuntimeError,match='job mismatch'):fresh_wave.verify_inventory(apps,broken,r,pending)
+    with pytest.raises(RuntimeError,match='Missing wave app role'):fresh_wave.verify_inventory(broken,r,pending)
 
 
 def test_prepare_is_local_and_deploy_refuses_existing_group(monkeypatch,tmp_path):
@@ -222,11 +216,14 @@ def test_activation_waits_for_durable_bootstrap(monkeypatch,tmp_path,bootstrap_s
             pending=label.endswith('bootstrap')
             if not pending:assert 'certificate-Succeeded' in events
             return dict(properties=dict(outputs={}))
-        if args[:1]==('rest',):return dict(value=inventory(r,pending)[0])
-        if args[:3]==('containerapp','job','show'):return inventory(r,pending)[1]
+        if args[:3]==('storage','account','show'):return dict(id='storage-id')
+        if args[:2]==('role','assignment'):return None
+        if args[0]=='rest':
+            method=args[args.index('--method')+1];url=args[args.index('--url')+1]
+            if 'containerApps' in url:return dict(value=inventory(r,pending))
+            if method=='get':return dict(identity=dict(principalId='11111111-1111-1111-1111-111111111111'))
+            return None
         if args[:3]==('containerapp','job','start'):
-            template=json.loads(Path(args[args.index('--yaml')+1]).read_text())
-            assert template['containers'][0]['command']==['python','-u','-m','wave_bootstrap']
             assert pending;events.append('certificate-'+bootstrap_status)
             return dict(name='seed-execution')
         if args[:4]==('containerapp','job','execution','show'):return dict(properties=dict(status=bootstrap_status))
@@ -249,10 +246,3 @@ def test_activation_waits_for_durable_bootstrap(monkeypatch,tmp_path,bootstrap_s
         fresh_wave.main()
         assert events==['test-wave-bootstrap','certificate-Succeeded','test-wave-activate']
         assert json.loads((output/'state.json').read_text())['phase']=='verified'
-
-
-def test_inventory_rejects_manual_recovery_without_an_idle_repair_schedule():
-    r=release();apps,job=inventory(r,False)
-    job['properties']['configuration']['triggerType']='Manual'
-    with pytest.raises(RuntimeError,match='Recovery/bootstrap job mismatch'):
-        fresh_wave.verify_inventory(apps,job,r,False)
