@@ -5,9 +5,10 @@ from execution_lease import guard_operations
 from upload_waves import Conflict,digest
 
 MAX_SOURCE_ATTEMPTS=1
+MAX_INSPECTION_FAILURES=3
 
 
-def settle(store,wave_id,member,outcome,reason,*,witness,maintenance=False):
+def settle(store,wave_id,member,outcome,reason,*,witness,maintenance=False,pending_only=False):
     if outcome not in ('deleted','superseded','failed_exhausted','excluded'):
         raise ValueError('Not a terminal settlement outcome')
     payload=dict(waveId=wave_id,photoId=member['photoId'],revision=member['processingRevision'],
@@ -16,6 +17,7 @@ def settle(store,wave_id,member,outcome,reason,*,witness,maintenance=False):
     def commit():
         control=store._required('control');wave=store._required(store.wave_key(wave_id))
         old=store._required(member['RowKey'])
+        if pending_only and old['outcome'] != 'pending':return
         if old['outcome']==outcome and old['evidenceId']==identity:return
         allowed=('collecting','waiting_predecessor','processing_pending','processing') if maintenance and outcome=='deleted' else ('processing_pending','processing')
         if wave['state'] not in allowed:
@@ -71,6 +73,50 @@ def attempt(store,member):
         store.table.submit_transaction([store._change(old,row),*guard_operations(store)])
         return count
     return store._retry(commit)
+
+
+def inspection_failed(store, wave_id, member, metadata, error):
+    """Bound pre-admission failures separately from expensive source attempts.
+
+    Persist only a bounded count and exception type, never exception text.
+    Ownership loss and failures to write this record escape to stage retries.
+    A live source owner or changed revision must not be declared failed.
+    """
+    def record():
+        control = store._required('control')
+        wave = store._required(store.wave_key(wave_id))
+        current = store._required(member['RowKey'])
+        if current['outcome'] != 'pending':
+            return current
+        if wave['state'] not in ('processing_pending', 'processing'):
+            raise Conflict('Inspection failures cannot alter frozen inputs')
+        count = min(MAX_INSPECTION_FAILURES, int(current.get('inspectionFailures', 0)) + 1)
+        updated = dict(current, inspectionFailures=count, inspectionError=type(error).__name__[:80])
+        if updated != dict(current):
+            store._commit(control, [store._change(current, updated)])
+        return updated
+    current = store._retry(record)
+    if current['outcome'] != 'pending':
+        return True
+    if current['inspectionFailures'] < MAX_INSPECTION_FAILURES:
+        return False
+    # Bypass a possibly stale page snapshot for the terminal decision.
+    raw = getattr(metadata, 'table', metadata)
+    row = raw.get_entity(store.library, member['filename'])
+    from storage_utils import _processing_is_expired
+    if (row.get('anonymousImageId') != member['photoId']
+            or row.get('processingRevision') != member['processingRevision']
+            or (any(row.get(k) for k in ('processing_lease_owner', 'processing_lease',
+                                        'processing_lease_expires_at')) and not _processing_is_expired(row))):
+        return False
+    # Reload after checking the source: a concurrently settled member wins.
+    current = store._required(member['RowKey'])
+    if current['outcome'] != 'pending':
+        return True
+    settle(store, wave_id, member, 'failed_exhausted', 'inspection_failures_exhausted',
+           witness=dict(attempts=current['inspectionFailures'], error=current['inspectionError'],
+                        generation=row.get('processingGeneration', '')), pending_only=True)
+    return True
 
 
 def exhausted(store,wave_id,member,metadata,count):

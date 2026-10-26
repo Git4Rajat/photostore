@@ -34,3 +34,43 @@ def test_worker_cannot_consume_another_roles_stage(monkeypatch):
     monkeypatch.setitem(sys.modules,'app',SimpleNamespace())
     with pytest.raises(ValueError,match='Wrong app role'):
         runtime.consume(dict(userId='u',stage='index',waveId='w'))
+
+
+@pytest.mark.parametrize('errors,progressed,expected_attempts', [(1, False, 1), (0, False, 0), (1, True, 0)])
+def test_continuation_refunds_only_healthy_or_progressing_passes(monkeypatch, errors, progressed, expected_attempts):
+    from contextlib import nullcontext
+    import index_publication
+    import wave_policy
+    from tests.test_index_work import EtagTable
+    from upload_waves import ShadowWaves, digest
+    from upload_wave_execution import stage_work_store, dispatch_outbox
+    from tests.test_upload_waves import AtomicTable, close
+    from tests.test_wave_execution_consumers import register_accepted
+    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED', 'true')
+    monkeypatch.setenv('APP_ROLE', 'vision')
+    table = AtomicTable()
+    store = ShadowWaves(table, 'library-A')
+    wave_id, resolved = register_accepted(store)
+    close(store, 'parent', resolved)
+    wave = store.status(wave_id)
+    key = wave['visionPendingKey']
+    work = stage_work_store(EtagTable())
+    monkeypatch.setattr(runtime, 'stage_work_store', lambda table: work)
+    assert dispatch_outbox(work, store, store.library, key, 'vision')
+    scope = f'wave-vision:{wave_id}:{digest(key)}'
+    token = work.key(store.library, scope)
+    revision = work._get(token)['revision']
+    app = SimpleNamespace(jobs_table_client=table, metadata_table_client=object(),
+                          _ipwork_metrics_context=SimpleNamespace(collector=None), IPWORKER_CONCURRENCY=2)
+    monkeypatch.setitem(sys.modules, 'app', app)
+    monkeypatch.setattr(wave_policy, 'owned', lambda *a: False)
+    monkeypatch.setattr(index_publication, 'publication', lambda *a: nullcontext())
+    monkeypatch.setattr(runtime, '_source_executor', lambda *a: None)
+    monkeypatch.setattr(runtime, 'relay_current', lambda *a: None)
+    def run(*args, inspection_failures, **kwargs):
+        inspection_failures[0] = errors
+        return dict(wave, state='processing', lastProgressAt=float(wave.get('lastProgressAt') or 0) + int(progressed))
+    monkeypatch.setattr(runtime, 'run_vision_release', run)
+    assert runtime.consume(dict(userId=store.library, stage='vision', waveId=wave_id,
+                                scope=scope, intentRevision=revision)) == 'done'
+    assert work._get(token)['attempts'] == expected_attempts

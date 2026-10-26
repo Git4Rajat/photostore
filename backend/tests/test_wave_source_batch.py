@@ -348,3 +348,92 @@ def test_metadata_queries_bound_long_filename_filters():
     assert len(queries) > 2
     assert all(len(quote(query)) <= 6000 for query in queries)
     assert all(batch.get_entity('library-A', member['filename'])['RowKey'] == member['filename'] for member in members)
+
+
+def test_empty_serialized_outbox_requalifies_instead_of_skipping_member(world):
+    metadata, wave, key = admit(world, 1)
+    store = world[0]
+    row = metadata.rows[store.library, 'photo-0.jpg']
+    row.update(processingCompletionId='missing-completion', processingCompletionOutbox='[]')
+    calls = []
+    def process(library, filename, revision, renew):
+        calls.append(filename)
+        publish_completion(store, metadata, filename=filename)
+    assert run(world, metadata, wave, key, process)['state'] == 'ready'
+    assert calls == ['photo-0.jpg']
+    assert store.status(wave)['failedMembers'] == 0
+    assert not store._page(f'e!{wave}!m!')[0].get('inspectionFailures')
+
+
+def test_inspection_failure_has_separate_bounded_budget_and_does_not_block_siblings(world, monkeypatch):
+    import upload_wave_execution as execution
+    from wave_settlement import MAX_INSPECTION_FAILURES, verified
+    metadata, wave, key = admit(world, 2)
+    store = world[0]
+    inspect = execution._inspect_vision_member
+    def broken(store, wave, member, *args):
+        if member['filename'] == 'photo-0.jpg':
+            raise IndexError('private details must not be persisted')
+        return inspect(store, wave, member, *args)
+    monkeypatch.setattr(execution, '_inspect_vision_member', broken)
+    calls = []
+    def process(library, filename, revision, renew):
+        calls.append(filename)
+        publish_completion(store, metadata, filename=filename)
+    for attempt in range(1, MAX_INSPECTION_FAILURES + 1):
+        failures = [0]
+        result = run(world, metadata, wave, key, process, inspection_failures=failures)
+        bad = next(r for r in store._page(f'e!{wave}!m!') if r['filename'] == 'photo-0.jpg')
+        assert bad['inspectionFailures'] == attempt
+        assert bad['inspectionError'] == 'IndexError'
+        assert 'private details' not in json.dumps(bad)
+        assert failures == [int(attempt < MAX_INSPECTION_FAILURES)]
+        assert result['state'] == ('ready' if attempt == MAX_INSPECTION_FAILURES else 'processing')
+    assert bad['outcome'] == 'failed_exhausted' and verified(store, bad)
+    proof = store._get('settlement!' + bad['evidenceId'])
+    assert json.loads(proof['payload'])['reason'] == 'inspection_failures_exhausted'
+    assert calls == ['photo-1.jpg']
+    assert len(store._page('source-attempt!')) == 1
+    assert store.status(wave)['failedMembers'] == 1
+
+
+def test_transient_inspection_failure_can_recover_without_consuming_model_budget(world, monkeypatch):
+    import upload_wave_execution as execution
+    metadata, wave, key = admit(world, 1)
+    original = execution._inspect_vision_member
+    monkeypatch.setattr(execution, '_inspect_vision_member', lambda *a: (_ for _ in ()).throw(OSError('temporary')))
+    run(world, metadata, wave, key, lambda *a: pytest.fail('Model started during failed inspection'))
+    assert not world[0]._page('source-attempt!')
+    monkeypatch.setattr(execution, '_inspect_vision_member', original)
+    def process(library, filename, revision, renew):
+        publish_completion(world[0], metadata, filename=filename)
+    assert run(world, metadata, wave, key, process)['state'] == 'ready'
+    assert world[0].status(wave)['failedMembers'] == 0
+
+
+def test_inspection_failure_cannot_fail_another_active_source_owner(world, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    import upload_wave_execution as execution
+    from wave_settlement import MAX_INSPECTION_FAILURES
+    metadata, wave, key = admit(world, 1)
+    row = metadata.rows[world[0].library, 'photo-0.jpg']
+    row.update(processing_lease_owner='other',
+               processing_lease_expires_at=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat())
+    monkeypatch.setattr(execution, '_inspect_vision_member', lambda *a: (_ for _ in ()).throw(ValueError('bad')))
+    for _ in range(MAX_INSPECTION_FAILURES + 1):
+        result = run(world, metadata, wave, key, lambda *a: pytest.fail('Stole active source'))
+        assert result['state'] == 'processing'
+    member, = world[0]._page(f'e!{wave}!m!')
+    assert member['outcome'] == 'pending'
+    assert member['inspectionFailures'] == MAX_INSPECTION_FAILURES
+    assert not world[0]._page('settlement!')
+
+
+def test_inspection_ownership_loss_is_not_swallowed_or_counted(world, monkeypatch):
+    import upload_wave_execution as execution
+    metadata, wave, key = admit(world, 1)
+    monkeypatch.setattr(execution, '_inspect_vision_member', lambda *a: (_ for _ in ()).throw(OwnershipLost('lost')))
+    with pytest.raises(OwnershipLost):
+        run(world, metadata, wave, key, lambda *a: None)
+    member, = world[0]._page(f'e!{wave}!m!')
+    assert 'inspectionFailures' not in member

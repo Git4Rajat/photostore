@@ -159,6 +159,7 @@ def consume(payload,*,deadline=None,progress=None):
         work.finish(claim,failed=True)
         raise RuntimeError('Wave dispatch attempts exhausted; operator retry required')
     leases=ExecutionLeases(store.table,partition=store.partition)
+    healthy_continuation = True
     try:
         # Dispatcher bookkeeping is renewed separately from stage ownership.
         with publication(work,claim):
@@ -206,12 +207,15 @@ def consume(payload,*,deadline=None,progress=None):
                     except Exception:
                         try:app.app.logger.exception('Wave tag invalidation failed for %s; continuing without it',library)
                         except Exception:pass
+                inspection_failures = [0]
                 result=run_vision_release(leases,work,store,library,wave_id,key,
                     app.metadata_table_client,None,None,send_stage,process_source=process_with_metrics,
                     deadline=deadline,progress=progress,before_freeze=invalidate_tags,
                     source_workers=app.IPWORKER_CONCURRENCY,
                     source_executor=_source_executor(app.IPWORKER_CONCURRENCY),
-                    prepare_sources=prepare_sources)
+                    prepare_sources=prepare_sources, inspection_failures=inspection_failures)
+                healthy_continuation = not (inspection_failures[0] and result
+                    and float(result.get('lastProgressAt') or 0) <= float(wave.get('lastProgressAt') or 0))
             elif stage=='cluster':
                 # Bounded zero-face probes continue on Cluster wakes without
                 # loading FAISS. The release remains eligible while probing.
@@ -239,7 +243,7 @@ def consume(payload,*,deadline=None,progress=None):
                 with catalog_serialization(store.table,library,app.blob_service_client,app.BLOB_LEXICAL_INDEX_CONTAINER):
                     result=run_index_release(leases,store,library,wave_id,key,ledger,publisher=publish,prepare=prepare)
         if result and result['state'] in ('processing_pending','processing','ready'):
-            work.release(claim,deferred=True,retry_delay=5)
+            work.release(claim,deferred=healthy_continuation,retry_delay=5)
         else:
             work.finish(claim)
         current=store._required(store.wave_key(wave_id))

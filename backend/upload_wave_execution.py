@@ -308,10 +308,13 @@ def _observe_qualified(store, member, metadata_table, receipts=None):
     if not identity:
         return None, row
     completion = _completion(store, member, identity, receipts)
-    if completion is None and row.get('processingCompletionOutbox'):
+    backlog = json.loads(row.get('processingCompletionOutbox') or '[]') if completion is None else []
+    if not isinstance(backlog, list):
+        raise ValueError('Processing completion outbox must be a list')
+    if completion is None and backlog:
         from processing_completion import relay_completion
         from processing_receipts import ArtifactReceipts
-        head = json.loads(row['processingCompletionOutbox'])[0]
+        head = backlog[0]
         if (all(head.get(key) == value for key, value in dict(library=store.library,
                 filename=member['filename'], photoId=member['photoId'],
                 revision=member['processingRevision'], generation=row.get('processingGeneration')).items())
@@ -348,12 +351,12 @@ def _inspect_vision_member(store, wave_id, member, metadata_table, receipts):
     return dict(member=member, completion=completion, row=row, runnable=runnable)
 
 
-def _process_vision_group(store, wave_id, members, metadata, process_source, renew, progressed, executor, receipts):
+def _process_vision_group(store, wave_id, members, metadata, process_source, renew, progressed, executor, receipts, inspection_failures=None):
     """Parallel source effects; the coordinator alone updates wave evidence."""
     from contextvars import copy_context
     from concurrent.futures import wait
     from execution_lease import OwnershipLost
-    from wave_settlement import exhausted
+    from wave_settlement import exhausted, inspection_failed
     from wave_source_batch import reserve_attempts
     from storage_utils import _processing_is_expired
     import logging
@@ -364,7 +367,12 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
             item = _inspect_vision_member(store, wave_id, member, metadata, receipts)
         except (OwnershipLost, NotImplementedError):
             raise
-        except Exception:
+        except Exception as error:
+            # Inspection has its own budget: it happens before model admission.
+            # Failure to persist this evidence must escape to stage retry handling.
+            settled = inspection_failed(store, wave_id, member, metadata, error)
+            if not settled and inspection_failures is not None:
+                inspection_failures[0] += 1
             logger.exception('Vision member inspection failed for %s/%s; continuing wave',
                              store.library, member['filename'])
             continue
@@ -439,7 +447,7 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
 def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
                        metadata_table, face_table, face_ids, cluster_send, *, process_source=None,
                        deadline=None, progress=None, before_freeze=None, source_workers=1, source_executor=None,
-                       prepare_sources=None):
+                       prepare_sources=None, inspection_failures=None):
     """Resume bounded source/evaluation passes using qualified receipts.
 
     A checkpoint is a scan position, never proof of source completion. Each
@@ -502,7 +510,7 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
                     renew()
                     group = members[offset:offset + source_workers]
                     observations.extend(_process_vision_group(store, wave_id, group,
-                        metadata, process_source, renew, progressed, executor, receipts))
+                        metadata, process_source, renew, progressed, executor, receipts, inspection_failures))
                     cursor = group[-1]['RowKey']
                     progressed()
                 # A checkpoint covers only drained groups. Source results are

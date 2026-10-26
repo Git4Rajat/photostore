@@ -154,3 +154,26 @@ process; phase thread CPU excludes native helper threads. Storage deltas carry
 scope can contribute to them. This label also applies to Vision's existing
 `processing_apply_phase` events. Missing storage counters mean no performance
 scope was available, rather than zero storage activity.
+
+### Bounded Vision inspection failures
+
+An empty serialized completion outbox (`"[]"`) is treated as having no relayable
+intent. It does not establish successful processing: normal receipt qualification
+or the fenced source adapter must still provide completion evidence.
+
+Inspection exceptions occur before source-attempt admission. Pending members now
+persist a separate `inspectionFailures` counter (maximum three) and
+`inspectionError` exception type. At exhaustion, a matching source without a live
+lease is settled as `failed_exhausted` with reason
+`inspection_failures_exhausted` and a durable settlement witness. This counts as
+a failure, never successful inference, and allows other members to reach the
+clustering barrier. Completed members and active source owners are protected;
+ownership loss or failure to persist inspection evidence propagates to stage
+retry handling. The existing one-attempt model-processing limit is unchanged.
+
+A Vision continuation containing unresolved inspection errors and no advance in
+`lastProgressAt` retains its dispatch-attempt charge. Healthy waiting and passes
+that advance member progress retain their existing continuation behavior. Five
+failed dispatch attempts remain the stage limit; exhaustion requires operator
+retry rather than an indefinite loop. Updating inspection counters alone does
+not count as member progress.
