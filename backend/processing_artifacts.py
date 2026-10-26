@@ -96,7 +96,7 @@ def promote_prepared(storage, metadata):
     Upload finalization can mark the shared preparation blobs done without an
     attempt receipt. Read bounded, ETag-pinned bytes, then publish a create-only
     copy under the current source fence. The caller commits the new pointers
-    with its normal result CAS; never overwrite an existing receipt or blob.
+    with its normal result CAS; retain valid current receipts and immutable blobs.
     """
     from image_utils import is_video_file
     from processing_fence import current_fence
@@ -107,8 +107,17 @@ def promote_prepared(storage, metadata):
     if is_video_file(metadata['RowKey']):
         return  # Video preparation remains browser-owned.
     for kind in ('thumbnail', 'preview'):
-        if metadata.get(kind + '_status') != 'done' or metadata.get(kind + 'Artifact'):
+        if metadata.get(kind + '_status') != 'done':
             continue
+        if metadata.get(kind + 'Artifact'):
+            try:
+                validate_receipt(metadata, kind)
+            except (ValueError, KeyError, TypeError):
+                # Older rows can retain a previous source's receipt. Rebuild
+                # from this photo's prepared bytes, never relabel old proof.
+                pass
+            else:
+                continue
         name = fence.photo if kind == 'thumbnail' else f'preview/{fence.photo}.jpg'
         blob = storage._get_blob_client(storage._CTX['blob_thumbnail_container'], name)
         data, _ = _read(blob, kind)
@@ -120,7 +129,7 @@ def derivative_blob(metadata, kind, fallback):
     if not raw:
         return fallback
     receipt = json.loads(raw)
-    if (receipt.get('schemaVersion') != 1 or receipt.get('kind') != kind
+    if (not isinstance(receipt, dict) or receipt.get('schemaVersion') != 1 or receipt.get('kind') != kind
             or receipt.get('photoId') != metadata.get('anonymousImageId')
             or receipt.get('blob') != published_name(receipt['library'], receipt['photoId'],
                 receipt['revision'], kind, receipt['sha256'])

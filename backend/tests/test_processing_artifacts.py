@@ -278,3 +278,59 @@ def test_unfenced_legacy_publication_keeps_its_existing_content_type(monkeypatch
     storage_utils._publish_processing_derivative({'RowKey': 'legacy.png'}, 'thumbnail', b'legacy-png',
         filename='legacy.png', content_type='image/png')
     assert writes == [('thumbnail', 'legacy.png', b'legacy-png', 'image/png')]
+
+
+@pytest.mark.parametrize('kind', ['thumbnail', 'preview'])
+@pytest.mark.parametrize('invalid', ['photo', 'revision', 'malformed', 'list', 'null'])
+def test_prepared_promotion_replaces_stale_receipts_using_current_photo_bytes(blobs, kind, invalid):
+    from processing_artifacts import promote_prepared, verify_receipt, published_name
+    (metadata, *_, fence), objects = blobs
+    row = metadata.get_entity('lib', 'photo.jpg')
+    with result_fence(fence):
+        previous = publish(storage_utils, row, kind, data=jpeg('red'))
+    old_blob = previous['blob']
+    if invalid in ('malformed', 'list', 'null'):
+        row[kind + 'Artifact'] = {'malformed': 'not-json', 'list': '[]', 'null': 'null'}[invalid]
+    else:
+        stale = dict(previous)
+        stale['photoId' if invalid == 'photo' else 'revision'] = 'previous-source'
+        stale['blob'] = published_name(stale['library'], stale['photoId'], stale['revision'], kind, stale['sha256'])
+        row[kind + 'Artifact'] = json.dumps(stale)
+    row[kind + '_status'] = 'done'
+    prepared = Blob(); prepared.data = jpeg('blue'); prepared.version = 1
+    objects['photo' if kind == 'thumbnail' else 'preview/photo.jpg'] = prepared
+    with result_fence(fence):
+        promote_prepared(storage_utils, row)
+        current = verify_receipt(storage_utils, row, kind)
+    assert current['photoId'] == fence.photo and current['revision'] == fence.revision
+    assert current['sha256'] != previous['sha256']
+    assert objects[current['blob']].data == jpeg('blue')
+    assert objects[old_blob].data == jpeg('red')
+
+
+@pytest.mark.parametrize('kind', ['thumbnail', 'preview'])
+def test_prepared_promotion_preserves_valid_receipt_without_reading_preparation(blobs, monkeypatch, kind):
+    from processing_artifacts import promote_prepared
+    (metadata, *_, fence), _ = blobs
+    row = metadata.get_entity('lib', 'photo.jpg')
+    with result_fence(fence):
+        publish(storage_utils, row, kind, data=jpeg())
+        row[kind + '_status'] = 'done'
+        original = row[kind + 'Artifact']
+        monkeypatch.setattr(storage_utils, '_get_blob_client', lambda *a: pytest.fail('Reread valid prepared artifact'))
+        promote_prepared(storage_utils, row)
+    assert row[kind + 'Artifact'] == original
+
+
+@pytest.mark.parametrize('kind', ['thumbnail', 'preview'])
+def test_stale_receipt_repair_rejects_invalid_prepared_bytes(blobs, kind):
+    from processing_artifacts import promote_prepared
+    (metadata, *_, fence), objects = blobs
+    row = metadata.get_entity('lib', 'photo.jpg')
+    row.update({kind + '_status': 'done', kind + 'Artifact': '{}'})
+    prepared = Blob(); prepared.data = b'not-an-image'; prepared.version = 1
+    objects['photo' if kind == 'thumbnail' else 'preview/photo.jpg'] = prepared
+    with result_fence(fence), pytest.raises((ValueError, OSError)):
+        promote_prepared(storage_utils, row)
+    assert row[kind + 'Artifact'] == '{}'
+    assert not any(name.startswith('derived/') for name in objects)

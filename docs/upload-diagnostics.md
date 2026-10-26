@@ -177,3 +177,18 @@ that advance member progress retain their existing continuation behavior. Five
 failed dispatch attempts remain the stage limit; exhaustion requires operator
 retry rather than an indefinite loop. Updating inspection counters alone does
 not count as member progress.
+
+### Derivative receipts after replacement uploads
+
+Upload finalization clears `thumbnailArtifact` and `previewArtifact` when it
+allocates a new processing revision. Explicit empty values clear these columns
+through both conditional replacement and legacy merge persistence. A retry with
+the same physical photo, content hash, and existing revision retains its receipts.
+Historical completion outboxes and immutable derivative blobs remain intact.
+
+Prepared-derivative promotion skips a receipt only after validating its current
+photo/revision binding and structure. Stale or malformed receipts are replaced
+by reading the current photo's browser-prepared bytes, validating them, and
+publishing immutable artifacts under the active source fence. Old receipt IDs
+are never relabeled as proof of new content. This does not automatically
+reopen members already settled as failed in a frozen wave.

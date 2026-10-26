@@ -10494,6 +10494,11 @@ def finalize_uploaded_file(
             file_hash=next_source[0], is_video=is_video))
         metadata['artifactReceipt'] = ''
         metadata['processingCompletionPending'] = ''
+        # Receipts bind derivatives to an exact photo/revision. Explicit empty
+        # values also clear stale columns when legacy persistence uses MERGE.
+        # Same-source finalize retries retain their generation and receipts.
+        metadata['thumbnailArtifact'] = ''
+        metadata['previewArtifact'] = ''
     apply_upload_hash_result(metadata, file_hash)
     metadata.setdefault('peopleIds', json.dumps([]))
 
