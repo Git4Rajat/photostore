@@ -73,7 +73,7 @@ class ArtifactReceipts:
         # Required image face work and positive counts still need proof.
         if 'face' not in required and metadata.get('faceCount') is None:
             metadata['faceCount'] = 0
-        derivatives = {kind: verify_receipt(storage, metadata, kind) for kind in ('thumbnail', 'preview')
+        derivatives = {kind: verify_receipt(storage, metadata, kind, reuse_published=True) for kind in ('thumbnail', 'preview')
                        if statuses[kind] == 'done' and (kind in required or metadata.get(kind + 'Artifact'))}
         snapshot_ids = []
         lookup_generation = ''

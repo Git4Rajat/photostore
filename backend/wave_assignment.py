@@ -1,9 +1,9 @@
 """Frozen, disk-ordered wave inputs and write-ahead per-face decisions.
 
-The wave partition is the authority: input publication, decisions, applied
-markers and final coverage are fenced by the stage lease in the SAME Table
-transaction. People/membership/face tables are recoverable materializations of
-those immutable decisions. They use create-only or genuine-ETag writes.
+Table-backed journals fence each record in a stage-ownership transaction.
+The mounted-file path flushes its snapshot before publishing a fenced Table
+marker, then flushes decisions before conditional materialization. Both retain
+compact completion receipts and create-only or genuine-ETag entity writes.
 
 A private FAISS runtime is rebuilt from the frozen baseline on each attempt,
 then committed decisions are replayed in order. No checkpoint can introduce
@@ -399,7 +399,7 @@ def _assignment_lock(assigner, library):
         yield guard
 
 
-def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128, progress=lambda count: None):
+def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128, progress=lambda count: None, local_journal=False):
     """One logical pass; page_size changes neither decisions nor recovery IDs.
 
     inputs is a callable yielding frozen face dictionaries, used only while
@@ -416,20 +416,27 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
         algorithm='canonical-faiss-v1', threshold=config.threshold, margin=config.margin,
         candidates=config.candidates, nprobe=config.nprobe, deltaLimit=config.delta_limit,
         threads=config.threads, indexConfig=asdict(config.index_config))
-    journal = WaveAssignmentJournal(store, wave['waveId'], check)
     # Keep the existing library assignment lease/lock: legacy assignments cannot
     # race baseline capture or a wave's materialization within the same owner.
     with _assignment_lock(assigner, store.library) as library_guard:
         class Guard:
             def check(self):
                 check(); library_guard.check()
+
+            def boundary(self):
+                getattr(check, "boundary", check)()
+                library_guard.check()
         guard = Guard()
         guard.check()
         invalidate(store.library)  # A wave never publishes a partial legacy cache.
         with tempfile.TemporaryDirectory(prefix='photostore-wave-', dir=config.work_dir) as directory:
             workspace = Workspace(directory + '/manifest.sqlite3')
             runtime = None
+            resources = ExitStack()
             try:
+                from wave_assignment_files import assignment_journal
+                journal = resources.enter_context(assignment_journal(store, wave['waveId'], check,
+                    share=assigner.config.checkpoint_dir if local_journal else None, local=directory))
                 header = journal.prepare(workspace, inputs, assigner, binding,
                     getattr(library_guard, 'checkpoint_revision', None))
                 guard.check()
@@ -445,6 +452,7 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
                 for position, face in enumerate(workspace.inputs()):
                     guard.check()
                     if position % page_size == 0:
+                        guard.boundary()
                         workspace.db.commit()
                     decision = journal.decision(position)
                     if decision is None:
@@ -474,5 +482,6 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
             finally:
                 if runtime is not None:
                     runtime.close()
+                resources.close()
                 workspace.close()
                 invalidate(store.library)

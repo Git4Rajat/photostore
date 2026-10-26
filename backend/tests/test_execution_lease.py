@@ -162,3 +162,21 @@ def test_keepalive_renews_while_the_main_thread_is_in_a_blocking_operation(lease
     with leases.keepalive(ownership) as check:
         assert renewed.wait(timeout=1)
         check()
+
+
+def test_local_keepalive_checks_do_not_read_tables_and_cannot_extend_expiry(leases, monkeypatch):
+    import execution_lease as execution
+    now = [0.0]
+    monkeypatch.setattr(execution.time, 'monotonic', lambda: now[0])
+    ownership = leases.claim('lib', 'wave', 'cluster', 'rev')
+    reads = []
+    original = leases._get
+    monkeypatch.setattr(leases, '_get', lambda key: (reads.append(key), original(key))[1])
+    with pytest.raises(OwnershipLost, match='validity elapsed'):
+        with leases.keepalive(ownership, local_checks=True) as check:
+            baseline = len(reads)
+            for _ in range(1000):
+                check()
+            assert len(reads) == baseline
+            now[0] += leases.lease_seconds + 1
+            check()

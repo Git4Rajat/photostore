@@ -260,3 +260,26 @@ def test_outbox_recovery_cannot_overwrite_a_concurrent_completion(blobs, monkeyp
     with pytest.raises(StaleProcessingResult, match='outbox changed'):
         storage_utils._commit_worker_processing_results('lib', 'photo.jpg', baseline, result, [], 'owner')
     assert json.loads(metadata.get_entity('lib', 'photo.jpg')['processingCompletionOutbox']) == [{'id': 'concurrent'}]
+
+
+def test_capture_reuses_same_attempt_publication_readback_for_both_derivatives(blobs, monkeypatch):
+    from processing_artifacts import publish
+    from test_processing_artifacts import jpeg
+    (metadata, _, _, _, fence), _ = blobs
+    row = terminal(dict(metadata.get_entity('lib', 'photo.jpg')))
+    receipts = ArtifactReceipts(AtomicTable(), 'lib')
+    original = storage_utils._get_blob_client
+    with result_fence(fence):
+        for kind in ('thumbnail', 'preview'):
+            publish(storage_utils, row, kind, data=jpeg())
+            row[kind + '_status'] = 'done'
+        storage_utils._store_client_face_entities('lib', 'photo.jpg', [])
+        monkeypatch.setattr(storage_utils, '_get_blob_client',
+                            lambda *a: pytest.fail('Downloaded just-verified immutable output again'))
+        assert receipts.capture(storage_utils, row)
+    # A new attempt must independently verify persisted artifacts.
+    accessed = []
+    monkeypatch.setattr(storage_utils, '_get_blob_client', lambda *a: (accessed.append(a), original(*a))[1])
+    with result_fence(fence):
+        assert receipts.capture(storage_utils, row)
+    assert len(accessed) == 2

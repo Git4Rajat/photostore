@@ -87,6 +87,8 @@ def publish(storage, metadata, kind, *, data=None, staged=False):
         attempt=fence.attempt, kind=kind, blob=name, sha256=content_hash, size=len(data),
         width=width, height=height, etag=str(props.etag))
     metadata[kind + 'Artifact'] = json.dumps(receipt, sort_keys=True, separators=(',', ':'))
+    from processing_fence import remember_published_derivative
+    remember_published_derivative(receipt)
     return receipt
 
 
@@ -157,8 +159,12 @@ def validate_receipt(metadata, kind, *, current_revision=True):
     return receipt
 
 
-def verify_receipt(storage, metadata, kind):
+def verify_receipt(storage, metadata, kind, *, reuse_published=False):
     receipt = validate_receipt(metadata, kind)
+    if reuse_published:
+        from processing_fence import published_derivative_matches
+        if published_derivative_matches(receipt):
+            return receipt
     blob = storage._get_blob_client(storage._CTX['blob_thumbnail_container'], receipt['blob'])
     data, props = _read(blob, kind)
     if (str(props.etag) != receipt['etag'] or hashlib.sha256(data).hexdigest() != receipt['sha256']

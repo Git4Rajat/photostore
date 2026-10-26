@@ -5,6 +5,7 @@ then check the source attempt, and condition its write on that artifact version.
 Never retry a rejected write against a newer artifact version.
 """
 import contextvars
+import json
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ from azure.data.tables import UpdateMode
 from processing_completion import StaleProcessingResult
 
 _ACTIVE = contextvars.ContextVar('processing_result_fence', default=None)
+_PUBLISHED = contextvars.ContextVar('attempt_verified_derivatives', default=None)
 POLICY_CHECK = None
 
 
@@ -61,9 +63,11 @@ class ResultFence:
 @contextmanager
 def result_fence(fence):
     token = _ACTIVE.set(fence)
+    published = _PUBLISHED.set({})
     try:
         yield
     finally:
+        _PUBLISHED.reset(published)
         _ACTIVE.reset(token)
 
 
@@ -96,3 +100,18 @@ def write_artifact(table, entity, *, previous=None, previous_known=False):
             raise StaleProcessingResult('Processing artifact requires a genuine ETag.')
         table.update_entity(row, mode=UpdateMode.REPLACE, etag=version,
                             match_condition=MatchConditions.IfNotModified)
+
+
+def remember_published_derivative(receipt):
+    """Only called after publication read-back proved these immutable bytes."""
+    fence, verified = _ACTIVE.get(), _PUBLISHED.get()
+    if (fence is not None and verified is not None
+            and receipt.get('library') == fence.library and receipt.get('photoId') == fence.photo
+            and receipt.get('revision') == fence.revision and receipt.get('attempt') == fence.attempt):
+        verified[receipt['kind']] = json.dumps(receipt, sort_keys=True, separators=(',', ':'))
+
+
+def published_derivative_matches(receipt):
+    verified = _PUBLISHED.get()
+    return (verified is not None and verified.get(receipt.get('kind'))
+            == json.dumps(receipt, sort_keys=True, separators=(',', ':')))

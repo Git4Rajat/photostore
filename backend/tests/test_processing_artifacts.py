@@ -334,3 +334,35 @@ def test_stale_receipt_repair_rejects_invalid_prepared_bytes(blobs, kind):
         promote_prepared(storage_utils, row)
     assert row[kind + 'Artifact'] == '{}'
     assert not any(name.startswith('derived/') for name in objects)
+
+
+def test_capture_can_reuse_just_published_bytes_but_other_attempts_must_verify(blobs, monkeypatch):
+    from processing_artifacts import verify_receipt
+    (metadata, *_, fence), _ = blobs
+    row = metadata.get_entity('lib', 'photo.jpg')
+    original = storage_utils._get_blob_client
+    reads = []
+    monkeypatch.setattr(storage_utils, '_get_blob_client', lambda *a: (reads.append(a), original(*a))[1])
+    with result_fence(fence):
+        receipt = publish(storage_utils, row, 'thumbnail', data=jpeg())
+        reads.clear()
+        assert verify_receipt(storage_utils, row, 'thumbnail', reuse_published=True) == receipt
+        assert not reads
+        # Ordinary verification still checks the blob even inside this attempt.
+        verify_receipt(storage_utils, row, 'thumbnail')
+        assert reads
+    with result_fence(fence):
+        reads.clear()
+        verify_receipt(storage_utils, row, 'thumbnail', reuse_published=True)
+        assert reads  # Reentering even the same fence cannot reuse old trust.
+
+
+def test_modified_receipt_cannot_use_publication_verification_cache(blobs):
+    from processing_artifacts import verify_receipt
+    (metadata, *_, fence), _ = blobs
+    row = metadata.get_entity('lib', 'photo.jpg')
+    with result_fence(fence):
+        receipt = publish(storage_utils, row, 'thumbnail', data=jpeg())
+        row['thumbnailArtifact'] = json.dumps(dict(receipt, etag='another-version'))
+        with pytest.raises(ValueError, match='no longer matches'):
+            verify_receipt(storage_utils, row, 'thumbnail', reuse_published=True)

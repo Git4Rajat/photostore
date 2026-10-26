@@ -10181,10 +10181,12 @@ def apply_client_processing_results_for_file(
             apply_completed = True
             if artifact_fence and _CTX.get('source_artifact_receipt_capture'):
                 from processing_artifacts import promote_prepared
-                promote_prepared(sys.modules[__name__], metadata)
+                with processing_diagnostics.apply_phase(user_id, filename, 'derivative_promotion'):
+                    promote_prepared(sys.modules[__name__], metadata)
                 candidate = dict(metadata)
                 _apply_processing_status_updates(candidate, batch)
-                receipt = _CTX['source_artifact_receipt_capture'](user_id, candidate)
+                with processing_diagnostics.apply_phase(user_id, filename, 'artifact_capture'):
+                    receipt = _CTX['source_artifact_receipt_capture'](user_id, candidate)
                 if receipt:
                     # Capture can normalize the video zero-face contract and
                     # retire a known invalid video outbox entry. Commit those

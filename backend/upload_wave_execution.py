@@ -554,9 +554,9 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
 
 def _iter_wave_faces(store, wave_id, *, renew=lambda: None):
     """Read one bounded member page and one immutable face snapshot at a time."""
-    from processing_receipts import ArtifactReceipts
+    from wave_source_batch import ReceiptBatch
     from upload_waves import MAX_PAGE
-    receipts = ArtifactReceipts(store.table, store.library)
+    receipts = ReceiptBatch(store.table, store.library)
     after = ''
     while True:
         renew()
@@ -568,7 +568,7 @@ def _iter_wave_faces(store, wave_id, *, renew=lambda: None):
                 if verified(store,member):continue
             if member['outcome'] != 'settled' or not member.get('evidenceQualified'):
                 raise ValueError('Frozen member lacks qualified completion evidence')
-            completion = _completion(store, member, member['evidenceId'])
+            completion = _completion(store, member, member['evidenceId'], receipts)
             if completion is None:
                 raise ValueError('Frozen completion receipt is missing')
             intent, manifest = completion
@@ -622,16 +622,22 @@ def run_cluster_release(leases, store, library, wave_id, outbox_key, *,
             _execution_check(leases, ownership, store, outbox_key)
             leases.renew(ownership)
         from wave_assignment import run_frozen_assignment
-        with leases.keepalive(ownership) as owned:
+        import time
+        next_check = [0.0]
+        with leases.keepalive(ownership, local_checks=True) as owned:
             @processing_diagnostics.wave_phase('guard_check')
-            def check():
+            def check(force=False):
                 with processing_diagnostics.wave_phase_scope('guard_keepalive_check'):
                     owned()
-                _execution_check(leases, ownership, store, outbox_key)
+                if force or time.monotonic() >= next_check[0]:
+                    _execution_check(leases, ownership, store, outbox_key)
+                    next_check[0] = time.monotonic() + 1.0
+            check.boundary = lambda: check(force=True)
             assignment_receipt = run_frozen_assignment(store, wave, assigner,
                 lambda: _iter_wave_faces(store, wave_id, renew=check), check,
                 page_size=128 if chunk_size is None else chunk_size,
-                progress=lambda count: leases.checkpoint(ownership, 'faces-applied:' + str(count)))
+                progress=lambda count: leases.checkpoint(ownership, 'faces-applied:' + str(count)),
+                local_journal=True)
         with processing_diagnostics.wave_phase_scope('publication_handoff'):
             renew()
             from wave_catalog import SCOPES, PREREQUISITES

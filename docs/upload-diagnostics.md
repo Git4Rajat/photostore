@@ -192,3 +192,43 @@ by reading the current photo's browser-prepared bytes, validating them, and
 publishing immutable artifacts under the active source fence. Old receipt IDs
 are never relabeled as proof of new content. This does not automatically
 reopen members already settled as failed in a frozen wave.
+
+### File-backed wave assignment journals
+
+New clustering stages use `PEOPLE_FAISS_CHECKPOINT_DIR/wave-journals` when the
+checkpoint mount is configured. Snapshot and decision records are append-only
+JSONL on the trusted mount, with a SQLite lookup index on local work disk only.
+The complete snapshot is flushed before a compact, execution-fenced `local-v1`
+Table marker is published. Every subsequent decision is flushed before its
+conditional person/member/face writes. A compact completion receipt remains in
+Table Storage. Existing table-backed manifests continue on their original path;
+without a configured checkpoint directory the table journal is still used.
+
+The mount must provide cross-process flock and fsync, matching the existing
+clustering checkpoint contract. A marked journal that disappears or becomes
+corrupt fails closed; restore the mounted journal before retrying. Rebuilding
+from a partially materialized live baseline is not safe. A torn final append is
+truncated, while an interrupted unpublished snapshot can be captured again.
+Journal files are retained for recovery; this change does not add automatic
+retention/deletion of completed wave journals.
+
+A background heartbeat renews durable execution ownership. The clustering loop
+checks local lease validity on every guard call, refreshes durable eligibility
+at least every second when checks are invoked, and forces a refresh at each
+assignment-page boundary. Lease expiry or heartbeat failure aborts the attempt;
+conditional entity ETags and library-lease checks remain on materialization.
+This bounds the observation delay for policy/release changes to the refresh
+interval between boundaries, rather than rereading all control rows per face.
+Wave transitions and compact journal markers retain transaction fencing.
+
+Vision receipt capture may reuse the exact derivative receipt whose immutable
+bytes were published and read back in the same source-fence context. Only two
+small receipt fingerprints are retained, no image bytes. Changed receipts and
+new/reentered source contexts require fresh verification; ordinary verification
+continues to read storage. `derivative_promotion` and `artifact_capture` spans
+now expose these previously unmeasured apply costs.
+
+The synthetic benchmark `backend/scripts/benchmark_wave_assignment_files.py`
+compares 1,000 faces with real matching and fake Table clients. It verifies
+output parity and reports client-call counts. Its local-disk timings contain no
+Azure latency and must not be interpreted as production throughput.

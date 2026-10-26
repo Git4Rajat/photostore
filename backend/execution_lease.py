@@ -187,24 +187,36 @@ class ExecutionLeases:
         raise RuntimeError('Execution renewal contention')
 
     @contextmanager
-    def keepalive(self, ownership):
+    def keepalive(self, ownership, *, local_checks=False):
         """Renew through native FAISS training and other long blocking calls.
 
-        A stalled SDK call cannot bless expired ownership: check() still reads
-        the durable lease and rejects expiry before the next effect.
+        Default checks reread durable ownership. Local checks instead reject
+        renewal errors and conservative monotonic expiry without I/O; callers
+        must still validate durable eligibility at publication/write boundaries.
+        A stalled renewal cannot extend the local validity deadline.
         """
         stop, errors = threading.Event(), []
+        # A local check never extends validity. Only a successful durable
+        # renewal advances this conservative monotonic deadline.
+        initial = self.check(ownership)
+        deadline = [time.monotonic() + max(0, float(initial['leaseUntil']) - self.clock())]
         def heartbeat():
             while not stop.wait(min(30, self.lease_seconds / 3)):
                 try:
+                    started = time.monotonic()
                     self.renew(ownership)
+                    deadline[0] = started + self.lease_seconds
                 except Exception as error:
                     errors.append(error)
                     stop.set()
         def check():
             if errors:
                 raise OwnershipLost('Execution heartbeat failed') from errors[0]
-            self.check(ownership)
+            if local_checks:
+                if time.monotonic() >= deadline[0]:
+                    raise OwnershipLost('Execution lease validity elapsed')
+            else:
+                self.check(ownership)
         check()
         thread = threading.Thread(target=heartbeat, name='wave-stage-lease', daemon=True)
         thread.start()
