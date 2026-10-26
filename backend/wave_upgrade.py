@@ -13,7 +13,7 @@ import time
 
 from upload_waves import ShadowWaves, Conflict, digest, identifier
 from wave_bootstrap import deployment_contract
-from wave_policy import CAPABILITIES, PROTOCOL, certify
+from wave_policy import CAPABILITIES, PROTOCOL, certify, _supported_certificate_roles
 
 
 class UpgradeBusy(Conflict):
@@ -21,9 +21,16 @@ class UpgradeBusy(Conflict):
 
 
 def validate_contract(deployments, expected):
+    # The certificate being migrated away from may still be an immutable
+    # pre-removal one carrying the retired wave-recovery role (see
+    # wave_policy._supported_certificate_roles); deployment_contract() only
+    # ever builds the current role set, so compare per-role values directly
+    # instead of requiring an exact dict match.
     core = deployments.get('core', '')
     vision = deployments.get('vision', '')
-    if deployments != deployment_contract(core, vision) or digest([PROTOCOL, deployments]) != expected:
+    if (not _supported_certificate_roles(deployments)
+            or any(value != (vision if role == 'vision' else core) for role, value in deployments.items())
+            or digest([PROTOCOL, deployments]) != expected):
         raise ValueError('Upgrade requires an exact, same-protocol immutable release contract')
 
 
