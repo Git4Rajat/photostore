@@ -363,14 +363,14 @@ class ShadowWaves:
         return self._retry(run)
 
     def promote_successor(self, wave_id):
-        """Advances a wave out of `waiting_predecessor` once its predecessor
-        has committed exact indexing-completion evidence. Mirrors exactly
-        what close() does for a wave with no predecessor -- the same target
+        """Release Vision once the predecessor has frozen its Vision evidence.
+        Clustering separately requires exact predecessor publication coverage.
+        Mirrors what close() does for a wave with no predecessor -- the same target
         state and outbox shape -- so there is one processing_pending/
         visionPending transition in this module, not two parallel ones.
 
         Idempotent and safe to call speculatively: a wave not currently in
-        `waiting_predecessor`, or whose predecessor is incomplete, is a
+        `waiting_predecessor`, or whose predecessor has not exited Vision, is a
         no-op that returns the wave unchanged (not an error). Callers
         (the opt-in execution layer, or its recovery sweep) can call this on
         every `waiting_predecessor` wave they see without first checking.
@@ -383,18 +383,25 @@ class ShadowWaves:
             if wave['state'] != 'waiting_predecessor':
                 return dict(wave)
             predecessor = self._get(self.wave_key(wave['predecessorWaveId']))
-            if predecessor is None or predecessor['state'] != 'complete':
+            if (predecessor is None or predecessor['state'] not in ('ready', 'indexing', 'complete')
+                    or not predecessor.get('frozenRevision')):
                 return dict(wave)
-            completion = self._get('completion!' + predecessor['waveId'])
-            if (not completion or not predecessor.get('frozenRevision')
-                    or (wave.get('predecessorFrozenRevision') and completion.get('frozenRevision') != wave['predecessorFrozenRevision'])
-                    or completion.get('frozenRevision') != predecessor.get('frozenRevision')
-                    or completion.get('requiredSetId') != predecessor.get('requiredPublicationId')
-                    or completion.get('receiptId') != predecessor.get('completionReceiptId')):
+            frozen = self._get('shadow-cluster!' + predecessor['waveId'])
+            # The no-work fast path has a completion receipt instead of a
+            # cluster outbox. Both are durable evidence of Vision's exit.
+            if (wave.get('predecessorFrozenRevision')
+                    and wave['predecessorFrozenRevision'] != predecessor['frozenRevision']):
+                return dict(wave)
+            frozen_valid = (frozen and frozen.get('waveId') == predecessor['waveId']
+                    and frozen.get('inputRevision') == predecessor['frozenRevision']
+                    and frozen.get('manifestDigest') == predecessor.get('manifestDigest')
+                    and frozen.get('destination') == 'cluster')
+            witness = frozen if frozen_valid else self._predecessor_completion(wave)
+            if witness is None:
                 return dict(wave)
             next_wave = dict(wave, state='processing_pending', waitReason='',
                              predecessorFrozenRevision=predecessor['frozenRevision'],
-                             predecessorSatisfiedAt=self.clock(),
+                             predecessorVisionSatisfiedAt=self.clock(),
                              stateEnteredAt=self.clock(), lastProgressAt=self.clock(),
                              updatedAt=self.clock())
             outbox = self._row(f"shadow-vision!{wave_id}!{wave['intakeEpoch']}",
@@ -402,9 +409,28 @@ class ShadowWaves:
                 destination='vision', dispatchable=False, createdAt=self.clock())
             next_wave['visionPendingKey'] = outbox['RowKey']
             self._commit(control, [self._change(wave, next_wave), ('create', outbox),
-                self._change(predecessor,dict(predecessor)),self._change(completion,dict(completion))])
+                self._change(predecessor,dict(predecessor)),self._change(witness,dict(witness))])
             return next_wave
         return self._retry(run)
+
+    def _predecessor_completion(self, wave):
+        """Exact publication proof, independent of the Vision release gate."""
+        if not wave.get('predecessorWaveId'):
+            return None
+        prior = self._get(self.wave_key(wave['predecessorWaveId']))
+        if not prior or prior['state'] != 'complete' or not prior.get('frozenRevision'):
+            return None
+        proof = self._get('completion!' + prior['waveId'])
+        if (not proof
+                or (wave.get('predecessorFrozenRevision') and proof.get('frozenRevision') != wave['predecessorFrozenRevision'])
+                or proof.get('frozenRevision') != prior['frozenRevision']
+                or proof.get('requiredSetId') != prior.get('requiredPublicationId')
+                or proof.get('receiptId') != prior.get('completionReceiptId')):
+            return None
+        return proof
+
+    def predecessor_published(self, wave):
+        return not wave.get('predecessorWaveId') or self._predecessor_completion(wave) is not None
 
     def commit_assignment(self, wave_id, required_publication_id, *, manifest_digest, assignment_receipt=None):
         """Commits the cluster consumer's handoff: the frozen (ready) wave's
@@ -428,6 +454,8 @@ class ShadowWaves:
                 return dict(wave)
             if wave['state'] != 'ready':
                 raise Conflict('Only a frozen (ready) wave can commit its assignment')
+            if not self.predecessor_published(wave):
+                raise Conflict('Predecessor publication is incomplete')
             if wave.get('manifestDigest') != manifest_digest:
                 raise Conflict('Assignment input no longer matches the frozen manifest')
             if assignment_receipt is not None:
@@ -483,15 +511,15 @@ class ShadowWaves:
             return next_wave
         return self._retry(run)
 
-    @staticmethod
-    def outbox_eligible(wave, outbox):
+    def outbox_eligible(self, wave, outbox):
         if outbox.get('destination') == 'vision':
             return (wave['state'] in ('processing_pending', 'processing')
                     and wave.get('visionPendingKey') == outbox['RowKey']
                     and wave['intakeEpoch'] == outbox.get('intakeEpoch'))
         if outbox.get('destination') == 'cluster':
             return (wave['state'] == 'ready'
-                    and wave.get('frozenRevision') == outbox.get('inputRevision'))
+                    and wave.get('frozenRevision') == outbox.get('inputRevision')
+                    and self.predecessor_published(wave))
         if outbox.get('destination') == 'index':
             return (wave['state'] == 'indexing'
                     and wave.get('indexPendingKey') == outbox['RowKey']

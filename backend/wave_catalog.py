@@ -153,7 +153,7 @@ class CatalogPublisher:
                         options['force_full']=True
                     result=getattr(su,f'refresh_user_{scope}_index')(library,**options)
                 if result is None:
-                    raise RuntimeError('Required publisher produced no artifact')
+                    raise RuntimeError(f'Required publisher produced no artifact (scope={scope})')
                 if set(guard.outputs) != set(aliases):
                     raise RuntimeError('Publisher did not commit every required artifact')
             outputs = guard.outputs

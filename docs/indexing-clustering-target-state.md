@@ -142,7 +142,7 @@ scope and requires relocating those operations too.
 flowchart TD
     U[Upload sessions and accepted file manifest] --> W[Durable library wave]
     W --> T[All declared upload chunks finalized and intake closed]
-    T --> H{Predecessor complete and library stage slot available?}
+    T --> H{Predecessor Vision evidence frozen?}
     H -->|No| Q[waiting_predecessor: persist dependency, no Vision dispatch]
     Q --> H
     H -->|Yes| VP[processing_pending plus durable visionPending]
@@ -152,7 +152,9 @@ flowchart TD
     B -->|No| V
     B -->|Yes| F[Freeze wave membership and revision]
     F --> O[Durable clustering handoff]
-    O --> C[One logical clustering job]
+    O --> P{Predecessor publication complete?}
+    P -->|No: retain frozen handoff| P
+    P -->|Yes| C[One logical clustering job]
     C --> A[Commit assignments and completion outbox]
     A --> I[Indexer publishes dependent views]
     I --> D[Wave ready in UI]
@@ -368,41 +370,42 @@ acknowledgement, a telemetry event or `ipwork` job status alone is insufficient.
 State: `collecting -> waiting_predecessor (when necessary) -> processing_pending
 -> processing -> ready -> clustering -> assignments_committed -> indexing
 -> complete`, with explicit `blocked`, `failed` and partial-result details.
-`ready` means processing is complete and clustering can be released; it never
+`ready` means processing is complete; clustering can be released once the
+predecessor's publication is complete. It never
 means ready to begin Vision.
 
 | State | Durable meaning | Permitted automatic work |
 | --- | --- | --- |
 | `collecting` | Intake declaration/reservations remain open | Upload only; previously leased processing may safely drain if intake reopened |
-| `waiting_predecessor` | Intake closed, but predecessor publication/completion or library stage-slot release is not yet confirmed | No successor Vision/cluster/index dispatch |
-| `processing_pending` | Intake closed, predecessor dependency satisfied and library stage slot reserved for this wave; Vision handoff exists | Relay eligible `visionPending`; no downstream cluster/index work |
+| `waiting_predecessor` | Intake closed, but predecessor Vision completion evidence is not yet frozen | No successor Vision/cluster/index dispatch |
+| `processing_pending` | Intake closed, predecessor Vision evidence frozen; Vision handoff exists | Relay eligible `visionPending`; no downstream cluster/index work |
 | `processing` | Valid processing claim accepted, or validated stage evaluation is resolving zero-work inputs | Required processing and completion evidence |
-| `ready` | Captured input settled; clustering/removal work or a proved no-op handoff is pending | Relay `clusterPending` or its explicit no-op advancement |
+| `ready` | Captured input settled; clustering/removal work or a proved no-op handoff is pending | After exact predecessor publication coverage, relay `clusterPending` or its explicit no-op advancement |
 
 Persist `predecessorWaveId`, `predecessorRequiredRevision`,
-`predecessorWaitStartedAt`, `predecessorSatisfiedAt` and a bounded `waitReason`.
+`predecessorWaitStartedAt`, `predecessorVisionSatisfiedAt` and a bounded `waitReason`.
 The library control record maintains an ordered admission lineage and the active
 background wave/epoch. A successor may be collecting while its predecessor is
 active; after intake closes, it enters `waiting_predecessor` rather than looking
 like Vision capacity is missing. The first wave has no predecessor dependency.
 
-The predecessor's `complete` receipt must cover its required publication
-frontier. `assignments_committed`, a queue acknowledgement, a cooldown expiry or
-an arbitrary scope's `done` record cannot release the successor. A failed or
-blocked predecessor remains an explicit dependency blocker; operator recovery
-must repair it or perform an audited compatible ownership transfer, never
-silently bypass it. A completed-with-errors wave can release its successor only
-when its permitted partial outcome and all required publication receipts are
-committed.
+Vision release requires the predecessor's frozen revision and matching cluster
+outbox, or a valid no-work completion receipt. A predecessor stuck in clustering
+or indexing therefore permits successor Vision. Each wave still finishes Vision
+before the next wave starts Vision.
 
-Predecessor completion durably records successor-promotion work. The completing
-indexer can attempt promotion; independent recovery guarantees it if that
-attempt is lost. Promotion conditionally reserves the library stage slot for
-the next closed wave and persists its `processing_pending`/`visionPending`
-transition. If these records cannot share a transaction, use a recoverable
-reservation keyed by wave/epoch; consumers verify both sides before claiming.
-Repeating promotion cannot skip a wave or grant two automatic stage owners.
-An open next intake retains its order without waking Vision prematurely.
+Successor clustering requires the predecessor's `complete` receipt covering its
+exact required publication frontier. Assignment completion or an unproved
+`complete` flag cannot release clustering. A failed publication blocks downstream
+clustering and publication, while later waves can finish Vision and retain frozen
+handoffs. Empty and zero-face fast paths preserve the same publication ordering.
+
+The Vision consumer wakes the direct successor after freezing its evidence; the
+indexer also wakes it after publication. Independent recovery covers lost wakes
+and promotes existing waiting waves under these same rules. Promotion persists
+`processing_pending` and its Vision outbox atomically with checks of the
+predecessor and its frozen evidence. Repeating promotion is idempotent. An open
+next intake retains its order without waking Vision prematurely.
 
 Reopened admission before clustering freeze invalidates old processing-release
 eligibility by intake revision/epoch and returns the wave to `collecting`.
@@ -977,9 +980,9 @@ must not emit an additional automatic job for an already committed revision.
     without draining deferred wave indexing. Failed handoffs remain recoverable
     without running a coordinator in an unrelated app.
 15. Close successor intake while predecessor is clustering/indexing: successor
-    remains `waiting_predecessor` with no Vision message or capacity alert.
-    Crash after predecessor publication/completion but before successor
-    promotion; external recovery promotes it once. Test duplicate promotion,
+    can run Vision, then waits at its frozen clustering handoff until predecessor
+    publication completes. Crash after predecessor Vision freeze but before
+    successor promotion; external recovery promotes it once. Test duplicate promotion,
     two waiting successors, failed predecessor, zero-work predecessor and partial
     fan-out of `indexPending`; ordering, coverage and stage-slot fencing survive.
 16. Crash halfway through Vision manifest fan-out, expire a dispatched message,

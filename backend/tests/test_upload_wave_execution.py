@@ -116,8 +116,7 @@ def test_advance_wave_promotes_a_waiting_successor_once_predecessor_publication_
     assert wave['state'] == 'processing_pending' and dispatched == ['vision']
 
 
-def test_advance_wave_leaves_a_waiting_successor_alone_while_predecessor_is_not_ready(world, monkeypatch):
-    """Ready is a clustering barrier, not indexing completion."""
+def test_advance_wave_releases_vision_while_predecessor_is_ready(world, monkeypatch):
     store, work, table, work_table = world
     monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED', 'true')
     predecessor = store.open_session('p', 0)
@@ -130,7 +129,7 @@ def test_advance_wave_leaves_a_waiting_successor_alone_while_predecessor_is_not_
 
 
     wave, dispatched = advance_wave(work, store, 'library-A', successor['waveId'])
-    assert wave['state'] == 'waiting_predecessor' and dispatched == []
+    assert wave['state'] == 'processing_pending' and dispatched == ['vision']
 
 
 def test_promotion_happens_even_while_dispatch_is_disabled(world, monkeypatch):
@@ -163,9 +162,9 @@ def test_sweep_library_advances_every_wave_it_finds(world, monkeypatch):
     touched = sweep_library(work, store, 'library-A')
     states = {entry['waveId']: entry['state'] for entry in touched}
     assert states[first['waveId']] == 'ready'
-    assert second['waveId'] not in states
-    assert store.status(second['waveId'])['state'] == 'waiting_predecessor'
-    assert set(entry['waveId'] for entry in touched if entry['dispatched']) == {first['waveId']}
+    assert states[second['waveId']] == 'processing_pending'
+    assert store.status(second['waveId'])['state'] == 'processing_pending'
+    assert set(entry['waveId'] for entry in touched if entry['dispatched']) == {first['waveId'], second['waveId']}
 
 
 def test_sweep_library_is_idempotent_on_repeated_calls(world, monkeypatch):
@@ -288,7 +287,7 @@ def test_ready_or_wrong_frontier_cannot_be_declared_complete(world):
         store.complete_indexing(wave['waveId'], ledger)
 
 
-def test_successor_does_not_promote_from_a_complete_flag_without_coverage_receipt(world):
+def test_complete_flag_without_coverage_cannot_release_successor_clustering(world):
     store, work, table, _ = world
     parent = store.open_session('p', 0)
     close(store, 'p', parent)
@@ -296,4 +295,89 @@ def test_successor_does_not_promote_from_a_complete_flag_without_coverage_receip
     successor = store.open_session('s', 0)
     close(store, 's', successor)
     table.rows[store.partition, store.wave_key(parent['waveId'])]['state'] = 'complete'
-    assert store.promote_successor(successor['waveId'])['state'] == 'waiting_predecessor'
+    assert store.promote_successor(successor['waveId'])['state'] == 'processing_pending'
+    wave = finish_scan(store, successor['waveId'])
+    assert wave['state'] == 'ready'
+    assert not store.outbox_eligible(wave, store._get('shadow-cluster!' + wave['waveId']))
+
+
+@pytest.mark.parametrize('stage', ['ready', 'indexing'])
+def test_vision_advances_past_stalled_predecessor_but_cluster_waits(world, monkeypatch, stage):
+    from execution_lease import ExecutionLeases
+    from upload_wave_execution import claim_release
+    from upload_waves import Conflict
+    from wave_no_work import advance_empty, advance_zero_faces
+    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED', 'true')
+    store, work, table, _ = world
+    parent = store.open_session('p', 0)
+    close(store, 'p', parent)
+    prior = finish_scan(store, parent['waveId'])
+    if stage == 'indexing':
+        store.commit_assignment(prior['waveId'], 'pending-publication', manifest_digest=prior['manifestDigest'])
+    child = store.open_session('s', 0)
+    close(store, 's', child)
+    wave, sent = advance_wave(work, store, store.library, child['waveId'])
+    assert wave['state'] == 'processing_pending' and sent == ['vision']
+    # Empty/no-face paths cannot bypass ordered publication either.
+    assert advance_empty(store, wave['waveId'])['state'] == 'processing_pending'
+    wave = finish_scan(store, wave['waveId'])
+    assert wave['state'] == 'ready'
+    key = 'shadow-cluster!' + wave['waveId']
+    assert advance_zero_faces(store, wave['waveId'])['state'] == 'ready'
+    assert not dispatch_outbox(work, store, store.library, key, 'cluster')
+    leases = ExecutionLeases(table, partition=store.partition)
+    assert claim_release(leases, store, store.library, wave['waveId'], 'cluster', key, 'cluster')[0] is None
+    with pytest.raises(Conflict, match='Predecessor publication'):
+        store.commit_assignment(wave['waveId'], 'too-early', manifest_digest=wave['manifestDigest'])
+    assert store._get('assignment!' + wave['waveId'] + '!manifest') is None
+    # A third Vision wave can run even though both predecessors await catalogs.
+    third = store.open_session('third', 0)
+    close(store, 'third', third)
+    assert advance_wave(work, store, store.library, third['waveId'])[1] == ['vision']
+    if stage == 'ready':
+        complete_publication(store, prior['waveId'])
+        assert advance_wave(work, store, store.library, wave['waveId'])[1] == ['cluster']
+
+
+@pytest.mark.parametrize('state', ['collecting', 'processing_pending', 'processing'])
+def test_successor_vision_waits_until_predecessor_vision_exits(world, monkeypatch, state):
+    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED', 'true')
+    store, work, table, _ = world
+    parent = store.open_session('p', 0)
+    close(store, 'p', parent)
+    finish_scan(store, parent['waveId'])
+    child = store.open_session('s', 0)
+    close(store, 's', child)
+    table.rows[store.partition, store.wave_key(parent['waveId'])]['state'] = state
+    assert advance_wave(work, store, store.library, child['waveId'])[1] == []
+    assert store.status(child['waveId'])['state'] == 'waiting_predecessor'
+
+
+def test_missing_or_wrong_frozen_evidence_cannot_release_vision(world):
+    store, _, table, _ = world
+    parent = store.open_session('p', 0)
+    close(store, 'p', parent)
+    finish_scan(store, parent['waveId'])
+    child = store.open_session('s', 0)
+    close(store, 's', child)
+    key = store.partition, 'shadow-cluster!' + parent['waveId']
+    table.rows[key]['inputRevision'] = 'wrong'
+    assert store.promote_successor(child['waveId'])['state'] == 'waiting_predecessor'
+    del table.rows[key]
+    assert store.promote_successor(child['waveId'])['state'] == 'waiting_predecessor'
+
+
+def test_vision_exit_relays_next_wave_before_publication(world, monkeypatch):
+    from wave_runtime import relay_successor
+    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED', 'true')
+    store, work, _, _ = world
+    parent = store.open_session('p', 0)
+    close(store, 'p', parent)
+    finish_scan(store, parent['waveId'])
+    child = store.open_session('s', 0)
+    close(store, 's', child)
+    sent = []
+    relay_successor(work, store, parent['waveId'], lambda *args, **kwargs: sent.append(args))
+    assert len(sent) == 1 and sent[0][1].startswith('wave-vision:' + child['waveId'] + ':')
+    relay_successor(work, store, parent['waveId'], lambda *args, **kwargs: sent.append(args))
+    assert len(sent) == 1

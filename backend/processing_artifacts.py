@@ -132,6 +132,8 @@ def derivative_blob(metadata, kind, fallback):
         return fallback
     receipt = json.loads(raw)
     if (not isinstance(receipt, dict) or receipt.get('schemaVersion') != 1 or receipt.get('kind') != kind
+            or any(not isinstance(receipt.get(key), str) or not receipt[key]
+                   for key in ('library', 'photoId', 'revision', 'sha256', 'blob'))
             or receipt.get('photoId') != metadata.get('anonymousImageId')
             or receipt.get('blob') != published_name(receipt['library'], receipt['photoId'],
                 receipt['revision'], kind, receipt['sha256'])

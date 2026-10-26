@@ -101,8 +101,35 @@ def test_serving_retains_previous_derivative_for_same_photo_but_rejects_cross_ph
     with result_fence(fence): receipt = publish(storage_utils, row, 'thumbnail', data=jpeg())
     row['processingRevision'] = 'new-revision'
     assert derivative_blob(row, 'thumbnail', 'legacy') == receipt['blob']
+    assert storage_utils._sort_index_row(row)['thumb'] == receipt['blob']
+    assert storage_utils._access_index_row(row)['thumbnailArtifact'] == row['thumbnailArtifact']
     row['anonymousImageId'] = 'replacement'
     with pytest.raises(ValueError): derivative_blob(row, 'thumbnail', 'legacy')
+
+
+@pytest.mark.parametrize('bad', ['photo', 'library', 'blob', 'missing', 'typed', 'json', 'list', 'null'])
+def test_catalog_omits_invalid_receipts_without_weakening_completion_validation(blobs, bad):
+    from processing_artifacts import published_name, validate_receipt
+    (metadata, *_, fence), _ = blobs
+    row = metadata.get_entity('lib', 'photo.jpg')
+    with result_fence(fence):
+        receipt = publish(storage_utils, row, 'thumbnail', data=jpeg())
+    invalid = dict(receipt)
+    if bad in ('photo', 'library'):
+        invalid['photoId' if bad == 'photo' else 'library'] = 'other'
+        invalid['blob'] = published_name(invalid['library'], invalid['photoId'], invalid['revision'], 'thumbnail', invalid['sha256'])
+    elif bad == 'blob': invalid['blob'] = 'untrusted/path.jpg'
+    elif bad == 'missing': del invalid['revision']
+    elif bad == 'typed': invalid['library'] = 123
+    raw = {'json': '{', 'list': '[]', 'null': 'null'}.get(bad, json.dumps(invalid))
+    row['thumbnailArtifact'] = row['previewArtifact'] = raw
+    assert storage_utils._sort_index_row(row)['thumb'] == row['anonymousImageId']
+    projected = storage_utils._access_index_row(row)
+    assert projected['RowKey'] == row['RowKey'] and projected['blobName'] == row['anonymousImageId']
+    assert 'thumbnailArtifact' not in projected and 'previewArtifact' not in projected
+    assert row['thumbnailArtifact'] == raw  # Projection never rewrites durable evidence.
+    with pytest.raises((ValueError, KeyError, TypeError)):
+        validate_receipt(row, 'thumbnail')
 
 
 def test_receipt_detects_tampering_and_requires_the_current_processing_revision(blobs):

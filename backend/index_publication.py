@@ -112,6 +112,16 @@ def check():
         guard.check()
 
 
+def propagate_build_failure(error):
+    """Required publications preserve the builder's original failure.
+
+    Legacy background builders may return None for a failed refresh. A guarded
+    wave build must retain the actual scan/upload error for its retry and logs.
+    """
+    if _ACTIVE.get() is not None:
+        raise error
+
+
 @contextmanager
 def guarded_publication(guard):
     """Use a wave stage guard with the same actual publisher blob wrappers."""

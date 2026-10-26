@@ -251,6 +251,7 @@ def consume(payload,*,deadline=None,progress=None):
         if current['state']=='complete':
             import index_events
             index_events.publish(library,'wave',current['completionReceiptId'])
+        if current['state'] in ('ready','indexing','complete'):
             relay_successor(work,store,wave_id,send_stage)
         return 'done'
     except Exception:

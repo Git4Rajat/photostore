@@ -240,3 +240,69 @@ def test_dedup_delete_epoch_race_cannot_receive_a_wave_receipt(world,monkeypatch
         with pytest.raises(ResourceModifiedError):
             CatalogPublisher(store,wave['waveId'],su,check).publish('dedup','c'*64)
     assert not store._get(f"publication!{wave['waveId']}!"+'c'*64)
+
+
+@pytest.mark.parametrize('scope', ['sort', 'access'])
+@pytest.mark.parametrize('invalid', ['cross-photo', 'malformed'])
+def test_real_catalog_publishes_all_photos_despite_invalid_derivative_hints(world, monkeypatch, scope, invalid):
+    import gzip
+    from test_wave_recovery import RuntimeTable
+    from processing_artifacts import published_name
+    store, wave, leases, owner, blobs, check = world
+    metadata = RuntimeTable()
+    receipt = dict(schemaVersion=1, kind='thumbnail', library='u', photoId='old-photo', revision='old',
+        sha256='f'*64, size=100, width=40, height=40, etag='etag', attempt='old-attempt')
+    receipt['blob'] = published_name('u', 'old-photo', 'old', 'thumbnail', 'f'*64)
+    raw = json.dumps(receipt) if invalid == 'cross-photo' else '{bad'
+    metadata.create_entity(dict(PartitionKey='u', RowKey='replacement.jpg', anonymousImageId='current-photo',
+        processingRevision='current', thumbnailArtifact=raw, previewArtifact=raw, thumbnail_status='failed'))
+    metadata.create_entity(dict(PartitionKey='u', RowKey='healthy.jpg', anonymousImageId='healthy'))
+    monkeypatch.setitem(su._CTX, 'metadata_table_client', metadata)
+    obligation = 'e'*64
+    with execution_scope(leases, owner, store, check):
+        assert CatalogPublisher(store, wave['waveId'], su, check).publish(scope, obligation)
+    proof = json.loads(store._get(f"publication!{wave['waveId']}!{obligation}")['payload'])
+    artifacts = [blobs.rows[o['container'], o['blob']][0] for o in proof['outputs']]
+    data = json.loads(gzip.decompress(next(d for d in artifacts if d.startswith(b'\x1f\x8b'))))
+    assert {r['RowKey'] for r in data['rows']} == {'replacement.jpg', 'healthy.jpg'}
+    row = next(r for r in data['rows'] if r['RowKey'] == 'replacement.jpg')
+    if scope == 'sort': assert row['thumb'] == 'current-photo'
+    else:
+        assert row['blobName'] == 'current-photo'
+        assert 'thumbnailArtifact' not in row and 'previewArtifact' not in row
+
+
+@pytest.mark.parametrize('scope', ['sort', 'access'])
+@pytest.mark.parametrize('failure', ['scan', 'data', 'manifest'])
+def test_required_streaming_publisher_preserves_original_error_and_never_records_success(world, monkeypatch, scope, failure):
+    from test_wave_recovery import RuntimeTable
+    store, wave, leases, owner, blobs, check = world
+    metadata = RuntimeTable()
+    monkeypatch.setitem(su._CTX, 'metadata_table_client', metadata)
+    error = OSError('original ' + failure + ' failed')
+    def fail(*args, **kwargs): raise error
+    publisher = CatalogPublisher(store, wave['waveId'], su, check)
+    if failure == 'scan': monkeypatch.setattr(metadata, 'query_entities', fail)
+    else:
+        target = publisher._aliases(scope)[0 if failure == 'data' else 1]
+        original = blobs.get_blob_client
+        def client(container, blob):
+            result = original(container, blob)
+            if (container, blob) == target: result.upload_blob = fail
+            return result
+        monkeypatch.setattr(blobs, 'get_blob_client', client)
+    with execution_scope(leases, owner, store, check):
+        with pytest.raises(OSError) as caught:
+            publisher.publish(scope, 'e'*64)
+    assert caught.value is error
+    assert not store._get(f"publication!{wave['waveId']}!" + 'e'*64)
+    assert not any(name.startswith('wave-projections/') for _, name in blobs.rows)
+
+
+def test_required_publisher_without_output_identifies_its_scope(world, monkeypatch):
+    store, wave, leases, owner, _, check = world
+    monkeypatch.setattr(su, 'refresh_user_sort_index', lambda *a, **kw: None)
+    with execution_scope(leases, owner, store, check):
+        with pytest.raises(RuntimeError, match=r'no artifact \(scope=sort\)'):
+            CatalogPublisher(store, wave['waveId'], su, check).publish('sort', 'e'*64)
+    assert not store._get(f"publication!{wave['waveId']}!" + 'e'*64)

@@ -232,3 +232,34 @@ The synthetic benchmark `backend/scripts/benchmark_wave_assignment_files.py`
 compares 1,000 faces with real matching and fake Table clients. It verifies
 output parity and reports client-call counts. Its local-disk timings contain no
 Azure latency and must not be interpreted as production throughput.
+
+### Vision and publication dependencies
+
+`waiting_predecessor` waits for the previous wave's Vision evidence to freeze,
+verified by its frozen revision and cluster outbox (or exact no-work completion
+receipt). A previous wave stuck in clustering or indexing does not block Vision.
+The Vision consumer wakes its direct successor at this boundary; recovery also
+promotes existing waiting waves, including waves admitted before this change.
+
+After Vision, a successor remains `ready` until its predecessor has exact
+publication-completion coverage. Cluster dispatch and worker claims enforce this
+gate, as do assignment commits and empty/zero-face fast paths. This preserves
+clustering/publication ordering while allowing later Vision waves to drain.
+
+### Invalid derivative pointers during indexing
+
+The October 26 indexing failure was one error chain: a stale cross-photo
+thumbnail receipt caused `Invalid derivative pointer` in the sort projection;
+the builder returned `None`, which became `Required publisher produced no
+artifact`. Sort and access projections now omit invalid derivative receipts
+without dropping the photo. Thumbnail URLs fall back to the current photo's
+physical identity. Valid receipts from a previous revision of the same photo
+remain usable while processing continues. Projection does not rewrite metadata,
+repair bytes, or qualify failed source processing as successful.
+
+Required streamed sort/access builds propagate original scan, data-upload and
+manifest-upload errors. They cannot produce wave publication receipts after a
+failed build. The fallback error for a publisher returning no output identifies
+the scope. A previously exhausted wave still needs a fresh dispatch revision
+after the corrected image is deployed; deploying code alone does not immediately
+reset its attempt budget.

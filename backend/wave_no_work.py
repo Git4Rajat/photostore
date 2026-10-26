@@ -28,6 +28,7 @@ def advance_empty(store,wave_id):
     def commit():
         wave=store._required(store.wave_key(wave_id))
         if wave['state'] not in ('processing_pending','processing') or wave.get('noWorkImpossible'):return wave
+        if not store.predecessor_published(wave):return wave
         control=store._required('control')
         probe=json.loads(wave.get('noWorkProbe') or '{}')
         if probe.get('revision')!=control['revision']:
@@ -75,6 +76,7 @@ def advance_empty(store,wave_id):
 def advance_zero_faces(store,wave_id):
     wave=store._required(store.wave_key(wave_id))
     if wave['state']!='ready' or wave.get('hasFaceWork'):return wave
+    if not store.predecessor_published(wave):return wave
     from upload_wave_execution import _completion
     from wave_settlement import verified
     # One frozen page per call, with a durable proof cursor.

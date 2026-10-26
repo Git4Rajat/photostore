@@ -5303,14 +5303,32 @@ def _serialize_sort_index(snapshot: LexicalIndexSnapshot) -> bytes:
     return out
 
 
+def _catalog_derivative_receipt(entity: Dict, kind: str):
+    """Omit invalid serving hints without dropping a photo from the catalog.
+
+    Previous revisions for the same photo may remain visible during processing;
+    cross-photo/library or malformed receipts must never enter serving indexes.
+    Source-completion qualification still requires exact current-revision proof.
+    """
+    from processing_artifacts import validate_receipt
+    if not entity.get(kind + 'Artifact'):
+        return None
+    try:
+        return validate_receipt(entity, kind, current_revision=False)
+    except (ValueError, KeyError, TypeError):
+        _LOGGER.warning('Ignoring invalid %s derivative pointer in catalog photo=%s',
+                        kind, entity.get('anonymousImageId') or '')
+        return None
+
+
 def _sort_index_row(entity: Dict) -> Optional[Dict[str, object]]:
-    from processing_artifacts import derivative_blob
     filename = str(entity.get('RowKey') or '').strip()
     if not filename:
         return None
     capture_dt = metadata_capture_datetime(entity)
     processing = _safe_json_load(entity.get('processing_metadata'))
     thumbnail = processing.get('client_thumbnail') if isinstance(processing, dict) else None
+    receipt = _catalog_derivative_receipt(entity, 'thumbnail')
 
     def rotation(value):
         try:
@@ -5331,7 +5349,7 @@ def _sort_index_row(entity: Dict) -> Optional[Dict[str, object]]:
         # thumbnail_status/preview_status=='done': the client attempts the
         # blob directly and treats a 404 as "still generating" instead of
         # asking this index whether it's ready first.
-        'thumb': derivative_blob(entity, 'thumbnail', str(entity.get('anonymousImageId') or filename)),
+        'thumb': receipt['blob'] if receipt else str(entity.get('anonymousImageId') or filename),
         'gallery': {
             'liked': str(entity.get('PartitionKey') or '') in _json_list(entity.get('likedBy')),
             'rotation': rotation(entity.get('rotation')),
@@ -5563,9 +5581,11 @@ def _refresh_rows_index_on_disk(
             except BaseException:
                 writer.abort()
                 raise
-        except Exception:
+        except Exception as error:
             # A failed scan must never be persisted as an empty, clean index.
             _LOGGER.exception('Streaming %s index build failed user=%s', kind, key)
+            from index_publication import propagate_build_failure
+            propagate_build_failure(error)
             return None
         if blob_client is not None:
             try:
@@ -5574,8 +5594,10 @@ def _refresh_rows_index_on_disk(
                         blob_client, out_path, overwrite=True,
                         content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
                     )
-            except Exception:
+            except Exception as error:
                 _LOGGER.warning('Uploading %s index failed user=%s', kind, key, exc_info=True)
+                from index_publication import propagate_build_failure
+                propagate_build_failure(error)
                 return None
     if container_name:
         _clear_manifest_dirty_flag(key, kind)
@@ -5591,7 +5613,9 @@ def _refresh_rows_index_on_disk(
                     overwrite=True,
                     content_settings=BlobContentSettings(content_type='application/json'),
                 )
-            except Exception:
+            except Exception as error:
+                from index_publication import propagate_build_failure
+                propagate_build_failure(error)
                 pass
     with cache_lock:
         cache.pop(key, None)  # the rows are on disk/blob, not held here
@@ -5930,7 +5954,8 @@ def _access_index_row(entity: Dict) -> Optional[Dict[str, object]]:
         'blobName': str(entity.get('anonymousImageId') or '').strip(),
         'thumbnailStatus': str(entity.get('thumbnail_status') or '').strip(),
         'previewStatus': str(entity.get('preview_status') or '').strip(),
-        **{key: entity[key] for key in ('thumbnailArtifact', 'previewArtifact') if entity.get(key)},
+        **{kind + 'Artifact': entity[kind + 'Artifact'] for kind in ('thumbnail', 'preview')
+           if _catalog_derivative_receipt(entity, kind) is not None},
     }
 
 
