@@ -259,7 +259,7 @@ def _execution_check(leases, ownership, store, outbox_key):
     leases.check(ownership)
 
 
-def _completion(store, member, identity):
+def _completion(store, member, identity, receipts=None):
     from processing_completion import validate_intent
     from processing_receipts import ArtifactReceipts
     from upload_waves import digest
@@ -274,11 +274,12 @@ def _completion(store, member, identity):
         raise ValueError('Completion does not match the frozen member')
     if set(intent['requiredSteps']) != set(json.loads(member['requiredSteps'])):
         raise ValueError('Completion required steps differ from admission')
-    manifest = ArtifactReceipts(store.table, store.library).verify_reference(intent['artifactReceipt'], intent)
+    receipts = receipts if receipts is not None else ArtifactReceipts(store.table, store.library)
+    manifest = receipts.verify_reference(intent['artifactReceipt'], intent)
     return intent, manifest
 
 
-def _observe_qualified(store, member, metadata_table):
+def _observe_qualified(store, member, metadata_table, receipts=None):
     from azure.core.exceptions import ResourceNotFoundError
     from processing_generation import is_superseded
     from image_utils import is_video_file
@@ -300,7 +301,7 @@ def _observe_qualified(store, member, metadata_table):
     identity = row.get('processingCompletionId')
     if not identity:
         return None, row
-    completion = _completion(store, member, identity)
+    completion = _completion(store, member, identity, receipts)
     if completion is None and row.get('processingCompletionOutbox'):
         from processing_completion import relay_completion
         from processing_receipts import ArtifactReceipts
@@ -311,7 +312,7 @@ def _observe_qualified(store, member, metadata_table):
                 and ArtifactReceipts(store.table, store.library).is_video_status_mismatch(head)):
             return None, row  # Requalify under a source lease before replacing this invalid intent.
         relay_completion(metadata_table, store.library, member['filename'], store.accept_source_completion)
-        completion = _completion(store, member, identity)
+        completion = _completion(store, member, identity, receipts)
     if completion is None or completion[0]['generation'] != row.get('processingGeneration'):
         return None, row
     from processing_generation import contract_id
@@ -319,7 +320,7 @@ def _observe_qualified(store, member, metadata_table):
     if contract_id(contract) != row['processingGeneration']:
         raise ValueError('Processing contract identity mismatch')
     from processing_receipts import ArtifactReceipts
-    receipts = ArtifactReceipts(store.table, store.library)
+    receipts = receipts if receipts is not None else ArtifactReceipts(store.table, store.library)
     for snapshot in completion[1]['faceSnapshots']:
         face = json.loads(receipts._get('face!' + snapshot)['payload'])
         if face.get('embeddingVersion') not in contract.get('faceEmbeddingVersions', []):
@@ -327,44 +328,112 @@ def _observe_qualified(store, member, metadata_table):
     return completion, row
 
 
-def _process_vision_member(store, wave_id, member, metadata_table, process_source, renew, progressed):
-    from upload_waves import digest
-    from wave_settlement import source_state, attempt, exhausted, verified
+def _inspect_vision_member(store, wave_id, member, metadata_table, receipts):
+    from wave_settlement import source_state, verified
     from storage_utils import _processing_is_expired
-    if member['outcome'] not in ('pending', 'settled') and verified(store, member): return
-    if source_state(store, wave_id, member, metadata_table): return
-    completion, row = _observe_qualified(store, member, metadata_table)
-    leased = bool(row and any(row.get(k) for k in ('processing_lease_owner', 'processing_lease', 'processing_lease_expires_at')))
-    if completion is None and row is not None and (not leased or _processing_is_expired(row)):
-        if process_source is None:
-            raise NotImplementedError('A fenced source-processing adapter is required')
-        count = attempt(store, member)
-        progressed()  # Start a source's own watchdog window.
+    if member['outcome'] not in ('pending', 'settled') and verified(store, member):
+        return None
+    if source_state(store, wave_id, member, metadata_table):
+        return None
+    completion, row = _observe_qualified(store, member, metadata_table, receipts)
+    leased = bool(row and any(row.get(k) for k in
+        ('processing_lease_owner', 'processing_lease', 'processing_lease_expires_at')))
+    runnable = completion is None and row is not None and (not leased or _processing_is_expired(row))
+    return dict(member=member, completion=completion, row=row, runnable=runnable)
+
+
+def _process_vision_group(store, wave_id, members, metadata, process_source, renew, progressed, executor, receipts):
+    """Parallel source effects; the coordinator alone updates wave evidence."""
+    from contextvars import copy_context
+    from concurrent.futures import wait
+    from execution_lease import OwnershipLost
+    from wave_settlement import exhausted
+    from wave_source_batch import reserve_attempts
+    from storage_utils import _processing_is_expired
+    import logging
+    logger = logging.getLogger(__name__)
+    planned = []
+    for member in members:
         try:
-            process_source(store.library, member['filename'], member['processingRevision'], renew)
+            item = _inspect_vision_member(store, wave_id, member, metadata, receipts)
+        except (OwnershipLost, NotImplementedError):
+            raise
         except Exception:
-            renew()  # Ownership failures are never source failures.
-            # exhausted() is the single authority on whether this source still
-            # has budget left -- it settles terminally once count reaches
-            # MAX_SOURCE_ATTEMPTS, independent of what kept failing (a step
-            # result, or a bare exception with no step to blame). Below budget,
-            # re-raise: the caller isolates this one member so the exception
-            # never blocks its wave-mates, and the next wake retries.
-            if not exhausted(store, wave_id, member, metadata_table, count):
-                raise
+            logger.exception('Vision member inspection failed for %s/%s; continuing wave',
+                             store.library, member['filename'])
+            continue
+        if item is not None:
+            planned.append(item)
+    runnable = [item for item in planned if item['runnable']]
+    if runnable and process_source is None:
+        raise NotImplementedError('A fenced source-processing adapter is required')
+    counts = reserve_attempts(store, [item['member'] for item in runnable]) if runnable else {}
+    def process(item):
+        member = item['member']
         renew()
-        completion, row = _observe_qualified(store, member, metadata_table)
-        if completion is None: exhausted(store, wave_id, member, metadata_table, count)
-    leased = bool(row and any(row.get(k) for k in ('processing_lease_owner', 'processing_lease', 'processing_lease_expires_at')) and not _processing_is_expired(row))
-    store.observe(wave_id, member['photoId'], member['processingRevision'],
-        outcome='settled' if completion else 'pending',
-        evidence_id=completion[0]['id'] if completion else digest(['pending', member['photoId'], member['processingRevision']]),
-        evidence_qualified=bool(completion), outstanding_leases=int(leased and completion is None))
+        progressed()
+        process_source(store.library, member['filename'], member['processingRevision'], renew)
+    futures = {}
+    errors = {}
+    for item in runnable:
+        key = item['member']['RowKey']
+        count, admitted = counts[key]
+        if not admitted:
+            exhausted(store, wave_id, item['member'], metadata, count)
+        elif executor is not None:
+            futures[key] = executor.submit(copy_context().run, process, item)
+        else:
+            try:
+                process(item)
+            except Exception as error:
+                errors[key] = error
+    # Never let a task continue writing after this stage releases ownership.
+    if futures:
+        wait(futures.values())
+        for key, future in futures.items():
+            try:
+                future.result()
+            except Exception as error:
+                errors[key] = error
+    for error in errors.values():
+        if isinstance(error, (OwnershipLost, NotImplementedError)):
+            raise error
+    observations = []
+    for item in planned:
+        member = item['member']
+        if item['runnable']:
+            renew()
+            metadata.invalidate(member['filename'])
+            count, _ = counts[member['RowKey']]
+            error = errors.get(member['RowKey'])
+            if error is not None and not exhausted(store, wave_id, member, metadata, count):
+                logger.error('Vision source failed for %s/%s; continuing wave', store.library,
+                    member['filename'], exc_info=(type(error), error, error.__traceback__))
+                continue
+            try:
+                item['completion'], item['row'] = _observe_qualified(store, member, metadata, receipts)
+            except OwnershipLost:
+                raise
+            except Exception:
+                logger.exception('Vision receipt qualification failed for %s/%s; continuing wave',
+                                 store.library, member['filename'])
+                exhausted(store, wave_id, member, metadata, count)
+                continue
+            if item['completion'] is None:
+                if exhausted(store, wave_id, member, metadata, count):
+                    continue
+        row, completion = item['row'], item['completion']
+        leased = bool(row and any(row.get(k) for k in
+            ('processing_lease_owner', 'processing_lease', 'processing_lease_expires_at'))
+            and not _processing_is_expired(row))
+        observations.append((member, completion, leased))
+    return observations
 
 
 def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
                        metadata_table, face_table, face_ids, cluster_send, *, process_source=None,
-                       deadline=None, progress=None, before_freeze=None):
+                       deadline=None, progress=None, before_freeze=None, source_workers=1, source_executor=None,
+                       prepare_sources=None):
     """Resume bounded source/evaluation passes using qualified receipts.
 
     A checkpoint is a scan position, never proof of source completion. Each
@@ -373,16 +442,30 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
     revision; the runtime queues the continuation before acknowledging its wake.
     """
     import time
+    import threading
+    from contextlib import nullcontext
+    from concurrent.futures import ThreadPoolExecutor
     from execution_lease import execution_scope, OwnershipLost
     from upload_waves import MAX_PAGE
+    from wave_source_batch import MetadataBatch, ReceiptBatch, commit_observations
+    if type(source_workers) is not int or not 1 <= source_workers <= MAX_PAGE:
+        raise ValueError('Vision source concurrency must be between 1 and the member page size')
     ownership, wave = claim_release(leases, store, library, wave_id, 'vision', outbox_key, 'vision')
     if ownership is None:
         return None
     if ownership.status == 'succeeded':
         return wave
+    renewal_lock = threading.Lock()
+    next_renewal = [0.0]
     def renew():
-        _execution_check(leases, ownership, store, outbox_key)
-        leases.renew(ownership)
+        # Every check still validates durable ownership and release eligibility.
+        # The keepalive also renews during blocking calls; do not write the same
+        # stage lease at every source boundary or from every source thread.
+        with renewal_lock:
+            _execution_check(leases, ownership, store, outbox_key)
+            if time.monotonic() >= next_renewal[0]:
+                leases.renew(ownership)
+                next_renewal[0] = time.monotonic() + min(30, leases.lease_seconds / 3)
     def checkpoint(phase, after=''):
         leases.checkpoint(ownership, 'vision:' + json.dumps(dict(phase=phase, after=after)))
     def expired():
@@ -392,41 +475,36 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
     saved = leases.row(ownership).get('progressCheckpoint', '')
     position = json.loads(saved[7:]) if saved.startswith('vision:') else {}
     phase, cursor = position.get('phase', 'sources'), position.get('after', '')
+    pool = (nullcontext(source_executor) if source_executor is not None or source_workers == 1
+            else ThreadPoolExecutor(max_workers=source_workers, thread_name_prefix='wave-source'))
     try:
-        with execution_scope(leases, ownership, store, lambda: _execution_check(leases, ownership, store, outbox_key)), leases.keepalive(ownership):
+        with execution_scope(leases, ownership, store, lambda: _execution_check(leases, ownership, store, outbox_key)), leases.keepalive(ownership), pool as executor:
             while phase == 'sources':
                 if expired(): return store._required(store.wave_key(wave_id))
                 renew()
                 members = store._page(f'e!{wave_id}!m!', cursor)
-                for member in members:
-                    if expired(): return store._required(store.wave_key(wave_id))
-                    renew()
-                    try:
-                        _process_vision_member(store, wave_id, member, metadata_table,
-                            process_source, renew, progressed)
-                    except (OwnershipLost, NotImplementedError):
-                        raise  # Ownership loss and a missing adapter are never per-source outcomes.
-                    except Exception:
-                        # No single member may abort the whole pass -- the exact
-                        # production incident this closes: one source's
-                        # exception used to propagate out of this loop
-                        # uncaught, so every other member in the page never
-                        # got its turn. Only reaches here while this source is
-                        # still under its retry budget (_process_vision_member
-                        # re-raises in that case only -- once exhausted() fires
-                        # it settles the source terminally and does not
-                        # re-raise), so the next wake simply retries it; this
-                        # pass moves on to the rest of the page now.
-                        import app
-                        try:
-                            app.app.logger.exception(
-                                'Vision member processing failed for %s/%s; continuing wave',
-                                library, member.get('filename'))
-                        except Exception:
-                            pass
-                    cursor = member['RowKey']
-                    checkpoint('sources', cursor)
+                metadata = MetadataBatch(metadata_table, store.library, members)
+                receipts = ReceiptBatch(store.table, store.library)
+                if members and prepare_sources is not None:
                     progressed()
+                    prepare_sources(members, metadata, renew, expired)
+                    renew()
+                    progressed()
+                observations = []
+                for offset in range(0, len(members), source_workers):
+                    if expired(): break
+                    renew()
+                    group = members[offset:offset + source_workers]
+                    observations.extend(_process_vision_group(store, wave_id, group,
+                        metadata, process_source, renew, progressed, executor, receipts))
+                    cursor = group[-1]['RowKey']
+                    progressed()
+                # A checkpoint covers only drained groups. Source results are
+                # durable first; interruption before this commit is replayable
+                # through receipt qualification without another model attempt.
+                commit_observations(store, wave_id, observations)
+                checkpoint('sources', cursor)
+                if expired(): return store._required(store.wave_key(wave_id))
                 if len(members) < MAX_PAGE:
                     phase = 'evaluate'
                     checkpoint(phase)

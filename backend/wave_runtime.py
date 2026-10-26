@@ -8,6 +8,7 @@ import os
 import threading
 import uuid
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 
 from upload_waves import ShadowWaves, digest
 from execution_lease import ExecutionLeases
@@ -17,6 +18,17 @@ from upload_wave_execution import (execution_enabled,stage_work_store,run_vision
 
 TYPE='upload_wave_stage'
 ROLES={'vision':'vision','cluster':'cluster','index':'index-worker'}
+_SOURCE_POOL = None
+_SOURCE_POOL_LOCK = threading.Lock()
+
+
+def _source_executor(workers):
+    """All wave deliveries share the configured process-wide source slots."""
+    global _SOURCE_POOL
+    with _SOURCE_POOL_LOCK:
+        if _SOURCE_POOL is None:
+            _SOURCE_POOL = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='wave-source')
+        return _SOURCE_POOL
 
 
 def send_stage(library,scope,revision,delay=0):
@@ -151,6 +163,32 @@ def consume(payload,*,deadline=None,progress=None):
         # Dispatcher bookkeeping is renewed separately from stage ownership.
         with publication(work,claim):
             if stage=='vision':
+                collector = getattr(app._ipwork_metrics_context, 'collector', None)
+                def prepare_sources(members, metadata, renew, expired):
+                    from azure.core.exceptions import ResourceNotFoundError
+                    from processing_completion import TERMINAL
+                    names = []
+                    for member in members:
+                        if expired(): return
+                        try:
+                            row = metadata.get_entity(library, member['filename'])
+                        except ResourceNotFoundError:
+                            continue
+                        if (row.get('anonymousImageId') == member['photoId']
+                                and row.get('processingRevision') == member['processingRevision']
+                                and row.get('processing_state') != 'deleted' and not row.get('processingIsolated')
+                                and row.get('face_status') not in TERMINAL):
+                            names.append(member['filename'])
+                    if names:
+                        renew()
+                        app.reconcile_face_filename_indexes_batch(library, names, cancelled=expired)
+                def process_with_metrics(*args):
+                    previous = getattr(app._ipwork_metrics_context, 'collector', None)
+                    app._ipwork_metrics_context.collector = collector
+                    try:
+                        return process_source(*args)
+                    finally:
+                        app._ipwork_metrics_context.collector = previous
                 def invalidate_tags():
                     # Wave source writes bypass legacy invalidation. Vision's
                     # model-owned sweep must not reuse a clean, older tag set.
@@ -169,8 +207,11 @@ def consume(payload,*,deadline=None,progress=None):
                         try:app.app.logger.exception('Wave tag invalidation failed for %s; continuing without it',library)
                         except Exception:pass
                 result=run_vision_release(leases,work,store,library,wave_id,key,
-                    app.metadata_table_client,None,None,send_stage,process_source=process_source,
-                    deadline=deadline,progress=progress,before_freeze=invalidate_tags)
+                    app.metadata_table_client,None,None,send_stage,process_source=process_with_metrics,
+                    deadline=deadline,progress=progress,before_freeze=invalidate_tags,
+                    source_workers=app.IPWORKER_CONCURRENCY,
+                    source_executor=_source_executor(app.IPWORKER_CONCURRENCY),
+                    prepare_sources=prepare_sources)
             elif stage=='cluster':
                 # Bounded zero-face probes continue on Cluster wakes without
                 # loading FAISS. The release remains eligible while probing.

@@ -2,6 +2,7 @@
 import json
 import sys
 import time
+import threading
 from collections import Counter
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -33,6 +34,8 @@ def live(monkeypatch):
     table.create_entity(store._row('policy',protocol=wave_policy.PROTOCOL,capabilityId=certificate,cleanupState=''))
     app=SimpleNamespace(jobs_table_client=table,metadata_table_client=metadata,
         blob_service_client=None,BLOB_LEXICAL_INDEX_CONTAINER='indexes',
+        IPWORKER_CONCURRENCY=2,_ipwork_metrics_context=threading.local(),
+        reconcile_face_filename_indexes_batch=lambda *a,**kw:None,
         _live_faiss_metadata_update=lambda *a:None,
         _get_live_faiss_assigner=lambda:pytest.fail('zero-face work loaded FAISS'))
     monkeypatch.setitem(sys.modules,'app',app)
@@ -239,3 +242,30 @@ def test_index_completion_wakes_a_waiting_successor(live,monkeypatch):
     assert store.status(first)['state']=='complete'
     assert store.status(second)['state']=='processing_pending'
     assert any(f'wave-vision:{second}:' in message[1] for message in sent)
+
+
+def test_runtime_restores_face_preparation_batches_and_source_metrics(live, monkeypatch):
+    import threading
+    from execution_lease import guard_operations
+    store, metadata, sent, _ = live
+    wave = admit(store, metadata, 25)
+    app = sys.modules['app']
+    marker = object()
+    app._ipwork_metrics_context.collector = marker
+    prepared, processed = [], []
+    lock = threading.Lock()
+    def prepare(library, filenames, cancelled):
+        assert library == store.library and not cancelled()
+        prepared.append(list(filenames))
+    app.reconcile_face_filename_indexes_batch = prepare
+    def process(library, filename, revision, renew):
+        assert app._ipwork_metrics_context.collector is marker
+        assert guard_operations(store)
+        complete_source(store, metadata, filename)
+        with lock:
+            processed.append(filename)
+    monkeypatch.setattr(wave_runtime, 'process_source', process)
+    assert wave_runtime.consume(wake(store, wave, 'vision')) == 'done'
+    assert [len(names) for names in prepared] == [20, 5]
+    assert len(processed) == len(set(processed)) == 25
+    assert set(processed) == {name for names in prepared for name in names}
