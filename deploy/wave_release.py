@@ -5,7 +5,21 @@ import re
 
 PROTOCOL = 'library-wave-v1'
 ROLES = ('core','upload','vision','cluster','index-worker','archive','recovery')
+# Accepted only when validating a pre-existing release artifact: releases built
+# before the standing wave-recovery job's removal still carry this role.
+LEGACY_ROLES = ROLES + ('wave-recovery',)
 IMAGE = re.compile(r'ghcr\.io/[a-z0-9_./-]+@sha256:[a-f0-9]{64}')
+
+
+def _deployments_for(roles, images):
+    return {role: images['ipworker'] if role=='vision' else images['backend'] for role in roles}
+
+
+def _contract_for(roles, images, source):
+    deployments = _deployments_for(roles, images)
+    body = json.dumps([PROTOCOL,deployments],sort_keys=True,separators=(',',':'),ensure_ascii=False)
+    return dict(protocol=PROTOCOL,sourceCommit=source,images=images,deployments=deployments,
+                capabilityId=hashlib.sha256(body.encode()).hexdigest())
 
 
 def release_contract(images, source):
@@ -13,16 +27,16 @@ def release_contract(images, source):
         raise ValueError('One source commit and all three release images are required')
     if any(not IMAGE.fullmatch(image) for image in images.values()):
         raise ValueError('Release images must be immutable GHCR digests, not tags')
-    deployments = {role: images['ipworker'] if role=='vision' else images['backend'] for role in ROLES}
-    body = json.dumps([PROTOCOL,deployments],sort_keys=True,separators=(',',':'),ensure_ascii=False)
-    return dict(protocol=PROTOCOL,sourceCommit=source,images=images,deployments=deployments,
-                capabilityId=hashlib.sha256(body.encode()).hexdigest())
+    return _contract_for(ROLES, images, source)
 
 
 def validate_release(release):
     expected = release_contract(release['images'],release['sourceCommit'])
     if any(release.get(k)!=v for k,v in expected.items()):
-        raise ValueError('Release capability or role images were changed')
+        legacy = _contract_for(LEGACY_ROLES, release['images'], release['sourceCommit'])
+        if any(release.get(k)!=v for k,v in legacy.items()):
+            raise ValueError('Release capability or role images were changed')
+        expected = legacy
     if release.get('qualification') != 'wave-unit-tests-passed':
         raise ValueError('Use the wave-release artifact from the successful qualification job')
     return expected
