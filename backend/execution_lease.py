@@ -23,6 +23,8 @@ import contextvars
 import threading
 from contextlib import contextmanager
 import uuid
+
+import processing_diagnostics
 from dataclasses import dataclass
 
 from azure.core import MatchConditions
@@ -97,6 +99,7 @@ class ExecutionLeases:
                 dict(mode=UpdateMode.REPLACE, etag=version,
                      match_condition=MatchConditions.IfNotModified))
 
+    @processing_diagnostics.wave_phase('guard_ownership_read')
     def check(self, ownership):
         current = self._authoritative(ownership)
         if current.get('status') != 'running' or float(current.get('leaseUntil') or 0) <= self.clock():

@@ -451,3 +451,27 @@ def test_foreground_face_curation_is_witnessed_without_overwriting_or_stalling(a
     assert override and override['outcome']=='curated' and override['originalDecisionId']
     for table in (h.faces,h.people,h.members):table.after_write=lambda row:pytest.fail('reapplied curation')
     assert execute(h,snapshots,store,frozen,leases)==first
+
+
+def test_wave_path_emits_aggregated_phase_costs_without_changing_assignments(caplog):
+    import logging
+    import processing_diagnostics as diagnostics
+    from test_processing_diagnostics import records
+    caplog.set_level(logging.INFO, logger=diagnostics._LOGGER.name)
+    expected = oracle()
+    h, snapshots, store, frozen, leases = setup()
+
+    @diagnostics.cluster_wave_summary
+    def run(leases, store, library, wave_id):
+        return execute(h, snapshots, store, frozen, leases)
+
+    run(leases, store, 'u', frozen['waveId'])
+    assert comparable(assignment_snapshot(h)) == expected
+    phases = {row['phase']: row for row in records(caplog, 'cluster_wave_phase')}
+    assert {'lease_wait', 'snapshot_prepare', 'runtime_build', 'matching',
+            'journal_write', 'assignment_persistence', 'curation_check',
+            'runtime_update', 'checkpoint'} <= phases.keys()
+    assert phases['matching']['calls'] == len(snapshots)
+    summary, = records(caplog, 'cluster_wave_summary')
+    assert summary['faces'] == summary['faces_processed'] == len(snapshots)
+    assert summary['wave_id'] == frozen['waveId']

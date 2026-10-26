@@ -123,7 +123,115 @@ def apply_phase(user, filename, phase):
             milliseconds=max(0, time.monotonic() - started) * 1000,
             thread_cpu_ms=max(0, time.thread_time() - cpu_started) * 1000,
             sdk_calls=after[1] - before[1] if same_scope else None,
-            sdk_send_ms=after[2] - before[2] if same_scope else None)
+            sdk_send_ms=after[2] - before[2] if same_scope else None,
+            sdk_attribution='shared_scope' if same_scope else None)
+
+
+# One bounded accumulator per wave attempt; no per-face logging or retained IDs.
+_WAVE = ContextVar('processing_wave_metrics', default=None)
+
+
+def _scope_io():
+    try:
+        from perf_instrumentation import current_scope
+        scope = current_scope()
+        if scope is not None:
+            with scope.lock:
+                return scope, scope.io_count, scope.io_ms
+    except Exception:
+        pass
+    return None
+
+
+def _io_delta(before):
+    after = _scope_io()
+    if before is not None and after is not None and before[0] is after[0]:
+        return dict(sdk_calls=after[1] - before[1], sdk_send_ms=after[2] - before[2],
+                    sdk_attribution='shared_scope')
+    return {}
+
+
+class WaveMetrics:
+    def __init__(self, library, wave_id):
+        self.fields = dict(_TRACE.get() or {})
+        self.fields.update(role='cluster', library_id=file_id(library, ''), wave_id=wave_id)
+        self.phases = {}
+        self.faces = 0
+        self.faces_processed = 0
+
+    @contextmanager
+    def phase(self, name):
+        started, cpu, before = time.monotonic(), time.thread_time(), _scope_io()
+        outcome = 'success'
+        try:
+            yield
+        except BaseException:
+            outcome = 'error'
+            raise
+        finally:
+            row = self.phases.setdefault(name, dict(calls=0, errors=0, milliseconds=0.,
+                                                    thread_cpu_ms=0.))
+            row['calls'] += 1
+            row['errors'] += outcome == 'error'
+            row['milliseconds'] += max(0, time.monotonic() - started) * 1000
+            row['thread_cpu_ms'] += max(0, time.thread_time() - cpu) * 1000
+            for key, value in _io_delta(before).items():
+                if key != 'sdk_attribution':
+                    row[key] = row.get(key, 0) + value
+
+
+@contextmanager
+def wave_phase_scope(name):
+    metrics = _WAVE.get()
+    if metrics is None:
+        yield
+    else:
+        with metrics.phase(name):
+            yield
+
+
+def wave_faces(total=None, processed=None):
+    metrics = _WAVE.get()
+    if metrics is not None:
+        if total is not None:
+            metrics.faces = total
+        if processed is not None:
+            metrics.faces_processed = processed
+
+
+def wave_phase(name):
+    """Aggregate inclusive phase costs; nested phases must not be summed."""
+    def decorate(function):
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            with wave_phase_scope(name):
+                return function(*args, **kwargs)
+        return wrapped
+    return decorate
+
+
+def cluster_wave_summary(function):
+    @wraps(function)
+    def wrapped(leases, store, library, wave_id, *args, **kwargs):
+        metrics = WaveMetrics(library, wave_id)
+        token = _WAVE.set(metrics)
+        started, cpu, before = time.monotonic(), time.process_time(), _scope_io()
+        outcome = 'error'
+        try:
+            result = function(leases, store, library, wave_id, *args, **kwargs)
+            outcome = 'success' if result is not None else 'no_work'
+            return result
+        finally:
+            _WAVE.reset(token)
+            for name, totals in metrics.phases.items():
+                emit('cluster_wave_phase', **metrics.fields, phase=name,
+                     inclusive=True, sdk_attribution='shared_scope', **totals)
+            emit('cluster_wave_summary', **metrics.fields, outcome=outcome,
+                 milliseconds=max(0, time.monotonic() - started) * 1000,
+                 process_cpu_ms=max(0, time.process_time() - cpu) * 1000,
+                 cpu_attribution='process', faces=metrics.faces,
+                 faces_processed=metrics.faces_processed, **_io_delta(before))
+    return wrapped
 
 
 def payload(message):

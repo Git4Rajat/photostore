@@ -138,3 +138,64 @@ def test_mixed_activity_and_cluster_face_counts(caplog):
     row, = records(caplog, 'cluster_applied')
     assert row['faces'] == 2
     assert all(secret not in json.dumps(row) for secret in ('p.jpg', 'face1', 'private-user'))
+
+
+def test_wave_metrics_aggregate_inclusive_costs_and_correlate(caplog, monkeypatch):
+    import perf_instrumentation as perf
+    wall, cpu = [0.], [0.]
+    monkeypatch.setattr(d.time, 'monotonic', lambda: wall[0])
+    monkeypatch.setattr(d.time, 'thread_time', lambda: cpu[0])
+    monkeypatch.setattr(d.time, 'process_time', lambda: cpu[0])
+
+    @d.wave_phase('guard_check')
+    def guard():
+        wall[0] += .01
+        cpu[0] += .002
+        perf.current_scope().add_io('table', 'GET', '/jobs', 200, 8, 0)
+
+    @d.cluster_wave_summary
+    def run(leases, store, library, wave_id):
+        d.wave_faces(total=3)
+        with d.wave_phase_scope('matching'):
+            for i in range(3):
+                guard()
+                d.wave_faces(processed=i + 1)
+        return 'receipt'
+
+    with perf.scope('test'):
+        assert run(None, None, 'private-library', 'wave-1') == 'receipt'
+    phases = {r['phase']: r for r in records(caplog, 'cluster_wave_phase')}
+    guard_row = phases['guard_check']
+    assert guard_row['calls'] == 3 and guard_row['errors'] == 0
+    assert guard_row['milliseconds'] == pytest.approx(30)
+    assert guard_row['thread_cpu_ms'] == pytest.approx(6)
+    assert guard_row['sdk_calls'] == 3 and guard_row['sdk_send_ms'] == 24
+    assert phases['matching']['sdk_calls'] == 3  # Inclusive, not another 3 requests.
+    summary, = records(caplog, 'cluster_wave_summary')
+    assert summary['sdk_calls'] == 3 and summary['milliseconds'] == pytest.approx(30)
+    assert summary['process_cpu_ms'] == pytest.approx(6)
+    assert summary['faces'] == summary['faces_processed'] == 3
+    assert summary['wave_id'] == 'wave-1' and summary['outcome'] == 'success'
+    assert summary['sdk_attribution'] == 'shared_scope'
+    assert 'private-library' not in json.dumps(summary)
+    assert d._WAVE.get() is None
+
+
+def test_wave_metrics_report_failure_and_restore_context(caplog):
+    failure = ValueError('original failure')
+
+    @d.cluster_wave_summary
+    def run(leases, store, library, wave_id):
+        with d.wave_phase_scope('assignment_persistence'):
+            d.wave_faces(total=2, processed=1)
+            raise failure
+
+    with pytest.raises(ValueError) as caught:
+        run(None, None, 'u', 'wave-error')
+    assert caught.value is failure
+    summary, = records(caplog, 'cluster_wave_summary')
+    phase, = records(caplog, 'cluster_wave_phase')
+    assert summary['outcome'] == 'error' and summary['faces_processed'] == 1
+    assert phase['errors'] == 1
+    assert 'sdk_calls' not in summary  # No scope is not zero I/O.
+    assert d._WAVE.get() is None

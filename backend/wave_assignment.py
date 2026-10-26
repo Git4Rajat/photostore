@@ -9,11 +9,14 @@ A private FAISS runtime is rebuilt from the frozen baseline on each attempt,
 then committed decisions are replayed in order. No checkpoint can introduce
 unrecorded candidates, and each face enters the private runtime at most once.
 """
+from contextlib import contextmanager, ExitStack
 from dataclasses import asdict
 from datetime import datetime
 import json
 import sqlite3
 import tempfile
+
+import processing_diagnostics
 
 from azure.core import MatchConditions
 from azure.core.exceptions import ResourceNotFoundError
@@ -98,6 +101,7 @@ class WaveAssignmentJournal:
             raise ValueError('Corrupt wave assignment journal')
         return body
 
+    @processing_diagnostics.wave_phase('journal_write')
     def put(self, key, payload):
         body = encoded(payload)
         if len(body.encode('utf-16-le')) > 60_000:
@@ -132,6 +136,7 @@ class WaveAssignmentJournal:
                 return
             after = page[-1]['RowKey']
 
+    @processing_diagnostics.wave_phase('snapshot_prepare')
     def prepare(self, workspace, inputs, assigner, binding, baseline_revision):
         header = self.get('manifest')
         if header is not None:
@@ -218,6 +223,7 @@ def _runtime_rows(workspace, guard):
         yield row
 
 
+@processing_diagnostics.wave_phase('matching')
 def _decide(assigner, library, face, workspace, runtime, guard):
     face_id = face['RowKey']
     result = dict(faceId=face_id, inputDigest=digest(face), outcome='excluded', person=None,
@@ -267,6 +273,7 @@ SOURCE_FIELDS = ('filename', 'sourcePhotoId', 'processingRevision', 'processingG
                  'processingFence', 'embeddingVersion', 'alignmentMethod')
 
 
+@processing_diagnostics.wave_phase('curation_check')
 def _curation_override(journal, position, assigner, library, face, decision, guard):
     """Witness foreground curation before an unapplied decision takes effect.
 
@@ -296,6 +303,7 @@ def _curation_override(journal, position, assigner, library, face, decision, gua
     return override
 
 
+@processing_diagnostics.wave_phase('assignment_persistence')
 def _apply(assigner, library, face, decision, decision_id, guard, wave_id):
     if decision['outcome'] == 'excluded':
         return
@@ -357,6 +365,7 @@ def _apply(assigner, library, face, decision, decision_id, guard, wave_id):
     _write(assigner.face_table, face_row, live, guard)
 
 
+@processing_diagnostics.wave_phase('runtime_update')
 def _replay(workspace, runtime, decision, guard):
     candidate = decision.get('candidate')
     if candidate is None:
@@ -381,6 +390,15 @@ def _replay(workspace, runtime, decision, guard):
     workspace.put('people', decision['personId'], decision['person'])
 
 
+@contextmanager
+def _assignment_lock(assigner, library):
+    with ExitStack() as stack:
+        with processing_diagnostics.wave_phase_scope('lease_wait'):
+            stack.enter_context(_LOCK)
+            guard = stack.enter_context(assigner._assignment_lease(library))
+        yield guard
+
+
 def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128, progress=lambda count: None):
     """One logical pass; page_size changes neither decisions nor recovery IDs.
 
@@ -401,7 +419,7 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
     journal = WaveAssignmentJournal(store, wave['waveId'], check)
     # Keep the existing library assignment lease/lock: legacy assignments cannot
     # race baseline capture or a wave's materialization within the same owner.
-    with _LOCK, assigner._assignment_lease(store.library) as library_guard:
+    with _assignment_lock(assigner, store.library) as library_guard:
         class Guard:
             def check(self):
                 check(); library_guard.check()
@@ -418,7 +436,9 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
                 runtime = LiveFaceIndex(directory + '/runtime', config=config.index_config,
                     candidates=config.candidates, nprobe=config.nprobe,
                     delta_limit=config.delta_limit, threads=config.threads)
-                runtime.build(_runtime_rows(workspace, guard))
+                processing_diagnostics.wave_faces(total=header['faceCount'])
+                with processing_diagnostics.wave_phase_scope('runtime_build'):
+                    runtime.build(_runtime_rows(workspace, guard))
                 guard.check()
                 chain = digest(['wave-decisions-v1', digest(header)])
                 begun = False
@@ -445,8 +465,10 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
                         journal.put(f'applied!{position:012d}', {'decisionId': identity})
                     _replay(workspace, runtime, decision, guard)
                     chain = digest([chain, position, identity])
+                    processing_diagnostics.wave_faces(processed=position + 1)
                     if (position + 1) % page_size == 0 or position + 1 == header['faceCount']:
-                        progress(position + 1)
+                        with processing_diagnostics.wave_phase_scope('checkpoint'):
+                            progress(position + 1)
                 guard.check()
                 return journal.finish(header, chain)
             finally:

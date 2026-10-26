@@ -127,3 +127,30 @@ is best-effort and must not block uploads. Windows are selected by log emission
 time and may cross the requested period boundary. Upload and vision are separate
 stages, often handling the same source bytes; their volumes must not be added
 and called distinct uploaded data.
+
+### Wave clustering cost attribution
+
+`run_cluster_release` emits one `cluster_wave_summary` and bounded
+`cluster_wave_phase` totals per attempt, including failed attempts. Correlate
+using `wave_id`, opaque `library_id`, `process_instance`, and replica identity.
+The summary reports elapsed `milliseconds`, `process_cpu_ms`, `faces`,
+`faces_processed`, outcome, and scope storage counters when available. A replay
+of an already completed stage can report success with zero processed faces.
+
+Phases include lease acquisition, frozen snapshot preparation, runtime build,
+matching, curation validation, durable journal writes, assignment persistence,
+local runtime updates, checkpoints, and publication handoff. `guard_check` and
+`eligibility_check` measure repeated control checks; `guard_policy_read`,
+`guard_wave_read`, `guard_dispatch_read`, `guard_ownership_read`, and
+`guard_keepalive_check` separate their causes. Each phase reports invocation
+count, error count, elapsed time, calling-thread CPU, and scope storage deltas.
+No per-face phase log lines or additional storage calls are introduced.
+
+Phase timings are **inclusive**: guard time inside persistence is included in
+both totals. Do not add nested phase totals together. CPU and network time can
+overlap. Process CPU includes native worker threads and other work in the same
+process; phase thread CPU excludes native helper threads. Storage deltas carry
+`sdk_attribution=shared_scope`, since concurrent work sharing a performance
+scope can contribute to them. This label also applies to Vision's existing
+`processing_apply_phase` events. Missing storage counters mean no performance
+scope was available, rather than zero storage activity.

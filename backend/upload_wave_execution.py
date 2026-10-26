@@ -19,6 +19,8 @@ stage.
 import os
 import json
 
+import processing_diagnostics
+
 from index_work import WorkStore
 
 STAGE_PARTITION = 'upload-wave-stage-pending'
@@ -244,15 +246,19 @@ def claim_release(leases, store, library, wave_id, stage, outbox_key, destinatio
     return leases.claim(library, wave_id, stage, revision), wave
 
 
+@processing_diagnostics.wave_phase('eligibility_check')
 def _execution_check(leases, ownership, store, outbox_key):
     from execution_lease import OwnershipLost
     if not execution_enabled():
         raise OwnershipLost('Wave execution is disabled')
-    policy=store._get('policy')
+    with processing_diagnostics.wave_phase_scope('guard_policy_read'):
+        policy=store._get('policy')
     if policy and policy.get('cleanupState'):
         raise OwnershipLost('Library cleanup has fenced wave execution')
-    wave = store._required(store.wave_key(ownership.waveId))
-    outbox = store._required(outbox_key)
+    with processing_diagnostics.wave_phase_scope('guard_wave_read'):
+        wave = store._required(store.wave_key(ownership.waveId))
+    with processing_diagnostics.wave_phase_scope('guard_dispatch_read'):
+        outbox = store._required(outbox_key)
     if (not store.outbox_eligible(wave, outbox)
             or _release_input_revision(outbox, wave) != ownership.inputRevision):
         raise OwnershipLost('Stage release is no longer current')
@@ -587,6 +593,7 @@ def _load_wave_faces(store, wave_id, face_table=None, face_ids=None, *, renew=la
     return members, faces
 
 
+@processing_diagnostics.cluster_wave_summary
 def run_cluster_release(leases, store, library, wave_id, outbox_key, *,
                         assigner, journal, obligations_table, face_table, face_ids,
                         required_scopes=None, chunk_size=None):
@@ -608,25 +615,29 @@ def run_cluster_release(leases, store, library, wave_id, outbox_key, *,
             leases.renew(ownership)
         from wave_assignment import run_frozen_assignment
         with leases.keepalive(ownership) as owned:
+            @processing_diagnostics.wave_phase('guard_check')
             def check():
-                owned()
+                with processing_diagnostics.wave_phase_scope('guard_keepalive_check'):
+                    owned()
                 _execution_check(leases, ownership, store, outbox_key)
             assignment_receipt = run_frozen_assignment(store, wave, assigner,
                 lambda: _iter_wave_faces(store, wave_id, renew=check), check,
                 page_size=128 if chunk_size is None else chunk_size,
                 progress=lambda count: leases.checkpoint(ownership, 'faces-applied:' + str(count)))
-        renew()
-        from wave_catalog import SCOPES, PREREQUISITES
-        scopes=tuple(SCOPES if required_scopes is None else required_scopes)
-        graph={scope:deps for scope,deps in PREREQUISITES.items() if scope in scopes}
-        ledger = ObligationLedger(obligations_table, wave_id, library=library,
-            frozen_revision=wave['frozenRevision'], assignment_revision=assignment_receipt)
-        obligations=compute_obligations(library,wave_id,wave['frozenRevision'],scopes,
-            prerequisite_scopes=graph,assignment_revision=assignment_receipt)
-        frontier=ledger.record_required(obligations,prerequisite_scopes=graph)
-        next_wave = store.commit_assignment(wave_id, frontier, manifest_digest=wave['manifestDigest'],
-            assignment_receipt=assignment_receipt)
-    leases.complete(ownership, frontier)
+        with processing_diagnostics.wave_phase_scope('publication_handoff'):
+            renew()
+            from wave_catalog import SCOPES, PREREQUISITES
+            scopes=tuple(SCOPES if required_scopes is None else required_scopes)
+            graph={scope:deps for scope,deps in PREREQUISITES.items() if scope in scopes}
+            ledger = ObligationLedger(obligations_table, wave_id, library=library,
+                frozen_revision=wave['frozenRevision'], assignment_revision=assignment_receipt)
+            obligations=compute_obligations(library,wave_id,wave['frozenRevision'],scopes,
+                prerequisite_scopes=graph,assignment_revision=assignment_receipt)
+            frontier=ledger.record_required(obligations,prerequisite_scopes=graph)
+            next_wave = store.commit_assignment(wave_id, frontier, manifest_digest=wave['manifestDigest'],
+                assignment_receipt=assignment_receipt)
+    with processing_diagnostics.wave_phase_scope('execution_complete'):
+        leases.complete(ownership, frontier)
     return next_wave
 
 
