@@ -182,6 +182,42 @@ it('serializes a delayed open, registration, live resolution and close', async (
     expect(mocks.resolve).not.toHaveBeenCalled();
     releaseOpen({ waveId: 'wave', manifestRevision: 'opened' });
     await Promise.all([opening, resolving, closing]);
-    expect(events).toEqual(['registered', 'resolved', 'resolved', 'closed']);
+    expect(events).toEqual(['registered', 'resolved', 'closed']);
     expect(mocks.open).toHaveBeenCalledTimes(1);
+});
+
+it('admits the next file without waiting for a slow duplicate resolution', async () => {
+    const s = session(2, 'slow-duplicate');
+    await ensureWaveShadowSessionOpened(s);
+    let release!: (value: { manifestRevision: string }) => void;
+    mocks.resolve.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const resolving = resolveWaveShadowFile(s, { ...s.files[0], status: 'done', skippedDuplicate: true });
+    await vi.waitFor(() => expect(mocks.resolve).toHaveBeenCalledTimes(1));
+    // A stalled outcome request must not stall admission for the next hash check.
+    await ensureWaveShadowSessionOpened(s);
+    expect(mocks.register).toHaveBeenCalledTimes(1);
+    release({ manifestRevision: 'duplicate' });
+    await resolving;
+});
+
+it('resolves duplicate and failed files once across callbacks and cleanup', async () => {
+    const s = session(2, 'settled-files');
+    s.files[0] = { ...s.files[0], status: 'done', skippedDuplicate: true };
+    s.files[1].status = 'failed';
+    await Promise.all(s.files.flatMap(file => [resolveWaveShadowFile(s, file), resolveWaveShadowFile(s, file)]));
+    await finalizeWaveShadowSession(s);
+    expect(mocks.resolve).toHaveBeenCalledTimes(2);
+    expect(mocks.close).toHaveBeenCalledTimes(1);
+});
+
+it('retries an unacknowledged outcome at cleanup and holds close until it succeeds', async () => {
+    const s = session(1, 'retry-resolution');
+    s.files[0].status = 'failed';
+    mocks.resolve.mockResolvedValueOnce(null).mockResolvedValueOnce(null);
+    await resolveWaveShadowFile(s, s.files[0]);
+    await finalizeWaveShadowSession(s);
+    expect(mocks.close).not.toHaveBeenCalled();
+    await finalizeWaveShadowSession(s);
+    expect(mocks.resolve).toHaveBeenCalledTimes(3);
+    expect(mocks.close).toHaveBeenCalledTimes(1);
 });

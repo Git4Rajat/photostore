@@ -940,12 +940,10 @@ describe('upload wave shadow protocol wiring', () => {
         const registerCalls = shadowCalls('/items');
         expect(registerCalls).toHaveLength(1);
         expect(registerCalls[0][1].items).toHaveLength(2);
-        // Each file is resolved live as it finalizes, then defensively
-        // re-resolved (idempotently) when the session closes -- see
-        // finalizeWaveShadowSession's own comment for why.
+        // Cleanup reuses acknowledged outcomes instead of resolving them again.
         const resolveCalls = shadowCalls('/resolve');
         expect(resolveCalls.every(([, body]) => body.outcome === 'accepted')).toBe(true);
-        expect(resolveCalls).toHaveLength(4);
+        expect(resolveCalls).toHaveLength(2);
         expect(new Set(resolveCalls.map(([, body]) => body.itemId)).size).toBe(2);
         expect(shadowCalls('/close')).toHaveLength(1);
     });

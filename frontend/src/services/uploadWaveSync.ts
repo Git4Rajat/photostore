@@ -18,6 +18,7 @@ interface WaveShadowSessionState {
     opened: boolean;
     registered: boolean;
     closed: boolean;
+    resolved: Set<string>;
     pending: Promise<void>;
 }
 
@@ -26,7 +27,7 @@ const sessionState = new Map<string, WaveShadowSessionState>();
 const stateFor = (sessionId: string): WaveShadowSessionState => {
     let state = sessionState.get(sessionId);
     if (!state) {
-        state = { manifestRevision: null, opened: false, registered: false, closed: false, pending: Promise.resolve() };
+        state = { manifestRevision: null, opened: false, registered: false, closed: false, resolved: new Set(), pending: Promise.resolve() };
         sessionState.set(sessionId, state);
     }
     return state;
@@ -87,8 +88,13 @@ const serialized = (session: PersistedUploadSession, action: () => Promise<void>
     return state.pending;
 };
 
-export const ensureWaveShadowSessionOpened = (session: PersistedUploadSession): Promise<void> =>
-    serialized(session, () => ensureRegistered(session));
+export const ensureWaveShadowSessionOpened = (session: PersistedUploadSession): Promise<void> => {
+    const parent = waveParentFor(session);
+    // Admission is immutable once the complete manifest is acknowledged. Do not
+    // put hashing/init/finalize behind the queue draining earlier file outcomes.
+    if (!parent || stateFor(parent.id).registered) return Promise.resolve();
+    return serialized(session, () => ensureRegistered(session));
+};
 
 // Resolves one file's outcome as it settles. A single cheap call -- not a
 // full-session rescan. Call once per file, from finalizeUploadedFile/
@@ -100,14 +106,20 @@ export const resolveWaveShadowFile = (session: PersistedUploadSession, file: Per
     if (state.closed) return;
     const outcome = liveOutcomeForFile(file);
     if (!outcome || !waveFileBelongs(session, file)) return;
+    const itemId = file.waveItemKey || file.key;
+    if (state.resolved.has(itemId)) {
+        recordWaveItemResolved(session, file);
+        return;
+    }
     await ensureRegistered(session);
     if (!state.registered || !waveParentFor(session)) return;
     const result = await resolveWaveShadowItem(
-        parent.id, file.waveItemKey || file.key, outcome,
+        parent.id, itemId, outcome,
         outcome === 'accepted' || outcome === 'duplicate' ? (file.waveAcceptedFilename || file.name) : undefined,
     );
     if (result) {
         state.manifestRevision = result.manifestRevision;
+        state.resolved.add(itemId);
         recordWaveItemResolved(session, file);
     }
 });
@@ -129,16 +141,24 @@ export const finalizeWaveShadowSession = (session: PersistedUploadSession): Prom
     for (const file of session.files) {
         if (!waveParentFor(session)) return;
         if (!waveFileBelongs(session, file)) continue;
+        const itemId = file.waveItemKey || file.key;
+        if (state.resolved.has(itemId)) {
+            recordWaveItemResolved(session, file);
+            continue;
+        }
         const outcome = liveOutcomeForFile(file) ?? 'cancelled';
         const result = await resolveWaveShadowItem(
-            parent.id, file.waveItemKey || file.key, outcome,
+            parent.id, itemId, outcome,
             outcome === 'accepted' || outcome === 'duplicate' ? (file.waveAcceptedFilename || file.name) : undefined,
         );
         if (result) {
             state.manifestRevision = result.manifestRevision;
+            state.resolved.add(itemId);
             recordWaveItemResolved(session, file);
         }
     }
+    if (session.files.some(file => waveFileBelongs(session, file)
+        && !state.resolved.has(file.waveItemKey || file.key))) return;
     if (!waveParentResolved(session)) return;
     if (!state.manifestRevision) return;
     const result = await closeWaveShadowSession(parent.id, state.manifestRevision, parent.id);
