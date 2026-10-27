@@ -1,4 +1,4 @@
-import { waveParentFor, recordWaveItemResolved, waveParentResolved, waveSelectionSession, waveFileBelongs, loadWaveOperation } from './uploadWaveOperations';
+import { waveParentFor, recordWaveItemResolved, waveParentResolved, waveSelectionSession, waveFileBelongs, loadWaveOperation, retireWaveOperation } from './uploadWaveOperations';
 import type { PersistedUploadFile, PersistedUploadSession } from '../types/browserProcessing';
 import {
     WAVE_SHADOW_MAX_PAGE,
@@ -24,6 +24,7 @@ interface WaveShadowSessionState {
     closed: boolean;
     resolved: Set<string>;
     pending: Promise<void>;
+    admissionError?: Error;
 }
 
 const sessionState = new Map<string, WaveShadowSessionState>();
@@ -52,6 +53,10 @@ const ensureRegistered = async (child: PersistedUploadSession): Promise<void> =>
     const session = waveParentFor(child);
     if (!session) return;
     const state = stateFor(session.id);
+    if ('closed' in session && session.closed === true) {
+        state.opened = state.registered = state.closed = true;
+        return;
+    }
     if (state.closed || session.files.length === 0) return;
     if (!state.opened) {
         // A previous admission may have failed before this browser retried.
@@ -89,7 +94,9 @@ const serialized = (session: PersistedUploadSession, action: () => Promise<void>
     const parent = waveParentFor(session);
     if (!parent) return Promise.resolve();
     const state = stateFor(parent.id);
-    state.pending = state.pending.then(action).catch(() => { /* diagnostics must not fail uploading */ });
+    state.pending = state.pending.then(action).catch(error => {
+        state.admissionError = error instanceof Error ? error : new Error('Upload admission failed.');
+    });
     return state.pending;
 };
 
@@ -127,6 +134,7 @@ const resolveFiles = async (session: PersistedUploadSession, files: PersistedUpl
         }
         if (result.state === 'closed') {
             state.closed = true;
+            retireWaveOperation(session);
             return;
         }
     }
@@ -163,7 +171,10 @@ export const acknowledgeWaveFinalizedFile = (session: PersistedUploadSession, fi
     state.manifestRevision = receipt.manifestRevision;
     state.resolved.add(file.waveItemKey || file.key);
     recordWaveItemResolved(session, file);
-    if (receipt.state === 'closed') state.closed = true;
+    if (receipt.state === 'closed') {
+        state.closed = true;
+        retireWaveOperation(session);
+    }
 });
 
 // Called once, from runUploadSession's `finally`, regardless of how the
@@ -191,7 +202,10 @@ export const finalizeWaveShadowSession = (session: PersistedUploadSession): Prom
     if (!waveParentResolved(session)) return;
     if (!state.manifestRevision) return;
     const result = await closeWaveShadowSession(parent.id, state.manifestRevision, parent.id);
-    if (result) state.closed = true;
+    if (result) {
+        state.closed = true;
+        retireWaveOperation(session);
+    }
 });
 
 export const cancelQueuedWaveSelection = (files: File[]): Promise<void> => {
@@ -212,8 +226,12 @@ export const liveWaveAdmission = async (session: PersistedUploadSession, file: P
     if (!waveLiveEnabled() || await waveProtocol()==='legacy') return {};
     await ensureWaveShadowSessionOpened(session);
     const parent=waveParentFor(session);
+    if (session.waveAdmissionFailed) {
+        throw new Error('Upload admission could not be saved in browser storage. Free space for this site, then retry.');
+    }
     if (!parent || !session.waveOperationId || !waveFileBelongs(session,file)
-        || !stateFor(parent.id).registered || session.waveAdmissionFailed) {
+        || !stateFor(parent.id).registered) {
+        if (parent && stateFor(parent.id).admissionError) throw stateFor(parent.id).admissionError;
         throw new Error('Upload wave admission is unavailable. Retry before uploading files.');
     }
     return {waveSessionId:parent.id,waveItemId:await wireItemId(file.waveItemKey || file.key)};

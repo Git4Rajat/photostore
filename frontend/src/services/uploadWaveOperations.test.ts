@@ -11,7 +11,7 @@ vi.mock('./uploadWaveClient', () => ({ waveShadowEnabled: () => true, waveLiveEn
         return results.every(Boolean) ? results[results.length - 1] : null;
     }, closeWaveShadowSession: mocks.close }));
 import { bindWaveChild, clearWaveOperationCachesForTests, declareWaveSelection, loadWaveOperation,
-    retryWaveOperation, sliceWaveSelection } from './uploadWaveOperations';
+    retryWaveOperation, sliceWaveSelection, waveParentResolved } from './uploadWaveOperations';
 import { __resetWaveShadowStateForTests, ensureWaveShadowSessionOpened, finalizeWaveShadowSession,
     cancelQueuedWaveSelection, liveWaveAdmission, acknowledgeWaveFinalizedFile } from './uploadWaveSync';
 const child = (files: File[], id: string): PersistedUploadSession => {
@@ -24,7 +24,9 @@ const child = (files: File[], id: string): PersistedUploadSession => {
 beforeEach(() => {
     const storage = new Map<string, string>();
     vi.stubGlobal("localStorage", { getItem: (key: string) => storage.get(key) ?? null,
-        setItem: (key: string, value: string) => storage.set(key, value), clear: () => storage.clear() });
+        setItem: (key: string, value: string) => storage.set(key, value), clear: () => storage.clear(),
+        removeItem: (key: string) => storage.delete(key), key: (index: number) => Array.from(storage.keys())[index] ?? null,
+        get length() { return storage.size; } });
     clearWaveOperationCachesForTests(); __resetWaveShadowStateForTests(); vi.clearAllMocks();
     mocks.scope = 'library-a';
     mocks.open.mockResolvedValue({ manifestRevision: 'open' });
@@ -133,6 +135,62 @@ it('refuses live bytes when parent registration fails or the library changes', a
     mocks.register.mockResolvedValue({ manifestRevision: 'registered' });
     mocks.scope = 'other-library';
     await expect(liveWaveAdmission(current, current.files[0])).rejects.toThrow('admission is unavailable');
+});
+
+it('preserves an admission error after Stop and permits registration to recover', async () => {
+    const stopped = [new File(['old'], 'stopped.webp')];
+    declareWaveSelection(stopped);
+    await cancelQueuedWaveSelection(stopped);
+    const files = [new File(['new'], '000201.webp')];
+    declareWaveSelection(files);
+    const current = child(files, 'after-stop');
+    mocks.register.mockRejectedValueOnce(new Error('Upload admission failed: Library cleanup is in progress'));
+    await expect(liveWaveAdmission(current, current.files[0])).rejects.toThrow('Library cleanup is in progress');
+    await expect(liveWaveAdmission(current, current.files[0])).resolves.toHaveProperty('waveSessionId');
+});
+
+it('recovers quota space by compacting legacy manifests without removing unfinished identities or receipts', async () => {
+    const prefix = 'photostore.upload.wave-operation.v1:';
+    const oldKey = prefix + JSON.stringify([mocks.scope, 'old']);
+    const file = { key: 'old-0', name: 'unfinished.webp', previewDataUrl: 'x'.repeat(12000),
+        size: 500000, type: 'image/webp', status: 'pending' };
+    localStorage.setItem(oldKey, JSON.stringify({ id: 'old', scope: mocks.scope, createdAt: 1, files: [file] }));
+    localStorage.setItem(oldKey + ':old-0', 'resolved');
+    localStorage.setItem('photostore.upload.session', 'keep checkpoint');
+    const save = localStorage.setItem.bind(localStorage);
+    vi.spyOn(localStorage, 'setItem').mockImplementation((storageKey, value) => {
+        const total = Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index)!)
+            .filter(key => key !== storageKey).reduce((sum, key) => sum + localStorage.getItem(key)!.length, value.length);
+        if (total > 12500) throw new DOMException('Quota exceeded', 'QuotaExceededError');
+        save(storageKey, value);
+    });
+    const files = Array.from({ length: 20 }, (_, i) => new File(['x'], `${i}.webp`));
+    expect(declareWaveSelection(files)).not.toBeNull();
+    const restored = loadWaveOperation('old', mocks.scope)!;
+    expect(restored.files[0]).toMatchObject({ key: 'old-0', name: 'unfinished.webp' });
+    expect(localStorage.getItem(oldKey)!.length).toBeLessThan(300);
+    expect(localStorage.getItem(oldKey + ':old-0')).toBe('resolved');
+    expect(localStorage.getItem('photostore.upload.session')).toBe('keep checkpoint');
+});
+
+it('retires only confirmed closed parents and preserves retry linkage after reload', async () => {
+    const files = [new File(['x'], 'retry.webp')];
+    const parent = declareWaveSelection(files)!;
+    const current = child(files, 'closed-child');
+    current.files[0].status = 'failed';
+    mocks.close.mockResolvedValueOnce(null);
+    await finalizeWaveShadowSession(current);
+    expect(loadWaveOperation(parent.id, mocks.scope)!.files).toHaveLength(1);
+    await finalizeWaveShadowSession(current);
+    expect(localStorage.length).toBe(1);
+    clearWaveOperationCachesForTests(); __resetWaveShadowStateForTests();
+    expect(loadWaveOperation(parent.id, mocks.scope)).toMatchObject({ closed: true, files: [] });
+    expect(waveParentResolved(current)).toBe(true);
+    const retry = retryWaveOperation(current);
+    mocks.open.mockClear();
+    await ensureWaveShadowSessionOpened(retry);
+    expect(mocks.open).toHaveBeenCalledTimes(1);
+    expect(mocks.open).toHaveBeenCalledWith(retry.waveOperationId, 1, parent.id);
 });
 
 it('uses live finalize receipts without sending browser resolution or close requests', async () => {

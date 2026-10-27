@@ -31,6 +31,7 @@ export const waveProtocol = async (): Promise<'live' | 'legacy'> => {
 
 const callShadow = async <T = unknown>(
     path: string, body: unknown | (() => Promise<unknown>), config = SHADOW_REQUEST_CONFIG,
+    admission = false,
 ): Promise<T | null> => {
     if (!waveShadowEnabled()) return null;
     try {
@@ -40,6 +41,14 @@ const callShadow = async <T = unknown>(
         if (sessionScope() !== scope) return null;
         return await postUpload<T>(path, payload, config);
     } catch (err) {
+        // Live admission is required for bytes to start. Keep the server's
+        // reason instead of turning a library/session failure into a generic
+        // error on every selected file. Outcome reporting remains best effort.
+        if (admission && waveLiveEnabled()) {
+            const failure = err as { response?: { data?: { error?: unknown } }; message?: string };
+            const reason = failure?.response?.data?.error;
+            throw new Error(`Upload admission failed: ${typeof reason === 'string' ? reason : failure?.message || 'Unable to contact the upload service.'}`);
+        }
         // Best-effort diagnostics only -- never surfaced to the user and
         // never thrown into the real upload path's callers.
         if (typeof console !== 'undefined' && console.debug) {
@@ -72,6 +81,7 @@ export const openWaveShadowSession = (sessionId: string, declaredCount: number, 
     callShadow<{ waveId: string; manifestRevision: string }>(
         `${base()}/sessions`,
         { sessionId, declaredCount, ...(resumedFromSessionId ? { resumedFromSessionId } : {}) },
+        SHADOW_REQUEST_CONFIG, true,
     );
 
 export const registerWaveShadowItems = (sessionId: string, items: WaveShadowItem[]) =>
@@ -81,6 +91,7 @@ export const registerWaveShadowItems = (sessionId: string, items: WaveShadowItem
             ...item, itemId: await wireItemId(item.itemId),
         }))) }),
         BATCH_REQUEST_CONFIG,
+        true,
     );
 
 export interface WaveShadowResolution {

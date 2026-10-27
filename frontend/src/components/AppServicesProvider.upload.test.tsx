@@ -964,6 +964,32 @@ describe('upload wave shadow protocol wiring', () => {
         expect(new Set(resolutionCalls().map(([, body]) => body.itemId)).size).toBe(901);
     });
 
+    it('pauses a blocked live selection once without failing or cancelling its files, then retries', async () => {
+        vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
+        mocks.getUpload.mockImplementation(async (url) => url === '/upload/waves/protocol' ? { protocol: 'live' } : { hashes: {} });
+        const original = mocks.postUpload.getMockImplementation()!;
+        let blocked = true;
+        mocks.postUpload.mockImplementation(async (url: string, payload: any) => {
+            if (blocked && url.endsWith('/items')) {
+                throw { response: { data: { error: 'Library cleanup is in progress' } } };
+            }
+            return original(url, payload);
+        });
+        select(filesFor(50));
+        await advance(4000);
+        expect(services.uploading).toBe(false);
+        expect(services.notifications.some(notification => notification.details?.includes('Library cleanup is in progress'))).toBe(true);
+        expect(services.pendingUploadSummary).toMatchObject({ fileCount: 50, failedCount: 0 });
+        expect(mocks.staged).not.toHaveBeenCalled();
+        expect(resolutionCalls()).toHaveLength(0);
+        expect(shadowCalls('/close')).toHaveLength(0);
+        blocked = false;
+        act(() => { void services.retryPersistedUploadSession(); });
+        await advance(5000);
+        expect(finalizedFiles()).toHaveLength(50);
+        expect(services.pendingUploadSummary).toBeNull();
+    });
+
     it('uses live finalize acknowledgements without extra outcome or close calls', async () => {
         vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
         mocks.getUpload.mockImplementation(async (url) => url === '/upload/waves/protocol' ? { protocol: 'live' } : { hashes: {} });

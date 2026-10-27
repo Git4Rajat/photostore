@@ -4,7 +4,7 @@ import { waveShadowEnabled } from './uploadWaveClient';
 
 const PREFIX = 'photostore.upload.wave-operation.v1:';
 type Ref = { operationId: string; scope: string; itemKey: string };
-export type Operation = PersistedUploadSession & { scope: string; resumedFromSessionId?: string };
+export type Operation = PersistedUploadSession & { scope: string; resumedFromSessionId?: string; closed?: boolean };
 const selections = new WeakMap<File[], Ref[]>();
 const unadmitted = new WeakSet<File[]>();
 const operations = new Map<string, Operation>();
@@ -12,9 +12,49 @@ const outcomes = new Map<string, Set<string>>();
 const key = (scope: string, id: string) => PREFIX + JSON.stringify([scope, id]);
 const outcomeKey = (scope: string, id: string, item: string) => key(scope, id) + ':' + item;
 
+// A manifest needs only stable item IDs and names. Blob checkpoints, previews
+// and errors belong to the separate upload session, never to each retry parent.
+const encode = (operation: Operation): string => JSON.stringify({
+    id: operation.id, scope: operation.scope, createdAt: operation.createdAt,
+    ...(operation.resumedFromSessionId ? { resumedFromSessionId: operation.resumedFromSessionId } : {}),
+    ...(operation.closed ? { closed: true } : {}),
+    files: operation.files.map(file => ({ key: file.key, name: file.name })),
+});
+
+// Upgrade old records in place, including unfinished manifests. No file IDs,
+// names, outcome receipts or upload checkpoints are removed by this migration.
+const compactExisting = (): boolean => {
+    let changed = false;
+    try {
+        const keys = Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index));
+        for (const storageKey of keys) {
+            if (!storageKey?.startsWith(PREFIX)) continue;
+            try {
+                const raw = localStorage.getItem(storageKey);
+                if (!raw) continue;
+                const operation = JSON.parse(raw) as Operation;
+                if (!operation || typeof operation.id !== 'string' || typeof operation.scope !== 'string'
+                    || storageKey !== key(operation.scope, operation.id) || !Array.isArray(operation.files)
+                    || !operation.files.every(file => typeof file.key === 'string' && typeof file.name === 'string')) continue;
+                const compact = encode(operation);
+                if (compact.length >= raw.length) continue;
+                localStorage.setItem(storageKey, compact);
+                changed = true;
+            } catch { /* Leave unrecognized or unwritable records intact. */ }
+        }
+    } catch { /* Storage may be disabled altogether. */ }
+    return changed;
+};
+
 const persist = (operation: Operation): boolean => {
-    try { localStorage.setItem(key(operation.scope, operation.id), JSON.stringify(operation)); return true; }
-    catch { return false; }
+    const save = () => localStorage.setItem(key(operation.scope, operation.id), encode(operation));
+    try { save(); return true; }
+    catch {
+        if (compactExisting()) {
+            try { save(); return true; } catch { /* Still fail closed. */ }
+        }
+        return false;
+    }
 };
 
 export const loadWaveOperation = (id: string, scope: string): Operation | null => {
@@ -24,6 +64,8 @@ export const loadWaveOperation = (id: string, scope: string): Operation | null =
     try {
         const stored = JSON.parse(localStorage.getItem(cacheKey) || 'null') as Operation | null;
         if (!stored || stored.id !== id || stored.scope !== scope || !Array.isArray(stored.files)) return null;
+        stored.files = stored.files.map(file => Object.assign({ size: 0, type: '', lastModified: 0,
+            uploadedBytes: 0, skippedDuplicate: false, status: 'pending' as const }, file));
         operations.set(cacheKey, stored);
         return stored;
     } catch { return null; }
@@ -75,7 +117,7 @@ export const waveParentFor = (session: PersistedUploadSession): PersistedUploadS
 export const recordWaveItemResolved = (session: PersistedUploadSession, file: PersistedUploadFile): void => {
     if (!session.waveOperationId || !file.waveItemKey || session.waveScope !== sessionScope()) return;
     const parent = loadWaveOperation(session.waveOperationId, session.waveScope!);
-    if (!parent) return;
+    if (!parent || parent.closed) return;
     const cacheKey = key(parent.scope, parent.id);
     let resolved = outcomes.get(cacheKey);
     if (!resolved) {
@@ -87,6 +129,21 @@ export const recordWaveItemResolved = (session: PersistedUploadSession, file: Pe
         localStorage.setItem(outcomeKey(parent.scope, parent.id, file.waveItemKey), 'resolved');
         resolved.add(file.waveItemKey);
     } catch { /* a lost checkpoint must hold intake open, never infer completion */ }
+};
+
+// Only a confirmed server close permits retiring item-level recovery records.
+// Keep a small durable receipt so linked retries still prove the parent existed.
+export const retireWaveOperation = (session: PersistedUploadSession): void => {
+    if (!session.waveOperationId || session.waveScope !== sessionScope()) return;
+    const parent = loadWaveOperation(session.waveOperationId, session.waveScope!);
+    if (!parent || parent.closed) return;
+    const receipt: Operation = { id: parent.id, scope: parent.scope, createdAt: parent.createdAt, closed: true, files: [] };
+    if (!persist(receipt)) return;
+    operations.set(key(parent.scope, parent.id), receipt);
+    outcomes.delete(key(parent.scope, parent.id));
+    for (const file of parent.files) {
+        try { localStorage.removeItem(outcomeKey(parent.scope, parent.id, file.key)); } catch { /* Receipt is already durable. */ }
+    }
 };
 
 export const waveParentResolved = (session: PersistedUploadSession): boolean => {

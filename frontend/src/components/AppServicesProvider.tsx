@@ -3240,6 +3240,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const pendingFinalizeTasks = new Set<Promise<void>>();
         const uploadPreparation = new UploadPreparationPipeline();
         let uploadEndReason: UploadEndReason = 'failed';
+        let admissionReady = false;
         // Tracks this run's own terminal outcomes independent of
         // uploadSessionStoreRef, which gets nulled by clearPersistedSession
         // on a fully successful run before the `finally` block below runs --
@@ -3261,6 +3262,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             const pendingFiles = normalized.files.filter((file) => (
                 file.status !== 'done' && (!options.fileKeys || options.fileKeys.has(file.key))
             ));
+            // Admission is shared by the selection. Pause once before any
+            // worker starts rather than failing every file and cancelling its
+            // reservation when the service or browser manifest is unavailable.
+            if (waveLiveEnabled() && pendingFiles.length) {
+                await liveWaveAdmission(normalized, pendingFiles[0]);
+            }
+            admissionReady = true;
 
             // Split the connection budget across the active file lanes: with one
             // big file the lane gets the full budget (so its blocks stage in
@@ -3433,7 +3441,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 }
                 updatePersistedFile(fileMeta.key, {
                     status: 'failed',
-                    error: uploadSourceFilesRef.current.has(fileMeta.key)
+                    error: !uploadSourceFilesRef.current.has(fileMeta.key) && !uploadHandlesRef.current.has(fileMeta.key)
                         ? `${getUploadErrorMessage(err, 'Upload failed for this file.')} Please reselect this file to retry.`
                         : getUploadErrorMessage(err, 'Upload failed for this file.'),
                     previewDataUrl,
@@ -3979,14 +3987,16 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             uploadPreparation?.dispose();
             // Best-effort, fire-and-forget (see uploadWaveSync.ts) -- resolves
             // whatever this run didn't already resolve live (e.g. a Stop) and
-            // attempts to close the shadow session, regardless of how this
-            // run ended. Built from waveShadowFileOutcomes (this run's own
+            // attempts to close admitted or explicitly stopped sessions.
+            // A blocked admission stays open for retry. Built from this run's
             // record), not uploadSessionRef, which clearPersistedSession may
             // already have nulled by the time this runs on a clean finish.
-            void Promise.allSettled(Array.from(pendingFinalizeTasks)).then(() => finalizeWaveShadowSession({
-                ...normalized,
-                files: normalized.files.map((file) => ({ ...file, ...waveShadowFileOutcomes.get(file.key) })),
-            }));
+            if (admissionReady || uploadStopRequestedRef.current) {
+                void Promise.allSettled(Array.from(pendingFinalizeTasks)).then(() => finalizeWaveShadowSession({
+                    ...normalized,
+                    files: normalized.files.map((file) => ({ ...file, ...waveShadowFileOutcomes.get(file.key) })),
+                }));
+            }
             void Promise.allSettled(Array.from(pendingFinalizeTasks)).then(() => batchTelemetry('end', {
                 uploaded: totalUploaded - previouslyUploaded - (totalSkippedDuplicates - previouslySkipped),
                 failed: totalFailed, duplicates: totalSkippedDuplicates - previouslySkipped,
@@ -4005,8 +4015,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 uploadingRef.current = false;
                 setBackgroundUploadTailActive(false);
                 isResumingUploadRef.current = false;
-                uploadSourceFilesRef.current.clear();
-                uploadHandlesRef.current.clear();
+                // Failed/blocked sessions still need these for Retry. The
+                // IndexedDB resume cache is best effort and may be unavailable.
+                if (!uploadSessionRef.current) {
+                    uploadSourceFilesRef.current.clear();
+                    uploadHandlesRef.current.clear();
+                }
                 uploadAbortControllersRef.current.clear();
                 uploadStopRequestedRef.current = false;
                 // Recompute keep-alive state now that the transfer has ended (on

@@ -79,6 +79,15 @@ it('never guesses legacy ownership after a discovery error and permits retry', a
     await expect(waveProtocol()).resolves.toBe('live');
 });
 
+it('preserves live admission errors while outcome reports remain best effort', async () => {
+    vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
+    mocks.post.mockRejectedValue({ response: { data: { error: 'Library cleanup is in progress' } } });
+    await expect(openWaveShadowSession('new-selection', 3544)).rejects.toThrow('Library cleanup is in progress');
+    await expect(registerWaveShadowItems('new-selection', [{ itemId: 'key', filename: '000201.webp' }]))
+        .rejects.toThrow('Library cleanup is in progress');
+    await expect(resolveWaveShadowItem('stopped-selection', 'key', 'cancelled')).resolves.toBeNull();
+});
+
 it('allows the deployed runtime flag to opt in without a special frontend image build', async () => {
     vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'false');
     vi.stubGlobal('window', { __APP_CONFIG__: { uploadWaveExecutionEnabled: true } });
