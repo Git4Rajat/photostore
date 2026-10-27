@@ -4,13 +4,16 @@ const mocks = vi.hoisted(() => ({ scope: 'library-a', open: vi.fn(), register: v
 vi.mock('./sessionScope', () => ({ sessionScope: () => mocks.scope }));
 vi.mock('./uploadWaveClient', () => ({ waveShadowEnabled: () => true, waveLiveEnabled: () => true,
     waveProtocol: async () => 'live',
-    wireItemId: async (key: string) => `wire:${key}`, WAVE_SHADOW_MAX_PAGE: 20,
+    wireItemId: async (key: string) => `wire:${key}`, WAVE_SHADOW_MAX_PAGE: 2000, WAVE_RESOLVE_MAX_BATCH: 100,
     openWaveShadowSession: mocks.open, registerWaveShadowItems: mocks.register,
-    resolveWaveShadowItem: mocks.resolve, closeWaveShadowSession: mocks.close }));
+    resolveWaveShadowItems: async (id: string, items: any[]) => {
+        const results = await Promise.all(items.map(item => mocks.resolve(id, item.itemId, item.outcome, item.filename)));
+        return results.every(Boolean) ? results[results.length - 1] : null;
+    }, closeWaveShadowSession: mocks.close }));
 import { bindWaveChild, clearWaveOperationCachesForTests, declareWaveSelection, loadWaveOperation,
     retryWaveOperation, sliceWaveSelection } from './uploadWaveOperations';
 import { __resetWaveShadowStateForTests, ensureWaveShadowSessionOpened, finalizeWaveShadowSession,
-    cancelQueuedWaveSelection, liveWaveAdmission } from './uploadWaveSync';
+    cancelQueuedWaveSelection, liveWaveAdmission, acknowledgeWaveFinalizedFile } from './uploadWaveSync';
 const child = (files: File[], id: string): PersistedUploadSession => {
     const session: PersistedUploadSession = { id, createdAt: 1, files: files.map((file, index) => ({
         key: `${id}:${index}`, name: file.name, size: file.size, type: file.type, lastModified: file.lastModified,
@@ -36,7 +39,7 @@ it('admits 901 items before transport and closes only after both 900/1 children 
     const last = child(sliceWaveSelection(files, 900), 'child-2');
     await ensureWaveShadowSessionOpened(first);
     expect(mocks.open).toHaveBeenCalledWith(parent.id, 901);
-    expect(mocks.register).toHaveBeenCalledTimes(46);
+    expect(mocks.register).toHaveBeenCalledTimes(1);
     await finalizeWaveShadowSession(first);
     expect(mocks.close).not.toHaveBeenCalled();
     clearWaveOperationCachesForTests(); __resetWaveShadowStateForTests();
@@ -120,7 +123,7 @@ it('binds live upload children across the 900 boundary to the same fully registe
     const b = await liveWaveAdmission(last, last.files[0]);
     expect(a.waveSessionId).toBe(parent.id); expect(b.waveSessionId).toBe(parent.id);
     expect(a.waveItemId).not.toBe(b.waveItemId);
-    expect(mocks.register).toHaveBeenCalledTimes(46);
+    expect(mocks.register).toHaveBeenCalledTimes(1);
     expect(mocks.open).toHaveBeenCalledTimes(1);
 });
 it('refuses live bytes when parent registration fails or the library changes', async () => {
@@ -130,4 +133,30 @@ it('refuses live bytes when parent registration fails or the library changes', a
     mocks.register.mockResolvedValue({ manifestRevision: 'registered' });
     mocks.scope = 'other-library';
     await expect(liveWaveAdmission(current, current.files[0])).rejects.toThrow('admission is unavailable');
+});
+
+it('uses live finalize receipts without sending browser resolution or close requests', async () => {
+    const files = [new File(['x'], 'a.jpg'), new File(['y'], 'b.jpg')];
+    const parent = declareWaveSelection(files)!;
+    const current = child(files, 'receipt-child');
+    await ensureWaveShadowSessionOpened(current);
+    for (let index = 0; index < current.files.length; index++) {
+        const file = current.files[index];
+        await acknowledgeWaveFinalizedFile(current, file, { sessionId: parent.id,
+            itemId: `wire:${file.waveItemKey}`, manifestRevision: `resolved-${index}`,
+            state: index === 1 ? 'closed' : 'open' });
+    }
+    await finalizeWaveShadowSession(current);
+    expect(mocks.resolve).not.toHaveBeenCalled();
+    expect(mocks.close).not.toHaveBeenCalled();
+});
+
+it('rejects a receipt for another item and resolves the outstanding file during cleanup', async () => {
+    const files = [new File(['x'], 'a.jpg')];
+    const parent = declareWaveSelection(files)!;
+    const current = child(files, 'wrong-receipt');
+    await acknowledgeWaveFinalizedFile(current, current.files[0], { sessionId: parent.id,
+        itemId: 'wrong', manifestRevision: 'wrong', state: 'closed' });
+    await finalizeWaveShadowSession(current);
+    expect(mocks.resolve).toHaveBeenCalledTimes(1);
 });

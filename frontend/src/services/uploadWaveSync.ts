@@ -2,11 +2,12 @@ import { waveParentFor, recordWaveItemResolved, waveParentResolved, waveSelectio
 import type { PersistedUploadFile, PersistedUploadSession } from '../types/browserProcessing';
 import {
     WAVE_SHADOW_MAX_PAGE,
+    WAVE_RESOLVE_MAX_BATCH,
     type WaveShadowOutcome,
     closeWaveShadowSession,
     openWaveShadowSession,
     registerWaveShadowItems,
-    resolveWaveShadowItem,
+    resolveWaveShadowItems,
 } from './uploadWaveClient';
 
 // Optional shadow protocol for full-selection parents and their transport children.
@@ -17,6 +18,9 @@ interface WaveShadowSessionState {
     manifestRevision: string | null;
     opened: boolean;
     registered: boolean;
+    registeredCount: number;
+    queued: Map<string, PersistedUploadFile>;
+    resolutionScheduled: boolean;
     closed: boolean;
     resolved: Set<string>;
     pending: Promise<void>;
@@ -27,7 +31,7 @@ const sessionState = new Map<string, WaveShadowSessionState>();
 const stateFor = (sessionId: string): WaveShadowSessionState => {
     let state = sessionState.get(sessionId);
     if (!state) {
-        state = { manifestRevision: null, opened: false, registered: false, closed: false, resolved: new Set(), pending: Promise.resolve() };
+        state = { manifestRevision: null, opened: false, registered: false, registeredCount: 0, queued: new Map(), resolutionScheduled: false, closed: false, resolved: new Set(), pending: Promise.resolve() };
         sessionState.set(sessionId, state);
     }
     return state;
@@ -66,13 +70,14 @@ const ensureRegistered = async (child: PersistedUploadSession): Promise<void> =>
         state.manifestRevision = opened.manifestRevision;
     }
     if (state.registered) return;
-    for (let i = 0; i < session.files.length; i += WAVE_SHADOW_MAX_PAGE) {
+    for (let i = state.registeredCount; i < session.files.length; i += WAVE_SHADOW_MAX_PAGE) {
         if (!waveParentFor(child)) return;
         const page = session.files.slice(i, i + WAVE_SHADOW_MAX_PAGE)
             .map((file) => ({ itemId: file.key, filename: file.name }));
         const result = await registerWaveShadowItems(session.id, page);
-        if (!result) return; // stop paging; a later call resumes from the top (idempotent)
+        if (!result) return; // Replay only the unacknowledged HTTP batch on retry.
         state.manifestRevision = result.manifestRevision;
+        state.registeredCount = i + page.length;
     }
     state.registered = true;
 };
@@ -96,32 +101,69 @@ export const ensureWaveShadowSessionOpened = (session: PersistedUploadSession): 
     return serialized(session, () => ensureRegistered(session));
 };
 
-// Resolves one file's outcome as it settles. A single cheap call -- not a
-// full-session rescan. Call once per file, from finalizeUploadedFile/
-// markFileFailed as each file reaches a terminal status.
-export const resolveWaveShadowFile = (session: PersistedUploadSession, file: PersistedUploadFile): Promise<void> => serialized(session, async () => {
+// Called only from the parent's ordered chain. Failed batches remain unresolved
+// and are retried during cleanup; replay is idempotent even after partial commits.
+const resolveFiles = async (session: PersistedUploadSession, files: PersistedUploadFile[]): Promise<void> => {
     const parent = waveParentFor(session);
     if (!parent) return;
     const state = stateFor(parent.id);
-    if (state.closed) return;
-    const outcome = liveOutcomeForFile(file);
-    if (!outcome || !waveFileBelongs(session, file)) return;
-    const itemId = file.waveItemKey || file.key;
-    if (state.resolved.has(itemId)) {
-        recordWaveItemResolved(session, file);
-        return;
-    }
     await ensureRegistered(session);
     if (!state.registered || !waveParentFor(session)) return;
-    const result = await resolveWaveShadowItem(
-        parent.id, itemId, outcome,
-        outcome === 'accepted' || outcome === 'duplicate' ? (file.waveAcceptedFilename || file.name) : undefined,
-    );
-    if (result) {
+    const outstanding = files.filter(file => waveFileBelongs(session, file)
+        && !state.resolved.has(file.waveItemKey || file.key));
+    for (let i = 0; i < outstanding.length; i += WAVE_RESOLVE_MAX_BATCH) {
+        if (!waveParentFor(session)) return;
+        const page = outstanding.slice(i, i + WAVE_RESOLVE_MAX_BATCH);
+        const result = await resolveWaveShadowItems(parent.id, page.map(file => {
+            const outcome = liveOutcomeForFile(file) ?? 'cancelled';
+            return { itemId: file.waveItemKey || file.key, outcome,
+                filename: outcome === 'accepted' || outcome === 'duplicate' ? (file.waveAcceptedFilename || file.name) : undefined };
+        }));
+        if (!result) continue;
         state.manifestRevision = result.manifestRevision;
-        state.resolved.add(itemId);
-        recordWaveItemResolved(session, file);
+        for (const file of page) {
+            state.resolved.add(file.waveItemKey || file.key);
+            recordWaveItemResolved(session, file);
+        }
+        if (result.state === 'closed') {
+            state.closed = true;
+            return;
+        }
     }
+};
+
+// Coalesce outcomes while lanes continue hashing and transferring. The ordered
+// chain still fences cleanup and close, but admission no longer waits on it.
+export const resolveWaveShadowFile = (session: PersistedUploadSession, file: PersistedUploadFile): Promise<void> => {
+    const parent = waveParentFor(session);
+    if (!parent || !liveOutcomeForFile(file) || !waveFileBelongs(session, file)) return Promise.resolve();
+    const state = stateFor(parent.id);
+    if (state.closed || state.resolved.has(file.waveItemKey || file.key)) return Promise.resolve();
+    state.queued.set(file.waveItemKey || file.key, file);
+    if (state.resolutionScheduled) return state.pending;
+    state.resolutionScheduled = true;
+    return serialized(session, async () => {
+        await new Promise(resolve => setTimeout(resolve, 25));
+        const files = Array.from(state.queued.values());
+        state.queued.clear();
+        state.resolutionScheduled = false;
+        if (!state.closed) await resolveFiles(session, files);
+    });
+};
+
+// The live finalize response proves that the backend already resolved this item.
+// Verify its binding before using it; old servers fall back to explicit resolve.
+export const acknowledgeWaveFinalizedFile = (session: PersistedUploadSession, file: PersistedUploadFile,
+    receipt: { sessionId: string; itemId: string; manifestRevision: string; state: string }): Promise<void> => serialized(session, async () => {
+    const parent = waveParentFor(session);
+    const { wireItemId } = await import('./uploadWaveClient');
+    if (!parent || !waveFileBelongs(session, file) || receipt.sessionId !== parent.id
+        || receipt.itemId !== await wireItemId(file.waveItemKey || file.key) || !receipt.manifestRevision) return;
+    const state = stateFor(parent.id);
+    state.manifestRevision = receipt.manifestRevision;
+    state.resolved.add(file.waveItemKey || file.key);
+    recordWaveItemResolved(session, file);
+    if (receipt.state === 'closed') state.closed = true;
 });
 
 // Called once, from runUploadSession's `finally`, regardless of how the
@@ -138,25 +180,12 @@ export const finalizeWaveShadowSession = (session: PersistedUploadSession): Prom
     if (state.closed) return;
     await ensureRegistered(session);
     if (!state.registered || !waveParentFor(session)) return;
+    await resolveFiles(session, session.files);
+    // Retry local checkpoint writes without repeating acknowledged HTTP calls.
     for (const file of session.files) {
-        if (!waveParentFor(session)) return;
-        if (!waveFileBelongs(session, file)) continue;
-        const itemId = file.waveItemKey || file.key;
-        if (state.resolved.has(itemId)) {
-            recordWaveItemResolved(session, file);
-            continue;
-        }
-        const outcome = liveOutcomeForFile(file) ?? 'cancelled';
-        const result = await resolveWaveShadowItem(
-            parent.id, itemId, outcome,
-            outcome === 'accepted' || outcome === 'duplicate' ? (file.waveAcceptedFilename || file.name) : undefined,
-        );
-        if (result) {
-            state.manifestRevision = result.manifestRevision;
-            state.resolved.add(itemId);
-            recordWaveItemResolved(session, file);
-        }
+        if (state.resolved.has(file.waveItemKey || file.key)) recordWaveItemResolved(session, file);
     }
+    if (state.closed) return;
     if (session.files.some(file => waveFileBelongs(session, file)
         && !state.resolved.has(file.waveItemKey || file.key))) return;
     if (!waveParentResolved(session)) return;

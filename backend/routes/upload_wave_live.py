@@ -74,7 +74,10 @@ def install(blueprint):
                 # explicit resolve endpoint instead.
                 session=resolve_source(store,app.metadata_table_client,*binding,
                     'accepted',entry['filename'])
-                close_resolved_intake(store,session)
+                session=close_resolved_intake(store,session)
+                entry['waveResolution']=dict(sessionId=binding[0],itemId=binding[1],
+                    manifestRevision=session['manifestRevision'],state=session['state'])
+            response.set_data(app.jsonify(result).get_data())
         except (AzureError,Conflict,ValueError):
             app.app.logger.exception('Wave finalize admission must be retried')
             # after_request hooks must return a Response, unlike route handlers.

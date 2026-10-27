@@ -12,6 +12,7 @@ export const waveShadowEnabled = () => waveLiveEnabled() || import.meta.env.VITE
 const base = () => `/upload/waves/${waveLiveEnabled() ? 'live' : 'shadow'}`;
 
 const SHADOW_REQUEST_CONFIG = { singleAttempt: true, timeout: 15000 };
+const BATCH_REQUEST_CONFIG = { singleAttempt: true, timeout: 120000 };
 const protocols = new Map<string, Promise<'live' | 'legacy'>>();
 export const waveProtocol = async (): Promise<'live' | 'legacy'> => {
     const scope = sessionScope();
@@ -29,7 +30,7 @@ export const waveProtocol = async (): Promise<'live' | 'legacy'> => {
 };
 
 const callShadow = async <T = unknown>(
-    path: string, body: unknown | (() => Promise<unknown>),
+    path: string, body: unknown | (() => Promise<unknown>), config = SHADOW_REQUEST_CONFIG,
 ): Promise<T | null> => {
     if (!waveShadowEnabled()) return null;
     try {
@@ -37,7 +38,7 @@ const callShadow = async <T = unknown>(
         if (waveLiveEnabled() && await waveProtocol() === 'legacy') return null;
         const payload = typeof body === 'function' ? await body() : body;
         if (sessionScope() !== scope) return null;
-        return await postUpload<T>(path, payload, SHADOW_REQUEST_CONFIG);
+        return await postUpload<T>(path, payload, config);
     } catch (err) {
         // Best-effort diagnostics only -- never surfaced to the user and
         // never thrown into the real upload path's callers.
@@ -63,8 +64,9 @@ export interface WaveShadowItem {
 
 export type WaveShadowOutcome = 'accepted' | 'duplicate' | 'cancelled' | 'failed';
 
-// MAX_PAGE in backend/upload_waves.py -- registration is paged at this size.
-export const WAVE_SHADOW_MAX_PAGE = 20;
+// HTTP limits are independent of the smaller transactional storage pages.
+export const WAVE_SHADOW_MAX_PAGE = 2000;
+export const WAVE_RESOLVE_MAX_BATCH = 100;
 
 export const openWaveShadowSession = (sessionId: string, declaredCount: number, resumedFromSessionId?: string) =>
     callShadow<{ waveId: string; manifestRevision: string }>(
@@ -78,6 +80,22 @@ export const registerWaveShadowItems = (sessionId: string, items: WaveShadowItem
         async () => ({ items: await Promise.all(items.map(async item => ({
             ...item, itemId: await wireItemId(item.itemId),
         }))) }),
+        BATCH_REQUEST_CONFIG,
+    );
+
+export interface WaveShadowResolution {
+    itemId: string;
+    outcome: WaveShadowOutcome;
+    filename?: string;
+}
+
+export const resolveWaveShadowItems = (sessionId: string, items: WaveShadowResolution[]) =>
+    callShadow<{ manifestRevision: string; state?: string }>(
+        `${base()}/sessions/${encodeURIComponent(sessionId)}/resolve-batch`,
+        async () => ({ items: await Promise.all(items.map(async item => ({
+            ...item, itemId: await wireItemId(item.itemId),
+        }))) }),
+        BATCH_REQUEST_CONFIG,
     );
 
 export const resolveWaveShadowItem = (

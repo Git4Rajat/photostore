@@ -224,7 +224,11 @@ def test_partial_finalize_batch_replays_and_keeps_unadmitted_sources_publishable
     client=api.test_client()
     assert client.post('/upload/finalize-batch',json=body).status_code==503
     assert store._required('session!partial')['resolvedCount']==1
-    assert client.post('/upload/finalize-batch',json=body).status_code==200
+    response=client.post('/upload/finalize-batch',json=body)
+    assert response.status_code==200
+    receipts=[entry['waveResolution'] for entry in response.json['results']]
+    assert [(receipt['sessionId'],receipt['itemId']) for receipt in receipts]==[('partial','a'),('partial','b')]
+    assert receipts[-1]['state']=='closed'
     parent=store._required('session!partial')
     assert parent['resolvedCount']==2 and parent['state']=='closed'
     assert all(store._required(store.item_key('partial',k))['outcome']=='accepted' for k in 'ab')
@@ -238,3 +242,44 @@ def test_fresh_preparation_blocks_intake_instead_of_legacy_fallback(live_api,mon
     response=client.get(path) if path.endswith('/protocol') else client.post(path,json={})
     assert response.status_code==503
     assert not metadata.rows
+
+
+def test_batched_duplicate_and_failed_outcomes_close_once_and_replay(live_api):
+    client, store, metadata, library = live_api
+    root = '/upload/waves/live/sessions'
+    client.post(root, json=dict(sessionId='batch', declaredCount=3))
+    client.post(root + '/batch/items', json=dict(items=[dict(itemId=k, filename=k+'.jpg') for k in 'abc']))
+    metadata.create_entity(dict(PartitionKey='u', RowKey='a.jpg', anonymousImageId='p', processingRevision='r'))
+    body = dict(items=[dict(itemId='a', outcome='duplicate', filename='a.jpg'),
+                       dict(itemId='b', outcome='failed'), dict(itemId='c', outcome='cancelled')])
+    first = client.post(root + '/batch/resolve-batch', json=body)
+    assert first.status_code == 200 and first.json['state'] == 'closed'
+    assert first.json['resolvedCount'] == 3
+    replay = client.post(root + '/batch/resolve-batch', json=body)
+    assert replay.status_code == 200 and replay.json['manifestRevision'] == first.json['manifestRevision']
+    assert store.status(first.json['waveId'])['memberCount'] == 1
+    library[0] = 'other'
+    assert client.post(root + '/batch/resolve-batch', json=body).status_code == 409
+
+
+def test_batch_resolution_partial_failure_is_retryable(live_api, monkeypatch):
+    import upload_wave_shadow
+    from azure.core.exceptions import AzureError
+    client, store, _, _ = live_api
+    root = '/upload/waves/live/sessions'
+    client.post(root, json=dict(sessionId='retry', declaredCount=2))
+    client.post(root + '/retry/items', json=dict(items=[dict(itemId=k, filename=k+'.jpg') for k in 'ab']))
+    original = upload_wave_shadow.resolve_source
+    failed = [False]
+    def resolve(store, table, session, item, *args):
+        if item == 'b' and not failed[0]:
+            failed[0] = True
+            raise AzureError('lost storage response')
+        return original(store, table, session, item, *args)
+    monkeypatch.setattr(upload_wave_shadow, 'resolve_source', resolve)
+    body = dict(items=[dict(itemId=k, outcome='failed') for k in 'ab'])
+    assert client.post(root + '/retry/resolve-batch', json=body).status_code == 503
+    assert store._required('session!retry')['resolvedCount'] == 1
+    response = client.post(root + '/retry/resolve-batch', json=body)
+    assert response.status_code == 200 and response.json['state'] == 'closed'
+    assert response.json['resolvedCount'] == 2

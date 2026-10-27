@@ -376,3 +376,45 @@ def test_video_admission_and_observation_share_the_empty_backend_contract():
     observation = observe_source(store, member, table, None,
         lambda *a: pytest.fail('video should not require a face lookup'))
     assert observation['outcome'] == 'settled'
+
+
+def test_two_thousand_manifest_items_use_one_request_with_bounded_transactions(api):
+    client, table, _ = api
+    assert client.post(ROOT + '/sessions', json=dict(sessionId='large', declaredCount=2000)).status_code == 200
+    items = [dict(itemId=f'i{i}', filename=f'holiday-photo-{i}.jpg') for i in range(2000)]
+    assert len(json.dumps(dict(items=items)).encode()) > 65536
+    response = client.post(ROOT + '/sessions/large/items', json=dict(items=items))
+    assert response.status_code == 200 and response.json['registeredCount'] == 2000
+    transactions = len(table.transactions)
+    # A lost response can be replayed without changing counts or writing again.
+    replay = client.post(ROOT + '/sessions/large/items', json=dict(items=items))
+    assert replay.json['manifestRevision'] == response.json['manifestRevision']
+    assert len(table.transactions) == transactions
+    assert max(map(len, table.transactions)) <= 100
+
+
+def test_manifest_failure_replays_partial_server_pages_safely(api, monkeypatch):
+    client, table, library = api
+    client.post(ROOT + '/sessions', json=dict(sessionId='partial', declaredCount=25))
+    items = [dict(itemId=f'i{i}', filename=f'{i}.jpg') for i in range(25)]
+    original = ShadowWaves.register
+    failed = [False]
+    def register(store, session, page):
+        if page[0]['itemId'] == 'i20' and not failed[0]:
+            failed[0] = True
+            raise AzureError('storage unavailable')
+        return original(store, session, page)
+    monkeypatch.setattr(ShadowWaves, 'register', register)
+    assert client.post(ROOT + '/sessions/partial/items', json=dict(items=items)).status_code == 503
+    assert ShadowWaves(table, library[0])._required('session!partial')['registeredCount'] == 20
+    response = client.post(ROOT + '/sessions/partial/items', json=dict(items=items))
+    assert response.status_code == 200 and response.json['registeredCount'] == 25
+
+
+def test_manifest_validates_last_item_before_any_page_is_written(api):
+    client, table, library = api
+    client.post(ROOT + '/sessions', json=dict(sessionId='invalid', declaredCount=21))
+    items = [dict(itemId=f'i{i}', filename=f'{i}.jpg') for i in range(21)]
+    items[-1]['filename'] = ''
+    assert client.post(ROOT + '/sessions/invalid/items', json=dict(items=items)).status_code == 400
+    assert ShadowWaves(table, library[0])._required('session!invalid')['registeredCount'] == 0

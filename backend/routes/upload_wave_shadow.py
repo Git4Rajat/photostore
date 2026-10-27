@@ -9,6 +9,9 @@ import app
 from upload_waves import Conflict, ShadowWaves
 import upload_wave_shadow as source
 
+MAX_MANIFEST_REQUEST = 2000
+MAX_RESOLVE_REQUEST = 100
+
 
 def _public(row):
     result = {key: value for key, value in row.items()
@@ -30,7 +33,11 @@ def endpoint(function):
         _, library, error = app._require_library_context(require_auth=True)
         if error:
             return error
-        if app.request.content_length and app.request.content_length > 65536:
+        # Large manifests are a single browser request; storage transactions
+        # remain bounded independently inside the registration handler.
+        operation = app.request.path.rsplit('/', 1)[-1]
+        limit = {'items': 16 * 1024 * 1024, 'resolve-batch': 1024 * 1024}.get(operation, 65536)
+        if app.request.content_length and app.request.content_length > limit:
             return app.jsonify({'error': 'Shadow request too large'}), 413
         if app.jobs_table_client is None:
             return app.jsonify({'error': 'Shadow protocol storage unavailable'}), 503
@@ -74,7 +81,50 @@ def register_routes(blueprint):
     @blueprint.route('/upload/waves/shadow/sessions/<session>/items', methods=['POST'])
     @endpoint
     def wave_shadow_register(store, data, session):
-        return store.register(session, data['items'])
+        from upload_waves import MAX_PAGE, identifier
+        items = data['items']
+        if not isinstance(items, list) or not 0 < len(items) <= MAX_MANIFEST_REQUEST:
+            raise ValueError('Invalid manifest size')
+        # Validate the whole request before committing its first storage page.
+        ids = []
+        for item in items:
+            ids.append(identifier(item['itemId']))
+            if not isinstance(item.get('filename'), str) or not 0 < len(item['filename']) <= 1024:
+                raise ValueError('Invalid filename')
+        if len(set(ids)) != len(ids):
+            raise ValueError('Duplicate itemId')
+        for offset in range(0, len(items), MAX_PAGE):
+            result = store.register(session, items[offset:offset + MAX_PAGE])
+        return result
+
+    @blueprint.route('/upload/waves/live/sessions/<session>/resolve-batch', methods=['POST'])
+    @blueprint.route('/upload/waves/shadow/sessions/<session>/resolve-batch', methods=['POST'])
+    @endpoint
+    def wave_shadow_resolve_batch(store, data, session):
+        from upload_waves import identifier
+        items = data['items']
+        if not isinstance(items, list) or not 0 < len(items) <= MAX_RESOLVE_REQUEST:
+            raise ValueError('Invalid outcome batch size')
+        ids = []
+        for item in items:
+            ids.append(identifier(item['itemId']))
+            if item['outcome'] not in ('accepted', 'duplicate', 'cancelled', 'failed'):
+                raise ValueError('Invalid outcome')
+            if item['outcome'] in ('accepted', 'duplicate'):
+                if app.metadata_table_client is None:
+                    raise AzureError('Metadata storage unavailable')
+                filename = item.get('filename', '')
+                if not isinstance(filename, str) or not app._validate_media_filename(filename):
+                    raise ValueError('Finalized filename required')
+                item['filename'] = app._validate_media_filename(filename)
+        if len(set(ids)) != len(ids):
+            raise ValueError('Duplicate itemId')
+        # Partial commits are safe to replay after a lost response or failure.
+        # Acknowledge only when every item has been durably resolved.
+        for item in items:
+            result = source.resolve_source(store, app.metadata_table_client, session,
+                item['itemId'], item['outcome'], item.get('filename', ''))
+        return close_resolved_intake(store, result) if '/waves/live/' in app.request.path else result
 
     @blueprint.route('/upload/waves/live/sessions/<session>/resolve', methods=['POST'])
     @blueprint.route('/upload/waves/shadow/sessions/<session>/resolve', methods=['POST'])

@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({ post: vi.fn(), get: vi.fn(), scope: 'test' }));
 vi.mock('./sessionScope', () => ({ sessionScope: () => mocks.scope }));
 vi.mock('./apiClient', () => ({ postUpload: mocks.post, getUpload: mocks.get }));
-import { waveLiveEnabled, waveProtocol, closeWaveShadowSession, openWaveShadowSession, registerWaveShadowItems, resolveWaveShadowItem } from './uploadWaveClient';
+import { waveLiveEnabled, waveProtocol, closeWaveShadowSession, openWaveShadowSession, registerWaveShadowItems, resolveWaveShadowItem, resolveWaveShadowItems } from './uploadWaveClient';
 
 beforeEach(() => {
     mocks.scope = crypto.randomUUID();
@@ -17,6 +17,17 @@ beforeEach(() => {
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
 
 describe('shadow wire protocol', () => {
+    it('hashes batched outcomes consistently with manifest registration', async () => {
+        await registerWaveShadowItems('parent', [{ itemId: 'key:a', filename: 'a.jpg' }]);
+        await resolveWaveShadowItems('parent', [{ itemId: 'key:a', outcome: 'duplicate', filename: 'a.jpg' },
+            { itemId: 'key:b', outcome: 'failed' }]);
+        const [url, body, config] = mocks.post.mock.calls[1];
+        expect(url).toContain('/resolve-batch');
+        expect(body.items[0]).toEqual({ itemId: mocks.post.mock.calls[0][1].items[0].itemId,
+            outcome: 'duplicate', filename: 'a.jpg' });
+        expect(body.items[1].itemId).toMatch(/^[a-f0-9]{64}$/);
+        expect(config).toEqual({ singleAttempt: true, timeout: 120000 });
+    });
     it('makes no requests while client diagnostics are disabled', async () => {
         vi.stubEnv('VITE_UPLOAD_WAVE_SHADOW_ENABLED', 'false');
         expect(await openWaveShadowSession('parent', 1)).toBeNull();

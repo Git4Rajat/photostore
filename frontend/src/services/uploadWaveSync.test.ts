@@ -5,14 +5,19 @@ const mocks = vi.hoisted(() => ({
     open: vi.fn(),
     register: vi.fn(),
     resolve: vi.fn(),
+    batch: vi.fn(),
     close: vi.fn(),
 }));
 
 vi.mock('./uploadWaveClient', () => ({
-    WAVE_SHADOW_MAX_PAGE: 20,
+    WAVE_SHADOW_MAX_PAGE: 2000, WAVE_RESOLVE_MAX_BATCH: 100,
     openWaveShadowSession: mocks.open,
     registerWaveShadowItems: mocks.register,
-    resolveWaveShadowItem: mocks.resolve,
+    resolveWaveShadowItems: async (id: string, items: any[]) => {
+        mocks.batch(id, items);
+        const results = await Promise.all(items.map(item => mocks.resolve(id, item.itemId, item.outcome, item.filename)));
+        return results.every(Boolean) ? results[results.length - 1] : null;
+    },
     closeWaveShadowSession: mocks.close,
 }));
 
@@ -44,16 +49,35 @@ beforeEach(() => {
     mocks.close.mockResolvedValue({ state: 'closed' });
 });
 
+it('coalesces 250 duplicate outcomes into three bounded requests without cleanup replays', async () => {
+    const s = session(250, 'many-duplicates');
+    s.files = s.files.map(file => ({ ...file, status: 'done', skippedDuplicate: true }));
+    await Promise.all(s.files.map(file => resolveWaveShadowFile(s, file)));
+    expect(mocks.batch.mock.calls.map(([, items]) => items.length)).toEqual([100, 100, 50]);
+    await finalizeWaveShadowSession(s);
+    expect(mocks.batch).toHaveBeenCalledTimes(3);
+    expect(mocks.close).toHaveBeenCalledTimes(1);
+});
+
+it('retries registration from the last acknowledged HTTP batch', async () => {
+    const s = session(4005, 'registration-progress');
+    mocks.register.mockResolvedValueOnce({ manifestRevision: 'first' }).mockResolvedValueOnce(null);
+    await ensureWaveShadowSessionOpened(s);
+    await ensureWaveShadowSessionOpened(s);
+    expect(mocks.register.mock.calls.map(([, items]) => items[0].itemId))
+        .toEqual([s.files[0].key, s.files[2000].key, s.files[2000].key, s.files[4000].key]);
+});
+
 afterEach(() => { vi.restoreAllMocks(); });
 
 describe('ensureWaveShadowSessionOpened', () => {
     it('opens once and registers every item, paged at WAVE_SHADOW_MAX_PAGE', async () => {
-        const s = session(45, 'sess-a');
+        const s = session(4005, 'sess-a');
         await ensureWaveShadowSessionOpened(s);
         expect(mocks.open).toHaveBeenCalledTimes(1);
-        expect(mocks.open).toHaveBeenCalledWith('sess-a', 45);
-        expect(mocks.register).toHaveBeenCalledTimes(3); // 20 + 20 + 5
-        expect(mocks.register.mock.calls[0][1]).toHaveLength(20);
+        expect(mocks.open).toHaveBeenCalledWith('sess-a', 4005);
+        expect(mocks.register).toHaveBeenCalledTimes(3); // 2000 + 2000 + 5
+        expect(mocks.register.mock.calls[0][1]).toHaveLength(2000);
         expect(mocks.register.mock.calls[2][1]).toHaveLength(5);
     });
 
@@ -66,7 +90,7 @@ describe('ensureWaveShadowSessionOpened', () => {
     });
 
     it('resumes registration from where it left off after a failed page', async () => {
-        const s = session(25, 'sess-c');
+        const s = session(2005, 'sess-c');
         mocks.register.mockResolvedValueOnce(null); // first page fails (network/disabled)
         await ensureWaveShadowSessionOpened(s);
         expect(mocks.register).toHaveBeenCalledTimes(1);

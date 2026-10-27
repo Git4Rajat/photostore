@@ -908,6 +908,7 @@ describe('upload wave shadow protocol wiring', () => {
     let waveUUIDSequence = 0;
     const shadowCalls = (suffix: string) => mocks.postUpload.mock.calls
         .filter(([url]) => typeof url === 'string' && /^\/upload\/waves\/(shadow|live)\//.test(url) && url.endsWith(suffix));
+    const resolutionCalls = () => shadowCalls('/resolve-batch').flatMap(([url, body]) => body.items.map((item: any) => [url, item]));
     const opens = () => mocks.postUpload.mock.calls.filter(([url]) => /^\/upload\/waves\/(shadow|live)\/sessions$/.test(url));
 
     beforeEach(() => {
@@ -924,7 +925,7 @@ describe('upload wave shadow protocol wiring', () => {
         mocks.postUpload.mockImplementation(async (url: string, payload: any) => {
             if (/^\/upload\/waves\/(shadow|live)\//.test(url)) {
                 if (url.endsWith('/items')) return { manifestRevision: 'rev-items', registeredCount: payload.items.length };
-                if (url.endsWith('/resolve')) return { manifestRevision: 'rev-resolve' };
+                if (url.endsWith('/resolve-batch')) return { manifestRevision: 'rev-resolve' };
                 if (url.endsWith('/close')) return { state: 'closed' };
                 return { waveId: 'wave-1', manifestRevision: 'rev-open' };
             }
@@ -941,7 +942,7 @@ describe('upload wave shadow protocol wiring', () => {
         expect(registerCalls).toHaveLength(1);
         expect(registerCalls[0][1].items).toHaveLength(2);
         // Cleanup reuses acknowledged outcomes instead of resolving them again.
-        const resolveCalls = shadowCalls('/resolve');
+        const resolveCalls = resolutionCalls();
         expect(resolveCalls.every(([, body]) => body.outcome === 'accepted')).toBe(true);
         expect(resolveCalls).toHaveLength(2);
         expect(new Set(resolveCalls.map(([, body]) => body.itemId)).size).toBe(2);
@@ -955,12 +956,34 @@ describe('upload wave shadow protocol wiring', () => {
         expect(finalizedFiles()).toHaveLength(901);
         expect(opens()).toHaveLength(1);
         expect(opens()[0][1]).toMatchObject({ declaredCount: 901 });
-        expect(shadowCalls('/items')).toHaveLength(46);
+        expect(shadowCalls('/items')).toHaveLength(1);
         expect(shadowCalls('/close')).toHaveLength(1);
         const calls = mocks.postUpload.mock.calls;
         expect(calls.findIndex(([url]) => url.endsWith('/items')))
             .toBeLessThan(calls.findIndex(([url]) => url === '/upload/init-batch'));
-        expect(new Set(shadowCalls('/resolve').map(([, body]) => body.itemId)).size).toBe(901);
+        expect(new Set(resolutionCalls().map(([, body]) => body.itemId)).size).toBe(901);
+    });
+
+    it('uses live finalize acknowledgements without extra outcome or close calls', async () => {
+        vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
+        mocks.getUpload.mockImplementation(async (url) => url === '/upload/waves/protocol' ? { protocol: 'live' } : { hashes: {} });
+        const original = mocks.postUpload.getMockImplementation()!;
+        mocks.postUpload.mockImplementation(async (url: string, payload: any) => {
+            const result = await original(url, payload);
+            if (url === '/upload/finalize-batch') {
+                result.results.forEach((entry: any, index: number) => {
+                    entry.waveResolution = { sessionId: payload.files[index].waveSessionId,
+                        itemId: payload.files[index].waveItemId, manifestRevision: 'finalized', state: 'closed' };
+                });
+            }
+            return result;
+        });
+        select(filesFor(2));
+        await advance(4000);
+        expect(finalizedFiles()).toHaveLength(2);
+        expect(shadowCalls('/items')).toHaveLength(1);
+        expect(shadowCalls('/resolve-batch')).toHaveLength(0);
+        expect(shadowCalls('/close')).toHaveLength(0);
     });
 
     it.each([[50, 'shadow'], [901, 'shadow'], [50, 'live'], [901, 'live']] as const)(
@@ -980,7 +1003,7 @@ describe('upload wave shadow protocol wiring', () => {
         expect(finalizedFiles()).toHaveLength(1);
         act(() => services.stopActiveUpload());
         await advance(4000);
-        const outcomes = new Map(shadowCalls('/resolve').map(([, body]) => [body.itemId, body.outcome]));
+        const outcomes = new Map(resolutionCalls().map(([, body]) => [body.itemId, body.outcome]));
         expect(outcomes.size).toBe(count);
         expect(Array.from(outcomes.values()).filter(outcome => outcome === 'accepted')).toHaveLength(1);
         expect(Array.from(outcomes.values()).filter(outcome => outcome === 'cancelled')).toHaveLength(count - 1);
@@ -1019,7 +1042,7 @@ describe('upload wave shadow protocol wiring', () => {
         await advance(4000);
         expect(cancelledFiles().length).toBeGreaterThan(0);
         expect(cancelledFiles().some(file => file.filename === committedFilename)).toBe(false);
-        expect(shadowCalls('/resolve').some(([, body]) => body.outcome === 'accepted')).toBe(true);
+        expect(resolutionCalls().some(([, body]) => body.outcome === 'accepted')).toBe(true);
         expect(shadowCalls('/close')).toHaveLength(1);
     });
 
@@ -1031,7 +1054,7 @@ describe('upload wave shadow protocol wiring', () => {
         });
         select(filesFor(1));
         for (let tick = 0; tick < 6; tick += 1) await advance(1000);
-        const resolveCalls = shadowCalls('/resolve');
+        const resolveCalls = resolutionCalls();
         expect(resolveCalls.some(([, body]) => body.outcome === 'failed')).toBe(true);
     });
 

@@ -8,7 +8,7 @@ import { preloadLocalIndexes } from '../services/preloadLocalIndexes';
 import { startMediaTokenAutoRefresh } from '../services/mediaToken';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { get, getUpload, post, postTools, postUpload, resolveApiUrl } from '../services/apiClient';
-import { liveWaveAdmission, ensureWaveShadowSessionOpened, finalizeWaveShadowSession, resolveWaveShadowFile, cancelQueuedWaveSelection } from '../services/uploadWaveSync';
+import { liveWaveAdmission, ensureWaveShadowSessionOpened, finalizeWaveShadowSession, resolveWaveShadowFile, acknowledgeWaveFinalizedFile, cancelQueuedWaveSelection } from '../services/uploadWaveSync';
 import { hashLargeFile, LARGE_FILE_HASH_THRESHOLD } from '../utils/largeFileHash';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
 import { getRuntimeConfig } from '../config/appConfig';
@@ -3517,7 +3517,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     const waveAcceptedFilename = completeResponse?.filename || fileMeta.name;
                     waveShadowFileOutcomes.set(fileMeta.key, { status: 'done', skippedDuplicate, waveAcceptedFilename });
                     updatePersistedFile(fileMeta.key, { waveAcceptedFilename });
-                    void resolveWaveShadowFile(session, { ...fileMeta, status: 'done', skippedDuplicate, waveAcceptedFilename });
+                    const settledFile = { ...fileMeta, status: 'done' as const, skippedDuplicate, waveAcceptedFilename };
+                    if (completeResponse?.waveResolution) {
+                        void acknowledgeWaveFinalizedFile(session, settledFile, completeResponse.waveResolution);
+                    } else {
+                        void resolveWaveShadowFile(session, settledFile);
+                    }
                     if (!skippedDuplicate) {
                         freshlyUploadedFilenamesRef.current.add(fileMeta.name);
                         if (!prepared.clientProcessing?.thumbnail) kickOffThumbnailForFile(file, fileMeta.name, fileMeta.blobName);
