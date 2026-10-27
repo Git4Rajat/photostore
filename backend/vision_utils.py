@@ -136,15 +136,31 @@ def get_text_embedding_dimension() -> int:
 
 # Server-side embeddings are limited to text queries for search.
 def encode_text_embedding(text: str) -> List[float]:
+    from semantic_batching import current_batcher
+    batcher = current_batcher()
+    if text and batcher is not None:
+        return batcher.submit(text)
+    return _encode_text_embedding_single(text)
+
+
+def _encode_text_embedding_single(text: str) -> List[float]:
     if not text:
         return []
     if not _load_model():
         return _hash_text_embedding(text)
     try:
+        started = time.monotonic()
         tokens = _TOKENIZER([text]).to(_device())
+        metrics.add(text_tokenize_ms=(time.monotonic() - started) * 1000)
         with torch.no_grad():
+            waiting = time.monotonic()
             with _MODEL_LOCK:
-                text_features = _MODEL.encode_text(tokens)
+                metrics.add(text_lock_wait_ms=(time.monotonic() - waiting) * 1000)
+                started = time.monotonic()
+                try:
+                    text_features = _MODEL.encode_text(tokens)
+                finally:
+                    metrics.add(text_inference_ms=(time.monotonic() - started) * 1000)
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         return text_features.squeeze(0).cpu().tolist()
     except Exception:
@@ -209,10 +225,18 @@ def encode_text_embeddings_batch(texts: List[str]) -> List[List[float]]:
     if not texts or not _load_model():
         return []
     try:
+        started = time.monotonic()
         tokens = _TOKENIZER(list(texts)).to(_device())
+        metrics.add(text_tokenize_ms=(time.monotonic() - started) * 1000)
         with torch.no_grad():
+            waiting = time.monotonic()
             with _MODEL_LOCK:
-                text_features = _MODEL.encode_text(tokens)
+                metrics.add(text_lock_wait_ms=(time.monotonic() - waiting) * 1000)
+                started = time.monotonic()
+                try:
+                    text_features = _MODEL.encode_text(tokens)
+                finally:
+                    metrics.add(text_inference_ms=(time.monotonic() - started) * 1000)
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         return text_features.cpu().tolist()
     except Exception:

@@ -268,3 +268,63 @@ Prefetch duration moved out of per-member inspection; include both when comparin
 inspection cost across versions. A resident OCR worker receives each request's
 accounting context anew and clears it after that request. Timed-out workers are
 retired and cannot contribute a complete per-image native timing sample.
+
+## Semantic text and exact apply-phase storage accounting
+
+`processing_apply_phase` now includes `storage_attribution=phase_context` and
+physical transport counters from a new context-local accumulator. Enclosing image
+and wave counters still receive each operation exactly once. Unlike the retained
+legacy `sdk_calls`/`sdk_send_ms` (`sdk_attribution=shared_scope`), these phase
+counters exclude unrelated concurrent source calls. Nested phases remain inclusive;
+never sum overlapping scopes as exclusive wall time.
+
+Nonzero `io_<table>_<operation>_{calls,ms}` fields use a fixed table allowlist
+(metadata, jobs, faces, face embeddings, photo embeddings, face-by-filename) plus
+`other_table`, `blob`, and `queue`. Operations are read/write/delete/other. Raw
+paths, filenames, arbitrary table names and payloads are never labels. A table
+transaction's `$batch` endpoint goes into `other_table`, since transport alone
+cannot reliably identify its inner table. Core storage totals explicitly report
+zero; unused table/operation buckets are omitted to bound log volume.
+
+HTTP categories distinguish `storage_not_found` (404), `storage_conflicts` (409),
+`storage_precondition_failed` (412), `storage_throttled` (429) and
+`storage_server_errors` (5xx). They do not imply failed images. Read latency,
+write latency and expected not-found responses can now be separated by phase.
+
+`completion_delivery` now times the committed completion outbox's delivery and
+acknowledgement. It retains existing recovery/error behavior: successful phase
+execution is not itself proof that the wave is complete. Durable member and
+publication receipts remain authoritative.
+
+Page-level timers `vision_{page_load,page_commit,checkpoint,evaluation}_{calls,ms,errors}`
+cover metadata/member loading, committing observations, all checkpoints and final
+wave evaluation. These complement prefetch and settlement timing. This change does
+not overlap page preparation with source execution; the timers measure the cost
+before choosing that scheduling change.
+
+Semantic refresh records `semantic_embedding_encodes`, `semantic_embedding_reuses`
+and `semantic_embedding_reuse_read_errors`. Reuse requires unchanged text plus a
+matching SHA-256 text digest, current model version, expected vector dimension and
+finite nonzero stored vector. The digest is stored with the vector in the embeddings
+table; a metadata flag alone cannot conceal a failed vector write. Missing,
+corrupt, changed-model or changed-text inputs re-encode. A reuse-read outage falls
+back to encoding. Legacy rows gain the digest when next encoded.
+
+An attempt-scoped worker batches up to eight text requests with a five-millisecond
+collection window and a bounded queue. It performs inference only, with no source
+storage access or copied source fences. Source adapters wait for their own result
+and retain their existing post-inference ownership checks and conditional commits.
+Unsupported/failed batches fall back per input to the existing singleton encoder;
+one fallback failure does not poison its siblings. Source adapters drain before
+the batching worker closes. OCR, face filters and image inference are unchanged.
+
+`semantic_text_requests` and `semantic_text_request_ms` are measured on the source
+caller and include queue/collection/native wait. `semantic_text_batches`,
+`semantic_text_batch_items`, `semantic_text_batch_fallbacks`, `text_tokenize_ms`,
+`text_lock_wait_ms` and `text_inference_ms` are measured by the text worker at wave
+attempt scope, not charged to an arbitrary image or multiplied by batch size.
+Per-phase thread CPU excludes the separate text worker; wave process CPU includes
+it. Native timings are host elapsed and require device-specific measurement if
+GPU inference is introduced. Numerical batch behavior should be evaluated on the
+next real-image run, alongside batch sizes and collection overhead; no production
+speedup is inferred from unit tests.

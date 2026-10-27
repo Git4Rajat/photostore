@@ -14,7 +14,7 @@ _PURPOSE = ContextVar('processing_io_purpose', default='other')
 _PURPOSES = {'inspection', 'qualification', 'claim', 'heartbeat', 'source_release',
              'artifact_write', 'derivative_promotion', 'artifact_capture',
              'face_persistence', 'semantic_refresh', 'embedding_write',
-             'metadata_commit', 'metadata_cas', 'lease_and_policy_check', 'other'}
+             'metadata_commit', 'metadata_cas', 'lease_and_policy_check', 'completion_delivery', 'other'}
 _FIELDS = {
     'storage_calls', 'storage_send_ms', 'storage_bytes', 'storage_errors',
     'metadata_point_reads', 'metadata_query_requests', 'metadata_read_ms',
@@ -27,6 +27,9 @@ _FIELDS = {
     'journal_flushes', 'journal_flush_ms', 'journal_flush_errors',
     'journal_fsyncs', 'journal_fsync_ms', 'journal_fsync_errors',
     'image_passes', 'image_inspections', 'source_attempts', 'source_errors',
+    'semantic_embedding_reuses', 'semantic_embedding_encodes', 'semantic_embedding_reuse_read_errors',
+    'semantic_text_requests', 'semantic_text_request_ms', 'semantic_text_batches', 'semantic_text_batch_items',
+    'semantic_text_batch_fallbacks', 'text_tokenize_ms', 'text_lock_wait_ms', 'text_inference_ms',
     'vision_source_queue_ms', 'vision_source_busy_ms', 'vision_pool_ms', 'vision_pool_capacity_ms',
     'vision_coordinator_wait_ms', 'vision_admission_ms', 'vision_admission_batches', 'vision_settlement_ms',
     'ocr_engine_init_ms', 'ocr_engine_inits', 'ocr_recognition_ms',
@@ -39,7 +42,17 @@ _FIELDS = {
     'vision_source_' + phase + suffix
     for phase in ('claim', 'steps', 'apply', 'qualify', 'release')
     for suffix in ('_calls', '_ms', '_errors')
-}
+} | {
+    'io_' + table + '_' + operation + suffix
+    for table in ('photometadata', 'photojobs', 'photofaces', 'photofaceembeddings',
+                  'photoembeddings', 'photofacebyfilename', 'other_table', 'blob', 'queue')
+    for operation in ('read', 'write', 'delete', 'other')
+    for suffix in ('_calls', '_ms')
+} | {
+    'vision_' + phase + suffix
+    for phase in ('page_load', 'page_commit', 'checkpoint', 'evaluation')
+    for suffix in ('_calls', '_ms', '_errors')
+} | {'storage_not_found', 'storage_conflicts', 'storage_precondition_failed', 'storage_throttled', 'storage_server_errors'}
 
 
 class Counters:
@@ -55,7 +68,8 @@ class Counters:
 
     def snapshot(self):
         with self.lock:
-            return {key: self.values.get(key, 0) for key in sorted(_FIELDS)}
+            return {key: self.values.get(key, 0) for key in sorted(_FIELDS)
+                    if not key.startswith('io_') or key in self.values}
 
 
 @contextmanager
@@ -88,6 +102,18 @@ def record_io(kind, method, path, status, milliseconds, size):
     values = dict(storage_calls=1, storage_send_ms=milliseconds, storage_bytes=size,
                   storage_errors=int(status <= 0 or status >= 400))
     resource = path.split('?', 1)[0].strip('/').split('/', 1)[0]
+    table = resource.split('(', 1)[0].lower() if kind == 'table' else kind
+    if table not in ('photometadata', 'photojobs', 'photofaces', 'photofaceembeddings',
+                     'photoembeddings', 'photofacebyfilename', 'blob', 'queue'):
+        table = 'other_table'
+    operation = ('read' if method in ('GET', 'HEAD') else 'delete' if method == 'DELETE'
+                 else 'write' if method in ('PUT', 'POST', 'PATCH', 'MERGE') else 'other')
+    values['io_' + table + '_' + operation + '_calls'] = 1
+    values['io_' + table + '_' + operation + '_ms'] = milliseconds
+    category = {404: 'storage_not_found', 409: 'storage_conflicts',
+                412: 'storage_precondition_failed', 429: 'storage_throttled'}.get(status)
+    if category: values[category] = 1
+    if status >= 500: values['storage_server_errors'] = 1
     if kind == 'table' and method == 'GET':
         table = resource.split('(', 1)[0].lower()
         if table == 'photometadata':

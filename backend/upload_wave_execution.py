@@ -521,6 +521,8 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
     """
     import time
     import processing_metrics as metrics
+    import vision_utils
+    from semantic_batching import text_batches
     from contextlib import nullcontext
     from concurrent.futures import ThreadPoolExecutor
     from execution_lease import execution_scope, OwnershipLost
@@ -542,7 +544,8 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
         stage_check(force=force)
     renew.boundary = lambda: renew(force=True)
     def checkpoint(phase, after=''):
-        leases.checkpoint(ownership, 'vision:' + json.dumps(dict(phase=phase, after=after)))
+        with metrics.timer('vision_checkpoint', count_name='vision_checkpoint_calls'):
+            leases.checkpoint(ownership, 'vision:' + json.dumps(dict(phase=phase, after=after)))
     def expired():
         return deadline is not None and time.monotonic() >= deadline
     def progressed():
@@ -553,14 +556,16 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
     pool = (nullcontext(source_executor) if source_executor is not None or source_workers == 1
             else ThreadPoolExecutor(max_workers=source_workers, thread_name_prefix='wave-source'))
     try:
-        with execution_scope(leases, ownership, store, lambda: _execution_check(leases, ownership, store, outbox_key)), leases.keepalive(ownership, local_checks=True) as owned, source_policy_scope(store.table, library, wave_id=wave_id), pool as executor:
+        with execution_scope(leases, ownership, store, lambda: _execution_check(leases, ownership, store, outbox_key)), leases.keepalive(ownership, local_checks=True) as owned, source_policy_scope(store.table, library, wave_id=wave_id), text_batches(
+                vision_utils.encode_text_embeddings_batch, vision_utils._encode_text_embedding_single), pool as executor:
             stage_check = CoalescedCheck(
                 lambda: _execution_check(leases, ownership, store, outbox_key), local=owned)
             while phase == 'sources':
                 if expired(): return store._required(store.wave_key(wave_id))
                 renew(force=True)
-                members = store._page(f'e!{wave_id}!m!', cursor)
-                metadata = MetadataBatch(metadata_table, store.library, members)
+                with metrics.timer('vision_page_load', count_name='vision_page_load_calls'):
+                    members = store._page(f'e!{wave_id}!m!', cursor)
+                    metadata = MetadataBatch(metadata_table, store.library, members)
                 receipts = ReceiptBatch(store.table, store.library)
                 if members and prepare_sources is not None:
                     progressed()
@@ -579,7 +584,8 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
                 # A checkpoint covers only drained groups. Source results are
                 # durable first; interruption before this commit is replayable
                 # through receipt qualification without another model attempt.
-                commit_observations(store, wave_id, observations)
+                with metrics.timer('vision_page_commit', count_name='vision_page_commit_calls'):
+                    commit_observations(store, wave_id, observations)
                 checkpoint('sources', cursor)
                 if expired(): return store._required(store.wave_key(wave_id))
                 if len(members) < MAX_PAGE:
@@ -592,7 +598,8 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
             while True:
                 if expired(): return store._required(store.wave_key(wave_id))
                 renew()
-                wave = store.evaluate(wave_id)
+                with metrics.timer('vision_evaluation', count_name='vision_evaluation_calls'):
+                    wave = store.evaluate(wave_id)
                 progressed()
                 if wave['state'] == 'ready' or not wave.get('evaluation'):
                     break

@@ -205,7 +205,7 @@ def apply_phase(user, filename, phase):
     before = io_snapshot()
     outcome = 'success'
     try:
-        with io_metrics.purpose(phase):
+        with io_metrics.accounting() as local, io_metrics.purpose(phase):
             yield
     except BaseException:
         outcome = 'error'
@@ -218,7 +218,10 @@ def apply_phase(user, filename, phase):
             thread_cpu_ms=max(0, time.thread_time() - cpu_started) * 1000,
             sdk_calls=after[1] - before[1] if same_scope else None,
             sdk_send_ms=after[2] - before[2] if same_scope else None,
-            sdk_attribution='shared_scope' if same_scope else None)
+            sdk_attribution='shared_scope' if same_scope else None,
+            storage_attribution='phase_context', storage_tracing_enabled=storage_tracing_enabled(),
+            **{key: value for key, value in local.snapshot().items()
+               if value or key in ('storage_calls', 'storage_send_ms', 'storage_bytes', 'storage_errors')})
 
 
 # One bounded accumulator per wave attempt; no per-face logging or retained IDs.

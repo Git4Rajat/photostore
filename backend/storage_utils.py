@@ -8767,16 +8767,55 @@ def _build_client_semantic_text(filename: str, metadata: Dict) -> str:
     return build_semantic_text(filename, metadata)
 
 
+def _reusable_semantic_vector(row, text_digest, version, dimension):
+    if row.get('semanticTextDigest') != text_digest or row.get('semanticEmbeddingVersion') != version:
+        return None
+    try:
+        vector = json.loads(row.get('semanticEmbedding') or '[]')
+        if (not isinstance(vector, list) or len(vector) != dimension or not any(vector)
+                or any(type(v) not in (int, float) or not math.isfinite(v) for v in vector)):
+            return None
+        return vector
+    except (TypeError, ValueError):
+        return None
+
+
 def _refresh_semantic_fields(filename: str, metadata: Dict) -> None:
+    import processing_metrics as metrics
     semantic_text = _build_client_semantic_text(filename, metadata)
+    text_digest = hashlib.sha256(semantic_text.encode('utf-8')).hexdigest()
+    version = vision_utils.get_text_embedding_version()
+    dimension = vision_utils.get_text_embedding_dimension()
+    vector = None
+    if metadata.get('semanticText') == semantic_text:
+        # Embeddings are stored separately. A metadata flag alone cannot prove
+        # their write succeeded: require the digest/version beside the vector.
+        table, library = _CTX.get('embeddings_table_client'), metadata.get('PartitionKey')
+        prior = metadata if table is None else {}
+        if table is not None and library:
+            try:
+                prior = table.get_entity(library, filename)
+            except ResourceNotFoundError:
+                pass
+            except Exception:
+                metrics.add(semantic_embedding_reuse_read_errors=1)
+        vector = _reusable_semantic_vector(prior, text_digest, version, dimension)
     metadata['semanticText'] = semantic_text
     metadata['semanticLayers'] = _json_compact(build_semantic_layers(filename, metadata))
-    metadata['semanticEmbedding'] = json.dumps(
-        vision_utils.encode_text_embedding(semantic_text),
-        ensure_ascii=False,
-        separators=(',', ':'),
-    )
-    metadata['semanticEmbeddingVersion'] = vision_utils.get_text_embedding_version()
+    if vector is None:
+        metrics.add(semantic_embedding_encodes=1)
+        vector = vision_utils.encode_text_embedding(semantic_text)
+        version = vision_utils.get_text_embedding_version()
+        dimension = vision_utils.get_text_embedding_dimension()
+    else:
+        metrics.add(semantic_embedding_reuses=1)
+    metadata['semanticEmbedding'] = json.dumps(vector, ensure_ascii=False, separators=(',', ':'))
+    metadata['semanticEmbeddingVersion'] = version
+    # A fallback or invalid vector must never become a reusable model result.
+    candidate = dict(semanticTextDigest=text_digest, semanticEmbeddingVersion=version,
+                     semanticEmbedding=metadata['semanticEmbedding'])
+    metadata['semanticTextDigest'] = text_digest if _reusable_semantic_vector(
+        candidate, text_digest, version, dimension) is not None else ''
 
 
 def _merge_processing_metadata(entity: Dict, key: str, value) -> None:
@@ -10418,7 +10457,8 @@ def _commit_worker_processing_results(user_id, filename, baseline, result, updat
                 reads += 1
                 current = table.get_entity(partition_key=user_id, row_key=filename)
                 continue
-            publish_source_completion_intent(user_id, filename, entity)
+            with processing_diagnostics.apply_phase(user_id, filename, 'completion_delivery'):
+                publish_source_completion_intent(user_id, filename, entity)
             outcome = 'partial' if error is not None else 'success'
             with processing_diagnostics.apply_phase(user_id, filename, 'index_dirty'):
                 touch_user_search_indexes_state(user_id, filenames=filename)
@@ -11238,7 +11278,7 @@ def _resolve_filename_for_upload(user_id: str, filename: str, file_hash: str) ->
         return filename
 
 
-_EMBEDDING_FIELDS = ('photoEmbedding', 'photoEmbeddingVersion', 'semanticEmbedding', 'semanticEmbeddingVersion')
+_EMBEDDING_FIELDS = ('photoEmbedding', 'photoEmbeddingVersion', 'semanticEmbedding', 'semanticEmbeddingVersion', 'semanticTextDigest')
 
 
 def _extract_and_store_embeddings(user_id: str, filename: str, entity: Dict) -> None:
