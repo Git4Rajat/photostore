@@ -108,6 +108,41 @@ def test_parallel_sources_inherit_stage_scope_and_batch_observation_writes(world
     assert metadata.queries == 1
 
 
+def test_repeated_parallel_checks_do_not_repeat_remote_stage_and_policy_reads(world, monkeypatch):
+    import processing_checks
+    import processing_diagnostics
+    from processing_cleanup import check_source_policy
+    metadata, wave, key = admit(world, 2)
+    store, _, _, table, _ = world
+    original_guard = processing_checks.CoalescedCheck
+    monkeypatch.setattr(processing_checks, 'CoalescedCheck',
+        lambda *args, **kwargs: original_guard(*args, clock=lambda: 0.0, **kwargs))
+    reads = []
+    original_read = table.get_entity
+    def read(*args, **kwargs):
+        reads.append(args)
+        return original_read(*args, **kwargs)
+    monkeypatch.setattr(table, 'get_entity', read)
+    emitted = []
+    original_emit = processing_diagnostics.emit
+    def emit(event, **fields):
+        if event in ('vision_policy_checks', 'vision_stage_checks'):
+            emitted.append((event, fields))
+        original_emit(event, **fields)
+    monkeypatch.setattr(processing_diagnostics, 'emit', emit)
+    def process(library, filename, revision, renew):
+        for _ in range(1000):
+            renew()
+            check_source_policy(table, library)
+        publish_completion(store, metadata, filename=filename)
+    assert run(world, metadata, wave, key, process, source_workers=2)['state'] == 'ready'
+    assert len(reads) < 300  # Includes real admission, receipts and barrier writes.
+    stats = dict(emitted)
+    assert stats['vision_policy_checks']['cached_checks'] >= 2000
+    assert stats['vision_stage_checks']['cached_checks'] >= 2000
+    assert stats['vision_stage_checks']['forced_checks'] >= 2
+
+
 def test_completed_page_uses_one_metadata_read_and_no_new_attempts(world):
     metadata, wave, key = admit(world, 20)
     store = world[0]

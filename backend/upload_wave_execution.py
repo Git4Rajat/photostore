@@ -412,6 +412,9 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
     for error in errors.values():
         if isinstance(error, (OwnershipLost, NotImplementedError)):
             raise error
+    # Qualifying/settling drained source results is a durable batch boundary.
+    # Detect an intake reopen or lost release before interpreting those results.
+    getattr(renew, 'boundary', renew)()
     observations = []
     for item in planned:
         member = item['member']
@@ -456,12 +459,13 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
     revision; the runtime queues the continuation before acknowledging its wake.
     """
     import time
-    import threading
     from contextlib import nullcontext
     from concurrent.futures import ThreadPoolExecutor
     from execution_lease import execution_scope, OwnershipLost
     from upload_waves import MAX_PAGE
     from wave_source_batch import MetadataBatch, ReceiptBatch, commit_observations
+    from processing_checks import CoalescedCheck
+    from processing_cleanup import source_policy_scope
     if type(source_workers) is not int or not 1 <= source_workers <= MAX_PAGE:
         raise ValueError('Vision source concurrency must be between 1 and the member page size')
     ownership, wave = claim_release(leases, store, library, wave_id, 'vision', outbox_key, 'vision')
@@ -469,17 +473,12 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
         return None
     if ownership.status == 'succeeded':
         return wave
-    renewal_lock = threading.Lock()
-    next_renewal = [0.0]
-    def renew():
-        # Every check still validates durable ownership and release eligibility.
-        # The keepalive also renews during blocking calls; do not write the same
-        # stage lease at every source boundary or from every source thread.
-        with renewal_lock:
-            _execution_check(leases, ownership, store, outbox_key)
-            if time.monotonic() >= next_renewal[0]:
-                leases.renew(ownership)
-                next_renewal[0] = time.monotonic() + min(30, leases.lease_seconds / 3)
+    stage_check = None
+    def renew(*, force=False):
+        # Source threads share stage observations; durable wave mutations still
+        # use execution_scope's authoritative transaction guard below.
+        stage_check(force=force)
+    renew.boundary = lambda: renew(force=True)
     def checkpoint(phase, after=''):
         leases.checkpoint(ownership, 'vision:' + json.dumps(dict(phase=phase, after=after)))
     def expired():
@@ -492,10 +491,12 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
     pool = (nullcontext(source_executor) if source_executor is not None or source_workers == 1
             else ThreadPoolExecutor(max_workers=source_workers, thread_name_prefix='wave-source'))
     try:
-        with execution_scope(leases, ownership, store, lambda: _execution_check(leases, ownership, store, outbox_key)), leases.keepalive(ownership), pool as executor:
+        with execution_scope(leases, ownership, store, lambda: _execution_check(leases, ownership, store, outbox_key)), leases.keepalive(ownership, local_checks=True) as owned, source_policy_scope(store.table, library, wave_id=wave_id), pool as executor:
+            stage_check = CoalescedCheck(
+                lambda: _execution_check(leases, ownership, store, outbox_key), local=owned)
             while phase == 'sources':
                 if expired(): return store._required(store.wave_key(wave_id))
-                renew()
+                renew(force=True)
                 members = store._page(f'e!{wave_id}!m!', cursor)
                 metadata = MetadataBatch(metadata_table, store.library, members)
                 receipts = ReceiptBatch(store.table, store.library)
@@ -524,6 +525,7 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
                     checkpoint(phase)
             if before_freeze is not None:
                 if expired(): return store._required(store.wave_key(wave_id))
+                renew(force=True)
                 before_freeze()
             while True:
                 if expired(): return store._required(store.wave_key(wave_id))
@@ -544,6 +546,9 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
             release_and_relay(work_store, store, library, 'shadow-cluster!' + wave_id, 'cluster', cluster_send)
         return wave
     finally:
+        if stage_check is not None:
+            processing_diagnostics.emit('vision_stage_checks', role='vision', wave_id=wave_id,
+                library_id=processing_diagnostics.file_id(library, ''), **stage_check.metrics())
         # keepalive has stopped before releasing, so it cannot renew a yielded
         # lease. A replacement owner is never cleared by this attempt's cleanup.
         current = leases._get(ownership.key)

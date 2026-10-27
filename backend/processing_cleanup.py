@@ -9,11 +9,42 @@ and retryable through the existing library-operations queue.
 """
 import json
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from azure.core.exceptions import ResourceNotFoundError
 
 from processing_artifacts import staging_name
 from upload_waves import digest
+
+_SOURCE_POLICY = ContextVar('wave_source_policy_checks', default=None)
+_POLICY_BOUNDARY = ContextVar('source_policy_boundary', default=False)
+
+
+@contextmanager
+def source_policy_scope(table, library, *, wave_id=None):
+    """Share a one-second policy observation window across wave source threads."""
+    from processing_checks import CoalescedCheck
+    import processing_diagnostics
+    guard = CoalescedCheck(lambda: _check_source_policy(table, library))
+    guard(force=True)
+    token = _SOURCE_POLICY.set((table, library, guard))
+    try:
+        yield guard
+    finally:
+        _SOURCE_POLICY.reset(token)
+        processing_diagnostics.emit('vision_policy_checks', role='vision', wave_id=wave_id,
+            library_id=processing_diagnostics.file_id(library, ''), **guard.metrics())
+
+
+@contextmanager
+def source_policy_boundary():
+    """Claims and final metadata commits cannot reuse a cached policy read."""
+    token = _POLICY_BOUNDARY.set(True)
+    try:
+        yield
+    finally:
+        _POLICY_BOUNDARY.reset(token)
 
 
 def delete_staging_attempt(storage, library, photo, revision, attempt, *, current_attempt):
@@ -198,11 +229,23 @@ def _wave_store(table,library):
 
 
 def check_source_policy(table,library):
-    """Called before source claims and commits; durable cleanup never falls back."""
-    store=_wave_store(table,library)
-    if not store:return
-    policy=store._required('policy')
-    if policy.get('cleanupState') or policy.get('gcUntil',0)>store.clock():
+    scoped = _SOURCE_POLICY.get()
+    if scoped is not None and scoped[0] is table and scoped[1] == library:
+        return scoped[2](force=_POLICY_BOUNDARY.get())
+    _check_source_policy(table, library)
+
+
+def _check_source_policy(table, library):
+    """One policy read determines ownership and cleanup state together."""
+    from wave_policy import owned, PROTOCOL
+    from upload_waves import ShadowWaves
+    if table is None:
+        owned(table, library)  # Preserve unavailable-storage enforcement.
+        return
+    store = ShadowWaves(table, library)
+    policy = store._get('policy')
+    if policy and policy.get('protocol') == PROTOCOL and (
+            policy.get('cleanupState') or policy.get('gcUntil', 0) > store.clock()):
         raise RuntimeError('Processing is fenced by library cleanup')
 
 

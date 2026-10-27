@@ -10315,7 +10315,9 @@ def _commit_worker_processing_results(user_id, filename, baseline, result, updat
             with processing_diagnostics.apply_phase(user_id, filename, 'lease_and_policy_check'):
                 _check_result_lease(current, owner)
                 if _CTX.get('source_policy_check'):
-                    _CTX['source_policy_check'](user_id)
+                    from processing_cleanup import source_policy_boundary
+                    with source_policy_boundary():
+                        _CTX['source_policy_check'](user_id)
                 if require_unexpired and _processing_is_expired(current):
                     from processing_completion import StaleProcessingResult
                     raise StaleProcessingResult('Processing result lease expired before commit.')
@@ -10841,7 +10843,9 @@ def claim_processing_lease(
     """
     _require_context()
     if _CTX.get('source_policy_check'):
-        _CTX['source_policy_check'](user_id)
+        from processing_cleanup import source_policy_boundary
+        with source_policy_boundary():
+            _CTX['source_policy_check'](user_id)
     metadata_table_client = _CTX['metadata_table_client']
     requested_steps = tuple(step for step in (steps or list(BROWSER_PROCESSING_STEPS)) if step in BROWSER_PROCESSING_STEPS)
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=max(30, int(lease_seconds or CLIENT_PROCESSING_LEASE_SECONDS)))

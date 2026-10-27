@@ -442,6 +442,42 @@ def test_real_nonempty_cluster_executes_frozen_journal_and_commits_receipt(world
     assert not h.metadata
 
 
+def test_local_journal_handoff_releases_index_and_completes_publication(world, tmp_path):
+    from dataclasses import replace
+    from upload_wave_execution import _load_wave_faces
+    store, work, leases, *_ = world
+    wave_id = ready_wave(world, with_face=True)
+    h = real_wave_assigner()
+    workdir = tmp_path / 'work'
+    workdir.mkdir()
+    h.assigner.config = replace(h.assigner.config, work_dir=str(workdir), checkpoint_dir=str(tmp_path / 'mount'))
+    _, frozen = _load_wave_faces(store, wave_id)
+    h.faces.create_entity(frozen['face-1'])
+    obligations = EtagTable()
+    result = run_cluster_release(leases, store, store.library, wave_id, 'shadow-cluster!' + wave_id,
+        assigner=h.assigner, journal=None, obligations_table=obligations, face_table=None, face_ids=None)
+    assert result['state'] == 'indexing'
+    manifest = store._required(f'assignment!{wave_id}!manifest')
+    receipt = store._required(f'assignment!{wave_id}!complete')
+    assert json.loads(receipt['payload'])['manifestId'] == manifest['digest']
+    assert store._get(f'assignment!{wave_id}!local-v1')
+    sent = []
+    assert release_and_relay(work, store, store.library, result['indexPendingKey'], 'index',
+                             lambda *args: sent.append(args))
+    assert len(sent) == 1 and sent[0][1].startswith('wave-index:' + wave_id)
+    ledger = ObligationLedger(obligations, wave_id, library=store.library,
+        frozen_revision=result['frozenRevision'], assignment_revision=result['assignmentReceiptId'])
+    published = []
+    def publish(scope, obligation, check):
+        check()
+        published.append(scope)
+        return digest([scope, obligation])
+    completed = run_index_release(leases, store, store.library, wave_id, result['indexPendingKey'],
+                                  ledger, publisher=publish)
+    assert completed['state'] == 'complete' and completed['completionReceiptId']
+    assert set(published) == set(ledger._specs()[1])
+
+
 def test_index_handoff_cannot_rebind_an_assignment_receipt(world):
     from upload_waves import Conflict
     store, work, leases, *_ = world

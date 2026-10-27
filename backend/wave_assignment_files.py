@@ -145,6 +145,9 @@ class FileAssignmentJournal(WaveAssignmentJournal):
 
     def finish(self, header, chain):
         identity = super().finish(header, chain)
+        # The handoff validator needs the compact frozen header, not the
+        # per-face journal. Publish it before exposing completion in Table.
+        self.cloud.put('manifest', header)
         # Keep a compact durable completion receipt for publication/diagnostics.
         if self.cloud.put('complete', self.get('complete')) != identity:
             raise ValueError('Wave completion receipt mismatch')
@@ -161,7 +164,12 @@ class FileAssignmentJournal(WaveAssignmentJournal):
 @contextmanager
 def assignment_journal(store, wave_id, check, *, share, local):
     cloud = WaveAssignmentJournal(store, wave_id, check)
-    if not share or cloud.get('manifest') is not None:
+    marker = cloud.get('local-v1')
+    if marker is not None and not share:
+        raise ValueError('Marked wave journal requires its checkpoint mount')
+    # A local journal's compact handoff manifest does not turn it into a
+    # legacy Table journal. Resume its original decisions on the mount.
+    if marker is None and (not share or cloud.get('manifest') is not None):
         yield cloud
         return
     root = Path(share)

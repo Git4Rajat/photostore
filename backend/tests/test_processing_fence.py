@@ -50,6 +50,46 @@ def test_stale_attempt_cannot_write_output(world, change):
     assert not faces.rows
 
 
+@pytest.mark.parametrize('operation', ['claim', 'commit'])
+def test_policy_cache_cannot_hide_cleanup_from_source_claim_or_commit(world, monkeypatch, operation):
+    from processing_cleanup import source_policy_scope, check_source_policy
+    from test_wave_activation import active
+    from test_wave_recovery import RuntimeTable
+    metadata, *_ = world
+    jobs = RuntimeTable()
+    store = active(jobs, 'lib')
+    monkeypatch.setitem(storage_utils._CTX, 'source_policy_check', lambda uid: check_source_policy(jobs, uid))
+    with source_policy_scope(jobs, 'lib'):
+        row = jobs.get_entity(store.partition, 'policy')
+        jobs.update_entity(dict(row, cleanupState='cleaning'), etag=row.metadata['etag'], match_condition='IfNotModified')
+        baseline = metadata.get_entity('lib', 'photo.jpg')
+        with pytest.raises(RuntimeError, match='cleanup'):
+            if operation == 'claim':
+                storage_utils.claim_processing_lease('lib', 'photo.jpg', 'other-owner')
+            else:
+                storage_utils._commit_worker_processing_results('lib', 'photo.jpg', baseline,
+                    dict(baseline), {}, 'owner')
+    assert metadata.update_calls == 0
+
+
+def test_cached_policy_does_not_cache_photo_generation_checks(world, monkeypatch):
+    import processing_fence
+    from processing_cleanup import source_policy_scope, check_source_policy
+    from test_wave_activation import active
+    from test_wave_recovery import RuntimeTable
+    metadata, faces, _, _, fence = world
+    jobs = RuntimeTable()
+    active(jobs, 'lib')
+    monkeypatch.setattr(processing_fence, 'POLICY_CHECK', lambda uid: check_source_policy(jobs, uid))
+    with source_policy_scope(jobs, 'lib'), result_fence(fence):
+        fence.check()
+        row = metadata.get_entity('lib', 'photo.jpg')
+        metadata.upsert_entity(dict(row, processingFence='replacement'))
+        with pytest.raises(StaleProcessingResult):
+            write_artifact(faces, dict(PartitionKey='lib', RowKey='face', filename='photo.jpg'))
+    assert not faces.rows
+
+
 def test_artifact_cas_rejects_newer_curation_instead_of_retrying_with_its_version(world):
     _, faces, _, _, fence = world
     faces.upsert_entity(dict(PartitionKey='lib', RowKey='face', filename='photo.jpg', personId='old'))

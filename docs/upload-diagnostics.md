@@ -200,9 +200,14 @@ checkpoint mount is configured. Snapshot and decision records are append-only
 JSONL on the trusted mount, with a SQLite lookup index on local work disk only.
 The complete snapshot is flushed before a compact, execution-fenced `local-v1`
 Table marker is published. Every subsequent decision is flushed before its
-conditional person/member/face writes. A compact completion receipt remains in
-Table Storage. Existing table-backed manifests continue on their original path;
-without a configured checkpoint directory the table journal is still used.
+conditional person/member/face writes. The compact frozen manifest header and
+completion receipt remain in Table Storage for assignment handoff validation;
+per-face records remain on the mount. An existing `local-v1` marker continues to
+select the mounted journal even after its compact header is published. Retrying
+an older completed local journal backfills the header without applying faces
+again. Existing table-only journals continue on their original path; without a
+configured checkpoint directory a new wave uses the Table journal. A marked
+local journal always requires its mount.
 
 The mount must provide cross-process flock and fsync, matching the existing
 clustering checkpoint contract. A marked journal that disappears or becomes
@@ -220,6 +225,27 @@ conditional entity ETags and library-lease checks remain on materialization.
 This bounds the observation delay for policy/release changes to the refresh
 interval between boundaries, rather than rereading all control rows per face.
 Wave transitions and compact journal markers retain transaction fencing.
+
+Vision uses the same locally checked, background-renewed execution lease. Stage
+eligibility reads are coalesced across source threads for at most one second,
+with forced checks at member-page entry, after drained source groups, and before
+tag invalidation. Evidence/barrier transactions retain authoritative ownership
+guards. A failed refresh is latched for the attempt; cached approval cannot
+outlive a failed refresh or the lease deadline.
+
+Wave source threads also share a one-second cleanup-policy observation window.
+Source claims and final metadata commits force a fresh policy read. Every
+ResultFence check still rereads the actual photo and verifies its exact revision,
+generation, attempt, owner, expiry and deletion/isolation state. Artifact writes
+retain ETags. Cleanup changes can be observed up to one second later during
+intermediate work, but claims and final result publication do not use cached
+policy approval. Outside a Vision wave scope, policy checks remain fresh and
+need one read instead of separately reading ownership and cleanup state.
+
+`vision_stage_checks` and `vision_policy_checks` emit one bounded summary per
+attempt: `checks`, `cached_checks`, `authoritative_checks`, `forced_checks`,
+`failures`, and `lock_wait_ms`. Per-source shared-scope SDK deltas still overlap;
+compare request totals from the enclosing scope when measuring call reductions.
 
 Vision receipt capture may reuse the exact derivative receipt whose immutable
 bytes were published and read back in the same source-fence context. Only two

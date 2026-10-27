@@ -35,7 +35,7 @@ def test_local_journal_matches_oracle_without_per_face_table_journal_rows(tmp_pa
     receipt = run(h, snapshots, store, frozen, leases, tmp_path, page_size=page_size)
     assert comparable(assignment_snapshot(h)) == expected
     rows = store._page('assignment!')
-    assert {r['RowKey'].split('!')[-1] for r in rows} == {'local-v1', 'complete'}
+    assert {r['RowKey'].split('!')[-1] for r in rows} == {'local-v1', 'manifest', 'complete'}
     assert len(receipt) == 64
     journal_file, = (tmp_path / 'mount').rglob('journal.jsonl')
     assert journal_file.stat().st_size > 0
@@ -112,8 +112,52 @@ def test_table_journal_transactions_are_constant_for_local_plan(tmp_path):
         store.table.submit_transaction = submit
         run(h, snapshots, store, frozen, leases, root, local=local)
         counts[local] = len(writes)
-    assert counts[True] == 2
+    assert counts[True] == 3
     assert counts[False] > 3 * len(snapshots)
+
+
+def test_compact_manifest_does_not_switch_recovery_to_table_journal(tmp_path):
+    h, snapshots, store, frozen, leases = setup()
+    receipt = run(h, snapshots, store, frozen, leases, tmp_path)
+    assert store._get(f"assignment!{frozen['waveId']}!manifest")
+    for table in (h.faces, h.people, h.members):
+        table.after_write = lambda row: pytest.fail('Reapplied local decisions')
+    assert run(h, snapshots, store, frozen, leases, tmp_path) == receipt
+    journal_file, = (tmp_path / 'mount').rglob('journal.jsonl')
+    journal_file.unlink()
+    with pytest.raises(ValueError, match='missing'):
+        run(h, snapshots, store, frozen, leases, tmp_path)
+    with pytest.raises(ValueError, match='checkpoint mount'):
+        run(h, snapshots, store, frozen, leases, tmp_path, local=False)
+
+
+def test_completed_old_local_journal_backfills_missing_handoff_header(tmp_path):
+    h, snapshots, store, frozen, leases = setup()
+    receipt = run(h, snapshots, store, frozen, leases, tmp_path)
+    # Reproduce the deployed layout: local marker + complete, no Table header.
+    del store.table.rows[store.partition, f"assignment!{frozen['waveId']}!manifest"]
+    for table in (h.faces, h.people, h.members):
+        table.after_write = lambda row: pytest.fail('Reapplied already completed assignment')
+    assert run(h, snapshots, store, frozen, leases, tmp_path) == receipt
+    assert store._required(f"assignment!{frozen['waveId']}!manifest")['digest']
+
+
+def test_interrupted_compact_manifest_publication_resumes_without_reapplying(tmp_path, monkeypatch):
+    h, snapshots, store, frozen, leases = setup()
+    original = wave.WaveAssignmentJournal.put
+    def publish(self, key, payload):
+        if type(self) is wave.WaveAssignmentJournal and key == 'manifest':
+            raise OSError('handoff header upload failed')
+        return original(self, key, payload)
+    with monkeypatch.context() as patch:
+        patch.setattr(wave.WaveAssignmentJournal, 'put', publish)
+        with pytest.raises(OSError, match='header upload'):
+            run(h, snapshots, store, frozen, leases, tmp_path)
+    assert not store._get(f"assignment!{frozen['waveId']}!complete")
+    for table in (h.faces, h.people, h.members):
+        table.after_write = lambda row: pytest.fail('Reapplied after header upload failure')
+    receipt = run(h, snapshots, store, frozen, leases, tmp_path)
+    assert store._get(f"assignment!{frozen['waveId']}!complete")['digest'] == receipt
 
 
 def test_local_plan_preserves_foreground_curation_after_interrupted_decision(tmp_path, monkeypatch):
