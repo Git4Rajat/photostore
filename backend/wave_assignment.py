@@ -19,7 +19,7 @@ import tempfile
 import processing_diagnostics
 
 from azure.core import MatchConditions
-from azure.core.exceptions import ResourceNotFoundError
+from azure.core.exceptions import ResourceNotFoundError, ResourceExistsError
 from azure.data.tables import UpdateMode
 
 from clustering_wave import canonical_sort_key
@@ -27,6 +27,7 @@ from execution_lease import guard_operations
 from faiss_assignment import FaissAssigner, _point, _vector, _rejected, invalidate, _LOCK
 from clustering_runtime import LiveFaceIndex, RebuildNeeded
 from upload_waves import digest
+from table_reads import read_entities, key_batches
 
 
 def encoded(value):
@@ -161,23 +162,30 @@ class WaveAssignmentJournal:
         # UUID5 person rows can predate their face stamps after an interrupted
         # legacy write. Freeze those too: the reference reuses them rather than
         # treating them as a new-person collision on recovery.
-        for face in workspace.inputs():
+        for keys in key_batches(assigner.person_id(self.store.library, face['RowKey']) for face in workspace.inputs()):
             self.check()
-            person_id = assigner.person_id(self.store.library, face['RowKey'])
-            person = _point(assigner.person_table, self.store.library, person_id)
-            if person is not None:
-                workspace.put('people', person_id, clean(person))
+            for person_id, person in read_entities(assigner.person_table, self.store.library, keys).items():
+                if person is not None:
+                    workspace.put('people', person_id, clean(person))
         # Empty waves need no candidate scan.
         if workspace.count('inputs'):
-            for candidate in assigner._cold_rows(self.store.library):
+            candidates = []
+            def capture_candidates():
                 self.check()
-                person = workspace.get('people', candidate['personId'])
-                if person is None:
-                    person = _point(assigner.person_table, self.store.library, candidate['personId'])
+                keys = [row['personId'] for row in candidates if workspace.get('people', row['personId']) is None]
+                for person_id, person in read_entities(assigner.person_table, self.store.library, keys).items():
                     if person is not None:
-                        workspace.put('people', candidate['personId'], clean(person))
-                workspace.put('candidates', candidate['faceId'], dict(candidate,
-                    embedding=candidate['embedding'].tolist()))
+                        workspace.put('people', person_id, clean(person))
+                for candidate in candidates:
+                    workspace.put('candidates', candidate['faceId'], dict(candidate,
+                        embedding=candidate['embedding'].tolist()))
+            for candidate in assigner._cold_rows(self.store.library):
+                candidates.append(candidate)
+                if len(candidates) == 14:
+                    capture_candidates()
+                    candidates.clear()
+            if candidates:
+                capture_candidates()
         # Deterministic keys also detect a changed partial manifest on retry.
         for position, row in enumerate(workspace.inputs()):
             self.put(f'input!{position:012d}', row)
@@ -274,7 +282,7 @@ SOURCE_FIELDS = ('filename', 'sourcePhotoId', 'processingRevision', 'processingG
 
 
 @processing_diagnostics.wave_phase('curation_check')
-def _curation_override(journal, position, assigner, library, face, decision, guard):
+def _curation_override(journal, position, assigner, library, face, decision, guard, observed=None):
     """Witness foreground curation before an unapplied decision takes effect.
 
     No later decision can exist past this position's missing applied marker.
@@ -290,6 +298,7 @@ def _curation_override(journal, position, assigner, library, face, decision, gua
     if journal.get(f'applied!{position:012d}') is not None:return decision
     guard.check()
     live=_point(assigner.face_table,library,face['RowKey'])
+    if observed is not None: observed['face'] = live
     if live is None or any(live.get(k)!=face.get(k) for k in SOURCE_FIELDS):return decision
     changed=(any(live.get(k)!=face.get(k) for k in ('rejected','reviewStatus'))
              or (live.get('personId') or '') not in ((face.get('personId') or ''),(decision.get('personId') or '')))
@@ -304,10 +313,12 @@ def _curation_override(journal, position, assigner, library, face, decision, gua
 
 
 @processing_diagnostics.wave_phase('assignment_persistence')
-def _apply(assigner, library, face, decision, decision_id, guard, wave_id):
+def _apply(assigner, library, face, decision, decision_id, guard, wave_id, observed=None):
     if decision['outcome'] == 'excluded':
         return
-    live = _point(assigner.face_table, library, face['RowKey'])
+    # Reuse the curation witness with its genuine ETag. A later face edit
+    # rejects the conditional write; never reread and upgrade that ETag.
+    live = observed['face'] if observed is not None and 'face' in observed else _point(assigner.face_table, library, face['RowKey'])
     if live is None:
         raise ValueError('Frozen face was deleted before assignment')
     # Source replacement and curation must not be overwritten by old work.
@@ -353,13 +364,16 @@ def _apply(assigner, library, face, decision, decision_id, guard, wave_id):
                 person_row[key] = decision['person'][key]
     _write(assigner.person_table, person_row, person, guard)
     if assigner.member_table is not None:
-        member = _point(assigner.member_table, target, face['RowKey'])
-        if member is None:
+        try:
+            # Most assignments create a member. Create-only is the absence
+            # test; a conflict must still validate existing membership.
             _write(assigner.member_table, dict(PartitionKey=target, RowKey=face['RowKey'],
                 userId=library, addedAt=decision['person'].get('createdAt') or '',
                 assignmentDecisionId=decision_id), None, guard)
-        elif member.get('userId') != library:
-            raise ValueError('Person membership belongs to another library')
+        except ResourceExistsError:
+            member = _point(assigner.member_table, target, face['RowKey'])
+            if member is None or member.get('userId') != library:
+                raise ValueError('Person membership belongs to another library')
     face_row = clean(live)
     face_row.update(personId=target, assignmentDecisionId=decision_id)
     _write(assigner.face_table, face_row, live, guard)
@@ -463,13 +477,14 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
                             or decision.get('manifestId') != digest(header)
                             or decision.get('position') != position or decision.get('previousDigest') != chain):
                         raise ValueError('Decision is bound to another frozen face')
-                    decision = _curation_override(journal,position,assigner,store.library,face,decision,guard)
+                    observed = {}
+                    decision = _curation_override(journal,position,assigner,store.library,face,decision,guard,observed)
                     identity = digest(decision)
                     if not journal.applied(position, identity):
                         if not begun:
                             library_guard.begin_assignment()
                             begun = True
-                        _apply(assigner, store.library, face, decision, identity, guard, wave['waveId'])
+                        _apply(assigner, store.library, face, decision, identity, guard, wave['waveId'],observed)
                         journal.put(f'applied!{position:012d}', {'decisionId': identity})
                     _replay(workspace, runtime, decision, guard)
                     chain = digest([chain, position, identity])

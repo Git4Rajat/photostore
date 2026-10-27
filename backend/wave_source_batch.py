@@ -1,9 +1,11 @@
 """Bounded Vision coordination batches; source artifacts retain their own fences."""
 from urllib.parse import quote as url_quote
+from collections import OrderedDict
 from azure.core.exceptions import ResourceNotFoundError
 
 from upload_waves import Conflict, MAX_PAGE, digest
 from processing_receipts import ArtifactReceipts
+from processing_metrics import add
 
 
 class ReceiptBatch(ArtifactReceipts):
@@ -14,14 +16,30 @@ class ReceiptBatch(ArtifactReceipts):
     """
     def __init__(self, table, library):
         super().__init__(table, library)
-        self.rows = {}
+        self.rows = OrderedDict()
+
+    def _remember(self, key, row):
+        if row is not None and key.startswith(('manifest!', 'face!')):
+            self.rows[key] = row
+            self.rows.move_to_end(key)
+            while len(self.rows) > 4096:
+                self.rows.popitem(last=False)
+                add(receipt_cache_evictions=1)
+
+    def prefetch(self, keys):
+        from table_reads import read_entities, key_batches
+        for batch in key_batches(key for key in keys if key not in self.rows):
+            for key, row in read_entities(self.table, self.partition, batch).items():
+                self._remember(key, row)
 
     def _get(self, key):
         if key in self.rows:
+            add(receipt_cache_hits=1)
+            self.rows.move_to_end(key)
             return self.rows[key]
         row = super()._get(key)
-        if row is not None and key.startswith(('manifest!', 'face!')) and len(self.rows) < 4096:
-            self.rows[key] = row
+        add(receipt_cache_misses=1)
+        self._remember(key, row)
         return row
 
 

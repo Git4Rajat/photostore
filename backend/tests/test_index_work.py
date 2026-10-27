@@ -302,3 +302,36 @@ def test_healthy_deferred_barrier_waits_do_not_exhaust_work_attempts(work):
     store.release(claim,deferred=True)
     now[0]+=200
     assert store.claim(key).attempt==2
+
+
+def test_retry_timing_is_piggybacked_consumed_once_and_invalidated_by_new_revision(work):
+    store, table, now = work
+    key = store.request('A', 'wave-vision:wave:outbox')
+    first = store.claim(key)
+    calls = []
+    original_get, original_update = table.get_entity, table.update_entity
+    table.get_entity = lambda *a: (calls.append('get'), original_get(*a))[1]
+    table.update_entity = lambda *a, **kw: (calls.append('update'), original_update(*a, **kw))[1]
+    store.release(first, retry_delay=2, retry_reason='coordination_conflict')
+    assert calls == ['get', 'update']  # No telemetry read or write.
+    now[0] += 7
+    second = store.claim(key)
+    assert second.scheduled_at == 1000 and second.scheduled_delay == 2
+    assert second.schedule_id and second.schedule_reason == 'coordination_conflict'
+    store.release(second)
+    third = store.claim(key)
+    assert third.schedule_id == ''  # Duplicate delivery cannot reuse old timing.
+    store.release(third, retry_delay=2)
+    store.request('A', 'wave-vision:wave:outbox')
+    fourth = store.claim(key)
+    assert fourth.schedule_id == ''  # A newer requested revision has another origin.
+
+
+def test_malformed_optional_retry_telemetry_cannot_block_a_claim(work):
+    store, table, _ = work
+    key = store.request('A', 'scope')
+    current = store._get(key)
+    table.update_entity(dict(current, retryScheduledAt='invalid', retryDelaySeconds='invalid',
+        retryScheduleRevision=current['revision'], retryScheduleId='invalid'), etag=current.metadata['etag'])
+    claim = store.claim(key)
+    assert claim and not claim.schedule_id

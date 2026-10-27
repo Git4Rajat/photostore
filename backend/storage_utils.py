@@ -58,6 +58,7 @@ import table_scan
 import maps_utils
 import perf_instrumentation
 import processing_diagnostics
+import processing_metrics
 import vision_utils
 
 CLIENT_PROCESSING_SCHEMA_VERSION = 2
@@ -10291,6 +10292,7 @@ def _check_result_lease(entity: Dict, owner: str) -> None:
         raise StaleProcessingResult('Processing result lease owner changed.')
 
 
+@processing_metrics.purpose('metadata_commit')
 def _commit_worker_processing_results(user_id, filename, baseline, result, updates, owner,
                                       *, failed_steps=None, error=None, require_unexpired=False):
     """CAS only this attempt's delta, statuses and release in one row write.
@@ -10819,6 +10821,7 @@ class PhotoNotFoundError(RuntimeError):
     `except Exception` callers unchanged since it subclasses RuntimeError."""
 
 
+@processing_metrics.purpose('claim')
 def claim_processing_lease(
     user_id: str,
     filename: str,
@@ -11001,6 +11004,7 @@ def heartbeat_processing_lease(user_id: str, filename: str, owner_id: str, *, le
     return claim_processing_lease(user_id, filename, owner_id, lease_seconds=lease_seconds, mark_running=False)
 
 
+@processing_metrics.purpose('source_release')
 def release_processing_lease(user_id: str, filename: str, owner_id: str, *,
                              expected_processing_fence: Optional[str] = None) -> None:
     """Ownership re-checked against a fresh read on every retry attempt (see

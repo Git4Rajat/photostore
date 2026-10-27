@@ -283,3 +283,18 @@ def test_capture_reuses_same_attempt_publication_readback_for_both_derivatives(b
     with result_fence(fence):
         assert receipts.capture(storage_utils, row)
     assert len(accessed) == 2
+
+
+def test_new_immutable_receipts_skip_point_reads_but_retries_validate_existing_payload(monkeypatch):
+    table = AtomicTable()
+    receipts = ArtifactReceipts(table, 'lib')
+    reads = []
+    original = table.get_entity
+    monkeypatch.setattr(table, 'get_entity', lambda *a: (reads.append(a), original(*a))[1])
+    identity = receipts._put('face', dict(filename='photo.jpg', embedding='[1,0]'))
+    assert not reads
+    assert receipts._put('face', dict(filename='photo.jpg', embedding='[1,0]')) == identity
+    assert len(reads) == 1
+    table.rows[receipts.partition, 'face!' + identity]['payload'] = '{}'
+    with pytest.raises(ValueError, match='identity rebound'):
+        receipts._put('face', dict(filename='photo.jpg', embedding='[1,0]'))

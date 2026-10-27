@@ -15,6 +15,7 @@ import uuid
 from datetime import datetime, timezone
 
 from ipworker_metrics import replica_identity, resource_sample
+import processing_metrics as io_metrics
 
 _LOGGER = logging.getLogger('processing_diagnostics')
 _INSTANCE = uuid.uuid4().hex
@@ -24,6 +25,95 @@ _STATES = ('startup', 'idle', 'accumulating', 'processing', 'checkpoint')
 _BATCH = ContextVar('processing_upload_batch', default=None)
 _TRACE = ContextVar('processing_message', default=None)
 _MEDIA = ContextVar('processing_media_download', default=None)
+_IMAGES = ContextVar('processing_image_metrics', default=None)
+
+
+def storage_tracing_enabled():
+    import perf_instrumentation
+    return bool(perf_instrumentation.ENABLED and perf_instrumentation._transport_patched)
+
+
+@contextmanager
+def stage_context(wave_id, stage, claim):
+    fields = dict(_TRACE.get() or {}, wave_id=wave_id, stage=stage,
+                  attempt_id=claim.owner, dispatch_attempt=claim.attempt,
+                  schedule_id=claim.schedule_id or None)
+    token = _TRACE.set(fields)
+    try:
+        yield
+    finally:
+        _TRACE.reset(token)
+
+
+@contextmanager
+def image_scope(member_key, phase):
+    images = _IMAGES.get()
+    if images is None:
+        yield
+        return
+    counter = images[member_key]
+    started = time.monotonic()
+    with io_metrics.accounting(counter), io_metrics.purpose(phase):
+        if phase == 'processing': io_metrics.add(source_attempts=1)
+        try:
+            yield
+        except BaseException:
+            if phase == 'processing': io_metrics.add(source_errors=1)
+            raise
+        finally:
+            io_metrics.add(**{'image_' + phase + '_ms': (time.monotonic() - started) * 1000})
+
+
+def vision_group_summary(function):
+    @wraps(function)
+    def wrapped(store, wave_id, members, *args, **kwargs):
+        images = {member['RowKey']: io_metrics.Counters() for member in members}
+        token = _IMAGES.set(images)
+        observations, outcome = [], 'error'
+        try:
+            observations = function(store, wave_id, members, *args, **kwargs)
+            outcome = 'success'
+            return observations
+        finally:
+            _IMAGES.reset(token)
+            qualified = {member['RowKey'] for member, completion, _ in observations if completion}
+            for member in members:
+                counter = images[member['RowKey']]
+                io_metrics.add(image_passes=1)
+                counter.add(dict(image_passes=1))
+                file_event('vision_image_summary', store.library, member['filename'], wave_id=wave_id,
+                    member_id=file_id(store.library, member['RowKey']),
+                    measurement_scope='group_pass', outcome=outcome,
+                    receipt_qualified=member['RowKey'] in qualified, storage_attribution='image_context',
+                    storage_tracing_enabled=storage_tracing_enabled(),
+                    **counter.snapshot())
+    return wrapped
+
+
+def vision_wave_summary(function):
+    @wraps(function)
+    def wrapped(leases, work, store, library, wave_id, *args, **kwargs):
+        started, cpu = time.monotonic(), time.process_time()
+        result, outcome = None, 'error'
+        with io_metrics.accounting() as counter:
+            try:
+                result = function(leases, work, store, library, wave_id, *args, **kwargs)
+                outcome = 'success' if result is not None else 'no_work'
+                return result
+            finally:
+                wave = result or {}
+                trace_fields = {key: value for key, value in (_TRACE.get() or {}).items()
+                                if key in ('message_id', 'batch_id', 'attempt_id', 'dispatch_attempt', 'schedule_id')}
+                emit('vision_wave_attempt_summary', wave_id=wave_id, library_id=file_id(library, ''),
+                    measurement_scope='attempt', outcome=outcome, state=wave.get('state'),
+                    vision_complete=wave.get('state') in ('ready', 'indexing', 'complete'),
+                    member_count=wave.get('memberCount'), failed_members=wave.get('failedMembers'),
+                    milliseconds=(time.monotonic() - started) * 1000,
+                    process_cpu_ms=(time.process_time() - cpu) * 1000, cpu_attribution='process',
+                    storage_tracing_enabled=storage_tracing_enabled(),
+                    **trace_fields,
+                    **counter.snapshot())
+    return wrapped
 
 
 def media_download_context():
@@ -112,7 +202,8 @@ def apply_phase(user, filename, phase):
     before = io_snapshot()
     outcome = 'success'
     try:
-        yield
+        with io_metrics.purpose(phase):
+            yield
     except BaseException:
         outcome = 'error'
         raise
@@ -163,8 +254,10 @@ class WaveMetrics:
     def phase(self, name):
         started, cpu, before = time.monotonic(), time.thread_time(), _scope_io()
         outcome = 'success'
+        counters = io_metrics.Counters()
         try:
-            yield
+            with io_metrics.accounting(counters):
+                yield
         except BaseException:
             outcome = 'error'
             raise
@@ -177,6 +270,9 @@ class WaveMetrics:
             row['thread_cpu_ms'] += max(0, time.thread_time() - cpu) * 1000
             for key, value in _io_delta(before).items():
                 if key != 'sdk_attribution':
+                    row[key] = row.get(key, 0) + value
+            for key, value in counters.snapshot().items():
+                if value:
                     row[key] = row.get(key, 0) + value
 
 
@@ -217,20 +313,24 @@ def cluster_wave_summary(function):
         token = _WAVE.set(metrics)
         started, cpu, before = time.monotonic(), time.process_time(), _scope_io()
         outcome = 'error'
-        try:
-            result = function(leases, store, library, wave_id, *args, **kwargs)
-            outcome = 'success' if result is not None else 'no_work'
-            return result
-        finally:
-            _WAVE.reset(token)
-            for name, totals in metrics.phases.items():
-                emit('cluster_wave_phase', **metrics.fields, phase=name,
-                     inclusive=True, sdk_attribution='shared_scope', **totals)
-            emit('cluster_wave_summary', **metrics.fields, outcome=outcome,
-                 milliseconds=max(0, time.monotonic() - started) * 1000,
-                 process_cpu_ms=max(0, time.process_time() - cpu) * 1000,
-                 cpu_attribution='process', faces=metrics.faces,
-                 faces_processed=metrics.faces_processed, **_io_delta(before))
+        with io_metrics.accounting() as counters:
+            try:
+                result = function(leases, store, library, wave_id, *args, **kwargs)
+                outcome = 'success' if result is not None else 'no_work'
+                return result
+            finally:
+                _WAVE.reset(token)
+                for name, totals in metrics.phases.items():
+                    emit('cluster_wave_phase', **metrics.fields, phase=name,
+                         inclusive=True, sdk_attribution='shared_scope', **totals)
+                emit('cluster_wave_summary', **metrics.fields, outcome=outcome,
+                     milliseconds=max(0, time.monotonic() - started) * 1000,
+                     process_cpu_ms=max(0, time.process_time() - cpu) * 1000,
+                     cpu_attribution='process', faces=metrics.faces,
+                     faces_processed=metrics.faces_processed, measurement_scope='attempt',
+                     state=result.get('state') if outcome == 'success' and isinstance(result, dict) else None,
+                     storage_tracing_enabled=storage_tracing_enabled(),
+                     **counters.snapshot(), **_io_delta(before))
     return wrapped
 
 
@@ -253,6 +353,7 @@ def message_fields(message):
 def trace(message):
     fields = message_fields(message)
     fields['batch_id'] = batch_id(payload(message).get('uploadBatchId'))
+    fields['wave_id'] = batch_id(payload(message).get('waveId'))
     token = _TRACE.set(fields)
     try:
         yield

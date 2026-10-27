@@ -28,6 +28,10 @@ class Conflict(RuntimeError):
     pass
 
 
+class MutationContention(Conflict):
+    """Conditional storage conflicts exhausted the bounded local retry loop."""
+
+
 def identifier(value):
     if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', value):
         raise ValueError('Expected a stable identifier of 1-128 letters, digits, underscores or hyphens')
@@ -94,16 +98,24 @@ class ShadowWaves:
             *self._policy_guard(changes,maintenance=maintenance),*guard_operations(self)])
 
     def _retry(self, action):
+        started = time.monotonic()
         for attempt in range(MAX_RETRIES):
             try:
                 return action()
-            except (ResourceExistsError, ResourceModifiedError):
-                pass
+            except (ResourceExistsError, ResourceModifiedError) as error:
+                conflict = error
             except TableTransactionError as error:
                 if error.status_code not in (409, 412):
                     raise
+                conflict = error
             if attempt + 1 == MAX_RETRIES:
-                raise Conflict('Concurrent wave mutation; retry the request')
+                import processing_diagnostics
+                processing_diagnostics.emit('wave_mutation_contention',
+                    operation=getattr(action, '__qualname__', type(action).__name__).replace('.<locals>.', '.').replace('<lambda>', 'lambda')[-80:], attempts=MAX_RETRIES,
+                    milliseconds=(time.monotonic() - started) * 1000,
+                    status=getattr(conflict, 'status_code', None),
+                    transaction_index=getattr(conflict, 'index', None))
+                raise MutationContention('Concurrent wave mutation; retry the request') from conflict
             # Immediate retries can repeatedly lose to another request on the
             # library control row. Yield with bounded jitter; still fail closed
             # after MAX_RETRIES rather than weakening the conditional commit.

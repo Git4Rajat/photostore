@@ -15,6 +15,7 @@ from processing_artifacts import verify_receipt
 from processing_completion import STEPS, TERMINAL
 from processing_fence import current_fence
 from upload_waves import digest
+import processing_metrics
 
 
 class ArtifactReceipts:
@@ -41,21 +42,24 @@ class ArtifactReceipts:
             raise ValueError('Artifact snapshot exceeds property byte budget')
         identity = digest(payload)
         key = kind + '!' + identity
-        previous = self._get(key)
-        if previous is None:
-            row = dict(PartitionKey=self.partition, RowKey=key, payload=encoded)
-            try:
-                self.table.submit_transaction([('create', row)])
-            except (ResourceExistsError, TableTransactionError) as exc:
-                if isinstance(exc, TableTransactionError) and exc.status_code != 409:
-                    raise
-                previous = self._get(key)
-                if previous is None:
-                    raise
-        if previous is not None and previous.get('payload') != encoded:
-            raise ValueError('Artifact receipt identity rebound')
+        row = dict(PartitionKey=self.partition, RowKey=key, payload=encoded)
+        try:
+            # New immutable receipts are the common path. Create-only proves
+            # absence without a preliminary GET; retries must prove equality.
+            self.table.submit_transaction([('create', row)])
+            processing_metrics.add(receipt_creates=1)
+        except (ResourceExistsError, TableTransactionError) as exc:
+            if isinstance(exc, TableTransactionError) and exc.status_code != 409:
+                raise
+            processing_metrics.add(receipt_create_conflicts=1)
+            previous = self._get(key)
+            if previous is None:
+                raise
+            if previous.get('payload') != encoded:
+                raise ValueError('Artifact receipt identity rebound')
         return identity
 
+    @processing_metrics.purpose('artifact_capture')
     def capture(self, storage, metadata):
         fence = current_fence(self.library, metadata['RowKey'])
         if fence is None:
@@ -109,7 +113,6 @@ class ArtifactReceipts:
                 raise ValueError('Face lookup changed during artifact capture')
         elif metadata.get('faceCount') != 0:
             raise ValueError('Skipped face work with existing faces requires an explicit prior receipt')
-        fence.check()
         payload = dict(schemaVersion=1, library=self.library, filename=fence.filename, photoId=fence.photo,
             revision=fence.revision, statuses=statuses, derivatives=derivatives, faceCount=metadata.get('faceCount'),
             faceSnapshots=snapshot_ids, faceLookupGeneration=lookup_generation)

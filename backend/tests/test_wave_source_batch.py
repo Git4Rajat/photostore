@@ -472,3 +472,30 @@ def test_inspection_ownership_loss_is_not_swallowed_or_counted(world, monkeypatc
         run(world, metadata, wave, key, lambda *a: None)
     member, = world[0]._page(f'e!{wave}!m!')
     assert 'inspectionFailures' not in member
+
+
+def test_frozen_face_inputs_use_bounded_queries_without_receipt_point_reads(world, monkeypatch):
+    from upload_wave_execution import _iter_wave_faces
+    metadata, wave, key = admit(world, 20)
+    store, _, _, table, _ = world
+    for i in range(20):
+        filename = f'photo-{i}.jpg'
+        metadata.rows[store.library, filename]['face_status'] = 'done'
+        version = json.loads(metadata.rows[store.library, filename]['processingContract'])['faceEmbeddingVersions'][0]
+        _publish_completion(store, metadata, filename=filename, faces=[dict(
+            PartitionKey=store.library, RowKey=f'face-{i}', filename=filename,
+            sourcePhotoId=f'photo-{i}', processingRevision='revision-1', embedding='[1,0]', embeddingVersion=version)])
+    run(world, metadata, wave, key, lambda *a: pytest.fail('Reran completed image'))
+    original = table.get_entity
+    reads = []
+    monkeypatch.setattr(table, 'get_entity', lambda *a, **kw: (reads.append(a), original(*a, **kw))[1])
+    table.queries.clear()
+    faces = list(_iter_wave_faces(store, wave))
+    assert len(faces) == 20
+    assert not reads
+    assert len(table.queries) == 8  # Two queries per inbox/manifest/face set, two member pages.
+    # Prefetch changes transport only; every snapshot still needs a valid hash.
+    face_key = next(k for k in table.rows if k[1].startswith('face!'))
+    table.rows[face_key]['payload'] = '{}'
+    with pytest.raises(ValueError, match='invalid face snapshots'):
+        list(_iter_wave_faces(store, wave))

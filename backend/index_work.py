@@ -83,6 +83,29 @@ class Claim:
     revision: str
     owner: str
     attempt: int
+    scheduled_at: float = 0
+    scheduled_delay: float = 0
+    schedule_id: str = ''
+    schedule_reason: str = ''
+
+
+def _retry_timing(row):
+    """Optional telemetry must never stop a work claim on legacy/bad fields."""
+    try:
+        if row.get('retryScheduleRevision') != row['revision']:
+            return (0, 0, '', '')
+        scheduled = float(row.get('retryScheduledAt') or 0)
+        delay = float(row.get('retryDelaySeconds') or 0)
+        identity = row.get('retryScheduleId') or ''
+        if (not math.isfinite(scheduled) or not math.isfinite(delay) or scheduled < 0 or delay < 0
+                or not isinstance(identity, str) or len(identity) != 32
+                or any(char not in '0123456789abcdef' for char in identity)):
+            return (0, 0, '', '')
+        reason = row.get('retryReason')
+        return (scheduled, delay, identity, reason if reason in {
+            'progress', 'barrier_wait', 'coordination_conflict', 'continuation'} else 'other')
+    except (ValueError, TypeError):
+        return (0, 0, '', '')
 
 
 class WorkStore:
@@ -173,9 +196,12 @@ class WorkStore:
                        if current.get('attemptRevision') == current['revision'] else 1)
             row = dict(current, owner=owner, leaseUntil=now + self.lease_seconds, wakeUntil=0,
                        attempts=attempt, attemptRevision=current['revision'])
+            timing = _retry_timing(current)
+            row.update(retryScheduleId='', retryScheduledAt=0)
             try:
                 self._replace(current, row)
-                return Claim(key, row['libraryId'], row['scope'], row['revision'], owner, attempt)
+                return Claim(key, row['libraryId'], row['scope'], row['revision'], owner, attempt,
+                    *timing)
             except ResourceModifiedError:
                 continue
         raise RuntimeError('Maintenance claim contention')
@@ -193,7 +219,7 @@ class WorkStore:
                 continue
         raise RuntimeError('Maintenance lease renewal contention')
 
-    def release(self, claim, *, deferred=False, retry_delay=None):
+    def release(self, claim, *, deferred=False, retry_delay=None, retry_reason='continuation'):
         for _ in range(12):
             current = self._get(claim.key)
             if current is None or current.get('owner') != claim.owner:
@@ -204,12 +230,25 @@ class WorkStore:
                 if retry_delay is not None:
                     # Explicit continuation: notify reserves and sends the next
                     # delayed wake before the current queue message is ACKed.
-                    row.update(wakeUntil=0, notBefore=self.clock() + max(0, retry_delay))
+                    scheduled_at = self.clock()
+                    row.update(wakeUntil=0, notBefore=scheduled_at + max(0, retry_delay),
+                        retryScheduledAt=scheduled_at, retryDelaySeconds=max(0, retry_delay),
+                        retryScheduleId=uuid.uuid4().hex, retryScheduleRevision=claim.revision,
+                        retryReason=retry_reason)
                 # A healthy barrier wait (or obsolete wake) did not fail work.
                 # Preserve earlier failures without charging this claim again.
                 if deferred and current['revision'] == claim.revision:
                     row['attempts'] = max(0, int(current.get('attempts') or 0) - 1)
                 self._replace(current, row)
+                if retry_delay is not None:
+                    import processing_diagnostics
+                    parts = claim.scope.split(':')
+                    if len(parts) == 3 and parts[0] in ('wave-vision', 'wave-cluster', 'wave-index'):
+                        processing_diagnostics.emit('wave_retry_scheduled', wave_id=parts[1],
+                            stage=parts[0][5:], schedule_id=row['retryScheduleId'],
+                            attempt_id=claim.owner,
+                            reason=retry_reason, requested_delay_seconds=max(0, retry_delay),
+                            scheduled_at=scheduled_at, dispatch_attempt=claim.attempt)
                 return
             except ResourceModifiedError:
                 continue

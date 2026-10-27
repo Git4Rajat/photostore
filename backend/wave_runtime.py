@@ -7,10 +7,12 @@ import json
 import os
 import threading
 import uuid
+import processing_metrics
+import processing_diagnostics
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 
-from upload_waves import ShadowWaves, digest
+from upload_waves import ShadowWaves, digest, MutationContention
 from execution_lease import ExecutionLeases
 from wave_policy import source_change
 from upload_wave_execution import (execution_enabled,stage_work_store,run_vision_release,
@@ -59,7 +61,7 @@ def _source_heartbeat(storage,library,filename,lease,renew):
                     expected_processing_fence=lease['entity']['processingFence'])
             except Exception as error:
                 errors.append(error); stop.set()
-    thread=threading.Thread(target=heartbeat,name='wave-source-lease',daemon=True); thread.start()
+    thread=threading.Thread(target=processing_metrics.inherit(heartbeat),name='wave-source-lease',daemon=True); thread.start()
     try:
         yield check
         check()
@@ -162,7 +164,14 @@ def consume(payload,*,deadline=None,progress=None):
     healthy_continuation = True
     try:
         # Dispatcher bookkeeping is renewed separately from stage ownership.
-        with publication(work,claim):
+        with publication(work,claim), processing_diagnostics.stage_context(wave_id, stage, claim):
+            elapsed = max(0, work.clock() - claim.scheduled_at) if claim.scheduled_at and claim.schedule_id else None
+            processing_diagnostics.emit('wave_stage_started', wave_id=wave_id, stage=stage,
+                dispatch_attempt=claim.attempt, attempt_id=claim.owner, schedule_id=claim.schedule_id or None,
+                reason=claim.schedule_reason or None, actual_delay_seconds=elapsed,
+                requested_delay_seconds=claim.scheduled_delay if elapsed is not None else None,
+                excess_delay_seconds=max(0, elapsed - claim.scheduled_delay) if elapsed is not None else None,
+                resume_point='stage_start')
             if stage=='vision':
                 collector = getattr(app._ipwork_metrics_context, 'collector', None)
                 def prepare_sources(members, metadata, renew, expired):
@@ -243,7 +252,10 @@ def consume(payload,*,deadline=None,progress=None):
                 with catalog_serialization(store.table,library,app.blob_service_client,app.BLOB_LEXICAL_INDEX_CONTAINER):
                     result=run_index_release(leases,store,library,wave_id,key,ledger,publisher=publish,prepare=prepare)
         if result and result['state'] in ('processing_pending','processing','ready'):
-            work.release(claim,deferred=healthy_continuation,retry_delay=5)
+            progressing = float(result.get('lastProgressAt') or 0) > float(wave.get('lastProgressAt') or 0)
+            delay = 0 if stage == 'vision' and healthy_continuation and progressing else 5
+            work.release(claim,deferred=healthy_continuation,retry_delay=delay,
+                         retry_reason='progress' if progressing else 'barrier_wait')
         else:
             work.finish(claim)
         current=store._required(store.wave_key(wave_id))
@@ -253,6 +265,25 @@ def consume(payload,*,deadline=None,progress=None):
             index_events.publish(library,'wave',current['completionReceiptId'])
         if current['state'] in ('ready','indexing','complete'):
             relay_successor(work,store,wave_id,send_stage)
+        return 'done'
+    except MutationContention:
+        current = store._required(store.wave_key(wave_id))
+        intent = work._get(claim.key)
+        if (stage != 'vision' or current['state'] not in ('processing_pending', 'processing')
+                or intent is None or intent.get('owner') != claim.owner):
+            if intent is not None and intent.get('owner') == claim.owner:
+                work.release(claim)
+            raise
+        # Source results precede coordination/checkpoint writes. Retry those
+        # through the normal durable release, without waiting out the queue's
+        # five-minute visibility timeout or admitting another model attempt.
+        # Keep this failure charged to the dispatch budget: contention cannot
+        # create an unbounded healthy-continuation loop.
+        delay = min(30, 2 ** min(claim.attempt, 5))
+        work.release(claim, retry_delay=delay, retry_reason='coordination_conflict')
+        relay_current(work, store, current, send_stage)
+        processing_diagnostics.emit('vision_coordination_retry', wave_id=wave_id,
+            attempt=claim.attempt, delay_seconds=delay)
         return 'done'
     except Exception:
         try: work.release(claim)

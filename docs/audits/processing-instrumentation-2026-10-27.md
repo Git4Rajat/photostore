@@ -1,0 +1,185 @@
+# Watching the processing optimizations
+
+Counters aggregate in memory and emit summaries, not a log for each SDK call.
+No telemetry-specific storage operation is added. Dispatch timing fields are
+piggybacked on the existing release/claim writes. Identifiers in image logs are
+hashed; paths, source filenames, tokens and payloads are never counter labels.
+
+## Events and attribution
+
+- `vision_image_summary`: one source-member/group pass (hashed `member_id`), combining its inspection,
+  processing and qualification contexts. Concurrent images have separate counters;
+  child executor work and source heartbeat I/O inherit their owner's counter.
+  `source_attempts=0` distinguishes receipt replay from a source-processing call.
+  `receipt_qualified` is proof observed by this pass, not a claim that the later
+  wave observation transaction committed. `outcome` describes group execution.
+- `vision_wave_attempt_summary`: whole coordinator attempt, including shared
+  work outside image contexts. `measurement_scope=attempt`, `attempt_id`,
+  `dispatch_attempt`, `wave_id`, final returned state, `vision_complete`, member
+  count and failed-member count (when supplied by the authoritative result).
+  `process_cpu_ms` is process CPU, not image processing elapsed time.
+- `cluster_wave_summary`: same storage/batch/artifact/journal totals for a
+  clustering attempt. `cluster_wave_phase` includes counters for that inclusive
+  phase. Nested phase totals overlap: never sum them to obtain wall time.
+- `wave_retry_scheduled` / `wave_stage_started`: join by `schedule_id` to compare
+  requested delay with `actual_delay_seconds` at the next stage start;
+  `excess_delay_seconds` includes queue polling, cold start and coordination.
+  Reasons distinguish productive continuation, barrier wait and coordination
+  conflict. `attempt_id` ties the stage start to its attempt summary. Timing is
+  consumed once and ignored on a newer request revision. The measurement ends
+  at coordinator stage start, not the first model invocation.
+
+An attempt summary contains:
+
+- Physical transport requests: `storage_calls`, overlapping `storage_send_ms`,
+  `storage_bytes`, `storage_errors`, `metadata_point_reads`,
+  `metadata_query_requests`, `metadata_read_ms`, `job_read_requests`, `blob_gets`,
+  `blob_heads`. HTTP retries count as separate requests. Non-2xx errors include
+  expected missing-row/create-conflict responses; they are not failed images.
+- Metadata reads by purpose: `metadata_claim_reads`, `metadata_heartbeat_reads`,
+  `metadata_artifact_write_reads`, `metadata_derivative_promotion_reads`,
+  `metadata_artifact_capture_reads`, `metadata_metadata_commit_reads`,
+  `metadata_metadata_cas_reads`, `metadata_lease_and_policy_check_reads`,
+  `metadata_source_release_reads`, `metadata_inspection_reads`,
+  `metadata_qualification_reads`, other bounded phase labels and
+  `metadata_other_reads`. These count point and query requests; their sum equals
+  `metadata_point_reads + metadata_query_requests`.
+- Logical batches: `batch_requests`, `batch_queries`, `batch_keys`, `batch_rows`,
+  `batch_missing`, `batch_point_reads` (compatibility fallback). Logical query
+  calls differ from transport requests when paging/retries occur. Receipt-cache
+  hit/miss/eviction counts are separate.
+- Artifact operations: `artifact_gets`, `artifact_heads`,
+  `artifact_verifications`, `artifact_verified_bytes`,
+  `artifact_verification_reuse`, `artifact_create_conflicts`, `receipt_creates`,
+  `receipt_create_conflicts`. Logical attempts remain available with fake storage
+  or when SDK transport tracing is disabled.
+- Mounted journal: `journal_flushes`, `journal_flush_ms`, `journal_flush_errors`,
+  `journal_fsyncs`, `journal_fsync_ms`, `journal_fsync_errors`. Flush elapsed
+  includes buffer flush, fsync and local SQLite commit; fsync time is nested.
+- `image_processing_ms` sums source-adapter elapsed (models and persistence),
+  `image_inspection_ms` and `image_qualification_ms` describe the other image
+  segments. Parallel image durations and SDK durations must not be subtracted
+  from wall time. Shared coordinator operations stay in the wave attempt total.
+
+`storage_tracing_enabled=false` means physical request counters are unavailable,
+not proof of zero I/O. Existing shared-scope SDK fields remain for compatibility;
+use the new image-context counters for per-image attribution.
+
+A complete wave spans deliveries and may span process restarts. Its view is
+aggregated from attempt events in Log Analytics, rather than writing extra
+counter rows to Table Storage. A killed attempt can lack its closing summary;
+compare stage-start/summary `attempt_id`s and treat missing summaries as incomplete
+measurements. Do not manufacture cumulative totals from process-local state.
+
+## KQL: Vision wave comparison
+
+Use the same preamble for each query below, setting the desired wave ID.
+
+```kusto
+let targetWave = "82a439bce7d145ed977579f791c7ca12";
+let events = ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(24h)
+| where Log_s contains "processing telemetry"
+| extend d = parse_json(extract(@"processing telemetry (.*)$", 1, Log_s))
+| where tostring(d.wave_id) == targetWave
+| extend at = todatetime(d.at);
+events
+| where tostring(d.event) == "vision_wave_attempt_summary"
+| summarize
+    first = min(at - tolong(d.milliseconds) * 1ms), last = max(at),
+    attempt_elapsed_ms = sum(todouble(d.milliseconds)),
+    process_cpu_ms = sum(todouble(d.process_cpu_ms)),
+    metadata_point_reads = sum(tolong(d.metadata_point_reads)),
+    metadata_queries = sum(tolong(d.metadata_query_requests)),
+    storage_calls = sum(tolong(d.storage_calls)),
+    members = max(tolong(d.member_count)),
+    failed_members = max(tolong(d.failed_members)),
+    completion_events = countif(tobool(d.vision_complete)),
+    summaries = dcount(tostring(d.attempt_id))
+| extend wall_seconds = datetime_diff('millisecond', last, first) / 1000.0,
+         aggregate_attempt_seconds = attempt_elapsed_ms / 1000.0,
+         point_reads_per_member = metadata_point_reads / todouble(members)
+```
+
+Wall time is the observed attempt envelope and excludes upload intake and time
+before the first attempt. Aggregate attempt elapsed is separate; overlapping or
+missing attempts prevent it being an exact wall-time decomposition. To audit
+coverage, replace the final query with:
+
+```kusto
+events
+| where tostring(d.event) in ("wave_stage_started", "vision_wave_attempt_summary")
+| where tostring(d.stage) == "vision" or tostring(d.event) == "vision_wave_attempt_summary"
+| summarize starts=countif(tostring(d.event)=="wave_stage_started"),
+            summaries=countif(tostring(d.event)=="vision_wave_attempt_summary")
+  by attempt_id=tostring(d.attempt_id)
+| where starts != summaries
+```
+
+For read-count distribution, aggregate repeated passes by image first:
+
+```kusto
+events
+| where tostring(d.event) == "vision_image_summary"
+| summarize reads=sum(tolong(d.metadata_point_reads)), passes=count(),
+            source_attempts=sum(tolong(d.source_attempts)) by member_id=tostring(d.member_id)
+| summarize images=count(), mean_reads=avg(reads),
+            percentiles(reads, 50, 95, 99), max_reads=max(reads),
+            total_source_attempts=sum(source_attempts)
+```
+
+Image totals exclude shared coordinator queries and group admission/observation
+writes. Compare the previous ~22 point reads/image against the whole-attempt
+`point_reads_per_member`, then use image purpose counts to find remaining costs.
+
+## KQL: retry delays and clustering overhead
+
+With the same preamble, use:
+
+```kusto
+events
+| where tostring(d.event) == "wave_stage_started" and isnotempty(tostring(d.schedule_id))
+| project at, stage=tostring(d.stage), reason=tostring(d.reason),
+          schedule_id=tostring(d.schedule_id),
+          requested_seconds=todouble(d.requested_delay_seconds),
+          actual_seconds=todouble(d.actual_delay_seconds),
+          excess_seconds=todouble(d.excess_delay_seconds)
+| order by at asc
+```
+
+An unmatched scheduled wake is visible with:
+
+```kusto
+events
+| where tostring(d.event)=="wave_retry_scheduled"
+| extend schedule_id=tostring(d.schedule_id)
+| join kind=leftanti (
+    events | where tostring(d.event)=="wave_stage_started"
+    | project schedule_id=tostring(d.schedule_id)
+  ) on schedule_id
+```
+
+For clustering, inspect the latest successful attempt (or filter `attempt_id`
+explicitly when comparing retries):
+
+```kusto
+events
+| where tostring(d.event)=="cluster_wave_phase"
+| project at, attempt_id=tostring(d.attempt_id), phase=tostring(d.phase),
+          seconds=todouble(d.milliseconds)/1000.0,
+          storage_calls=tolong(d.storage_calls),
+          batch_queries=tolong(d.batch_queries), batch_keys=tolong(d.batch_keys),
+          batch_rows=tolong(d.batch_rows),
+          flushes=tolong(d.journal_flushes), fsync_seconds=todouble(d.journal_fsync_ms)/1000.0
+| order by at desc, seconds desc
+```
+
+The telemetry changes are ready for deployment testing; these example queries
+have not yet been run against events from the new image. No live deployment or
+queue operation was performed while adding instrumentation.
+
+Validation: 1,177 regression tests passed. The final correlation, heartbeat and
+source-member attribution adjustments also passed 136 lease/metrics/runtime
+checks and 74 source/consumer/diagnostics checks. The overlap test intentionally
+uses two distinct source members with the same filename: their counters and
+qualification flags remain separate. git diff --check passed.

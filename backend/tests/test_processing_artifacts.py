@@ -20,17 +20,22 @@ def jpeg(color='red', edge=40):
 class Blob:
     def __init__(self):
         self.data = None; self.version = 0; self.before_download = None
+        self.heads = self.gets = 0
     def upload_blob(self, data, *, overwrite, content_settings):
         assert overwrite is False
         if self.data is not None: raise ResourceExistsError('exists')
         self.data = data; self.version += 1
     def get_blob_properties(self):
+        self.heads += 1
+        return self._properties()
+    def _properties(self):
         if self.data is None: raise ResourceNotFoundError('missing')
         return SimpleNamespace(size=len(self.data), etag=str(self.version), content_settings=SimpleNamespace(content_type='image/jpeg'))
-    def download_blob(self, *, offset, length, etag, match_condition):
+    def download_blob(self, *, offset, length, etag=None, match_condition=None):
+        self.gets += 1
         if self.before_download: self.before_download()
-        if etag != str(self.version): raise ResourceModifiedError('changed')
-        return SimpleNamespace(readall=lambda: self.data[offset:offset+length])
+        if etag is not None and etag != str(self.version): raise ResourceModifiedError('changed')
+        return SimpleNamespace(readall=lambda: self.data[offset:offset+length], properties=self._properties())
 
 
 @pytest.fixture
@@ -393,3 +398,63 @@ def test_modified_receipt_cannot_use_publication_verification_cache(blobs):
         row['thumbnailArtifact'] = json.dumps(dict(receipt, etag='another-version'))
         with pytest.raises(ValueError, match='no longer matches'):
             verify_receipt(storage_utils, row, 'thumbnail', reuse_published=True)
+
+
+def test_two_prepared_derivatives_need_two_source_checks_and_no_head_round_trips(blobs, monkeypatch):
+    from processing_artifacts import promote_prepared
+    (metadata, *_, fence), objects = blobs
+    row = metadata.get_entity('lib', 'photo.jpg')
+    row.update(thumbnail_status='done', preview_status='done')
+    for name in ['photo', 'preview/photo.jpg']:
+        blob = Blob(); blob.data = jpeg(); blob.version = 1; objects[name] = blob
+    original = metadata.get_entity
+    reads = []
+    monkeypatch.setattr(metadata, 'get_entity', lambda *a, **kw: (reads.append(a), original(*a, **kw))[1])
+    with result_fence(fence):
+        promote_prepared(storage_utils, row)
+    assert len(reads) == 2  # Was seven: fresh publication checks, no generic metadata cache.
+    assert sum(blob.heads for blob in objects.values()) == 0
+    assert sum(blob.gets for blob in objects.values()) == 4
+    assert row['thumbnailArtifact'] and row['previewArtifact']
+
+
+def test_bounded_artifact_get_rejects_oversized_or_truncated_response():
+    from processing_artifacts import _read, LIMITS
+    blob = Blob(); blob.data = b'x' * (LIMITS['thumbnail'][0] + 20); blob.version = 1
+    with pytest.raises(ValueError, match='size or content type'):
+        _read(blob, 'thumbnail')
+    blob.data = jpeg()
+    original = blob.download_blob
+    def truncated(**options):
+        result = original(**options)
+        result.readall = lambda: blob.data[:-1]
+        return result
+    blob.download_blob = truncated
+    with pytest.raises(ValueError, match='changed while being read'):
+        _read(blob, 'thumbnail')
+
+
+def test_empty_blob_range_error_is_invalid_content():
+    from azure.core.exceptions import HttpResponseError
+    from processing_artifacts import _read
+    def empty(**options):
+        error = HttpResponseError('InvalidRange'); error.status_code = 416; raise error
+    with pytest.raises(ValueError, match='blob size'):
+        _read(SimpleNamespace(download_blob=empty), 'thumbnail')
+
+
+def test_artifact_counters_report_request_and_verification_reuse(blobs):
+    import processing_metrics as metrics
+    from processing_artifacts import promote_prepared, verify_receipt
+    (metadata, *_, fence), objects = blobs
+    row = dict(metadata.get_entity('lib', 'photo.jpg'), thumbnail_status='done', preview_status='done')
+    for name in ['photo', 'preview/photo.jpg']:
+        blob = Blob(); blob.data = jpeg(); blob.version = 1; objects[name] = blob
+    with metrics.accounting() as counter, result_fence(fence):
+        promote_prepared(storage_utils, row)
+        for kind in ['thumbnail', 'preview']:
+            verify_receipt(storage_utils, row, kind, reuse_published=True)
+    values = counter.snapshot()
+    assert values['artifact_gets'] == values['artifact_verifications'] == 4
+    assert values['artifact_verification_reuse'] == 2 and values['artifact_heads'] == 0
+    assert values['artifact_verified_bytes'] == 4 * len(jpeg())

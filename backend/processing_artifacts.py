@@ -9,8 +9,9 @@ import json
 
 from PIL import Image
 from azure.core import MatchConditions
-from azure.core.exceptions import ResourceExistsError
+from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, HttpResponseError
 from azure.storage.blob import ContentSettings
+import processing_metrics
 
 LIMITS = {'thumbnail': (512_000, 120), 'preview': (1_500_000, 2048)}
 
@@ -41,31 +42,45 @@ def validate_derivative_bytes(data, kind):
         return image.size
 
 
-def _read(blob, kind):
-    props = blob.get_blob_properties()
+def _read(blob, kind, *, etag=None):
+    # Bounded GET returns both bytes and their ETag/content properties. A HEAD
+    # beforehand adds a round trip without strengthening this single response.
+    # One excess byte detects oversized objects without downloading them all.
+    options = dict(etag=etag, match_condition=MatchConditions.IfNotModified) if etag is not None else {}
+    processing_metrics.add(artifact_gets=1)
+    try:
+        download = blob.download_blob(offset=0, length=LIMITS[kind][0] + 1, **options)
+    except HttpResponseError as exc:
+        if exc.status_code == 416:  # Empty blob: an explicit range is unsatisfiable.
+            raise ValueError('Invalid derivative blob size') from exc
+        raise
+    props = download.properties
     size = int(props.size)
     if not 0 < size <= LIMITS[kind][0] or props.content_settings.content_type != 'image/jpeg':
         raise ValueError('Invalid derivative blob size or content type')
-    data = blob.download_blob(offset=0, length=size, etag=props.etag,
-                              match_condition=MatchConditions.IfNotModified).readall()
+    data = download.readall()
     if len(data) != size:
         raise ValueError('Derivative changed while being read')
     validate_derivative_bytes(data, kind)
+    processing_metrics.add(artifact_verifications=1, artifact_verified_bytes=len(data))
     return data, props
 
 
+@processing_metrics.purpose('derivative_promotion')
 def publish(storage, metadata, kind, *, data=None, staged=False):
     from processing_fence import current_fence
     fence = current_fence(metadata['PartitionKey'], metadata['RowKey'])
     if fence is None:
         raise ValueError('Immutable derivative publication requires a processing fence')
-    fence.check()
     container = storage._CTX.get('blob_thumbnail_container')
     if not container:
         raise ValueError('Derivative storage unavailable')
     if staged:
         source = storage._get_blob_client(container, staging_name(fence.library, fence.photo, fence.revision, fence.attempt, kind))
-        data, _ = _read(source, kind)
+        # This API explicitly pins browser staging before reading it. Normal
+        # prepared promotion below needs just a coherent bounded GET.
+        processing_metrics.add(artifact_heads=1)
+        data, _ = _read(source, kind, etag=source.get_blob_properties().etag)
     if not isinstance(data, bytes):
         raise ValueError('Derivative bytes required')
     width, height = validate_derivative_bytes(data, kind)
@@ -74,14 +89,16 @@ def publish(storage, metadata, kind, *, data=None, staged=False):
     blob = storage._get_blob_client(container, name)
     if blob is None:
         raise ValueError('Derivative storage unavailable')
-    fence.check()
     try:
         blob.upload_blob(data, overwrite=False, content_settings=ContentSettings(content_type='image/jpeg'))
     except ResourceExistsError:
-        pass  # Retry must prove exact stored content, not assume existence means success.
+        processing_metrics.add(artifact_create_conflicts=1)
     actual, props = _read(blob, kind)
     if actual != data:
         raise ValueError('Immutable derivative content mismatch')
+    # All preceding effects are immutable, create-only blobs. One fresh
+    # source check after read-back protects pointer publication; abandoned
+    # work can leave an unreferenced blob, never replace a live artifact.
     fence.check()
     receipt = dict(schemaVersion=1, library=fence.library, photoId=fence.photo, revision=fence.revision,
         attempt=fence.attempt, kind=kind, blob=name, sha256=content_hash, size=len(data),
@@ -105,7 +122,6 @@ def promote_prepared(storage, metadata):
     fence = current_fence(metadata['PartitionKey'], metadata['RowKey'])
     if fence is None:
         raise ValueError('Prepared derivative promotion requires a processing fence')
-    fence.check()
     if is_video_file(metadata['RowKey']):
         return  # Video preparation remains browser-owned.
     for kind in ('thumbnail', 'preview'):
@@ -166,9 +182,13 @@ def verify_receipt(storage, metadata, kind, *, reuse_published=False):
     if reuse_published:
         from processing_fence import published_derivative_matches
         if published_derivative_matches(receipt):
+            processing_metrics.add(artifact_verification_reuse=1)
             return receipt
     blob = storage._get_blob_client(storage._CTX['blob_thumbnail_container'], receipt['blob'])
-    data, props = _read(blob, kind)
+    try:
+        data, props = _read(blob, kind, etag=receipt['etag'])
+    except ResourceModifiedError as exc:
+        raise ValueError('Published derivative no longer matches its receipt') from exc
     if (str(props.etag) != receipt['etag'] or hashlib.sha256(data).hexdigest() != receipt['sha256']
             or len(data) != receipt['size'] or validate_derivative_bytes(data, kind) != (receipt['width'], receipt['height'])):
         raise ValueError('Published derivative no longer matches its receipt')

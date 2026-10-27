@@ -14,6 +14,7 @@ from pathlib import Path
 import sqlite3
 
 import processing_diagnostics
+import processing_metrics
 
 from upload_waves import digest
 from wave_assignment import WaveAssignmentJournal, encoded
@@ -98,9 +99,11 @@ class FileAssignmentJournal(WaveAssignmentJournal):
         return payload
 
     def _flush(self):
-        self.file.flush()
-        os.fsync(self.file.fileno())
-        self.db.commit()
+        with processing_metrics.timer('journal_flush'):
+            self.file.flush()
+            with processing_metrics.timer('journal_fsync'):
+                os.fsync(self.file.fileno())
+            self.db.commit()
 
     @processing_diagnostics.wave_phase('journal_write')
     def put(self, key, payload):

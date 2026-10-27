@@ -190,3 +190,20 @@ def test_unpublished_partial_snapshot_is_safe_to_rebuild(tmp_path):
     assert not store._page('assignment!')
     run(h, snapshots, store, frozen, leases, tmp_path)
     assert comparable(assignment_snapshot(h)) == expected
+
+
+def test_flush_metrics_measure_mount_sync_separately_from_local_commit(monkeypatch):
+    from types import SimpleNamespace
+    import processing_metrics as metrics
+    import wave_assignment_files as files
+    journal = object.__new__(files.FileAssignmentJournal)
+    calls = []
+    journal.file = SimpleNamespace(flush=lambda: calls.append('flush'), fileno=lambda: 1)
+    journal.db = SimpleNamespace(commit=lambda: calls.append('commit'))
+    monkeypatch.setattr(files.os, 'fsync', lambda descriptor: calls.append('fsync'))
+    with metrics.accounting() as counter:
+        journal._flush()
+    values = counter.snapshot()
+    assert calls == ['flush', 'fsync', 'commit']
+    assert values['journal_flushes'] == values['journal_fsyncs'] == 1
+    assert values['journal_flush_ms'] >= values['journal_fsync_ms'] >= 0

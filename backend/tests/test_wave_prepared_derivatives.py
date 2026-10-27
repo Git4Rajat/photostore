@@ -197,4 +197,9 @@ def test_source_change_during_preparation_read_cannot_publish(blobs):
     with result_fence(fence), pytest.raises(StaleProcessingResult):
         promote_prepared(storage_utils, row)
     assert not row.get('thumbnailArtifact')
-    assert not any(name.startswith('derived/') for name in objects)
+    # Create-only publication may leave an unreferenced immutable blob. The
+    # fresh post-read-back fence must reject its pointer, preserving the new
+    # source. No mutable source artifact is written under a cached approval.
+    current = metadata.get_entity('lib', 'photo.jpg')
+    assert current['processingFence'] == 'successor'
+    assert not current.get('thumbnailArtifact')

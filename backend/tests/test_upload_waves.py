@@ -53,9 +53,15 @@ class AtomicTable:
                 self.versions[key] = self.versions.get(key, 0) + 1
             self.transactions.append(operations)
 
-    def query_entities(self, query, *, results_per_page):
+    def query_entities(self, query, *, results_per_page=1000):
         self.queries.append((query, results_per_page))
         pk = re.search(r"PartitionKey eq '([^']+)'", query)[1]
+        names = re.findall(r"RowKey eq '((?:[^']|'')*)'", query)
+        if names:
+            names = {name.replace("''", "'") for name in names}
+            with self.lock:
+                return iter([Entity(row, self.versions[key]) for key, row in sorted(self.rows.items())
+                             if key[0] == pk and key[1] in names])
         lower = re.search(r"RowKey ge '([^']+)'", query)[1]
         upper = re.search(r"RowKey lt '([^']+)'", query)[1]
         after_match = re.search(r"RowKey gt '([^']+)'", query)
@@ -442,3 +448,21 @@ def test_contention_beyond_old_retry_budget_can_finish_without_partial_writes(wo
     assert len(attempts) == 11  # ten conflicts, then the atomic intake commit
     assert len(pauses) == 10 and all(0 < pause <= .5 for pause in pauses)
     assert len(table.transactions) == 1  # the atomic intake commit
+
+
+def test_storage_contention_is_distinct_and_records_failed_operation(world, monkeypatch):
+    import processing_diagnostics
+    import upload_waves
+    from upload_waves import MutationContention
+    store, _, _ = world
+    events = []
+    monkeypatch.setattr(upload_waves.time, 'sleep', lambda seconds: None)
+    monkeypatch.setattr(processing_diagnostics, 'emit', lambda name, **fields: events.append((name, fields)))
+    def conflict(): raise ResourceModifiedError('ETag changed')
+    with pytest.raises(MutationContention) as caught:
+        store._retry(conflict)
+    assert isinstance(caught.value, Conflict)
+    assert events[0][0] == 'wave_mutation_contention'
+    assert events[0][1]['operation'].endswith('.conflict')
+    assert events[0][1]['attempts'] == MAX_RETRIES
+    assert isinstance(caught.value.__cause__, ResourceModifiedError)

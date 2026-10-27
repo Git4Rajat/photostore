@@ -15,6 +15,7 @@ from azure.core.exceptions import ResourceNotFoundError
 from azure.data.tables import UpdateMode
 
 from processing_completion import StaleProcessingResult
+import processing_metrics
 
 _ACTIVE = contextvars.ContextVar('processing_result_fence', default=None)
 _PUBLISHED = contextvars.ContextVar('attempt_verified_derivatives', default=None)
@@ -79,6 +80,7 @@ def current_fence(library=None, filename=None):
     return fence
 
 
+@processing_metrics.purpose('artifact_write')
 def write_artifact(table, entity, *, previous=None, previous_known=False):
     fence = current_fence(entity['PartitionKey'], entity.get('filename'))
     if fence is None:

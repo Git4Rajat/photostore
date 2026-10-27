@@ -218,7 +218,8 @@ class ExecutionLeases:
             else:
                 self.check(ownership)
         check()
-        thread = threading.Thread(target=heartbeat, name='wave-stage-lease', daemon=True)
+        from processing_metrics import inherit
+        thread = threading.Thread(target=inherit(heartbeat), name='wave-stage-lease', daemon=True)
         thread.start()
         try:
             yield check

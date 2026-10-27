@@ -55,8 +55,9 @@ class _LeaseGuard:
         self._stop = threading.Event()
         self._lost = None
         self._closed = False
+        from processing_metrics import inherit
         self._thread = threading.Thread(
-            target=self._run, name='faiss-assignment-lease', daemon=True)
+            target=inherit(self._run), name='faiss-assignment-lease', daemon=True)
 
     def check(self):
         """Fail closed, including when the renewal thread is stalled or stopped."""

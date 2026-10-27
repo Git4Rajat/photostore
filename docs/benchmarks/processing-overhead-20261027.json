@@ -1,0 +1,43 @@
+{
+  "baseline_ref": "851f7c2",
+  "before": {
+    "faces": 1000,
+    "mode": "files",
+    "seconds": 2.831,
+    "calls": {
+      "jobs.get_entity": 14,
+      "jobs.submit_transaction": 5,
+      "people.get_entity": 2002,
+      "faces.query_entities": 1,
+      "faces.get_entity": 2000,
+      "people.update_entity": 999,
+      "members.get_entity": 1000,
+      "members.create_entity": 1000,
+      "faces.update_entity": 1000,
+      "people.create_entity": 1
+    },
+    "total_calls": 8022,
+    "receipt": "c508368ec15286be7e4b2babd9bbd6a3a76151fc2c091745e0180014fadd7cd2"
+  },
+  "after": {
+    "faces": 1000,
+    "mode": "files",
+    "seconds": 2.817,
+    "calls": {
+      "jobs.get_entity": 14,
+      "jobs.submit_transaction": 5,
+      "people.query_entities": 73,
+      "faces.query_entities": 1,
+      "faces.get_entity": 1000,
+      "people.get_entity": 1000,
+      "people.update_entity": 999,
+      "members.create_entity": 1000,
+      "faces.update_entity": 1000,
+      "people.create_entity": 1
+    },
+    "total_calls": 5093,
+    "receipt": "65e497d862672174b9204aba357468231345f4659ea5e9bbf61f812ef01c2722"
+  },
+  "output_parity": true,
+  "note": "Synthetic storage with zero Azure latency; measures assignment snapshot/persistence, not cloud receipt loading."
+}
