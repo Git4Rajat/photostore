@@ -660,3 +660,27 @@ def test_fenced_heartbeat_does_not_reanimate_expired_attempt(worker_commit_ctx):
     with pytest.raises(StaleProcessingResult):
         storage_utils.heartbeat_processing_lease('u1', 'a.jpg', 'worker-A', expected_processing_fence='attempt')
     assert table.update_calls == 0
+
+
+def test_worker_completion_reuses_actual_commit_etag_without_metadata_rereads(worker_commit_ctx, monkeypatch):
+    from processing_completion import STEPS
+    from test_processing_completion import _CommitResponseTable, accepted
+    import processing_metrics
+    table = _CommitResponseTable()
+    row = dict(worker_commit_ctx.rows['u1', 'a.jpg'], anonymousImageId='photo',
+               processingRevision='rev-1', processingGeneration='a' * 64, faceCount=0,
+               **{step + '_status': 'no_data' for step in STEPS})
+    row.update(ocr_status='running', map_detection_status='running')
+    table.upsert_entity(row)
+    monkeypatch.setitem(storage_utils._CTX, 'metadata_table_client', table)
+    monkeypatch.setitem(storage_utils._CTX, 'source_completion_delivery', lambda library, intent: accepted(intent))
+    monkeypatch.setenv('UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED', 'true')
+    with processing_metrics.accounting() as metrics:
+        _apply_worker()
+    assert table.get_calls == 1  # Fresh apply read only; neither completion reread.
+    assert table.update_calls == 2  # Result CAS followed by conditional outbox ack.
+    stored = table.rows['u1', 'a.jpg']
+    assert stored['rating'] == 1 and stored['ocrText'] == 'hello'
+    assert stored['processing_lease_owner'] == ''
+    assert not stored['processingCompletionPending'] and stored['processingCompletionOutbox'] == '[]'
+    assert metrics.snapshot()['completion_ack_snapshot_uses'] == 1

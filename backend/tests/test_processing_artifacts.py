@@ -458,3 +458,31 @@ def test_artifact_counters_report_request_and_verification_reuse(blobs):
     assert values['artifact_gets'] == values['artifact_verifications'] == 4
     assert values['artifact_verification_reuse'] == 2 and values['artifact_heads'] == 0
     assert values['artifact_verified_bytes'] == 4 * len(jpeg())
+
+
+def test_promotion_and_receipt_capture_share_one_final_source_check(blobs):
+    from processing_artifacts import promote_prepared
+    from processing_completion import STEPS
+    from processing_fence import immutable_artifact_checks
+    from processing_receipts import ArtifactReceipts
+    from test_upload_waves import AtomicTable
+    import processing_metrics
+    (metadata, _, _, _, fence), objects = blobs
+    row = dict(metadata.get_entity('lib', 'photo.jpg'), faceCount=0,
+               **{step + '_status': 'no_data' for step in STEPS})
+    row.update(thumbnail_status='done', preview_status='done')
+    for name in ['photo', 'preview/photo.jpg']:
+        blob = Blob(); blob.data = jpeg(); blob.version = 1; objects[name] = blob
+    receipts = ArtifactReceipts(AtomicTable(), 'lib')
+    with result_fence(fence):
+        storage_utils._store_client_face_entities('lib', 'photo.jpg', [])
+        metadata.get_calls = 0
+        with processing_metrics.accounting() as metrics:
+            with immutable_artifact_checks(fence):
+                promote_prepared(storage_utils, row)
+                reference = receipts.capture(storage_utils, row)
+        assert metadata.get_calls == 1  # Two promotion + two capture checks -> one.
+    assert reference and row['thumbnailArtifact'] and row['previewArtifact']
+    assert sum(blob.gets for blob in objects.values()) == 4  # Read-back verification retained.
+    assert metrics.snapshot()['artifact_source_checks_coalesced'] == 3
+    assert metrics.snapshot()['artifact_verification_reuse'] == 2

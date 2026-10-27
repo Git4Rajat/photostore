@@ -1685,6 +1685,11 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
             // concurrency fix. No correctness impact -- purely how many OS
             // threads one call spawns, not what it returns.
             { name: 'OMP_THREAD_LIMIT', value: '1' }
+            // Separate from Tesseract's OpenMP cap: NumPy/SciPy/OpenCV use
+            // OpenBLAS pools. Matched two-CPU runs measured 29.5% less stage
+            // wall time at one BLAS thread, with identical outputs on 48 inputs.
+            // Keep aligned with the Vision image default; source workers stay 2.
+            { name: 'OPENBLAS_NUM_THREADS', value: '1' }
             // receive_messages() with no visibility_timeout defaults to Azure's
             // 30s, which a single ipwork pass (YOLO + MediaPipe + AdaFace + CLIP
             // + tesseract OCR in sequence) can exceed -- see

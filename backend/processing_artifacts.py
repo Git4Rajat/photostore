@@ -99,7 +99,8 @@ def publish(storage, metadata, kind, *, data=None, staged=False):
     # All preceding effects are immutable, create-only blobs. One fresh
     # source check after read-back protects pointer publication; abandoned
     # work can leave an unreferenced blob, never replace a live artifact.
-    fence.check()
+    from processing_fence import check_immutable_source
+    check_immutable_source(fence)
     receipt = dict(schemaVersion=1, library=fence.library, photoId=fence.photo, revision=fence.revision,
         attempt=fence.attempt, kind=kind, blob=name, sha256=content_hash, size=len(data),
         width=width, height=height, etag=str(props.etag))

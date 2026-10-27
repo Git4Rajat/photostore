@@ -109,6 +109,34 @@ def test_parallel_sources_inherit_stage_scope_and_batch_observation_writes(world
     assert metadata.queries == 1
 
 
+def test_opt_in_image_batches_propagate_to_source_pool_without_write_guards(world, monkeypatch):
+    import vision_utils
+    from image_batching import current_batcher
+    metadata, wave, key = admit(world, 2)
+    store = world[0]
+    barrier = threading.Barrier(2)
+    seen = []
+    def vector(name):
+        return [float(i == int(name.split('-')[1].split('.')[0])) for i in range(512)]
+    def encode(names):
+        assert not guard_operations(store), 'Broker inherited a source write/execution context'
+        seen.append(names)
+        return [vector(name) for name in names]
+    monkeypatch.setenv('IPWORK_CLIP_IMAGE_BATCH_SIZE', '2')
+    monkeypatch.setenv('IPWORK_CLIP_IMAGE_BATCH_WINDOW_MS', '50')
+    monkeypatch.setattr(vision_utils, '_encode_image_tensors_batch', encode)
+    monkeypatch.setattr(vision_utils, '_encode_image_tensor_single', lambda _: pytest.fail('Lost pair'))
+    def process(library, filename, revision, renew):
+        assert guard_operations(store)
+        barrier.wait(5)
+        assert current_batcher().submit(filename) == vector(filename)
+        renew()
+        publish_completion(store, metadata, filename=filename)
+    assert run(world, metadata, wave, key, process, source_workers=2)['state'] == 'ready'
+    assert len(seen) == 1
+    assert current_batcher() is None
+
+
 def test_repeated_parallel_checks_do_not_repeat_remote_stage_and_policy_reads(world, monkeypatch):
     import processing_checks
     import processing_diagnostics

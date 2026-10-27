@@ -557,7 +557,7 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
             else ThreadPoolExecutor(max_workers=source_workers, thread_name_prefix='wave-source'))
     try:
         with execution_scope(leases, ownership, store, lambda: _execution_check(leases, ownership, store, outbox_key)), leases.keepalive(ownership, local_checks=True) as owned, source_policy_scope(store.table, library, wave_id=wave_id), text_batches(
-                vision_utils.encode_text_embeddings_batch, vision_utils._encode_text_embedding_single), pool as executor:
+                vision_utils.encode_text_embeddings_batch, vision_utils._encode_text_embedding_single), vision_utils.image_embedding_batches(source_workers=source_workers), pool as executor:
             stage_check = CoalescedCheck(
                 lambda: _execution_check(leases, ownership, store, outbox_key), local=owned)
             while phase == 'sources':

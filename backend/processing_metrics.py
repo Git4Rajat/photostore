@@ -12,10 +12,14 @@ import time
 _COUNTERS = ContextVar('processing_io_counters', default=())
 _PURPOSE = ContextVar('processing_io_purpose', default='other')
 _PURPOSES = {'inspection', 'qualification', 'claim', 'heartbeat', 'source_release',
+             'artifact_source_validation',
              'artifact_write', 'derivative_promotion', 'artifact_capture',
              'face_persistence', 'semantic_refresh', 'embedding_write',
              'metadata_commit', 'metadata_cas', 'lease_and_policy_check', 'completion_delivery', 'other'}
 _FIELDS = {
+    'artifact_source_checks', 'artifact_source_check_batches', 'artifact_source_checks_coalesced',
+    'completion_ack_snapshot_uses', 'completion_ack_snapshot_conflicts',
+    'completion_inbox_creates', 'completion_inbox_create_conflicts',
     'storage_calls', 'storage_send_ms', 'storage_bytes', 'storage_errors',
     'metadata_point_reads', 'metadata_query_requests', 'metadata_read_ms',
     'job_read_requests', 'blob_gets', 'blob_heads',
@@ -35,6 +39,9 @@ _FIELDS = {
     'ocr_engine_init_ms', 'ocr_engine_inits', 'ocr_recognition_ms',
     'ocr_worker_starts', 'ocr_worker_reuses', 'ocr_worker_timeouts', 'ocr_worker_capacity_errors',
     'clip_preprocess_ms', 'clip_lock_wait_ms', 'clip_inference_ms',
+    'clip_image_requests', 'clip_image_request_ms', 'clip_image_batches', 'clip_image_batch_items',
+    'clip_image_singleton_batches', 'clip_image_batch_fallbacks', 'clip_image_queue_ms',
+    'clip_image_stack_ms', 'clip_image_batch_service_ms',
     'face_decode_ms', 'face_detect_ms', 'face_landmark_wait_ms', 'face_landmark_ms',
     'face_align_ms', 'face_embed_ms',
     'image_inspection_ms', 'image_processing_ms', 'image_qualification_ms',

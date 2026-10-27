@@ -157,20 +157,39 @@ class ShadowWaves:
             artifacts_qualified = True
         body = json.dumps(payload, sort_keys=True, separators=(',', ':'))
         key = 'source-completion!' + digest([payload['photoId'], payload['revision']]) + '!' + intent['id']
-        def run():
+        def existing():
             previous = self._get(key)
             if previous:
                 if previous.get('payload') != body:
                     raise Conflict('Source completion identity cannot be rebound')
                 return dict(previous)
+            return None
+        def run():
             policy=self._get('policy')
             if policy and (policy.get('cleanupState') or policy.get('gcUntil',0)>self.clock()):
+                # Existing exact references remain idempotently acknowledgeable
+                # while cleanup blocks creation of any new reference.
+                previous = existing()
+                if previous is not None:
+                    return previous
                 raise Conflict('Artifact cleanup has paused new completion references')
             row = self._row(key, completionId=intent['id'], photoId=payload['photoId'],
                 processingRevision=payload['revision'], payload=body, completionQualified=False, artifactReceiptQualified=artifacts_qualified,
                 acceptedAt=self.clock())
-            self.table.submit_transaction([('create', row),
-                *([self._change(policy,dict(policy))] if policy else [])])
+            try:
+                self.table.submit_transaction([('create', row),
+                    *([self._change(policy,dict(policy))] if policy else [])])
+            except (ResourceExistsError, TableTransactionError) as error:
+                if isinstance(error, TableTransactionError) and error.status_code != 409:
+                    raise
+                import processing_metrics
+                processing_metrics.add(completion_inbox_create_conflicts=1)
+                previous = existing()
+                if previous is None:
+                    raise
+                return previous
+            import processing_metrics
+            processing_metrics.add(completion_inbox_creates=1)
             return row
         return self._retry(run)
 

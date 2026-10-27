@@ -13,7 +13,7 @@ from azure.data.tables import TableTransactionError
 
 from processing_artifacts import verify_receipt
 from processing_completion import STEPS, TERMINAL
-from processing_fence import current_fence
+from processing_fence import current_fence, check_immutable_source
 from upload_waves import digest
 import processing_metrics
 
@@ -89,7 +89,7 @@ class ArtifactReceipts:
         fence = current_fence(self.library, metadata['RowKey'])
         if fence is None:
             raise ValueError('Artifact capture requires a source attempt fence')
-        fence.check()
+        check_immutable_source(fence)
         statuses = {step: metadata.get(step + '_status') for step in STEPS}
         from image_utils import is_video_file
         from processing_generation import required_steps_for_media
@@ -157,7 +157,7 @@ class ArtifactReceipts:
             revision=fence.revision, statuses=statuses, derivatives=derivatives, faceCount=metadata.get('faceCount'),
             faceSnapshots=snapshot_ids, faceLookupGeneration=lookup_generation)
         identity = self._put('manifest', payload)
-        fence.check()
+        check_immutable_source(fence)
         # Replace only the known, unacceptably mismatched video intents. The
         # caller commits this outbox delta with the newly captured proof under
         # the same source fence. Valid and other-generation intents survive.

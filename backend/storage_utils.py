@@ -989,14 +989,15 @@ def publish_metadata_index_intent(user_id, filename, entity):
         return False
 
 
-def publish_source_completion_intent(user_id, filename, entity):
+def publish_source_completion_intent(user_id, filename, entity, *, committed_etag=None):
     from processing_completion import completion_capture_enabled, relay_completion
     deliver = _CTX.get('source_completion_delivery')
     if not completion_capture_enabled() or not deliver or not json.loads(entity.get('processingCompletionOutbox') or '[]'):
         return False
     try:
+        options = dict(committed=entity, committed_etag=committed_etag) if committed_etag else {}
         return relay_completion(_CTX['metadata_table_client'], user_id, filename,
-                                lambda intent: deliver(user_id, intent))
+                                lambda intent: deliver(user_id, intent), **options)
     except Exception:
         # Result commit already succeeded. Retain outbox evidence for recovery.
         _LOGGER.warning('Source completion intent retained user=%s file=%s', user_id, filename, exc_info=True)
@@ -10179,7 +10180,7 @@ def apply_client_processing_results_for_file(
         from processing_completion import StaleProcessingResult
         if not lease_owner or _metadata_lease_owner(metadata) != lease_owner or _processing_is_expired(metadata):
             raise StaleProcessingResult('Processing result lease is no longer owned.')
-    from processing_fence import ResultFence, result_fence
+    from processing_fence import ResultFence, result_fence, immutable_artifact_checks
     from processing_completion import completion_capture_enabled
     artifact_fence = None
     if expected_processing_revision is not None and completion_capture_enabled():
@@ -10249,20 +10250,20 @@ def apply_client_processing_results_for_file(
             apply_completed = True
             if artifact_fence and _CTX.get('source_artifact_receipt_capture'):
                 from processing_artifacts import promote_prepared
-                with processing_diagnostics.apply_phase(user_id, filename, 'derivative_promotion'):
-                    promote_prepared(sys.modules[__name__], metadata)
-                candidate = dict(metadata)
-                _apply_processing_status_updates(candidate, batch)
-                with processing_diagnostics.apply_phase(user_id, filename, 'artifact_capture'):
-                    receipt = _CTX['source_artifact_receipt_capture'](user_id, candidate)
-                if receipt:
-                    # Capture can normalize the video zero-face contract and
-                    # retire a known invalid video outbox entry. Commit those
-                    # exact values along with its immutable manifest pointer.
-                    for key in ('faceCount', 'processingCompletionOutbox'):
-                        if key in candidate:
-                            metadata[key] = candidate[key]
-                    metadata['artifactReceipt'] = json.dumps(receipt, sort_keys=True, separators=(',', ':'))
+                with immutable_artifact_checks(artifact_fence):
+                    with processing_diagnostics.apply_phase(user_id, filename, 'derivative_promotion'):
+                        promote_prepared(sys.modules[__name__], metadata)
+                    candidate = dict(metadata)
+                    _apply_processing_status_updates(candidate, batch)
+                    with processing_diagnostics.apply_phase(user_id, filename, 'artifact_capture'):
+                        receipt = _CTX['source_artifact_receipt_capture'](user_id, candidate)
+                    if receipt:
+                        # Normalize the video contract and invalid old intents
+                        # under the same final source check and metadata CAS.
+                        for key in ('faceCount', 'processingCompletionOutbox'):
+                            if key in candidate:
+                                metadata[key] = candidate[key]
+                        metadata['artifactReceipt'] = json.dumps(receipt, sort_keys=True, separators=(',', ':'))
     except Exception as exc:
         if consolidated:
             partial_updates = batch
@@ -10298,7 +10299,7 @@ def apply_client_processing_results_for_file(
 
 def qualify_completed_processing(user_id, filename, lease):
     """Retry artifact capture/delivery for terminal results without rerunning models."""
-    from processing_fence import ResultFence, result_fence
+    from processing_fence import ResultFence, result_fence, immutable_artifact_checks
     from processing_completion import check_revision, StaleProcessingResult
     current = _CTX['metadata_table_client'].get_entity(user_id, filename)
     claimed = lease['entity']
@@ -10312,11 +10313,12 @@ def qualify_completed_processing(user_id, filename, lease):
         fence.check()
         from processing_artifacts import promote_prepared
         result = dict(current)
-        promote_prepared(sys.modules[__name__], result)
-        reference = _CTX['source_artifact_receipt_capture'](user_id, result)
-        if reference is None:
-            raise ValueError('Processing outputs are not terminal')
-        result['artifactReceipt'] = json.dumps(reference, sort_keys=True, separators=(',', ':'))
+        with immutable_artifact_checks(fence):
+            promote_prepared(sys.modules[__name__], result)
+            reference = _CTX['source_artifact_receipt_capture'](user_id, result)
+            if reference is None:
+                raise ValueError('Processing outputs are not terminal')
+            result['artifactReceipt'] = json.dumps(reference, sort_keys=True, separators=(',', ':'))
         return _commit_worker_processing_results(user_id, filename, current, result, [], lease['ownerId'], require_unexpired=True)
 
 
@@ -10448,7 +10450,7 @@ def _commit_worker_processing_results(user_id, filename, baseline, result, updat
             try:
                 writes += 1
                 with processing_diagnostics.apply_phase(user_id, filename, 'metadata_cas'):
-                    table.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
+                    committed = table.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
             except ResourceModifiedError:
                 conflicts += 1
                 if attempt + 1 == _METADATA_UPDATE_MAX_RETRIES:
@@ -10458,7 +10460,11 @@ def _commit_worker_processing_results(user_id, filename, baseline, result, updat
                 current = table.get_entity(partition_key=user_id, row_key=filename)
                 continue
             with processing_diagnostics.apply_phase(user_id, filename, 'completion_delivery'):
-                publish_source_completion_intent(user_id, filename, entity)
+                commit_etag = committed.get('etag') if isinstance(committed, dict) else None
+                if isinstance(commit_etag, str) and commit_etag and commit_etag != '*':
+                    publish_source_completion_intent(user_id, filename, entity, committed_etag=commit_etag)
+                else:
+                    publish_source_completion_intent(user_id, filename, entity)
             outcome = 'partial' if error is not None else 'success'
             with processing_diagnostics.apply_phase(user_id, filename, 'index_dirty'):
                 touch_user_search_indexes_state(user_id, filenames=filename)

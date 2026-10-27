@@ -19,6 +19,7 @@ import processing_metrics
 
 _ACTIVE = contextvars.ContextVar('processing_result_fence', default=None)
 _PUBLISHED = contextvars.ContextVar('attempt_verified_derivatives', default=None)
+_IMMUTABLE_CHECKS = contextvars.ContextVar('immutable_artifact_source_checks', default=None)
 POLICY_CHECK = None
 
 
@@ -78,6 +79,40 @@ def current_fence(library=None, filename=None):
                   or (filename is not None and filename != fence.filename)):
         raise StaleProcessingResult('Processing artifact scope mismatch.')
     return fence
+
+
+def check_immutable_source(fence):
+    """Only immutable blob/receipt producers may defer their source check."""
+    batch = _IMMUTABLE_CHECKS.get()
+    if batch is not None and batch['fence'] is fence and current_fence() is fence:
+        batch['checks'] += 1
+        return
+    processing_metrics.add(artifact_source_checks=1)
+    fence.check()
+
+
+@contextmanager
+def immutable_artifact_checks(fence):
+    """One final source check before immutable results reach the metadata CAS.
+
+    This scope must contain only create-only blobs/receipts and local metadata
+    edits. Mutable face writes keep their immediate ResultFence.check checks.
+    Failure leaves only unreferenced artifacts; no source pointer is committed.
+    """
+    if fence is None or current_fence() is not fence:
+        raise StaleProcessingResult('Immutable artifact batch requires its active source fence.')
+    token = _IMMUTABLE_CHECKS.set(dict(fence=fence, checks=0))
+    try:
+        yield
+        checks = _IMMUTABLE_CHECKS.get()['checks']
+        if checks:
+            import processing_diagnostics
+            with processing_diagnostics.apply_phase(fence.library, fence.filename, 'artifact_source_validation'):
+                processing_metrics.add(artifact_source_checks=1, artifact_source_check_batches=1,
+                                       artifact_source_checks_coalesced=max(0, checks - 1))
+                fence.check()
+    finally:
+        _IMMUTABLE_CHECKS.reset(token)
 
 
 @processing_metrics.purpose('artifact_write')

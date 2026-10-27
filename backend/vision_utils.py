@@ -202,19 +202,58 @@ def encode_rgb_image_embedding(image) -> List[float]:
         started = time.monotonic()
         pixel_values = _PREPROCESS(image).unsqueeze(0).to(_device())
         metrics.add(clip_preprocess_ms=(time.monotonic() - started) * 1000)
-        with torch.no_grad():
-            waiting = time.monotonic()
-            with _MODEL_LOCK:
-                metrics.add(clip_lock_wait_ms=(time.monotonic() - waiting) * 1000)
-                started = time.monotonic()
-                try:
-                    image_features = _MODEL.encode_image(pixel_values)
-                finally:
-                    metrics.add(clip_inference_ms=(time.monotonic() - started) * 1000)
-            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        return image_features.squeeze(0).cpu().tolist()
+        from image_batching import current_batcher
+        batcher = current_batcher()
+        return (batcher.submit(pixel_values) if batcher is not None
+                else _encode_image_tensor_single(pixel_values))
     except Exception:
         return []
+
+
+def _encode_image_tensors_batch(tensors):
+    """Prepared tensors only; no source context, image decoding or persistence."""
+    started = time.monotonic()
+    pixels = torch.cat(tensors, dim=0)
+    metrics.add(clip_image_stack_ms=(time.monotonic() - started) * 1000)
+    with torch.no_grad():
+        waiting = time.monotonic()
+        with _MODEL_LOCK:
+            metrics.add(clip_lock_wait_ms=(time.monotonic() - waiting) * 1000)
+            started = time.monotonic()
+            try:
+                features = _MODEL.encode_image(pixels)
+            finally:
+                metrics.add(clip_inference_ms=(time.monotonic() - started) * 1000)
+        features = features / features.norm(dim=-1, keepdim=True)
+    return features.cpu().tolist()
+
+
+def _encode_image_tensor_single(tensor):
+    # Same numerical path as the existing singleton encoder, without a copy.
+    with torch.no_grad():
+        waiting = time.monotonic()
+        with _MODEL_LOCK:
+            metrics.add(clip_lock_wait_ms=(time.monotonic() - waiting) * 1000)
+            started = time.monotonic()
+            try:
+                features = _MODEL.encode_image(tensor)
+            finally:
+                metrics.add(clip_inference_ms=(time.monotonic() - started) * 1000)
+        features = features / features.norm(dim=-1, keepdim=True)
+    return features.squeeze(0).cpu().tolist()
+
+
+def image_embedding_batches(*, source_workers=2, batch_size=None, window=None):
+    """Opt-in per-attempt scope; a single source never waits to fill a batch."""
+    from contextlib import nullcontext
+    from image_batching import image_batches
+    size = int(os.getenv('IPWORK_CLIP_IMAGE_BATCH_SIZE', '1')) if batch_size is None else batch_size
+    wait = float(os.getenv('IPWORK_CLIP_IMAGE_BATCH_WINDOW_MS', '2')) / 1000 if window is None else window
+    if type(size) is not int or not 1 <= size <= 8 or not 0 <= wait <= .05:
+        raise ValueError('Invalid CLIP image batching configuration')
+    size = min(size, source_workers)
+    return (nullcontext() if size <= 1 else image_batches(
+        _encode_image_tensors_batch, _encode_image_tensor_single, batch_size=size, window=wait))
 
 
 # Precomputed once per process and cached by ipwork_vision.py -- encoding the

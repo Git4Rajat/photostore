@@ -178,3 +178,154 @@ def test_missing_or_wrong_inbox_acceptance_never_acknowledges_source(receipt):
     table = _RacyTable(); row = source(); prepare_completion(row); table.upsert_entity(row)
     assert not relay_completion(table, 'lib', 'photo.jpg', lambda intent: receipt)
     assert table.get_entity('lib', 'photo.jpg')['processingCompletionPending']
+
+
+class _CommitResponseTable(_RacyTable):
+    """Preserves MERGE fields and returns the service's post-write ETag."""
+    def update_entity(self, entity, mode=None, *, etag=None, match_condition=None):
+        from azure.core.exceptions import ResourceModifiedError
+        from azure.data.tables import UpdateMode
+        key = entity['PartitionKey'], entity['RowKey']
+        version = etag if etag is not None else entity.metadata['etag']
+        with self.lock:
+            self.update_calls += 1
+            if match_condition is not None and str(version) != str(self.etags[key]):
+                raise ResourceModifiedError('changed')
+            if mode == UpdateMode.MERGE:
+                self.rows[key].update(dict(entity))
+            else:
+                self.rows[key] = dict(entity)
+            self.etags[key] += 1
+            return {'etag': str(self.etags[key])}
+
+
+def test_committed_completion_ack_skips_both_reads_and_preserves_metadata():
+    import processing_metrics
+    table = _CommitResponseTable(); row = source(); row['rating'] = 3
+    prepare_completion(row); table.upsert_entity(row)
+    with processing_metrics.accounting() as counts:
+        assert relay_completion(table, 'lib', 'photo.jpg', accepted,
+                                committed=row, committed_etag='1')
+    assert table.get_calls == 0 and table.update_calls == 1
+    stored = table.rows['lib', 'photo.jpg']
+    assert stored['rating'] == 3 and stored['processingRevision'] == 'rev-1'
+    assert stored['processingCompletionOutbox'] == '[]' and not stored['processingCompletionPending']
+    assert row['processingCompletionPending']  # Caller snapshot is not mutated.
+    assert counts.snapshot()['completion_ack_snapshot_uses'] == 1
+
+
+@pytest.mark.parametrize('replacement', [False, True])
+def test_committed_ack_conflict_rereads_and_preserves_new_generation_or_edit(replacement):
+    import processing_metrics
+    table = _CommitResponseTable(); row = source(); prepare_completion(row); table.upsert_entity(row)
+    def racing_delivery(intent):
+        fresh = dict(table.rows['lib', 'photo.jpg'], rating=7)
+        if replacement:
+            fresh['processingRevision'] = 'rev-2'; prepare_completion(fresh)
+        table.upsert_entity(fresh)
+        return accepted(intent)
+    with processing_metrics.accounting() as counts:
+        assert relay_completion(table, 'lib', 'photo.jpg', racing_delivery,
+                                committed=row, committed_etag='1')
+    assert table.get_calls == 1  # One conflict recovery read; no optimistic pre-read.
+    stored = table.rows['lib', 'photo.jpg']
+    assert stored['rating'] == 7
+    if replacement:
+        assert stored['processingRevision'] == 'rev-2'
+        assert stored['processingCompletionPending'] != row['processingCompletionPending']
+        assert len(json.loads(stored['processingCompletionOutbox'])) == 1
+    else:
+        assert not stored['processingCompletionPending']
+    assert counts.snapshot()['completion_ack_snapshot_conflicts'] == 1
+
+
+@pytest.mark.parametrize('etag', [None, '', '*', 1])
+def test_missing_genuine_commit_etag_uses_fresh_reads(etag):
+    table = _CommitResponseTable(); row = source(); prepare_completion(row); table.upsert_entity(row)
+    assert relay_completion(table, 'lib', 'photo.jpg', accepted, committed=row, committed_etag=etag)
+    assert table.get_calls == 2
+
+
+def test_committed_ack_requires_durable_acceptance_and_lost_reply_is_recoverable():
+    table = _CommitResponseTable(); row = source(); prepare_completion(row); table.upsert_entity(row)
+    assert not relay_completion(table, 'lib', 'photo.jpg', lambda _: {}, committed=row, committed_etag='1')
+    def lost(_): raise OSError('lost response')
+    with pytest.raises(OSError):
+        relay_completion(table, 'lib', 'photo.jpg', lost, committed=row, committed_etag='1')
+    assert table.update_calls == 0
+    assert table.rows['lib', 'photo.jpg']['processingCompletionPending']
+    assert relay_completion(table, 'lib', 'photo.jpg', accepted, committed=row, committed_etag='1')
+
+
+def test_committed_ack_rejects_cross_source_snapshot():
+    table = _CommitResponseTable(); row = source(); prepare_completion(row)
+    with pytest.raises(ValueError, match='scope mismatch'):
+        relay_completion(table, 'other', 'photo.jpg', lambda _: pytest.fail('delivered wrong source'),
+                         committed=row, committed_etag='1')
+    assert table.get_calls == table.update_calls == 0
+
+
+def test_new_completion_inbox_skips_absence_read_and_retries_verify_existing(monkeypatch):
+    from upload_waves import ShadowWaves
+    from test_upload_waves import AtomicTable
+    import processing_metrics
+    table = AtomicTable(); inbox = ShadowWaves(table, 'lib')
+    row = source(); prepare_completion(row); intent = json.loads(row['processingCompletionOutbox'])[0]
+    reads = []; original = table.get_entity
+    monkeypatch.setattr(table, 'get_entity', lambda partition, key: (reads.append(key), original(partition, key))[1])
+    with processing_metrics.accounting() as metrics:
+        first = inbox.accept_source_completion(intent)
+        assert reads == ['policy']  # Create-only common path: no source-completion GET.
+        assert inbox.accept_source_completion(intent) == first
+    assert sum(k.startswith('source-completion!') for k in reads) == 1
+    assert metrics.snapshot()['completion_inbox_creates'] == 1
+    assert metrics.snapshot()['completion_inbox_create_conflicts'] == 1
+    key = next(k for k in table.rows if k[1].startswith('source-completion!'))
+    table.rows[key]['payload'] = '{}'
+    from upload_waves import Conflict
+    with pytest.raises(Conflict, match='rebound'): inbox.accept_source_completion(intent)
+
+
+def test_cleanup_allows_existing_inbox_ack_but_fences_new_reference():
+    from upload_waves import ShadowWaves, Conflict
+    from test_upload_waves import AtomicTable
+    table = AtomicTable(); inbox = ShadowWaves(table, 'lib')
+    row = source(); prepare_completion(row); intent = json.loads(row['processingCompletionOutbox'])[0]
+    first = inbox.accept_source_completion(intent)
+    table.submit_transaction([('create', inbox._row('policy', cleanupState='active', gcUntil=0))])
+    assert inbox.accept_source_completion(intent) == first
+    row['processingRevision'] = 'rev-2'; prepare_completion(row)
+    new = json.loads(row['processingCompletionOutbox'])[-1]
+    with pytest.raises(Conflict, match='cleanup'): inbox.accept_source_completion(new)
+    assert len([k for k in table.rows if k[1].startswith('source-completion!')]) == 1
+
+
+def test_cleanup_starting_during_create_prevents_new_inbox_reference():
+    from upload_waves import ShadowWaves, Conflict
+    from test_upload_waves import AtomicTable
+    table = AtomicTable(); inbox = ShadowWaves(table, 'lib')
+    table.submit_transaction([('create', inbox._row('policy', cleanupState='', gcUntil=0))])
+    row = source(); prepare_completion(row); intent = json.loads(row['processingCompletionOutbox'])[0]
+    def cleanup():
+        old = inbox._required('policy')
+        table.submit_transaction([inbox._change(old, dict(old, cleanupState='active'))])
+    table.before_commit = cleanup
+    with pytest.raises(Conflict, match='cleanup'): inbox.accept_source_completion(intent)
+    assert not any(k[1].startswith('source-completion!') for k in table.rows)
+
+
+def test_snapshot_relay_recovers_lost_inbox_reply_without_recreating_or_losing_intent():
+    from upload_waves import ShadowWaves
+    from test_upload_waves import AtomicTable
+    table = _CommitResponseTable(); row = source(); prepare_completion(row); table.upsert_entity(row)
+    inbox_table = AtomicTable(); inbox = ShadowWaves(inbox_table, 'lib')
+    def lost(intent):
+        inbox.accept_source_completion(intent)
+        raise OSError('reply lost after durable inbox commit')
+    with pytest.raises(OSError):
+        relay_completion(table, 'lib', 'photo.jpg', lost, committed=row, committed_etag='1')
+    assert table.rows['lib', 'photo.jpg']['processingCompletionPending']
+    assert relay_completion(table, 'lib', 'photo.jpg', inbox.accept_source_completion,
+                            committed=row, committed_etag='1')
+    assert table.get_calls == 0 and len(inbox_table.rows) == 1
+    assert table.rows['lib', 'photo.jpg']['processingCompletionOutbox'] == '[]'

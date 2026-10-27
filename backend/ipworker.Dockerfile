@@ -18,6 +18,11 @@ ENV PIP_ROOT_USER_ACTION=ignore \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     DEBIAN_FRONTEND=noninteractive
 
+# Limit NumPy/SciPy/OpenCV BLAS pools before Python imports them. The matched
+# two-CPU benchmark reduced stage wall time by 29.5% with identical outputs.
+# See docs/benchmarks/vision-stages-azure-20261027.md.
+ENV OPENBLAS_NUM_THREADS=1
+
 # tesseract-ocr: OCR runtime + trained data. libtesseract-dev/
 # libleptonica-dev/pkg-config/build-essential: tesserocr (ipwork_ocr.py)
 # links against libtesseract/leptonica and compiles a Cython extension at

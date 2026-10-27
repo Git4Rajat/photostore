@@ -7,6 +7,7 @@ Notifications can be lost; the row retains its intent until exact-ID ack.
 import hashlib
 import json
 import os
+import processing_metrics
 
 from azure.core import MatchConditions
 from azure.core.exceptions import ResourceModifiedError
@@ -168,13 +169,22 @@ def prepare_completion(row):
     row['processingCompletionPending'] = '' if row.get('processingCompletionAck') == identity else identity
 
 
-def relay_completion(table, library, filename, deliver):
+def relay_completion(table, library, filename, deliver, *, committed=None, committed_etag=None):
     """Deliver at least once; acknowledge only the ID delivered, with its ETag.
 
     deliver MUST return the exact durable inbox record after idempotent acceptance.
     A lost response or a racing new completion leaves a recoverable pending row.
     """
-    row = table.get_entity(library, filename)
+    # A successful conditional metadata commit provides the exact outbox and
+    # its new ETag. Acknowledge against that version first; a racing edit falls
+    # back to a fresh read, never a blind overwrite of another generation.
+    snapshot = (committed is not None and isinstance(committed_etag, str)
+                and bool(committed_etag) and committed_etag != '*')
+    if snapshot and (committed.get('PartitionKey') != library or committed.get('RowKey') != filename):
+        raise ValueError('Committed completion source scope mismatch')
+    row = committed if snapshot else table.get_entity(library, filename)
+    if snapshot:
+        processing_metrics.add(completion_ack_snapshot_uses=1)
     backlog = json.loads(row.get('processingCompletionOutbox') or '[]')
     if not backlog:
         return False
@@ -186,21 +196,31 @@ def relay_completion(table, library, filename, deliver):
             'completionId': pending, 'libraryId': library, 'photoId': intent['photoId'],
             'processingRevision': intent['revision']}.items()):
         return False  # No exact durable acceptance receipt, so retain the outbox.
+    if snapshot:
+        try:
+            return _ack_completion(table, row, pending, etag=committed_etag, merge=True)
+        except ResourceModifiedError:
+            processing_metrics.add(completion_ack_snapshot_conflicts=1)
     current = table.get_entity(library, filename)
+    try:
+        return _ack_completion(table, current, pending)
+    except ResourceModifiedError:
+        return False
+
+
+def _ack_completion(table, current, pending, *, etag=None, merge=False):
     remaining = json.loads(current.get('processingCompletionOutbox') or '[]')
     if not any(item['id'] == pending for item in remaining):
         return False
     remaining = [item for item in remaining if item['id'] != pending]
-    version = getattr(current, 'metadata', {}).get('etag')
+    version = etag if etag is not None else getattr(current, 'metadata', {}).get('etag')
     if not version:
         raise RuntimeError('Source completion acknowledgement requires an ETag')
-    fields = dict(current, processingCompletionOutbox=json.dumps(remaining, sort_keys=True, separators=(',', ':')),
+    base = {key: current[key] for key in ('PartitionKey', 'RowKey')} if merge else current
+    fields = dict(base, processingCompletionOutbox=json.dumps(remaining, sort_keys=True, separators=(',', ':')),
         processingCompletionAck=pending)
     if current.get('processingCompletionPending') == pending:
         fields['processingCompletionPending'] = ''
-    try:
-        table.update_entity(fields, etag=version, mode=UpdateMode.REPLACE,
-            match_condition=MatchConditions.IfNotModified)
-    except ResourceModifiedError:
-        return False
+    table.update_entity(fields, etag=version, mode=UpdateMode.MERGE if merge else UpdateMode.REPLACE,
+                        match_condition=MatchConditions.IfNotModified)
     return True
