@@ -38,6 +38,8 @@ import glob
 import os
 import queue
 import threading
+import time
+import processing_metrics as metrics
 from typing import Dict, Optional
 
 
@@ -95,8 +97,12 @@ _thread_local = threading.local()
 def _get_api():
     api = getattr(_thread_local, 'api', None)
     if api is None:
-        api = tesserocr.PyTessBaseAPI(path=_TESSDATA_PATH) if _TESSDATA_PATH else tesserocr.PyTessBaseAPI()
-        _thread_local.api = api
+        started = time.monotonic()
+        try:
+            api = tesserocr.PyTessBaseAPI(path=_TESSDATA_PATH) if _TESSDATA_PATH else tesserocr.PyTessBaseAPI()
+            _thread_local.api = api
+        finally:
+            metrics.add(ocr_engine_inits=1, ocr_engine_init_ms=(time.monotonic() - started) * 1000)
     return api
 
 
@@ -135,7 +141,12 @@ def _recognize(image, outcome: 'queue.Queue') -> None:
     try:
         api = _get_api()
         api.SetImage(image)
-        if not api.Recognize():
+        started = time.monotonic()
+        try:
+            recognized = api.Recognize()
+        finally:
+            metrics.add(ocr_recognition_ms=(time.monotonic() - started) * 1000)
+        if not recognized:
             outcome.put(('error', RuntimeError('OCR recognition failed')))
             return
         iterator = api.GetIterator()
@@ -173,7 +184,8 @@ def process_ocr(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dic
     # non-default orientation. exif_transpose already applied inside
     # rgb_image()/_decode(), same as before this function was restructured.
     outcome: 'queue.Queue' = queue.Queue(maxsize=1)
-    worker = threading.Thread(target=_recognize, args=(image, outcome), daemon=True)
+    worker = threading.Thread(target=metrics.inherit(
+        lambda: _recognize(image, outcome), purpose_name='other'), daemon=True)
     worker.start()
     try:
         status, payload = outcome.get(timeout=OCR_CALL_TIMEOUT_SECONDS)

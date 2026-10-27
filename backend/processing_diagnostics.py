@@ -54,6 +54,7 @@ def image_scope(member_key, phase):
     counter = images[member_key]
     started = time.monotonic()
     with io_metrics.accounting(counter), io_metrics.purpose(phase):
+        if phase == 'inspection': io_metrics.add(image_inspections=1)
         if phase == 'processing': io_metrics.add(source_attempts=1)
         try:
             yield
@@ -79,6 +80,8 @@ def vision_group_summary(function):
             qualified = {member['RowKey'] for member, completion, _ in observations if completion}
             for member in members:
                 counter = images[member['RowKey']]
+                if not counter.snapshot()['image_inspections']:
+                    continue  # A deadline can leave the page tail unvisited.
                 io_metrics.add(image_passes=1)
                 counter.add(dict(image_passes=1))
                 file_event('vision_image_summary', store.library, member['filename'], wave_id=wave_id,

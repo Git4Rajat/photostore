@@ -2,6 +2,8 @@ import io
 import os
 import re
 import threading
+import time
+import processing_metrics as metrics
 import unicodedata
 from typing import Dict, List, Optional
 
@@ -181,10 +183,18 @@ def encode_rgb_image_embedding(image) -> List[float]:
     if not _load_model():
         return []
     try:
+        started = time.monotonic()
         pixel_values = _PREPROCESS(image).unsqueeze(0).to(_device())
+        metrics.add(clip_preprocess_ms=(time.monotonic() - started) * 1000)
         with torch.no_grad():
+            waiting = time.monotonic()
             with _MODEL_LOCK:
-                image_features = _MODEL.encode_image(pixel_values)
+                metrics.add(clip_lock_wait_ms=(time.monotonic() - waiting) * 1000)
+                started = time.monotonic()
+                try:
+                    image_features = _MODEL.encode_image(pixel_values)
+                finally:
+                    metrics.add(clip_inference_ms=(time.monotonic() - started) * 1000)
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         return image_features.squeeze(0).cpu().tolist()
     except Exception:

@@ -601,6 +601,11 @@ def process_face(user_id: str, filename: str, image_bytes: bytes) -> Optional[Di
         result['faceDiagnostics'] = diagnostics
         return result
     finally:
+        from processing_metrics import add
+        names = {'decode': 'decode', 'detect': 'detect', 'landmarkWait': 'landmark_wait',
+                 'landmark': 'landmark', 'align': 'align', 'embed': 'embed'}
+        add(**{'face_' + name + '_ms': diagnostics['stageTimingsMs'][stage]
+               for stage, name in names.items()})
         _FACE_DIAGNOSTICS.reset(token)
 
 

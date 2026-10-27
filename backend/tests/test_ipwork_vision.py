@@ -76,3 +76,27 @@ def test_shared_decode_failure_preserves_processor_failure_shape(monkeypatch):
     # (decode succeeded but the model produced nothing usable), which keeps
     # retrying.
     assert result == {'hasData': False, 'error': 'image_undecodable'}
+
+
+def test_clip_reports_preprocess_lock_and_inference_without_changing_output(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    import vision_utils as vision
+    import processing_metrics as metrics
+    class Tensor:
+        def unsqueeze(self, dim): return self
+        def to(self, device): return self
+        def norm(self, **kwargs): return self
+        def __truediv__(self, other): return self
+        def squeeze(self, dim): return self
+        def cpu(self): return self
+        def tolist(self): return [1.0, 0.0]
+    tensor = Tensor()
+    monkeypatch.setattr(vision, '_load_model', lambda: True)
+    monkeypatch.setattr(vision, '_device', lambda: 'cpu')
+    monkeypatch.setattr(vision, '_PREPROCESS', lambda image: tensor)
+    monkeypatch.setattr(vision, '_MODEL', SimpleNamespace(encode_image=lambda pixels: tensor))
+    monkeypatch.setattr(vision, 'torch', SimpleNamespace(no_grad=nullcontext))
+    with metrics.accounting() as counter:
+        assert vision.encode_rgb_image_embedding(object()) == [1.0, 0.0]
+    assert {'clip_preprocess_ms', 'clip_lock_wait_ms', 'clip_inference_ms'} <= counter.values.keys()

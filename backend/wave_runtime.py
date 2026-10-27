@@ -72,6 +72,7 @@ def _source_heartbeat(storage,library,filename,lease,renew):
 @source_change
 def process_source(library,filename,revision,renew):
     import app
+    import processing_metrics as metrics
     import storage_utils as storage
     from processing_completion import TERMINAL,completion_capture_enabled,StaleProcessingResult
     from processing_generation import required_steps_for_media,enforcement_enabled
@@ -80,7 +81,8 @@ def process_source(library,filename,revision,renew):
         raise RuntimeError('Wave source completion and generation enforcement must be enabled together')
     renew()
     steps=required_steps_for_media(is_video_file(filename))
-    lease=storage.claim_processing_lease(library,filename,'wave-'+uuid.uuid4().hex,steps=list(steps),mark_running=False)
+    with metrics.timer('vision_source_claim', count_name='vision_source_claim_calls'):
+        lease=storage.claim_processing_lease(library,filename,'wave-'+uuid.uuid4().hex,steps=list(steps),mark_running=False)
     try:
         row=lease['entity']
         if row.get('processingRevision')!=revision:
@@ -89,17 +91,21 @@ def process_source(library,filename,revision,renew):
             runnable=[step for step in steps if row.get(step+'_status') not in TERMINAL]
             if runnable:
                 app._register_ipwork_processors()
-                output=app._run_ipwork_steps(library,filename,runnable,metadata_snapshot=dict(row))
+                with metrics.timer('vision_source_steps', count_name='vision_source_steps_calls'):
+                    output=app._run_ipwork_steps(library,filename,runnable,metadata_snapshot=dict(row))
                 check()
-                storage.apply_client_processing_results_for_file(library,filename,
-                    client_processing=output,origin='ipworker',claimed_steps=runnable,
-                    lease_owner=lease['ownerId'],expected_processing_revision=revision,
-                    expected_processing_fence=row['processingFence'])
+                with metrics.timer('vision_source_apply', count_name='vision_source_apply_calls'):
+                    storage.apply_client_processing_results_for_file(library,filename,
+                        client_processing=output,origin='ipworker',claimed_steps=runnable,
+                        lease_owner=lease['ownerId'],expected_processing_revision=revision,
+                        expected_processing_fence=row['processingFence'])
             else:
-                storage.qualify_completed_processing(library,filename,lease)
+                with metrics.timer('vision_source_qualify', count_name='vision_source_qualify_calls'):
+                    storage.qualify_completed_processing(library,filename,lease)
     finally:
-        storage.release_processing_lease(library,filename,lease['ownerId'],
-            expected_processing_fence=lease['entity']['processingFence'])
+        with metrics.timer('vision_source_release', count_name='vision_source_release_calls'):
+            storage.release_processing_lease(library,filename,lease['ownerId'],
+                expected_processing_fence=lease['entity']['processingFence'])
 
 
 def invalidate_wave_tags(storage,library):

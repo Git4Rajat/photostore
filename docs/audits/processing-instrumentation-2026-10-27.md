@@ -183,3 +183,76 @@ source-member attribution adjustments also passed 136 lease/metrics/runtime
 checks and 74 source/consumer/diagnostics checks. The overlap test intentionally
 uses two distinct source members with the same filename: their counters and
 qualification flags remain separate. git diff --check passed.
+
+## Rolling Vision source pool
+
+Vision now admits a rolling, bounded set of source adapters within each 20-member
+page. A free slot is refilled without waiting for its slower sibling. Admission
+transactions contain only the newly available slots, so there may be more small
+admission transactions than with fixed pairs; `vision_admission_batches` exposes
+that tradeoff. Member observations still commit together after the page's admitted
+sources drain. On deadline, the unvisited tail consumes no attempts and the
+checkpoint covers only the inspected prefix. Exceptions also drain submitted work
+before releasing stage ownership, including with a shared executor.
+
+New fields in image/wave counters:
+
+- `vision_source_queue_ms`: submission-to-start delay, including contention for
+  the shared executor. It is outside `vision_source_busy_ms`.
+- `vision_source_busy_ms`: elapsed inside executing source adapters, including
+  models, persistence and lease operations. It is not model-only CPU time.
+- `vision_pool_ms`: coordinator admission/execution/drain window, excluding the
+  subsequent qualification phase; `vision_pool_capacity_ms` multiplies this by
+  configured source slots. Their ratio with summed busy time measures source
+  slot occupancy, not CPU utilization. Shared executors can reduce occupancy.
+- `vision_coordinator_wait_ms`: coordinator waiting for at least one future;
+  this overlaps source execution and is not wasted time to subtract from wall.
+- `vision_admission_ms`: inspection, reservation and submission elapsed. In the
+  inline single-worker path it also includes source execution.
+- `vision_settlement_ms`: authoritative boundary check and receipt qualification
+  after draining, excluding the later page observation transaction.
+- `vision_source_{claim,steps,apply,qualify,release}_ms`, corresponding `_calls`
+  counts and `_errors`: source adapter boundaries. `steps` includes lazy
+  input acquisition; model-step events exclude that acquisition. These nested
+  durations must not be added to source busy time.
+- `face_{decode,detect,landmark_wait,landmark,align,embed}_ms`: existing native
+  face diagnostics now reach image/wave counters, including the wave adapter.
+  Landmark execution excludes its separately measured lock wait.
+- `ocr_engine_inits`, `ocr_engine_init_ms`, `ocr_recognition_ms`: initialization
+  and native recognition separately. Accounting is carried into the OCR thread
+  without copying execution fences. A timed-out native call may finish after
+  its image summary and must not be interpreted as a complete timing sample.
+- `clip_preprocess_ms`, `clip_lock_wait_ms`, `clip_inference_ms`: preprocessing,
+  model lock acquisition and forward call separately. Forward elapsed is host
+  elapsed; asynchronous GPU execution would require device-specific measurement.
+
+`image_inspections` marks visited members. Deadline-skipped members no longer
+produce empty image summaries. The SDK `photometadata()` query endpoint now
+counts as `metadata_query_requests`; earlier builds incorrectly counted it as a
+point read. Combined metadata GET totals remain comparable across builds.
+
+Example (use attempt summaries only to avoid double-counting image summaries):
+
+```kusto
+ContainerAppConsoleLogs_CL
+| where Log_s contains "processing telemetry "
+| extend d=parse_json(extract("processing telemetry (.*)$", 1, Log_s))
+| where tostring(d.event) == "vision_wave_attempt_summary"
+| summarize wall_ms=sum(todouble(d.milliseconds)),
+    busy_ms=sum(todouble(d.vision_source_busy_ms)),
+    capacity_ms=sum(todouble(d.vision_pool_capacity_ms)),
+    queue_ms=sum(todouble(d.vision_source_queue_ms)),
+    admission_ms=sum(todouble(d.vision_admission_ms)),
+    settlement_ms=sum(todouble(d.vision_settlement_ms)),
+    claim_ms=sum(todouble(d.vision_source_claim_ms)),
+    steps_ms=sum(todouble(d.vision_source_steps_ms)),
+    apply_ms=sum(todouble(d.vision_source_apply_ms)),
+    ocr_init_ms=sum(todouble(d.ocr_engine_init_ms)),
+    clip_wait_ms=sum(todouble(d.clip_lock_wait_ms))
+  by wave_id=tostring(d.wave_id)
+| extend source_slot_occupancy=busy_ms / capacity_ms
+```
+
+The summed attempt `wall_ms` excludes inter-attempt gaps and any killed attempt
+that never emitted its closing summary. Use stage-start events and durable freeze
+time for end-to-end wall time, and identify missing summaries by attempt ID.

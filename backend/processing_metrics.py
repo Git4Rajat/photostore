@@ -25,9 +25,19 @@ _FIELDS = {
     'artifact_verification_reuse', 'artifact_create_conflicts', 'receipt_creates', 'receipt_create_conflicts',
     'journal_flushes', 'journal_flush_ms', 'journal_flush_errors',
     'journal_fsyncs', 'journal_fsync_ms', 'journal_fsync_errors',
-    'image_passes', 'source_attempts', 'source_errors',
+    'image_passes', 'image_inspections', 'source_attempts', 'source_errors',
+    'vision_source_queue_ms', 'vision_source_busy_ms', 'vision_pool_ms', 'vision_pool_capacity_ms',
+    'vision_coordinator_wait_ms', 'vision_admission_ms', 'vision_admission_batches', 'vision_settlement_ms',
+    'ocr_engine_init_ms', 'ocr_engine_inits', 'ocr_recognition_ms',
+    'clip_preprocess_ms', 'clip_lock_wait_ms', 'clip_inference_ms',
+    'face_decode_ms', 'face_detect_ms', 'face_landmark_wait_ms', 'face_landmark_ms',
+    'face_align_ms', 'face_embed_ms',
     'image_inspection_ms', 'image_processing_ms', 'image_qualification_ms',
-} | {'metadata_' + purpose + '_reads' for purpose in _PURPOSES}
+} | {'metadata_' + purpose + '_reads' for purpose in _PURPOSES} | {
+    'vision_source_' + phase + suffix
+    for phase in ('claim', 'steps', 'apply', 'qualify', 'release')
+    for suffix in ('_calls', '_ms', '_errors')
+}
 
 
 class Counters:
@@ -80,7 +90,7 @@ def record_io(kind, method, path, status, milliseconds, size):
         table = resource.split('(', 1)[0].lower()
         if table == 'photometadata':
             values.update(metadata_read_ms=milliseconds)
-            values['metadata_point_reads' if '(' in resource else 'metadata_query_requests'] = 1
+            values['metadata_point_reads' if '(partitionkey=' in resource.lower() else 'metadata_query_requests'] = 1
             values['metadata_' + _PURPOSE.get() + '_reads'] = 1
         elif table == 'photojobs':
             values['job_read_requests'] = 1
@@ -89,13 +99,13 @@ def record_io(kind, method, path, status, milliseconds, size):
     add(**values)
 
 
-def inherit(function):
-    """Carry counters into a raw heartbeat thread without changing its fences."""
+def inherit(function, *, purpose_name='heartbeat'):
+    """Carry only accounting into a raw thread, without copying execution fences."""
     counters = _COUNTERS.get()
     def run():
         token = _COUNTERS.set(counters)
         try:
-            with purpose('heartbeat'):
+            with purpose(purpose_name):
                 return function()
         finally:
             _COUNTERS.reset(token)
@@ -103,7 +113,7 @@ def inherit(function):
 
 
 @contextmanager
-def timer(name):
+def timer(name, *, count_name=None):
     started = time.monotonic()
     try:
         yield
@@ -111,5 +121,5 @@ def timer(name):
         add(**{name + '_errors': 1})
         raise
     finally:
-        plural = name + ('es' if name.endswith('flush') else 's')
+        plural = count_name or name + ('es' if name.endswith('flush') else 's')
         add(**{plural: 1, name + '_ms': (time.monotonic() - started) * 1000})

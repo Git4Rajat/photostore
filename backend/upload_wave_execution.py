@@ -352,71 +352,119 @@ def _inspect_vision_member(store, wave_id, member, metadata_table, receipts):
 
 
 @processing_diagnostics.vision_group_summary
-def _process_vision_group(store, wave_id, members, metadata, process_source, renew, progressed, executor, receipts, inspection_failures=None):
+def _process_vision_group(store, wave_id, members, metadata, process_source, renew, progressed, executor, receipts, inspection_failures=None, *, source_workers=1, expired=lambda: False, processed_members=None):
     """Parallel source effects; the coordinator alone updates wave evidence."""
     from contextvars import copy_context
-    from concurrent.futures import wait
+    from concurrent.futures import wait, FIRST_COMPLETED
+    import time
+    import processing_metrics as metrics
     from execution_lease import OwnershipLost
     from wave_settlement import exhausted, inspection_failed
     from wave_source_batch import reserve_attempts
     from storage_utils import _processing_is_expired
     import logging
     logger = logging.getLogger(__name__)
-    planned = []
-    for member in members:
-        with processing_diagnostics.image_scope(member['RowKey'], 'inspection'):
-            try:
-                item = _inspect_vision_member(store, wave_id, member, metadata, receipts)
-            except (OwnershipLost, NotImplementedError):
-                raise
-            except Exception as error:
-                # Inspection has its own budget: it happens before model admission.
-                # Failure to persist this evidence must escape to stage retry handling.
-                settled = inspection_failed(store, wave_id, member, metadata, error)
-                if not settled and inspection_failures is not None:
-                    inspection_failures[0] += 1
-                logger.exception('Vision member inspection failed for %s/%s; continuing wave',
-                                 store.library, member['filename'])
-                continue
-            if item is not None:
-                planned.append(item)
-    runnable = [item for item in planned if item['runnable']]
-    if runnable and process_source is None:
-        raise NotImplementedError('A fenced source-processing adapter is required')
-    counts = reserve_attempts(store, [item['member'] for item in runnable]) if runnable else {}
-    def process(item):
+    planned, counts, errors, futures = [], {}, {}, {}
+    remaining = iter(members)
+    exhausted_members = False
+    capacity = source_workers if executor is not None else 1
+    pool_started = time.monotonic()
+
+    def process(item, submitted):
         member = item['member']
+        started = time.monotonic()
         with processing_diagnostics.image_scope(member['RowKey'], 'processing'):
-            renew()
-            progressed()
-            process_source(store.library, member['filename'], member['processingRevision'], renew)
-    futures = {}
-    errors = {}
-    for item in runnable:
-        key = item['member']['RowKey']
-        count, admitted = counts[key]
-        if not admitted:
-            exhausted(store, wave_id, item['member'], metadata, count)
-        elif executor is not None:
-            futures[key] = executor.submit(copy_context().run, process, item)
-        else:
+            metrics.add(vision_source_queue_ms=(started - submitted) * 1000)
             try:
-                process(item)
-            except Exception as error:
-                errors[key] = error
-    # Never let a task continue writing after this stage releases ownership.
-    if futures:
-        wait(futures.values())
-        for key, future in futures.items():
-            try:
-                future.result()
-            except Exception as error:
-                errors[key] = error
+                renew()
+                progressed()
+                process_source(store.library, member['filename'], member['processingRevision'], renew)
+            finally:
+                metrics.add(vision_source_busy_ms=(time.monotonic() - started) * 1000)
+
+    try:
+        while True:
+            for error in errors.values():
+                if isinstance(error, (OwnershipLost, NotImplementedError)):
+                    raise error
+            # Reserve only slots we can submit now; never consume the attempt
+            # budget of the unstarted page tail. Only this coordinator inspects
+            # members and later qualifies results; source workers own effects.
+            ready = []
+            admission_started = time.monotonic()
+            while not exhausted_members and len(futures) + len(ready) < capacity and not expired():
+                member = next(remaining, None)
+                if member is None:
+                    exhausted_members = True
+                    break
+                if processed_members is not None:
+                    processed_members.append(member)
+                with processing_diagnostics.image_scope(member['RowKey'], 'inspection'):
+                    try:
+                        item = _inspect_vision_member(store, wave_id, member, metadata, receipts)
+                    except (OwnershipLost, NotImplementedError):
+                        raise
+                    except Exception as error:
+                        settled = inspection_failed(store, wave_id, member, metadata, error)
+                        if not settled and inspection_failures is not None:
+                            inspection_failures[0] += 1
+                        logger.exception('Vision member inspection failed for %s/%s; continuing wave',
+                                         store.library, member['filename'])
+                        continue
+                if item is not None:
+                    planned.append(item)
+                    if item['runnable']:
+                        ready.append(item)
+            if ready:
+                if process_source is None:
+                    raise NotImplementedError('A fenced source-processing adapter is required')
+                admitted = reserve_attempts(store, [item['member'] for item in ready])
+                counts.update(admitted)
+                for item in ready:
+                    key = item['member']['RowKey']
+                    count, allowed = admitted[key]
+                    if not allowed:
+                        exhausted(store, wave_id, item['member'], metadata, count)
+                    elif executor is not None:
+                        futures[executor.submit(copy_context().run, process, item, time.monotonic())] = key
+                    else:
+                        try:
+                            process(item, time.monotonic())
+                        except Exception as error:
+                            errors[key] = error
+                metrics.add(vision_admission_batches=1)
+            metrics.add(vision_admission_ms=(time.monotonic() - admission_started) * 1000)
+            for error in errors.values():
+                if isinstance(error, (OwnershipLost, NotImplementedError)):
+                    raise error
+            if not futures:
+                if exhausted_members or expired():
+                    break
+                continue
+            wait_started = time.monotonic()
+            done, _ = wait(futures, return_when=FIRST_COMPLETED)
+            metrics.add(vision_coordinator_wait_ms=(time.monotonic() - wait_started) * 1000)
+            for future in done:
+                key = futures.pop(future)
+                try:
+                    future.result()
+                except Exception as error:
+                    errors[key] = error
+            # The next loop refills free slots immediately, even if an earlier
+            # member is still running. Checkpointing stays at a drained page.
+    finally:
+        # Shared executors outlive this stage. Drain even if inspection,
+        # admission, submission or a source raises before releasing its fence.
+        if futures:
+            wait(futures)
+        elapsed_ms = (time.monotonic() - pool_started) * 1000
+        metrics.add(vision_pool_ms=elapsed_ms, vision_pool_capacity_ms=elapsed_ms * capacity)
     for error in errors.values():
         if isinstance(error, (OwnershipLost, NotImplementedError)):
             raise error
     # Qualifying/settling drained source results is a durable batch boundary.
     # Detect an intake reopen or lost release before interpreting those results.
+    settlement_started = time.monotonic()
     getattr(renew, 'boundary', renew)()
     observations = []
     for item in planned:
@@ -448,6 +496,7 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
                 ('processing_lease_owner', 'processing_lease', 'processing_lease_expires_at'))
                 and not _processing_is_expired(row))
             observations.append((member, completion, leased))
+    metrics.add(vision_settlement_ms=(time.monotonic() - settlement_started) * 1000)
     return observations
 
 
@@ -510,14 +559,12 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
                     prepare_sources(members, metadata, renew, expired)
                     renew()
                     progressed()
-                observations = []
-                for offset in range(0, len(members), source_workers):
-                    if expired(): break
-                    renew()
-                    group = members[offset:offset + source_workers]
-                    observations.extend(_process_vision_group(store, wave_id, group,
-                        metadata, process_source, renew, progressed, executor, receipts, inspection_failures))
-                    cursor = group[-1]['RowKey']
+                processed = []
+                observations = _process_vision_group(store, wave_id, members,
+                    metadata, process_source, renew, progressed, executor, receipts, inspection_failures,
+                    source_workers=source_workers, expired=expired, processed_members=processed)
+                if processed:
+                    cursor = processed[-1]['RowKey']
                     progressed()
                 # A checkpoint covers only drained groups. Source results are
                 # durable first; interruption before this commit is replayable

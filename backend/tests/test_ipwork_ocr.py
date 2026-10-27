@@ -377,3 +377,23 @@ def test_real_engine_handles_text_free_images_and_reuse_without_losing_text(monk
     finally:
         if getattr(local, 'api', None) is not None:
             local.api.End()
+
+
+def test_ocr_subthread_attributes_engine_initialization_and_recognition(monkeypatch):
+    import processing_metrics as metrics
+    class Api:
+        def SetImage(self, image): pass
+        def Recognize(self): return True
+        def GetIterator(self): return _WordIterator([('WORD', 95.0)])
+    monkeypatch.setattr(ipwork_ocr, 'tesserocr', SimpleNamespace(
+        RIL=SimpleNamespace(WORD=3), PyTessBaseAPI=lambda **kwargs: Api()))
+    monkeypatch.setattr(ipwork_ocr, '_thread_local', threading.local())
+    with metrics.accounting() as wave, metrics.accounting() as image:
+        assert ipwork_ocr.process_ocr('owner', 'photo.jpg', _make_jpeg_bytes())['hasData']
+    for counter in (wave, image):
+        values = counter.snapshot()
+        assert values['ocr_engine_inits'] == 1
+        assert values['ocr_engine_init_ms'] >= 0
+        assert values['ocr_recognition_ms'] >= 0
+    # OCR's raw thread must not leak its context into later calls.
+    assert wave.snapshot() == image.snapshot()

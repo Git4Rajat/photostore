@@ -550,3 +550,17 @@ def test_recovery_diagnostics_survive_storage_bounds():
               'recoveryDetectorReady': True, 'primaryRawFaceCount': 0,
               'primaryFilteredFaceCount': 0, 'primaryDetectorMaxScore': .31}
     assert _bounded_face_diagnostics(fields) == fields
+
+
+def test_face_substage_timings_reach_wave_counters(monkeypatch):
+    import processing_metrics as metrics
+    def process(*args):
+        face_mod._FACE_DIAGNOSTICS.get()['stageTimingsMs'].update(
+            decode=1, detect=2, landmarkWait=3, landmark=4, align=5, embed=6)
+        return {'hasData': False}
+    monkeypatch.setattr(face_mod, '_process_face', process)
+    with metrics.accounting() as counter:
+        face_mod.process_face('owner', 'photo.jpg', b'image')
+    values = counter.snapshot()
+    assert [values['face_' + key + '_ms'] for key in
+            ('decode', 'detect', 'landmark_wait', 'landmark', 'align', 'embed')] == [1, 2, 3, 4, 5, 6]

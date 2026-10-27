@@ -103,7 +103,8 @@ def test_parallel_sources_inherit_stage_scope_and_batch_observation_writes(world
     assert result['state'] == 'ready'
     assert peak[0] == 2
     assert observation_batches == [8]
-    assert attempt_batches == [2, 2, 2, 2]
+    assert sum(attempt_batches) == 8
+    assert all(1 <= size <= 2 for size in attempt_batches)
     assert len([value for value in checkpoints if '"phase": "sources"' in value]) == 1
     assert metadata.queries == 1
 
@@ -499,3 +500,83 @@ def test_frozen_face_inputs_use_bounded_queries_without_receipt_point_reads(worl
     table.rows[face_key]['payload'] = '{}'
     with pytest.raises(ValueError, match='invalid face snapshots'):
         list(_iter_wave_faces(store, wave))
+
+
+def test_rolling_pool_refills_before_slow_sibling_finishes(world):
+    """The third source must run while the first pair's slow source is live."""
+    metadata, wave, key = admit(world, 4)
+    store = world[0]
+    names = [m['filename'] for m in store._page(f'e!{wave}!m!')]
+    first_started, replacement_started = threading.Event(), threading.Event()
+    lock = threading.Lock()
+    active, peak = [0], [0]
+    def process(library, filename, revision, renew):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        try:
+            if filename == names[0]:
+                first_started.set()
+                assert replacement_started.wait(5), 'Pool waited for the whole pair'
+            elif filename == names[1]:
+                assert first_started.wait(5)
+            elif filename == names[2]:
+                assert active[0] == 2
+                replacement_started.set()
+            publish_completion(store, metadata, filename=filename)
+        finally:
+            with lock: active[0] -= 1
+    assert run(world, metadata, wave, key, process, source_workers=2)['state'] == 'ready'
+    assert replacement_started.is_set() and peak[0] == 2
+
+
+def test_rolling_deadline_drains_admitted_sources_without_charging_tail(world, monkeypatch):
+    metadata, wave, key = admit(world, 5)
+    store, _, leases, *_ = world
+    clock = [0.0]
+    monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
+    both_started = threading.Barrier(2)
+    calls = []
+    def process(library, filename, revision, renew):
+        calls.append(filename)
+        both_started.wait(5)
+        publish_completion(store, metadata, filename=filename)
+        clock[0] = 10
+    run(world, metadata, wave, key, process, source_workers=2, deadline=5)
+    assert len(calls) == 2
+    assert len(store._page('source-attempt!')) == 2
+    members = store._page(f'e!{wave}!m!')
+    row = leases._get(leases.key(store.library, wave, 'vision'))
+    assert json.loads(row['progressCheckpoint'][7:]) == dict(phase='sources', after=members[1]['RowKey'])
+    assert [m['outcome'] for m in members] == ['settled', 'settled', 'pending', 'pending', 'pending']
+
+
+def test_admission_exception_drains_shared_executor_before_releasing_stage(world, monkeypatch):
+    import wave_source_batch
+    metadata, wave, key = admit(world, 4)
+    store = world[0]
+    names = [m['filename'] for m in store._page(f'e!{wave}!m!')]
+    slow_started, release_slow, slow_finished = (threading.Event() for _ in range(3))
+    original = wave_source_batch.reserve_attempts
+    admissions = []
+    def reserve(store, members):
+        admissions.append(len(members))
+        if len(admissions) == 2:
+            release_slow.set()
+            raise RuntimeError('admission unavailable')
+        return original(store, members)
+    monkeypatch.setattr(wave_source_batch, 'reserve_attempts', reserve)
+    def process(library, filename, revision, renew):
+        if filename == names[0]:
+            slow_started.set()
+            assert release_slow.wait(5)
+        else:
+            assert slow_started.wait(5)
+        publish_completion(store, metadata, filename=filename)
+        if filename == names[0]: slow_finished.set()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        with pytest.raises(RuntimeError, match='admission unavailable'):
+            run(world, metadata, wave, key, process, source_workers=2, source_executor=pool)
+        assert slow_finished.is_set(), 'Returned while a shared-executor source could still write'
+    assert admissions == [2, 1]
+    assert len(store._page('source-attempt!')) == 2

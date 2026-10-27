@@ -113,3 +113,35 @@ def test_vision_attempt_summary_is_emitted_on_failure(caplog):
     row, = [row for row in records(caplog) if row['event'] == 'vision_wave_attempt_summary']
     assert row['outcome'] == 'error' and not row['vision_complete']
     assert row['metadata_point_reads'] == 2 and row['measurement_scope'] == 'attempt'
+
+
+def test_sdk_parenthesized_query_endpoint_is_not_a_point_read():
+    with metrics.accounting() as counter:
+        metrics.record_io('table', 'GET', '/photometadata()?$filter=private', 200, 2, 10)
+        metadata_reads(1)
+    assert counter.snapshot()['metadata_query_requests'] == 1
+    assert counter.snapshot()['metadata_point_reads'] == 1
+
+
+def test_unvisited_deadline_tail_does_not_emit_image_summary(caplog):
+    store = SimpleNamespace(library='private-library')
+    members = [dict(RowKey=k, filename=k + '.jpg') for k in ('visited', 'tail')]
+    @diagnostics.vision_group_summary
+    def group(store, wave_id, members):
+        with diagnostics.image_scope('visited', 'inspection'):
+            pass
+        return []
+    group(store, 'wave', members)
+    rows = [r for r in records(caplog) if r['event'] == 'vision_image_summary']
+    assert len(rows) == 1
+    assert rows[0]['image_inspections'] == rows[0]['image_passes'] == 1
+
+
+def test_source_boundary_timer_uses_explicit_call_count_on_failure():
+    with metrics.accounting() as counter:
+        with pytest.raises(RuntimeError):
+            with metrics.timer('vision_source_steps', count_name='vision_source_steps_calls'):
+                raise RuntimeError('model failed')
+    values = counter.snapshot()
+    assert values['vision_source_steps_calls'] == values['vision_source_steps_errors'] == 1
+    assert 'vision_source_steps_ms' in counter.values
