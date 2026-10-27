@@ -28,6 +28,14 @@ from PIL import Image
 import ipwork_ocr
 
 
+@pytest.fixture(autouse=True)
+def isolated_ocr_pool(monkeypatch):
+    pool = ipwork_ocr._OcrPool(4)
+    monkeypatch.setattr(ipwork_ocr, '_POOL', pool)
+    yield pool
+    pool.close()
+
+
 class _WordIterator:
     def __init__(self, entries):
         self.entries = entries
@@ -397,3 +405,121 @@ def test_ocr_subthread_attributes_engine_initialization_and_recognition(monkeypa
         assert values['ocr_recognition_ms'] >= 0
     # OCR's raw thread must not leak its context into later calls.
     assert wave.snapshot() == image.snapshot()
+
+
+def test_reusable_worker_initializes_once_and_clears_each_image(monkeypatch, isolated_ocr_pool):
+    import processing_metrics as metrics
+    created, calls, clears, ended = [], [], [], []
+    class Api:
+        def __init__(self):
+            self.owner = threading.get_ident(); created.append(self)
+        def SetImage(self, image):
+            assert threading.get_ident() == self.owner
+        def Recognize(self):
+            calls.append(threading.get_ident()); return True
+        def GetIterator(self): return _WordIterator([('PHOTO', 95)])
+        def Clear(self): clears.append(threading.get_ident())
+        def ClearAdaptiveClassifier(self): assert threading.get_ident() == self.owner
+        def End(self): ended.append(threading.get_ident())
+    monkeypatch.setattr(ipwork_ocr, 'tesserocr', SimpleNamespace(
+        RIL=SimpleNamespace(WORD=3), PyTessBaseAPI=lambda **kw: Api()))
+    with metrics.accounting() as counter:
+        for _ in range(3):
+            assert ipwork_ocr.process_ocr('owner', 'photo.jpg', _make_jpeg_bytes()) == {'hasData': True, 'text': 'PHOTO'}
+    assert len(created) == 1 and len(calls) == len(clears) == 3
+    assert len(set(calls)) == 1
+    assert counter.snapshot()['ocr_engine_inits'] == counter.snapshot()['ocr_worker_starts'] == 1
+    assert counter.snapshot()['ocr_worker_reuses'] == 2
+    isolated_ocr_pool.close()
+    assert ended == [created[0].owner]
+
+
+def test_timed_out_worker_is_replaced_and_never_reused(monkeypatch, isolated_ocr_pool):
+    release, exited = threading.Event(), threading.Event()
+    created = []
+    class Api:
+        def __init__(self): self.index = len(created); created.append(self)
+        def SetImage(self, image): pass
+        def Recognize(self):
+            if self.index == 0:
+                release.wait(5); exited.set()
+            return True
+        def GetIterator(self): return _WordIterator([('PHOTO', 95)])
+    monkeypatch.setattr(ipwork_ocr, 'tesserocr', SimpleNamespace(
+        RIL=SimpleNamespace(WORD=3), PyTessBaseAPI=lambda **kw: Api()))
+    monkeypatch.setattr(ipwork_ocr, 'OCR_CALL_TIMEOUT_SECONDS', .05)
+    try:
+        assert ipwork_ocr.process_ocr('owner', 'photo.jpg', _make_jpeg_bytes())['errorCode'] == 'ocr_timeout'
+        assert not exited.is_set()
+        for _ in range(2):
+            assert ipwork_ocr.process_ocr('owner', 'photo.jpg', _make_jpeg_bytes())['text'] == 'PHOTO'
+        assert len(created) == 2
+    finally:
+        release.set()
+        isolated_ocr_pool.close()
+
+
+def test_abandoned_worker_replacements_are_bounded(monkeypatch):
+    pool = ipwork_ocr._OcrPool(2)
+    monkeypatch.setattr(ipwork_ocr, '_POOL', pool)
+    release = threading.Event()
+    class Api:
+        def SetImage(self, image): pass
+        def Recognize(self): release.wait(5); return True
+        def GetIterator(self): return _WordIterator([])
+    monkeypatch.setattr(ipwork_ocr, 'tesserocr', SimpleNamespace(
+        RIL=SimpleNamespace(WORD=3), PyTessBaseAPI=lambda **kw: Api()))
+    monkeypatch.setattr(ipwork_ocr, 'OCR_CALL_TIMEOUT_SECONDS', .03)
+    try:
+        for _ in range(2):
+            assert ipwork_ocr.process_ocr('owner', 'photo.jpg', _make_jpeg_bytes())['errorCode'] == 'ocr_timeout'
+        result = ipwork_ocr.process_ocr('owner', 'photo.jpg', _make_jpeg_bytes())
+        assert result['errorCode'] == 'ocr_engine_failed' and 'capacity exhausted' in result['error']
+        assert len(pool.workers) == 2
+    finally:
+        release.set()
+        pool.close()
+
+
+def test_concurrent_sources_use_separate_thread_owned_engines(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    barrier = threading.Barrier(2)
+    owners = set()
+    lock = threading.Lock()
+    class Api:
+        def __init__(self):
+            self.owner = threading.get_ident()
+            with lock: owners.add(self.owner)
+        def SetImage(self, image): assert threading.get_ident() == self.owner
+        def Recognize(self):
+            assert threading.get_ident() == self.owner
+            barrier.wait(5)
+            return True
+        def GetIterator(self): return _WordIterator([('PHOTO', 95)])
+    monkeypatch.setattr(ipwork_ocr, 'tesserocr', SimpleNamespace(
+        RIL=SimpleNamespace(WORD=3), PyTessBaseAPI=lambda **kw: Api()))
+    with ThreadPoolExecutor(max_workers=2) as callers:
+        tasks = [callers.submit(ipwork_ocr.process_ocr, 'owner', 'photo.jpg', _make_jpeg_bytes()) for _ in range(2)]
+        assert [task.result() for task in tasks] == [{'hasData': True, 'text': 'PHOTO'}] * 2
+    assert len(owners) == 2
+
+
+def test_timeout_retains_owned_pixels_after_shared_source_job_closes(monkeypatch, isolated_ocr_pool):
+    from ipwork_image import image_job
+    release = threading.Event()
+    pixels = []
+    class Api:
+        def SetImage(self, image): pixels.append(image)
+        def Recognize(self): release.wait(5); return True
+        def GetIterator(self): return _WordIterator([])
+    monkeypatch.setattr(ipwork_ocr, 'tesserocr', SimpleNamespace(
+        RIL=SimpleNamespace(WORD=3), PyTessBaseAPI=lambda **kw: Api()))
+    monkeypatch.setattr(ipwork_ocr, 'OCR_CALL_TIMEOUT_SECONDS', .03)
+    try:
+        with image_job(True):
+            assert ipwork_ocr.process_ocr('owner', 'photo.jpg', _make_jpeg_bytes())['errorCode'] == 'ocr_timeout'
+        assert pixels[0].getpixel((0, 0)) == (255, 255, 255)
+    finally:
+        release.set()
+        isolated_ocr_pool.close()
+    with pytest.raises(ValueError): pixels[0].getpixel((0, 0))

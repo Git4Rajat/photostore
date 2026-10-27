@@ -31,7 +31,7 @@ class ArtifactReceipts:
         except ResourceNotFoundError:
             return None
 
-    def _put(self, kind, payload):
+    def _prepare(self, kind, payload):
         def timestamp(value):
             if isinstance(value, datetime):
                 return value.isoformat()
@@ -43,6 +43,11 @@ class ArtifactReceipts:
         identity = digest(payload)
         key = kind + '!' + identity
         row = dict(PartitionKey=self.partition, RowKey=key, payload=encoded)
+        return identity, row
+
+    def _put(self, kind, payload):
+        identity, row = self._prepare(kind, payload)
+        key, encoded = row['RowKey'], row['payload']
         try:
             # New immutable receipts are the common path. Create-only proves
             # absence without a preliminary GET; retries must prove equality.
@@ -58,6 +63,26 @@ class ArtifactReceipts:
             if previous.get('payload') != encoded:
                 raise ValueError('Artifact receipt identity rebound')
         return identity
+
+    def _put_many(self, kind, payloads):
+        """Bounded create-only transactions; a conflicting batch fully rolls back.
+
+        Retry individual immutable creates only on 409, proving equality for
+        existing identities. Never publish a manifest until every batch succeeds.
+        """
+        prepared = [self._prepare(kind, payload) for payload in payloads]
+        for offset in range(0, len(prepared), 20):
+            batch = prepared[offset:offset + 20]
+            unique = {row['RowKey']: row for _, row in batch}
+            try:
+                self.table.submit_transaction([('create', row) for row in unique.values()])
+                processing_metrics.add(receipt_creates=len(unique), receipt_write_batches=1)
+            except (ResourceExistsError, TableTransactionError) as exc:
+                if isinstance(exc, TableTransactionError) and exc.status_code != 409:
+                    raise
+                for _, row in batch:
+                    self._put(kind, json.loads(row['payload']))
+        return [identity for identity, _ in prepared]
 
     @processing_metrics.purpose('artifact_capture')
     def capture(self, storage, metadata):
@@ -92,13 +117,27 @@ class ArtifactReceipts:
                     or lookup.get('processingRevision') != fence.revision):
                 raise ValueError('Face lookup is not qualified for this source generation')
             lookup_generation = lookup['generation']
-            for face_id in sorted(ids):
-                face = storage._CTX['face_table_client'].get_entity(self.library, face_id)
+            ordered_ids = sorted(ids)
+            face_table = storage._CTX['face_table_client']
+            embedding_table = storage._CTX.get('face_embeddings_table_client')
+            face_rows, embedding_rows = {}, {}
+            if len(ordered_ids) >= 4:
+                from table_reads import read_entities
+                face_rows = read_entities(face_table, self.library, ordered_ids)
+                if embedding_table:
+                    embedding_rows = read_entities(embedding_table, self.library, ordered_ids)
+            snapshots = []
+            for face_id in ordered_ids:
+                face = face_rows.get(face_id) if face_id in face_rows else face_table.get_entity(self.library, face_id)
+                if face is None:
+                    raise ValueError('Face snapshot row missing')
                 if (face.get('filename') != fence.filename or face.get('sourcePhotoId') != fence.photo
                         or face.get('processingRevision') != fence.revision or not face.get('processingFence')):
                     raise ValueError('Face snapshot source identity mismatch')
-                embedding_table = storage._CTX.get('face_embeddings_table_client')
-                embedded = embedding_table.get_entity(self.library, face_id) if embedding_table else face
+                embedded = (embedding_rows.get(face_id) if face_id in embedding_rows else
+                    embedding_table.get_entity(self.library, face_id)) if embedding_table else face
+                if embedded is None:
+                    raise ValueError('Face snapshot embedding missing')
                 if any(embedded.get(key) != face.get(key) for key in ('sourcePhotoId', 'processingRevision', 'processingFence')):
                     raise ValueError('Face and embedding attempts differ')
                 vector = json.loads(embedded.get('embedding') or '[]')
@@ -106,7 +145,8 @@ class ArtifactReceipts:
                         or any(type(v) not in (float, int) or not math.isfinite(v) for v in vector)
                         or not any(vector)):
                     raise ValueError('Face snapshot requires a valid versioned embedding')
-                snapshot_ids.append(self._put('face', dict(face, embedding=json.dumps(vector, separators=(',', ':')))))
+                snapshots.append(dict(face, embedding=json.dumps(vector, separators=(',', ':'))))
+            snapshot_ids = self._put_many('face', snapshots)
             # Do not publish a receipt from a lookup concurrently replaced by repair.
             again = table.get_entity(self.library, fence.filename)
             if dict(again) != dict(lookup):

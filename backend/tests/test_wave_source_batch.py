@@ -580,3 +580,74 @@ def test_admission_exception_drains_shared_executor_before_releasing_stage(world
         assert slow_finished.is_set(), 'Returned while a shared-executor source could still write'
     assert admissions == [2, 1]
     assert len(store._page('source-attempt!')) == 2
+
+
+def test_inspection_prefetches_inboxes_and_receipts_without_member_point_reads(world, monkeypatch):
+    metadata, wave, key = admit(world, 20)
+    store, _, _, table, _ = world
+    for _, filename in list(metadata.rows):
+        publish_completion(store, metadata, filename=filename)
+    original = table.get_entity
+    reads = []
+    def get(partition, key):
+        reads.append(key)
+        return original(partition, key)
+    monkeypatch.setattr(table, 'get_entity', get)
+    assert run(world, metadata, wave, key, lambda *a: pytest.fail('Reprocessed qualified source'))['state'] == 'ready'
+    selection_prefixes = ('source-completion!', 'manifest!', 'face!', 'deleted-source!', 'supersession!')
+    assert not [key for key in reads if key.startswith(selection_prefixes)]
+    assert not store._page('source-attempt!')
+
+
+def test_prefetched_receipt_still_rejects_corrupt_manifest(world):
+    from wave_source_batch import InspectionBatch, ReceiptBatch, MetadataBatch
+    from upload_wave_execution import _inspect_vision_member
+    metadata, wave, _ = admit(world, 1)
+    store, _, _, table, _ = world
+    intent = publish_completion(store, metadata, filename='photo-0.jpg')
+    partition = ReceiptBatch(table, store.library).partition
+    manifest = table.rows[partition, 'manifest!' + intent['artifactReceipt']['id']]
+    payload = json.loads(manifest['payload']); payload['faceCount'] = 123
+    manifest['payload'] = json.dumps(payload)
+    members = store._page(f'e!{wave}!m!')
+    rows = MetadataBatch(metadata, store.library, members)
+    receipts = ReceiptBatch(table, store.library)
+    receipts.inspection = InspectionBatch(store, members, rows, receipts)
+    with pytest.raises(ValueError, match='does not cover'):
+        _inspect_vision_member(store, wave, members[0], rows, receipts)
+
+
+def test_twenty_completed_sources_replace_eighty_point_reads_with_seven_queries(world, monkeypatch):
+    from wave_source_batch import InspectionBatch, ReceiptBatch, MetadataBatch
+    from upload_wave_execution import _inspect_vision_member
+    metadata, wave, _ = admit(world, 20)
+    store, _, _, table, _ = world
+    for _, filename in list(metadata.rows):
+        publish_completion(store, metadata, filename=filename)
+    members = store._page(f'e!{wave}!m!')
+    metadata = MetadataBatch(metadata, store.library, members)
+    original = table.get_entity
+    reads = []
+    monkeypatch.setattr(table, 'get_entity', lambda *a: (reads.append(a), original(*a))[1])
+    baseline = ReceiptBatch(table, store.library)
+    before = [_inspect_vision_member(store, wave, member, metadata, baseline) for member in members]
+    assert len(reads) == 80
+    reads.clear(); queries_before = len(table.queries)
+    batched = ReceiptBatch(table, store.library)
+    batched.inspection = InspectionBatch(store, members, metadata, batched)
+    after = [_inspect_vision_member(store, wave, member, metadata, batched) for member in members]
+    assert before == after
+    assert reads == [] and len(table.queries) - queries_before == 7
+
+
+def test_deletion_arriving_after_prefetch_wins_before_source_settlement(world):
+    from wave_settlement import deletion_key
+    metadata, wave, key = admit(world, 1)
+    store, _, _, table, _ = world
+    member = store._page(f'e!{wave}!m!')[0]
+    def deleted_during_source(*args):
+        table.submit_transaction([('create', store._row(
+            deletion_key(member['photoId'], member['processingRevision']), deleted=True))])
+    result = run(world, metadata, wave, key, deleted_during_source)
+    assert result['state'] in ('ready', 'indexing', 'complete')
+    assert store._required(member['RowKey'])['outcome'] == 'deleted'

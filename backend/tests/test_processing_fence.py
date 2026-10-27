@@ -177,3 +177,32 @@ def test_zero_face_result_publishes_an_explicit_attempt_bound_empty_lookup(world
     assert row['state'] == 'complete' and json.loads(row['faceIds']) == []
     assert row['processingFence'] == 'attempt' and row['sourcePhotoId'] == 'photo'
     assert not faces.rows and not embeddings.rows
+
+
+def test_face_writes_keep_one_fresh_source_check_per_artifact(world, monkeypatch):
+    *_, fence = world
+    original = ResultFence.check
+    checks = []
+    def check(self):
+        checks.append(self.attempt)
+        return original(self)
+    monkeypatch.setattr(ResultFence, 'check', check)
+    with result_fence(fence):
+        ids = storage_utils._store_client_face_entities('lib', 'photo.jpg', [_face(0), _face(40)])
+    assert len(ids) == 2
+    # Filename acquire + publish, and a check at each of two writes per face.
+    # Filename lease checks no longer duplicate those artifact checks.
+    assert len(checks) == 6
+
+
+def test_source_change_during_embedding_read_still_blocks_persistence(world, monkeypatch):
+    metadata, faces, embeddings, _, fence = world
+    read = embeddings.get_entity
+    def changed(*args, **kwargs):
+        row = metadata.get_entity('lib', 'photo.jpg')
+        metadata.upsert_entity(dict(row, processingFence='replacement-attempt'))
+        return read(*args, **kwargs)
+    monkeypatch.setattr(embeddings, 'get_entity', changed)
+    with result_fence(fence), pytest.raises(StaleProcessingResult):
+        storage_utils._store_client_face_entities('lib', 'photo.jpg', [_face(0)])
+    assert not faces.rows and not embeddings.rows

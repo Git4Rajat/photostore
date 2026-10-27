@@ -42,7 +42,7 @@ def test_immutable_face_snapshot_survives_live_face_changes_and_qualifies_inbox(
     assert received['completionQualified'] is False  # Scheduling/model-policy is separate.
 
 
-def test_manifest_is_not_published_after_a_partial_snapshot_failure(blobs, monkeypatch):
+def test_manifest_is_not_published_after_a_snapshot_batch_failure(blobs, monkeypatch):
     (metadata, _, _, _, fence), _ = blobs
     table = AtomicTable(); receipts = ArtifactReceipts(table, 'lib')
     row = terminal(dict(metadata.get_entity('lib', 'photo.jpg')))
@@ -53,7 +53,7 @@ def test_manifest_is_not_published_after_a_partial_snapshot_failure(blobs, monke
         submit = table.submit_transaction
         failed = [False]
         def outage(ops):
-            if ops[0][1]['RowKey'].startswith('face!') and len(table.rows) == 1 and not failed[0]:
+            if ops[0][1]['RowKey'].startswith('face!') and not failed[0]:
                 failed[0] = True; raise OSError('snapshot outage')
             return submit(ops)
         monkeypatch.setattr(table, 'submit_transaction', outage)
@@ -298,3 +298,32 @@ def test_new_immutable_receipts_skip_point_reads_but_retries_validate_existing_p
     table.rows[receipts.partition, 'face!' + identity]['payload'] = '{}'
     with pytest.raises(ValueError, match='identity rebound'):
         receipts._put('face', dict(filename='photo.jpg', embedding='[1,0]'))
+
+
+def test_face_receipt_batches_are_bounded_and_conflicts_prove_equality():
+    table = AtomicTable(); receipts = ArtifactReceipts(table, 'lib')
+    payloads = [dict(filename='photo.jpg', face=str(i), embedding='[1,0]') for i in range(45)]
+    identities = receipts._put_many('face', payloads)
+    assert [len(ops) for ops in table.transactions] == [20, 20, 5]
+    assert receipts._put_many('face', payloads) == identities
+    key = receipts.partition, 'face!' + identities[7]
+    table.rows[key]['payload'] = '{}'
+    with pytest.raises(ValueError, match='identity rebound'):
+        receipts._put_many('face', payloads)
+
+
+def test_partial_multi_batch_receipts_resume_without_changing_identity(monkeypatch):
+    table = AtomicTable(); receipts = ArtifactReceipts(table, 'lib')
+    payloads = [dict(filename='photo.jpg', face=str(i), embedding='[1,0]') for i in range(45)]
+    original = table.submit_transaction
+    def outage(ops):
+        if len(table.rows) == 20:
+            raise OSError('second batch unavailable')
+        return original(ops)
+    monkeypatch.setattr(table, 'submit_transaction', outage)
+    with pytest.raises(OSError): receipts._put_many('face', payloads)
+    assert len(table.rows) == 20
+    monkeypatch.setattr(table, 'submit_transaction', original)
+    ids = receipts._put_many('face', payloads)
+    assert len(table.rows) == len(set(ids)) == 45
+    assert ids == [receipts._prepare('face', payload)[0] for payload in payloads]

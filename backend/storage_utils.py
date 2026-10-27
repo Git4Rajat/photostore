@@ -1326,7 +1326,7 @@ def _finish_face_filename_write(user_id: str, filename: str, generation: str,
                         match_condition=MatchConditions.IfNotModified)
 
 
-def _renew_face_filename_write(user_id: str, filename: str, generation: str) -> None:
+def _renew_face_filename_write(user_id: str, filename: str, generation: str, *, artifact_checks_source=False) -> None:
     """Fence every mutation; extend only when less than 90 seconds remain."""
     if generation is None:
         return
@@ -1338,8 +1338,6 @@ def _renew_face_filename_write(user_id: str, filename: str, generation: str) -> 
         raise FaceFilenameLookupRetryableError('Filename face writer lost its lease')
     from processing_fence import current_fence
     fence = current_fence(user_id, filename)
-    if fence:
-        fence.check()
     etag = _face_filename_etag(current)
     now = datetime.now(timezone.utc)
     try:
@@ -1347,6 +1345,11 @@ def _renew_face_filename_write(user_id: str, filename: str, generation: str) -> 
     except (TypeError, ValueError):
         remaining = 0  # Cannot prove headroom: retain the conditional renewal.
     renewed = remaining <= _FACE_FILENAME_LEASE_SECONDS * .75
+    # The immediately following conditional artifact writer checks the source
+    # after reading its artifact ETag. Do not duplicate that metadata GET.
+    # A lookup renewal is itself a write and retains its own source check.
+    if fence and (not artifact_checks_source or renewed):
+        fence.check()
     if renewed:
         entity = dict(current)
         entity['leaseExpiresAt'] = (now + timedelta(seconds=_FACE_FILENAME_LEASE_SECONDS)).isoformat()
@@ -1787,9 +1790,9 @@ def _store_client_face_generation(user_id: str, filename: str, faces, *,
         # must run before upsert_entity below so the large array never lands
         # on the photofaces row. No-op (puts the field back) if the table
         # isn't configured, so older deploys keep today's inline behavior.
-        _renew_face_filename_write(user_id, filename, generation)
+        _renew_face_filename_write(user_id, filename, generation, artifact_checks_source=True)
         _extract_and_store_face_embedding(user_id, face_id, entity, strict=True)
-        _renew_face_filename_write(user_id, filename, generation)
+        _renew_face_filename_write(user_id, filename, generation, artifact_checks_source=True)
         from processing_fence import write_artifact
         write_artifact(face_table_client, entity, previous=existing, previous_known=True)
         stored_ids.append(face_id)

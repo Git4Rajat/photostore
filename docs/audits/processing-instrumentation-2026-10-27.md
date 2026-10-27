@@ -256,3 +256,15 @@ ContainerAppConsoleLogs_CL
 The summed attempt `wall_ms` excludes inter-attempt gaps and any killed attempt
 that never emitted its closing summary. Use stage-start events and durable freeze
 time for end-to-end wall time, and identify missing summaries by attempt ID.
+
+## Inspection/persistence/OCR follow-up
+
+See [Vision follow-up](vision-overhead-followup-2026-10-27.md) for the bounded
+prefetch and reusable OCR-worker changes. New attempt/image counters include
+`vision_inspection_prefetches`, `vision_inspection_prefetch_ms`,
+`vision_inspection_prefetch_errors`, `receipt_write_batches`, `ocr_worker_starts`,
+`ocr_worker_reuses`, `ocr_worker_timeouts`, and `ocr_worker_capacity_errors`.
+Prefetch duration moved out of per-member inspection; include both when comparing
+inspection cost across versions. A resident OCR worker receives each request's
+accounting context anew and clears it after that request. Timed-out workers are
+retired and cannot contribute a complete per-image native timing sample.

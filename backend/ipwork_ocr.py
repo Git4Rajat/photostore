@@ -13,12 +13,12 @@ Uses tesserocr's in-process PyTessBaseAPI instead of the pytesseract
 subprocess wrapper this replaced (2026-08-28): pytesseract wrote each image
 to a temp file and forked a fresh `tesseract` CLI process per call, which
 reloads the trained data from disk on every single call. tesserocr links
-directly against libtesseract, so one PyTessBaseAPI per worker thread loads
+directly against libtesseract, so one PyTessBaseAPI per resident OCR thread loads
 the trained data once and is reused for every subsequent photo processed on
 that thread. PyTessBaseAPI is NOT thread-safe to share across threads --
-with IPWORKER_CONCURRENCY=2 there are 2 worker threads calling
-process_ocr() concurrently, so each gets its own instance via
-threading.local() rather than a single module-level instance.
+concurrent source workers borrow separate resident OCR workers, each owning an
+instance via threading.local() rather than a shared module-level engine. Healthy
+workers are reused; timed-out workers are retired and have bounded replacements.
 
 OMP_THREAD_LIMIT=1 (deploy/resources.bicep) still applies here even though
 this is no longer a subprocess call: it's a container-level env var on the
@@ -45,7 +45,7 @@ from typing import Dict, Optional
 
 from image_utils import RAW_EXTENSIONS_CINEMA, RAW_EXTENSIONS_RAWPY, extract_raw_preview_bytes
 from optional_deps import try_import
-from ipwork_image import rgb_image
+from ipwork_image import rgb_image, sharing_enabled
 
 tesserocr = try_import('tesserocr')
 
@@ -132,12 +132,9 @@ def _decodable_image_bytes(image_bytes: bytes, filename: str) -> bytes:
     return image_bytes
 
 
-def _recognize(image, outcome: 'queue.Queue') -> None:
-    """Runs on its own daemon thread (see process_ocr) so a hang inside
-    libtesseract's C++ core can be bounded. Puts exactly one
-    (status, payload) pair on `outcome`; never raises out to the thread
-    boundary since there's nothing on the other end to catch it once the
-    caller has given up waiting."""
+def _recognize(image):
+    """Execute entirely on one reusable worker; API state never crosses threads."""
+    api = None
     try:
         api = _get_api()
         api.SetImage(image)
@@ -147,12 +144,10 @@ def _recognize(image, outcome: 'queue.Queue') -> None:
         finally:
             metrics.add(ocr_recognition_ms=(time.monotonic() - started) * 1000)
         if not recognized:
-            outcome.put(('error', RuntimeError('OCR recognition failed')))
-            return
+            return 'error', RuntimeError('OCR recognition failed')
         iterator = api.GetIterator()
         if iterator is None:
-            outcome.put(('error', RuntimeError('OCR result iterator unavailable')))
-            return
+            return 'error', RuntimeError('OCR result iterator unavailable')
         word_confidences = []
         level = tesserocr.RIL.WORD
         while True:
@@ -162,10 +157,126 @@ def _recognize(image, outcome: 'queue.Queue') -> None:
                 word_confidences.append((iterator.GetUTF8Text(level), iterator.Confidence(level)))
             if not iterator.Next(level):
                 break
-        outcome.put(('ok', word_confidences))
+        return 'ok', word_confidences
     except Exception as exc:
-        outcome.put(('error', exc))
+        return 'error', exc
+    finally:
+        # Retain trained data, discard image/results and adaptation between
+        # independent photos. Both operations stay on the engine's owner thread.
+        if api is not None:
+            clear = getattr(api, 'Clear', None)
+            if callable(clear): clear()
+            clear_adaptive = getattr(api, 'ClearAdaptiveClassifier', None)
+            if callable(clear_adaptive): clear_adaptive()
 
+
+
+class _OcrJob:
+    def __init__(self, run, cleanup):
+        self.run, self.cleanup = run, cleanup
+        self.outcome = queue.Queue(maxsize=1)
+        self.lock = threading.Lock()
+        self.done = self.abandoned = False
+
+    def execute(self):
+        with self.lock:
+            if self.abandoned:
+                self.done = True
+                self.cleanup()
+                return
+        try:
+            result = self.run()
+        except Exception as exc:
+            result = 'error', exc
+        with self.lock:
+            self.done = True
+            if self.abandoned:
+                self.cleanup()
+            else:
+                self.outcome.put(result)
+
+    def abandon(self):
+        with self.lock:
+            self.abandoned = True
+            if self.done:
+                self.cleanup()
+
+
+class _OcrWorker:
+    def __init__(self, pool):
+        self.pool, self.retired = pool, False
+        self.jobs = queue.Queue(maxsize=1)
+        self.thread = threading.Thread(target=self._run, daemon=True, name='ocr-recognizer')
+
+    def _run(self):
+        try:
+            while True:
+                job = self.jobs.get()
+                if job is None: break
+                job.execute()
+                del job  # Idle engines retain no image, trace context or request closure.
+                with self.pool.lock:
+                    if self.retired: break
+        finally:
+            api = getattr(_thread_local, 'api', None)
+            try:
+                if api is not None and callable(getattr(api, 'End', None)): api.End()
+            except Exception:
+                pass  # Engine is being discarded on its owning thread.
+            finally:
+                if api is not None: del _thread_local.api
+                with self.pool.lock:
+                    self.pool.workers.discard(self)
+
+
+class _OcrPool:
+    """Bounded resident engines plus spare slots for abandoned native calls.
+
+    A timed-out worker is retired permanently. Its active native call retains
+    its image until it returns, and is never given another photo. No native
+    thread is killed, reused after timeout, or allowed unbounded replacements.
+    """
+    def __init__(self, limit):
+        self.limit, self.lock = limit, threading.Lock()
+        self.idle, self.workers = [], set()
+
+    def acquire(self):
+        with self.lock:
+            if self.idle:
+                metrics.add(ocr_worker_reuses=1)
+                return self.idle.pop()
+            if len(self.workers) >= self.limit:
+                metrics.add(ocr_worker_capacity_errors=1)
+                return None
+            worker = _OcrWorker(self)
+            self.workers.add(worker)
+            try:
+                worker.thread.start()
+            except Exception:
+                self.workers.remove(worker)
+                raise
+            metrics.add(ocr_worker_starts=1)
+            return worker
+
+    def release(self, worker):
+        with self.lock:
+            if not worker.retired: self.idle.append(worker)
+
+    def retire(self, worker):
+        with self.lock:
+            if worker.retired: return
+            worker.retired = True
+            if worker in self.idle: self.idle.remove(worker)
+            try: worker.jobs.put_nowait(None)
+            except queue.Full: pass  # A job timed out before the native thread took it.
+
+    def close(self):
+        with self.lock: workers = list(self.workers)
+        for worker in workers: self.retire(worker)
+        for worker in workers: worker.thread.join(timeout=1)
+
+
+_POOL = _OcrPool(max(1, int(os.getenv('IPWORKER_CONCURRENCY', '1'))) + 2)
 
 def process_ocr(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dict]:
     if tesserocr is None:
@@ -174,6 +285,16 @@ def process_ocr(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dic
     context = rgb_image(image_bytes, filename, _decodable_image_bytes)
     try:
         image = context.__enter__()
+        if sharing_enabled():
+            # The source job can finish and close its shared pixels after an
+            # OCR timeout. Give native recognition an independently owned copy.
+            try:
+                image = image.copy()
+            finally:
+                context.__exit__(None, None, None)
+            cleanup = image.close
+        else:
+            cleanup = lambda: context.__exit__(None, None, None)
     except Exception as exc:
         return {'hasData': False, 'error': str(exc), 'errorCode': error_code}
     error_code = 'ocr_engine_failed'
@@ -183,29 +304,31 @@ def process_ocr(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dic
     # for it, OCR would read sideways/upside-down text on any photo with a
     # non-default orientation. exif_transpose already applied inside
     # rgb_image()/_decode(), same as before this function was restructured.
-    outcome: 'queue.Queue' = queue.Queue(maxsize=1)
-    worker = threading.Thread(target=metrics.inherit(
-        lambda: _recognize(image, outcome), purpose_name='other'), daemon=True)
-    worker.start()
+    def close_image():
+        try: cleanup()
+        except Exception: pass
     try:
-        status, payload = outcome.get(timeout=OCR_CALL_TIMEOUT_SECONDS)
+        worker = _POOL.acquire()
+    except Exception as exc:
+        close_image()
+        return {'hasData': False, 'error': str(exc), 'errorCode': error_code}
+    if worker is None:
+        close_image()
+        return {'hasData': False, 'error': 'OCR worker capacity exhausted', 'errorCode': error_code}
+    job = _OcrJob(metrics.inherit(lambda: _recognize(image), purpose_name='other'), close_image)
+    worker.jobs.put_nowait(job)
+    try:
+        status, payload = job.outcome.get(timeout=OCR_CALL_TIMEOUT_SECONDS)
     except queue.Empty:
-        # Recognize() never returned within budget. tesserocr/libtesseract
-        # has no cooperative-cancellation API, so `worker` is abandoned, not
-        # joined or killed -- it leaks until the hang resolves or the
-        # process exits. Deliberately skips context.__exit__() (which would
-        # call image.close()): SetImage() may still hold a live reference
-        # into that image from inside the stuck call, and closing it out
-        # from under an abandoned thread risks a use-after-free crash in
-        # native code instead of a clean, contained timeout. Leaking one
-        # image's memory for a rare poison photo is the safer trade.
+        metrics.add(ocr_worker_timeouts=1)
+        job.abandon()
+        _POOL.retire(worker)
         return {'hasData': False, 'error': f'OCR recognition exceeded {OCR_CALL_TIMEOUT_SECONDS}s', 'errorCode': 'ocr_timeout'}
-    try:
-        context.__exit__(None, None, None)
-    except Exception:
-        pass
+    close_image()
     if status == 'error':
+        _POOL.retire(worker)
         return {'hasData': False, 'error': str(payload), 'errorCode': error_code}
+    _POOL.release(worker)
     word_confidences = payload
     # Word-level confidences (not full-page GetUTF8Text()) so low-confidence
     # words -- texture/grain tesseract hallucinated as "text", the dominant

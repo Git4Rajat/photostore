@@ -285,7 +285,7 @@ def _completion(store, member, identity, receipts=None, inboxes=None):
     return intent, manifest
 
 
-def _observe_qualified(store, member, metadata_table, receipts=None):
+def _observe_qualified(store, member, metadata_table, receipts=None, inboxes=None):
     from azure.core.exceptions import ResourceNotFoundError
     from processing_generation import is_superseded
     from image_utils import is_video_file
@@ -307,7 +307,7 @@ def _observe_qualified(store, member, metadata_table, receipts=None):
     identity = row.get('processingCompletionId')
     if not identity:
         return None, row
-    completion = _completion(store, member, identity, receipts)
+    completion = _completion(store, member, identity, receipts, inboxes)
     backlog = json.loads(row.get('processingCompletionOutbox') or '[]') if completion is None else []
     if not isinstance(backlog, list):
         raise ValueError('Processing completion outbox must be a list')
@@ -340,11 +340,14 @@ def _observe_qualified(store, member, metadata_table, receipts=None):
 def _inspect_vision_member(store, wave_id, member, metadata_table, receipts):
     from wave_settlement import source_state, verified
     from storage_utils import _processing_is_expired
-    if member['outcome'] not in ('pending', 'settled') and verified(store, member):
+    inspection = getattr(receipts, 'inspection', None)
+    proofs = inspection.proofs if inspection is not None else None
+    if member['outcome'] not in ('pending', 'settled') and verified(store, member, proofs=proofs):
         return None
-    if source_state(store, wave_id, member, metadata_table):
+    if source_state(store, wave_id, member, metadata_table, proofs=proofs):
         return None
-    completion, row = _observe_qualified(store, member, metadata_table, receipts)
+    completion, row = _observe_qualified(store, member, metadata_table, receipts,
+        inspection.inboxes if inspection is not None else None)
     leased = bool(row and any(row.get(k) for k in
         ('processing_lease_owner', 'processing_lease', 'processing_lease_expires_at')))
     runnable = completion is None and row is not None and (not leased or _processing_is_expired(row))
@@ -465,6 +468,7 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
     # Qualifying/settling drained source results is a durable batch boundary.
     # Detect an intake reopen or lost release before interpreting those results.
     settlement_started = time.monotonic()
+    receipts.inspection = None  # Post-source qualification must see newly relayed inboxes.
     getattr(renew, 'boundary', renew)()
     observations = []
     for item in planned:
@@ -473,6 +477,9 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
             if item['runnable']:
                 renew()
                 metadata.invalidate(member['filename'])
+                from wave_settlement import source_state
+                if source_state(store, wave_id, member, metadata):
+                    continue
                 count, _ = counts[member['RowKey']]
                 error = errors.get(member['RowKey'])
                 if error is not None and not exhausted(store, wave_id, member, metadata, count):
@@ -513,11 +520,12 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
     revision; the runtime queues the continuation before acknowledging its wake.
     """
     import time
+    import processing_metrics as metrics
     from contextlib import nullcontext
     from concurrent.futures import ThreadPoolExecutor
     from execution_lease import execution_scope, OwnershipLost
     from upload_waves import MAX_PAGE
-    from wave_source_batch import MetadataBatch, ReceiptBatch, commit_observations
+    from wave_source_batch import MetadataBatch, ReceiptBatch, InspectionBatch, commit_observations
     from processing_checks import CoalescedCheck
     from processing_cleanup import source_policy_scope
     if type(source_workers) is not int or not 1 <= source_workers <= MAX_PAGE:
@@ -559,6 +567,8 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
                     prepare_sources(members, metadata, renew, expired)
                     renew()
                     progressed()
+                with metrics.timer('vision_inspection_prefetch', count_name='vision_inspection_prefetches'):
+                    receipts.inspection = InspectionBatch(store, members, metadata, receipts)
                 processed = []
                 observations = _process_vision_group(store, wave_id, members,
                     metadata, process_source, renew, progressed, executor, receipts, inspection_failures,

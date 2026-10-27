@@ -32,8 +32,12 @@ def settle(store,wave_id,member,outcome,reason,*,witness,maintenance=False,pendi
     return store._required(member['RowKey'])
 
 
-def verified(store,member):
-    proof=store._get('settlement!'+member.get('evidenceId',''))
+def _proof(store, key, proofs):
+    return proofs[key] if proofs is not None and key in proofs else store._get(key)
+
+
+def verified(store,member, *, proofs=None):
+    proof=_proof(store, 'settlement!'+member.get('evidenceId',''), proofs)
     if not proof:return False
     body=json.loads(proof['payload'])
     return (digest(body)==member['evidenceId'] and body.get('outcome')==member['outcome']
@@ -44,9 +48,9 @@ def verified(store,member):
 def deletion_key(photo,revision):return 'deleted-source!'+digest([photo,revision])
 
 
-def source_state(store,wave_id,member,metadata):
+def source_state(store,wave_id,member,metadata, *, proofs=None):
     """Only durable deletion/successor proof can automatically exclude old input."""
-    deleted=store._get(deletion_key(member['photoId'],member['processingRevision']))
+    deleted=_proof(store, deletion_key(member['photoId'],member['processingRevision']), proofs)
     if deleted:
         return settle(store,wave_id,member,'deleted','permanent_deletion',witness=dict(deleted))
     try:row=metadata.get_entity(store.library,member['filename'])
@@ -55,10 +59,10 @@ def source_state(store,wave_id,member,metadata):
         return settle(store,wave_id,member,'deleted','source_tombstone',witness=dict(row))
     if row.get('anonymousImageId') and row.get('processingRevision') and (
             row['anonymousImageId']!=member['photoId'] or row['processingRevision']!=member['processingRevision']):
-        admitted=store._get('admitted-source!'+digest([row['anonymousImageId'],row['processingRevision']]))
+        admitted=_proof(store, 'admitted-source!'+digest([row['anonymousImageId'],row['processingRevision']]), proofs)
         if admitted and admitted['filename']==member['filename']:
             return settle(store,wave_id,member,'superseded','admitted_replacement',witness=dict(admitted))
-    successor=store._get('supersession!'+digest([member['photoId'],member['processingRevision']]))
+    successor=_proof(store, 'supersession!'+digest([member['photoId'],member['processingRevision']]), proofs)
     if successor:
         return settle(store,wave_id,member,'superseded','admitted_successor',witness=dict(successor))
     return None

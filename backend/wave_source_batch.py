@@ -17,6 +17,7 @@ class ReceiptBatch(ArtifactReceipts):
     def __init__(self, table, library):
         super().__init__(table, library)
         self.rows = OrderedDict()
+        self.inspection = None
 
     def _remember(self, key, row):
         if row is not None and key.startswith(('manifest!', 'face!')):
@@ -41,6 +42,56 @@ class ReceiptBatch(ArtifactReceipts):
         add(receipt_cache_misses=1)
         self._remember(key, row)
         return row
+
+
+class InspectionBatch:
+    """Page-local selection snapshots; never used to authorize source writes.
+
+    Only immutable receipt payloads survive this page. Mutable inbox/proof
+    absence is discarded before post-processing qualification or relay.
+    """
+    def __init__(self, store, members, metadata, receipts):
+        import json
+        from table_reads import read_entities
+        from wave_settlement import deletion_key
+        self.inboxes = {}
+        proof_keys, inbox_keys = [], []
+        for member in members:
+            photo, revision = member['photoId'], member['processingRevision']
+            proof_keys.extend([deletion_key(photo, revision), 'supersession!' + digest([photo, revision])])
+            if member['outcome'] not in ('pending', 'settled') and member.get('evidenceId'):
+                proof_keys.append('settlement!' + member['evidenceId'])
+            try:
+                row = metadata.get_entity(store.library, member['filename'])
+            except ResourceNotFoundError:
+                continue
+            if (row.get('anonymousImageId') and row.get('processingRevision')
+                    and (row['anonymousImageId'], row['processingRevision']) != (photo, revision)):
+                proof_keys.append('admitted-source!' + digest([row['anonymousImageId'], row['processingRevision']]))
+            if row.get('processingCompletionId'):
+                inbox_keys.append('source-completion!' + digest([photo, revision]) + '!' + row['processingCompletionId'])
+        rows = read_entities(store.table, store.partition, [*proof_keys, *inbox_keys])
+        self.proofs = {key: rows[key] for key in proof_keys}
+        self.inboxes = {key: rows[key] for key in inbox_keys}
+        references = []
+        for inbox in self.inboxes.values():
+            if inbox is not None and inbox.get('artifactReceiptQualified'):
+                try:
+                    reference = json.loads(inbox['payload']).get('artifactReceipt')
+                    if isinstance(reference, dict) and isinstance(reference.get('id'), str):
+                        references.append(reference)
+                except (ValueError, TypeError):
+                    pass  # Per-member validation still reports corrupt evidence.
+        receipts.prefetch('manifest!' + ref['id'] for ref in references)
+        faces = []
+        for ref in references:
+            manifest = receipts._get('manifest!' + ref['id'])
+            if manifest is not None:
+                try:
+                    faces.extend('face!' + key for key in json.loads(manifest['payload'])['faceSnapshots'])
+                except (ValueError, TypeError, KeyError):
+                    pass
+        receipts.prefetch(faces)
 
 
 class MetadataBatch:

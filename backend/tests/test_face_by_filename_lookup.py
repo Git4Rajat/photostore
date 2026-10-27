@@ -211,7 +211,7 @@ def test_storage_phase_timings_cover_full_lazy_enumeration(lookup_ctx, monkeypat
     monkeypatch.setattr(storage_utils, '_begin_face_filename_write', begin)
     monkeypatch.setattr(faces, 'get_entity', get)
     monkeypatch.setattr(faces, 'query_entities', query)
-    monkeypatch.setattr(storage_utils, '_renew_face_filename_write', lambda *a: advance(.005))
+    monkeypatch.setattr(storage_utils, '_renew_face_filename_write', lambda *a, **kw: advance(.005))
     monkeypatch.setattr(faces, 'upsert_entity', lambda entity: advance(.04))
     published = []
 
