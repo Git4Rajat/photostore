@@ -3,6 +3,8 @@ from types import SimpleNamespace
 import pytest
 import app
 import wave_policy
+import upload_session_lease
+_SEND_EXPIRY_CHECK=upload_session_lease.send_check
 from upload_waves import ShadowWaves
 from test_wave_recovery import RuntimeTable
 
@@ -330,3 +332,64 @@ def test_existing_heartbeat_renews_authenticated_parent_but_cannot_resurrect_it(
     result=client.post('/upload/transfer-heartbeat',json=dict(waveSessionId='lease'))
     assert not result.json.get('leaseActive')
     assert store._required(store.session_key('lease'))['leaseExpiresAt']==1
+
+
+def test_discard_absent_session_needs_no_admission_queue_or_resume_ancestor(live_api,monkeypatch):
+    import upload_session_lease
+    client,store,_,_=live_api
+    monkeypatch.setattr(upload_session_lease,'send_check',lambda *args:pytest.fail('Discard must not enqueue expiry'))
+    result=client.post('/upload/waves/live/sessions/never-admitted/abandon',json=dict(reason='User discarded'))
+    assert result.status_code==200 and result.json['state']=='absent'
+    assert store._get(store.session_key('never-admitted')) is None
+    assert store._get('control') is None
+
+
+def test_discard_uses_current_revision_without_reopening_intake(live_api,monkeypatch):
+    import upload_session_lease
+    client,store,_,_=live_api
+    parent=store.open_session('discard',2)
+    store.register('discard',[dict(itemId='one',filename='one.jpg')])
+    store.resolve('discard','one',outcome='accepted',filename='one.jpg',photo_id='photo',processing_revision='revision',required_steps=['face'])
+    monkeypatch.setattr(upload_session_lease,'send_check',lambda *args:pytest.fail('Discard must not enqueue expiry'))
+    result=client.post('/upload/waves/live/sessions/discard/abandon',json=dict(reason='User discarded'))
+    assert result.status_code==200 and result.json['state']=='abandoned'
+    assert store._required(store.item_key('discard','one'))['outcome']=='accepted'
+    assert store._required(store.wave_key(parent['waveId']))['memberCount']==1
+    assert client.post('/upload/waves/live/sessions/discard/abandon',json=dict(reason='Retry discard')).status_code==200
+
+
+def test_missing_expiry_queue_is_service_failure_not_missing_photo(live_api,monkeypatch):
+    from azure.core.exceptions import ResourceNotFoundError
+    import upload_session_lease
+    client,store,_,_=live_api
+    error=ResourceNotFoundError('The specified queue does not exist.')
+    error.error_code='QueueNotFound'
+    def send(*args,**kwargs):raise error
+    monkeypatch.setattr(app,'queue_service_client',SimpleNamespace(get_queue_client=lambda name:SimpleNamespace(send_message=send)))
+    monkeypatch.setattr(upload_session_lease,'send_check',_SEND_EXPIRY_CHECK)
+    result=client.post('/upload/waves/live/sessions',json=dict(sessionId='missing-queue',declaredCount=1))
+    assert result.status_code==503 and result.json['code']=='upload_expiry_unavailable'
+    assert 'photo' not in result.json['error'].lower()
+    assert store._get(store.session_key('missing-queue')) is None
+
+
+def test_missing_source_still_reports_missing_photo_only_during_resolution(live_api):
+    client,store,_,_=live_api
+    store.open_session('missing-source',1)
+    store.register('missing-source',[dict(itemId='one',filename='one.jpg')])
+    result=client.post('/upload/waves/live/sessions/missing-source/resolve',json=dict(
+        itemId='one',outcome='accepted',filename='one.jpg'))
+    assert result.status_code==409 and result.json['error']=='Finalized photo not found'
+
+
+def test_unleased_heartbeat_upgrade_reports_missing_queue_as_service_failure(live_api,monkeypatch):
+    from upload_session_lease import ExpiryUnavailable
+    client,store,_,_=live_api
+    store.open_session('old-unleased',1)
+    monkeypatch.setattr(app,'_require_user_id',lambda **kw:('owner',None))
+    monkeypatch.setattr(app,'_mark_upload_activity_heartbeat',lambda user:None)
+    def unavailable(*args):raise ExpiryUnavailable('Upload expiry queue is not provisioned')
+    monkeypatch.setattr(upload_session_lease,'send_check',unavailable)
+    result=client.post('/upload/transfer-heartbeat',json=dict(waveSessionId='old-unleased'))
+    assert result.status_code==503 and result.json['code']=='upload_expiry_unavailable'
+    assert not store._required(store.session_key('old-unleased')).get('leaseExpiresAt')

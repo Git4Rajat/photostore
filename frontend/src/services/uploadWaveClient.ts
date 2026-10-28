@@ -137,10 +137,10 @@ export const closeWaveShadowSession = (sessionId: string, manifestRevision: stri
         { manifestRevision, closeId },
     );
 
-export const abandonWaveShadowSession = (sessionId: string, manifestRevision: string) =>
+export const abandonWaveShadowSession = (sessionId: string, manifestRevision?: string) =>
     callShadow<{ manifestRevision: string; state: string; abandonmentNeedsMore?: boolean }>(
         `${base()}/sessions/${encodeURIComponent(sessionId)}/abandon`,
-        { manifestRevision, reason: 'User discarded the paused upload' }, BATCH_REQUEST_CONFIG, true,
+        { ...(manifestRevision ? {manifestRevision} : {}), reason: 'User discarded the paused upload' }, BATCH_REQUEST_CONFIG, true,
     );
 
 // Reuse the existing heartbeat transport; the authenticated library is resolved

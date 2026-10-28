@@ -240,14 +240,9 @@ export const discardWaveShadowSession = async (session: PersistedUploadSession):
     await state.pending;
     try {
         if (state.closed) return;
-        // Idempotent open reads the current manifest revision, including after
-        // refresh, without replaying thousands of already registered items.
-        const readCurrent = () => parent.resumedFromSessionId
-            ? openWaveShadowSession(parent.id, parent.files.length, parent.resumedFromSessionId)
-            : openWaveShadowSession(parent.id, parent.files.length);
-        const current = await readCurrent();
-        if (!current) throw new Error('Upload discard could not be acknowledged. Retry Discard.');
-        let revision = current.manifestRevision;
+        // Read-and-cancel is owned by the server. Reopening an absent intake
+        // would require admission infrastructure and could fail on old lineage.
+        let revision: string | undefined;
         let staleRefreshes = 0;
         for (;;) {
             let result: Awaited<ReturnType<typeof abandonWaveShadowSession>>;
@@ -255,14 +250,12 @@ export const discardWaveShadowSession = async (session: PersistedUploadSession):
             catch (error) {
                 if (!(error instanceof Error) || !error.message.includes('Abandonment revision is stale')
                     || staleRefreshes++ >= 3) throw error;
-                const fresh = await readCurrent();
-                if (!fresh) throw error;
-                revision = fresh.manifestRevision;
+                revision = undefined; // Let the server read the current revision.
                 continue;
             }
             if (!result) throw new Error('Upload discard could not be acknowledged. Retry Discard.');
             revision = result.manifestRevision;
-            if (result.state === 'closed' || result.state === 'abandoned') {
+            if (['closed','abandoned','absent'].includes(result.state)) {
                 state.closed = true;
                 retireWaveOperation(session);
                 return;

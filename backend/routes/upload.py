@@ -59,7 +59,7 @@ def upload_transfer_heartbeat():
     if session:
         from upload_waves import ShadowWaves, Conflict
         from wave_policy import owned
-        from upload_session_lease import renew
+        from upload_session_lease import renew, ExpiryUnavailable
         # Resolve the authenticated library, never trust a library from JSON.
         _,library,error=app._require_library_context(require_auth=True)
         if error:return error
@@ -74,6 +74,10 @@ def upload_transfer_heartbeat():
                 return app.jsonify({'error':str(error)}),409
             except ResourceNotFoundError:
                 return app.jsonify({'error':'Upload session not found'}),404
+            except ExpiryUnavailable:
+                app.app.logger.exception('Upload expiry renewal wake unavailable')
+                return app.jsonify({'error':'Upload service is temporarily unavailable. Please retry.',
+                                    'code':'upload_expiry_unavailable'}),503
     return app.jsonify({'recorded': True})
 
 

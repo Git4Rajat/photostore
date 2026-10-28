@@ -8,6 +8,7 @@ from azure.core.exceptions import AzureError, ResourceNotFoundError
 import app
 from upload_waves import Conflict, MutationContention, ShadowWaves
 import upload_wave_shadow as source
+from upload_session_lease import ExpiryUnavailable
 
 MAX_MANIFEST_REQUEST = 2000
 MAX_RESOLVE_REQUEST = 100
@@ -57,8 +58,13 @@ def endpoint(function):
             response = app.jsonify(dict(_public(result), protocolMode='live' if live else 'shadow', dispatchable=False, evidenceQualified=False))
             response.headers['Cache-Control'] = 'no-store'
             return response
+        except ExpiryUnavailable:
+            app.app.logger.exception('Upload expiry wake unavailable')
+            return app.jsonify({'error':'Upload service is temporarily unavailable. Please retry.',
+                                'code':'upload_expiry_unavailable'}),503
         except ResourceNotFoundError:
-            return app.jsonify({'error': 'Finalized photo not found'}), 409
+            return app.jsonify({'error':'Upload session state not found',
+                                'code':'wave_state_not_found'}),409
         except MutationContention as error:
             response=app.jsonify({'error':str(error),'code':'wave_mutation_contention'})
             response.headers['Retry-After']='1'
@@ -174,7 +180,16 @@ def register_routes(blueprint):
         if not app.library_store.is_owner(account,store.library):
             raise Conflict('Only the library owner may abandon intake')
         from wave_settlement import abandon
-        result=abandon(store,session,data['manifestRevision'],reason=data['reason'])
+        reason=data['reason']
+        if not isinstance(reason,str) or not reason.strip() or len(reason)>256:
+            raise ValueError('Abandonment reason required')
+        parent=store._get(store.session_key(session))
+        if parent is None:
+            # Discard is an end operation. Never create an intake, validate a
+            # resume ancestor or enqueue an expiry check merely to discard it.
+            return store._row(store.session_key(session),sessionId=session,
+                              manifestRevision='',state='absent')
+        result=abandon(store,session,data.get('manifestRevision',parent['manifestRevision']),reason=reason)
         _drive(store,result['waveId'])
         return result
 

@@ -303,5 +303,19 @@ it('refreshes a stale discard revision after an in-flight finalize wins', async 
     mocks.abandon.mockRejectedValueOnce(new Error('Abandonment revision is stale'))
         .mockResolvedValueOnce({manifestRevision: 'closed', state: 'abandoned'});
     await discardWaveShadowSession(s);
-    expect(mocks.abandon.mock.calls[1]).toEqual([s.id, 'after-finalize']);
+    expect(mocks.abandon.mock.calls[1]).toEqual([s.id, undefined]);
+    expect(mocks.open).not.toHaveBeenCalled();
+});
+
+
+it('discard never reopens a never-admitted retry whose ancestor is missing', async () => {
+    mocks.live=true;
+    const s=session(1,'never-admitted-retry');
+    s.resumedFromSessionId='missing-ancestor';
+    mocks.open.mockRejectedValue(new Error('Upload admission failed: Finalized photo not found'));
+    mocks.abandon.mockReset().mockResolvedValue({state:'absent',manifestRevision:''});
+    await expect(discardWaveShadowSession(s)).resolves.toBeUndefined();
+    expect(mocks.open).not.toHaveBeenCalled();
+    expect(mocks.register).not.toHaveBeenCalled();
+    expect(mocks.abandon).toHaveBeenCalledWith(s.id,undefined);
 });

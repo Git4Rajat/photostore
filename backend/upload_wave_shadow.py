@@ -37,7 +37,10 @@ def source_identity(row):
 def resolve_source(store, metadata_table, session, item, outcome, filename):
     if outcome not in ('accepted', 'duplicate'):
         return store.resolve(session, item, outcome=outcome)
-    row = metadata_table.get_entity(store.library, filename)
+    try:
+        row = metadata_table.get_entity(store.library, filename)
+    except ResourceNotFoundError as error:
+        raise Conflict('Finalized photo not found') from error
     photo, revision, _qualified = source_identity(row)
     previous = store._required(store.item_key(session, item))
     if previous['outcome'] in ('accepted', 'duplicate'):

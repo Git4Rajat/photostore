@@ -6,6 +6,7 @@ Duplicate checks and deliveries are safe under the existing ETag fences.
 """
 import json
 import math
+from azure.core.exceptions import AzureError, ResourceNotFoundError
 from upload_waves import Conflict, ShadowWaves
 
 LEASE_SECONDS = 300
@@ -13,15 +14,21 @@ QUEUE_NAME = 'photostore-upload-expiry'
 TYPE = 'upload_session_expiry'
 
 
+class ExpiryUnavailable(AzureError):
+    """The durable expiry wake cannot be stored; admission must not proceed."""
+
+
 def send_check(library, session, delay=LEASE_SECONDS):
     import app
     if app.queue_service_client is None:
-        from azure.core.exceptions import AzureError
-        raise AzureError('Upload expiry queue unavailable')
+        raise ExpiryUnavailable('Upload expiry queue unavailable')
     queue = app.queue_service_client.get_queue_client(QUEUE_NAME)
     # Provisioned in IaC; never acknowledge admission without a durable wake.
-    queue.send_message(json.dumps(dict(type=TYPE, userId=library, sessionId=session)),
-                       visibility_timeout=max(0, math.ceil(delay)), time_to_live=-1)
+    try:
+        queue.send_message(json.dumps(dict(type=TYPE, userId=library, sessionId=session)),
+                           visibility_timeout=max(0, math.ceil(delay)), time_to_live=-1)
+    except ResourceNotFoundError as error:
+        raise ExpiryUnavailable('Upload expiry queue is not provisioned') from error
 
 
 def active(parent, now):
