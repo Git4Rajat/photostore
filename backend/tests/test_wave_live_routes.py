@@ -470,3 +470,39 @@ def test_modern_discard_preserves_live_finalization_then_closes_after_admission(
     assert result.status_code==200 and result.json['state']=='abandoned'
     assert store._required(store.item_key('finalizing','one'))['outcome']=='accepted'
     assert store._required(store.wave_key(opened['waveId']))['memberCount']==1
+
+
+def test_artifact_gc_defers_admission_before_sending_wake_then_allows_same_session(live_api,monkeypatch):
+    client,store,_,_=live_api
+    policy=store._required('policy')
+    store.table.submit_transaction([store._change(policy,dict(policy,gcOwner='gc',gcUntil=store.clock()+600))])
+    monkeypatch.setattr(upload_session_lease,'send_check',lambda *args:pytest.fail('No orphan wake while GC is known active'))
+    result=client.post('/upload/waves/live/sessions',json=dict(sessionId='after-gc',declaredCount=1))
+    assert result.status_code==409 and result.json['code']=='wave_artifact_cleanup_busy'
+    assert result.headers['Retry-After']=='2'
+    assert store._get(store.session_key('after-gc')) is None
+    policy=store._required('policy')
+    store.table.submit_transaction([store._change(policy,dict(policy,gcOwner='',gcUntil=0))])
+    monkeypatch.setattr(upload_session_lease,'send_check',lambda *args:None)
+    result=client.post('/upload/waves/live/sessions',json=dict(sessionId='after-gc',declaredCount=1))
+    assert result.status_code==200 and result.json['state']=='open'
+
+
+def test_gc_acquiring_after_preflight_still_gets_retryable_admission_error(live_api,monkeypatch):
+    client,store,_,_=live_api
+    def gc_starts(*args):
+        policy=store._required('policy')
+        store.table.submit_transaction([store._change(policy,dict(policy,gcOwner='gc',gcUntil=store.clock()+600))])
+    monkeypatch.setattr(upload_session_lease,'send_check',gc_starts)
+    result=client.post('/upload/waves/live/sessions',json=dict(sessionId='racing-gc',declaredCount=1))
+    assert result.status_code==409 and result.json['code']=='wave_artifact_cleanup_busy'
+    assert store._get(store.session_key('racing-gc')) is None
+
+
+def test_destructive_library_cleanup_is_not_classified_as_transient_artifact_gc(live_api):
+    client,store,_,_=live_api
+    policy=store._required('policy')
+    store.table.submit_transaction([store._change(policy,dict(policy,cleanupState='cleaning',gcUntil=store.clock()+600))])
+    result=client.post('/upload/waves/live/sessions',json=dict(sessionId='cleaning',declaredCount=1))
+    assert result.status_code==409 and result.json.get('code')!='wave_artifact_cleanup_busy'
+    assert store._get(store.session_key('cleaning')) is None

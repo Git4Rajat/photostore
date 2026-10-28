@@ -50,15 +50,26 @@ const callShadow = async <T = unknown>(
         if (waveLiveEnabled() && await waveProtocol() === 'legacy') return null;
         const payload = typeof body === 'function' ? await body() : body;
         if (sessionScope() !== scope) return null;
-        for (let attempt = 0; ; attempt += 1) {
+        const cleanupDeadline=Date.now()+90_000;
+        let contentionRetries=0;
+        let cleanupRetries=0;
+        for (;;) {
             if (sessionScope() !== scope) return null;
             try { return await postUpload<T>(path, payload, config); }
             catch (error) {
                 const failure=waveFailure(error);
                 const contention=failure.status===409 && (failure.body?.code==='wave_mutation_contention'
                     || failure.body?.error==='Concurrent wave mutation; retry the request');
-                if (!contention || attempt >= 3) throw error;
-                await new Promise(resolve => setTimeout(resolve, 250 * 2 ** attempt + Math.random() * 250));
+                const cleanupBusy=failure.status===409 && failure.body?.code==='wave_artifact_cleanup_busy';
+                if (cleanupBusy) {
+                    const remaining=cleanupDeadline-Date.now();
+                    if (remaining<=0) throw error;
+                    const delay=Math.min(remaining,5000,1000*2**Math.min(++cleanupRetries,3));
+                    await new Promise(resolve => setTimeout(resolve,delay));
+                    continue;
+                }
+                if (!contention || contentionRetries>=3) throw error;
+                await new Promise(resolve => setTimeout(resolve,250*2**contentionRetries++ + Math.random()*250));
             }
         }
     } catch (err) {

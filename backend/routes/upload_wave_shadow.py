@@ -6,7 +6,7 @@ import os
 from azure.core.exceptions import AzureError, ResourceNotFoundError
 
 import app
-from upload_waves import Conflict, MutationContention, ShadowWaves
+from upload_waves import ArtifactCleanupBusy, Conflict, MutationContention, ShadowWaves
 import upload_wave_shadow as source
 from upload_session_lease import ExpiryUnavailable
 
@@ -53,7 +53,12 @@ def endpoint(function):
                 if not owned(store.table,library) or not configuration_ready():
                     raise Conflict('Library is not enabled for the live wave protocol')
                 require_capability(store,'upload')
-                if store._required('policy').get('cleanupState'):raise Conflict('Library cleanup is in progress')
+                policy=store._required('policy')
+                if policy.get('cleanupState'):raise Conflict('Library cleanup is in progress')
+                # Check before admission queues a wake. Atomic mutation guards
+                # still catch GC starting after this inexpensive preflight.
+                if app.request.method=='POST' and policy.get('gcUntil',0)>store.clock():
+                    raise ArtifactCleanupBusy('Upload is waiting for background cleanup to finish.')
             result = function(store, data, *args, **kwargs)
             response = app.jsonify(dict(_public(result), protocolMode='live' if live else 'shadow', dispatchable=False, evidenceQualified=False))
             response.headers['Cache-Control'] = 'no-store'
@@ -65,6 +70,14 @@ def endpoint(function):
         except ResourceNotFoundError:
             return app.jsonify({'error':'Upload session state not found',
                                 'code':'wave_state_not_found'}),409
+        except ArtifactCleanupBusy as error:
+            import processing_diagnostics
+            from upload_waves import digest
+            processing_diagnostics.emit('upload_wave_deferred',library_id=digest(library),
+                reason='artifact_cleanup',operation=operation,retry_after_seconds=2)
+            response=app.jsonify({'error':str(error),'code':'wave_artifact_cleanup_busy','retryAfterSeconds':2})
+            response.headers['Retry-After']='2'
+            return response,409
         except MutationContention as error:
             response=app.jsonify({'error':str(error),'code':'wave_mutation_contention'})
             response.headers['Retry-After']='1'

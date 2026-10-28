@@ -201,3 +201,58 @@ it('retries normalized contention failures with the same stable payload', async 
         expect(mocks.post.mock.calls[0][1]).toEqual(mocks.post.mock.calls[1][1]);
     } finally { vi.useRealTimers(); }
 });
+
+it('waits through a 34-second artifact cleanup and replays identical admission once it clears', async () => {
+    vi.useFakeTimers();
+    try {
+        vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED','true');
+        const start=Date.now();
+        mocks.post.mockImplementation(async () => {
+            if (Date.now()-start<34000) throw new ApiError({kind:'client',status:409,retriable:false,requestId:'test',
+                message:'Upload is waiting for background cleanup to finish.',rawMessage:'GC active',
+                responseData:{error:'Upload is waiting for background cleanup to finish.',code:'wave_artifact_cleanup_busy'}});
+            return {manifestRevision:'opened'};
+        });
+        const pending=openWaveShadowSession('waiting-parent',2);
+        await vi.runAllTimersAsync();
+        await expect(pending).resolves.toMatchObject({manifestRevision:'opened'});
+        expect(Date.now()-start).toBeGreaterThanOrEqual(34000);
+        expect(Date.now()-start).toBeLessThan(40000);
+        for (const [,body] of mocks.post.mock.calls) expect(body).toEqual({sessionId:'waiting-parent',declaredCount:2});
+    } finally { vi.useRealTimers(); }
+});
+
+it('bounds the artifact-cleanup wait and retains its useful server error', async () => {
+    vi.useFakeTimers();
+    try {
+        vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED','true');
+        const start=Date.now();
+        mocks.post.mockRejectedValue(new ApiError({kind:'client',status:409,retriable:false,requestId:'test',
+            message:'Upload is waiting for background cleanup to finish.',rawMessage:'GC active',
+            responseData:{error:'Upload is waiting for background cleanup to finish.',code:'wave_artifact_cleanup_busy'}}));
+        const pending=openWaveShadowSession('still-busy',1);
+        const checked=expect(pending).rejects.toMatchObject({code:'wave_artifact_cleanup_busy'});
+        await vi.runAllTimersAsync();await checked;
+        expect(Date.now()-start).toBe(90000);
+        expect(mocks.post.mock.calls.length).toBeLessThan(25);
+    } finally { vi.useRealTimers(); }
+});
+
+it('does not keep retrying a real library cleanup or a changed account', async () => {
+    vi.useFakeTimers();
+    try {
+        vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED','true');
+        mocks.post.mockRejectedValueOnce(new ApiError({kind:'client',status:409,retriable:false,requestId:'test',
+            message:'Library cleanup is in progress',rawMessage:'Library cleanup is in progress'}));
+        await expect(openWaveShadowSession('cleaning',1)).rejects.toThrow('Library cleanup is in progress');
+        expect(mocks.post).toHaveBeenCalledTimes(1);
+        mocks.post.mockReset().mockImplementation(async () => {
+            mocks.scope='changed';
+            throw {status:409,responseData:{code:'wave_artifact_cleanup_busy'}};
+        });
+        const pending=openWaveShadowSession('old-account',1);
+        await vi.runAllTimersAsync();
+        expect(await pending).toBeNull();
+        expect(mocks.post).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
+});

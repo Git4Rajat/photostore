@@ -28,6 +28,10 @@ class Conflict(RuntimeError):
     pass
 
 
+class ArtifactCleanupBusy(Conflict):
+    """A bounded artifact GC currently fences mutations; retry unchanged."""
+
+
 class MutationContention(Conflict):
     """Conditional storage conflicts exhausted the bounded local retry loop."""
 
@@ -82,8 +86,11 @@ class ShadowWaves:
     def _policy_guard(self,changes=(),*,maintenance=False):
         policy=self._get('policy')
         if policy is None:return []
-        if (policy.get('cleanupState') or policy.get('gcUntil',0)>self.clock()) and not maintenance:
-            raise Conflict('Library cleanup has fenced wave mutations')
+        if not maintenance:
+            if policy.get('cleanupState'):
+                raise Conflict('Library cleanup has fenced wave mutations')
+            if policy.get('gcUntil',0)>self.clock():
+                raise ArtifactCleanupBusy('Upload is waiting for background cleanup to finish.')
         if any(op[1]['RowKey']=='policy' for op in changes):return []
         return [self._change(policy,dict(policy))]
 
