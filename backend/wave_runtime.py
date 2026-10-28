@@ -77,6 +77,7 @@ def process_source(library,filename,revision,renew):
     from processing_completion import TERMINAL,completion_capture_enabled,StaleProcessingResult
     from processing_generation import required_steps_for_media,enforcement_enabled
     from image_utils import is_video_file
+    from ipwork_image import original_input_job, crop_input_job
     if not completion_capture_enabled() or not enforcement_enabled():
         raise RuntimeError('Wave source completion and generation enforcement must be enabled together')
     renew()
@@ -87,7 +88,7 @@ def process_source(library,filename,revision,renew):
         row=lease['entity']
         if row.get('processingRevision')!=revision:
             raise StaleProcessingResult('Wave source was superseded')
-        with _source_heartbeat(storage,library,filename,lease,renew) as check:
+        with original_input_job(library,filename), crop_input_job(library,filename), _source_heartbeat(storage,library,filename,lease,renew) as check:
             runnable=[step for step in steps if row.get(step+'_status') not in TERMINAL]
             if runnable:
                 app._register_ipwork_processors()

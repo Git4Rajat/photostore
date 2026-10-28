@@ -1166,6 +1166,12 @@ class FaceFilenameLookupRetryableError(RuntimeError):
     """A filename writer is active or its generation/lease was lost; retry."""
 
 
+class FaceReconciliationCancelled(FaceFilenameLookupRetryableError):
+    def __init__(self, reason):
+        super().__init__('Batch reconciliation cancelled: ' + reason)
+        self.reason = reason
+
+
 def _face_query_request_options():
     """Bound each SDK page request, not the entire multi-page enumeration.
 
@@ -1457,8 +1463,12 @@ def reconcile_face_filename_indexes_batch(user_id: str, filenames, *, cancelled=
     generations = _FaceFilenameGenerations()
 
     def check_cancelled():
-        if time.monotonic() - started >= 90 or (cancelled is not None and cancelled()):
-            raise FaceFilenameLookupRetryableError('Batch reconciliation cancelled')
+        if cancelled is not None and cancelled():
+            metrics['cancellation_reason'] = 'caller_cancelled'
+            raise FaceReconciliationCancelled('caller_cancelled')
+        if time.monotonic() - started >= 90:
+            metrics['cancellation_reason'] = 'scan_timeout'
+            raise FaceReconciliationCancelled('scan_timeout')
 
     try:
         face_table = _CTX.get('face_table_client')

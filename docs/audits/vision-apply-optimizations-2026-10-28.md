@@ -11,7 +11,7 @@ The existing upload-session edits in this workspace are separate work.
 | `IPWORK_ARTIFACT_UPLOAD_RESPONSE_ENABLED` | `true` | Successful create-only, content-validated upload ACK supplies receipt ETag |
 | `IPWORK_ARTIFACT_PREVIEW_REUSE_ENABLED` | `true` | Reuse a bounded, decoded preview from the same source/revision |
 | `IPWORK_FACE_PERSIST_BATCH_ENABLED` | `true` | Conditional per-table transactions for fenced multi-face writes |
-| `IPWORK_SEMANTIC_TEXT_MODE` | `batch` | Set `direct` to bypass the broker |
+| `IPWORK_SEMANTIC_TEXT_MODE` | `direct` | Set `batch` to opt into the broker |
 | `IPWORK_SEMANTIC_TEXT_BATCH_SIZE` | `2` | Maximum texts per batch, permitted 1–8 |
 | `IPWORK_SEMANTIC_TEXT_WINDOW_MS` | `5` | Collection window, permitted 0–50 ms |
 
@@ -69,10 +69,11 @@ source/lease failures remain visible in the enclosing source/phase diagnostics.
 
 ## Semantic inference
 
-The default broker limit is two, matching the unchanged two-source architecture.
-The collection window remains five milliseconds; a full pair flushes immediately.
-Direct mode avoids the broker when testing sparse arrivals. Individual failure
-fallback and per-source digests/results are unchanged.
+Direct encoding is now the default: the first deployed upload produced 1,283
+singleton batches and no pairs, accumulating 6.8 seconds of collection wait.
+Opt-in batch mode retains limit two and a five-millisecond window; a full pair
+flushes immediately. Per-source digests/results and the encoder's model lock are
+unchanged. Batch mode remains available for controlled comparisons.
 
 Additional metrics include total collection time, per-request queue time,
 encoder service time, singleton batches and peak batch occupancy. Queue time
@@ -87,6 +88,43 @@ items divided by batches. Lock/inference/tokenization counters remain distinct.
 - [Real Azure receipt validation and verified cleanup](../benchmarks/vision-artifacts-azure-validation-20261028.md)
 
 Production deployment and fresh-upload throughput validation remain pending.
+
+## Follow-up integration fixes
+
+The first real wave exposed missing integration coverage: the old per-photo
+queue adapter opened crop/original input scopes, but `wave_runtime.process_source`
+did not. The wave adapter now opens both around inference **and** result apply,
+retaining only per-source references and cleaning them up on success or failure.
+This enables the preview reuse already implemented in promotion and lets apply
+reuse a fallback original instead of downloading it again. Existing identity,
+revision, JPEG validation and publication fencing checks remain unchanged.
+
+Reconciliation now raises a typed cancellation carrying `caller_cancelled` or
+`scan_timeout`. When, and only when, the caller cancellation coincides with the
+Vision stage deadline, the coordinator checkpoints the last processed cursor
+and returns normally. No members from the fetched preparation page are skipped
+or charged another source attempt. Existing runtime continuation scheduling then
+refunds the healthy dispatch attempt and sends a normal short/immediate wake,
+instead of waiting for five-minute queue redelivery. A scan's own 90-second
+timeout, early caller cancellation, lease loss and other exceptions still fail.
+
+`vision_deadline_yield` explicitly records the normal deadline transition.
+Reconciliation timing logs include `cancellation_reason`. Semantic configuration
+now uses scalar `semantic_text_mode`, `semantic_text_batch_size`, and
+`semantic_text_window_ms` fields: the logger rejects nested dictionaries, so
+the previous `semantic_text` dictionary was silently absent from telemetry.
+
+Regression coverage uses the real wave source adapter for buffer retention and
+cleanup, and the real stage coordinator/runtime for deadline cancellation,
+unchanged pending member/scan cursor, dispatch accounting and retry enqueue.
+It also verifies that early cancellation and genuine scan timeout still fail,
+and that scalar configuration survives the actual telemetry logger.
+
+Follow-up validation: **1,529 passed, one deselected** across the same 75 related
+modules. The deselected case is the independently reproduced upload-wave
+query-count assertion described below; the two previously failing baseline
+modules remain outside this run. Final runtime/semantic focused checks:
+**40 passed**. Changed modules compile and `git diff --check` passes.
 
 ## Validation
 

@@ -569,10 +569,14 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
             from processing_artifacts import upload_response_enabled
             from face_write_batch import enabled as face_batch_enabled
             from semantic_batching import runtime_config as semantic_runtime_config
+            semantic_config = semantic_runtime_config()
             processing_diagnostics.emit('vision_runtime_config', role='vision', wave_id=wave_id,
                 artifact_upload_response_enabled=upload_response_enabled(),
                 artifact_preview_reuse_enabled=os.getenv('IPWORK_ARTIFACT_PREVIEW_REUSE_ENABLED', 'true').lower() in ('1','true','yes'),
-                face_persist_batch_enabled=face_batch_enabled(), semantic_text=semantic_runtime_config(),
+                face_persist_batch_enabled=face_batch_enabled(),
+                semantic_text_mode=semantic_config['mode'],
+                semantic_text_batch_size=semantic_config['batch_size'],
+                semantic_text_window_ms=semantic_config['window']*1000,
                 member_fetch_size=member_fetch_size, processing_group_size=MAX_PAGE,
                 source_workers=source_workers, inspection_read_workers=4,
                 member_memory_limit_bytes=window.rows.memory_limit, member_disk_limit_bytes=window.rows.disk_limit,
@@ -590,7 +594,17 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
                 if members and prepare_sources is not None:
                     progressed()
                     with metrics.timer('vision_source_prepare', count_name='vision_source_prepare_calls'):
-                        prepare_sources(members, metadata, renew, expired)
+                        from storage_utils import FaceReconciliationCancelled
+                        try:
+                            prepare_sources(members, metadata, renew, expired)
+                        except FaceReconciliationCancelled as error:
+                            if error.reason != 'caller_cancelled' or not expired():
+                                raise
+                            # No sources from this page have been admitted yet.
+                            checkpoint('sources', cursor)
+                            processing_diagnostics.emit('vision_deadline_yield', wave_id=wave_id,
+                                phase='source_prepare', reason='stage_deadline')
+                            return store._required(store.wave_key(wave_id))
                     renew()
                     progressed()
                 with metrics.timer('vision_inspection_prefetch', count_name='vision_inspection_prefetches'):

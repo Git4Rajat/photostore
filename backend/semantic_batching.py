@@ -13,7 +13,7 @@ _ACTIVE = ContextVar('semantic_text_batcher', default=None)
 
 
 def runtime_config():
-    mode = os.getenv('IPWORK_SEMANTIC_TEXT_MODE', 'batch').lower()
+    mode = os.getenv('IPWORK_SEMANTIC_TEXT_MODE', 'direct').lower()
     size = int(os.getenv('IPWORK_SEMANTIC_TEXT_BATCH_SIZE', '2'))
     window = float(os.getenv('IPWORK_SEMANTIC_TEXT_WINDOW_MS', '5')) / 1000
     if mode not in ('direct', 'batch') or not 1 <= size <= 8 or not 0 <= window <= .05:

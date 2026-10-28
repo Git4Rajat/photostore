@@ -12,6 +12,11 @@ from semantic_batching import text_batches, current_batcher
 from test_processing_diagnostics import records
 
 
+@pytest.fixture(autouse=True)
+def broker_mode_for_broker_tests(monkeypatch):
+    monkeypatch.setenv('IPWORK_SEMANTIC_TEXT_MODE','batch')
+
+
 def test_parallel_text_requests_share_one_batch_and_only_wave_accounts_native_work():
     seen = []
     def encode(texts):
@@ -170,7 +175,8 @@ def test_runtime_defaults_two_and_direct_mode_bypasses_broker(monkeypatch):
     from semantic_batching import runtime_config
     monkeypatch.delenv('IPWORK_SEMANTIC_TEXT_BATCH_SIZE', raising=False)
     assert runtime_config()['batch_size']==2
-    monkeypatch.setenv('IPWORK_SEMANTIC_TEXT_MODE','direct')
+    monkeypatch.delenv('IPWORK_SEMANTIC_TEXT_MODE')
+    assert runtime_config()['mode']=='direct'
     with text_batches(lambda _: pytest.fail('Broker ran'), lambda _: [1]):
         assert current_batcher() is None
 
