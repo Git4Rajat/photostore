@@ -4,6 +4,7 @@ import type { PersistedUploadSession } from '../types/browserProcessing';
 const mocks = vi.hoisted(() => ({
     open: vi.fn(),
     abandon: vi.fn(),
+    legacyAbandon: vi.fn(),
     live: false,
     register: vi.fn(),
     resolve: vi.fn(),
@@ -14,7 +15,8 @@ const mocks = vi.hoisted(() => ({
 vi.mock('./uploadWaveClient', () => ({
     waveLiveEnabled: () => mocks.live,
     waveProtocol: async () => 'live',
-    abandonWaveShadowSession: mocks.abandon,
+    discardWaveSession: mocks.abandon,
+    abandonWaveShadowSession: mocks.legacyAbandon,
     WAVE_SHADOW_MAX_PAGE: 2000, WAVE_RESOLVE_MAX_BATCH: 100,
     openWaveShadowSession: mocks.open,
     registerWaveShadowItems: mocks.register,
@@ -49,7 +51,9 @@ beforeEach(() => {
     mocks.live = false;
     __resetWaveShadowStateForTests();
     vi.clearAllMocks();
-    mocks.open.mockResolvedValue({ waveId: 'wave-1', manifestRevision: 'rev-0' });
+    mocks.abandon.mockReset();
+    mocks.legacyAbandon.mockReset();
+    mocks.open.mockReset().mockResolvedValue({ waveId: 'wave-1', manifestRevision: 'rev-0' });
     mocks.register.mockImplementation(async (_sessionId: string, items: unknown[]) =>
         ({ manifestRevision: `rev-register-${items.length}`, registeredCount: items.length }));
     mocks.resolve.mockResolvedValue({ manifestRevision: 'rev-resolve' });
@@ -271,7 +275,7 @@ it('discard waits for restored registration but does not replay the remaining ma
     await restoring; await discarding;
     expect(mocks.register).toHaveBeenCalledTimes(1);
     expect(mocks.abandon).toHaveBeenCalledTimes(2);
-    expect(mocks.abandon.mock.calls[1]).toEqual([s.id, 'cancel-page']);
+    expect(mocks.abandon.mock.calls[1]).toEqual([s.id, undefined]);
     expect(mocks.resolve).not.toHaveBeenCalled();
 });
 
@@ -317,5 +321,27 @@ it('discard never reopens a never-admitted retry whose ancestor is missing', asy
     await expect(discardWaveShadowSession(s)).resolves.toBeUndefined();
     expect(mocks.open).not.toHaveBeenCalled();
     expect(mocks.register).not.toHaveBeenCalled();
-    expect(mocks.abandon).toHaveBeenCalledWith(s.id,undefined);
+    expect(mocks.abandon).toHaveBeenCalledWith(s.id,'missing-ancestor');
+    expect(mocks.abandon).toHaveBeenCalledWith('missing-ancestor',undefined);
+});
+
+
+it('falls back to exact-revision abandonment when the previous API has no discard route', async () => {
+    mocks.live=true;
+    const s=session(1,'old-api');
+    mocks.abandon.mockReset().mockRejectedValue(Object.assign(new Error('Not found'),{status:404}));
+    mocks.open.mockReset().mockResolvedValue({manifestRevision:'exact-revision',state:'open'});
+    mocks.legacyAbandon.mockReset().mockResolvedValue({state:'abandoned',manifestRevision:'closed'});
+    await discardWaveShadowSession(s);
+    expect(mocks.open).toHaveBeenCalledWith(s.id,1,undefined);
+    expect(mocks.legacyAbandon).toHaveBeenCalledWith(s.id,'exact-revision');
+});
+
+it('does not treat admission failure on an older API as successful discard', async () => {
+    mocks.live=true;
+    const s=session(1,'old-api-no-queue');
+    mocks.abandon.mockReset().mockRejectedValue(Object.assign(new Error('Not found'),{status:404}));
+    mocks.open.mockReset().mockRejectedValue(new Error('Upload expiry unavailable'));
+    await expect(discardWaveShadowSession(s)).rejects.toThrow('Upload expiry unavailable');
+    expect(mocks.legacyAbandon).not.toHaveBeenCalled();
 });

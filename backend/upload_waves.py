@@ -205,6 +205,7 @@ class ShadowWaves:
         def run():
             existing = self._get(key)
             if existing:
+                if existing.get('discardAbsent'):return dict(existing)
                 if existing['declaredCount'] != declared_count or existing.get('resumedFromSessionId', '') != resumed_from:
                     raise Conflict('A session declaration is immutable')
                 return dict(existing)

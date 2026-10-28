@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { PersistedUploadSession } from '../types/browserProcessing';
-const mocks = vi.hoisted(() => ({ scope: 'library-a', renew: vi.fn(), open: vi.fn(), register: vi.fn(), resolve: vi.fn(), close: vi.fn() }));
+const mocks = vi.hoisted(() => ({ scope: 'library-a', renew: vi.fn(), discard: vi.fn(), open: vi.fn(), register: vi.fn(), resolve: vi.fn(), close: vi.fn() }));
 vi.mock('./sessionScope', () => ({ sessionScope: () => mocks.scope }));
 vi.mock('./uploadWaveClient', () => ({ waveShadowEnabled: () => true, waveLiveEnabled: () => true,
+    discardWaveSession:mocks.discard,
     waveProtocol: async () => 'live', renewUploadWaveLease: mocks.renew,
     wireItemId: async (key: string) => `wire:${key}`, WAVE_SHADOW_MAX_PAGE: 2000, WAVE_RESOLVE_MAX_BATCH: 100,
     openWaveShadowSession: mocks.open, registerWaveShadowItems: mocks.register,
@@ -13,7 +14,7 @@ vi.mock('./uploadWaveClient', () => ({ waveShadowEnabled: () => true, waveLiveEn
 import { bindWaveChild, clearWaveOperationCachesForTests, declareWaveSelection, loadWaveOperation,
     retryWaveOperation, sliceWaveSelection, waveParentResolved } from './uploadWaveOperations';
 import { __resetWaveShadowStateForTests, ensureWaveShadowSessionOpened, finalizeWaveShadowSession,
-    cancelQueuedWaveSelection, liveWaveAdmission, heartbeatWaveSession, acknowledgeWaveFinalizedFile } from './uploadWaveSync';
+    discardWaveShadowSession, cancelQueuedWaveSelection, liveWaveAdmission, heartbeatWaveSession, acknowledgeWaveFinalizedFile } from './uploadWaveSync';
 const child = (files: File[], id: string): PersistedUploadSession => {
     const session: PersistedUploadSession = { id, createdAt: 1, files: files.map((file, index) => ({
         key: `${id}:${index}`, name: file.name, size: file.size, type: file.type, lastModified: file.lastModified,
@@ -30,6 +31,7 @@ beforeEach(() => {
         get length() { return storage.size; } });
     clearWaveOperationCachesForTests(); __resetWaveShadowStateForTests(); vi.clearAllMocks();
     mocks.scope = 'library-a';
+    mocks.discard.mockReset().mockResolvedValue({state:'absent',manifestRevision:''});
     mocks.renew.mockResolvedValue({leaseActive:true,leaseExpiresAt:1300,serverNow:1000});
     mocks.open.mockResolvedValue({ manifestRevision: 'open' });
     mocks.register.mockResolvedValue({ manifestRevision: 'registered' });
@@ -286,4 +288,49 @@ it('coalesces concurrent heartbeat renewals for the same active parent', async (
     expect(mocks.renew).toHaveBeenCalledTimes(1);
     complete({leaseActive:true,leaseExpiresAt:1300,serverNow:1000});
     await Promise.all([first,second]);
+});
+
+
+it('keeps the retry checkpoint until its unleased earlier parent has also closed', async () => {
+    const files=[new File(['a'],'a.jpg')];declareWaveSelection(files);
+    const original=child(files,'original');original.files[0].status='failed';
+    const retry=retryWaveOperation(original);
+    const root=retry.waveOperationId!;
+    mocks.discard.mockImplementation(async (id:string) => {
+        if (id===root) return {state:'absent',manifestRevision:'',resumedFromSessionId:original.waveOperationId};
+        throw new Error('Earlier parent finalization still active');
+    });
+    await expect(discardWaveShadowSession(retry)).rejects.toThrow('Earlier parent finalization still active');
+    expect(loadWaveOperation(root,mocks.scope)?.closed).not.toBe(true);
+    clearWaveOperationCachesForTests();__resetWaveShadowStateForTests();
+    mocks.discard.mockImplementation(async (id:string) => ({state:id===root ? 'absent' : 'abandoned',manifestRevision:'closed',
+        resumedFromSessionId:id===root ? original.waveOperationId : ''}));
+    await discardWaveShadowSession(retry);
+    expect(loadWaveOperation(root,mocks.scope)?.closed).toBe(true);
+    expect(loadWaveOperation(original.waveOperationId!,mocks.scope)?.closed).toBe(true);
+});
+
+it('follows server lineage when the older browser manifest has been lost', async () => {
+    const files=[new File(['a'],'a.jpg')];declareWaveSelection(files);
+    const current=child(files,'server-lineage');
+    mocks.discard.mockImplementation(async (id:string) => ({state:'abandoned',manifestRevision:'closed',
+        resumedFromSessionId:id===current.waveOperationId ? 'server-only-ancestor' : ''}));
+    await discardWaveShadowSession(current);
+    expect(mocks.discard).toHaveBeenCalledWith('server-only-ancestor',undefined);
+});
+
+it('closes every linked retry after multiple interruptions before retiring the root', async () => {
+    const files=[new File(['a'],'a.jpg')];declareWaveSelection(files);
+    let current=child(files,'multiple-retries');current.files[0].status='failed';
+    const ids=[current.waveOperationId!];
+    for (let i=0;i<3;i++) { current=retryWaveOperation(current);ids.push(current.waveOperationId!); }
+    const calls:string[]=[];
+    mocks.discard.mockImplementation(async (id:string,hint?:string) => {
+        calls.push(id);
+        expect(loadWaveOperation(ids[3],mocks.scope)?.closed).not.toBe(true);
+        return {state:'abandoned',manifestRevision:'closed',resumedFromSessionId:hint};
+    });
+    await discardWaveShadowSession(current);
+    expect(calls).toEqual([...ids].reverse());
+    for (const id of ids) expect(loadWaveOperation(id,mocks.scope)?.closed).toBe(true);
 });

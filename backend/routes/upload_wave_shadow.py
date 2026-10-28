@@ -172,6 +172,7 @@ def register_routes(blueprint):
             _drive(store,result['waveId'])
         return result
 
+    @blueprint.route('/upload/waves/live/sessions/<session>/discard', methods=['POST'])
     @blueprint.route('/upload/waves/live/sessions/<session>/abandon', methods=['POST'])
     @endpoint
     def wave_live_abandon(store,data,session):
@@ -179,16 +180,17 @@ def register_routes(blueprint):
         if error:return error
         if not app.library_store.is_owner(account,store.library):
             raise Conflict('Only the library owner may abandon intake')
-        from wave_settlement import abandon
+        from wave_settlement import abandon, fence_discard
         reason=data['reason']
         if not isinstance(reason,str) or not reason.strip() or len(reason)>256:
             raise ValueError('Abandonment reason required')
+        modern=app.request.path.endswith('/discard')
         parent=store._get(store.session_key(session))
-        if parent is None:
-            # Discard is an end operation. Never create an intake, validate a
-            # resume ancestor or enqueue an expiry check merely to discard it.
-            return store._row(store.session_key(session),sessionId=session,
-                              manifestRevision='',state='absent')
+        if modern or parent is None or parent.get('discardAbsent'):
+            parent=fence_discard(store,session,reason=reason,
+                                 resumed_from=data.get('resumedFromSessionId',''))
+        if parent.get('discardAbsent'):
+            return dict(parent,state='absent')
         result=abandon(store,session,data.get('manifestRevision',parent['manifestRevision']),reason=reason)
         _drive(store,result['waveId'])
         return result

@@ -73,7 +73,7 @@ def seal_expired(store, session):
 
 def expire(store, session, send, drive, emit=lambda **fields: None):
     parent = seal_expired(store, session)
-    if not parent:
+    if not parent or parent.get('discardAbsent'):
         # A pre-admission wake can outlive a failed create. No intake to close.
         return
     if parent['state'] != 'open':

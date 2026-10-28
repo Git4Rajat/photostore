@@ -1,11 +1,12 @@
 // @vitest-environment node
+import { ApiError } from './apiError';
 import { webcrypto } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({ post: vi.fn(), get: vi.fn(), scope: 'test' }));
 vi.mock('./sessionScope', () => ({ sessionScope: () => mocks.scope }));
 vi.mock('./apiClient', () => ({ postUpload: mocks.post, getUpload: mocks.get }));
-import { renewUploadWaveLease, waveLiveEnabled, waveProtocol, closeWaveShadowSession, openWaveShadowSession, registerWaveShadowItems, resolveWaveShadowItem, resolveWaveShadowItems } from './uploadWaveClient';
+import { discardWaveSession, abandonWaveShadowSession, renewUploadWaveLease, waveLiveEnabled, waveProtocol, closeWaveShadowSession, openWaveShadowSession, registerWaveShadowItems, resolveWaveShadowItem, resolveWaveShadowItems } from './uploadWaveClient';
 
 beforeEach(() => {
     mocks.scope = crypto.randomUUID();
@@ -151,4 +152,52 @@ it('renews the session lease using the existing heartbeat transport', async () =
 it('rejects heartbeat acknowledgment after switching libraries', async () => {
     mocks.post.mockImplementationOnce(async () => { mocks.scope='other';return {leaseActive:true}; });
     await expect(renewUploadWaveLease('parent')).rejects.toThrow('Upload library changed');
+});
+
+
+it('uses the versioned discard route and preserves its resume lineage', async () => {
+    mocks.post.mockResolvedValue({state:'absent',manifestRevision:'tombstone',resumedFromSessionId:'previous'});
+    await discardWaveSession('retry','previous');
+    const [url,body]=mocks.post.mock.calls[0];
+    expect(url).toContain('/sessions/retry/discard');
+    expect(body).toEqual({reason:'User discarded the paused upload',resumedFromSessionId:'previous'});
+});
+
+it('preserves exact manifest revisions for the preceding API compatibility path', async () => {
+    await abandonWaveShadowSession('parent','revision-42');
+    expect(mocks.post.mock.calls[0][0]).toContain('/sessions/parent/abandon');
+    expect(mocks.post.mock.calls[0][1].manifestRevision).toBe('revision-42');
+});
+
+
+it('keeps structured application 503 errors instead of the generic cold-start message', async () => {
+    vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED','true');
+    mocks.post.mockRejectedValue(new ApiError({kind:'unreachable',status:503,retriable:true,requestId:'test',
+        message:"Can't reach the server right now",rawMessage:'Upload service is temporarily unavailable. Please retry.',
+        responseData:{error:'Upload service is temporarily unavailable. Please retry.',code:'upload_expiry_unavailable'}}));
+    await expect(openWaveShadowSession('parent',1)).rejects.toMatchObject({status:503,code:'upload_expiry_unavailable',
+        message:'Upload admission failed: Upload service is temporarily unavailable. Please retry.'});
+});
+
+it('preserves normalized 404 status for the preceding-API discard fallback', async () => {
+    vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED','true');
+    mocks.post.mockRejectedValue(new ApiError({kind:'client',status:404,retriable:false,requestId:'test',
+        message:'Not found',rawMessage:'Not found'}));
+    await expect(discardWaveSession('parent')).rejects.toMatchObject({status:404});
+});
+
+it('retries normalized contention failures with the same stable payload', async () => {
+    vi.useFakeTimers();
+    try {
+        vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED','true');
+        mocks.post.mockRejectedValueOnce(new ApiError({kind:'client',status:409,retriable:false,requestId:'test',
+            message:'Concurrent wave mutation; retry the request',rawMessage:'Concurrent wave mutation; retry the request',
+            responseData:{code:'wave_mutation_contention',error:'Concurrent wave mutation; retry the request'}}))
+            .mockResolvedValueOnce({manifestRevision:'opened'});
+        const pending=openWaveShadowSession('stable-parent',2);
+        await vi.runAllTimersAsync();
+        await expect(pending).resolves.toMatchObject({manifestRevision:'opened'});
+        expect(mocks.post).toHaveBeenCalledTimes(2);
+        expect(mocks.post.mock.calls[0][1]).toEqual(mocks.post.mock.calls[1][1]);
+    } finally { vi.useRealTimers(); }
 });

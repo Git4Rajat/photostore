@@ -1,7 +1,10 @@
 import { waveParentFor, recordWaveItemResolved, waveParentResolved, waveSelectionSession, waveFileBelongs, loadWaveOperation, retireWaveOperation, retryWaveOperation } from './uploadWaveOperations';
+import { sessionScope } from './sessionScope';
 import type { PersistedUploadFile, PersistedUploadSession } from '../types/browserProcessing';
 import {
     abandonWaveShadowSession,
+    discardWaveSession,
+    type WaveDiscardResult,
     renewUploadWaveLease,
     wireItemId,
     waveLiveEnabled,
@@ -234,46 +237,93 @@ export const discardWaveShadowSession = async (session: PersistedUploadSession):
         await finalizeWaveShadowSession(session);
         return;
     }
-    const state = stateFor(parent.id);
-    if (state.closed || ('closed' in parent && parent.closed)) return;
-    state.discarding = true;
-    await state.pending;
+    const scope=sessionScope();
+    const visited=new Set<string>();
+    const held=new Set<WaveShadowSessionState>();
+    let legacyApi=false;
+    let currentId=parent.id;
     try {
-        if (state.closed) return;
-        // Read-and-cancel is owned by the server. Reopening an absent intake
-        // would require admission infrastructure and could fail on old lineage.
-        let revision: string | undefined;
-        let staleRefreshes = 0;
-        for (;;) {
-            let result: Awaited<ReturnType<typeof abandonWaveShadowSession>>;
-            try { result = await abandonWaveShadowSession(parent.id, revision); }
-            catch (error) {
-                if (!(error instanceof Error) || !error.message.includes('Abandonment revision is stale')
-                    || staleRefreshes++ >= 3) throw error;
-                revision = undefined; // Let the server read the current revision.
-                continue;
-            }
-            if (!result) throw new Error('Upload discard could not be acknowledged. Retry Discard.');
-            revision = result.manifestRevision;
-            if (['closed','abandoned','absent'].includes(result.state)) {
-                state.closed = true;
-                retireWaveOperation(session);
-                return;
-            }
-            if (!result.abandonmentNeedsMore) throw new Error('Upload discard is incomplete. Retry Discard.');
+        // Quiesce every locally known parent before sending cancellation.
+        let local: PersistedUploadSession | null=parent;
+        const localIds=new Set<string>();
+        while (local && !localIds.has(local.id)) {
+            localIds.add(local.id);
+            const state=stateFor(local.id); state.discarding=true; held.add(state);
+            const previous: string | undefined=local.resumedFromSessionId;
+            local=previous ? loadWaveOperation(previous,session.waveScope || scope) : null;
         }
-    } catch (error) {
-        // The existing abandonment endpoint is owner-only. Other library
-        // uploaders retain the ordinary resolve/close permissions and path.
-        if ((error as { status?: number }).status === 403
-            || (error instanceof Error && error.message.includes('Only the library owner may abandon intake'))) {
-            state.discarding = false;
-            await finalizeWaveShadowSession(session);
-            if (state.closed) return;
+        await Promise.all(Array.from(held,state => state.pending));
+        while (currentId) {
+            if (scope!==sessionScope()) throw new Error('Upload library changed.');
+            if (visited.has(currentId)) throw new Error('Upload recovery lineage contains a cycle.');
+            const candidate=currentId===parent.id ? parent : loadWaveOperation(currentId,session.waveScope || scope);
+            const state=stateFor(currentId); state.discarding=true; held.add(state);
+            await state.pending;
+            let revision: string | undefined;
+            let staleRefreshes=0;
+            let result: WaveDiscardResult | null=null;
+            for (;;) {
+                try {
+                    if (legacyApi) {
+                        // Previous APIs require the exact manifest revision.
+                        // Reopen only as a compatibility read; failures retain
+                        // the checkpoint, never infer that an intake is absent.
+                        if (!revision) {
+                            if (!candidate || ('closed' in candidate && candidate.closed)) {
+                                if (candidate && candidate.closed) {
+                                    result={state:'closed',manifestRevision:'',resumedFromSessionId:candidate.resumedFromSessionId};
+                                    break;
+                                }
+                                throw new Error('Upload recovery information requires an updated upload service.');
+                            }
+                            const opened=await openWaveShadowSession(currentId,candidate.files.length,candidate.resumedFromSessionId);
+                            if (!opened) throw new Error('Upload discard could not be acknowledged. Retry Discard.');
+                            revision=opened.manifestRevision;
+                            if (['closed','abandoned'].includes(opened.state || '')) {
+                                result={...opened,state:opened.state!};break;
+                            }
+                        }
+                        result=await abandonWaveShadowSession(currentId,revision);
+                    } else {
+                        result=await discardWaveSession(currentId,candidate?.resumedFromSessionId);
+                    }
+                } catch (error) {
+                    const failure=error as Error & {status?: number};
+                    if (!legacyApi && [404,405].includes(failure.status || 0)) {
+                        legacyApi=true; continue;
+                    }
+                    if ([403].includes(failure.status || 0) || failure.message?.includes('Only the library owner may abandon intake')) {
+                        const child=currentId===parent.id ? session : candidate;
+                        if (!child) throw error;
+                        state.discarding=false;
+                        await finalizeWaveShadowSession(child);
+                        state.discarding=true;
+                        if (!state.closed) throw error;
+                        result={state:'closed',manifestRevision:'',resumedFromSessionId:candidate?.resumedFromSessionId};
+                        break;
+                    }
+                    if (!failure.message?.includes('Abandonment revision is stale') || staleRefreshes++>=3) throw error;
+                    revision=undefined;continue;
+                }
+                if (!result) throw new Error('Upload discard could not be acknowledged. Retry Discard.');
+                if (['closed','abandoned','absent'].includes(result.state)) break;
+                if (!result.abandonmentNeedsMore) throw new Error('Upload discard is incomplete. Retry Discard.');
+                revision=result.manifestRevision;
+            }
+            if (scope!==sessionScope()) throw new Error('Upload library changed.');
+            visited.add(currentId);
+            // Follow committed links even when this browser lost the older
+            // local manifest. An unadmitted retry supplies its persisted link.
+            currentId=result?.resumedFromSessionId || candidate?.resumedFromSessionId || '';
         }
-        throw error;
+        // Do not retire any link until the whole chain is acknowledged. A
+        // failed ancestor cleanup can be retried after refresh from the root.
+        for (const id of Array.from(visited)) {
+            stateFor(id).closed=true;
+            retireWaveOperation({...session,waveOperationId:session.waveOperationId ? id : undefined});
+        }
     } finally {
-        state.discarding = false;
+        for (const state of Array.from(held)) state.discarding=false;
     }
 };
 

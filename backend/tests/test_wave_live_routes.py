@@ -5,7 +5,7 @@ import app
 import wave_policy
 import upload_session_lease
 _SEND_EXPIRY_CHECK=upload_session_lease.send_check
-from upload_waves import ShadowWaves
+from upload_waves import ShadowWaves, Conflict
 from test_wave_recovery import RuntimeTable
 
 
@@ -340,7 +340,7 @@ def test_discard_absent_session_needs_no_admission_queue_or_resume_ancestor(live
     monkeypatch.setattr(upload_session_lease,'send_check',lambda *args:pytest.fail('Discard must not enqueue expiry'))
     result=client.post('/upload/waves/live/sessions/never-admitted/abandon',json=dict(reason='User discarded'))
     assert result.status_code==200 and result.json['state']=='absent'
-    assert store._get(store.session_key('never-admitted')) is None
+    assert store._required(store.session_key('never-admitted'))['discardAbsent']
     assert store._get('control') is None
 
 
@@ -393,3 +393,80 @@ def test_unleased_heartbeat_upgrade_reports_missing_queue_as_service_failure(liv
     result=client.post('/upload/transfer-heartbeat',json=dict(waveSessionId='old-unleased'))
     assert result.status_code==503 and result.json['code']=='upload_expiry_unavailable'
     assert not store._required(store.session_key('old-unleased')).get('leaseExpiresAt')
+
+
+
+def test_discard_tombstone_prevents_late_open_and_ignores_its_expiry_wake(live_api):
+    from upload_session_lease import expire
+    client,store,_,_=live_api
+    result=client.post('/upload/waves/live/sessions/late-open/discard',json=dict(reason='Discard'))
+    assert result.status_code==200 and result.json['state']=='absent'
+    late=store.open_session('late-open',100)
+    assert late['state']=='abandoned' and late['discardAbsent']
+    with pytest.raises(Conflict,match='closed'):
+        store.register('late-open',[dict(itemId='one',filename='one.jpg')])
+    assert store._get('control') is None
+    expire(store,'late-open',lambda *args:pytest.fail('No reschedule'),lambda *args:pytest.fail('No wave to drive'))
+
+
+def test_open_committing_first_is_fenced_and_closed_by_discard_retry(live_api):
+    client,store,_,_=live_api
+    store.table.before_commit=lambda:store.open_session('racing',1)
+    result=client.post('/upload/waves/live/sessions/racing/discard',json=dict(reason='Discard'))
+    assert result.status_code==200 and result.json['state']=='abandoned'
+    parent=store._required(store.session_key('racing'))
+    assert parent['state']=='abandoned' and parent.get('abandoning')
+    assert store._required(store.wave_key(parent['waveId']))['openSessions']==0
+
+
+def test_discard_committing_first_prevents_inflight_open_transaction(live_api):
+    client,store,_,_=live_api
+    def discard_first():
+        result=client.post('/upload/waves/live/sessions/racing/discard',json=dict(reason='Discard'))
+        assert result.status_code==200 and result.json['state']=='absent'
+    store.table.before_commit=discard_first
+    result=store.open_session('racing',1)
+    assert result.get('discardAbsent') and result['state']=='abandoned'
+    assert store._get('control') is None
+
+
+def test_discard_unadmitted_retry_exposes_link_and_closes_unleased_parent(live_api):
+    client,store,_,_=live_api
+    old=store.open_session('old',2)
+    store.register('old',[dict(itemId='accepted',filename='a.jpg'),dict(itemId='pending',filename='b.jpg')])
+    store.resolve('old','accepted',outcome='accepted',filename='a.jpg',photo_id='photo',processing_revision='rev',required_steps=['face'])
+    result=client.post('/upload/waves/live/sessions/unadmitted/discard',json=dict(reason='Discard',resumedFromSessionId='old'))
+    assert result.status_code==200 and result.json['resumedFromSessionId']=='old'
+    result=client.post('/upload/waves/live/sessions/old/discard',json=dict(reason='Discard'))
+    assert result.status_code==200 and result.json['state']=='abandoned'
+    assert store._required(store.item_key('old','accepted'))['outcome']=='accepted'
+    assert store._required(store.wave_key(old['waveId']))['memberCount']==1
+    assert store._required(store.wave_key(old['waveId']))['openSessions']==0
+
+
+def test_discard_uses_stored_lineage_and_refuses_rebinding_it(live_api):
+    client,store,_,_=live_api
+    store.open_session('old',1)
+    store.open_session('retry',1,resumed_from='old')
+    result=client.post('/upload/waves/live/sessions/retry/discard',json=dict(reason='Discard',resumedFromSessionId='wrong'))
+    assert result.status_code==409
+    assert store._required(store.session_key('retry'))['state']=='open'
+    result=client.post('/upload/waves/live/sessions/retry/discard',json=dict(reason='Discard'))
+    assert result.status_code==200 and result.json['resumedFromSessionId']=='old'
+
+
+def test_modern_discard_preserves_live_finalization_then_closes_after_admission(live_api):
+    client,store,_,_=live_api
+    opened=store.open_session('finalizing',1)
+    store.register('finalizing',[dict(itemId='one',filename='one.jpg')])
+    item=store._required(store.item_key('finalizing','one'))
+    store.table.submit_transaction([store._change(item,dict(item,finalizeLeaseUntil=store.clock()+600))])
+    result=client.post('/upload/waves/live/sessions/finalizing/discard',json=dict(reason='Discard'))
+    assert result.status_code==409 and 'still in flight' in result.json['error']
+    assert store._required(store.session_key('finalizing'))['abandoning']
+    assert store._required(store.item_key('finalizing','one'))['outcome']=='reserved'
+    store.resolve('finalizing','one',outcome='accepted',filename='one.jpg',photo_id='photo',processing_revision='rev',required_steps=['face'])
+    result=client.post('/upload/waves/live/sessions/finalizing/discard',json=dict(reason='Discard'))
+    assert result.status_code==200 and result.json['state']=='abandoned'
+    assert store._required(store.item_key('finalizing','one'))['outcome']=='accepted'
+    assert store._required(store.wave_key(opened['waveId']))['memberCount']==1

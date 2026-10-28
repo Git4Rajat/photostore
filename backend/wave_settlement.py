@@ -165,6 +165,44 @@ def admit_reprocess(store,metadata):
     return row['waveId']
 
 
+def fence_discard(store,session,*,reason,resumed_from=''):
+    """Persist cancellation even when a timed-out admission has not committed.
+
+    Creating the session key competes atomically with open_session's create.
+    If open wins, retry fences its real parent; if cancellation wins, late
+    opens see a terminal tombstone and cannot add an open session to a wave.
+    """
+    from upload_waves import identifier
+    import uuid
+    identifier(session)
+    if resumed_from:
+        identifier(resumed_from)
+        if resumed_from==session:raise ValueError('A session cannot resume itself')
+    if not isinstance(reason,str) or not reason.strip() or len(reason)>256:
+        raise ValueError('Abandonment reason required')
+    def commit():
+        old=store._get(store.session_key(session))
+        if old is None:
+            row=store._row(store.session_key(session),sessionId=session,waveId='',
+                state='abandoned',discardAbsent=True,discardRequestedAt=store.clock(),
+                declaredCount=0,registeredCount=0,resolvedCount=0,
+                manifestRevision=uuid.uuid4().hex,resumedFromSessionId=resumed_from)
+        elif old.get('discardAbsent'):
+            previous=old.get('resumedFromSessionId','')
+            if previous and resumed_from and previous!=resumed_from:
+                raise Conflict('Discard lineage cannot be rebound')
+            if previous or not resumed_from:return dict(old)
+            row=dict(old,resumedFromSessionId=resumed_from)
+        else:
+            if resumed_from and old.get('resumedFromSessionId','')!=resumed_from:
+                raise Conflict('Discard lineage differs from admitted session')
+            if old['state']!='open' or old.get('abandoning'):return dict(old)
+            row=dict(old,abandoning=True,abandonReason=reason,discardRequestedAt=store.clock())
+        store.table.submit_transaction([store._change(old,row),*store._policy_guard()])
+        return row
+    return store._retry(commit)
+
+
 def abandon(store,session,manifest_revision,*,reason):
     """Operator-confirmed stop, one bounded reservation page per call.
     Resolved sources remain members; unknown/missing reservations are cancelled,

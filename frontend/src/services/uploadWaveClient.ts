@@ -29,6 +29,17 @@ export const waveProtocol = async (): Promise<'live' | 'legacy'> => {
     return pending;
 };
 
+// requestJson throws ApiError; direct Axios shapes remain supported for
+// callers/tests that bypass it. Preserve structured application failures.
+const waveFailure = (error: unknown) => {
+    const failure=error as {status?:number;responseData?:unknown;rawMessage?:string;message?:string;
+        response?:{status?:number;data?:unknown}};
+    const raw=failure?.response?.data ?? failure?.responseData;
+    const body=raw && typeof raw==='object' ? raw as {code?:string;error?:unknown} : undefined;
+    return {status:failure?.response?.status ?? failure?.status,body,
+        message:typeof body?.error==='string' ? body.error : failure?.message};
+};
+
 const callShadow = async <T = unknown>(
     path: string, body: unknown | (() => Promise<unknown>), config = SHADOW_REQUEST_CONFIG,
     admission = false,
@@ -43,10 +54,9 @@ const callShadow = async <T = unknown>(
             if (sessionScope() !== scope) return null;
             try { return await postUpload<T>(path, payload, config); }
             catch (error) {
-                const failure = error as { response?: { status?: number; data?: { code?: string; error?: string } } };
-                const contention = failure.response?.status === 409
-                    && (failure.response.data?.code === 'wave_mutation_contention'
-                        || failure.response.data?.error === 'Concurrent wave mutation; retry the request');
+                const failure=waveFailure(error);
+                const contention=failure.status===409 && (failure.body?.code==='wave_mutation_contention'
+                    || failure.body?.error==='Concurrent wave mutation; retry the request');
                 if (!contention || attempt >= 3) throw error;
                 await new Promise(resolve => setTimeout(resolve, 250 * 2 ** attempt + Math.random() * 250));
             }
@@ -56,9 +66,9 @@ const callShadow = async <T = unknown>(
         // reason instead of turning a library/session failure into a generic
         // error on every selected file. Outcome reporting remains best effort.
         if (admission && waveLiveEnabled()) {
-            const failure = err as { response?: { status?: number; data?: { error?: unknown } }; message?: string };
-            const reason = failure?.response?.data?.error;
-            throw Object.assign(new Error(`Upload admission failed: ${typeof reason === 'string' ? reason : failure?.message || 'Unable to contact the upload service.'}`), { status: failure.response?.status });
+            const failure=waveFailure(err);
+            throw Object.assign(new Error(`Upload admission failed: ${failure.message || 'Unable to contact the upload service.'}`),
+                {status:failure.status,code:failure.body?.code});
         }
         // Best-effort diagnostics only -- never surfaced to the user and
         // never thrown into the real upload path's callers.
@@ -89,7 +99,7 @@ export const WAVE_SHADOW_MAX_PAGE = 2000;
 export const WAVE_RESOLVE_MAX_BATCH = 100;
 
 export const openWaveShadowSession = (sessionId: string, declaredCount: number, resumedFromSessionId?: string) =>
-    callShadow<{ waveId: string; manifestRevision: string; state?: string; leaseActive?: boolean; leaseExpiresAt?: number; serverNow?: number }>(
+    callShadow<{ waveId: string; manifestRevision: string; state?: string; resumedFromSessionId?: string; leaseActive?: boolean; leaseExpiresAt?: number; serverNow?: number }>(
         `${base()}/sessions`,
         { sessionId, declaredCount, ...(resumedFromSessionId ? { resumedFromSessionId } : {}) },
         SHADOW_REQUEST_CONFIG, true,
@@ -137,8 +147,17 @@ export const closeWaveShadowSession = (sessionId: string, manifestRevision: stri
         { manifestRevision, closeId },
     );
 
+export interface WaveDiscardResult {
+    manifestRevision: string; state: string; abandonmentNeedsMore?: boolean; resumedFromSessionId?: string;
+}
+
+export const discardWaveSession = (sessionId: string, resumedFromSessionId?: string) =>
+    callShadow<WaveDiscardResult>(`${base()}/sessions/${encodeURIComponent(sessionId)}/discard`,
+        {reason:'User discarded the paused upload', ...(resumedFromSessionId ? {resumedFromSessionId} : {})},
+        BATCH_REQUEST_CONFIG,true);
+
 export const abandonWaveShadowSession = (sessionId: string, manifestRevision?: string) =>
-    callShadow<{ manifestRevision: string; state: string; abandonmentNeedsMore?: boolean }>(
+    callShadow<WaveDiscardResult>(
         `${base()}/sessions/${encodeURIComponent(sessionId)}/abandon`,
         { ...(manifestRevision ? {manifestRevision} : {}), reason: 'User discarded the paused upload' }, BATCH_REQUEST_CONFIG, true,
     );
