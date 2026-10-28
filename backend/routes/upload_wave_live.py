@@ -2,8 +2,45 @@
 from flask import g
 import os
 from azure.core.exceptions import AzureError
-from upload_waves import ShadowWaves,Conflict
+from upload_waves import ShadowWaves,Conflict,IntakeBindingConflict
 import wave_policy
+
+
+def finalized_replay(data):
+    """The guard verifies resolved items before any finalization can write."""
+    return getattr(g,'wave_finalize_replays',{}).get((data.get('waveSessionId'),data.get('waveItemId')))
+
+
+def _verified_replay(store, binding, data, metadata_table):
+    from upload_wave_shadow import source_identity
+    from azure.core.exceptions import ResourceNotFoundError
+    item=store._required(store.item_key(*binding))
+    if item['outcome'] not in ('accepted','duplicate'):return None
+    try:
+        source=metadata_table.get_entity(store.library,item['acceptedFilename'])
+    except ResourceNotFoundError as error:
+        raise IntakeBindingConflict(['sourceMissing']) from error
+    try:
+        photo,revision,_=source_identity(source)
+    except Conflict as error:
+        raise IntakeBindingConflict(['sourceUnavailable']) from error
+    differing=[]
+    if photo!=item['photoId']:differing.append('photoId')
+    if revision!=item['processingRevision']:differing.append('processingRevision')
+    if source.get('fileHash')!=data['sha256']:differing.append('sourceHash')
+    if data.get('blobName') and data['blobName']!=photo:differing.append('blobName')
+    if differing:raise IntakeBindingConflict(differing)
+    # Use the committed filename and policy, even if filename resolution or
+    # the default processing policy has changed since the original request.
+    return dict(complete=True,filename=item['acceptedFilename'],duplicates=[],
+        uploadId=data.get('uploadId') or '',bytesReceived=data.get('totalSize',0),
+        totalSize=data.get('totalSize',0),clientProcessingLateResultWaitSeconds=0,
+        processingIsolated=source.get('processingIsolated') is True)
+
+
+def _binding_conflict_response(app,error):
+    app.app.logger.warning('Wave finalize binding conflict fields=%s',','.join(error.fields))
+    return app.jsonify(error=str(error),code='wave_binding_conflict',fields=error.fields),409
 
 
 def install(blueprint):
@@ -48,9 +85,14 @@ def install(blueprint):
             files=data.get('files') if operation.endswith('-batch') else [data]
             if not isinstance(files,list) or not files:raise ValueError('Upload reservations required')
             bindings=[wave_policy.validate_admission(store,item,finalizing=True) for item in files]
+            if operation.startswith('finalize'):
+                g.wave_finalize_replays={binding:replay for binding,item in zip(bindings,files)
+                    if (replay:=_verified_replay(store,binding,item,app.metadata_table_client)) is not None}
             g.wave_upload=(store,bindings,operation)
             g.wave_source_token=wave_policy.begin_source_change()
             g.wave_finalize_token=wave_policy.begin_finalization(lambda:wave_policy.check_finalization(store,bindings))
+        except IntakeBindingConflict as error:
+            return _binding_conflict_response(app,error)
         except (Conflict,ValueError,KeyError,TypeError) as error:
             return app.jsonify(error=str(error),code='wave_admission_required'),409
         except AzureError:
@@ -72,12 +114,19 @@ def install(blueprint):
                 # publication even if dedup finds identical bytes (including
                 # itself on a retry). No-write duplicate selections use the
                 # explicit resolve endpoint instead.
-                session=resolve_source(store,app.metadata_table_client,*binding,
-                    'accepted',entry['filename'])
+                if binding in getattr(g,'wave_finalize_replays',{}):
+                    session=store._required(store.session_key(binding[0]))
+                else:
+                    session=resolve_source(store,app.metadata_table_client,*binding,
+                        'accepted',entry['filename'])
                 session=close_resolved_intake(store,session)
                 entry['waveResolution']=dict(sessionId=binding[0],itemId=binding[1],
                     manifestRevision=session['manifestRevision'],state=session['state'])
             response.set_data(app.jsonify(result).get_data())
+        except IntakeBindingConflict as error:
+            body,status=_binding_conflict_response(app,error)
+            body.status_code=status
+            return body
         except (AzureError,Conflict,ValueError):
             app.app.logger.exception('Wave finalize admission must be retried')
             # after_request hooks must return a Response, unlike route handlers.

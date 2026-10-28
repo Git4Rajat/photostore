@@ -327,6 +327,16 @@ export const discardWaveShadowSession = async (session: PersistedUploadSession):
     }
 };
 
+// A lost finalize response may leave server-accepted files locally unresolved.
+// Never rebind those results to cancelled just to stop the remaining upload.
+export const stopWaveShadowSession = async (session: PersistedUploadSession): Promise<void> => {
+    await finalizeWaveShadowSession(session);
+    const parent=waveParentFor(session);
+    if (!waveLiveEnabled() || await waveProtocol()==='legacy') return;
+    if (parent && stateFor(parent.id).closed) return;
+    await discardWaveShadowSession(session);
+};
+
 export const cancelQueuedWaveSelection = (files: File[]): Promise<void> => {
     const child = waveSelectionSession(files);
     return child ? finalizeWaveShadowSession(child) : Promise.resolve();

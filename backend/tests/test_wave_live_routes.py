@@ -210,7 +210,7 @@ def test_partial_finalize_batch_replays_and_keeps_unadmitted_sources_publishable
     store.open_session('partial', 2)
     store.register('partial',[dict(itemId=k,filename=k+'.jpg') for k in 'ab'])
     for k in 'ab':
-        metadata.create_entity(dict(PartitionKey='u',RowKey=k+'.jpg',anonymousImageId=k,processingRevision='r-'+k))
+        metadata.create_entity(dict(PartitionKey='u',RowKey=k+'.jpg',anonymousImageId=k,processingRevision='r-'+k,fileHash=k*64))
     bp=Blueprint('partial_upload',__name__);install(bp)
     @bp.route('/upload/finalize-batch',methods=['POST'])
     def finalized():
@@ -506,3 +506,84 @@ def test_destructive_library_cleanup_is_not_classified_as_transient_artifact_gc(
     result=client.post('/upload/waves/live/sessions',json=dict(sessionId='cleaning',declaredCount=1))
     assert result.status_code==409 and result.json.get('code')!='wave_artifact_cleanup_busy'
     assert store._get(store.session_key('cleaning')) is None
+
+
+@pytest.mark.parametrize('batch',[False,True])
+def test_finalize_replay_uses_committed_renamed_binding_without_source_writes(live_api,monkeypatch,batch):
+    client,store,metadata,_=live_api
+    from upload_wave_shadow import resolve_source
+    store.open_session('replay',1)
+    store.register('replay',[dict(itemId='i',filename='original.jpg')])
+    source=dict(PartitionKey='u',RowKey='renamed.jpg',anonymousImageId='photo',
+        processingRevision='revision',fileHash='a'*64,ocr_status='done')
+    metadata.create_entity(source)
+    parent=resolve_source(store,metadata,'replay','i','accepted','renamed.jpg')
+    monkeypatch.setattr(app,'_library_cleanup_block_reason',lambda *_:None)
+    monkeypatch.setattr(app,'_mark_fresh_upload_activity',lambda *_:None)
+    monkeypatch.setattr(app,'_mark_upload_activity_heartbeat',lambda *_:None)
+    monkeypatch.setattr(app,'enqueue_index_build',lambda *a,**k:None)
+    monkeypatch.setattr(app,'_queue_ipwork_release_check',lambda *_:None)
+    def forbidden(*a,**k):
+        pytest.fail('Committed finalize replay must not rewrite metadata or resolve a new filename')
+    monkeypatch.setattr(app,'finalize_uploaded_file',forbidden)
+    monkeypatch.setattr(app,'read_pending_anonymous_blob',forbidden)
+    body=dict(filename='original.jpg',sha256='a'*64,totalSize=123,
+        waveSessionId='replay',waveItemId='i',blobName='photo')
+    path='/upload/finalize-batch' if batch else '/upload/finalize'
+    for _ in range(2):
+        response=client.post(path,json=dict(files=[body]) if batch else body)
+        assert response.status_code==200,response.json
+        entry=response.json['results'][0] if batch else response.json
+        assert entry['filename']=='renamed.jpg' and entry['complete']
+        assert entry['totalSize']==123
+        assert entry['waveResolution']['state']=='closed'
+    assert metadata.get_entity('u','renamed.jpg')==source
+    assert store._required('session!replay')['resolvedCount']==1
+    assert store.status(parent['waveId'])['memberCount']==1
+
+
+@pytest.mark.parametrize('field,value,expected',[
+    ('anonymousImageId','replacement','photoId'),
+    ('processingRevision','replacement','processingRevision'),
+    ('fileHash','b'*64,'sourceHash'),
+])
+def test_finalize_replay_rejects_changed_source_before_route(live_api,monkeypatch,field,value,expected):
+    client,store,metadata,_=live_api
+    from upload_wave_shadow import resolve_source
+    store.open_session('changed',1)
+    store.register('changed',[dict(itemId='i',filename='a.jpg')])
+    metadata.create_entity(dict(PartitionKey='u',RowKey='a.jpg',anonymousImageId='photo',
+        processingRevision='revision',fileHash='a'*64))
+    resolve_source(store,metadata,'changed','i','accepted','a.jpg')
+    metadata.rows['u','a.jpg'][field]=value
+    def forbidden(*a,**k):pytest.fail('Changed source must be rejected before finalization')
+    monkeypatch.setattr(app,'finalize_uploaded_file',forbidden)
+    response=client.post('/upload/finalize',json=dict(filename='a.jpg',sha256='a'*64,
+        totalSize=123,waveSessionId='changed',waveItemId='i'))
+    assert response.status_code==409
+    assert response.json['code']=='wave_binding_conflict'
+    assert response.json['fields']==[expected]
+    assert 'Retry-After' not in response.headers
+    assert store._required(store.item_key('changed','i'))['processingRevision']=='revision'
+
+
+def test_finalize_binding_mismatch_after_write_is_not_reported_as_transient(live_api,monkeypatch):
+    from flask import Blueprint,Flask,jsonify
+    from routes.upload_wave_live import install
+    from upload_waves import IntakeBindingConflict
+    import upload_wave_shadow
+    _,store,_,_=live_api
+    store.open_session('conflict',1)
+    store.register('conflict',[dict(itemId='i',filename='a.jpg')])
+    bp=Blueprint('binding_conflict_upload',__name__);install(bp)
+    @bp.route('/upload/finalize',methods=['POST'])
+    def finalized():return jsonify(complete=True,filename='a.jpg')
+    api=Flask('binding_conflict_test');api.register_blueprint(bp)
+    def conflict(*a,**k):raise IntakeBindingConflict(['processingRevision','photoId'])
+    monkeypatch.setattr(upload_wave_shadow,'resolve_source',conflict)
+    response=api.test_client().post('/upload/finalize',json=dict(filename='a.jpg',
+        sha256='a'*64,waveSessionId='conflict',waveItemId='i'))
+    assert response.status_code==409
+    assert response.json['code']=='wave_binding_conflict'
+    assert response.json['fields']==['photoId','processingRevision']
+    assert 'Retry-After' not in response.headers

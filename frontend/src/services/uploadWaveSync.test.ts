@@ -33,6 +33,7 @@ import {
     ensureWaveShadowSessionOpened,
     finalizeWaveShadowSession,
     discardWaveShadowSession,
+    stopWaveShadowSession,
     resolveWaveShadowFile,
 } from './uploadWaveSync';
 
@@ -344,4 +345,28 @@ it('does not treat admission failure on an older API as successful discard', asy
     mocks.open.mockReset().mockRejectedValue(new Error('Upload expiry unavailable'));
     await expect(discardWaveShadowSession(s)).rejects.toThrow('Upload expiry unavailable');
     expect(mocks.legacyAbandon).not.toHaveBeenCalled();
+});
+
+
+it('Stop falls back to server closure when a lost finalize response conflicts with cancellation', async () => {
+    mocks.live=true;
+    const s=session(2,'stop-lost-response');
+    await ensureWaveShadowSessionOpened(s);
+    mocks.resolve.mockRejectedValue(new Error('Resolved intake item cannot be rebound'));
+    mocks.abandon.mockResolvedValue({state:'abandoned',manifestRevision:'stopped'});
+    await expect(stopWaveShadowSession(s)).resolves.toBeUndefined();
+    expect(mocks.abandon).toHaveBeenCalledWith('stop-lost-response',undefined);
+    expect(mocks.close).not.toHaveBeenCalled();
+});
+
+it('Stop surfaces failed server closure so the caller keeps its recovery checkpoint', async () => {
+    mocks.live=true;
+    const s=session(1,'stop-retry-closure');
+    await ensureWaveShadowSessionOpened(s);
+    mocks.resolve.mockRejectedValue(new Error('Resolved intake item cannot be rebound'));
+    mocks.abandon.mockRejectedValueOnce(new Error('storage unavailable'))
+        .mockResolvedValueOnce({state:'abandoned',manifestRevision:'stopped'});
+    await expect(stopWaveShadowSession(s)).rejects.toThrow('storage unavailable');
+    await expect(stopWaveShadowSession(s)).resolves.toBeUndefined();
+    expect(mocks.abandon).toHaveBeenCalledTimes(2);
 });

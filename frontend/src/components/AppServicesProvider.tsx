@@ -8,7 +8,7 @@ import { preloadLocalIndexes } from '../services/preloadLocalIndexes';
 import { startMediaTokenAutoRefresh } from '../services/mediaToken';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { get, getUpload, post, postTools, postUpload, resolveApiUrl } from '../services/apiClient';
-import { heartbeatWaveSession, discardWaveShadowSession, liveWaveAdmission, ensureWaveShadowSessionOpened, finalizeWaveShadowSession, resolveWaveShadowFile, acknowledgeWaveFinalizedFile, cancelQueuedWaveSelection } from '../services/uploadWaveSync';
+import { heartbeatWaveSession, discardWaveShadowSession, stopWaveShadowSession, liveWaveAdmission, ensureWaveShadowSessionOpened, finalizeWaveShadowSession, resolveWaveShadowFile, acknowledgeWaveFinalizedFile, cancelQueuedWaveSelection } from '../services/uploadWaveSync';
 import { hashLargeFile, LARGE_FILE_HASH_THRESHOLD } from '../utils/largeFileHash';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
 import { getRuntimeConfig } from '../config/appConfig';
@@ -329,6 +329,24 @@ const getUploadErrorMessage = (err: unknown, fallback: string): string => {
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const waitForUploadRetry = (delay: number, signal: AbortSignal): Promise<void> => new Promise((resolve,reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup=() => {
+        clearTimeout(timer);
+        window.removeEventListener('online',online);
+        signal.removeEventListener('abort',abort);
+    };
+    const abort=() => { cleanup(); reject(new Error(UPLOAD_STOPPED_ERROR)); };
+    const online=() => {
+        window.removeEventListener('online',online);
+        timer=setTimeout(() => { cleanup(); resolve(); },delay);
+    };
+    if (signal.aborted) { abort(); return; }
+    signal.addEventListener('abort',abort,{once:true});
+    if (navigator.onLine) online();
+    else window.addEventListener('online',online,{once:true});
+});
 
 // Caps how many submitted jobs run at once (at most `concurrency`), and lets
 // a caller check slot availability BEFORE committing to run something -- see
@@ -1112,6 +1130,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const uploadStopRequestedRef = useRef<boolean>(false);
     const uploadDiscardInProgressRef = useRef(false);
     const uploadAbortControllersRef = useRef<Set<AbortController>>(new Set());
+    const uploadRetryStopRef = useRef(new AbortController());
     // Hashes learned in this tab survive batch boundaries; downloaded library
     // hashes live separately so each refresh replaces, rather than accumulates, them.
     const knownHashesRef = useRef<Map<string, string>>(new Map());
@@ -1916,6 +1935,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // Same exponential backoff (capped 15s, MAX_FINALIZE_RETRIES attempts -- up
     // to ~75s total) for both, since a cold start is a cold start either way.
     const postUploadWithRetry = async (url: string, payload: any, signal?: AbortSignal) => {
+        const stopSignal=signal || uploadRetryStopRef.current.signal;
         let lastError: unknown = null;
         for (let attempt = 0; attempt < MAX_FINALIZE_RETRIES; attempt += 1) {
             if (uploadStopRequestedRef.current || signal?.aborted) {
@@ -1928,10 +1948,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 if (!isRetriableUploadError(err)) {
                     break;
                 }
-                if (!navigator.onLine) {
-                    await waitForOnline();
-                }
-                await sleep(Math.min(1000 * Math.pow(2, attempt), 15000));
+                await waitForUploadRetry(Math.min(1000 * Math.pow(2, attempt), 15000),stopSignal);
             }
         }
         throw lastError || new Error(`Request to ${url} failed.`);
@@ -1953,26 +1970,44 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         url: string,
         payload: any,
     ): Promise<any> => new Promise((resolve, reject) => {
+        const signal=uploadRetryStopRef.current.signal;
+        let inFlight=false;
+        let settled=false;
+        const finish=(error: unknown, result?: any) => {
+            if (settled) return;
+            settled=true;
+            signal.removeEventListener('abort',onStop);
+            if (error) reject(error); else resolve(result);
+        };
+        // Let an in-flight finalize return its durable result. Waiting work
+        // and retries can stop immediately without losing that confirmation.
+        const onStop=() => { if (!inFlight) finish(new Error(UPLOAD_STOPPED_ERROR)); };
+        signal.addEventListener('abort',onStop,{once:true});
         const attemptOnce = (attempt: number) => {
             gate.run(async () => {
-                if (uploadStopRequestedRef.current) {
-                    reject(new Error(UPLOAD_STOPPED_ERROR));
+                if (settled || signal.aborted || uploadStopRequestedRef.current) {
+                    finish(new Error(UPLOAD_STOPPED_ERROR));
                     return;
                 }
+                inFlight=true;
                 try {
-                    resolve(await postUpload(url, payload));
+                    finish(null,await postUpload(url, payload));
                 } catch (err) {
+                    inFlight=false;
+                    if (signal.aborted || uploadStopRequestedRef.current) {
+                        finish(new Error(UPLOAD_STOPPED_ERROR));
+                        return;
+                    }
                     if (attempt >= MAX_FINALIZE_RETRIES - 1 || !isRetriableUploadError(err)) {
-                        reject(err);
+                        finish(err);
                         return;
                     }
                     const delay = Math.min(1000 * Math.pow(2, attempt), 15000);
                     void (async () => {
-                        if (!navigator.onLine) {
-                            await waitForOnline();
-                        }
-                        await sleep(delay);
-                        attemptOnce(attempt + 1);
+                        try {
+                            await waitForUploadRetry(delay,signal);
+                            attemptOnce(attempt + 1);
+                        } catch (error) { finish(error); }
                     })();
                 }
             });
@@ -3032,10 +3067,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                             break;
                         } catch (err) {
                             if (isRetriableUploadError(err)) {
-                                if (!navigator.onLine) {
-                                    await waitForOnline();
-                                }
-                                await sleep(100 * Math.pow(2, attempt));
+                                await waitForUploadRetry(100 * Math.pow(2, attempt),
+                                    options?.signal || uploadRetryStopRef.current.signal);
                             }
                             lastError = err;
                         }
@@ -3147,6 +3180,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
 
         isResumingUploadRef.current = true;
+        uploadRetryStopRef.current = new AbortController();
         const uploadRunGeneration = uploadRunGenerationRef.current + 1;
         const uploadBatchId = crypto.randomUUID();
         const telemetryStartedAt = performance.now();
@@ -3282,15 +3316,29 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         // relying on that ref there would read every file back as whatever
         // stale status `normalized`/`session` captured at the start.
         const waveShadowFileOutcomes = new Map<string, Pick<PersistedUploadFile, 'status' | 'skippedDuplicate' | 'waveAcceptedFilename'>>();
-        const cleanupStoppedUpload = (latest: PersistedUploadSession) => {
+        const cleanupStoppedUpload = async (latest: PersistedUploadSession): Promise<boolean> => {
             // Committed files may still be finalizing when Stop rejects the
             // transfer workers. Never delete their reservations/blobs while
-            // finalization is using them. Keep the UI responsive and use this
-            // run's outcomes even after its persisted session has been cleared.
-            void Promise.allSettled(Array.from(pendingFinalizeTasks)).then(() => cleanupUnfinishedUploadArtifacts({
+            // finalization is using them. Keep the checkpoint until closure
+            // succeeds, including results returned after Stop was requested.
+            await Promise.allSettled(Array.from(pendingFinalizeTasks));
+            if (uploadRunGenerationRef.current!==uploadRunGeneration) return false;
+            const stopped={
                 ...latest,
                 files: latest.files.map(file => ({ ...file, ...waveShadowFileOutcomes.get(file.key) })),
-            }));
+            };
+            try {
+                await cleanupUnfinishedUploadArtifacts(stopped);
+                await stopWaveShadowSession(stopped);
+                return uploadRunGenerationRef.current===uploadRunGeneration;
+            } catch (error) {
+                if (uploadRunGenerationRef.current!==uploadRunGeneration) return false;
+                setPendingUploadSessionLive(stopped);
+                const message=getUploadErrorMessage(error,'Upload stopped locally. Server closure needs retry; use Discard.');
+                setUploadError(message);
+                addNotification('Upload stopped; closure pending',message);
+                return false;
+            }
         };
         try {
             persistSession(normalized);
@@ -3931,7 +3979,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
             if (uploadStopRequestedRef.current) {
                 const latest = uploadSessionRef.current || normalized;
-                cleanupStoppedUpload(latest);
+                if (!await cleanupStoppedUpload(latest)) return;
                 await clearPersistedSession();
                 setPendingUploadSessionLive(null);
                 updateUploadNotification({
@@ -3985,7 +4033,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 || discardedUploadSessionIdsRef.current.has(session.id)) return;
             if (uploadStopRequestedRef.current || isUploadStoppedError(err)) {
                 const latest = uploadSessionRef.current || session;
-                cleanupStoppedUpload(latest);
+                if (!await cleanupStoppedUpload(latest)) return;
                 await clearPersistedSession();
                 setPendingUploadSessionLive(null);
                 updateUploadNotification({
@@ -4019,12 +4067,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             clearInterval(leaseHeartbeat);
             uploadPreparation?.dispose();
             // Best-effort, fire-and-forget (see uploadWaveSync.ts) -- resolves
-            // whatever this run didn't already resolve live (e.g. a Stop) and
-            // attempts to close admitted or explicitly stopped sessions.
+            // whatever this run didn't already resolve live and attempts to
+            // close admitted sessions. Stop awaits its own durable closure.
             // A blocked admission stays open for retry. Built from this run's
             // record), not uploadSessionRef, which clearPersistedSession may
             // already have nulled by the time this runs on a clean finish.
-            if (admissionReady || uploadStopRequestedRef.current) {
+            if (admissionReady && !uploadStopRequestedRef.current) {
                 void Promise.allSettled(Array.from(pendingFinalizeTasks)).then(() => finalizeWaveShadowSession({
                     ...normalized,
                     files: normalized.files.map((file) => ({ ...file, ...waveShadowFileOutcomes.get(file.key) })),
@@ -4261,6 +4309,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         uploadingRef.current = false;
         uploadStartInProgressRef.current = false;
         uploadStopRequestedRef.current = true;
+        uploadRetryStopRef.current.abort();
         uploadAbortControllersRef.current.forEach((controller) => controller.abort());
         uploadAbortControllersRef.current.clear();
         try {
@@ -4295,7 +4344,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             return;
         }
         uploadStopRequestedRef.current = true;
+        uploadRetryStopRef.current.abort();
         uploadStartInProgressRef.current = false;
+        setUploading(false);
+        uploadingRef.current=false;
+        setBackgroundUploadTailActive(isResumingUploadRef.current);
         uploadAbortControllersRef.current.forEach((controller) => controller.abort());
         const queuedCount = queuedUploadBatchesRef.current.reduce((sum, batch) => sum + batch.length, 0);
         queuedUploadBatchesRef.current.forEach(files => { void cancelQueuedWaveSelection(files); });

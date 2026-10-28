@@ -615,6 +615,46 @@ describe('browser upload selection and startup', () => {
         expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull();
     });
 
+    it.each([false,true])('stops finalization retries promptly while offline=%s', async (offline) => {
+        const original=mocks.postUpload.getMockImplementation()!;
+        mocks.postUpload.mockImplementation(async (url,payload) => {
+            if (url==='/upload/finalize-batch') {
+                if (offline) vi.spyOn(navigator,'onLine','get').mockReturnValue(false);
+                throw {response:{status:503,data:{code:'wave_admission_retry'}}};
+            }
+            return original(url,payload);
+        });
+        select(filesFor(1));
+        await advance(1000);
+        expect(finalizedFiles()).toHaveLength(1);
+        expect(services.uploadActive).toBe(true);
+        act(() => services.stopActiveUpload());
+        await advance(100);
+        expect(services.uploadActive).toBe(false);
+        expect(services.pendingUploadSummary).toBeNull();
+        const attempts=finalizedFiles().length;
+        await advance(90000);
+        expect(finalizedFiles()).toHaveLength(attempts);
+        expect(refreshRequests().some(([,body]) => body.reason==='stopped')).toBe(true);
+    });
+
+    it('keeps the recovery checkpoint when Stop cannot acknowledge server closure', async () => {
+        vi.spyOn(uploadWaveSync,'stopWaveShadowSession').mockRejectedValue(new Error('Server closure unavailable'));
+        mocks.staged.mockImplementation((_id,_data,_size,options) => new Promise((_resolve,reject) => {
+            const abort=() => reject(new Error('upload_stopped_by_user'));
+            if (options.abortSignal.aborted) abort();
+            else options.abortSignal.addEventListener('abort',abort,{once:true});
+        }));
+        select(filesFor(2));
+        await advance(1000);
+        act(() => services.stopActiveUpload());
+        await advance(3000);
+        expect(services.uploadActive).toBe(false);
+        expect(services.pendingUploadSummary?.fileCount).toBe(2);
+        expect(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)).not.toBeNull();
+        expect(services.notifications.some(n => n.title==='Upload stopped; closure pending')).toBe(true);
+    });
+
     it('keeps Stop available during finalization and clears queued uploads after notification dismissal', async () => {
         let releaseFinalize!: () => void;
         const gate = new Promise<void>(resolve => { releaseFinalize = resolve; });
@@ -665,6 +705,7 @@ describe('browser upload selection and startup', () => {
         expect(refreshRequests()).toHaveLength(0);
         await act(async () => { releaseFinalize(); });
         await advance(1000);
+        for (let tick=0; tick<10 && services.uploadActive; tick+=1) await advance(100);
         expect(refreshRequests()).toHaveLength(1);
         expect(refreshRequests()[0][1]).toEqual({ reason: 'stopped' });
     });

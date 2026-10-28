@@ -28,6 +28,13 @@ class Conflict(RuntimeError):
     pass
 
 
+class IntakeBindingConflict(Conflict):
+    """A durable result differs; replaying the same request cannot repair it."""
+    def __init__(self, fields):
+        self.fields = sorted(fields)
+        super().__init__('Resolved intake item cannot be rebound: ' + ', '.join(self.fields))
+
+
 class ArtifactCleanupBusy(Conflict):
     """A bounded artifact GC currently fences mutations; retry unchanged."""
 
@@ -318,8 +325,9 @@ class ShadowWaves:
             old_session = self._required(self.session_key(session))
             old_item = self._required(self.item_key(session, item))
             if old_item['outcome'] != 'reserved':
-                if any(old_item.get(k) != v for k, v in binding.items()):
-                    raise Conflict('Resolved intake item cannot be rebound')
+                differing = [k for k, v in binding.items() if old_item.get(k) != v]
+                if differing:
+                    raise IntakeBindingConflict(differing)
                 return dict(old_session)
             if old_session['state'] != 'open':
                 raise Conflict('Session is closed')

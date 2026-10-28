@@ -483,6 +483,10 @@ def finalize_direct_upload():
         return app.jsonify({'error': 'Invalid filename'}), 400
     if total_size <= 0 or total_size > app.MAX_UPLOAD_FILE_BYTES:
         return app.jsonify({'error': 'Invalid totalSize'}), 400
+    from routes.upload_wave_live import finalized_replay
+    replay=finalized_replay(data)
+    if replay is not None:
+        return app.jsonify(dict(replay))
     if app.is_video_file(filename) and not re.fullmatch(r'[a-f0-9]{64}', str(data.get('sha256') or '')):
         return app.jsonify({'error': 'Video uploads require a client SHA-256'}), 400
 
@@ -687,6 +691,11 @@ def finalize_upload_batch():
             continue
         if total_size <= 0 or total_size > app.MAX_UPLOAD_FILE_BYTES:
             results.append({'index': idx, 'filename': filename, 'error': 'Invalid totalSize'})
+            continue
+        from routes.upload_wave_live import finalized_replay
+        replay=finalized_replay(item)
+        if replay is not None:
+            results.append(dict(replay,index=idx))
             continue
         if app.is_video_file(filename) and not re.fullmatch(r'[a-f0-9]{64}', str(item.get('sha256') or '')):
             results.append({'index': idx, 'filename': filename, 'error': 'Video uploads require a client SHA-256'})
