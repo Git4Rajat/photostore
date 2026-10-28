@@ -14881,6 +14881,9 @@ def _maybe_enqueue_coalesced_rerun(job_id: Optional[str], user_id: str) -> None:
 
 def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, job_type: str,
                                      *, incremental_assign=None, prepared=None) -> None:
+    if payload.get('type') == 'upload_session_expiry':
+        from upload_session_lease import consume
+        return consume(payload)
     if payload.get('type') == 'upload_wave_stage':
         from wave_runtime import consume
         return consume(payload)
@@ -16102,37 +16105,48 @@ def run_clustering_worker() -> None:
     signal.signal(signal.SIGTERM, _handle_shutdown_signal)
     signal.signal(signal.SIGINT, _handle_shutdown_signal)
 
-    while not shutdown_requested.is_set():
-        try:
-            # Priority queue first: only fall through to the general
-            # clustering queue once library-ops has nothing waiting, so a
-            # library_clean/library_download never queues behind backfill
-            # traffic. A sustained library-ops backlog can starve clustering
-            # entirely under maxReplicas=1 -- accepted deliberately, since
-            # these are rare, user-initiated, "someone is staring at a
-            # spinner" actions and the whole point is that they win.
-            processed_any = _poll_clustering_queue_once(
-                library_ops_client, LIBRARY_OPS_QUEUE_NAME, LIBRARY_CLEAN_MAX_RETRIES,
-                library_ops_deadletter_client,
-            )
-            if not processed_any and not shutdown_requested.is_set():
-                if batch_size == 1 and target_batch_size <= 1:
-                    processed_any = _poll_clustering_queue_once(
-                        queue_client, CLUSTERING_QUEUE_NAME, CLUSTERING_WORKER_MAX_RETRIES,
-                        clustering_deadletter_client)
-                else:
-                    processed_any = _poll_clustering_queue_batch_once(
-                        queue_client, CLUSTERING_QUEUE_NAME, CLUSTERING_WORKER_MAX_RETRIES,
-                        clustering_deadletter_client, batch_size=batch_size,
-                        target_size=target_batch_size, idle_timeout_seconds=idle_timeout_seconds,
-                        poll_seconds=poll_seconds, shutdown_requested=shutdown_requested,
-                        max_wait_seconds=max_accumulation_seconds)
-            if not processed_any and not shutdown_requested.is_set():
-                time.sleep(poll_seconds)
-        except Exception:
-            worker_logger.exception('Queue polling iteration failed')
-            if not shutdown_requested.is_set():
-                time.sleep(poll_seconds)
+    # Intake expiry must run even while a long clustering job is in progress.
+    # Its own delayed queue also wakes this app from zero replicas.
+    from upload_session_lease import start_worker
+    expiry_thread=start_worker(queue_service_client_local,shutdown_requested,poll_seconds,
+        _poll_clustering_queue_once,worker_logger)
+
+    try:
+        while not shutdown_requested.is_set():
+            try:
+                # Priority queue first: only fall through to the general
+                # clustering queue once library-ops has nothing waiting, so a
+                # library_clean/library_download never queues behind backfill
+                # traffic. A sustained library-ops backlog can starve clustering
+                # entirely under maxReplicas=1 -- accepted deliberately, since
+                # these are rare, user-initiated, "someone is staring at a
+                # spinner" actions and the whole point is that they win.
+                processed_any = _poll_clustering_queue_once(
+                    library_ops_client, LIBRARY_OPS_QUEUE_NAME, LIBRARY_CLEAN_MAX_RETRIES,
+                    library_ops_deadletter_client,
+                )
+                if not processed_any and not shutdown_requested.is_set():
+                    if batch_size == 1 and target_batch_size <= 1:
+                        processed_any = _poll_clustering_queue_once(
+                            queue_client, CLUSTERING_QUEUE_NAME, CLUSTERING_WORKER_MAX_RETRIES,
+                            clustering_deadletter_client)
+                    else:
+                        processed_any = _poll_clustering_queue_batch_once(
+                            queue_client, CLUSTERING_QUEUE_NAME, CLUSTERING_WORKER_MAX_RETRIES,
+                            clustering_deadletter_client, batch_size=batch_size,
+                            target_size=target_batch_size, idle_timeout_seconds=idle_timeout_seconds,
+                            poll_seconds=poll_seconds, shutdown_requested=shutdown_requested,
+                            max_wait_seconds=max_accumulation_seconds)
+                if not processed_any and not shutdown_requested.is_set():
+                    time.sleep(poll_seconds)
+            except Exception:
+                worker_logger.exception('Queue polling iteration failed')
+                if not shutdown_requested.is_set():
+                    time.sleep(poll_seconds)
+
+    finally:
+        shutdown_requested.set()
+        if expiry_thread is not None:expiry_thread.join(timeout=5)
 
     # Synchronous polling finishes the bounded in-flight group before reaching
     # here. Do not initialize an adapter or rebuild an absent/unsafe runtime.

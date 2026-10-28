@@ -7,6 +7,7 @@ the code relied on when these functions lived in app.py directly, so
 test-time monkeypatching of app.<name> globals still works unchanged).
 """
 from flask import Blueprint, g
+from azure.core.exceptions import ResourceNotFoundError
 import processing_diagnostics
 import re
 from upload_diagnostics import instrument_upload, timed_call, upload_count, upload_finalized, upload_results, upload_teardown
@@ -44,8 +45,8 @@ def upload_transfer_heartbeat():
     # detection window (IPWORK_RELEASE_IDLE_SECONDS / UPLOAD_ACTIVITY_WINDOW_SECONDS)
     # on a slow connection, wrongly releasing vision work / flushing clustering
     # buffers while the upload is still genuinely running. Deliberately minimal:
-    # no body, no cleanup-block check -- a stale ping during a blocked cleanup
-    # should still keep the "upload is active" signal alive, not fail.
+    # Library-only pings remain compatible. A waveSessionId also renews that
+    # parent's lease; this never resurrects a closed or expired intake.
     user_id, error = app._require_user_id()
     if error:
         return error
@@ -53,6 +54,26 @@ def upload_transfer_heartbeat():
         app._mark_upload_activity_heartbeat(user_id)
     except Exception:
         app.app.logger.exception('Failed to record transfer heartbeat for %s', user_id)
+    data=app.request.get_json(silent=True) or {}
+    session=data.get('waveSessionId') if isinstance(data,dict) else None
+    if session:
+        from upload_waves import ShadowWaves, Conflict
+        from wave_policy import owned
+        from upload_session_lease import renew
+        # Resolve the authenticated library, never trust a library from JSON.
+        _,library,error=app._require_library_context(require_auth=True)
+        if error:return error
+        if owned(app.jobs_table_client,library):
+            try:
+                parent=renew(ShadowWaves(app.jobs_table_client,library),session)
+                return app.jsonify(dict(recorded=True,sessionId=session,
+                    leaseActive=parent['leaseActive'],leaseExpiresAt=parent.get('leaseExpiresAt',0),serverNow=app.time.time()))
+            except (ValueError,KeyError):
+                return app.jsonify({'error':'Invalid upload session'}),400
+            except Conflict as error:
+                return app.jsonify({'error':str(error)}),409
+            except ResourceNotFoundError:
+                return app.jsonify({'error':'Upload session not found'}),404
     return app.jsonify({'recorded': True})
 
 

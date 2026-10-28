@@ -193,7 +193,7 @@ class ShadowWaves:
             return row
         return self._retry(run)
 
-    def open_session(self, session, declared_count, *, resumed_from=''):
+    def open_session(self, session, declared_count, *, resumed_from='', lease_seconds=0):
         key = self.session_key(session)
         if resumed_from:
             identifier(resumed_from)
@@ -231,7 +231,8 @@ class ShadowWaves:
             wave.update(noWorkProbe='',noWorkImpossible=False)
             row = self._row(key, sessionId=session, waveId=wave_id, declaredCount=declared_count,
                 registeredCount=0, resolvedCount=0, state='open', resumedFromSessionId=resumed_from, manifestRevision=uuid.uuid4().hex,
-                createdAt=self.clock())
+                createdAt=self.clock(), **(dict(heartbeatAt=self.clock(),
+                    leaseExpiresAt=self.clock()+lease_seconds) if lease_seconds else {}))
             # Session evidence is separately paged with the member manifest.
             evidence = self._row(f'e!{wave_id}!s!{session}', kind='session', sessionId=session,
                                  state='open', manifestRevision=row['manifestRevision'])
@@ -257,12 +258,14 @@ class ShadowWaves:
                 raise ValueError('Each item requires its intended filename')
 
         def run():
-            control = self._required('control')
             old = self._required(self.session_key(session))
+            from table_reads import read_entities
+            existing_items=read_entities(self.table,self.partition,
+                [self.item_key(session,item['itemId']) for item in items])
             changes = []
             for item in items:
                 key = self.item_key(session, item['itemId'])
-                existing = self._get(key)
+                existing = existing_items[key]
                 if existing:
                     if existing['filename'] != item['filename']:
                         raise Conflict('Item identity cannot be rebound')
@@ -271,13 +274,15 @@ class ShadowWaves:
                     sessionId=session, waveId=old['waveId'], filename=item['filename'], outcome='reserved')))
             if not changes:
                 return dict(old)
-            if old['state'] != 'open' or old.get('abandoning'):
+            if old['state'] != 'open' or old.get('abandoning') or (
+                    old.get('leaseExpiresAt') and old['leaseExpiresAt'] <= self.clock()):
                 raise Conflict('Session is closed')
             if old['registeredCount'] + len(changes) > old['declaredCount']:
                 raise Conflict('Registration exceeds declared parent selection')
             row = dict(old, registeredCount=old['registeredCount'] + len(changes),
                        manifestRevision=uuid.uuid4().hex)
             wave = self._required(self.wave_key(old['waveId']))
+            control = self._required('control')
             self._commit(control, [self._change(old, row), *changes,
                 self._change(wave, dict(wave, lastProgressAt=self.clock(), updatedAt=self.clock()))])
             return row

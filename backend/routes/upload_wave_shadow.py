@@ -6,7 +6,7 @@ import os
 from azure.core.exceptions import AzureError, ResourceNotFoundError
 
 import app
-from upload_waves import Conflict, ShadowWaves
+from upload_waves import Conflict, MutationContention, ShadowWaves
 import upload_wave_shadow as source
 
 MAX_MANIFEST_REQUEST = 2000
@@ -59,6 +59,10 @@ def endpoint(function):
             return response
         except ResourceNotFoundError:
             return app.jsonify({'error': 'Finalized photo not found'}), 409
+        except MutationContention as error:
+            response=app.jsonify({'error':str(error),'code':'wave_mutation_contention'})
+            response.headers['Retry-After']='1'
+            return response,409
         except Conflict as error:
             return app.jsonify({'error': str(error)}), 409
         except (ValueError, KeyError, TypeError):
@@ -74,8 +78,21 @@ def register_routes(blueprint):
     @blueprint.route('/upload/waves/shadow/sessions', methods=['POST'])
     @endpoint
     def wave_shadow_open(store, data):
-        return store.open_session(data['sessionId'], data['declaredCount'],
-                                  resumed_from=data.get('resumedFromSessionId', ''))
+        from upload_session_lease import LEASE_SECONDS, send_check, seal_expired
+        live='/waves/live/' in app.request.path
+        existing=store._get(store.session_key(data['sessionId']))
+        if live:
+            if data.get('resumedFromSessionId'):
+                seal_expired(store,data['resumedFromSessionId'])
+            if existing:
+                seal_expired(store,data['sessionId'])
+            else:
+                # Queue before commit: failures cannot strand a leased intake.
+                send_check(store.library,data['sessionId'])
+        result=store.open_session(data['sessionId'], data['declaredCount'],
+            resumed_from=data.get('resumedFromSessionId', ''), lease_seconds=LEASE_SECONDS if live else 0)
+        from upload_session_lease import active
+        return dict(result,leaseActive=active(result,store.clock()),serverNow=store.clock())
 
     @blueprint.route('/upload/waves/live/sessions/<session>/items', methods=['POST'])
     @blueprint.route('/upload/waves/shadow/sessions/<session>/items', methods=['POST'])

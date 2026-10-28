@@ -60,3 +60,11 @@ def test_receive_messages_uses_configured_visibility_timeout(monkeypatch):
         call['visibility_timeout'] == app.CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS
         for call in queue_client.receive_calls
     )
+
+
+@pytest.fixture(autouse=True)
+def isolate_upload_expiry_poller(monkeypatch):
+    # This module exercises clustering's queue/termination contract. Expiry's
+    # independent poller has its own concurrency test in test_upload_session_lease.
+    import upload_session_lease
+    monkeypatch.setattr(upload_session_lease,'start_worker',lambda *args:None)

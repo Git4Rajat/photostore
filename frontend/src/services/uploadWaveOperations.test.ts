@@ -1,9 +1,9 @@
-import { beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { PersistedUploadSession } from '../types/browserProcessing';
-const mocks = vi.hoisted(() => ({ scope: 'library-a', open: vi.fn(), register: vi.fn(), resolve: vi.fn(), close: vi.fn() }));
+const mocks = vi.hoisted(() => ({ scope: 'library-a', renew: vi.fn(), open: vi.fn(), register: vi.fn(), resolve: vi.fn(), close: vi.fn() }));
 vi.mock('./sessionScope', () => ({ sessionScope: () => mocks.scope }));
 vi.mock('./uploadWaveClient', () => ({ waveShadowEnabled: () => true, waveLiveEnabled: () => true,
-    waveProtocol: async () => 'live',
+    waveProtocol: async () => 'live', renewUploadWaveLease: mocks.renew,
     wireItemId: async (key: string) => `wire:${key}`, WAVE_SHADOW_MAX_PAGE: 2000, WAVE_RESOLVE_MAX_BATCH: 100,
     openWaveShadowSession: mocks.open, registerWaveShadowItems: mocks.register,
     resolveWaveShadowItems: async (id: string, items: any[]) => {
@@ -13,7 +13,7 @@ vi.mock('./uploadWaveClient', () => ({ waveShadowEnabled: () => true, waveLiveEn
 import { bindWaveChild, clearWaveOperationCachesForTests, declareWaveSelection, loadWaveOperation,
     retryWaveOperation, sliceWaveSelection, waveParentResolved } from './uploadWaveOperations';
 import { __resetWaveShadowStateForTests, ensureWaveShadowSessionOpened, finalizeWaveShadowSession,
-    cancelQueuedWaveSelection, liveWaveAdmission, acknowledgeWaveFinalizedFile } from './uploadWaveSync';
+    cancelQueuedWaveSelection, liveWaveAdmission, heartbeatWaveSession, acknowledgeWaveFinalizedFile } from './uploadWaveSync';
 const child = (files: File[], id: string): PersistedUploadSession => {
     const session: PersistedUploadSession = { id, createdAt: 1, files: files.map((file, index) => ({
         key: `${id}:${index}`, name: file.name, size: file.size, type: file.type, lastModified: file.lastModified,
@@ -21,6 +21,7 @@ const child = (files: File[], id: string): PersistedUploadSession => {
     bindWaveChild(files, session);
     return session;
 };
+afterEach(() => { vi.useRealTimers(); });
 beforeEach(() => {
     const storage = new Map<string, string>();
     vi.stubGlobal("localStorage", { getItem: (key: string) => storage.get(key) ?? null,
@@ -29,6 +30,7 @@ beforeEach(() => {
         get length() { return storage.size; } });
     clearWaveOperationCachesForTests(); __resetWaveShadowStateForTests(); vi.clearAllMocks();
     mocks.scope = 'library-a';
+    mocks.renew.mockResolvedValue({leaseActive:true,leaseExpiresAt:1300,serverNow:1000});
     mocks.open.mockResolvedValue({ manifestRevision: 'open' });
     mocks.register.mockResolvedValue({ manifestRevision: 'registered' });
     mocks.resolve.mockResolvedValue({ manifestRevision: 'resolved' });
@@ -217,4 +219,71 @@ it('rejects a receipt for another item and resolves the outstanding file during 
         itemId: 'wrong', manifestRevision: 'wrong', state: 'closed' });
     await finalizeWaveShadowSession(current);
     expect(mocks.resolve).toHaveBeenCalledTimes(1);
+});
+
+it('repeated lease expiry resumes only unfinished files with a fresh linked parent', async () => {
+    const files=[new File(['a'],'a.jpg'),new File(['b'],'b.jpg')];
+    declareWaveSelection(files);
+    const current=child(files,'resume');
+    current.files[1].status='pending';
+    vi.useFakeTimers({toFake:['Date']});
+    mocks.open.mockResolvedValueOnce({manifestRevision:'open',leaseActive:true,leaseExpiresAt:1000,serverNow:1000})
+        .mockResolvedValue({manifestRevision:'new',leaseActive:true,leaseExpiresAt:1300,serverNow:1000});
+    // First admission observes the timed-out server lease before any bytes.
+    mocks.renew.mockResolvedValue({leaseActive:false});
+    const ids=[current.waveOperationId];
+    for (let i=0;i<3;i+=1) {
+        if (i) vi.setSystemTime(Date.now()+301000);
+        const previous=current.waveOperationId;
+        const rebind=vi.fn();
+        const [a,b]=await Promise.all([
+            liveWaveAdmission(current,current.files[1],rebind),
+            liveWaveAdmission(current,current.files[1],rebind),
+        ]);
+        expect(a).toEqual(b);
+        expect(current.waveOperationId).not.toBe(previous);
+        expect(rebind).toHaveBeenCalledTimes(1);
+        expect(mocks.open).toHaveBeenLastCalledWith(current.waveOperationId,1,previous);
+        expect(loadWaveOperation(current.waveOperationId!,mocks.scope)?.files.map(file => file.name)).toEqual(['b.jpg']);
+        expect(current.files[0].waveItemKey).toContain(ids[0]);
+        ids.push(current.waveOperationId);
+    }
+    expect(new Set(ids).size).toBe(4);
+});
+
+it('restore detects server-closed intake without replaying its old manifest', async () => {
+    const files=[new File(['a'],'a.jpg')];declareWaveSelection(files);
+    const current=child(files,'restored');current.files[0].status='pending';
+    const previous=current.waveOperationId;
+    mocks.open.mockResolvedValueOnce({manifestRevision:'expired',state:'abandoned',leaseActive:false})
+        .mockResolvedValue({manifestRevision:'new',leaseActive:true,leaseExpiresAt:1300,serverNow:1000});
+    await liveWaveAdmission(current,current.files[0]);
+    expect(mocks.register).toHaveBeenCalledTimes(1);
+    expect(mocks.register.mock.calls[0][0]).not.toBe(previous);
+});
+
+
+it('rebinds a progress-store copy used by automatic retries after expiry', async () => {
+    const files=[new File(['a'],'a.jpg')];declareWaveSelection(files);
+    const current=child(files,'retry-copy');current.files[0].status='failed';
+    const retryCopy={...current.files[0]};
+    mocks.open.mockResolvedValueOnce({manifestRevision:'expired',leaseActive:false})
+        .mockResolvedValue({manifestRevision:'new',leaseActive:true,leaseExpiresAt:1300,serverNow:1000});
+    const binding=await liveWaveAdmission(current,retryCopy);
+    expect(retryCopy.waveItemKey).toBe(current.files[0].waveItemKey);
+    expect(binding.waveItemId).toBe(`wire:${current.files[0].waveItemKey}`);
+});
+
+
+it('coalesces concurrent heartbeat renewals for the same active parent', async () => {
+    const files=[new File(['a'],'a.jpg')];declareWaveSelection(files);
+    const current=child(files,'heartbeat');current.files[0].status='pending';
+    await liveWaveAdmission(current,current.files[0]);
+    let complete!: (value: any) => void;
+    mocks.renew.mockImplementationOnce(() => new Promise(resolve => {complete=resolve;}));
+    const first=heartbeatWaveSession(current), second=heartbeatWaveSession(current);
+    for (let i=0;i<10 && !complete;i++) await Promise.resolve();
+    expect(mocks.renew).toHaveBeenCalledTimes(1);
+    complete({leaseActive:true,leaseExpiresAt:1300,serverNow:1000});
+    await Promise.all([first,second]);
 });

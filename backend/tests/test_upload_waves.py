@@ -247,6 +247,7 @@ def test_scan_survives_store_restart_and_queries_are_bounded(world):
     wave, row = register_accepted(store)
     close(store, 'parent', row)
     settle(store, wave)
+    table.queries.clear()  # Inspect readiness scans, not admission's bounded keyed reads.
     store.evaluate(wave, page_size=1)
     restarted = ShadowWaves(table, 'library-A', clock=lambda: now[0])
     result = finish_scan(restarted, wave, size=1)

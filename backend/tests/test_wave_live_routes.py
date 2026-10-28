@@ -20,6 +20,8 @@ def live_api(monkeypatch):
     monkeypatch.setenv('UPLOAD_WAVE_DEPLOYMENT_ID','qualified-build')
     store=ShadowWaves(table,'u')
     table.create_entity(store._row('policy',protocol=wave_policy.PROTOCOL,capabilityId=certificate,cleanupState=''))
+    import upload_session_lease
+    monkeypatch.setattr(upload_session_lease,'send_check',lambda *args:None)
     import wave_runtime
     monkeypatch.setattr(wave_runtime,'send_stage',lambda *args:None)
     monkeypatch.setattr(app,'jobs_table_client',table)
@@ -283,3 +285,48 @@ def test_batch_resolution_partial_failure_is_retryable(live_api, monkeypatch):
     response = client.post(root + '/retry/resolve-batch', json=body)
     assert response.status_code == 200 and response.json['state'] == 'closed'
     assert response.json['resolvedCount'] == 2
+
+
+def test_registration_contention_is_a_distinct_retryable_conflict(live_api,monkeypatch):
+    from upload_waves import MutationContention,ShadowWaves
+    client,store,metadata,library=live_api
+    root='/upload/waves/live/sessions'
+    client.post(root,json=dict(sessionId='s',declaredCount=1))
+    def busy(*args,**kwargs):raise MutationContention('Concurrent wave mutation; retry the request')
+    monkeypatch.setattr(ShadowWaves,'register',busy)
+    response=client.post(root+'/s/items',json={'items':[{'itemId':'i','filename':'a.jpg'}]})
+    assert response.status_code==409
+    assert response.json['code']=='wave_mutation_contention'
+    assert response.headers['Retry-After']=='1'
+
+
+def test_open_never_admits_a_lease_without_a_durable_expiry_wake(live_api,monkeypatch):
+    from azure.core.exceptions import AzureError
+    import upload_session_lease
+    client,store,_,_=live_api
+    def unavailable(*args):raise AzureError('queue unavailable')
+    monkeypatch.setattr(upload_session_lease,'send_check',unavailable)
+    result=client.post('/upload/waves/live/sessions',json=dict(sessionId='no-wake',declaredCount=10))
+    assert result.status_code==503
+    assert store._get(store.session_key('no-wake')) is None
+
+
+def test_existing_heartbeat_renews_authenticated_parent_but_cannot_resurrect_it(live_api,monkeypatch):
+    import upload_session_lease
+    client,store,_,library=live_api
+    monkeypatch.setattr(app,'_require_user_id',lambda **kw:('owner',None))
+    monkeypatch.setattr(app,'_mark_upload_activity_heartbeat',lambda user:None)
+    client.post('/upload/waves/live/sessions',json=dict(sessionId='lease',declaredCount=2))
+    result=client.post('/upload/transfer-heartbeat',json=dict(waveSessionId='lease',libraryId='forged'))
+    assert result.status_code==200 and result.json['leaseActive']
+    parent=store._required(store.session_key('lease'))
+    assert parent['leaseExpiresAt']-parent['heartbeatAt']==300
+    store.table.submit_transaction([store._change(parent,dict(parent,leaseExpiresAt=1))])
+    result=client.post('/upload/transfer-heartbeat',json=dict(waveSessionId='lease'))
+    assert result.status_code==200 and result.json['leaseActive'] is False
+    assert store._required(store.session_key('lease'))['leaseExpiresAt']==1
+    library[0]='other'
+    # A different library cannot renew this parent's lease.
+    result=client.post('/upload/transfer-heartbeat',json=dict(waveSessionId='lease'))
+    assert not result.json.get('leaseActive')
+    assert store._required(store.session_key('lease'))['leaseExpiresAt']==1

@@ -190,3 +190,11 @@ def test_empty_general_queue_does_not_delay_next_priority_poll(monkeypatch):
     assert time.monotonic() - started < 2
     assert len(calls) == 2
     assert len(general.receive_calls) == 1
+
+
+@pytest.fixture(autouse=True)
+def isolate_upload_expiry_poller(monkeypatch):
+    # This module exercises clustering's queue/termination contract. Expiry's
+    # independent poller has its own concurrency test in test_upload_session_lease.
+    import upload_session_lease
+    monkeypatch.setattr(upload_session_lease,'start_worker',lambda *args:None)

@@ -275,3 +275,11 @@ def test_successful_dispatch_deletes_the_message(monkeypatch, metadata_table, di
 
     assert len(dispatch_spy) == 1
     assert queue_client.delete_calls == ['m1']
+
+
+@pytest.fixture(autouse=True)
+def isolate_upload_expiry_poller(monkeypatch):
+    # This module exercises clustering's queue/termination contract. Expiry's
+    # independent poller has its own concurrency test in test_upload_session_lease.
+    import upload_session_lease
+    monkeypatch.setattr(upload_session_lease,'start_worker',lambda *args:None)

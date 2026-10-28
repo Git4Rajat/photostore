@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({ post: vi.fn(), get: vi.fn(), scope: 'test' }));
 vi.mock('./sessionScope', () => ({ sessionScope: () => mocks.scope }));
 vi.mock('./apiClient', () => ({ postUpload: mocks.post, getUpload: mocks.get }));
-import { waveLiveEnabled, waveProtocol, closeWaveShadowSession, openWaveShadowSession, registerWaveShadowItems, resolveWaveShadowItem, resolveWaveShadowItems } from './uploadWaveClient';
+import { renewUploadWaveLease, waveLiveEnabled, waveProtocol, closeWaveShadowSession, openWaveShadowSession, registerWaveShadowItems, resolveWaveShadowItem, resolveWaveShadowItems } from './uploadWaveClient';
 
 beforeEach(() => {
     mocks.scope = crypto.randomUUID();
@@ -96,4 +96,59 @@ it('allows the deployed runtime flag to opt in without a special frontend image 
     expect(mocks.post.mock.calls[0][0]).toContain('/waves/live/');
     window.__APP_CONFIG__!.uploadWaveExecutionEnabled = false;
     expect(waveLiveEnabled()).toBe(false);
+});
+
+
+it('retries only transient 409 contention with the identical admission payload', async () => {
+    vi.stubGlobal('crypto', { subtle: { digest: async () => new Uint8Array(32).buffer } });
+    vi.useFakeTimers();
+    try {
+        vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
+        mocks.post.mockRejectedValueOnce({response: {status: 409, data: {code: 'wave_mutation_contention', error: 'Concurrent wave mutation; retry the request'}}})
+            .mockResolvedValueOnce({manifestRevision: 'registered', registeredCount: 1});
+        const pending = registerWaveShadowItems('retry', [{itemId: 'stable', filename: 'photo.jpg'}]);
+        await vi.runAllTimersAsync();
+        await expect(pending).resolves.toEqual({manifestRevision: 'registered', registeredCount: 1});
+        expect(mocks.post).toHaveBeenCalledTimes(2);
+        expect(mocks.post.mock.calls[0][1]).toEqual(mocks.post.mock.calls[1][1]);
+    } finally { vi.useRealTimers(); }
+});
+
+it('does not retry a permanent admission conflict', async () => {
+    vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
+    mocks.post.mockRejectedValue({response: {status: 409, data: {error: 'Session is closed'}}});
+    await expect(openWaveShadowSession('closed', 1)).rejects.toThrow('Session is closed');
+    expect(mocks.post).toHaveBeenCalledTimes(1);
+});
+
+it('bounds contention retries and stops replay if the authenticated scope changes', async () => {
+    vi.useFakeTimers();
+    try {
+        vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
+        const error = {response: {status: 409, data: {code: 'wave_mutation_contention', error: 'Concurrent wave mutation; retry the request'}}};
+        mocks.post.mockRejectedValue(error);
+        const pending = openWaveShadowSession('busy', 1);
+        const checked = expect(pending).rejects.toThrow('Concurrent wave mutation');
+        await vi.runAllTimersAsync(); await checked;
+        expect(mocks.post).toHaveBeenCalledTimes(4);
+        mocks.post.mockClear();
+        mocks.post.mockImplementationOnce(async () => { mocks.scope = 'other-account'; throw error; });
+        const changed = openWaveShadowSession('busy', 1);
+        await vi.runAllTimersAsync();
+        expect(await changed).toBeNull();
+        expect(mocks.post).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
+});
+
+
+it('renews the session lease using the existing heartbeat transport', async () => {
+    mocks.post.mockResolvedValue({leaseActive:false,leaseExpiresAt:123,serverNow:456});
+    expect(await renewUploadWaveLease('parent')).toMatchObject({leaseActive:false});
+    expect(mocks.post).toHaveBeenCalledWith('/upload/transfer-heartbeat',
+        {waveSessionId:'parent'},{singleAttempt:true,timeout:15000});
+});
+
+it('rejects heartbeat acknowledgment after switching libraries', async () => {
+    mocks.post.mockImplementationOnce(async () => { mocks.scope='other';return {leaseActive:true}; });
+    await expect(renewUploadWaveLease('parent')).rejects.toThrow('Upload library changed');
 });

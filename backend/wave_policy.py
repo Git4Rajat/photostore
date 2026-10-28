@@ -132,15 +132,17 @@ def enroll_new(table,library,metadata=None):
 def validate_admission(store,data,*,finalizing=False):
     session,item=data.get('waveSessionId',''),data.get('waveItemId','')
     old=store._required(store.item_key(session,item))
-    parent=store._required(store.session_key(session))
-    if parent.get('abandoning') or (parent['state']!='open' and old['outcome']=='reserved'):
-        raise Conflict('Upload intake is closed')
+    from upload_session_lease import active
     if old['filename']!=data.get('filename'):raise Conflict('Upload differs from its reservation')
     sha=data.get('sha256','')
     if not isinstance(sha,str) or len(sha)!=64 or any(c not in '0123456789abcdef' for c in sha):
         raise ValueError('Wave upload requires a source SHA-256')
     def bind():
         row=store._required(old['RowKey'])
+        current_parent=store._required(store.session_key(session))
+        if row['outcome'] in ('cancelled','failed') or (
+                not active(current_parent,store.clock()) and row['outcome']=='reserved'):
+            raise Conflict('Upload intake is closed')
         if row.get('sourceHash'):
             if row['sourceHash']!=sha:raise Conflict('Upload reservation cannot change source bytes')
             if not finalizing:return
@@ -149,7 +151,7 @@ def validate_admission(store,data,*,finalizing=False):
             # just to extend an otherwise healthy reservation by a few seconds.
             if row.get('finalizeLeaseUntil',0)-store.clock()>=120:return
         control=store._required('control')
-        store._commit(control,[store._change(row,dict(row,sourceHash=sha,
+        store._commit(control,[store._change(current_parent,dict(current_parent)),store._change(row,dict(row,sourceHash=sha,
             finalizeLeaseUntil=store.clock()+600 if finalizing else 0))])
     store._retry(bind)
     return session,item

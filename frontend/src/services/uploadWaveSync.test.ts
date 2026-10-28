@@ -3,6 +3,8 @@ import type { PersistedUploadSession } from '../types/browserProcessing';
 
 const mocks = vi.hoisted(() => ({
     open: vi.fn(),
+    abandon: vi.fn(),
+    live: false,
     register: vi.fn(),
     resolve: vi.fn(),
     batch: vi.fn(),
@@ -10,6 +12,9 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('./uploadWaveClient', () => ({
+    waveLiveEnabled: () => mocks.live,
+    waveProtocol: async () => 'live',
+    abandonWaveShadowSession: mocks.abandon,
     WAVE_SHADOW_MAX_PAGE: 2000, WAVE_RESOLVE_MAX_BATCH: 100,
     openWaveShadowSession: mocks.open,
     registerWaveShadowItems: mocks.register,
@@ -25,6 +30,7 @@ import {
     __resetWaveShadowStateForTests,
     ensureWaveShadowSessionOpened,
     finalizeWaveShadowSession,
+    discardWaveShadowSession,
     resolveWaveShadowFile,
 } from './uploadWaveSync';
 
@@ -40,6 +46,7 @@ function session(count: number, id: string): PersistedUploadSession {
 }
 
 beforeEach(() => {
+    mocks.live = false;
     __resetWaveShadowStateForTests();
     vi.clearAllMocks();
     mocks.open.mockResolvedValue({ waveId: 'wave-1', manifestRevision: 'rev-0' });
@@ -244,4 +251,57 @@ it('retries an unacknowledged outcome at cleanup and holds close until it succee
     await finalizeWaveShadowSession(s);
     expect(mocks.resolve).toHaveBeenCalledTimes(3);
     expect(mocks.close).toHaveBeenCalledTimes(1);
+});
+
+
+it('discard waits for restored registration but does not replay the remaining manifest', async () => {
+    mocks.live = true;
+    const s = session(5000, 'restored-discard');
+    let release!: (value: {manifestRevision: string; registeredCount: number}) => void;
+    mocks.register.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    mocks.abandon.mockResolvedValueOnce({manifestRevision: 'cancel-page', state: 'open', abandonmentNeedsMore: true})
+        .mockResolvedValueOnce({manifestRevision: 'cancelled', state: 'abandoned'});
+    const restoring = ensureWaveShadowSessionOpened(s);
+    for (let turn = 0; turn < 20 && !release; turn += 1) await Promise.resolve();
+    expect(release).toBeTypeOf('function');
+    const discarding = discardWaveShadowSession(s);
+    await Promise.resolve();
+    expect(mocks.abandon).not.toHaveBeenCalled();
+    release({manifestRevision: 'registered', registeredCount: 2000});
+    await restoring; await discarding;
+    expect(mocks.register).toHaveBeenCalledTimes(1);
+    expect(mocks.abandon).toHaveBeenCalledTimes(2);
+    expect(mocks.abandon.mock.calls[1]).toEqual([s.id, 'cancel-page']);
+    expect(mocks.resolve).not.toHaveBeenCalled();
+});
+
+it('discard surfaces server failure and can retry from the existing parent', async () => {
+    mocks.live = true;
+    const s = session(25, 'retry-discard');
+    mocks.abandon.mockRejectedValueOnce(new Error('storage unavailable'))
+        .mockResolvedValueOnce({manifestRevision: 'closed', state: 'abandoned'});
+    await expect(discardWaveShadowSession(s)).rejects.toThrow('storage unavailable');
+    await expect(discardWaveShadowSession(s)).resolves.toBeUndefined();
+    expect(mocks.register).not.toHaveBeenCalled();
+});
+
+it('library members retain resolve/close discard when owner abandonment is forbidden', async () => {
+    mocks.live = true;
+    const s = session(1, 'member-discard');
+    mocks.abandon.mockRejectedValue(Object.assign(new Error('forbidden'), {status: 403}));
+    await discardWaveShadowSession(s);
+    expect(mocks.resolve).toHaveBeenCalledWith(s.id, s.files[0].key, 'cancelled', undefined);
+    expect(mocks.close).toHaveBeenCalledTimes(1);
+});
+
+
+it('refreshes a stale discard revision after an in-flight finalize wins', async () => {
+    mocks.live = true;
+    const s = session(1, 'finalize-race');
+    mocks.open.mockResolvedValueOnce({manifestRevision: 'before-finalize'})
+        .mockResolvedValueOnce({manifestRevision: 'after-finalize'});
+    mocks.abandon.mockRejectedValueOnce(new Error('Abandonment revision is stale'))
+        .mockResolvedValueOnce({manifestRevision: 'closed', state: 'abandoned'});
+    await discardWaveShadowSession(s);
+    expect(mocks.abandon.mock.calls[1]).toEqual([s.id, 'after-finalize']);
 });

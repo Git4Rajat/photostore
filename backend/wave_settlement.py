@@ -174,22 +174,36 @@ def abandon(store,session,manifest_revision,*,reason):
     parent=store._required(store.session_key(session))
     if parent['manifestRevision']!=manifest_revision:raise Conflict('Abandonment revision is stale')
     if parent['state']!='open':return dict(parent)
-    cursor=parent.get('abandonCursor','')
-    items=store._page('item!'+session+'!',cursor)
-    if any(item['outcome']=='reserved' and item.get('finalizeLeaseUntil',0)>store.clock() for item in items):
-        raise Conflict('A finalization is still in flight; retry abandonment later')
-    for item in items:
-        if item['outcome']=='reserved':
-            parent=store.resolve(session,item['itemId'],outcome='cancelled')
-    more=len(items)==20
     def advance():
-        old=store._required(store.session_key(session));control=store._required('control')
+        old=store._required(store.session_key(session))
+        if old['state']!='open':return dict(old)
+        if old['manifestRevision']!=manifest_revision:raise Conflict('Abandonment revision is stale')
+        cursor=old.get('abandonCursor','')
+        items=store._page('item!'+session+'!',cursor)
+        reserved=[item for item in items if item['outcome']=='reserved']
+        if any(item.get('finalizeLeaseUntil',0)>store.clock() for item in reserved):
+            raise Conflict('A finalization is still in flight; retry abandonment later')
+        # Cancel the bounded page atomically. One transaction per item used to
+        # monopolize the shared wave/control rows while another tab registered.
+        changes=[store._change(item,dict(item,outcome='cancelled',photoId='',
+            processingRevision='',acceptedFilename='',requiredSteps='[]')) for item in reserved]
+        more=len(items)==20
         row=dict(old,abandoning=True,abandonReason=reason,
-            abandonCursor=items[-1]['RowKey'] if items else cursor,abandonScanComplete=not more)
-        store._commit(control,[store._change(old,row)])
+            abandonCursor=items[-1]['RowKey'] if items else cursor,abandonScanComplete=not more,
+            resolvedCount=old['resolvedCount']+len(reserved),
+            abandonCancelledCount=old.get('abandonCancelledCount',0)+len(reserved))
+        if reserved:
+            import uuid
+            row['manifestRevision']=uuid.uuid4().hex
+            wave=store._required(store.wave_key(old['waveId']))
+            changes.append(store._change(wave,dict(wave,lastProgressAt=store.clock(),updatedAt=store.clock())))
+        # Read the global fence after the page, minimizing its conflict window.
+        control=store._required('control')
+        store._commit(control,[*changes,store._change(old,row)])
         return row
     parent=store._retry(advance)
-    if not more:
+    more=not parent.get('abandonScanComplete',False)
+    if parent['state']=='open' and not more:
         parent=store.close(session,parent['manifestRevision'],'abandoned',abandoned=True)
     return dict(parent,abandonmentNeedsMore=more)
 

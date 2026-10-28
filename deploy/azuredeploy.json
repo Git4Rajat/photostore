@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.37.4.10188",
-      "templateHash": "11338512421528049461"
+      "templateHash": "3857549325807142221"
     }
   },
   "parameters": {
@@ -239,7 +239,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.37.4.10188",
-              "templateHash": "10723842565397968701"
+              "templateHash": "16174406991730034197"
             }
           },
           "parameters": {
@@ -564,6 +564,24 @@
               },
               "dependsOn": [
                 "[resourceId('Microsoft.Storage/storageAccounts/fileServices', variables('workerCacheStorageAccountName'), 'default')]"
+              ]
+            },
+            {
+              "type": "Microsoft.Storage/storageAccounts/queueServices",
+              "apiVersion": "2023-05-01",
+              "name": "[format('{0}/{1}', variables('storageAccountName'), 'default')]",
+              "properties": {},
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Storage/storageAccounts/queueServices/queues",
+              "apiVersion": "2023-05-01",
+              "name": "[format('{0}/{1}/{2}', variables('storageAccountName'), 'default', 'photostore-upload-expiry')]",
+              "properties": {},
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts/queueServices', variables('storageAccountName'), 'default')]"
               ]
             },
             {
@@ -1135,7 +1153,8 @@
                 "[resourceId('Microsoft.Communication/communicationServices', parameters('communicationServiceName'))]",
                 "[resourceId('Microsoft.Communication/emailServices/domains', format('{0}-email', parameters('appName')), 'AzureManagedDomain')]",
                 "[resourceId('Microsoft.SignalRService/webPubSub', format('{0}-index-events', parameters('appName')))]",
-                "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]"
+                "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]",
+                "[resourceId('Microsoft.Storage/storageAccounts/queueServices/queues', variables('storageAccountName'), 'default', 'photostore-upload-expiry')]"
               ]
             },
             {
@@ -1306,6 +1325,19 @@
                         }
                       },
                       {
+                        "name": "upload-expiry-queue",
+                        "custom": {
+                          "type": "azure-queue",
+                          "metadata": {
+                            "accountName": "[variables('storageAccountName')]",
+                            "queueName": "photostore-upload-expiry",
+                            "queueLength": "1",
+                            "queueLengthStrategy": "visibleonly"
+                          },
+                          "identity": "system"
+                        }
+                      },
+                      {
                         "name": "library-ops-queue",
                         "custom": {
                           "type": "azure-queue",
@@ -1327,6 +1359,7 @@
                 "[resourceId('Microsoft.Communication/emailServices/domains', format('{0}-email', parameters('appName')), 'AzureManagedDomain')]",
                 "[resourceId('Microsoft.SignalRService/webPubSub', format('{0}-index-events', parameters('appName')))]",
                 "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]",
+                "[resourceId('Microsoft.Storage/storageAccounts/queueServices/queues', variables('storageAccountName'), 'default', 'photostore-upload-expiry')]",
                 "[resourceId('Microsoft.App/managedEnvironments/storages', variables('environmentName'), 'faiss-checkpoints')]"
               ]
             },

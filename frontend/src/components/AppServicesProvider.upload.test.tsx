@@ -71,6 +71,7 @@ import { AppServicesProvider, useAppServices } from './AppServicesProvider';
 import { UploadDock } from './UploadDock';
 import { UPLOAD_SESSION_STORAGE_KEY } from './browserAiShared';
 import * as largeFileHash from '../utils/largeFileHash';
+import * as uploadWaveSync from '../services/uploadWaveSync';
 
 let services: ReturnType<typeof useAppServices>;
 function Probe() {
@@ -1164,4 +1165,76 @@ describe('upload wave shadow protocol wiring', () => {
         expect(services.uploading).toBe(false);
         expect(services.pendingUploadSummary).toBeNull();
     });
+});
+
+
+describe('discard acknowledgment after refresh', () => {
+    const restorePaused = () => {
+        const file = filesFor(1)[0];
+        localStorage.setItem(UPLOAD_SESSION_STORAGE_KEY, JSON.stringify({
+            id: 'discard-restored', createdAt: Date.now(), files: [{
+                key: 'discard-restored:0', name: file.name, size: file.size, type: file.type,
+                lastModified: file.lastModified, uploadedBytes: 0, skippedDuplicate: false, status: 'pending',
+            }],
+        }));
+        render(<AppServicesProvider><Probe /></AppServicesProvider>);
+    };
+
+    it('holds the checkpoint and new upload admission until server discard succeeds', async () => {
+        let release!: () => void;
+        vi.spyOn(uploadWaveSync, 'discardWaveShadowSession').mockImplementation(() => new Promise<void>(resolve => { release = resolve; }));
+        restorePaused(); await advance(100);
+        let discarding!: Promise<void>;
+        act(() => { discarding = services.discardPersistedUploadSession(); });
+        await advance(0);
+        expect(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)).not.toBeNull();
+        expect(services.pendingUploadSummary).not.toBeNull();
+        await act(async () => { await services.startUpload(filesFor(2)); await services.retryPersistedUploadSession(); });
+        expect(initFiles()).toHaveLength(0);
+        await act(async () => { release(); await discarding; });
+        expect(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)).toBeNull();
+        expect(services.pendingUploadSummary).toBeNull();
+        act(() => { void services.startUpload(filesFor(2)); });
+        await advance(5000);
+        expect(finalizedFiles()).toHaveLength(2);
+    });
+
+    it('keeps recovery information after failed discard and allows a later retry', async () => {
+        const discard = vi.spyOn(uploadWaveSync, 'discardWaveShadowSession')
+            .mockRejectedValueOnce(new Error('Server discard could not finish'))
+            .mockResolvedValueOnce(undefined);
+        restorePaused(); await advance(100);
+        await act(async () => { await services.discardPersistedUploadSession(); });
+        expect(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)).not.toBeNull();
+        expect(services.pendingUploadSummary).not.toBeNull();
+        expect(services.notifications.some(n => n.title === 'Upload discarded')).toBe(false);
+        await act(async () => { await services.discardPersistedUploadSession(); });
+        expect(discard).toHaveBeenCalledTimes(2);
+        expect(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)).toBeNull();
+    });
+
+    it('a late finalize callback cannot erase the checkpoint while server discard is pending', async () => {
+        let finishDiscard!: () => void;
+        let finishFinalize!: (value: unknown) => void;
+        vi.spyOn(uploadWaveSync, 'discardWaveShadowSession').mockImplementation(() => new Promise<void>(resolve => { finishDiscard = resolve; }));
+        const original = mocks.postUpload.getMockImplementation()!;
+        mocks.postUpload.mockImplementation((url: string, payload: any) => {
+            if (url === '/upload/finalize-batch') return new Promise(resolve => { finishFinalize = resolve; });
+            return original(url, payload);
+        });
+        select(filesFor(1)); await advance(2000);
+        expect(finishFinalize).toBeTypeOf('function');
+        expect(services.uploading).toBe(false);
+        let discarding!: Promise<void>;
+        act(() => { discarding = services.discardPersistedUploadSession(); });
+        await advance(0);
+        expect(finishDiscard).toBeTypeOf('function');
+        await act(async () => { finishFinalize({results: [{filename: 'original-0.heic', complete: true, duplicates: []}]}); });
+        await advance(500);
+        expect(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)).not.toBeNull();
+        expect(services.pendingUploadSummary).not.toBeNull();
+        await act(async () => { finishDiscard(); await discarding; });
+        expect(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)).toBeNull();
+    });
+
 });

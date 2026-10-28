@@ -39,15 +39,26 @@ const callShadow = async <T = unknown>(
         if (waveLiveEnabled() && await waveProtocol() === 'legacy') return null;
         const payload = typeof body === 'function' ? await body() : body;
         if (sessionScope() !== scope) return null;
-        return await postUpload<T>(path, payload, config);
+        for (let attempt = 0; ; attempt += 1) {
+            if (sessionScope() !== scope) return null;
+            try { return await postUpload<T>(path, payload, config); }
+            catch (error) {
+                const failure = error as { response?: { status?: number; data?: { code?: string; error?: string } } };
+                const contention = failure.response?.status === 409
+                    && (failure.response.data?.code === 'wave_mutation_contention'
+                        || failure.response.data?.error === 'Concurrent wave mutation; retry the request');
+                if (!contention || attempt >= 3) throw error;
+                await new Promise(resolve => setTimeout(resolve, 250 * 2 ** attempt + Math.random() * 250));
+            }
+        }
     } catch (err) {
         // Live admission is required for bytes to start. Keep the server's
         // reason instead of turning a library/session failure into a generic
         // error on every selected file. Outcome reporting remains best effort.
         if (admission && waveLiveEnabled()) {
-            const failure = err as { response?: { data?: { error?: unknown } }; message?: string };
+            const failure = err as { response?: { status?: number; data?: { error?: unknown } }; message?: string };
             const reason = failure?.response?.data?.error;
-            throw new Error(`Upload admission failed: ${typeof reason === 'string' ? reason : failure?.message || 'Unable to contact the upload service.'}`);
+            throw Object.assign(new Error(`Upload admission failed: ${typeof reason === 'string' ? reason : failure?.message || 'Unable to contact the upload service.'}`), { status: failure.response?.status });
         }
         // Best-effort diagnostics only -- never surfaced to the user and
         // never thrown into the real upload path's callers.
@@ -78,7 +89,7 @@ export const WAVE_SHADOW_MAX_PAGE = 2000;
 export const WAVE_RESOLVE_MAX_BATCH = 100;
 
 export const openWaveShadowSession = (sessionId: string, declaredCount: number, resumedFromSessionId?: string) =>
-    callShadow<{ waveId: string; manifestRevision: string }>(
+    callShadow<{ waveId: string; manifestRevision: string; state?: string; leaseActive?: boolean; leaseExpiresAt?: number; serverNow?: number }>(
         `${base()}/sessions`,
         { sessionId, declaredCount, ...(resumedFromSessionId ? { resumedFromSessionId } : {}) },
         SHADOW_REQUEST_CONFIG, true,
@@ -125,3 +136,19 @@ export const closeWaveShadowSession = (sessionId: string, manifestRevision: stri
         `${base()}/sessions/${encodeURIComponent(sessionId)}/close`,
         { manifestRevision, closeId },
     );
+
+export const abandonWaveShadowSession = (sessionId: string, manifestRevision: string) =>
+    callShadow<{ manifestRevision: string; state: string; abandonmentNeedsMore?: boolean }>(
+        `${base()}/sessions/${encodeURIComponent(sessionId)}/abandon`,
+        { manifestRevision, reason: 'User discarded the paused upload' }, BATCH_REQUEST_CONFIG, true,
+    );
+
+// Reuse the existing heartbeat transport; the authenticated library is resolved
+// on the server. Old servers remain compatible until the full rollout finishes.
+export const renewUploadWaveLease = async (sessionId: string) => {
+    const scope = sessionScope();
+    const result = await postUpload<{ leaseActive?: boolean; leaseExpiresAt?: number; serverNow?: number }>(
+        '/upload/transfer-heartbeat', { waveSessionId: sessionId }, SHADOW_REQUEST_CONFIG);
+    if (scope !== sessionScope()) throw new Error('Upload library changed.');
+    return result;
+};

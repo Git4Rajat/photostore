@@ -46,7 +46,17 @@ def _reap_stale_sessions(store,library,clock,emit,*,deadline,pages=2,work=None,s
             if row.get('state')=='open':
                 wave=store._get(store.wave_key(row['waveId']))
                 last=wave.get('lastProgressAt',wave.get('createdAt',0)) if wave else clock()
-                if row.get('abandoning') or clock()-last>=STALE_SESSION_SECONDS:
+                if row.get('leaseExpiresAt'):
+                    from upload_session_lease import expire
+                    def drive_expired(current,wave_id):
+                        if work is not None and send is not None:
+                            from wave_runtime import relay_current
+                            wave,_=advance_wave(work,current,library,wave_id)
+                            relay_current(work,current,wave,send)
+                    from upload_session_lease import send_check
+                    if row.get('abandoning') or row['leaseExpiresAt']<=clock():
+                        expire(store,row['sessionId'],send_check,drive_expired,emit)
+                elif row.get('abandoning') or clock()-last>=STALE_SESSION_SECONDS:
                     try:
                         result=abandon(store,row['sessionId'],row['manifestRevision'],
                             reason=row.get('abandonReason') or f'Auto-abandoned: no activity for over {STALE_SESSION_SECONDS}s')
