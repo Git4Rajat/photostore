@@ -568,12 +568,14 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
             previews = resources.enter_context(PreviewPrefetch(preview_loader))
             from processing_artifacts import upload_response_enabled
             from face_write_batch import enabled as face_batch_enabled
+            from face_write_batch import read_consolidation_enabled
             from semantic_batching import runtime_config as semantic_runtime_config
             semantic_config = semantic_runtime_config()
             processing_diagnostics.emit('vision_runtime_config', role='vision', wave_id=wave_id,
                 artifact_upload_response_enabled=upload_response_enabled(),
                 artifact_preview_reuse_enabled=os.getenv('IPWORK_ARTIFACT_PREVIEW_REUSE_ENABLED', 'true').lower() in ('1','true','yes'),
                 face_persist_batch_enabled=face_batch_enabled(),
+                face_apply_reads_batch_enabled=read_consolidation_enabled(),
                 semantic_text_mode=semantic_config['mode'],
                 semantic_text_batch_size=semantic_config['batch_size'],
                 semantic_text_window_ms=semantic_config['window']*1000,

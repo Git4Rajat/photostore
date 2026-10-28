@@ -12,6 +12,12 @@ spec=importlib.util.spec_from_file_location('face_persistence_benchmark',
 bench=importlib.util.module_from_spec(spec);sys.modules[spec.name]=bench;spec.loader.exec_module(bench)
 
 
+@pytest.fixture(autouse=True)
+def original_read_baseline(monkeypatch):
+    # This historical experiment compares write batching before read consolidation.
+    monkeypatch.setenv('IPWORK_FACE_APPLY_READS_BATCH_ENABLED', 'false')
+
+
 @pytest.mark.parametrize('count',[0,1,8])
 @pytest.mark.parametrize('seed',[False,True])
 def test_output_and_curation_match_current(count,seed):

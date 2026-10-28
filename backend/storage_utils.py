@@ -1815,9 +1815,12 @@ def _store_client_face_generation_rows(user_id: str, filename: str, faces, *,
         # must run before upsert_entity below so the large array never lands
         # on the photofaces row. No-op (puts the field back) if the table
         # isn't configured, so older deploys keep today's inline behavior.
-        _renew_face_filename_write(user_id, filename, generation, artifact_checks_source=True)
+        from face_write_batch import defers_writes
+        if not defers_writes(_CTX.get('face_embeddings_table_client')):
+            _renew_face_filename_write(user_id, filename, generation, artifact_checks_source=True)
         _extract_and_store_face_embedding(user_id, face_id, entity, strict=True)
-        _renew_face_filename_write(user_id, filename, generation, artifact_checks_source=True)
+        if not defers_writes(face_table_client):
+            _renew_face_filename_write(user_id, filename, generation, artifact_checks_source=True)
         from processing_fence import write_artifact
         write_artifact(face_table_client, entity, previous=existing, previous_known=True)
         stored_ids.append(face_id)

@@ -20,12 +20,25 @@ def enabled():
     return os.getenv('IPWORK_FACE_PERSIST_BATCH_ENABLED', 'true').lower() in ('true', '1', 'yes')
 
 
+def read_consolidation_enabled():
+    return os.getenv('IPWORK_FACE_APPLY_READS_BATCH_ENABLED', 'true').lower() in ('true', '1', 'yes')
+
+
+def defers_writes(table):
+    batch = _ACTIVE.get()
+    deferred = bool(batch is not None and batch['consolidate_reads'] and table is not None
+                    and hasattr(table, 'submit_transaction'))
+    if deferred: metrics.add(face_write_lease_checks_deferred=1)
+    return deferred
+
+
 @contextmanager
 def face_write_batch(use, guard):
-    token = _ACTIVE.set({'tables': {}, 'guard': guard} if use else None)
+    token = _ACTIVE.set({'tables': {}, 'guard': guard, 'pending': [],
+                         'consolidate_reads': read_consolidation_enabled()} if use else None)
     try:
         yield
-        if _ACTIVE.get() and _ACTIVE.get()['tables']:
+        if _ACTIVE.get() and (_ACTIVE.get()['tables'] or _ACTIVE.get()['pending']):
             raise RuntimeError('Face writes must flush before filename lookup publication')
     finally:
         _ACTIVE.reset(token)
@@ -35,6 +48,12 @@ def enqueue(table, entity, fence, previous, previous_known):
     batch = _ACTIVE.get()
     if batch is None or not hasattr(table, 'submit_transaction'):
         return False
+    # Reserve transaction order even when its version reads are deferred.
+    # Embeddings must precede face rows and filename completeness publication.
+    batch['tables'].setdefault((id(table), entity['PartitionKey']), [table, {}])
+    if not previous_known and batch['consolidate_reads']:
+        batch['pending'].append((table, dict(entity), fence))
+        return True
     if not previous_known:
         try: previous = table.get_entity(entity['PartitionKey'], entity['RowKey'])
         except ResourceNotFoundError: previous = None
@@ -58,6 +77,21 @@ def enqueue(table, entity, fence, previous, previous_known):
 def flush():
     batch = _ACTIVE.get()
     if batch is None: return
+    # Read versions once per table/partition before the final lease/source
+    # checks. Conditional transaction writes retain these exact ETags.
+    from table_reads import read_entities
+    grouped = {}
+    for table, entity, fence in batch['pending']:
+        grouped.setdefault((id(table), entity['PartitionKey']), []).append((table, entity, fence))
+    for entries in grouped.values():
+        table, partition = entries[0][0], entries[0][1]['PartitionKey']
+        keys = [entry[1]['RowKey'] for entry in entries]
+        with metrics.timer('face_write_version_read'):
+            versions = read_entities(table, partition, keys, workers=1)
+        metrics.add(face_write_version_batches=1, face_write_version_keys=len(keys))
+        for table, entity, fence in entries:
+            enqueue(table, entity, fence, versions[entity['RowKey']], True)
+    batch['pending'].clear()
     from processing_fence import current_fence
     for table, keyed in batch['tables'].values():
         operations = list(keyed.values())

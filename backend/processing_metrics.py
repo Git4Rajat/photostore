@@ -17,6 +17,8 @@ _PURPOSES = {'inspection', 'qualification', 'claim', 'heartbeat', 'source_releas
              'face_persistence', 'semantic_refresh', 'embedding_write',
              'metadata_commit', 'metadata_cas', 'lease_and_policy_check', 'completion_delivery', 'other'}
 _FIELDS = {
+    'face_write_version_batches', 'face_write_version_keys', 'face_write_lease_checks_deferred',
+    'face_write_version_reads', 'face_write_version_read_ms', 'face_write_version_read_errors',
     'artifact_upload_response_receipts', 'artifact_readback_bytes_avoided', 'artifact_readback_fallbacks',
     'artifact_preview_reuses', 'artifact_preview_bytes_avoided',
     'face_write_batches', 'face_write_batch_rows', 'face_write_batch_ms', 'face_write_batch_errors',
