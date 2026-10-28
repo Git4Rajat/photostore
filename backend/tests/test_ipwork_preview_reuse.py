@@ -38,6 +38,37 @@ def test_ready_preview_avoids_original_download(preview_ctx):
     assert not any(name == 'source_download_bytes' for name, _ in metrics)
 
 
+def test_claim_snapshot_consumes_matching_prefetched_preview(monkeypatch, preview_ctx):
+    from types import SimpleNamespace
+    from vision_prefetch import PreviewPrefetch
+    preview, calls, _ = preview_ctx
+    row = dict(PartitionKey='user', RowKey='display.CR3', anonymousImageId='physical.CR3',
+               processingRevision='r1', preview_status='done', ocr_status='pending', size=10000000)
+    metadata = SimpleNamespace(library='user', get_entity=lambda *_: dict(row))
+    with PreviewPrefetch(lambda *_: preview) as prefetch:
+        prefetch.prepare([dict(filename='display.CR3', photoId='physical.CR3', processingRevision='r1')], metadata)
+        result = app._run_ipwork_steps('user', 'display.CR3', ['ocr', 'face'], metadata_snapshot=row)
+    assert all(value['received'] == preview for value in result.values())
+    assert calls == []
+
+
+def test_failed_prefetch_falls_back_once_without_repeating_preview_get(monkeypatch, preview_ctx):
+    from types import SimpleNamespace
+    from vision_prefetch import PreviewPrefetch
+    preview, calls, _ = preview_ctx
+    row = dict(PartitionKey='user', RowKey='display.CR3', anonymousImageId='physical.CR3',
+               processingRevision='r1', preview_status='done', ocr_status='pending', size=10000000)
+    metadata = SimpleNamespace(library='user', get_entity=lambda *_: dict(row))
+    monkeypatch.setattr(app, 'download_media_bytes', lambda kind, name: (calls.append((kind, name)), preview)[1])
+    def failed(*args):
+        raise RuntimeError('preview missing')
+    with PreviewPrefetch(failed) as prefetch:
+        prefetch.prepare([dict(filename='display.CR3', photoId='physical.CR3', processingRevision='r1')], metadata)
+        result = app._run_ipwork_steps('user', 'display.CR3', ['ocr'], metadata_snapshot=row)
+    assert result['ocr']['hasData']
+    assert calls == [('image', 'physical.CR3')]
+
+
 def test_stored_size_avoids_head_on_reuse(monkeypatch, preview_ctx):
     preview, calls, metrics = preview_ctx
     # The row already carries the original's size (persisted at finalize), so

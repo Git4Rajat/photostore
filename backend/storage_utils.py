@@ -2281,6 +2281,20 @@ def get_blob_properties(container_name: str, filename: str):
     return blob_client.get_blob_properties()
 
 
+def download_preview_bytes_bounded(filename: str, limit: int) -> bytes:
+    container = _CTX.get('blob_thumbnail_container')
+    blob = _get_blob_client(container, filename) if container else None
+    if blob is None:
+        raise ResourceNotFoundError('Preview storage is not configured')
+    data = blob.download_blob(offset=0, length=limit + 1, max_concurrency=1,
+        connection_timeout=5, read_timeout=15, retry_total=0).readall()
+    import processing_metrics
+    processing_metrics.add(preview_prefetch_transfer_bytes=len(data))
+    if len(data) > limit:
+        raise ValueError('Preview exceeds prefetch limit')
+    return data
+
+
 def download_media_bytes(kind: str, filename: str) -> bytes:
     if kind == 'thumbnail':
         container_name = _CTX.get('blob_thumbnail_container')

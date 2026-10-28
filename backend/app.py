@@ -16314,7 +16314,10 @@ def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str],
                             source_size = int(get_media_properties('image', source_blob)['size'])
                         if source_size <= 0:
                             raise ValueError('Invalid source size')
-                        preview = download_media_bytes('thumbnail', _preview_cache_blob_name(source_blob))
+                        from vision_prefetch import prefetched_preview
+                        preview = prefetched_preview(user_id, filename, entity)
+                        if preview is None:
+                            preview = download_media_bytes('thumbnail', _preview_cache_blob_name(source_blob))
                         processing_diagnostics.file_event('vision_download', user_id, filename, role='vision',
                             source='preview', bytes=len(preview))
                         _ipwork_metric('preview_download_bytes', count=len(preview))

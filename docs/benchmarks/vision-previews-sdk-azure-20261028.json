@@ -1,0 +1,96 @@
+{
+  "platform": "Linux-6.6.157.1-1.azl3-x86_64-with-glibc2.41",
+  "transport": "sdk",
+  "reports": [
+    {
+      "mode": "serial",
+      "round": 0,
+      "images": 48,
+      "wall_seconds": 1.0990223980043083,
+      "bytes": 13129779,
+      "peak_buffer_bytes": 1332318,
+      "buffer_limit_bytes": 16777216,
+      "consumer_seconds": 0.010553418018389493
+    },
+    {
+      "mode": "memory4",
+      "round": 0,
+      "images": 48,
+      "wall_seconds": 0.5153447639895603,
+      "bytes": 13129779,
+      "peak_buffer_bytes": 3546461,
+      "buffer_limit_bytes": 16777216,
+      "consumer_seconds": 0.03261636517709121
+    },
+    {
+      "mode": "disk4",
+      "round": 0,
+      "images": 48,
+      "wall_seconds": 0.3455786259728484,
+      "bytes": 13129779,
+      "peak_buffer_bytes": 3546461,
+      "buffer_limit_bytes": 16777216,
+      "consumer_seconds": 0.05390353308757767
+    },
+    {
+      "mode": "disk4",
+      "round": 1,
+      "images": 48,
+      "wall_seconds": 0.33439188200281933,
+      "bytes": 13129779,
+      "peak_buffer_bytes": 3546461,
+      "buffer_limit_bytes": 16777216,
+      "consumer_seconds": 0.07277790532680228
+    },
+    {
+      "mode": "memory4",
+      "round": 1,
+      "images": 48,
+      "wall_seconds": 0.3493902590125799,
+      "bytes": 13129779,
+      "peak_buffer_bytes": 3546461,
+      "buffer_limit_bytes": 16777216,
+      "consumer_seconds": 0.021534391853492707
+    },
+    {
+      "mode": "serial",
+      "round": 1,
+      "images": 48,
+      "wall_seconds": 0.6854317389661446,
+      "bytes": 13129779,
+      "peak_buffer_bytes": 1332318,
+      "buffer_limit_bytes": 16777216,
+      "consumer_seconds": 0.009942284959834069
+    },
+    {
+      "mode": "serial",
+      "round": 2,
+      "images": 48,
+      "wall_seconds": 0.6888553439639509,
+      "bytes": 13129779,
+      "peak_buffer_bytes": 1332318,
+      "buffer_limit_bytes": 16777216,
+      "consumer_seconds": 0.010129226837307215
+    },
+    {
+      "mode": "memory4",
+      "round": 2,
+      "images": 48,
+      "wall_seconds": 0.3853613210376352,
+      "bytes": 13129779,
+      "peak_buffer_bytes": 3546461,
+      "buffer_limit_bytes": 16777216,
+      "consumer_seconds": 0.03978613665094599
+    },
+    {
+      "mode": "disk4",
+      "round": 2,
+      "images": 48,
+      "wall_seconds": 0.26245131803443655,
+      "bytes": 13129779,
+      "peak_buffer_bytes": 3546461,
+      "buffer_limit_bytes": 16777216,
+      "consumer_seconds": 0.06527639395790175
+    }
+  ]
+}

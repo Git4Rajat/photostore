@@ -1,0 +1,95 @@
+{
+  "kind": "matched historical proof-read and independent model-corpus replay",
+  "reports": [
+    {
+      "mode": "serial_mixed_queries",
+      "round": 0,
+      "images": 48,
+      "wall_seconds": 16.86293218296487,
+      "cpu_seconds": 21.061409963000003,
+      "inspection_seconds": 5.832782738958485,
+      "logical_query_batches": 8,
+      "outputs_identical": true
+    },
+    {
+      "mode": "serial_prefix_queries",
+      "round": 0,
+      "images": 48,
+      "wall_seconds": 11.06023542303592,
+      "cpu_seconds": 20.448579174000002,
+      "inspection_seconds": 0.31137428106740117,
+      "logical_query_batches": 10,
+      "outputs_identical": true
+    },
+    {
+      "mode": "overlapped_prefix_queries",
+      "round": 0,
+      "images": 48,
+      "wall_seconds": 11.196236012037843,
+      "cpu_seconds": 21.088478670999997,
+      "inspection_seconds": 0.2975786519818939,
+      "logical_query_batches": 10,
+      "outputs_identical": true
+    },
+    {
+      "mode": "overlapped_prefix_queries",
+      "round": 1,
+      "images": 48,
+      "wall_seconds": 11.133451466972474,
+      "cpu_seconds": 20.889170240999988,
+      "inspection_seconds": 0.31692567898426205,
+      "logical_query_batches": 10,
+      "outputs_identical": true
+    },
+    {
+      "mode": "serial_prefix_queries",
+      "round": 1,
+      "images": 48,
+      "wall_seconds": 11.242064454010688,
+      "cpu_seconds": 20.900952426000003,
+      "inspection_seconds": 0.27154348709154874,
+      "logical_query_batches": 10,
+      "outputs_identical": true
+    },
+    {
+      "mode": "serial_mixed_queries",
+      "round": 1,
+      "images": 48,
+      "wall_seconds": 17.129236345004756,
+      "cpu_seconds": 20.947451247999993,
+      "inspection_seconds": 6.09942535898881,
+      "logical_query_batches": 8,
+      "outputs_identical": true
+    },
+    {
+      "mode": "serial_mixed_queries",
+      "round": 2,
+      "images": 48,
+      "wall_seconds": 17.06439475697698,
+      "cpu_seconds": 20.857532649999996,
+      "inspection_seconds": 6.079693126026541,
+      "logical_query_batches": 8,
+      "outputs_identical": true
+    },
+    {
+      "mode": "serial_prefix_queries",
+      "round": 2,
+      "images": 48,
+      "wall_seconds": 11.343477468995843,
+      "cpu_seconds": 21.02112567399999,
+      "inspection_seconds": 0.2794554270221852,
+      "logical_query_batches": 10,
+      "outputs_identical": true
+    },
+    {
+      "mode": "overlapped_prefix_queries",
+      "round": 2,
+      "images": 48,
+      "wall_seconds": 11.551301411993336,
+      "cpu_seconds": 21.540616064999995,
+      "inspection_seconds": 0.337665079976432,
+      "logical_query_batches": 10,
+      "outputs_identical": true
+    }
+  ]
+}

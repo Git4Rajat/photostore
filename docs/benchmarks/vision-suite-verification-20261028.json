@@ -1,0 +1,21 @@
+{
+  "validated": true,
+  "complete_report_counts": {
+    "reads": 216,
+    "scheduling": 24,
+    "buffering": 18,
+    "handoff": 9,
+    "scan": 18,
+    "previews_sdk": 9
+  },
+  "azure_scheduling_image_passes": 1152,
+  "azure_handoff_image_passes": 432,
+  "local_scheduling_image_passes": 1152,
+  "matched_model_preview_inputs": true,
+  "model_output_changes": 0,
+  "inspected_read_payloads_match": true,
+  "scan_payloads_match": true,
+  "metadata_planning_payloads_match": true,
+  "bounded_preview_payloads_verified": true,
+  "source_hashes_match": true
+}

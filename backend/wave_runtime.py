@@ -223,12 +223,18 @@ def consume(payload,*,deadline=None,progress=None):
                         try:app.app.logger.exception('Wave tag invalidation failed for %s; continuing without it',library)
                         except Exception:pass
                 inspection_failures = [0]
+                def load_preview(row, limit):
+                    return storage.download_preview_bytes_bounded(
+                        app._preview_cache_blob_name(row['anonymousImageId']), limit)
                 result=run_vision_release(leases,work,store,library,wave_id,key,
                     app.metadata_table_client,None,None,send_stage,process_source=process_with_metrics,
                     deadline=deadline,progress=progress,before_freeze=invalidate_tags,
                     source_workers=app.IPWORKER_CONCURRENCY,
                     source_executor=_source_executor(app.IPWORKER_CONCURRENCY),
-                    prepare_sources=prepare_sources, inspection_failures=inspection_failures)
+                    prepare_sources=prepare_sources, inspection_failures=inspection_failures,
+                    member_fetch_size=int(os.getenv('IPWORK_VISION_MEMBER_FETCH_SIZE', '1000')),
+                    preview_loader=load_preview if getattr(app, 'IPWORK_REUSE_PREVIEW', False) and
+                        os.getenv('IPWORK_VISION_PREFETCH_ENABLED', 'true').lower() == 'true' else None)
                 healthy_continuation = not (inspection_failures[0] and result
                     and float(result.get('lastProgressAt') or 0) <= float(wave.get('lastProgressAt') or 0))
             elif stage=='cluster':

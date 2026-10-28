@@ -1,0 +1,43 @@
+{
+  "worker_image": "ghcr.io/git4rajat/photostore-ipworker@sha256:73c70ad8de009b858e4bace47182fdc48aea2b2aab7fb6e0fef8f1d013226f3a",
+  "cpu_limit": 2,
+  "memory_limit": "4Gi",
+  "state": {
+    "job": "vision-all-9840a137e4",
+    "account": "psbench71a9b27cca24",
+    "subscription": "c14d0e72-4b72-429d-bf2a-8cede087b9a8",
+    "resource_group": "forenklaprep1-dev-rg",
+    "image": "ghcr.io/git4rajat/photostore-ipworker@sha256:73c70ad8de009b858e4bace47182fdc48aea2b2aab7fb6e0fef8f1d013226f3a",
+    "execution": "vision-all-9840a137e4-ll7b2lj",
+    "followup_execution": "vision-all-9840a137e4-g6bexo9",
+    "cleanup_verified_utc": "2026-10-28T11:39:53.753672+00:00"
+  },
+  "original_source_hashes": {
+    "vision_utils.py": "41dc577f252f42a858b73225ef2bc5062fcf407a0e520c39a0b22e7bc1ee166a",
+    "image_batching.py": "682b1b8af8aa141c50fff0fff91229d6d06e62770ee57654bea247ebe04323fa",
+    "processing_metrics.py": "bdc606026903c7183bbf7bda46330e5bab8fa6e6700b002842fdc4269fb2bf8f",
+    "table_reads.py": "455277bc6fa7f46c9c0667d632fdc5b60986ab5d90bb01476e070815dcba61a7",
+    "benchmark_vision_reads.py": "a8980f15d29120106a25660f584f3014fd3c900bd70a924a5e1c2668dfd8d8a7",
+    "benchmark_vision_scheduling.py": "771a65a0ecbcc027cee720a53661a7e2a0d3b1b56d14909084f003bf7457ba6e",
+    "benchmark_vision_buffering.py": "22e70d70d551e8f7125167178c9885f067c542d14b2002ef656c049f557bd293",
+    "benchmark_vision_preview_fetch.py": "75145c7d6f223723bbccae75254053f08044bd971cb698c1efb2866e8a7e1b9b",
+    "benchmark_vision_stages.py": "4b156ad7b07ee32e8fabef4d1ba9e4f793164c39766eaf53fbc679d142156ca2",
+    "benchmark_vision_handoff.py": "bc5a216a8cc0be6f911a0c252c5bdb05db9462edf0f116fd71ebd4ef41ac7579"
+  },
+  "followup_source_hashes": {
+    "benchmark_vision_preview_fetch.py": "24a3690a863f48457bbdcc110ec36a791d15d817fcbae83ae4a5591f4d36c630",
+    "benchmark_vision_wave_scan.py": "89e565446746c98d343cb8151268d96ca09bcb247f57f54541e2d806a25cd4a1",
+    "benchmark_vision_reads.py": "a8980f15d29120106a25660f584f3014fd3c900bd70a924a5e1c2668dfd8d8a7",
+    "benchmark_vision_scheduling.py": "fdfa5db21c32740bdf7cd60cb68af25684544d0522de3dcc71125309653bc149",
+    "benchmark_vision_buffering.py": "e23ba5df94442e3373f4410c4e681f58f3423359fc70179c0c9cc768f369351c"
+  },
+  "production_verification": {
+    "vision_template_unchanged": true,
+    "containers": [
+      {
+        "name": "vision",
+        "image": "ghcr.io/git4rajat/photostore-ipworker:d8c8248b8396e247c1c7b84746e21405a70713bd"
+      }
+    ]
+  }
+}

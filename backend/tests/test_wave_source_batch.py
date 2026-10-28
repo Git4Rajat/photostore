@@ -28,7 +28,7 @@ class QueryMetadata(FakeMetadata):
         self.queries = 0
         self.reads = 0
 
-    def query_entities(self, query, results_per_page):
+    def query_entities(self, query, results_per_page=20):
         assert len(re.findall(r'\b(?:PartitionKey|RowKey) eq ', query)) <= 15
         self.queries += 1
         library = re.search(r"PartitionKey eq '((?:[^']|'')*)'", query)[1].replace("''", "'")
@@ -352,6 +352,29 @@ def test_receipt_reuse_does_not_skip_validation_or_cache_missing_artifacts(world
     assert batch._get('face!late') is not None
 
 
+def test_receipts_survive_page_boundary_but_inspection_snapshots_are_rebuilt(world, monkeypatch):
+    import wave_source_batch
+    metadata, wave, key = admit(world, 21)
+    store = world[0]
+    original = wave_source_batch.InspectionBatch
+    seen = []
+    def inspect(store, members, metadata, receipts):
+        if seen:
+            assert receipts is seen[0][0]
+            assert receipts._get('face!page-marker') == {'payload': 'immutable'}
+        snapshot = original(store, members, metadata, receipts)
+        receipts._remember('face!page-marker', {'payload': 'immutable'})
+        seen.append((receipts, snapshot))
+        return snapshot
+    monkeypatch.setattr(wave_source_batch, 'InspectionBatch', inspect)
+    def process(library, filename, revision, renew):
+        publish_completion(store, metadata, filename=filename)
+    assert run(world, metadata, wave, key, process)['state'] == 'ready'
+    assert len(seen) == 2
+    assert seen[0][1] is not seen[1][1]
+    assert set(seen[0][1].proofs).isdisjoint(seen[1][1].proofs)
+
+
 def test_preparation_deadline_does_not_consume_model_attempts(world, monkeypatch):
     metadata, wave, key = admit(world, 2)
     store = world[0]
@@ -401,7 +424,7 @@ def test_metadata_queries_bound_long_filename_filters():
     metadata = QueryMetadata()
     members = [dict(filename=str(index) + '-' + 'a' * 950 + '.jpg') for index in range(20)]
     for member in members:
-        metadata.put('library-A', member['filename'], RowKey=member['filename'])
+        metadata.put('library-A', member['filename'], PartitionKey='library-A', RowKey=member['filename'])
     original = metadata.query_entities
     queries = []
     def query(filter_text, **kwargs):
@@ -645,7 +668,7 @@ def test_prefetched_receipt_still_rejects_corrupt_manifest(world):
         _inspect_vision_member(store, wave, members[0], rows, receipts)
 
 
-def test_twenty_completed_sources_replace_eighty_point_reads_with_seven_queries(world, monkeypatch):
+def test_completed_sources_use_separate_proof_families_without_point_reads(world, monkeypatch):
     from wave_source_batch import InspectionBatch, ReceiptBatch, MetadataBatch
     from upload_wave_execution import _inspect_vision_member
     metadata, wave, _ = admit(world, 20)
@@ -665,7 +688,7 @@ def test_twenty_completed_sources_replace_eighty_point_reads_with_seven_queries(
     batched.inspection = InspectionBatch(store, members, metadata, batched)
     after = [_inspect_vision_member(store, wave, member, metadata, batched) for member in members]
     assert before == after
-    assert reads == [] and len(table.queries) - queries_before == 7
+    assert reads == [] and len(table.queries) - queries_before == 8
 
 
 def test_deletion_arriving_after_prefetch_wins_before_source_settlement(world):

@@ -89,6 +89,14 @@ def test_timer_accounts_failure_and_distinguishes_flush_from_fsync():
     assert values['journal_flush_ms'] >= values['journal_fsync_ms'] >= 0
 
 
+def test_buffer_peak_observations_are_maxima_not_summed_samples():
+    with metrics.accounting() as counter:
+        metrics.observe(receipt_cache_memory_peak_bytes=8, preview_prefetch_slots_peak=4)
+        metrics.observe(receipt_cache_memory_peak_bytes=3, preview_prefetch_slots_peak=1)
+    assert counter.snapshot()['receipt_cache_memory_peak_bytes'] == 8
+    assert counter.snapshot()['preview_prefetch_slots_peak'] == 4
+
+
 def test_batch_counters_measure_queries_rows_and_absence_without_extra_reads():
     from table_reads import read_entities
     from test_table_reads import QueryRows

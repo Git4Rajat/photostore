@@ -105,6 +105,7 @@ def vision_wave_summary(function):
                 return result
             finally:
                 wave = result or {}
+                resources = resource_sample()
                 trace_fields = {key: value for key, value in (_TRACE.get() or {}).items()
                                 if key in ('message_id', 'batch_id', 'attempt_id', 'dispatch_attempt', 'schedule_id')}
                 emit('vision_wave_attempt_summary', wave_id=wave_id, library_id=file_id(library, ''),
@@ -113,6 +114,8 @@ def vision_wave_summary(function):
                     member_count=wave.get('memberCount'), failed_members=wave.get('failedMembers'),
                     milliseconds=(time.monotonic() - started) * 1000,
                     process_cpu_ms=(time.process_time() - cpu) * 1000, cpu_attribution='process',
+                    process_current_rss_bytes=resources.get('current_rss_bytes'),
+                    process_peak_rss_bytes=resources.get('peak_rss_bytes'), memory_attribution='process',
                     storage_tracing_enabled=storage_tracing_enabled(),
                     **trace_fields,
                     **counter.snapshot())

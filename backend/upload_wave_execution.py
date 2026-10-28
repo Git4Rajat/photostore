@@ -511,7 +511,8 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
 def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
                        metadata_table, face_table, face_ids, cluster_send, *, process_source=None,
                        deadline=None, progress=None, before_freeze=None, source_workers=1, source_executor=None,
-                       prepare_sources=None, inspection_failures=None):
+                       prepare_sources=None, inspection_failures=None, preview_loader=None,
+                       member_fetch_size=1000):
     """Resume bounded source/evaluation passes using qualified receipts.
 
     A checkpoint is a scan position, never proof of source completion. Each
@@ -523,13 +524,15 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
     import processing_metrics as metrics
     import vision_utils
     from semantic_batching import text_batches
-    from contextlib import nullcontext
+    from contextlib import nullcontext, ExitStack
     from concurrent.futures import ThreadPoolExecutor
     from execution_lease import execution_scope, OwnershipLost
     from upload_waves import MAX_PAGE
     from wave_source_batch import MetadataBatch, ReceiptBatch, InspectionBatch, commit_observations
     from processing_checks import CoalescedCheck
     from processing_cleanup import source_policy_scope
+    from vision_buffer import MemberWindow
+    from vision_prefetch import PreviewPrefetch
     if type(source_workers) is not int or not 1 <= source_workers <= MAX_PAGE:
         raise ValueError('Vision source concurrency must be between 1 and the member page size')
     ownership, wave = claim_release(leases, store, library, wave_id, 'vision', outbox_key, 'vision')
@@ -557,23 +560,36 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
             else ThreadPoolExecutor(max_workers=source_workers, thread_name_prefix='wave-source'))
     try:
         with execution_scope(leases, ownership, store, lambda: _execution_check(leases, ownership, store, outbox_key)), leases.keepalive(ownership, local_checks=True) as owned, source_policy_scope(store.table, library, wave_id=wave_id), text_batches(
-                vision_utils.encode_text_embeddings_batch, vision_utils._encode_text_embedding_single), vision_utils.image_embedding_batches(source_workers=source_workers), pool as executor:
+                vision_utils.encode_text_embeddings_batch, vision_utils._encode_text_embedding_single), vision_utils.image_embedding_batches(source_workers=source_workers), ExitStack() as resources, pool as executor:
             stage_check = CoalescedCheck(
                 lambda: _execution_check(leases, ownership, store, outbox_key), local=owned)
+            receipts = resources.enter_context(ReceiptBatch(store.table, store.library))
+            window = resources.enter_context(MemberWindow(store, wave_id, fetch_size=member_fetch_size))
+            previews = resources.enter_context(PreviewPrefetch(preview_loader))
+            processing_diagnostics.emit('vision_runtime_config', role='vision', wave_id=wave_id,
+                member_fetch_size=member_fetch_size, processing_group_size=MAX_PAGE,
+                source_workers=source_workers, inspection_read_workers=4,
+                member_memory_limit_bytes=window.rows.memory_limit, member_disk_limit_bytes=window.rows.disk_limit,
+                receipt_memory_limit_bytes=receipts.rows.memory_limit, receipt_disk_limit_bytes=receipts.rows.disk_limit,
+                preview_prefetch_enabled=preview_loader is not None, preview_storage=previews.storage,
+                preview_reserved_limit_bytes=previews.limit, preview_workers=previews.workers,
+                model_schedule='source_serial', clip_image_batch_size=int(os.getenv('IPWORK_CLIP_IMAGE_BATCH_SIZE', '1')))
             while phase == 'sources':
                 if expired(): return store._required(store.wave_key(wave_id))
                 renew(force=True)
                 with metrics.timer('vision_page_load', count_name='vision_page_load_calls'):
-                    members = store._page(f'e!{wave_id}!m!', cursor)
-                    metadata = MetadataBatch(metadata_table, store.library, members)
-                receipts = ReceiptBatch(store.table, store.library)
+                    members = window.page(cursor)
+                    with metrics.timer('vision_metadata_fetch', count_name='vision_metadata_fetch_calls'):
+                        metadata = MetadataBatch(metadata_table, store.library, members)
                 if members and prepare_sources is not None:
                     progressed()
-                    prepare_sources(members, metadata, renew, expired)
+                    with metrics.timer('vision_source_prepare', count_name='vision_source_prepare_calls'):
+                        prepare_sources(members, metadata, renew, expired)
                     renew()
                     progressed()
                 with metrics.timer('vision_inspection_prefetch', count_name='vision_inspection_prefetches'):
                     receipts.inspection = InspectionBatch(store, members, metadata, receipts)
+                previews.prepare(members, metadata)
                 processed = []
                 observations = _process_vision_group(store, wave_id, members,
                     metadata, process_source, renew, progressed, executor, receipts, inspection_failures,
@@ -588,7 +604,7 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
                     commit_observations(store, wave_id, observations)
                 checkpoint('sources', cursor)
                 if expired(): return store._required(store.wave_key(wave_id))
-                if len(members) < MAX_PAGE:
+                if window.done:
                     phase = 'evaluate'
                     checkpoint(phase)
             if before_freeze is not None:
@@ -629,16 +645,20 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
 def _iter_wave_faces(store, wave_id, *, renew=lambda: None):
     """Read one bounded member page and one immutable face snapshot at a time."""
     from wave_source_batch import ReceiptBatch
+    with ReceiptBatch(store.table, store.library) as receipts:
+        yield from _iter_wave_faces_cached(store, wave_id, receipts, renew=renew)
+
+
+def _iter_wave_faces_cached(store, wave_id, receipts, *, renew):
     from upload_waves import MAX_PAGE, digest
     from table_reads import read_entities
-    receipts = ReceiptBatch(store.table, store.library)
     after = ''
     while True:
         renew()
         page = store._page(f'e!{wave_id}!m!', after, size=MAX_PAGE)
         inboxes = read_entities(store.table, store.partition, [
             'source-completion!' + digest([member['photoId'], member['processingRevision']]) + '!' + member['evidenceId']
-            for member in page if member['outcome'] == 'settled'])
+            for member in page if member['outcome'] == 'settled'], workers=4, group_namespaces=True)
         # Prefetch only immutable rows. verify_reference still checks every
         # digest and source binding before any row becomes a clustering input.
         references = [json.loads(row['payload']).get('artifactReceipt', {})

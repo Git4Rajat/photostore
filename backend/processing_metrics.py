@@ -11,7 +11,7 @@ import time
 
 _COUNTERS = ContextVar('processing_io_counters', default=())
 _PURPOSE = ContextVar('processing_io_purpose', default='other')
-_PURPOSES = {'inspection', 'qualification', 'claim', 'heartbeat', 'source_release',
+_PURPOSES = {'inspection', 'qualification', 'claim', 'heartbeat', 'source_release', 'prefetch',
              'artifact_source_validation',
              'artifact_write', 'derivative_promotion', 'artifact_capture',
              'face_persistence', 'semantic_refresh', 'embedding_write',
@@ -24,6 +24,15 @@ _FIELDS = {
     'metadata_point_reads', 'metadata_query_requests', 'metadata_read_ms',
     'job_read_requests', 'blob_gets', 'blob_heads',
     'batch_requests', 'batch_queries', 'batch_keys', 'batch_rows', 'batch_missing', 'batch_point_reads',
+    'batch_wall_ms', 'batch_service_ms', 'batch_queue_ms', 'batch_query_errors', 'batch_peak_inflight',
+    'vision_member_rows_fetched', 'vision_member_groups',
+    'vision_metadata_rows_peak', 'vision_metadata_snapshot_peak_bytes',
+    'member_buffer_capacity_stops', 'member_buffer_reloads', 'receipt_cache_oversize',
+    'preview_prefetch_submitted', 'preview_prefetch_bytes', 'preview_prefetch_transfer_bytes', 'preview_prefetch_errors',
+    'preview_prefetch_download_ms', 'preview_prefetch_wait_ms', 'preview_prefetch_hits',
+    'preview_prefetch_misses', 'preview_prefetch_unused', 'preview_prefetch_disk_bytes',
+    'preview_prefetch_unused_bytes', 'preview_prefetch_drain_ms', 'preview_prefetch_skipped_candidates',
+    'preview_prefetch_reserved_peak_bytes', 'preview_prefetch_slots_peak',
     'receipt_cache_hits', 'receipt_cache_misses', 'receipt_cache_evictions',
     'receipt_write_batches', 'vision_inspection_prefetches', 'vision_inspection_prefetch_ms', 'vision_inspection_prefetch_errors',
     'artifact_gets', 'artifact_heads', 'artifact_verified_bytes', 'artifact_verifications',
@@ -57,8 +66,13 @@ _FIELDS = {
     for suffix in ('_calls', '_ms')
 } | {
     'vision_' + phase + suffix
-    for phase in ('page_load', 'page_commit', 'checkpoint', 'evaluation')
+    for phase in ('page_load', 'page_commit', 'checkpoint', 'evaluation',
+                  'member_fetch', 'metadata_fetch', 'proof_inbox_fetch',
+                  'manifest_fetch', 'face_receipt_fetch', 'source_prepare')
     for suffix in ('_calls', '_ms', '_errors')
+} | {prefix + suffix for prefix in ('receipt_cache', 'member_buffer')
+     for suffix in ('_memory_peak_bytes', '_disk_peak_bytes', '_disk_file_peak_bytes', '_entries_peak',
+                    '_disk_read_ms', '_disk_write_ms', '_disk_errors', '_disk_hits')
 } | {'storage_not_found', 'storage_conflicts', 'storage_precondition_failed', 'storage_throttled', 'storage_server_errors'}
 
 
@@ -77,6 +91,12 @@ class Counters:
         with self.lock:
             return {key: self.values.get(key, 0) for key in sorted(_FIELDS)
                     if not key.startswith('io_') or key in self.values}
+
+    def observe(self, values):
+        with self.lock:
+            for key, value in values.items():
+                if key in _FIELDS:
+                    self.values[key] = max(self.values.get(key, 0), value)
 
 
 @contextmanager
@@ -102,6 +122,11 @@ def purpose(name):
 def add(**values):
     for counter in _COUNTERS.get():
         counter.add(values)
+
+
+def observe(**values):
+    for counter in _COUNTERS.get():
+        counter.observe(values)
 
 
 def record_io(kind, method, path, status, milliseconds, size):
@@ -137,10 +162,11 @@ def record_io(kind, method, path, status, milliseconds, size):
 def inherit(function, *, purpose_name='heartbeat'):
     """Carry only accounting into a raw thread, without copying execution fences."""
     counters = _COUNTERS.get()
+    inherited_purpose = _PURPOSE.get() if purpose_name is None else purpose_name
     def run():
         token = _COUNTERS.set(counters)
         try:
-            with purpose(purpose_name):
+            with purpose(inherited_purpose):
                 return function()
         finally:
             _COUNTERS.reset(token)

@@ -1,47 +1,58 @@
 """Bounded Vision coordination batches; source artifacts retain their own fences."""
-from urllib.parse import quote as url_quote
-from collections import OrderedDict
 from azure.core.exceptions import ResourceNotFoundError
 
 from upload_waves import Conflict, MAX_PAGE, digest
 from processing_receipts import ArtifactReceipts
-from processing_metrics import add
+from processing_metrics import add, timer
 
 
 class ReceiptBatch(ArtifactReceipts):
-    """Reuse immutable artifact rows while still validating every reference.
+    """Reuse immutable artifact rows across pages within one Vision attempt.
 
     Mutable metadata, inboxes, policies and leases are never cached. Missing
     rows are not retained: source processing can publish them during the page.
     """
     def __init__(self, table, library):
+        from vision_buffer import LocalRows, limit_bytes
         super().__init__(table, library)
-        self.rows = OrderedDict()
+        self.rows = LocalRows(prefix='receipt_cache',
+            memory_bytes=limit_bytes('IPWORK_VISION_RECEIPT_MEMORY_MB', 8, 64),
+            disk_bytes=limit_bytes('IPWORK_VISION_RECEIPT_DISK_MB', 256, 1024))
         self.inspection = None
 
     def _remember(self, key, row):
         if row is not None and key.startswith(('manifest!', 'face!')):
-            self.rows[key] = row
-            self.rows.move_to_end(key)
-            while len(self.rows) > 4096:
-                self.rows.popitem(last=False)
+            while not self.rows.put(key, row):
+                if not len(self.rows):
+                    add(receipt_cache_oversize=1)
+                    break
+                self.rows.pop(next(iter(self.rows.entries)))
                 add(receipt_cache_evictions=1)
 
     def prefetch(self, keys):
-        from table_reads import read_entities, key_batches
-        for batch in key_batches(key for key in keys if key not in self.rows):
-            for key, row in read_entities(self.table, self.partition, batch).items():
-                self._remember(key, row)
+        from table_reads import read_entities
+        pending = list(dict.fromkeys(key for key in keys if key not in self.rows))
+        for key, row in read_entities(self.table, self.partition, pending, workers=4, group_namespaces=True).items():
+            self._remember(key, row)
+        self.rows.flush()
 
     def _get(self, key):
         if key in self.rows:
             add(receipt_cache_hits=1)
-            self.rows.move_to_end(key)
-            return self.rows[key]
+            try:
+                return self.rows.get(key)
+            except KeyError:
+                self.rows.pop(key)
         row = super()._get(key)
         add(receipt_cache_misses=1)
         self._remember(key, row)
         return row
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.rows.clear()
 
 
 class InspectionBatch:
@@ -70,7 +81,8 @@ class InspectionBatch:
                 proof_keys.append('admitted-source!' + digest([row['anonymousImageId'], row['processingRevision']]))
             if row.get('processingCompletionId'):
                 inbox_keys.append('source-completion!' + digest([photo, revision]) + '!' + row['processingCompletionId'])
-        rows = read_entities(store.table, store.partition, [*proof_keys, *inbox_keys])
+        with timer('vision_proof_inbox_fetch', count_name='vision_proof_inbox_fetch_calls'):
+            rows = read_entities(store.table, store.partition, [*proof_keys, *inbox_keys], workers=4, group_namespaces=True)
         self.proofs = {key: rows[key] for key in proof_keys}
         self.inboxes = {key: rows[key] for key in inbox_keys}
         references = []
@@ -82,7 +94,8 @@ class InspectionBatch:
                         references.append(reference)
                 except (ValueError, TypeError):
                     pass  # Per-member validation still reports corrupt evidence.
-        receipts.prefetch('manifest!' + ref['id'] for ref in references)
+        with timer('vision_manifest_fetch', count_name='vision_manifest_fetch_calls'):
+            receipts.prefetch('manifest!' + ref['id'] for ref in references)
         faces = []
         for ref in references:
             manifest = receipts._get('manifest!' + ref['id'])
@@ -91,7 +104,8 @@ class InspectionBatch:
                     faces.extend('face!' + key for key in json.loads(manifest['payload'])['faceSnapshots'])
                 except (ValueError, TypeError, KeyError):
                     pass
-        receipts.prefetch(faces)
+        with timer('vision_face_receipt_fetch', count_name='vision_face_receipt_fetch_calls'):
+            receipts.prefetch(faces)
 
 
 class MetadataBatch:
@@ -106,26 +120,12 @@ class MetadataBatch:
             raise ValueError('Metadata batch exceeds member page')
         names = {member['filename'] for member in members}
         if hasattr(table, 'query_entities') and names:
-            quote = lambda value: value.replace("'", "''")
-            prefix = "PartitionKey eq '" + quote(library) + "' and ("
-            filters = []
-            def fetch():
-                query = prefix + ' or '.join(filters) + ')'
-                self.rows.update({row['RowKey']: row for row in
-                    table.query_entities(query, results_per_page=MAX_PAGE) if row.get('RowKey') in names})
-            for name in sorted(names):
-                clause = "RowKey eq '" + quote(name) + "'"
-                # One PK comparison plus at most fourteen row comparisons;
-                # also bound the encoded filter for long/non-ASCII filenames.
-                candidate = prefix + ' or '.join([*filters, clause]) + ')'
-                if filters and (len(filters) == 14 or len(url_quote(candidate)) > 6000):
-                    fetch()
-                    filters = []
-                filters.append(clause)
-            if filters:
-                fetch()
-            for name in names:
-                self.rows.setdefault(name, None)
+            from table_reads import read_entities
+            self.rows = read_entities(table, library, names, workers=4)
+            from vision_buffer import encode
+            from processing_metrics import observe
+            observe(vision_metadata_rows_peak=len(self.rows), vision_metadata_snapshot_peak_bytes=sum(
+                len(encode(row)) for row in self.rows.values() if row is not None))
 
     def get_entity(self, library, filename):
         if library == self.library and filename in self.rows:
