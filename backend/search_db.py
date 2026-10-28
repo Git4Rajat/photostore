@@ -49,6 +49,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import perf_instrumentation
 from index_ownership import catalog_publisher
 import search_utils
+from catalog_metadata import is_upload_reservation_only
 from ordering_utils import metadata_capture_datetime, metadata_upload_datetime
 
 _LOGGER = logging.getLogger(__name__)
@@ -161,9 +162,10 @@ def _collect_location_terms(into: set, row: Dict) -> None:
 def row_record(row: Dict) -> Optional[Dict]:
     """Everything the database stores for one photo (shared by the full build and by delta
     updates, so both produce byte-identical rows): the reduced JSON, gallery columns, people ids,
-    the full-text document and the place-name terms. None when the row has no filename."""
+    the full-text document and the place-name terms. None for missing filenames
+    or upload reservations that have not finalized."""
     filename = str(row.get('RowKey') or '').strip()
-    if not filename:
+    if not filename or is_upload_reservation_only(row):
         return None
     slim = reduced_row(row)
     captured = metadata_capture_datetime(row)

@@ -27,6 +27,7 @@ from azure.data.tables import UpdateMode
 from azure.storage.blob import ContentSettings as BlobContentSettings
 from werkzeug.utils import secure_filename
 from upload_diagnostics import timed_call, upload_phase
+from catalog_metadata import CATALOG_ADMISSION_FIELDS, is_upload_reservation_only
 
 # This module otherwise swallows failures silently (`except Exception: pass`)
 # because they happen inside a request a caller will retry or already
@@ -4139,7 +4140,7 @@ _STREAM_SELECT_FIELDS = sorted(set(PHOTO_LIST_SELECT_FIELDS) | {
     'ocrText', 'caption', 'aiPersonLabel', 'locationRegion', 'processing_complete',
     'faceCount', 'peopleIds', 'latitude', 'longitude', 'address', 'locationCity',
     'locationCountry', 'exifData', 'processing_metadata',
-})
+} | set(CATALOG_ADMISSION_FIELDS))
 
 # Set by app.py at import: callable(user_id, source_version=None) running the
 # streaming build with the app-level sinks (Explore needs app helpers).
@@ -4367,7 +4368,8 @@ def refresh_user_search_db_incremental(user_id: str) -> Dict[str, object]:
             upserts, deletes = [], []
             for name in chunk:
                 row = rows.get(name)
-                # Unprocessed photos are listed too (see library_build): only deleted/missing rows are dropped.
+                # Finalized photos are listed before processing completes;
+                # row_record also drops unfinalized upload reservations.
                 gone = row is None or str(row.get('processing_state') or '').strip().lower() == 'deleted'
                 record = search_db.row_record(row) if not gone else None
                 if record is not None:
@@ -5151,13 +5153,13 @@ def get_user_lexical_index(
 # _VECTOR_INDEX_RELEVANT_FIELDS/_SORT_INDEX_RELEVANT_FIELDS above). A rating
 # tap needs to cheaply re-sort a number, not pay for a full OCR/tag/embedding
 # lexical rebuild -- so this index tracks its own staleness end to end.
-_SORT_INDEX_SCHEMA_VERSION = 'v4'  # v4: complete compact gallery tiles, no per-page table enrichment
+_SORT_INDEX_SCHEMA_VERSION = 'v5'  # v5: exclude unfinalized upload reservations
 _SORT_INDEX_CACHE_LOCK = threading.RLock()
 _SORT_INDEX_CACHE: Dict[str, Dict[str, object]] = _serve_only_cache()
 _SORT_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
 # Stream only the columns needed for chronology and compact tiles. EXIF and
 # processing JSON are reduced per row, never stored in the browser index.
-_SORT_INDEX_SOURCE_FIELDS = [
+_SORT_INDEX_SOURCE_FIELDS = sorted(set(CATALOG_ADMISSION_FIELDS) | {
     'PartitionKey', 'RowKey', 'processing_state',
     'rating', 'likes', 'uploadDate',
     'exifData', 'clientLastModified', 'upload_started_at', 'last_processing_update',
@@ -5166,7 +5168,7 @@ _SORT_INDEX_SOURCE_FIELDS = [
     'preview_status', 'exif_status', 'ocr_status', 'face_status',
     'ai_vision_status', 'map_detection_status',
     'latitude', 'longitude', 'address', 'locationCity', 'locationCountry', 'locationRegion',
-]
+})
 
 
 def _sort_index_json_blob_name(user_id: str) -> str:
@@ -5328,7 +5330,7 @@ def _catalog_derivative_receipt(entity: Dict, kind: str):
 
 def _sort_index_row(entity: Dict) -> Optional[Dict[str, object]]:
     filename = str(entity.get('RowKey') or '').strip()
-    if not filename:
+    if not filename or is_upload_reservation_only(entity):
         return None
     capture_dt = metadata_capture_datetime(entity)
     processing = _safe_json_load(entity.get('processing_metadata'))
@@ -5349,7 +5351,7 @@ def _sort_index_row(entity: Dict) -> Optional[Dict[str, object]]:
         'uploadDate': entity.get('uploadDate') or None,
         # Physical blob name -- lets the browser build thumbnail/preview/full-res
         # URLs itself from the media token with no backend call (see GET
-        # /api/photos/media-token). Always present (assigned at upload time,
+        # /api/photos/media-token). Always present (assigned at finalization,
         # before any processing step runs) rather than gated on
         # thumbnail_status/preview_status=='done': the client attempts the
         # blob directly and treats a 404 as "still generating" instead of
@@ -5667,6 +5669,7 @@ def ensure_user_sort_index_current(user_id: str) -> bool:
     thumbnail wasn't done at build time, forcing the client to fall back to
     /api/photos/access-batch for those rows instead of resolving directly).
     v4 adds the compact tile metadata previously fetched from Table Storage.
+    v5 excludes upload reservations that have not finalized.
     True if a rebuild ran."""
     key = str(user_id or '').strip()
     manifest = _load_sort_index_manifest(key) if key else {}
@@ -5817,9 +5820,9 @@ _ACCESS_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
 # reasoning as _SORT_INDEX_SOURCE_FIELDS. No processing_state: unlike every
 # other derived index here, this one never filters on it, so there's nothing
 # to select it for.
-_ACCESS_INDEX_SOURCE_FIELDS = [
+_ACCESS_INDEX_SOURCE_FIELDS = sorted(set(CATALOG_ADMISSION_FIELDS) | {
     'PartitionKey', 'RowKey', 'anonymousImageId', 'thumbnail_status', 'preview_status', 'thumbnailArtifact', 'previewArtifact',
-]
+})
 
 
 def _access_index_json_blob_name(user_id: str) -> str:
@@ -5952,7 +5955,7 @@ def _serialize_access_index(snapshot: LexicalIndexSnapshot) -> bytes:
 
 def _access_index_row(entity: Dict) -> Optional[Dict[str, object]]:
     filename = str(entity.get('RowKey') or '').strip()
-    if not filename:
+    if not filename or is_upload_reservation_only(entity):
         return None
     return {
         'RowKey': filename,

@@ -124,6 +124,41 @@ def test_build_snapshot_returns_none_when_table_unconfigured(monkeypatch):
     assert storage_utils._build_user_sort_index_snapshot('lib-A', 'v1') is None
 
 
+@pytest.mark.parametrize('kind', ['sort', 'access'])
+def test_full_and_incremental_catalogs_exclude_reservations_until_finalized(sort_ctx, monkeypatch, kind):
+    table, _, _ = sort_ctx
+    refresh = getattr(storage_utils, f'refresh_user_{kind}_index')
+    load = getattr(storage_utils, f'_load_{kind}_index_blob')
+    # A projection-aware fake ensures the full scan sees the tracking fields.
+    query = table.query_entities
+
+    def projected_query(filter_str, select=None, **kwargs):
+        for row in query(filter_str, **kwargs):
+            yield {k: v for k, v in row.items() if select is None or k in select}
+
+    table.query_entities = projected_query
+    _seed_row(table, 'lib-reserved', 'pending.png', pendingAnonymousBlob='reserved',
+              upload_started_at='2026-10-27T19:21:30+00:00', thumbnail_status='running')
+    _seed_row(table, 'lib-reserved', 'legacy.jpg')
+    refresh('lib-reserved', source_version='v1', force_full=True)
+    assert [r['RowKey'] for r in load('lib-reserved').rows] == ['legacy.jpg']
+
+    # Simulate a catalog built before the fix, then dirty its leaked row.
+    with monkeypatch.context() as old_code:
+        old_code.setattr(storage_utils, 'is_upload_reservation_only', lambda row: False)
+        refresh('lib-reserved', source_version='old-catalog', force_full=True)
+    assert len(load('lib-reserved').rows) == 2
+    storage_utils._mark_search_index_dirty_filenames('lib-reserved', ['pending.png'], kinds={kind})
+    refresh('lib-reserved', source_version='v2')
+    assert [r['RowKey'] for r in load('lib-reserved').rows] == ['legacy.jpg']
+
+    _seed_row(table, 'lib-reserved', 'pending.png', anonymousImageId='reserved',
+              uploadDate='2026-10-28T09:00:00+00:00', thumbnail_status='pending')
+    storage_utils._mark_search_index_dirty_filenames('lib-reserved', ['pending.png'], kinds={kind})
+    refresh('lib-reserved', source_version='v3')
+    assert {r['RowKey'] for r in load('lib-reserved').rows} == {'legacy.jpg', 'pending.png'}
+
+
 def test_build_snapshot_returns_none_on_query_exception_not_empty_rows(monkeypatch):
     class _BoomTable:
         def query_entities(self, filter_str):

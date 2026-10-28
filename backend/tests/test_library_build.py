@@ -86,6 +86,28 @@ def test_first_build_makes_all_three_indexes_from_one_scan(world):
     assert not [p for p in __import__('os').listdir(index_files.WORK_DIR) if p.startswith('bootstrap-')]   # spool cleaned up
 
 
+def test_bootstrap_omits_upload_reservations_from_all_catalogs(world, monkeypatch):
+    svc, table = world
+    table.rows.append({'PartitionKey': 'lib', 'RowKey': 'reservation.png',
+                       'pendingAnonymousBlob': 'reserved', 'upload_started_at': '2026-10-27T19:21:30+00:00',
+                       'thumbnail_status': 'running'})
+    table.rows.sort(key=lambda r: r['RowKey'])
+    query = table.query_entities
+
+    def projected_query(filter_str, select=None, **kwargs):
+        for row in query(filter_str, **kwargs):
+            yield {k: v for k, v in row.items() if select is None or k in select}
+
+    monkeypatch.setattr(table, 'query_entities', projected_query)
+    assert library_build.bootstrap_library_build('lib')['status'] == 'built'
+    assert search_db.open_database('lib').row_count() == 96
+    for kind in ('sort', 'access'):
+        names = {r['RowKey'] for r in _blob_rows(svc, getattr(storage_utils, f'_{kind}_index_json_blob_name')('lib'))}
+        assert 'reservation.png' not in names
+        assert 'IMG_pending.jpg' in names  # Finalized photo still awaiting processing.
+    assert 'IMG_trashed.jpg' in names  # Access retains deleted finalized photos.
+
+
 def test_a_restart_resumes_from_the_cursor_and_ends_identical(world, monkeypatch):
     svc, table = world
     real_publish = search_db.publish_delta
