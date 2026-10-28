@@ -161,7 +161,9 @@ const fetchWithTimeout = async (url: string, timeoutMs: number): Promise<ArrayBu
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-        const response = await fetch(url, { signal: controller.signal });
+        // Published catalogs overwrite a stable blob URL. Versioned IndexedDB
+        // handles reuse; the HTTP cache can still contain the previous body.
+        const response = await fetch(url, { signal: controller.signal, cache: 'no-store' });
         if (!response.ok) throw new Error(`Failed to download sort index (${response.status})`);
         return await response.arrayBuffer();
     } finally {
@@ -276,8 +278,10 @@ const fetchLocalSortIndex = async (key: string, requestGeneration: number, editS
     const idbStarted = perfNow();
     const stored = await idbGetStored(key).catch(() => null);
     readStoredRemovals(key, stored);
-    perf.recordSpan('index.sort.idb_read', perfNow() - idbStarted, { cached: Boolean(stored && sourceVersion && stored.sourceVersion === sourceVersion) });
-    if (stored && sourceVersion && stored.sourceVersion === sourceVersion) {
+    const storedMatches = stored && sourceVersion && stored.sourceVersion === sourceVersion
+        && (!stored.payloadVersion || stored.payloadVersion === sourceVersion);
+    perf.recordSpan('index.sort.idb_read', perfNow() - idbStarted, { cached: Boolean(storedMatches) });
+    if (storedMatches) {
         // Unchanged since the last download for this library -- skip the
         // blob re-fetch entirely, this is the whole point of persisting it.
         perf.recordSpan('index.sort.total', perfNow() - totalStarted, { cached: true, rows: stored.rows.length });

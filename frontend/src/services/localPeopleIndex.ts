@@ -139,7 +139,8 @@ const BLOB_FETCH_TIMEOUT_MS = 120000;
 const fetchWithTimeout = (url: string, timeoutMs: number): Promise<Response> => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
-    return fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer));
+    // Stable catalog URLs are overwritten; reuse is controlled by versioned IndexedDB.
+    return fetch(url, { signal: controller.signal, cache: 'no-store' }).finally(() => clearTimeout(timer));
 };
 
 const mergeRows = (rows: PersonIndexRow[], version?: string, scope = pendingEditScope(), tokens?: ReadonlySet<string>): PersonIndexRow[] => rows.map(row => {
@@ -195,8 +196,10 @@ const fetchLocalPeopleIndex = async (key: string, scope: string, requestGenerati
     const sourceVersion = response.sourceVersion || '';
     const idbStarted = perfNow();
     const stored = await idbGetStored(key).catch(() => null);
-    perf.recordSpan('index.people.idb_read', perfNow() - idbStarted, { cached: Boolean(stored && sourceVersion && stored.sourceVersion === sourceVersion) });
-    if (stored && sourceVersion && stored.sourceVersion === sourceVersion) {
+    const storedMatches = stored && sourceVersion && stored.sourceVersion === sourceVersion
+        && (!stored.payloadVersion || stored.payloadVersion === sourceVersion);
+    perf.recordSpan('index.people.idb_read', perfNow() - idbStarted, { cached: Boolean(storedMatches) });
+    if (storedMatches) {
         perf.recordSpan('index.people.total', perfNow() - totalStarted, { cached: true, rows: stored.rows.length });
         if (stored.payloadVersion) snapshotVersions.set(stored.rows, stored.payloadVersion);
         return stored.rows;

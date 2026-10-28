@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
     library: 'library-A',
     postTools: vi.fn(),
-    get: vi.fn(async () => ({ available: true, indexUrl: 'https://storage.test/sort', sourceVersion: 'one' })),
+    get: vi.fn(async () => ({ available: true, indexUrl: 'https://storage.test/sort', sourceVersion: '2026-02-01' })),
 }));
 vi.mock('./apiClient', () => ({ get: mocks.get, postTools: mocks.postTools }));
 vi.mock('./passwordAuthClient', () => ({ getActiveLibraryFromToken: () => mocks.library }));
@@ -56,7 +56,7 @@ describe('index-backed gallery cache', () => {
         vi.resetModules();
         mocks.library = 'library-A';
         mocks.postTools.mockReset().mockRejectedValue(new Error('Source unavailable'));
-        mocks.get.mockReset().mockResolvedValue({ available: true, indexUrl: 'https://storage.test/sort', sourceVersion: 'one' });
+        mocks.get.mockReset().mockResolvedValue({ available: true, indexUrl: 'https://storage.test/sort', sourceVersion: '2026-02-01' });
         vi.stubGlobal('indexedDB', memoryDatabase());
         vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(snapshot()))));
     });
