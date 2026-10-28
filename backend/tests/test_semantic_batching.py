@@ -164,3 +164,32 @@ def test_batch_capacity_is_bounded_under_concurrent_requests():
             tasks = [pool.submit(copy_context().run, current_batcher().submit, str(i)) for i in range(8)]
             assert [task.result() for task in tasks] == [[i] for i in range(8)]
     assert sum(sizes) == 8 and max(sizes) <= 3
+
+
+def test_runtime_defaults_two_and_direct_mode_bypasses_broker(monkeypatch):
+    from semantic_batching import runtime_config
+    monkeypatch.delenv('IPWORK_SEMANTIC_TEXT_BATCH_SIZE', raising=False)
+    assert runtime_config()['batch_size']==2
+    monkeypatch.setenv('IPWORK_SEMANTIC_TEXT_MODE','direct')
+    with text_batches(lambda _: pytest.fail('Broker ran'), lambda _: [1]):
+        assert current_batcher() is None
+
+
+@pytest.mark.parametrize('name,value',[
+    ('IPWORK_SEMANTIC_TEXT_MODE','bad'),('IPWORK_SEMANTIC_TEXT_BATCH_SIZE','9'),
+    ('IPWORK_SEMANTIC_TEXT_WINDOW_MS','-1')])
+def test_bad_runtime_config_rejected(monkeypatch,name,value):
+    from semantic_batching import runtime_config
+    monkeypatch.setenv(name,value)
+    with pytest.raises(ValueError):runtime_config()
+
+
+def test_batch_occupancy_and_wait_metrics_are_recorded():
+    with metrics.accounting() as counter,text_batches(lambda texts:[[1] for _ in texts],lambda _: [1],window=.02):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures=[pool.submit(copy_context().run,current_batcher().submit,str(i)) for i in range(2)]
+            for future in futures:assert future.result()==[1]
+    values=counter.snapshot()
+    assert values['semantic_text_batch_items']==2
+    assert values['semantic_text_batch_peak']==2
+    assert values['semantic_text_queue_ms']>=0 and values['semantic_text_service_ms']>=0

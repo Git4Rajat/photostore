@@ -21,10 +21,11 @@ class Blob:
     def __init__(self):
         self.data = None; self.version = 0; self.before_download = None
         self.heads = self.gets = 0
-    def upload_blob(self, data, *, overwrite, content_settings):
+    def upload_blob(self, data, *, overwrite, content_settings, validate_content=False):
         assert overwrite is False
         if self.data is not None: raise ResourceExistsError('exists')
         self.data = data; self.version += 1
+        return {'etag': str(self.version)}
     def get_blob_properties(self):
         self.heads += 1
         return self._properties()
@@ -40,6 +41,7 @@ class Blob:
 
 @pytest.fixture
 def blobs(world, monkeypatch):
+    monkeypatch.setenv('IPWORK_ARTIFACT_UPLOAD_RESPONSE_ENABLED', 'false')
     objects = {}
     monkeypatch.setitem(storage_utils._CTX, 'blob_thumbnail_container', 'thumbs')
     monkeypatch.setattr(storage_utils, '_get_blob_client', lambda container, name: objects.setdefault(name, Blob()))

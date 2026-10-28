@@ -140,7 +140,11 @@ def encode_text_embedding(text: str) -> List[float]:
     batcher = current_batcher()
     if text and batcher is not None:
         return batcher.submit(text)
-    return _encode_text_embedding_single(text)
+    started = time.monotonic()
+    try:
+        return _encode_text_embedding_single(text)
+    finally:
+        metrics.add(semantic_text_requests=1, semantic_text_request_ms=(time.monotonic()-started)*1000)
 
 
 def _encode_text_embedding_single(text: str) -> List[float]:

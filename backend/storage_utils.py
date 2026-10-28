@@ -1603,6 +1603,19 @@ def _face_storage_phase(diagnostics, phase):
 def _store_client_face_generation(user_id: str, filename: str, faces, *,
                                   force_reconcile: bool, generation,
                                   previous_ids: Optional[List[str]], diagnostics=None) -> List[str]:
+    from face_write_batch import face_write_batch, enabled
+    from processing_fence import current_fence
+    use = enabled() and len(faces) > 1 and not force_reconcile and current_fence(user_id, filename) is not None
+    with face_write_batch(use, lambda: _renew_face_filename_write(
+            user_id, filename, generation, artifact_checks_source=True)):
+        return _store_client_face_generation_rows(user_id, filename, faces,
+            force_reconcile=force_reconcile, generation=generation,
+            previous_ids=previous_ids, diagnostics=diagnostics)
+
+
+def _store_client_face_generation_rows(user_id: str, filename: str, faces, *,
+                                  force_reconcile: bool, generation,
+                                  previous_ids: Optional[List[str]], diagnostics=None) -> List[str]:
     face_table_client = _CTX.get('face_table_client')
     if face_table_client is None or not isinstance(faces, list):
         return []
@@ -1865,6 +1878,8 @@ def _store_client_face_generation(user_id: str, filename: str, faces, *,
     # row not deleted above, plus every row just written (new detections and
     # IoU-matched re-detections, which reuse an existing RowKey). Mirrors
     # exactly what a `filename eq X` query would return.
+    from face_write_batch import flush
+    flush()  # Never mark a filename generation complete before both tables persist.
     _face_storage_phase(diagnostics, 'finish_publication')
     if diagnostics is not None:
         diagnostics.update(stored_face_count=len(stored_ids), deleted_face_count=len(deleted_face_ids))

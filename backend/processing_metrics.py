@@ -17,6 +17,11 @@ _PURPOSES = {'inspection', 'qualification', 'claim', 'heartbeat', 'source_releas
              'face_persistence', 'semantic_refresh', 'embedding_write',
              'metadata_commit', 'metadata_cas', 'lease_and_policy_check', 'completion_delivery', 'other'}
 _FIELDS = {
+    'artifact_upload_response_receipts', 'artifact_readback_bytes_avoided', 'artifact_readback_fallbacks',
+    'artifact_preview_reuses', 'artifact_preview_bytes_avoided',
+    'face_write_batches', 'face_write_batch_rows', 'face_write_batch_ms', 'face_write_batch_errors',
+    'semantic_text_collection_ms', 'semantic_text_queue_ms', 'semantic_text_service_ms',
+    'semantic_text_singleton_batches', 'semantic_text_batch_peak',
     'artifact_source_checks', 'artifact_source_check_batches', 'artifact_source_checks_coalesced',
     'completion_ack_snapshot_uses', 'completion_ack_snapshot_conflicts',
     'completion_inbox_creates', 'completion_inbox_create_conflicts',

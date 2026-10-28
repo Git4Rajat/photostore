@@ -179,7 +179,7 @@ def test_zero_face_result_publishes_an_explicit_attempt_bound_empty_lookup(world
     assert not faces.rows and not embeddings.rows
 
 
-def test_face_writes_keep_one_fresh_source_check_per_artifact(world, monkeypatch):
+def test_face_batches_keep_one_fresh_source_check_per_transaction(world, monkeypatch):
     *_, fence = world
     original = ResultFence.check
     checks = []
@@ -190,9 +190,9 @@ def test_face_writes_keep_one_fresh_source_check_per_artifact(world, monkeypatch
     with result_fence(fence):
         ids = storage_utils._store_client_face_entities('lib', 'photo.jpg', [_face(0), _face(40)])
     assert len(ids) == 2
-    # Filename acquire + publish, and a check at each of two writes per face.
+    # Filename acquire + publish, and one check before each table transaction.
     # Filename lease checks no longer duplicate those artifact checks.
-    assert len(checks) == 6
+    assert len(checks) == 4
 
 
 def test_source_change_during_embedding_read_still_blocks_persistence(world, monkeypatch):

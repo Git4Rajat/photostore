@@ -121,6 +121,9 @@ def write_artifact(table, entity, *, previous=None, previous_known=False):
     if fence is None:
         table.upsert_entity(entity)
         return
+    from face_write_batch import enqueue
+    if enqueue(table, entity, fence, previous, previous_known):
+        return
     if not previous_known:
         try:
             previous = table.get_entity(entity['PartitionKey'], entity['RowKey'])
@@ -140,7 +143,7 @@ def write_artifact(table, entity, *, previous=None, previous_known=False):
 
 
 def remember_published_derivative(receipt):
-    """Only called after publication read-back proved these immutable bytes."""
+    """Remember immutable publication proven by read-back or validated upload ACK."""
     fence, verified = _ACTIVE.get(), _PUBLISHED.get()
     if (fence is not None and verified is not None
             and receipt.get('library') == fence.library and receipt.get('photoId') == fence.photo

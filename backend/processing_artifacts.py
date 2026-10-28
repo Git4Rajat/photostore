@@ -6,6 +6,7 @@ unreferenced blobs but cannot replace a published derivative via its staging SAS
 import hashlib
 import io
 import json
+import os
 
 from PIL import Image
 from azure.core import MatchConditions
@@ -14,6 +15,10 @@ from azure.storage.blob import ContentSettings
 import processing_metrics
 
 LIMITS = {'thumbnail': (512_000, 120), 'preview': (1_500_000, 2048)}
+
+
+def upload_response_enabled():
+    return os.getenv('IPWORK_ARTIFACT_UPLOAD_RESPONSE_ENABLED', 'true').lower() in ('1', 'true', 'yes')
 
 
 def staging_name(library, photo, revision, attempt, kind):
@@ -89,21 +94,30 @@ def publish(storage, metadata, kind, *, data=None, staged=False):
     blob = storage._get_blob_client(container, name)
     if blob is None:
         raise ValueError('Derivative storage unavailable')
+    response = None
+    response_mode = upload_response_enabled()
     try:
-        blob.upload_blob(data, overwrite=False, content_settings=ContentSettings(content_type='image/jpeg'))
+        options = {'validate_content': True} if response_mode else {}
+        response = blob.upload_blob(data, overwrite=False, content_settings=ContentSettings(content_type='image/jpeg'), **options)
     except ResourceExistsError:
         processing_metrics.add(artifact_create_conflicts=1)
-    actual, props = _read(blob, kind)
-    if actual != data:
-        raise ValueError('Immutable derivative content mismatch')
+    etag = response.get('etag') if isinstance(response, dict) else None
+    if response_mode and isinstance(etag, str) and etag not in ('', '*'):
+        processing_metrics.add(artifact_upload_response_receipts=1, artifact_readback_bytes_avoided=len(data))
+    else:
+        processing_metrics.add(artifact_readback_fallbacks=int(response_mode))
+        actual, props = _read(blob, kind)
+        if actual != data:
+            raise ValueError('Immutable derivative content mismatch')
+        etag = str(props.etag)
     # All preceding effects are immutable, create-only blobs. One fresh
-    # source check after read-back protects pointer publication; abandoned
+    # source check after immutable publication proof protects pointer publication; abandoned
     # work can leave an unreferenced blob, never replace a live artifact.
     from processing_fence import check_immutable_source
     check_immutable_source(fence)
     receipt = dict(schemaVersion=1, library=fence.library, photoId=fence.photo, revision=fence.revision,
         attempt=fence.attempt, kind=kind, blob=name, sha256=content_hash, size=len(data),
-        width=width, height=height, etag=str(props.etag))
+        width=width, height=height, etag=etag)
     metadata[kind + 'Artifact'] = json.dumps(receipt, sort_keys=True, separators=(',', ':'))
     from processing_fence import remember_published_derivative
     remember_published_derivative(receipt)
@@ -114,7 +128,7 @@ def promote_prepared(storage, metadata):
     """Qualify browser-prepared JPEGs before a worker publishes completion.
 
     Upload finalization can mark the shared preparation blobs done without an
-    attempt receipt. Read bounded, ETag-pinned bytes, then publish a create-only
+    attempt receipt. Reuse source-bound input or read bounded bytes, then publish a create-only
     copy under the current source fence. The caller commits the new pointers
     with its normal result CAS; retain valid current receipts and immutable blobs.
     """
@@ -139,7 +153,15 @@ def promote_prepared(storage, metadata):
                 continue
         name = fence.photo if kind == 'thumbnail' else f'preview/{fence.photo}.jpg'
         blob = storage._get_blob_client(storage._CTX['blob_thumbnail_container'], name)
-        data, _ = _read(blob, kind)
+        data = None
+        if kind == 'preview' and os.getenv('IPWORK_ARTIFACT_PREVIEW_REUSE_ENABLED', 'true').lower() in ('1', 'true', 'yes'):
+            from ipwork_image import crop_preview
+            cached = crop_preview(fence.library, fence.filename, metadata)
+            if cached is not None and cached.source_revision and cached.source_revision == fence.revision:
+                data = cached.data
+                processing_metrics.add(artifact_preview_reuses=1, artifact_preview_bytes_avoided=len(data))
+        if data is None:
+            data, _ = _read(blob, kind)
         publish(storage, metadata, kind, data=data)
 
 

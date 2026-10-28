@@ -87,6 +87,25 @@ class FilenameLookupTable(AzureFaceTable):
                 raise ResourceExistsError('Already exists')
             self.upsert_entity(entity)
 
+    def submit_transaction(self, operations):
+        operations=list(operations)
+        assert len(operations)<=100
+        assert len({op[1]['PartitionKey'] for op in operations})==1
+        assert len({op[1]['RowKey'] for op in operations})==len(operations)
+        with self.lock:
+            for operation in operations:
+                kind,row=operation[:2];options=operation[2] if len(operation)>2 else {}
+                key=row['PartitionKey'],row['RowKey']
+                if kind=='create' and key in self.rows:raise ResourceExistsError('exists')
+                if kind=='update' and options.get('etag')!=str(self.versions.get(key)):
+                    raise ResourceModifiedError('ETag conflict')
+            self.submit_transaction_calls.append(operations)
+            for operation in operations:
+                kind,row=operation[:2];options=operation[2] if len(operation)>2 else {}
+                if kind=='create':self.create_entity(row)
+                elif kind=='update':self.update_entity(row,**options)
+                else:raise ValueError('Unsupported transaction operation')
+
     def update_entity(self, entity, mode=None, *, etag=None, match_condition=None):
         assert mode == UpdateMode.REPLACE
         assert match_condition == MatchConditions.IfNotModified
