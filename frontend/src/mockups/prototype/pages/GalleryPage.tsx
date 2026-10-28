@@ -3,6 +3,7 @@ import { CalendarSearch as CalendarSearchIcon, ChevronDown as ChevronDownIcon, H
 import { useStore, isVideoFilename } from '../store';
 import type { CaptureRange, MediaFilter } from '../store';
 import { useAppServices } from '../../../components/AppServicesProvider';
+import { UploadDock } from '../../../components/UploadDock';
 import { invalidateLocalSortIndex } from '../../../services/localSortIndex';
 import PhotoGrid from '../components/PhotoGrid';
 import TimelineBrowser from '../components/TimelineBrowser';
@@ -47,7 +48,7 @@ export const GalleryPage: React.FC = () => {
         loadMorePhotos, reloadPhotos, totalPhotos, mediaFilter, setMediaFilter, galleryFilters, setGalleryRating, setGalleryLikedOnly, jumpToGalleryDate, captureRange, setCaptureRange, timeline,
         route, focusPhoto, selectMode, setSelectMode,
     } = useStore();
-    const { requestUpload, startUpload, uploading, pendingUploadSummary, stopActiveUpload, notifications, registerUploadCompletionHandler } = useAppServices();
+    const { requestUpload, startUpload, uploadActive, registerUploadCompletionHandler } = useAppServices();
     const [dragging, setDragging] = useState(false);
     const [tileMin, setTileMin] = useTileSize('photostore.galleryTileSize', { min: GALLERY_TILE_MIN });
     // iOS-style zoom levels: keep zooming out past the smallest tiles to browse
@@ -193,11 +194,6 @@ export const GalleryPage: React.FC = () => {
         if (files.length) void startUpload(files);
     };
 
-    // Live upload progress from the active upload notification.
-    const progress = notifications.map((n) => n.progress).find((p) => p && p.totalCount > 0);
-    const pct = progress && progress.totalCount ? Math.round((progress.uploadedCount / progress.totalCount) * 100) : 0;
-    const showFailed = !uploading && (pendingUploadSummary?.failedCount ?? 0) > 0;
-
     // Client-side photo/video split over the loaded page(s).
     const visiblePhotos = useMemo(() => {
         if (mediaFilter === 'all') return photos;
@@ -331,7 +327,7 @@ export const GalleryPage: React.FC = () => {
         );
     }
 
-    if (photos.length === 0 && level === 'days' && !captureRange && !uploading) {
+    if (photos.length === 0 && level === 'days' && !captureRange && !uploadActive) {
         if (activeFilterCount > 0) {
             return (
                 <div className="pt-arrive">
@@ -431,24 +427,7 @@ export const GalleryPage: React.FC = () => {
 
             {scopeCrumbs}
 
-            {(uploading || showFailed) && (
-                <div className={`upload-dock${!uploading ? ' is-done' : ''}`}>
-                    {uploading ? (
-                        <>
-                            <span className="count">{progress ? `Uploading ${progress.uploadedCount} / ${progress.totalCount}` : 'Uploading…'}</span>
-                            <span className="track"><span className="fill" style={{ width: `${pct}%` }} /></span>
-                            {progress?.mbPerSecond ? <span className="rate">{progress.mbPerSecond.toFixed(1)} MB/s</span> : null}
-                            <button type="button" className="btn" onClick={stopActiveUpload}>Stop</button>
-                        </>
-                    ) : (
-                        <>
-                            <span className="done-label">Upload finished</span>
-                            <span className="track"><span className="fill" style={{ width: '100%' }} /></span>
-                            <span className="failed">{pendingUploadSummary?.failedCount} failed</span>
-                        </>
-                    )}
-                </div>
-            )}
+            <UploadDock />
 
             {level !== 'days' && timeline ? (
                 <div onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}>

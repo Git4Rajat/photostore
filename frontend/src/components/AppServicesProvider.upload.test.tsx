@@ -1,5 +1,5 @@
 import React from 'react';
-import { act, cleanup, fireEvent, render } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -68,13 +68,14 @@ vi.mock('@azure/storage-blob', () => ({
 }));
 
 import { AppServicesProvider, useAppServices } from './AppServicesProvider';
+import { UploadDock } from './UploadDock';
 import { UPLOAD_SESSION_STORAGE_KEY } from './browserAiShared';
 import * as largeFileHash from '../utils/largeFileHash';
 
 let services: ReturnType<typeof useAppServices>;
 function Probe() {
     services = useAppServices();
-    return <button onClick={services.requestUpload}>Upload</button>;
+    return <><button onClick={services.requestUpload}>Upload</button><UploadDock /></>;
 }
 
 const filesFor = (count: number) => Array.from({ length: count }, (_, index) => (
@@ -571,6 +572,73 @@ describe('browser upload selection and startup', () => {
         expect(services.uploading).toBe(false);
         expect(refreshRequests()).toHaveLength(1);
         expect(refreshRequests()[0][1]).toEqual({ reason: 'stopped' });
+    });
+
+    it('keeps upload progress and Stop available after notifications are cleared', async () => {
+        mocks.staged.mockImplementation((_id, _data, _size, options) => new Promise((_resolve, reject) => {
+            const abort = () => reject(new Error('upload_stopped_by_user'));
+            if (options.abortSignal.aborted) abort();
+            else options.abortSignal.addEventListener('abort', abort, { once: true });
+        }));
+        select(filesFor(50));
+        await advance(1000);
+        expect(services.uploadActive).toBe(true);
+        expect(screen.getByText('Uploading 0 / 50')).toBeTruthy();
+        act(() => services.clearNotifications());
+        expect(services.notifications).toEqual([]);
+        expect(screen.getByText('Uploading 0 / 50')).toBeTruthy();
+        fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
+        await advance(3000);
+        expect(services.uploadActive).toBe(false);
+        expect(services.uploadProgress).toBeNull();
+        expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull();
+        expect(refreshRequests()[0][1]).toEqual({ reason: 'stopped' });
+    });
+
+    it('can stop an automatic retry after notification dismissal with no finalization pending', async () => {
+        mocks.staged.mockRejectedValue(new Error('Test transfer failure'));
+        select(filesFor(1));
+        for (let tick = 0; tick < 200 && !services.notifications.some(n => n.title === 'Retrying failed files'); tick += 1) {
+            await advance(100);
+        }
+        expect(services.notifications.some(n => n.title === 'Retrying failed files')).toBe(true);
+        expect(services.uploading).toBe(false);
+        expect(services.uploadActive).toBe(true);
+        expect(finalizedFiles()).toHaveLength(0);
+        const attempts = mocks.staged.mock.calls.length;
+        act(() => services.clearNotifications());
+        fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
+        await advance(10000);
+        expect(mocks.staged).toHaveBeenCalledTimes(attempts);
+        expect(services.uploadActive).toBe(false);
+        expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull();
+    });
+
+    it('keeps Stop available during finalization and clears queued uploads after notification dismissal', async () => {
+        let releaseFinalize!: () => void;
+        const gate = new Promise<void>(resolve => { releaseFinalize = resolve; });
+        const originalPost = mocks.postUpload.getMockImplementation()!;
+        mocks.postUpload.mockImplementation(async (url, payload) => {
+            if (url === '/upload/finalize-batch') await gate;
+            return originalPost(url, payload);
+        });
+        select(filesFor(3));
+        await advance(1000);
+        expect(finalizedFiles()).toHaveLength(3);
+        expect(services.uploading).toBe(false);
+        expect(services.uploadActive).toBe(true);
+        await act(async () => { await services.startUpload([new File(['queued'], 'queued.heic')]); });
+        expect(services.queuedUploadFileCount).toBe(1);
+        act(() => services.clearNotifications());
+        expect(services.notifications).toEqual([]);
+        expect(screen.getByText(/Finishing upload/)).toBeTruthy();
+        fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
+        expect(services.queuedUploadFileCount).toBe(0);
+        await act(async () => releaseFinalize());
+        await advance(3000);
+        expect(services.uploadActive).toBe(false);
+        expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull();
+        expect(initFiles().some(file => file.filename === 'queued.heic')).toBe(false);
     });
 
     it('includes late finalization when stopping the remaining transfers', async () => {

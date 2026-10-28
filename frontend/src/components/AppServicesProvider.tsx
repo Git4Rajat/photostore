@@ -259,6 +259,8 @@ interface AppServicesContextValue {
     browserAiButtonClass: string;
     loadBrowserAiModel: () => Promise<SharedBrowserAiModelState>;
     uploading: boolean;
+    uploadActive: boolean;
+    uploadProgress: UploadProgress | null;
     pendingUploadSummary: PendingUploadSummary | null;
     pendingUploadFailedFiles: PersistedUploadFile[];
     queuedUploadFileCount: number;
@@ -896,6 +898,7 @@ const formatBrowserProcessingNotificationDetails = (
 export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     const [notifications, setNotifications] = useState<AppNotification[]>([]);
     const [uploading, setUploading] = useState<boolean>(false);
+    const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
     // True from the moment runUploadSession flips `uploading` false early
     // (all bytes transferred) until its background finalize/retry tail
     // actually finishes -- distinct from `uploading` specifically so the
@@ -3204,6 +3207,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             return Math.max(0, transferredBytesThisRun - oldest.bytes) / elapsedSeconds / MB;
         };
 
+        setUploadProgress({ uploadedCount: totalUploaded, totalCount, failedCount: totalFailed,
+            skippedDuplicateCount: totalSkippedDuplicates, mbPerSecond: 0 });
         const notificationId = options.notificationId || addNotification(
             options.resumed ? 'Upload resumed' : 'Upload started',
             options.resumed ? `Processing ${plural(totalCount, 'persisted file')}.` : `Uploading ${plural(totalCount, 'file')} with ${plural(uploadProfile.fileParallelism, 'lane')}.`,
@@ -3215,8 +3220,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 mbPerSecond: 0,
             },
         );
+        const updateUploadNotification = (updates: Partial<AppNotification>) => {
+            if (updates.progress && uploadRunGenerationRef.current === uploadRunGeneration) {
+                setUploadProgress(updates.progress);
+            }
+            updateNotification(notificationId, updates);
+        };
         if (options.notificationId) {
-            updateNotification(notificationId, {
+            updateUploadNotification({
                 title: options.resumed ? 'Upload resumed' : 'Upload started',
                 details: options.resumed ? `Processing ${plural(totalCount, 'persisted file')}.` : `Uploading ${plural(totalCount, 'file')} with ${plural(uploadProfile.fileParallelism, 'lane')}.`,
                 progress: {
@@ -3448,7 +3459,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 });
                 waveShadowFileOutcomes.set(fileMeta.key, { status: 'failed', skippedDuplicate: false });
                 void resolveWaveShadowFile(session, { ...fileMeta, status: 'failed' });
-                updateNotification(notificationId, {
+                updateUploadNotification({
                     title: 'Upload in progress',
                     details: `Uploaded ${totalUploaded}/${plural(totalCount, 'file')}. Skipped duplicates: ${totalSkippedDuplicates}.`,
                     progress: {
@@ -3536,7 +3547,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         if (!prepared.clientProcessing?.thumbnail) kickOffThumbnailForFile(file, fileMeta.name, fileMeta.blobName);
                     }
                     await releaseCachedUploadFile(fileMeta.key);
-                    updateNotification(notificationId, {
+                    updateUploadNotification({
                         title: 'Upload in progress',
                         details: `Uploaded ${totalUploaded}/${plural(totalCount, 'file')}. Skipped duplicates: ${totalSkippedDuplicates}.`,
                         progress: {
@@ -3730,7 +3741,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                                 .catch(() => undefined)
                                 .finally(() => { pendingFinalizeTasks.delete(cleanupTask); });
                             pendingFinalizeTasks.add(cleanupTask);
-                            updateNotification(notificationId, {
+                            updateUploadNotification({
                                 title: 'Upload in progress',
                                 details: `Uploaded ${totalUploaded}/${plural(totalCount, 'file')}. Skipped duplicates: ${totalSkippedDuplicates}.`,
                                 progress: {
@@ -3812,10 +3823,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 setUploading(false);
                 uploadingRef.current = false;
                 const stillFinalizing = pendingFinalizeTasks.size;
-                if (stillFinalizing > 0) {
-                    setBackgroundUploadTailActive(true);
-                }
-                updateNotification(notificationId, {
+                // Keep controls available through both finalization and retries,
+                // even when no finalization request is currently outstanding.
+                setBackgroundUploadTailActive(true);
+                updateUploadNotification({
                     title: stillFinalizing > 0 ? 'Upload transferred' : 'Upload complete',
                     details: stillFinalizing > 0
                         ? `All bytes transferred. Confirming ${plural(stillFinalizing, 'file')} in the background.`
@@ -3850,7 +3861,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 }
                 autoRetryRound += 1;
                 totalFailed -= retryCandidates.length;
-                updateNotification(notificationId, {
+                updateUploadNotification({
                     title: 'Retrying failed files',
                     details: `Automatically retrying ${plural(retryCandidates.length, 'file')} (attempt ${autoRetryRound}/${AUTO_RETRY_MAX_ROUNDS}).`,
                     progress: {
@@ -3900,7 +3911,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 cleanupStoppedUpload(latest);
                 await clearPersistedSession();
                 setPendingUploadSessionLive(null);
-                updateNotification(notificationId, {
+                updateUploadNotification({
                     title: 'Upload stopped',
                     details: `Stopped after uploading ${totalUploaded}/${plural(totalCount, 'file')}.`,
                     progress: {
@@ -3923,7 +3934,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             }
 
             if (totalFailed === 0 && !hasPending) {
-                updateNotification(notificationId, {
+                updateUploadNotification({
                     title: 'Upload complete',
                     details: `Uploaded ${plural(totalUploaded, 'file')} successfully. Skipped duplicates: ${totalSkippedDuplicates}.`,
                 });
@@ -3932,7 +3943,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 if (latest) {
                     setPendingUploadSessionLive(latest);
                 }
-                updateNotification(notificationId, {
+                updateUploadNotification({
                     title: 'Upload paused',
                     details: `Uploaded ${totalUploaded}/${plural(totalCount, 'file')}, failed ${totalFailed}, skipped duplicates ${totalSkippedDuplicates}. Reselect any missing files to retry.`,
                 });
@@ -3956,7 +3967,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 cleanupStoppedUpload(latest);
                 await clearPersistedSession();
                 setPendingUploadSessionLive(null);
-                updateNotification(notificationId, {
+                updateUploadNotification({
                     title: 'Upload stopped',
                     details: `Stopped after uploading ${totalUploaded}/${plural(totalCount, 'file')}.`,
                     progress: {
@@ -3971,7 +3982,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 return;
             }
             const message = getUploadErrorMessage(err, 'Upload failed unexpectedly.');
-            updateNotification(notificationId, {
+            updateUploadNotification({
                 title: 'Upload failed',
                 details: message,
             });
@@ -4243,7 +4254,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }, [addNotification, cleanupUnfinishedUploadArtifacts, clearPersistedSession, loadPersistedSession, pendingUploadSession, setPendingUploadSessionLive, setUploadError, uploading]);
 
     const stopActiveUpload = useCallback(() => {
-        if (!uploading && !uploadStartInProgressRef.current) {
+        if (!uploading && !isResumingUploadRef.current && !uploadStartInProgressRef.current) {
             return;
         }
         uploadStopRequestedRef.current = true;
@@ -4367,6 +4378,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         uploadStartInProgressRef.current = true;
         uploadStopRequestedRef.current = false;
         setUploading(true);
+        setUploadProgress({ uploadedCount: 0, totalCount: filesToUpload.length,
+            failedCount: 0, skippedDuplicateCount: 0 });
         uploadingRef.current = true;
         setUploadError(null);
         // requestUpload already probes this same backend before the native
@@ -5039,6 +5052,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         browserAiButtonClass,
         loadBrowserAiModel,
         uploading,
+        uploadActive: uploading || backgroundUploadTailActive,
+        uploadProgress: uploading || backgroundUploadTailActive ? uploadProgress : null,
         pendingUploadSummary,
         pendingUploadFailedFiles,
         queuedUploadFileCount,
@@ -5074,6 +5089,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         browserAiButtonClass,
         loadBrowserAiModel,
         uploading,
+        backgroundUploadTailActive,
+        uploadProgress,
         pendingUploadSummary,
         pendingUploadFailedFiles,
         queuedUploadFileCount,
