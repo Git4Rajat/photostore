@@ -474,6 +474,24 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
     settlement_started = time.monotonic()
     receipts.inspection = None  # Post-source qualification must see newly relayed inboxes.
     getattr(renew, 'boundary', renew)()
+    # Rebuild mutable evidence only after the source pool has drained. These
+    # snapshots plan reads; qualification still rereads authoritative metadata.
+    from wave_source_batch import MetadataBatch, InspectionBatch
+    current_metadata = getattr(metadata, 'table', metadata)
+    runnable = [item['member'] for item in planned if item['runnable']]
+    qualification = None
+    if runnable:
+        try:
+            with metrics.timer('vision_qualification_prefetch', count_name='vision_qualification_prefetch_calls'):
+                post_metadata = MetadataBatch(current_metadata, store.library, runnable)
+                qualification = InspectionBatch(store, runnable, post_metadata, receipts)
+        except (OwnershipLost, NotImplementedError):
+            raise
+        except Exception:
+            metrics.add(vision_qualification_fallback_members=len(runnable))
+            logger.exception('Vision qualification prefetch failed; using authoritative point reads')
+    getattr(renew, 'boundary', renew)()
+    verification_started = time.monotonic()
     observations = []
     for item in planned:
         member = item['member']
@@ -482,7 +500,8 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
                 renew()
                 metadata.invalidate(member['filename'])
                 from wave_settlement import source_state
-                if source_state(store, wave_id, member, metadata):
+                if source_state(store, wave_id, member, current_metadata,
+                        proofs=qualification.proofs if qualification is not None else None):
                     continue
                 count, _ = counts[member['RowKey']]
                 error = errors.get(member['RowKey'])
@@ -491,7 +510,9 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
                         member['filename'], exc_info=(type(error), error, error.__traceback__))
                     continue
                 try:
-                    item['completion'], item['row'] = _observe_qualified(store, member, metadata, receipts)
+                    metrics.add(vision_qualification_fresh_metadata_reads=1)
+                    item['completion'], item['row'] = _observe_qualified(store, member, current_metadata, receipts,
+                        inboxes=qualification.inboxes if qualification is not None else None)
                 except OwnershipLost:
                     raise
                 except Exception:
@@ -507,6 +528,9 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
                 ('processing_lease_owner', 'processing_lease', 'processing_lease_expires_at'))
                 and not _processing_is_expired(row))
             observations.append((member, completion, leased))
+            if completion is not None:
+                metrics.add(vision_qualification_completed=1)
+    metrics.add(vision_qualification_verify_ms=(time.monotonic() - verification_started) * 1000)
     metrics.add(vision_settlement_ms=(time.monotonic() - settlement_started) * 1000)
     return observations
 

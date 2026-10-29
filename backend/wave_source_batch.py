@@ -58,8 +58,9 @@ class ReceiptBatch(ArtifactReceipts):
 class InspectionBatch:
     """Page-local selection snapshots; never used to authorize source writes.
 
-    Only immutable receipt payloads survive this page. Mutable inbox/proof
-    absence is discarded before post-processing qualification or relay.
+    Only immutable receipt payloads survive this page. Rebuild mutable
+    inbox/proof snapshots after processing; final qualification still reads
+    authoritative metadata rather than the snapshot used to plan these reads.
     """
     def __init__(self, store, members, metadata, receipts):
         import json

@@ -106,7 +106,7 @@ def test_parallel_sources_inherit_stage_scope_and_batch_observation_writes(world
     assert sum(attempt_batches) == 8
     assert all(1 <= size <= 2 for size in attempt_batches)
     assert len([value for value in checkpoints if '"phase": "sources"' in value]) == 1
-    assert metadata.queries == 1
+    assert metadata.queries == 2  # Selection and fresh post-source evidence planning.
 
 
 def test_opt_in_image_batches_propagate_to_source_pool_without_write_guards(world, monkeypatch):
@@ -370,9 +370,9 @@ def test_receipts_survive_page_boundary_but_inspection_snapshots_are_rebuilt(wor
     def process(library, filename, revision, renew):
         publish_completion(store, metadata, filename=filename)
     assert run(world, metadata, wave, key, process)['state'] == 'ready'
-    assert len(seen) == 2
+    assert len(seen) == 4  # Selection and post-source snapshots for each page.
     assert seen[0][1] is not seen[1][1]
-    assert set(seen[0][1].proofs).isdisjoint(seen[1][1].proofs)
+    assert set(seen[0][1].proofs).isdisjoint(seen[2][1].proofs)
 
 
 def test_preparation_deadline_does_not_consume_model_attempts(world, monkeypatch):
@@ -804,3 +804,87 @@ def test_deletion_arriving_after_prefetch_wins_before_source_settlement(world):
     result = run(world, metadata, wave, key, deleted_during_source)
     assert result['state'] in ('ready', 'indexing', 'complete')
     assert store._required(member['RowKey'])['outcome'] == 'deleted'
+
+
+@pytest.mark.parametrize('failure', ['metadata', 'evidence'])
+def test_post_source_prefetch_failure_falls_back_without_reprocessing(world, monkeypatch, failure):
+    import wave_source_batch as batches
+    import processing_metrics as metrics
+    metadata, wave, key = admit(world, 3)
+    store = world[0]
+    processed = []
+    original = (batches.MetadataBatch if failure == 'metadata' else batches.InspectionBatch).__init__
+    target = batches.MetadataBatch if failure == 'metadata' else batches.InspectionBatch
+    failures = []
+    def init(self, *args, **kwargs):
+        if len(processed) == 3:
+            failures.append(True)
+            raise RuntimeError('Transient batch read failure')
+        return original(self, *args, **kwargs)
+    monkeypatch.setattr(target, '__init__', init)
+    def process(library, filename, revision, renew):
+        processed.append(filename)
+        publish_completion(store, metadata, filename=filename)
+    with metrics.accounting() as counters:
+        assert run(world, metadata, wave, key, process)['state'] == 'ready'
+    values = counters.snapshot()
+    assert values['vision_qualification_prefetch_calls'] == 1
+    assert values['vision_qualification_prefetch_errors'] == 1
+    assert values['vision_qualification_fallback_members'] == 3
+    assert values['vision_qualification_fresh_metadata_reads'] == 3
+    assert values['vision_qualification_completed'] == 3
+    assert values['vision_qualification_verify_ms'] > 0
+    assert failures and len(processed) == 3
+    assert all(m['outcome'] == 'settled' for m in store._page(f'e!{wave}!m!'))
+
+
+@pytest.mark.parametrize('change', ['replacement', 'lease'])
+def test_post_source_snapshot_cannot_qualify_changed_metadata(world, monkeypatch, change):
+    import wave_source_batch as batches
+    metadata, wave, key = admit(world, 1)
+    store = world[0]
+    processed = []
+    original = batches.InspectionBatch.__init__
+    def init(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        if processed:
+            row = metadata.rows[store.library, 'photo-0.jpg']
+            if change == 'replacement':
+                row['processingRevision'] = 'replacement'
+            else:
+                row['processing_lease_owner'] = 'new-owner'
+                row['processing_lease'] = 'new-lease'
+                row['processing_lease_expires_at'] = '2999-01-01T00:00:00Z'
+    monkeypatch.setattr(batches.InspectionBatch, '__init__', init)
+    def process(library, filename, revision, renew):
+        processed.append(filename)
+        publish_completion(store, metadata, filename=filename)
+    result = run(world, metadata, wave, key, process)
+    assert result['state'] != 'ready'
+    assert store._page(f'e!{wave}!m!')[0]['outcome'] == 'pending'
+
+
+def test_post_source_qualification_batches_new_completion_evidence(world, monkeypatch):
+    import upload_wave_execution as execution
+    metadata, wave, key = admit(world, 20)
+    store, _, _, table, _ = world
+    original_observe, original_get = execution._observe_qualified, table.get_entity
+    qualification_reads = []
+    active = [False]
+    def get(partition, row_key):
+        if active[0]:
+            qualification_reads.append(row_key)
+        return original_get(partition, row_key)
+    def observe(*args, **kwargs):
+        active[0] = True
+        try:
+            return original_observe(*args, **kwargs)
+        finally:
+            active[0] = False
+    monkeypatch.setattr(table, 'get_entity', get)
+    monkeypatch.setattr(execution, '_observe_qualified', observe)
+    def process(library, filename, revision, renew):
+        publish_completion(store, metadata, filename=filename)
+    assert run(world, metadata, wave, key, process)['state'] == 'ready'
+    assert not [key for key in qualification_reads
+                if key.startswith(('source-completion!', 'manifest!', 'face!'))]

@@ -17,6 +17,10 @@ _PURPOSES = {'inspection', 'qualification', 'claim', 'heartbeat', 'source_releas
              'face_persistence', 'semantic_refresh', 'embedding_write',
              'metadata_commit', 'metadata_cas', 'lease_and_policy_check', 'completion_delivery', 'other'}
 _FIELDS = {
+    'vision_qualification_prefetch_calls', 'vision_qualification_prefetch_ms',
+    'vision_qualification_prefetch_errors', 'vision_qualification_fallback_members',
+    'vision_qualification_fresh_metadata_reads', 'vision_qualification_completed',
+    'vision_qualification_verify_ms',
     'face_write_version_batches', 'face_write_version_keys', 'face_write_lease_checks_deferred',
     'face_write_version_reads', 'face_write_version_read_ms', 'face_write_version_read_errors',
     'artifact_upload_response_receipts', 'artifact_readback_bytes_avoided', 'artifact_readback_fallbacks',
