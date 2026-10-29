@@ -79,3 +79,33 @@ def test_parallel_reads_propagate_only_metrics_and_drain_on_error(monkeypatch):
         read_entities(table, 'lib', [str(index) for index in range(56)], workers=4)
     assert len(finished) == 4
     assert counter.snapshot()['job_read_requests'] == 4
+
+
+def test_point_strategy_avoids_queries_and_preserves_etags_and_absence():
+    table=QueryRows()
+    table.create_entity(dict(PartitionKey='lib',RowKey='key',value=1))
+    rows=read_entities(table,'lib',['key','missing','key'],workers=4,strategy='point')
+    assert rows['key'].metadata['etag']=='1' and rows['missing'] is None
+    assert not table.queries and table.reads==2
+
+
+def test_point_workers_drain_on_error_and_do_not_inherit_source_context(monkeypatch):
+    from processing_fence import current_fence
+    table=QueryRows();barrier=threading.Barrier(4);finished=[]
+    def get(partition,key):
+        assert current_fence() is None
+        barrier.wait(timeout=5)
+        finished.append(key)
+        if key=='0':raise OSError('point outage')
+        return dict(PartitionKey=partition,RowKey=key)
+    monkeypatch.setattr(table,'get_entity',get)
+    with pytest.raises(OSError,match='point outage'):
+        read_entities(table,'lib',[str(i) for i in range(8)],workers=4,strategy='point')
+    assert len(finished)==4
+
+
+def test_point_reader_rejects_a_different_entity(monkeypatch):
+    table=QueryRows()
+    monkeypatch.setattr(table,'get_entity',lambda *a:dict(PartitionKey='foreign',RowKey='key'))
+    with pytest.raises(ValueError,match='another entity'):
+        read_entities(table,'lib',['key'],strategy='point')

@@ -17,6 +17,13 @@ _PURPOSES = {'inspection', 'qualification', 'claim', 'heartbeat', 'source_releas
              'face_persistence', 'semantic_refresh', 'embedding_write',
              'metadata_commit', 'metadata_cas', 'lease_and_policy_check', 'completion_delivery', 'other'}
 _FIELDS = {
+    'receipt_commit_cache_hits', 'receipt_commit_cache_misses',
+    'receipt_commit_cache_oversize', 'receipt_commit_cache_evictions',
+    'receipt_commit_cache_peak_bytes', 'receipt_commit_cache_peak_rows', 'receipt_commit_handoff_rows',
+    'receipt_commit_handoff_bytes', 'receipt_commit_handoff_ms', 'receipt_prefetch_cached_keys',
+    'receipt_prefetch_query_groups', 'receipt_prefetch_point_groups',
+    'receipt_prefetch_query_ms', 'receipt_prefetch_point_ms',
+    'receipt_prefetch_keys', 'receipt_prefetch_strategy_switches', 'batch_point_errors',
     'vision_qualification_prefetch_calls', 'vision_qualification_prefetch_ms',
     'vision_qualification_prefetch_errors', 'vision_qualification_fallback_members',
     'vision_qualification_fresh_metadata_reads', 'vision_qualification_completed',

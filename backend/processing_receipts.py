@@ -26,6 +26,11 @@ class ArtifactReceipts:
         self.partition = 'processing-artifacts-' + digest(library)
 
     def _get(self, key):
+        from processing_receipt_cache import cached_receipt
+        row = cached_receipt(self.table, self.partition, key)
+        return row if row is not None else self._read_durable(key)
+
+    def _read_durable(self, key):
         try:
             return self.table.get_entity(self.partition, key)
         except ResourceNotFoundError:
@@ -57,11 +62,15 @@ class ArtifactReceipts:
             if isinstance(exc, TableTransactionError) and exc.status_code != 409:
                 raise
             processing_metrics.add(receipt_create_conflicts=1)
-            previous = self._get(key)
+            # Conflict equality must be proved from storage, never a cached
+            # write acknowledgement from an earlier create in this scope.
+            previous = self._read_durable(key)
             if previous is None:
                 raise
             if previous.get('payload') != encoded:
                 raise ValueError('Artifact receipt identity rebound')
+        from processing_receipt_cache import remember_committed
+        remember_committed(self.table, row)
         return identity
 
     def _put_many(self, kind, payloads):
@@ -77,6 +86,9 @@ class ArtifactReceipts:
             try:
                 self.table.submit_transaction([('create', row) for row in unique.values()])
                 processing_metrics.add(receipt_creates=len(unique), receipt_write_batches=1)
+                from processing_receipt_cache import remember_committed
+                for row in unique.values():
+                    remember_committed(self.table, row)
             except (ResourceExistsError, TableTransactionError) as exc:
                 if isinstance(exc, TableTransactionError) and exc.status_code != 409:
                     raise

@@ -19,21 +19,60 @@ class ReceiptBatch(ArtifactReceipts):
             memory_bytes=limit_bytes('IPWORK_VISION_RECEIPT_MEMORY_MB', 8, 64),
             disk_bytes=limit_bytes('IPWORK_VISION_RECEIPT_DISK_MB', 256, 1024))
         self.inspection = None
+        self._point_prefetch = False
+        self._prefetch_probed = False
+
+    def accept_committed(self, entries):
+        """Coordinator-only import; source threads never mutate LocalRows."""
+        import time
+        started = time.monotonic()
+        for table, partition, key, payload in entries:
+            if table is self.table and partition == self.partition:
+                if self._remember(key, dict(PartitionKey=partition, RowKey=key, payload=payload)):
+                    add(receipt_commit_handoff_rows=1, receipt_commit_handoff_bytes=len(payload.encode('utf-8')))
+        self.rows.flush()
+        add(receipt_commit_handoff_ms=(time.monotonic() - started) * 1000)
 
     def _remember(self, key, row):
         if row is not None and key.startswith(('manifest!', 'face!')):
             while not self.rows.put(key, row):
                 if not len(self.rows):
                     add(receipt_cache_oversize=1)
-                    break
+                    return False
                 self.rows.pop(next(iter(self.rows.entries)))
                 add(receipt_cache_evictions=1)
+            return True
+        return False
 
     def prefetch(self, keys):
-        from table_reads import read_entities
-        pending = list(dict.fromkeys(key for key in keys if key not in self.rows))
-        for key, row in read_entities(self.table, self.partition, pending, workers=4, group_namespaces=True).items():
-            self._remember(key, row)
+        from table_reads import read_entities, query_batches
+        import time
+        requested = list(dict.fromkeys(keys))
+        pending = [key for key in requested if key not in self.rows]
+        add(receipt_prefetch_cached_keys=len(requested) - len(pending))
+        # OR filters scan a partition. Keep cheap queries for small/fast
+        # partitions, but switch this attempt to bounded point reads after a
+        # slow query. A first probe bounds exposure for very large face groups.
+        while pending:
+            size = 14 if not self._prefetch_probed else len(pending)
+            group, pending = pending[:size], pending[size:]
+            strategy = 'point' if self._point_prefetch else 'query'
+            started = time.monotonic()
+            rows = read_entities(self.table, self.partition, group, workers=4,
+                                 group_namespaces=True, strategy=strategy)
+            elapsed = (time.monotonic() - started) * 1000
+            add(**{'receipt_prefetch_' + strategy + '_groups': 1,
+                   'receipt_prefetch_' + strategy + '_ms': elapsed}, receipt_prefetch_keys=len(group))
+            # A singleton is an indexed equality, not an OR-scan probe. Also
+            # normalize a large group by its bounded parallel query waves so
+            # a long but efficient bulk fetch does not look like a slow query.
+            self._prefetch_probed = self._prefetch_probed or len(group) > 1
+            waves = max(1, (sum(1 for _ in query_batches(group, group_namespaces=True)) + 3) // 4)
+            if strategy == 'query' and len(group) > 1 and elapsed / waves >= 100:
+                self._point_prefetch = True
+                add(receipt_prefetch_strategy_switches=1)
+            for key, row in rows.items():
+                self._remember(key, row)
         self.rows.flush()
 
     def _get(self, key):

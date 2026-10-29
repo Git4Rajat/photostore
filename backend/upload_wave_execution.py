@@ -378,6 +378,7 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
     pool_started = time.monotonic()
 
     def process(item, submitted):
+        from processing_receipt_cache import committed_receipt_scope
         member = item['member']
         started = time.monotonic()
         with processing_diagnostics.image_scope(member['RowKey'], 'processing'):
@@ -385,7 +386,9 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
             try:
                 renew()
                 progressed()
-                process_source(store.library, member['filename'], member['processingRevision'], renew)
+                with committed_receipt_scope() as committed:
+                    process_source(store.library, member['filename'], member['processingRevision'], renew)
+                    return committed.snapshot()
             finally:
                 metrics.add(vision_source_busy_ms=(time.monotonic() - started) * 1000)
 
@@ -436,7 +439,7 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
                         futures[executor.submit(copy_context().run, process, item, time.monotonic())] = key
                     else:
                         try:
-                            process(item, time.monotonic())
+                            receipts.accept_committed(process(item, time.monotonic()))
                         except Exception as error:
                             errors[key] = error
                 metrics.add(vision_admission_batches=1)
@@ -454,7 +457,7 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
             for future in done:
                 key = futures.pop(future)
                 try:
-                    future.result()
+                    receipts.accept_committed(future.result())
                 except Exception as error:
                     errors[key] = error
             # The next loop refills free slots immediately, even if an earlier

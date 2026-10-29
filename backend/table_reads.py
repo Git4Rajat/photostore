@@ -39,7 +39,7 @@ def query_batches(keys, *, group_namespaces=False):
         yield from key_batches(grouped)
 
 
-def read_entities(table, partition, keys, *, workers=1, group_namespaces=False):
+def read_entities(table, partition, keys, *, workers=1, group_namespaces=False, strategy='query'):
     """Return just requested keys, including None for authoritative absence.
 
     Callers bound their input. Known coordination families never share a query
@@ -48,20 +48,14 @@ def read_entities(table, partition, keys, *, workers=1, group_namespaces=False):
     keys = list(dict.fromkeys(keys))
     if type(workers) is not int or not 1 <= workers <= 4:
         raise ValueError('Table read concurrency must be between one and four')
+    if strategy not in ('query', 'point'):
+        raise ValueError('Unknown table read strategy')
     result = dict.fromkeys(keys)
     if keys: add(batch_requests=1, batch_keys=len(keys))
-    if not hasattr(table, 'query_entities'):
-        for key in keys:
-            add(batch_point_reads=1)
-            try:
-                result[key] = table.get_entity(partition, key)
-            except ResourceNotFoundError:
-                pass
-        add(batch_rows=sum(row is not None for row in result.values()), batch_missing=sum(row is None for row in result.values()))
-        return result
+    use_points = strategy == 'point' or not hasattr(table, 'query_entities')
     escaped = lambda value: value.replace("'", "''")
     started = time.monotonic()
-    batches = list(query_batches(keys, group_namespaces=group_namespaces))
+    batches = [[key] for key in keys] if use_points else list(query_batches(keys, group_namespaces=group_namespaces))
     active, active_lock = [0], threading.Lock()
     def fetch(batch, submitted):
         with _SLOTS:
@@ -73,13 +67,23 @@ def read_entities(table, partition, keys, *, workers=1, group_namespaces=False):
             try:
                 return query(batch)
             except BaseException:
-                add(batch_query_errors=1)
+                add(**{'batch_point_errors' if use_points else 'batch_query_errors': 1})
                 raise
             finally:
                 add(batch_service_ms=(time.monotonic() - service_started) * 1000)
                 with active_lock:
                     active[0] -= 1
     def query(batch):
+        if use_points:
+            key = batch[0]
+            add(batch_point_reads=1)
+            try:
+                row = table.get_entity(partition, key)
+            except ResourceNotFoundError:
+                return {}
+            if row.get('PartitionKey') != partition or row.get('RowKey') != key:
+                raise ValueError('Point read returned another entity')
+            return {key: row}
         add(batch_queries=1)
         wanted = set(batch)
         rows = {}

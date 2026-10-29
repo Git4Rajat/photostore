@@ -888,3 +888,52 @@ def test_post_source_qualification_batches_new_completion_evidence(world, monkey
     assert run(world, metadata, wave, key, process)['state'] == 'ready'
     assert not [key for key in qualification_reads
                 if key.startswith(('source-completion!', 'manifest!', 'face!'))]
+
+
+@pytest.mark.parametrize('workers',[1,2])
+@pytest.mark.parametrize('cache_enabled',[False,True])
+def test_source_receipts_reach_coordinator_or_fall_back_when_over_budget(world,monkeypatch,workers,cache_enabled):
+    import processing_metrics as metrics
+    import processing_receipt_cache as cache_module
+    if not cache_enabled:
+        original=cache_module.CommittedReceipts
+        monkeypatch.setattr(cache_module,'CommittedReceipts',lambda:original(max_bytes=1))
+    metadata,wave,key=admit(world,20)
+    store=world[0]
+    def process(library,filename,revision,renew):
+        publish_completion(store,metadata,filename=filename)
+    with metrics.accounting() as counters:
+        assert run(world,metadata,wave,key,process,source_workers=workers)['state']=='ready'
+    values=counters.snapshot()
+    assert values['vision_qualification_fresh_metadata_reads']==20
+    assert values['receipt_commit_handoff_rows']==(20 if cache_enabled else 0)
+    if cache_enabled:
+        assert values['receipt_prefetch_cached_keys']>=20
+        assert values['receipt_prefetch_query_groups']==values['receipt_prefetch_point_groups']==0
+        assert values['receipt_commit_cache_hits']>=20
+    else:
+        assert values['receipt_commit_cache_oversize']>=20
+        assert values['receipt_prefetch_query_groups']>0
+
+
+@pytest.mark.parametrize('attempt_limit',[1,3])
+def test_failed_source_discards_handoff_without_changing_retry_policy(world,monkeypatch,attempt_limit):
+    import processing_metrics as metrics
+    import wave_settlement
+    monkeypatch.setattr(wave_settlement,'MAX_SOURCE_ATTEMPTS',attempt_limit)
+    metadata,wave,key=admit(world,2)
+    store=world[0]
+    def process(library,filename,revision,renew):
+        publish_completion(store,metadata,filename=filename)
+        if filename=='photo-0.jpg':raise OSError('Late source failure')
+    with metrics.accounting() as counters:
+        result=run(world,metadata,wave,key,process,source_workers=2)
+    assert result['state'] in ('ready','processing_pending','processing')
+    assert counters.snapshot()['receipt_commit_handoff_rows']==1
+    assert counters.snapshot()['source_errors']==1
+    if result['state']!='ready':
+        assert run(world,metadata,wave,key,lambda *a:pytest.fail('Reprocessed durable result'))['state']=='ready'
+    else:
+        frozen=store._required(store.wave_key(wave))
+        assert frozen['outstandingMembers']==0
+        assert frozen['failedMembers']==int(attempt_limit==1)
