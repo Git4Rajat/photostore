@@ -348,6 +348,10 @@ def _inspect_vision_member(store, wave_id, member, metadata_table, receipts):
         return None
     completion, row = _observe_qualified(store, member, metadata_table, receipts,
         inspection.inboxes if inspection is not None else None)
+    if completion is None and row is None and member['outcome'] == 'pending':
+        from wave_settlement import blocked_source
+        blocked_source(store, wave_id, member, metadata_table)
+        return None
     leased = bool(row and any(row.get(k) for k in
         ('processing_lease_owner', 'processing_lease', 'processing_lease_expires_at')))
     runnable = completion is None and row is not None and (not leased or _processing_is_expired(row))

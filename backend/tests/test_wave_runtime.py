@@ -143,6 +143,26 @@ def test_coordination_contention_queues_short_retry_and_exhausts_existing_budget
     assert len(sent) == 5
 
 
+def test_artifact_cleanup_wait_preserves_budget_and_durable_wakeup(monkeypatch, vision_dispatch):
+    from upload_waves import ArtifactCleanupBusy
+    _, work, wave, token, payload, sent = vision_dispatch
+    def busy(*args, **kwargs):
+        raise ArtifactCleanupBusy('temporary GC')
+    monkeypatch.setattr(runtime, 'run_vision_release', busy)
+    now = [1000.0]
+    work.clock = lambda: now[0]
+    for _ in range(8):
+        assert runtime.consume(payload) == 'done'
+        row = work._get(token)
+        assert row['attempts'] == 0 and not row.get('failed')
+        assert row['notBefore'] == now[0] + 30
+        assert sent[-1][3] == 30
+        now[0] += 31
+    monkeypatch.setattr(runtime, 'run_vision_release', lambda *a, **k: dict(wave, state='processing'))
+    assert runtime.consume(payload) == 'done'
+    assert work._get(token)['attempts'] == 0
+
+
 @pytest.mark.parametrize('failure', [ValueError('invalid evidence'), RuntimeError('lost lease')])
 def test_other_failures_are_not_acknowledged_as_coordination_retries(monkeypatch, vision_dispatch, failure):
     _, work, _, token, payload, sent = vision_dispatch

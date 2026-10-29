@@ -498,6 +498,108 @@ def test_transient_inspection_failure_can_recover_without_consuming_model_budget
     assert world[0].status(wave)['failedMembers'] == 0
 
 
+@pytest.mark.parametrize('blocked', ['missing', 'isolated', 'identity', 'contract'])
+def test_silent_skip_has_bounded_failure_and_releases_healthy_siblings(world, blocked):
+    from wave_settlement import BLOCKED_GRACE_SECONDS, verified
+    metadata, wave, key = admit(world, 2)
+    store = world[0]
+    now = [store.clock()]
+    store.clock = lambda: now[0]
+    row = metadata.rows[store.library, 'photo-0.jpg']
+    if blocked == 'missing': del metadata.rows[store.library, 'photo-0.jpg']
+    elif blocked == 'isolated': row['processingIsolated'] = True
+    elif blocked == 'identity': row['processingRevision'] = 'unadmitted'
+    else: row['processingGeneration'] = 'obsolete'
+    calls = []
+    def process(library, filename, revision, renew):
+        calls.append(filename)
+        publish_completion(store, metadata, filename=filename)
+    for _ in range(3):
+        assert run(world, metadata, wave, key, process)['state'] == 'processing'
+    now[0] += BLOCKED_GRACE_SECONDS + 1
+    assert run(world, metadata, wave, key, process)['state'] == 'ready'
+    bad = next(m for m in store._page(f'e!{wave}!m!') if m['filename'] == 'photo-0.jpg')
+    assert bad['outcome'] == 'failed_exhausted' and verified(store, bad)
+    assert store.status(wave)['failedMembers'] == 1
+    assert calls == ['photo-1.jpg']
+
+
+def test_missing_source_recovers_during_grace(world):
+    metadata, wave, key = admit(world, 1)
+    row = metadata.rows.pop((world[0].library, 'photo-0.jpg'))
+    run(world, metadata, wave, key, lambda *a: pytest.fail('missing source ran'))
+    metadata.rows[world[0].library, 'photo-0.jpg'] = row
+    def process(library, filename, revision, renew):
+        publish_completion(world[0], metadata, filename=filename)
+    assert run(world, metadata, wave, key, process)['state'] == 'ready'
+    assert world[0].status(wave)['failedMembers'] == 0
+
+
+def test_blocked_source_does_not_fail_a_live_owner(world):
+    from datetime import datetime, timedelta, timezone
+    from wave_settlement import blocked_source, BLOCKED_GRACE_SECONDS
+    metadata, wave, _ = admit(world, 1)
+    store = world[0]
+    member, = store._page(f'e!{wave}!m!')
+    row = metadata.rows[store.library, 'photo-0.jpg']
+    row['processingIsolated'] = True
+    now = [store.clock()]
+    store.clock = lambda: now[0]
+    for _ in range(3): assert not blocked_source(store, wave, member, metadata)
+    now[0] += BLOCKED_GRACE_SECONDS + 1
+    row.update(processing_lease_owner='other',
+        processing_lease_expires_at=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat())
+    assert not blocked_source(store, wave, member, metadata)
+    assert store._required(member['RowKey'])['outcome'] == 'pending'
+    assert not store._page('settlement!')
+
+
+def test_blocked_source_rechecks_recovery_after_coordination_write(world, monkeypatch):
+    from wave_settlement import blocked_source, BLOCKED_GRACE_SECONDS
+    metadata, wave, _ = admit(world, 1)
+    store = world[0]
+    member, = store._page(f'e!{wave}!m!')
+    row = metadata.rows[store.library, 'photo-0.jpg']
+    row['processingIsolated'] = True
+    now = [store.clock()]
+    store.clock = lambda: now[0]
+    for _ in range(3): assert not blocked_source(store, wave, member, metadata)
+    now[0] += BLOCKED_GRACE_SECONDS + 1
+    get = metadata.get_entity
+    reads = [0]
+    def recover(*args):
+        reads[0] += 1
+        if reads[0] == 4: row['processingIsolated'] = False
+        return get(*args)
+    monkeypatch.setattr(metadata, 'get_entity', recover)
+    assert not blocked_source(store, wave, member, metadata)
+    assert store._required(member['RowKey'])['outcome'] == 'pending'
+
+
+def test_blocked_source_read_error_is_not_a_missing_source(world, monkeypatch):
+    from wave_settlement import blocked_source
+    metadata, wave, _ = admit(world, 1)
+    store = world[0]
+    member, = store._page(f'e!{wave}!m!')
+    def fail(*args): raise OSError('storage unavailable')
+    monkeypatch.setattr(metadata, 'get_entity', fail)
+    with pytest.raises(OSError): blocked_source(store, wave, member, metadata)
+    assert not store._required(member['RowKey']).get('blockedChecks')
+
+
+def test_settled_member_losing_qualification_is_retracted_before_blocked_budget(world):
+    metadata, wave, key = admit(world, 2)
+    store = world[0]
+    metadata.rows[store.library, 'photo-0.jpg']['processingIsolated'] = True
+    def process(library, filename, revision, renew):
+        publish_completion(store, metadata, filename=filename)
+    assert run(world, metadata, wave, key, process)['state'] == 'processing'
+    metadata.rows.pop((store.library, 'photo-1.jpg'))
+    assert run(world, metadata, wave, key, process)['state'] == 'processing'
+    member = next(m for m in store._page(f'e!{wave}!m!') if m['filename'] == 'photo-1.jpg')
+    assert member['outcome'] == 'pending'
+
+
 def test_inspection_failure_cannot_fail_another_active_source_owner(world, monkeypatch):
     from datetime import datetime, timedelta, timezone
     import upload_wave_execution as execution

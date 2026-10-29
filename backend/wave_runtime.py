@@ -12,7 +12,7 @@ import processing_diagnostics
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 
-from upload_waves import ShadowWaves, digest, MutationContention
+from upload_waves import ShadowWaves, digest, MutationContention, ArtifactCleanupBusy
 from execution_lease import ExecutionLeases
 from wave_policy import source_change
 from upload_wave_execution import (execution_enabled,stage_work_store,run_vision_release,
@@ -278,6 +278,15 @@ def consume(payload,*,deadline=None,progress=None):
             index_events.publish(library,'wave',current['completionReceiptId'])
         if current['state'] in ('ready','indexing','complete'):
             relay_successor(work,store,wave_id,send_stage)
+        return 'done'
+    except ArtifactCleanupBusy:
+        # Temporary artifact GC is not a failed model/dispatch attempt. Keep a
+        # durable delayed wake so scale-to-zero cannot strand this release.
+        current = store._required(store.wave_key(wave_id))
+        work.release(claim, deferred=True, retry_delay=30, retry_reason='artifact_cleanup')
+        relay_current(work, store, current, send_stage)
+        processing_diagnostics.emit('wave_cleanup_wait', wave_id=wave_id, stage=stage,
+                                    delay_seconds=30)
         return 'done'
     except MutationContention:
         current = store._required(store.wave_key(wave_id))

@@ -6,6 +6,81 @@ from upload_waves import Conflict,digest
 
 MAX_SOURCE_ATTEMPTS=1
 MAX_INSPECTION_FAILURES=3
+MAX_BLOCKED_CHECKS=3
+BLOCKED_GRACE_SECONDS=300
+
+
+def blocked_source(store, wave_id, member, metadata):
+    """Bound silent skips without treating a missing source as success/deletion.
+
+    Use fresh metadata for every decision. A known replacement/deletion wins;
+    live source owners and temporarily missing metadata retain a grace period.
+    Infrastructure read errors escape rather than consuming this budget.
+    """
+    raw = getattr(metadata, 'table', metadata)
+    if source_state(store, wave_id, member, raw):
+        return True
+    try:
+        row = raw.get_entity(store.library, member['filename'])
+    except ResourceNotFoundError:
+        row = None
+    from storage_utils import _processing_is_expired
+    from processing_generation import is_superseded
+    from image_utils import is_video_file
+    if row and any(row.get(k) for k in ('processing_lease_owner', 'processing_lease',
+                                       'processing_lease_expires_at')) and not _processing_is_expired(row):
+        return False
+    if row is None:
+        reason = 'source_metadata_missing'
+    elif (row.get('anonymousImageId'), row.get('processingRevision')) != (member['photoId'], member['processingRevision']):
+        reason = 'source_identity_unqualified'
+    elif row.get('processing_state') == 'deleted':
+        return False  # A concurrent tombstone is handled on the next proof pass.
+    elif row.get('processingIsolated'):
+        reason = 'source_isolated'
+    elif is_superseded(row, is_video=is_video_file(member['filename'])):
+        reason = 'source_contract_obsolete'
+    else:
+        return False  # The source recovered; let normal admission run next pass.
+    fingerprint = digest([reason, (row or {}).get('anonymousImageId'),
+                          (row or {}).get('processingRevision'), (row or {}).get('processingGeneration')])
+    def record():
+        control = store._required('control')
+        current = store._required(member['RowKey'])
+        if current['outcome'] != 'pending':
+            return current
+        same = current.get('blockedFingerprint') == fingerprint
+        updated = dict(current, blockedReason=reason, blockedFingerprint=fingerprint,
+            blockedChecks=min(MAX_BLOCKED_CHECKS, int(current.get('blockedChecks', 0)) + 1) if same else 1,
+            blockedSince=current['blockedSince'] if same else store.clock())
+        if updated != dict(current):
+            store._commit(control, [store._change(current, updated)])
+        return updated
+    current = store._retry(record)
+    if current['outcome'] != 'pending':
+        return True
+    age = max(0, store.clock() - current['blockedSince'])
+    import processing_diagnostics
+    processing_diagnostics.emit('vision_member_blocked', wave_id=wave_id, reason=reason,
+        checks=current['blockedChecks'], age_seconds=age)
+    if current['blockedChecks'] < MAX_BLOCKED_CHECKS or age < BLOCKED_GRACE_SECONDS:
+        return False
+    # Recheck after coordination writes: recovery or a new live owner wins.
+    if source_state(store, wave_id, member, raw):
+        return True
+    try:
+        latest = raw.get_entity(store.library, member['filename'])
+    except ResourceNotFoundError:
+        latest = None
+    fields = ('anonymousImageId', 'processingRevision', 'processingGeneration',
+              'processingIsolated', 'processing_state', 'processing_lease_owner',
+              'processing_lease', 'processing_lease_expires_at')
+    if (latest is None) != (row is None) or any((latest or {}).get(k) != (row or {}).get(k) for k in fields):
+        return False
+    settle(store, wave_id, member, 'failed_exhausted', reason,
+        witness=dict(checks=current['blockedChecks'], since=current['blockedSince'],
+                     fingerprint=fingerprint), pending_only=True)
+    return True
 
 
 def settle(store,wave_id,member,outcome,reason,*,witness,maintenance=False,pending_only=False):
