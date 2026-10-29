@@ -227,6 +227,15 @@ class BlobLibraryLeaseFactory:
             blob.upload_blob(json.dumps(initial), overwrite=False)
         except ResourceExistsError:
             pass  # Only an already-existing blob is benign; transport errors propagate.
+        except HttpResponseError as error:
+            # A blob that exists AND is currently leased by another owner
+            # fails the overwrite=False conditional check with LeaseIdMissing
+            # instead of ResourceExistsError -- equally benign here, since all
+            # we wanted was confirmation the blob exists. acquire_lease below
+            # turns a still-busy lease into RetryableLibraryLeaseError; it is
+            # the caller's job to decide whether/how long to retry that.
+            if getattr(error, 'error_code', None) != 'LeaseIdMissing':
+                raise
         acquired_at = time.monotonic()
         try:
             lease = blob.acquire_lease(lease_duration=self._duration)

@@ -1,7 +1,8 @@
 """Fail-closed lease checks and conditional legacy index publication."""
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from contextvars import ContextVar
 import threading
+import time
 
 from azure.core import MatchConditions
 from azure.core.exceptions import ResourceNotFoundError
@@ -150,9 +151,27 @@ def catalog_serialization(table,library,blobs,container):
     if not owned(table,library):
         yield
         return
-    from clustering_lease import BlobLibraryLeaseFactory
+    from clustering_lease import BlobLibraryLeaseFactory, RetryableLibraryLeaseError
     factory=BlobLibraryLeaseFactory(blobs,container,namespace='catalog-publication-locks')
-    with factory(library) as guard:
+    with ExitStack() as stack:
+        # A contending lease is valid for at most BlobLibraryLeaseFactory's
+        # own max duration (60s), whether its holder is still alive and
+        # renewing it or died right after a renewal. Retry past that worst
+        # case (margin added) with capped exponential backoff instead of
+        # failing the whole (often expensive, worker-side) caller on the
+        # first collision -- almost all contention, including an abandoned
+        # lease, clears well within this window.
+        deadline=time.monotonic()+65
+        attempt=0
+        while True:
+            try:
+                guard=stack.enter_context(factory(library))
+                break
+            except RetryableLibraryLeaseError:
+                remaining=deadline-time.monotonic()
+                if remaining<=0:raise
+                attempt+=1
+                time.sleep(min(2**attempt,8,remaining))
         token=_CATALOG.set(guard)
         try:
             guard.check();yield;guard.check()

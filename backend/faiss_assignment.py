@@ -18,7 +18,7 @@ recall beyond LiveFaceIndex's bounded retrieval and exact candidate reranking.
 from __future__ import annotations
 
 from collections import OrderedDict
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, ExitStack
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -260,7 +260,34 @@ class FaissAssigner:
         active = _ACTIVE
         if active is not None and (active.owner is not self or active.user_id != user_id):
             active.owner.final_checkpoint()
-        return self.lease(user_id)
+        return self._leased(user_id)
+
+    @contextmanager
+    def _leased(self, user_id):
+        """Bounded, short retry on top of ``self.lease`` for a busy lease.
+
+        Unlike index_publication.catalog_serialization's longer backoff,
+        this runs under the process-wide ``_LOCK`` (see _assignment_lease
+        above) -- every other concurrent assign()/batch() call, for any
+        user, stalls for as long as this retries. Keep the window short; a
+        lease still busy after it falls back to the caller's own queue
+        redelivery/retry instead of blocking the whole process.
+        """
+        from clustering_lease import RetryableLibraryLeaseError
+        with ExitStack() as stack:
+            deadline = time.monotonic() + 6
+            attempt = 0
+            while True:
+                try:
+                    guard = stack.enter_context(self.lease(user_id))
+                    break
+                except RetryableLibraryLeaseError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    attempt += 1
+                    time.sleep(min(2 ** attempt, 3, remaining))
+            yield guard
 
     @contextmanager
     def batch(self, user_id, face_ids=(), *, staged=False):
