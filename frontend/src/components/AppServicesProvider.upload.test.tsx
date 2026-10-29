@@ -69,7 +69,7 @@ vi.mock('@azure/storage-blob', () => ({
 
 import { AppServicesProvider, useAppServices } from './AppServicesProvider';
 import { UploadDock } from './UploadDock';
-import { UPLOAD_SESSION_STORAGE_KEY } from './browserAiShared';
+import { MAX_UPLOAD_RETRY_ATTEMPTS, UPLOAD_SESSION_STORAGE_KEY } from './browserAiShared';
 import * as largeFileHash from '../utils/largeFileHash';
 import * as uploadWaveSync from '../services/uploadWaveSync';
 
@@ -1100,6 +1100,41 @@ describe('upload wave shadow protocol wiring', () => {
         expect(services.pendingUploadSummary).toBeNull();
     });
 
+    it('stops retrying (auto or manual) once a session hits the attempt cap, instead of retrying forever', async () => {
+        vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
+        mocks.getUpload.mockImplementation(async (url) => url === '/upload/waves/protocol' ? { protocol: 'live' } : { hashes: {} });
+        const original = mocks.postUpload.getMockImplementation()!;
+        mocks.postUpload.mockImplementation(async (url: string, payload: any) => {
+            if (url.endsWith('/items')) throw { response: { data: { error: 'Library cleanup is in progress' } } };
+            return original(url, payload);
+        });
+        select(filesFor(1));
+        await advance(4000);
+        expect(services.pendingUploadSummary).not.toBeNull();
+        expect(resolutionCalls()).toHaveLength(0);
+        // Every manual Retry click (same call the banner's button makes) keeps
+        // hitting the same blocked /items call, consuming one attempt each --
+        // exactly what a user repeatedly clicking Retry on a stuck session
+        // does. The initial select() above isn't itself a "retry", so this
+        // loop is what exhausts all MAX_UPLOAD_RETRY_ATTEMPTS attempts.
+        for (let attempt = 0; attempt < MAX_UPLOAD_RETRY_ATTEMPTS; attempt += 1) {
+            act(() => { void services.retryPersistedUploadSession(); });
+            await advance(4000);
+        }
+        // Each top-level retry call can itself issue more than one raw /items
+        // request via the existing HTTP-level retry wrapper, so this count is
+        // not expected to equal MAX_UPLOAD_RETRY_ATTEMPTS -- the cap tracks
+        // retryPersistedUploadSession invocations, not raw HTTP attempts. What
+        // matters is that it stops growing once the cap is hit, below.
+        const itemsCallsBeforeCap = shadowCalls('/items').length;
+        act(() => { void services.retryPersistedUploadSession(); });
+        await advance(4000);
+        // The capped retry must not have touched the server at all.
+        expect(shadowCalls('/items')).toHaveLength(itemsCallsBeforeCap);
+        expect(services.notifications.some(notification => notification.title === 'Retry limit reached')).toBe(true);
+        expect(services.pendingUploadSummary).not.toBeNull();
+    });
+
     it('uses live finalize acknowledgements without extra outcome or close calls', async () => {
         vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
         mocks.getUpload.mockImplementation(async (url) => url === '/upload/waves/protocol' ? { protocol: 'live' } : { hashes: {} });
@@ -1252,6 +1287,19 @@ describe('discard acknowledgment after refresh', () => {
         await act(async () => { await services.discardPersistedUploadSession(); });
         expect(discard).toHaveBeenCalledTimes(2);
         expect(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)).toBeNull();
+    });
+
+    it('tells the user a blocked discard is a temporary server-side wait, not a failure', async () => {
+        // Mirrors the exact wording of backend/wave_settlement.py's abandon():
+        // raise Conflict('A finalization is still in flight; retry abandonment later')
+        vi.spyOn(uploadWaveSync, 'discardWaveShadowSession')
+            .mockRejectedValueOnce(new Error('Upload admission failed: A finalization is still in flight; retry abandonment later'));
+        restorePaused(); await advance(100);
+        await act(async () => { await services.discardPersistedUploadSession(); });
+        expect(services.notifications.some(n =>
+            n.title === 'Still finishing on the server' && n.details?.includes('Wait a few minutes'))).toBe(true);
+        expect(services.notifications.some(n => n.title === 'Upload discard failed')).toBe(false);
+        expect(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)).not.toBeNull();
     });
 
     it('a late finalize callback cannot erase the checkpoint while server discard is pending', async () => {

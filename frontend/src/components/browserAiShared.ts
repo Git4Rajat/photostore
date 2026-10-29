@@ -18,6 +18,81 @@ export const PHOTO_CACHE_STORAGE_KEY = 'photostore.photo.cache.v1';
 export const UPLOAD_SESSION_STORAGE_KEY = 'photostore.upload.session.v1';
 export const UPLOAD_STOPPED_ERROR = 'upload_stopped_by_user';
 
+// Counts finalize attempts (auto-resume on mount AND manual Retry clicks --
+// both end up calling retryPersistedUploadSession, which is the sole gate
+// below) against one session id, persisted so it survives reloads. The
+// backend refreshes its per-item finalize lease (wave_policy.py's
+// finalizeLeaseUntil) to a fresh 10 minutes on any finalize call where the
+// lease has under 2 minutes left, with no way to force-clear it -- so
+// unbounded retries, auto or manual, can keep re-arming that lease forever
+// and permanently block Discard. Capping attempts per session id bounds the
+// damage to MAX_UPLOAD_RETRY_ATTEMPTS lease refreshes before the UI stops
+// retrying and points the user at Discard instead.
+//
+// Storage holds a single {id, count} pair, not a map keyed by session id --
+// that's only correct as long as at most one upload session is ever
+// pending/resumable at a time (startUpload's pendingUploadSession guard
+// currently enforces this). If that ever changes (e.g. uploads to two
+// destinations pending at once), a second session's count would silently
+// clobber the first's here, and resuming the first would read a mismatched
+// id and start over at 0 attempts instead of carrying its real count.
+export const UPLOAD_SESSION_RETRY_ATTEMPTS_KEY = 'photostore.upload.session.retryAttempts.v1';
+export const MAX_UPLOAD_RETRY_ATTEMPTS = 3;
+
+export const readUploadRetryAttemptCount = (storage: Storage, sessionId: string): number => {
+    try {
+        const raw = storage.getItem(UPLOAD_SESSION_RETRY_ATTEMPTS_KEY);
+        if (!raw) return 0;
+        const parsed = JSON.parse(raw) as { id?: string; count?: number };
+        return parsed.id === sessionId && typeof parsed.count === 'number' ? parsed.count : 0;
+    } catch {
+        return 0;
+    }
+};
+
+const writeUploadRetryAttemptCount = (storage: Storage, sessionId: string, count: number): void => {
+    try {
+        storage.setItem(UPLOAD_SESSION_RETRY_ATTEMPTS_KEY, JSON.stringify({ id: sessionId, count }));
+    } catch {
+        // Quota/private-mode failure: worst case this session's attempts go
+        // uncounted and it retries more than intended, same as before this
+        // cap existed.
+    }
+};
+
+export const clearUploadRetryAttempts = (storage: Storage): void => {
+    try { storage.removeItem(UPLOAD_SESSION_RETRY_ATTEMPTS_KEY); } catch { /* ignore */ }
+};
+
+const RETRY_ATTEMPT_LOCK_NAME = 'photostore-upload-retry-attempt';
+
+// Checks the cap and increments in one pass -- a plain read-then-write isn't
+// atomic across browser tabs: two tabs open on the same stuck session could
+// both read the same pre-increment count and both decide they're under the
+// cap, each firing one more finalize attempt than intended. navigator.locks
+// (Chrome/Edge/Firefox, Safari 15.4+) serializes this across tabs/workers
+// sharing this origin; where it's unavailable (older browsers, and this
+// project's jsdom-based unit tests, which always provide a `navigator`
+// object but never `navigator.locks`) this degrades to the same
+// single-tab-safe behavior that existed before this function.
+//
+// Not a pure predicate: claiming an attempt mutates storage as part of
+// deciding the answer (the whole point is to make the check and the
+// increment indivisible), so this must run at most once per
+// claimUploadRetryAttempt call -- never call it a second time to "check
+// again", that would silently consume a second attempt.
+const claimOneAttemptNotIdempotent = (storage: Storage, sessionId: string): boolean => {
+    const count = readUploadRetryAttemptCount(storage, sessionId);
+    if (count >= MAX_UPLOAD_RETRY_ATTEMPTS) return false;
+    writeUploadRetryAttemptCount(storage, sessionId, count + 1);
+    return true;
+};
+
+export const claimUploadRetryAttempt = async (storage: Storage, sessionId: string): Promise<boolean> => {
+    if (typeof navigator === 'undefined' || !navigator.locks) return claimOneAttemptNotIdempotent(storage, sessionId);
+    return navigator.locks.request(RETRY_ATTEMPT_LOCK_NAME, () => claimOneAttemptNotIdempotent(storage, sessionId));
+};
+
 const isBrowserAiModelUiStatus = (status: string): status is BrowserAiModelUiStatus => (
     status === 'checking'
     || status === 'idle'

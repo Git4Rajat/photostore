@@ -27,9 +27,13 @@ import {
     MAX_BACKEND_UPLOAD_CHUNK_BYTES,
     MAX_FINALIZE_RETRIES,
     MB,
+    MAX_UPLOAD_RETRY_ATTEMPTS,
     PHOTO_CACHE_STORAGE_KEY,
     UPLOAD_SESSION_STORAGE_KEY,
     UPLOAD_STOPPED_ERROR,
+    claimUploadRetryAttempt,
+    clearUploadRetryAttempts,
+    readUploadRetryAttemptCount,
     browserAiIdleState,
     browserAiLoadingState,
     browserAiUnsupportedState,
@@ -327,6 +331,17 @@ const getUploadErrorMessage = (err: unknown, fallback: string): string => {
     const message = (err as any)?.message;
     return typeof message === 'string' && message.trim() ? message : fallback;
 };
+
+// Matched against discardPersistedUploadSession's errors to detect the one
+// specific backend Conflict raised by abandon() in backend/wave_settlement.py
+// (`raise Conflict('A finalization is still in flight; retry abandonment
+// later')`) -- a temporary, self-clearing wait (the finalize lease from a
+// recent retry attempt hasn't expired yet), not a real failure. There's no
+// shared error-code convention between this frontend and that backend
+// Conflict (it's a bare RuntimeError with no `code` field), so this free-text
+// match is the only mechanism available; if that backend message is ever
+// reworded, update this regex to match.
+const FINALIZATION_STILL_IN_FLIGHT_PATTERN = /finalization is still in flight/i;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -1864,6 +1879,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             await Promise.all(current.files.map((file) => idbDelete(file.key).catch(() => undefined)));
         }
         persistSession(null);
+        clearUploadRetryAttempts(localStorage);
     }, [persistSession]);
 
     const computeSha256 = async (file: File, signal?: AbortSignal): Promise<string> => (
@@ -4281,6 +4297,27 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (missingCachedFiles.length > 0) {
             addNotification('Partial retry', `${plural(retryableFiles.length, 'cached file')} will retry. Still to reselect: ${plural(missingCachedFiles.length, 'file')}.`);
         }
+        // The authoritative cap. Every caller of retryPersistedUploadSession --
+        // the mount-effect auto-resume, the manual Retry button, and any other
+        // path that resumes a paused session -- funnels through here, so none
+        // of them need their own gating: a manual click is just as capable of
+        // refreshing the backend's finalize lease and blocking Discard forever
+        // as the automatic path was. Checked here, right
+        // before the call that actually touches the server, so a session that
+        // never got this far (missing cache, already uploading) never spends
+        // one of its attempts. claimUploadRetryAttempt checks-and-increments
+        // atomically (via navigator.locks where available) so two tabs racing
+        // the same stuck session can't both slip through on the same count.
+        if (!await claimUploadRetryAttempt(localStorage, session.id)) {
+            // The attempt that just hit the cap may itself have refreshed the
+            // backend's finalize lease (see claimUploadRetryAttempt's comment),
+            // so Discard can keep failing with "finalization still in flight"
+            // for up to ~10 more minutes even though retrying has stopped --
+            // don't imply Discard will succeed right away.
+            addNotification('Retry limit reached', 'This upload has been retried too many times without finishing. Use Discard to start over -- it may need a few minutes to take effect if the server is still finishing the last attempt.');
+            setUploadError('This upload could not finish after multiple retries. Use Discard -- if it reports the server is still finishing, wait a few minutes and discard again.');
+            return;
+        }
         uploadStopRequestedRef.current = false;
         const retryableKeys = new Set(retryableFiles.map((file) => file.key));
         session = retryWaveOperation(session);
@@ -4332,8 +4369,19 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         } catch (error) {
             if (session) discardedUploadSessionIdsRef.current.delete(session.id);
             const message = getUploadErrorMessage(error, 'Upload discard could not finish. Retry Discard.');
-            setUploadError(message);
-            addNotification('Upload discard failed', message);
+            // This specific backend Conflict (wave_settlement.py's abandon())
+            // means the server is still holding a finalize lease from the last
+            // retry attempt -- it's a temporary, self-clearing wait, not a
+            // broken state. Surface it as such instead of a generic failure,
+            // so the user doesn't read "failed" and assume something is wrong
+            // or needs a different action.
+            if (FINALIZATION_STILL_IN_FLIGHT_PATTERN.test(message)) {
+                setUploadError('The server is still finishing a previous attempt. This clears on its own within a few minutes -- wait, then Discard again.');
+                addNotification('Still finishing on the server', 'A previous retry is still being processed server-side. Wait a few minutes, then try Discard again.');
+            } else {
+                setUploadError(message);
+                addNotification('Upload discard failed', message);
+            }
         } finally {
             uploadDiscardInProgressRef.current = false;
         }
@@ -5009,7 +5057,15 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         void ensureWaveShadowSessionOpened(restored);
         setPendingUploadSessionLive(restored);
         addNotification('Upload paused', `${plural(restored.files.filter((file) => file.status !== 'done').length, 'file')} need retry approval.`);
-        if (!autoResumeAttemptedRef.current) {
+        // autoResumeAttemptedRef only stops THIS mount's effect from calling
+        // retryPersistedUploadSession twice (e.g. a dev-mode double-invoke).
+        // The retry-attempt cap that matters across reloads -- and across
+        // every other caller of retryPersistedUploadSession -- lives inside
+        // that function itself (see MAX_UPLOAD_RETRY_ATTEMPTS). Checking the
+        // count here too just skips starting a pointless cache scan when we
+        // already know this session is capped.
+        if (!autoResumeAttemptedRef.current
+            && readUploadRetryAttemptCount(localStorage, restored.id) < MAX_UPLOAD_RETRY_ATTEMPTS) {
             autoResumeAttemptedRef.current = true;
             void retryPersistedUploadSession();
         }

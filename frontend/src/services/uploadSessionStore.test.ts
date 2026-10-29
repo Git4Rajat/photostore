@@ -69,12 +69,13 @@ describe('upload recovery checkpoints', () => {
         expect(JSON.parse(storage.getItem(KEY)!).files[0].uploadedBytes).toBe(49);
     });
 
-    it('coalesces completion promises and saves all resume fields before resolving', async () => {
+    it('coalesces completion promises and saves resume fields before resolving', async () => {
         const { store, storage } = setup();
         store.set(session());
         const oldFile = store.current!.files[0];
         store.update('session:0', { uploadId: 'upload', blobName: 'blob', chunkSizeBytes: 25000 });
         store.update('session:0', { blockIds: ['first', 'second'], uploadedBytes: 50000 });
+        store.update('session:0', { error: 'network', previewDataUrl: 'data:image/jpeg;base64,abc' });
         store.update('session:0', { status: 'done' });
         const first = store.checkpoint();
         store.update('session:1', { status: 'done', skippedDuplicate: true });
@@ -85,10 +86,16 @@ describe('upload recovery checkpoints', () => {
         expect(completed).not.toHaveBeenCalled();
         await vi.advanceTimersByTimeAsync(1);
         expect(await first).toBe(true);
+        // blockIds/chunkSizeBytes are resume-only -- once a file is 'done' they're
+        // dropped so a large session's checkpoint doesn't keep growing with dead
+        // weight from every file that already finished (see update()).
         expect(JSON.parse(storage.getItem(KEY)!).files[0]).toMatchObject({
-            uploadId: 'upload', blobName: 'blob', chunkSizeBytes: 25000,
-            blockIds: ['first', 'second'], uploadedBytes: 50000, status: 'done',
+            uploadId: 'upload', blobName: 'blob', uploadedBytes: 50000, status: 'done',
         });
+        expect(JSON.parse(storage.getItem(KEY)!).files[0]).not.toHaveProperty('chunkSizeBytes');
+        expect(JSON.parse(storage.getItem(KEY)!).files[0]).not.toHaveProperty('blockIds');
+        expect(JSON.parse(storage.getItem(KEY)!).files[0]).not.toHaveProperty('error');
+        expect(JSON.parse(storage.getItem(KEY)!).files[0]).not.toHaveProperty('previewDataUrl');
         expect(JSON.parse(storage.getItem(KEY)!).files[1]).toMatchObject({ status: 'done', skippedDuplicate: true });
         expect(oldFile.status).toBe('pending');
     });

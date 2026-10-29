@@ -27,7 +27,23 @@ export class UploadSessionStore {
     update(key: string, updates: Partial<PersistedUploadFile>): void {
         const index = this.positions.get(key);
         if (!this.current || index === undefined) return;
-        this.current.files[index] = { ...this.current.files[index], ...updates };
+        const merged = { ...this.current.files[index], ...updates };
+        // A finished file no longer needs its resume-only fields: blockIds/
+        // chunkSizeBytes exist solely to resume an interrupted chunked
+        // transfer, and error/previewDataUrl are leftovers from an earlier
+        // failed attempt before a successful retry. Across a large session
+        // (hundreds-to-thousands of files) these accumulate in the JSON
+        // blob written to localStorage and were pushing sessions over the
+        // browser's per-origin quota, silently losing the resume checkpoint.
+        // `merged` was just freshly allocated above and isn't aliased
+        // anywhere else yet, so deleting in place skips a second full copy.
+        if (merged.status === 'done') {
+            delete merged.blockIds;
+            delete merged.chunkSizeBytes;
+            delete merged.error;
+            delete merged.previewDataUrl;
+        }
+        this.current.files[index] = merged;
         this.dirty = true;
         this.schedule();
     }
