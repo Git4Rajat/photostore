@@ -803,10 +803,13 @@ def run_index_release(leases, store, library, wave_id, outbox_key, ledger, *, pu
     with execution_scope(leases, ownership, store, lambda: _execution_check(leases, ownership, store, outbox_key)):
         if ledger.assignment_revision != (wave.get('assignmentReceiptId') or ''):
             raise ValueError('Index obligations do not match the committed assignment receipt')
-        with leases.keepalive(ownership) as owned:
-            def check():
-                owned()
-                _execution_check(leases,ownership,store,outbox_key)
+        with leases.keepalive(ownership, local_checks=True) as owned:
+            from processing_checks import CoalescedCheck
+            stage_check = CoalescedCheck(
+                lambda: _execution_check(leases, ownership, store, outbox_key), local=owned)
+            def check(force=False):
+                stage_check(force=force)
+            check.boundary = lambda: check(force=True)
             if publisher is not None:
                 if prepare is not None:
                     prepare(check)
@@ -820,6 +823,7 @@ def run_index_release(leases, store, library, wave_id, outbox_key, ledger, *, pu
                         check()
                         if any(not ledger._valid_receipt(ledger._get(parent),manifest) for parent in spec['prerequisites']):
                             continue
+                        check.boundary()
                         generation=publisher(scope,spec['id'],check)
                         check()
                         ledger.record_receipt(spec['id'],output_generation=generation)
