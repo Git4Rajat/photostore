@@ -1,0 +1,3953 @@
+{
+  "date": "2026-10-29",
+  "scope": "Isolated Azure qualification and bounded compute/apply experiments.\n\nNo application entrypoint, production credentials or deployment changes. Uses\nproduction source claims, apply/semantic/receipt/ack, admission and qualification.\nBlob derivatives, stage ownership, wave freezing and publication are excluded.\n",
+  "configured_image": "ghcr.io/git4rajat/photostore-ipworker:32b9e9b7e014e1eeb8204ceff6536a0ffad94006",
+  "cpu": 2,
+  "memory": "4Gi",
+  "cpu_max": "200000 100000",
+  "measured_comparisons": 78,
+  "qualification_checks": 11880,
+  "real_model_image_passes": 1896,
+  "rounds": 3,
+  "isolated": true,
+  "production_changed": false,
+  "output_parity": true,
+  "counter_semantics": "SDK method invocations; internal retries and paginated wire requests are not separately counted",
+  "paired_change_semantics": "Median of 100*(1-candidate_wall/current_wall) matched within scenario and round; positive means less wall time",
+  "handoff_followup_gate": {
+    "required_median_wall_reduction_percent": 5,
+    "observed_face_heavy_ratio_of_medians_percent": 4.727919824790927,
+    "followup_run": false
+  },
+  "durable_validation": {
+    "durable_sources": 3216,
+    "verified_face_snapshots": 3476,
+    "acked_sources": 1896,
+    "retained_library_count": 46,
+    "verified_at": "2026-10-29T15:50:41.113968+00:00",
+    "manifests_and_inboxes_valid": true
+  },
+  "local_tests_passed": 113,
+  "superseded_executions_excluded": 1,
+  "summary": [
+    {
+      "section": "qualification",
+      "key": [
+        1000,
+        1,
+        0
+      ],
+      "mode": "batch",
+      "rounds": 3,
+      "median_wall_seconds": 12.072701010969467,
+      "paired_median_wall_reduction_percent": 73.82562216742716,
+      "paired_range": [
+        68.06050656883819,
+        74.62656411152324
+      ],
+      "median_sdk_calls": 1600,
+      "median_process_cores": 0.3759973001050753,
+      "median_container_cores": 0.37609105322454517
+    },
+    {
+      "section": "qualification",
+      "key": [
+        1000,
+        1,
+        0
+      ],
+      "mode": "parallel",
+      "rounds": 3,
+      "median_wall_seconds": 15.60440498002572,
+      "paired_median_wall_reduction_percent": 67.3569109081204,
+      "paired_range": [
+        64.13164947333874,
+        68.19243364269123
+      ],
+      "median_sdk_calls": 7000,
+      "median_process_cores": 0.8822642346308474,
+      "median_container_cores": 0.8833815624464467
+    },
+    {
+      "section": "qualification",
+      "key": [
+        1000,
+        1,
+        0
+      ],
+      "mode": "serial",
+      "rounds": 3,
+      "median_wall_seconds": 47.28294392902171,
+      "paired_median_wall_reduction_percent": 0.0,
+      "paired_range": [
+        0.0,
+        0.0
+      ],
+      "median_sdk_calls": 7000,
+      "median_process_cores": 0.31988643665814637,
+      "median_container_cores": 0.31992856358976884
+    },
+    {
+      "section": "qualification",
+      "key": [
+        200,
+        1,
+        10000
+      ],
+      "mode": "batch",
+      "rounds": 3,
+      "median_wall_seconds": 2.5329119150410406,
+      "paired_median_wall_reduction_percent": 73.5745974838155,
+      "paired_range": [
+        73.46425134407404,
+        73.92710560789
+      ],
+      "median_sdk_calls": 320,
+      "median_process_cores": 0.36856984584442587,
+      "median_container_cores": 0.36916186033703685
+    },
+    {
+      "section": "qualification",
+      "key": [
+        200,
+        1,
+        10000
+      ],
+      "mode": "parallel",
+      "rounds": 3,
+      "median_wall_seconds": 3.100628387008328,
+      "paired_median_wall_reduction_percent": 68.05573066962629,
+      "paired_range": [
+        65.04305356636814,
+        69.21680723190869
+      ],
+      "median_sdk_calls": 1400,
+      "median_process_cores": 0.8868720281095108,
+      "median_container_cores": 0.8879974174062817
+    },
+    {
+      "section": "qualification",
+      "key": [
+        200,
+        1,
+        10000
+      ],
+      "mode": "serial",
+      "rounds": 3,
+      "median_wall_seconds": 9.545281529019121,
+      "paired_median_wall_reduction_percent": 0.0,
+      "paired_range": [
+        0.0,
+        0.0
+      ],
+      "median_sdk_calls": 1400,
+      "median_process_cores": 0.30845933946838805,
+      "median_container_cores": 0.30857054961835056
+    },
+    {
+      "section": "qualification",
+      "key": [
+        20,
+        0,
+        0
+      ],
+      "mode": "batch",
+      "rounds": 3,
+      "median_wall_seconds": 0.24745132896350697,
+      "paired_median_wall_reduction_percent": 69.17103411976579,
+      "paired_range": [
+        64.21233767815848,
+        71.932282840876
+      ],
+      "median_sdk_calls": 30,
+      "median_process_cores": 0.3239603090263193,
+      "median_container_cores": 0.32847267517398127
+    },
+    {
+      "section": "qualification",
+      "key": [
+        20,
+        0,
+        0
+      ],
+      "mode": "parallel",
+      "rounds": 3,
+      "median_wall_seconds": 0.22344312502536923,
+      "paired_median_wall_reduction_percent": 70.76294510508468,
+      "paired_range": [
+        65.77839711683454,
+        72.16211969265316
+      ],
+      "median_sdk_calls": 120,
+      "median_process_cores": 0.9770137008149937,
+      "median_container_cores": 0.984077315141817
+    },
+    {
+      "section": "qualification",
+      "key": [
+        20,
+        0,
+        0
+      ],
+      "mode": "serial",
+      "rounds": 3,
+      "median_wall_seconds": 0.7417230010032654,
+      "paired_median_wall_reduction_percent": 0.0,
+      "paired_range": [
+        0.0,
+        0.0
+      ],
+      "median_sdk_calls": 120,
+      "median_process_cores": 0.3145647103897385,
+      "median_container_cores": 0.3152551554740994
+    },
+    {
+      "section": "qualification",
+      "key": [
+        100,
+        8,
+        0
+      ],
+      "mode": "batch",
+      "rounds": 3,
+      "median_wall_seconds": 1.4612385120126419,
+      "paired_median_wall_reduction_percent": 83.82837393767868,
+      "paired_range": [
+        82.38246080084035,
+        85.78259884754121
+      ],
+      "median_sdk_calls": 210,
+      "median_process_cores": 0.430906942175187,
+      "median_container_cores": 0.43134641936849455
+    },
+    {
+      "section": "qualification",
+      "key": [
+        100,
+        8,
+        0
+      ],
+      "mode": "parallel",
+      "rounds": 3,
+      "median_wall_seconds": 3.118001908005681,
+      "paired_median_wall_reduction_percent": 64.87544118760997,
+      "paired_range": [
+        64.56039231796602,
+        65.54963844369135
+      ],
+      "median_sdk_calls": 1400,
+      "median_process_cores": 0.8170086121811798,
+      "median_container_cores": 0.8178377280799525
+    },
+    {
+      "section": "qualification",
+      "key": [
+        100,
+        8,
+        0
+      ],
+      "mode": "serial",
+      "rounds": 3,
+      "median_wall_seconds": 9.035816846007947,
+      "paired_median_wall_reduction_percent": 0.0,
+      "paired_range": [
+        0.0,
+        0.0
+      ],
+      "median_sdk_calls": 1400,
+      "median_process_cores": 0.29725459239522833,
+      "median_container_cores": 0.2974198098443938
+    },
+    {
+      "section": "pipeline",
+      "key": [
+        "mixed"
+      ],
+      "mode": "current3",
+      "rounds": 3,
+      "median_wall_seconds": 22.5483905459987,
+      "paired_median_wall_reduction_percent": 0.0,
+      "paired_range": [
+        0.0,
+        0.0
+      ],
+      "median_sdk_calls": 1673,
+      "median_process_cores": 1.6001561895079033,
+      "median_container_cores": 1.6020567462744841
+    },
+    {
+      "section": "pipeline",
+      "key": [
+        "mixed"
+      ],
+      "mode": "handoff2x1",
+      "rounds": 3,
+      "median_wall_seconds": 22.39783836895367,
+      "paired_median_wall_reduction_percent": 0.6676848032142302,
+      "paired_range": [
+        -2.9832746114980546,
+        1.103547505119995
+      ],
+      "median_sdk_calls": 1671,
+      "median_process_cores": 1.4899278369316564,
+      "median_container_cores": 1.4920694331968785
+    },
+    {
+      "section": "pipeline",
+      "key": [
+        "mixed"
+      ],
+      "mode": "handoff2x2",
+      "rounds": 3,
+      "median_wall_seconds": 22.855221783043817,
+      "paired_median_wall_reduction_percent": 0.35081732893870177,
+      "paired_range": [
+        -4.364288803741956,
+        1.4633791371975624
+      ],
+      "median_sdk_calls": 1671,
+      "median_process_cores": 1.6265187862220853,
+      "median_container_cores": 1.6281466641910158
+    },
+    {
+      "section": "pipeline",
+      "key": [
+        "mixed"
+      ],
+      "mode": "handoff2x3",
+      "rounds": 3,
+      "median_wall_seconds": 21.76171832100954,
+      "paired_median_wall_reduction_percent": 3.4888176315039043,
+      "paired_range": [
+        -3.959890661641796,
+        7.15197951014066
+      ],
+      "median_sdk_calls": 1676,
+      "median_process_cores": 1.6347781105735109,
+      "median_container_cores": 1.636748595199806
+    },
+    {
+      "section": "pipeline",
+      "key": [
+        "face_positive"
+      ],
+      "mode": "current3",
+      "rounds": 3,
+      "median_wall_seconds": 34.03729015297722,
+      "paired_median_wall_reduction_percent": 0.0,
+      "paired_range": [
+        0.0,
+        0.0
+      ],
+      "median_sdk_calls": 2613,
+      "median_process_cores": 1.6246534631125142,
+      "median_container_cores": 1.6262509956351003
+    },
+    {
+      "section": "pipeline",
+      "key": [
+        "face_positive"
+      ],
+      "mode": "handoff2x1",
+      "rounds": 3,
+      "median_wall_seconds": 33.34788303897949,
+      "paired_median_wall_reduction_percent": 2.025446534959918,
+      "paired_range": [
+        -1.7291051592412066,
+        6.088754107852501
+      ],
+      "median_sdk_calls": 2607,
+      "median_process_cores": 1.5437333758735505,
+      "median_container_cores": 1.545421457180963
+    },
+    {
+      "section": "pipeline",
+      "key": [
+        "face_positive"
+      ],
+      "mode": "handoff2x2",
+      "rounds": 3,
+      "median_wall_seconds": 32.96344387996942,
+      "paired_median_wall_reduction_percent": 3.1549111817700703,
+      "paired_range": [
+        0.9516872587570391,
+        8.4625830003905
+      ],
+      "median_sdk_calls": 2608,
+      "median_process_cores": 1.6758125326998252,
+      "median_container_cores": 1.6776713683610205
+    },
+    {
+      "section": "pipeline",
+      "key": [
+        "face_positive"
+      ],
+      "mode": "handoff2x3",
+      "rounds": 3,
+      "median_wall_seconds": 32.428034364013,
+      "paired_median_wall_reduction_percent": 3.951450289063485,
+      "paired_range": [
+        1.8092073758276705,
+        8.546638224030112
+      ],
+      "median_sdk_calls": 2610,
+      "median_process_cores": 1.7064169155299413,
+      "median_container_cores": 1.70809666487289
+    },
+    {
+      "section": "pipeline",
+      "key": [
+        "small"
+      ],
+      "mode": "current3",
+      "rounds": 3,
+      "median_wall_seconds": 9.975110416009557,
+      "paired_median_wall_reduction_percent": 0.0,
+      "paired_range": [
+        0.0,
+        0.0
+      ],
+      "median_sdk_calls": 651,
+      "median_process_cores": 1.6902691013460827,
+      "median_container_cores": 1.6918827690470366
+    },
+    {
+      "section": "pipeline",
+      "key": [
+        "small"
+      ],
+      "mode": "handoff2x1",
+      "rounds": 3,
+      "median_wall_seconds": 9.85434320004424,
+      "paired_median_wall_reduction_percent": 1.5804657737698902,
+      "paired_range": [
+        0.1795608998761522,
+        10.464731866087462
+      ],
+      "median_sdk_calls": 651,
+      "median_process_cores": 1.6660057388748486,
+      "median_container_cores": 1.6680119301296361
+    },
+    {
+      "section": "pipeline",
+      "key": [
+        "small"
+      ],
+      "mode": "handoff2x2",
+      "rounds": 3,
+      "median_wall_seconds": 10.114027016970795,
+      "paired_median_wall_reduction_percent": -1.3926322132563396,
+      "paired_range": [
+        -1.4096374916224619,
+        3.641932069160414
+      ],
+      "median_sdk_calls": 651,
+      "median_process_cores": 1.698669371475101,
+      "median_container_cores": 1.7004871522630285
+    },
+    {
+      "section": "pipeline",
+      "key": [
+        "small"
+      ],
+      "mode": "handoff2x3",
+      "rounds": 3,
+      "median_wall_seconds": 9.85452140797861,
+      "paired_median_wall_reduction_percent": 0.7805157112871663,
+      "paired_range": [
+        0.3799609900741907,
+        10.463112692200028
+      ],
+      "median_sdk_calls": 651,
+      "median_process_cores": 1.7193823654555345,
+      "median_container_cores": 1.721172013149875
+    },
+    {
+      "section": "pipeline",
+      "key": [
+        "qualification_integrated"
+      ],
+      "mode": "batch",
+      "rounds": 3,
+      "median_wall_seconds": 31.504553720995318,
+      "paired_median_wall_reduction_percent": 7.063257670447176,
+      "paired_range": [
+        4.800432937163201,
+        9.634648602514794
+      ],
+      "median_sdk_calls": 2276,
+      "median_process_cores": 1.7445066342385134,
+      "median_container_cores": 1.7463336090152315
+    },
+    {
+      "section": "pipeline",
+      "key": [
+        "qualification_integrated"
+      ],
+      "mode": "serial",
+      "rounds": 3,
+      "median_wall_seconds": 33.706516966049094,
+      "paired_median_wall_reduction_percent": 0.0,
+      "paired_range": [
+        0.0,
+        0.0
+      ],
+      "median_sdk_calls": 2605,
+      "median_process_cores": 1.609402411510067,
+      "median_container_cores": 1.6110675210303071
+    }
+  ],
+  "measured_runner_sha256": "1a26b0d1f7a11d12efe76feda0313a7b9c4f18fd8cc6d7377eaa2dfa0fc47552",
+  "measured_runner_source": "\"\"\"Isolated Azure qualification and bounded compute/apply experiments.\n\nNo application entrypoint, production credentials or deployment changes. Uses\nproduction source claims, apply/semantic/receipt/ack, admission and qualification.\nBlob derivatives, stage ownership, wave freezing and publication are excluded.\n\"\"\"\nimport argparse\nfrom collections import Counter\nfrom concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED\nfrom contextlib import ExitStack\nfrom contextvars import copy_context\nimport hashlib\nimport json\nimport os\nfrom pathlib import Path\nimport resource\nimport threading\nimport time\nimport uuid\n\nfrom azure.core.exceptions import ResourceNotFoundError\nfrom benchmark_vision_stages import cpu_stat, fingerprint\nfrom benchmark_vision_persistence import Meter, configure, inputs, patch\nimport processing_fence as fencing\nfrom processing_completion import STEPS, prepare_completion\nfrom processing_generation import allocate_generation, current_contract\nfrom processing_receipts import ArtifactReceipts\nfrom upload_waves import ShadowWaves, digest\nfrom upload_wave_execution import _observe_qualified\nfrom wave_source_batch import MetadataBatch, InspectionBatch, ReceiptBatch, reserve_attempts\nfrom wave_settlement import source_state\nimport storage_utils as storage\n\n\ndef batch_create(table, entities):\n    grouped = {}\n    for entity in entities:\n        grouped.setdefault(entity['PartitionKey'], []).append(entity)\n    for rows in grouped.values():\n        for offset in range(0, len(rows), 50):\n            table.submit_transaction([('create', row) for row in rows[offset:offset+50]])\n\n\ndef source_row(library, index, *, complete=True):\n    filename, photo = f'{index:05}.jpg', f'photo-{index}'\n    row = dict(PartitionKey=library, RowKey=filename, anonymousImageId=photo, fileHash='a'*64,\n        processing_lease_owner='', processing_lease='', processing_lease_expires_at='',\n        faceCount=0, **allocate_generation('rev', photo_id=photo, file_hash='a'*64, is_video=False),\n        **{step+'_status': 'no_data' for step in STEPS})\n    if not complete:\n        row.update({step+'_status': 'pending' for step in ('ocr', 'face', 'ai_vision')})\n    return row\n\n\ndef member_row(store, wave, row):\n    return dict(PartitionKey=store.partition, RowKey=f'e!{wave}!m!{row[\"RowKey\"]}',\n        waveId=wave, filename=row['RowKey'], photoId=row['anonymousImageId'],\n        processingRevision=row['processingRevision'], outcome='pending',\n        requiredSteps=json.dumps(sorted(STEPS)))\n\n\ndef seed_completed(tables, images, faces=1, background=0):\n    \"\"\"Valid immutable fixture rows; fixture construction is outside timing.\"\"\"\n    library, wave = 'bench-'+uuid.uuid4().hex, uuid.uuid4().hex\n    store = ShadowWaves(tables['jobs'], library)\n    receipts = ArtifactReceipts(tables['jobs'], library)\n    metadata, jobs, members = [], [], []\n    version = current_contract()['faceEmbeddingVersions'][0]\n    for i in range(images):\n        row = source_row(library, i)\n        row.update(faceCount=faces, face_status='done' if faces else 'no_data', processingFence='attempt')\n        snapshots = []\n        for face_index in range(faces):\n            payload = dict(PartitionKey=library, RowKey=f'face-{i}-{face_index}', filename=row['RowKey'],\n                sourcePhotoId=row['anonymousImageId'], processingRevision='rev', processingFence='attempt',\n                embeddingVersion=version, embedding=json.dumps(inputs(1)[0]['embedding']), bbox='{}')\n            identity, entity = receipts._prepare('face', payload)\n            snapshots.append(identity); jobs.append(entity)\n        payload = dict(schemaVersion=1, library=library, filename=row['RowKey'], photoId=row['anonymousImageId'],\n            revision='rev', statuses={step: row[step+'_status'] for step in STEPS}, derivatives={},\n            faceCount=faces, faceSnapshots=snapshots, faceLookupGeneration='fixture')\n        identity, entity = receipts._prepare('manifest', payload); jobs.append(entity)\n        row['artifactReceipt'] = json.dumps(dict(id=identity, library=library, filename=row['RowKey'],\n            photoId=row['anonymousImageId'], revision='rev'))\n        prepare_completion(row)\n        intent = json.loads(row['processingCompletionOutbox'])[0]\n        # Accepted fixture is the same canonical payload consumed by qualification.\n        from processing_completion import validate_intent\n        key = 'source-completion!'+digest([row['anonymousImageId'], 'rev'])+'!'+intent['id']\n        jobs.append(dict(PartitionKey=store.partition, RowKey=key, completionId=intent['id'],\n            payload=json.dumps(validate_intent(intent, library), sort_keys=True, separators=(',', ':')),\n            artifactReceiptQualified=True, completionQualified=False))\n        metadata.append(row); members.append(member_row(store, wave, row))\n    batch_create(tables['metadata'], metadata); batch_create(tables['jobs'], jobs)\n    # Mix namespace/key ranges rather than placing all padding beyond the target range.\n    for offset in range(0, background, 50):\n        ids = range(offset, min(background, offset+50))\n        batch_create(tables['metadata'], [dict(PartitionKey=library, RowKey=f'{i%images:05}.jpg-padding-{i}', padding='x'*256) for i in ids])\n        batch_create(tables['jobs'], [dict(PartitionKey=store.partition,\n            RowKey=('deleted-source!' if i%2 else 'source-completion!')+hashlib.sha256(str(i).encode()).hexdigest(), padding='x'*256) for i in ids])\n    return store, members\n\n\ndef qualify_group(store, metadata, members, mode):\n    \"\"\"New snapshots after sources finish; never reuse pre-processing absence.\"\"\"\n    def one(member, rows, receipts, inspection=None, current_metadata=None):\n        if source_state(store, member['waveId'], member, rows,\n                        proofs=inspection.proofs if inspection is not None else None):\n            return False\n        completion, row = _observe_qualified(store, member, current_metadata or rows, receipts,\n            inboxes=inspection.inboxes if inspection is not None else None)\n        return bool(completion and row)\n    if mode == 'parallel':\n        def worker(member):\n            # Per-source receipt cache avoids sharing mutable LocalRows across threads.\n            with ReceiptBatch(store.table, store.library) as receipts:\n                return one(member, metadata, receipts)\n        with ThreadPoolExecutor(4) as pool:\n            return list(pool.map(worker, members))\n    with ReceiptBatch(store.table, store.library) as receipts:\n        if mode == 'batch':\n            rows = MetadataBatch(metadata, store.library, members)\n            inspection = InspectionBatch(store, members, rows, receipts)\n            # Prefetch plans evidence reads, but cannot authorize completion\n            # against a source replaced/leased since the batch was fetched.\n            return [one(m, rows, receipts, inspection, current_metadata=metadata) for m in members]\n        if mode != 'serial':\n            raise ValueError(mode)\n        return [one(m, metadata, receipts) for m in members]\n\n\ndef measured_qualification(raw, *, images, faces, background, mode, fixture=None):\n    counts, lock = Counter(), threading.Lock()\n    tables = {n: Meter(t, n, counts, lock) for n, t in raw.items()}\n    store, members = fixture or seed_completed(tables, images, faces, background)\n    # Fixture may have raw clients; point the benchmark store at this run's meter.\n    store = ShadowWaves(tables['jobs'], store.library)\n    counts.clear(); before, cpu, start = cpu_stat(), time.process_time(), time.perf_counter()\n    result = []\n    for offset in range(0, len(members), 20):\n        result.extend(qualify_group(store, tables['metadata'], members[offset:offset+20], mode))\n    wall, cpu_used = time.perf_counter()-start, time.process_time()-cpu\n    if not all(result) or len(result) != images:\n        raise AssertionError('Qualification result mismatch')\n    return dict(section='qualification', library=store.library, images=images, faces=faces, background=background, mode=mode,\n        wall_seconds=wall, process_cpu_seconds=cpu_used, sdk_calls=sum(counts.values()), calls=dict(counts),\n        cgroup_delta={k:v-before.get(k,0) for k,v in cpu_stat().items()}, output_digest=fingerprint(result))\n\n\ndef bounded_current(items, process, *, workers=3, admit=lambda items: None):\n    remaining=iter(items); exhausted=False; active={}; results=[]\n    with ThreadPoolExecutor(workers) as pool:\n        while True:\n            ready=[]\n            while not exhausted and len(active)+len(ready)<workers:\n                item=next(remaining,None)\n                if item is None:\n                    exhausted=True;break\n                ready.append(item)\n            if ready:\n                admit(ready)\n                for item in ready:\n                    active[pool.submit(copy_context().run,process,item)]=item\n            if not active:break\n            done,_=wait(active,return_when=FIRST_COMPLETED)\n            for future in done:\n                active.pop(future);results.append(future.result())\n    return results\n\n\ndef bounded_handoff(items, compute, apply, *, compute_workers=2, apply_workers=2, limit=6,\n                    byte_limit=32*1024*1024, admit=lambda items: None):\n    \"\"\"Unified completion means apply completed; all failure paths drain pools.\n\n    In-flight count is a strict cap. Byte budget controls admitting more compute\n    jobs once completed outputs fill the apply queue. Each result has an explicit\n    per-item cap so compute slots reserve enough headroom before they start.\n    \"\"\"\n    if min(compute_workers, apply_workers, limit, byte_limit) < 1:\n        raise ValueError('Positive bounded capacities required')\n    per_item = byte_limit//limit\n    if not per_item:\n        raise ValueError('Byte budget smaller than source capacity')\n    remaining = iter(items); exhausted = False\n    running, applying, results = {}, {}, []\n    peak_count = peak_bytes = pending_bytes = 0\n    with ThreadPoolExecutor(compute_workers) as cp, ThreadPoolExecutor(apply_workers) as ap:\n        try:\n            while True:\n                ready=[]\n                while not exhausted and len(running)+len(ready)<compute_workers and len(running)+len(applying)+len(ready)<limit:\n                    item = next(remaining, None)\n                    if item is None:\n                        exhausted = True; break\n                    ready.append(item)\n                if ready:\n                    admit(ready)\n                for item in ready:\n                    running[cp.submit(copy_context().run, compute, item)] = item\n                    peak_count = max(peak_count, len(running)+len(applying))\n                if not running and not applying:\n                    break\n                done, _ = wait([*running, *applying], return_when=FIRST_COMPLETED)\n                for future in done:\n                    if future in applying:\n                        size = applying.pop(future)\n                        pending_bytes -= size\n                        results.append(future.result())\n                    else:\n                        running.pop(future)\n                        value = future.result()\n                        size = len(json.dumps(value, default=str).encode())\n                        if size > per_item:\n                            raise ValueError('Compute output exceeds its reserved byte budget')\n                        pending_bytes += size\n                        peak_bytes = max(peak_bytes, pending_bytes)\n                        if pending_bytes > byte_limit:\n                            raise AssertionError('Byte budget exceeded')\n                        applying[ap.submit(copy_context().run, apply, value)] = size\n            return results, dict(peak_inflight=peak_count, peak_apply_bytes=peak_bytes,\n                inflight_limit=limit, byte_limit=byte_limit, pending_at_finish=0)\n        except BaseException:\n            # Futures already admitted must finish/fail before scopes/resources exit.\n            wait([*running, *applying])\n            raise\n\n\ndef configure_pipeline(tables, store):\n    configure(tables)\n    storage._CTX.update(embeddings_table_client=tables['photoembeddings'],\n        source_artifact_receipt_capture=lambda library, row: ArtifactReceipts(tables['jobs'], library).capture(storage, row),\n        source_completion_delivery=lambda library, intent: store.accept_source_completion(intent))\n\n\ndef pipeline_run(raw, samples, indices, models, references, *, mode, qualification='serial'):\n    from processing_cleanup import source_policy_scope, check_source_policy\n    from processing_fence import ResultFence\n    counts, lock = Counter(), threading.Lock()\n    tables = {n: Meter(t,n,counts,lock) for n,t in raw.items()}\n    library, wave = 'bench-'+uuid.uuid4().hex, uuid.uuid4().hex\n    store = ShadowWaves(tables['jobs'], library); configure_pipeline(tables, store)\n    storage._CTX['source_policy_check'] = lambda uid: check_source_policy(tables['jobs'], uid)\n    rows = [source_row(library, i, complete=False) for i in range(len(indices))]\n    if samples:\n        for i,row in enumerate(rows):\n            source_hash=hashlib.sha256(samples[indices[i]]).hexdigest()\n            row.update(fileHash=source_hash,**allocate_generation('rev',photo_id=row['anonymousImageId'],\n                file_hash=source_hash,is_video=False))\n    members = [member_row(store, wave, row) for row in rows]\n    batch_create(tables['metadata'], rows)\n    batch_create(tables['lookup'], [dict(PartitionKey=library, RowKey=r['RowKey'],\n        schemaVersion=storage._FACE_FILENAME_SCHEMA_VERSION, generation=uuid.uuid4().hex,\n        state='complete', faceIds='[]', leaseExpiresAt='') for r in rows])\n    # An active cleanup policy row makes admission and completion retain real CAS guards.\n    tables['jobs'].submit_transaction([('create',dict(PartitionKey=store.partition, RowKey='policy', cleanupState=''))])\n    timings = Counter(); leases = {}; completed = []; queue_stats = []\n    def compute(position):\n        began = time.perf_counter(); member = members[position]\n        lease = storage.claim_processing_lease(library, member['filename'], 'bench-'+uuid.uuid4().hex,\n            steps=['ocr','face','ai_vision'], mark_running=False)\n        with lock:\n            leases[position] = lease\n        output = models(indices[position])\n        model_digest = fingerprint(output)\n        with lock:\n            if references.setdefault(('model', indices[position]), model_digest) != model_digest:\n                raise AssertionError('Model result changed')\n            timings['compute_seconds_sum'] += time.perf_counter()-began\n        return dict(position=position, output=output, model_digest=model_digest)\n    def apply(bundle):\n        began = time.perf_counter(); position = bundle['position']; row = rows[position]; lease = leases[position]\n        # Validate at the handoff boundary; production apply also rereads/fences CAS.\n        ResultFence(tables['metadata'], library, row['RowKey'], 'rev', lease['entity']['processingFence'],\n            lease['ownerId'], row['anonymousImageId'], generation=row['processingGeneration']).check()\n        result = storage.apply_client_processing_results_for_file(library, row['RowKey'],\n            client_processing=bundle['output'], origin='ipworker', claimed_steps=['ocr','face','ai_vision'],\n            lease_owner=lease['ownerId'], expected_processing_revision='rev',\n            expected_processing_fence=lease['entity']['processingFence'])\n        storage.release_processing_lease(library,row['RowKey'],lease['ownerId'],\n            expected_processing_fence=lease['entity']['processingFence'])\n        with lock:\n            timings['apply_seconds_sum'] += time.perf_counter()-began\n        return dict(position=position, model_digest=bundle['model_digest'])\n    def sync(position):\n        return apply(compute(position))\n    before, cpu, start = cpu_stat(), time.process_time(), time.perf_counter(); counts.clear()\n    with source_policy_scope(tables['jobs'], library), patch(fencing,'POLICY_CHECK',storage._CTX['source_policy_check']):\n        def admit(positions):\n            reserve_attempts(store,[members[i] for i in positions])\n        for offset in range(0, len(indices), 20):\n            positions = list(range(offset,min(len(indices),offset+20)))\n            if mode == 'current3':\n                completed.extend(bounded_current(positions,sync,admit=admit))\n            else:\n                io_workers = int(mode.removeprefix('handoff2x'))\n                results, stats = bounded_handoff(positions,compute,apply,compute_workers=2,\n                    apply_workers=io_workers,limit=2+io_workers,admit=admit)\n                completed.extend(results); queue_stats.append(stats)\n            then = time.perf_counter()\n            qualified = qualify_group(store,tables['metadata'],members[offset:offset+20],qualification)\n            timings['qualification_seconds'] += time.perf_counter()-then\n            if not all(qualified):\n                raise AssertionError('Unqualified source after completed apply')\n    wall, cpu_used = time.perf_counter()-start,time.process_time()-cpu\n    cgroup = {k:v-before.get(k,0) for k,v in cpu_stat().items()}\n    if len(completed)!=len(indices):\n        raise AssertionError('Unfinished sources')\n    # Fresh durable readback includes semantic vectors, completed ACK and face membership.\n    canonical=[]\n    for position,row in enumerate(rows):\n        current=raw['metadata'].get_entity(library,row['RowKey'])\n        if current.get('processing_lease_owner') or current.get('processingCompletionOutbox') not in ('[]','',None):\n            raise AssertionError('Lease/outbox not drained')\n        vectors=raw['photoembeddings'].get_entity(library,row['RowKey'])\n        semantic=json.loads(vectors['semanticEmbedding'])\n        if len(semantic)!=512 or not vectors.get('semanticTextDigest'):\n            raise AssertionError('Real semantic result required')\n        key=('semantic',indices[position])\n        if references.setdefault(key,fingerprint(semantic))!=fingerprint(semantic):\n            raise AssertionError('Semantic result changed')\n        ids=json.loads(raw['lookup'].get_entity(library,row['RowKey'])['faceIds'])\n        face_values=[]\n        for fid in ids:\n            face=raw['faces'].get_entity(library,fid);embedding=raw['embeddings'].get_entity(library,fid)\n            face_values.append(dict(bbox=face['bbox'],embedding=embedding['embedding']))\n        canonical.append(dict(model=next(r['model_digest'] for r in completed if r['position']==position),\n            semantic=fingerprint(semantic),faces=sorted(face_values,key=lambda v:v['bbox']),\n            statuses={step:current.get(step+'_status') for step in STEPS}))\n    return dict(section='pipeline',library=library,mode=mode,qualification=qualification,images=len(indices),\n        wall_seconds=wall,process_cpu_seconds=cpu_used,cgroup_delta=cgroup,sdk_calls=sum(counts.values()),\n        calls=dict(counts),timings=dict(timings),queue_stats=queue_stats,\n        process_peak_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss*1024,\n        output_digest=fingerprint(canonical))\n\n\ndef main():\n    from azure.data.tables import TableServiceClient\n    parser=argparse.ArgumentParser(description=__doc__)\n    parser.add_argument('--output',type=Path,required=True)\n    parser.add_argument('--manifest',type=Path,required=True)\n    parser.add_argument('--rounds',type=int,default=3)\n    args=parser.parse_args()\n    os.environ['UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED']='true'\n    os.environ['PROCESSING_GENERATION_ENFORCEMENT_ENABLED']='true'\n    storage._LOGGER.setLevel('ERROR')\n    import processing_diagnostics\n    processing_diagnostics._LOGGER.setLevel('WARNING')\n    service=TableServiceClient.from_connection_string(os.environ['BENCHMARK_STORAGE_CONNECTION'])\n    tables={n:service.get_table_client('bench'+n) for n in ('metadata','faces','embeddings','lookup','jobs','photoembeddings')}\n    reports=[];references={}\n    def save(row):\n        reports.append(row)\n        args.output.write_text(json.dumps(dict(scope=__doc__,output_parity=True,\n            runner_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),\n            cpu_max=Path('/sys/fs/cgroup/cpu.max').read_text().strip(),reports=reports),indent=2))\n        print('ROUND '+json.dumps({k:row[k] for k in ('section','mode','images','wall_seconds','sdk_calls')}),flush=True)\n    # Main workload plus small-upload and face-count/partition controls.\n    for images,faces,background in [(1000,1,0),(200,1,10000),(20,0,0),(100,8,0)]:\n        fixture=seed_completed(tables,images,faces,background)\n        for round_number in range(args.rounds):\n            modes=['serial','parallel','batch']\n            for mode in modes if round_number%2==0 else reversed(modes):\n                row=measured_qualification(tables,images=images,faces=faces,background=background,mode=mode,fixture=fixture)\n                row['round']=round_number;save(row)\n    from image_utils import convert_image_to_jpeg\n    from ipwork_image import image_job\n    import ipwork_face as face\n    import ipwork_ocr as ocr\n    import ipwork_vision as vision\n    import vision_utils\n    face.FACE_LANDMARKER_MODEL_PATH='/app/models/face_landmarker.task'\n    samples=[]\n    for row in json.loads(args.manifest.read_text()):\n        data=convert_image_to_jpeg(Path(row['path']).read_bytes(),row['filename'])\n        if not data:raise ValueError('Preview conversion failed')\n        samples.append(data)\n    if not vision_utils.image_encoder_available() or not vision._load_vocabulary():\n        raise RuntimeError('Actual models required')\n    def models(index):\n        with image_job(True):\n            output={key:fn('benchmark',f'{index:04}.jpg',samples[index]) for key,fn in\n                [('ocr',ocr.process_ocr),('face',face.process_face),('ai_vision',vision.process_vision)]}\n        if any(value.get('error') for value in output.values()) or not output['face']['faceDiagnostics']['detectorModelReady']:\n            raise RuntimeError('Model failure')\n        return output\n    with ThreadPoolExecutor(3) as pool:\n        warmed=list(pool.map(models,range(len(samples))))\n    positive=[i for i,r in enumerate(warmed) if any(storage._client_face_passes_quality_gate(f) for f in r['face'].get('faces',[]))]\n    if not positive:raise RuntimeError('Empty face-positive profile')\n    for profile,indices in [('mixed',list(range(len(samples)))),('face_positive',positive*4),('small',list(range(20)))]:\n        for round_number in range(args.rounds):\n            modes=['current3','handoff2x1','handoff2x2','handoff2x3']\n            for mode in modes if round_number%2==0 else reversed(modes):\n                row=pipeline_run(tables,samples,indices,models,references,mode=mode)\n                row.update(profile=profile,round=round_number)\n                key=('pipeline',profile)\n                if references.setdefault(key,row['output_digest'])!=row['output_digest']:\n                    raise AssertionError('Pipeline output mismatch')\n                save(row)\n    # Keep a matched full-component control for the winning qualification path.\n    for round_number in range(args.rounds):\n        modes=['serial','batch']\n        for mode in modes if round_number%2==0 else reversed(modes):\n            row=pipeline_run(tables,samples,positive*4,models,references,mode='current3',qualification=mode)\n            row.update(profile='qualification_integrated',round=round_number);save(row)\n\n\nif __name__=='__main__':\n    main()\n",
+  "helper_sources": {
+    "benchmark_vision_persistence.py": "\"\"\"Isolated persistence prototypes; never imported by the application.\n\nUses production face writers, capture and completion acceptance. Only immutable\nreceipt rereads and bounded cross-image artifact writes are intercepted. No\nmodel, blob promotion, wave orchestration or full-upload throughput is measured.\n\"\"\"\nimport argparse\nfrom collections import Counter\nfrom concurrent.futures import ThreadPoolExecutor\nfrom contextlib import contextmanager\nfrom contextvars import ContextVar\nfrom datetime import datetime, timedelta, timezone\nimport hashlib\nimport json\nimport os\nfrom pathlib import Path\nimport threading\nimport time\nimport uuid\n\nfrom azure.core import MatchConditions\nfrom azure.core.exceptions import ResourceNotFoundError\nfrom azure.data.tables import UpdateMode\nimport processing_fence as fencing\nfrom processing_completion import STEPS, prepare_completion, validate_intent\nfrom processing_receipts import ArtifactReceipts\nfrom upload_waves import ShadowWaves\nimport storage_utils as storage\n\n\n@contextmanager\ndef patch(obj, name, value):\n    previous = getattr(obj, name)\n    setattr(obj, name, value)\n    try:\n        yield previous\n    finally:\n        setattr(obj, name, previous)\n\n\n_receipts = ContextVar('benchmark_committed_receipts', default=None)\n\n\n@contextmanager\ndef receipt_prototype(enabled):\n    \"\"\"Cache only successfully committed immutable payloads in this call scope.\"\"\"\n    if not enabled:\n        yield\n        return\n    get, put, many = ArtifactReceipts._get, ArtifactReceipts._put, ArtifactReceipts._put_many\n    def key(self, rowkey):\n        return id(self.table), self.partition, rowkey\n    def cached_get(self, rowkey):\n        cache = _receipts.get()\n        found = cache.get(key(self, rowkey)) if cache is not None else None\n        return dict(found) if found is not None else get(self, rowkey)\n    def remember(self, kind, payload):\n        identity, row = self._prepare(kind, payload)\n        cache = _receipts.get()\n        if cache is not None:\n            cache[key(self, row['RowKey'])] = row\n        return identity\n    def committed_put(self, kind, payload):\n        identity = put(self, kind, payload)\n        remember(self, kind, payload)  # Never populated before durable success.\n        return identity\n    def committed_many(self, kind, payloads):\n        payloads = list(payloads)\n        identities = many(self, kind, payloads)\n        for payload in payloads:\n            remember(self, kind, payload)\n        return identities\n    with patch(ArtifactReceipts, '_get', cached_get), patch(ArtifactReceipts, '_put', committed_put), \\\n            patch(ArtifactReceipts, '_put_many', committed_many):\n        yield\n\n\n@contextmanager\ndef receipt_scope():\n    token = _receipts.set({})\n    try:\n        yield\n    finally:\n        _receipts.reset(token)\n\n\nclass CrossImageBatch:\n    \"\"\"Bounded queue; no caller may publish completion until flush succeeds.\n\n    Keeps original artifact ETags, fresh per-source/lookup guards, embedding\n    before face ordering, and complete lookup publication strictly last.\n    \"\"\"\n    def __init__(self, guard_workers=1):\n        self.operations, self.finishes = {}, []\n        self.lock = threading.Lock()\n        self.original_finish = storage._finish_face_filename_write\n        self.original_renew = storage._renew_face_filename_write\n        self.guard_workers = guard_workers\n        self.timings = Counter()\n\n    def enqueue(self, table, entity, *, previous=None, previous_known=False):\n        fence = fencing.current_fence(entity['PartitionKey'], entity.get('filename'))\n        if fence is None:\n            raise ValueError('Source fence required')\n        if not previous_known:\n            try:\n                previous = table.get_entity(entity['PartitionKey'], entity['RowKey'])\n            except ResourceNotFoundError:\n                previous = None\n        row = dict(entity, **fence.headers())\n        operation = ('create', row) if previous is None else ('update', row, dict(\n            mode=UpdateMode.REPLACE, etag=previous.metadata['etag'], match_condition=MatchConditions.IfNotModified))\n        with self.lock:\n            self.operations.setdefault(table, []).append((operation, fence))\n\n    def finish(self, *args, **kwargs):\n        if args[3] is None:\n            return self.original_finish(*args, **kwargs)\n        with self.lock:\n            self.finishes.append((args, kwargs, fencing.current_fence()))\n\n    def renew(self, *args, **kwargs):\n        # This preparation only queues writes. Flush performs fresh checks.\n        if not kwargs.get('artifact_checks_source'):\n            return self.original_renew(*args, **kwargs)\n\n    @contextmanager\n    def installed(self):\n        with patch(fencing, 'write_artifact', self.enqueue), \\\n                patch(storage, '_finish_face_filename_write', self.finish), \\\n                patch(storage, '_renew_face_filename_write', self.renew):\n            yield self\n\n    def flush(self):\n        generations = {(f.library, f.filename): args[2] for args, _, f in self.finishes}\n        # Explicit ordering; thread scheduling must not determine table order.\n        ordered = [storage._CTX['face_embeddings_table_client'], storage._CTX['face_table_client']]\n        for table in ordered:\n            entries = self.operations.get(table, [])\n            # Conservative byte cap plus Azure's 100-operation transaction cap.\n            pages, page, size = [], [], 0\n            for entry in entries:\n                estimate = len(json.dumps(entry[0][1], default=str).encode()) * 2 + 1024\n                if page and (len(page) == 100 or size + estimate > 3_000_000):\n                    pages.append(page); page, size = [], 0\n                page.append(entry); size += estimate\n            if page:\n                pages.append(page)\n            for page in pages:\n                guards = {(f.library, f.filename): f for _, f in page}\n                started = time.perf_counter()\n                def check(item):\n                    source, fence = item\n                    with fencing.result_fence(fence):\n                        self.original_renew(*source, generations[source], artifact_checks_source=True)\n                        fence.check()\n                if self.guard_workers > 1:\n                    with ThreadPoolExecutor(self.guard_workers) as pool:\n                        list(pool.map(check, guards.items()))\n                else:\n                    for item in guards.items():\n                        check(item)\n                self.timings['batch_guard_seconds'] += time.perf_counter()-started\n                started = time.perf_counter()\n                table.submit_transaction([operation for operation, _ in page])\n                self.timings['batch_write_seconds'] += time.perf_counter()-started\n        started = time.perf_counter()\n        def finish(entry):\n            args, kwargs, fence = entry\n            with fencing.result_fence(fence):\n                self.original_finish(*args, **kwargs)\n        if self.guard_workers > 1:\n            with ThreadPoolExecutor(self.guard_workers) as pool:\n                list(pool.map(finish, self.finishes))\n        else:\n            for entry in self.finishes:\n                finish(entry)\n        self.timings['batch_lookup_publish_seconds'] += time.perf_counter()-started\n        self.operations.clear(); self.finishes.clear()\n\n\nclass Meter:\n    def __init__(self, table, name, counts, lock):\n        self.table, self.name, self.counts, self.lock = table, name, counts, lock\n    def __getattr__(self, name):\n        fn = getattr(self.table, name)\n        def call(*args, **kwargs):\n            with self.lock:\n                self.counts[self.name + '.' + name] += 1\n            return fn(*args, **kwargs)\n        return call\n\n\ndef configure(tables):\n    storage._CTX.update(metadata_table_client=tables['metadata'], face_table_client=tables['faces'],\n        face_embeddings_table_client=tables['embeddings'], face_by_filename_table_client=tables['lookup'],\n        blob_service_client=None, person_table_client=None, person_members_table_client=None,\n        face_summary_lookup=None, face_summary_cache_writer=None, source_policy_check=None)\n    storage.touch_user_search_indexes_state = lambda *a, **k: None\n    storage._start_face_crop_warming = lambda *a, **k: None\n\n\ndef inputs(count):\n    return [dict(embedding=[((j+i)%31-15)/100 for j in range(512)], confidence=.9,\n        bbox=dict(left=i*20, top=0, width=10, height=10), imageWidth=200, imageHeight=200,\n        embeddingVersion='benchmark-v1') for i in range(count)]\n\n\ndef execute(raw, *, mode, face_count, images, group, workers=3, seeded=False, library=None):\n    library = library or 'benchmark-' + uuid.uuid4().hex\n    counts, lock = Counter(), threading.Lock()\n    tables = {n: Meter(t, n, counts, lock) for n, t in raw.items()}\n    configure(tables)\n    rows, fences = [], []\n    for i in range(images):\n        filename = f'{i:04}.jpg'\n        row = dict(PartitionKey=library, RowKey=filename, anonymousImageId=f'photo-{i}',\n            processingRevision='rev', processingGeneration='b'*64, processingFence='attempt',\n            processing_lease_owner='owner', processing_lease_expires_at=(datetime.now(timezone.utc)+timedelta(hours=2)).isoformat(),\n            faceCount=face_count, **{step+'_status': 'no_data' for step in STEPS})\n        if face_count:\n            row['face_status'] = 'done'\n        tables['metadata'].create_entity(row)\n        tables['lookup'].create_entity(dict(PartitionKey=library, RowKey=filename,\n            schemaVersion=storage._FACE_FILENAME_SCHEMA_VERSION, generation=uuid.uuid4().hex,\n            state='complete', faceIds='[]', leaseExpiresAt=''))\n        fence = fencing.ResultFence(tables['metadata'], library, filename, 'rev', 'attempt', 'owner', f'photo-{i}', generation='b'*64)\n        rows.append(row); fences.append(fence)\n        if seeded:\n            with fencing.result_fence(fence):\n                ids = storage._store_client_face_entities(library, filename, inputs(face_count))\n            for fid in ids:\n                previous = tables['faces'].get_entity(library, fid)\n                entity = dict(previous)\n                entity.update(personId='curated-person', confirmedByUser=True, reviewStatus='confirmed')\n                tables['faces'].update_entity(entity, mode=UpdateMode.REPLACE,\n                    etag=previous.metadata['etag'], match_condition=MatchConditions.IfNotModified)\n    counts.clear()\n    phases, delivered = Counter(), {}\n    def persist(i):\n        with fencing.result_fence(fences[i]):\n            storage._store_client_face_entities(library, rows[i]['RowKey'], inputs(face_count))\n    def complete(i):\n        row = dict(rows[i])\n        with receipt_scope(), fencing.result_fence(fences[i]):\n            previous = tables['metadata'].get_entity(library, row['RowKey'])\n            with fencing.immutable_artifact_checks(fences[i]):\n                reference = ArtifactReceipts(tables['jobs'], library).capture(storage, row)\n            row['artifactReceipt'] = json.dumps(reference)\n            row.update(processing_lease_owner='', processing_lease_expires_at='')\n            prepare_completion(row)\n            tables['metadata'].update_entity(row, mode=UpdateMode.REPLACE,\n                etag=previous.metadata['etag'], match_condition=MatchConditions.IfNotModified)\n            intent = json.loads(row['processingCompletionOutbox'])[0]\n            accepted = ShadowWaves(tables['jobs'], library).accept_source_completion(intent)\n            assert accepted['artifactReceiptQualified']\n            with lock:\n                delivered[i] = reference, intent, accepted\n    start, cpu = time.perf_counter(), time.process_time()\n    with ThreadPoolExecutor(workers) as pool, receipt_prototype(mode in ('receipts', 'combined', 'combined_parallel')):\n        for offset in range(0, images, group):\n            indices = list(range(offset, min(images, offset+group)))\n            then = time.perf_counter()\n            if mode in ('batch', 'combined', 'batch_parallel', 'combined_parallel'):\n                with CrossImageBatch(workers if mode.endswith('_parallel') else 1).installed() as batch:\n                    list(pool.map(persist, indices))\n                    batch.flush()\n                    phases.update(batch.timings)\n            else:\n                list(pool.map(persist, indices))\n            phases['face_seconds'] += time.perf_counter()-then\n            then = time.perf_counter()\n            list(pool.map(complete, indices))\n            phases['capture_delivery_seconds'] += time.perf_counter()-then\n    wall, cpu = time.perf_counter()-start, time.process_time()-cpu\n    # Readbacks outside timing, compare semantic output rather than random IDs.\n    canonical = []\n    for row in rows:\n        lookup = raw['lookup'].get_entity(library, row['RowKey'])\n        ids = json.loads(lookup['faceIds'])\n        assert lookup['state'] == 'complete' and len(ids) == face_count\n        values = []\n        for fid in ids:\n            face = raw['faces'].get_entity(library, fid)\n            embedding = raw['embeddings'].get_entity(library, fid)\n            values.append({k: face.get(k) for k in ('bbox', 'confidence', 'personId', 'confirmedByUser', 'reviewStatus')} |\n                          dict(embedding=embedding.get('embedding')))\n        canonical.append(sorted(values, key=lambda x: json.dumps(x, sort_keys=True)))\n    for reference, intent, accepted in delivered.values():\n        ArtifactReceipts(raw['jobs'], library).verify_reference(reference, intent)\n        inbox = raw['jobs'].get_entity(accepted['PartitionKey'], accepted['RowKey'])\n        assert inbox['artifactReceiptQualified'] and json.loads(inbox['payload']) == validate_intent(intent, library)\n    return dict(mode=mode, faces=face_count, images=images, group=group, workers=workers, seeded=seeded,\n        wall_seconds=wall, cpu_seconds=cpu, milliseconds_per_image=wall*1000/images,\n        requests=sum(counts.values()), calls=dict(counts), phases=dict(phases),\n        output_digest=hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest())\n\n\ndef main():\n    from azure.data.tables import TableServiceClient\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument('--output', type=Path, required=True)\n    parser.add_argument('--rounds', type=int, default=4)\n    parser.add_argument('--images', type=int, default=32)\n    parser.add_argument('--parallel-followup', action='store_true')\n    args = parser.parse_args()\n    service = TableServiceClient.from_connection_string(os.environ['BENCHMARK_STORAGE_CONNECTION'])\n    tables = {n: service.get_table_client('bench'+n) for n in ('metadata', 'faces', 'embeddings', 'lookup', 'jobs')}\n    storage._LOGGER.setLevel('ERROR')\n    reports, references = [], {}\n    matrix = [(1, False, (1, 8, 16)), (0, False, (8,)), (8, False, (8,)), (1, True, (8,))]\n    if args.parallel_followup:\n        matrix = [(1, False, (8, 16))]\n    for faces, seeded, groups in matrix:\n        for group in groups:\n            for round_number in range(args.rounds):\n                modes = ['current', 'batch', 'receipts', 'combined']\n                if args.parallel_followup:\n                    modes = ['current', 'batch_parallel', 'receipts', 'combined_parallel']\n                for mode in modes if round_number%2 == 0 else reversed(modes):\n                    row = execute(tables, mode=mode, face_count=faces, seeded=seeded,\n                        images=args.images, group=group)\n                    key = faces, seeded\n                    references.setdefault(key, row['output_digest'])\n                    assert references[key] == row['output_digest'], 'Output mismatch'\n                    row['round'] = round_number; reports.append(row)\n                    args.output.write_text(json.dumps(dict(scope=__doc__, output_parity=True, reports=reports), indent=2))\n                    print('ROUND '+json.dumps({k: row[k] for k in ('mode', 'faces', 'seeded', 'group', 'round', 'wall_seconds', 'requests')}), flush=True)\n\n\nif __name__ == '__main__':\n    main()\n",
+    "benchmark_vision_stages.py": "\"\"\"Offline real-model stage benchmark; no app import or storage writes.\n\nUse the worker environment and a JSON list of {path, filename?}. Inputs are\nconverted to worker previews before timing. Model load and warmup are separate.\nOutput contains timings and output hashes, never text or embeddings.\n\"\"\"\nimport argparse\nfrom concurrent.futures import ThreadPoolExecutor\nfrom contextvars import copy_context\nimport hashlib\nimport importlib.metadata\nimport json\nfrom pathlib import Path\nimport platform\nimport os\nimport statistics\nimport time\n\n\ndef cpu_stat():\n    path = Path('/sys/fs/cgroup/cpu.stat')\n    return {k: int(v) for k, v in (line.split() for line in path.read_text().splitlines())} if path.exists() else {}\n\n\ndef fingerprint(value):\n    def clean(item):\n        if isinstance(item, dict):\n            return {k: clean(v) for k, v in item.items() if k != 'stageTimingsMs'}\n        if isinstance(item, list):\n            return [clean(v) for v in item]\n        return item\n    return hashlib.sha256(json.dumps(clean(value), sort_keys=True).encode()).hexdigest()\n\n\ndef distribution(values):\n    values = sorted(values)\n    return {'mean': statistics.mean(values), 'median': statistics.median(values),\n            'p95': values[min(len(values) - 1, int(.95 * len(values)))],\n            'min': values[0], 'max': values[-1]}\n\n\ndef main():\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument('--manifest', type=Path, required=True)\n    parser.add_argument('--face-landmarker', required=True)\n    parser.add_argument('--output', type=Path, required=True)\n    parser.add_argument('--rounds', type=int, default=2)\n    parser.add_argument('--workers', type=int, nargs='+', default=[1, 2])\n    parser.add_argument('--shared-decode', choices=['both', 'on', 'off'], default='both')\n    parser.add_argument('--warmup-workers', type=int, default=2)\n    parser.add_argument('--clip-batch-sizes', type=int, nargs='+', default=[1])\n    parser.add_argument('--clip-batch-windows-ms', type=float, nargs='+', default=[2])\n    parser.add_argument('--native-threads', type=int,\n                        help='Set BLAS/OpenMP thread limits before importing native libraries')\n    args = parser.parse_args()\n    if args.rounds < 1:\n        parser.error('rounds must be positive')\n    if min(args.workers) < 1 or args.warmup_workers < 1:\n        parser.error('worker counts must be positive')\n    if not all(1 <= n <= 8 for n in args.clip_batch_sizes) or not all(0 <= n <= 50 for n in args.clip_batch_windows_ms):\n        parser.error('Invalid CLIP batch sizes/windows')\n    if args.native_threads is not None:\n        if args.native_threads < 1:\n            parser.error('native thread count must be positive')\n        for variable in ('OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'OMP_NUM_THREADS'):\n            os.environ[variable] = str(args.native_threads)\n    from image_utils import convert_image_to_jpeg\n    from ipwork_image import image_job\n    import ipwork_face as face\n    import ipwork_ocr as ocr\n    import ipwork_vision as vision\n    import vision_utils\n    import processing_metrics as metrics\n    from threadpoolctl import threadpool_info\n    face.FACE_LANDMARKER_MODEL_PATH = args.face_landmarker\n    samples = []\n    for row in json.loads(args.manifest.read_text()):\n        path = Path(row['path'])\n        name = row.get('filename', path.name)\n        preview = convert_image_to_jpeg(path.read_bytes(), name)\n        if not preview:\n            raise RuntimeError(f'Preview failed: {path}')\n        samples.append((name, preview))\n    if not samples:\n        parser.error('manifest is empty')\n    started = time.perf_counter()\n    if not vision_utils.image_encoder_available() or not vision._load_vocabulary():\n        raise RuntimeError('Real CLIP model and vocabulary required')\n    model_load_ms = (time.perf_counter() - started) * 1000\n\n    def process(index, shared):\n        name, data = samples[index]\n        result, durations = {}, {}\n        with metrics.accounting() as counter, image_job(shared):\n            started = time.perf_counter()\n            for stage, function in [('ocr', ocr.process_ocr), ('face', face.process_face),\n                                    ('clip', vision.process_vision)]:\n                before = time.perf_counter()\n                result[stage] = function('offline-benchmark', name, data)\n                durations[stage] = (time.perf_counter() - before) * 1000\n                if result[stage].get('error') or result[stage].get('faceFailureStage') not in (\n                        None, '', 'quality_filter_rejected'):\n                    raise RuntimeError(f'{stage} sample {index}: {result[stage]}')\n            durations['total'] = (time.perf_counter() - started) * 1000\n        diagnostics = result['face']['faceDiagnostics']\n        if not diagnostics['detectorModelReady']:\n            raise RuntimeError('Real face detector required')\n        return {'sample': index, 'ms': durations, 'metrics': counter.snapshot(),\n                '_clip_vector': result['clip']['imageEmbedding'],\n                '_clip_decisions': (result['clip']['tags'], result['clip']['aiPersonCandidate'], result['clip']['aiPersonLabel']),\n                'face_stages_ms': diagnostics['stageTimingsMs'],\n                'embedded_count': diagnostics['embeddedCount'],\n                'face_count': len(result['face'].get('faces') or []),\n                'raw_face_count': result['face'].get('rawFaceCount', 0),\n                'text_positive': bool(result['ocr'].get('text')),\n                'hash': fingerprint(result)}\n\n    # Warm all face branches on portraits and all resident OCR engines. No\n    # first-inference timing is counted as steady-state processing.\n    warmup_start = time.perf_counter()\n    with ThreadPoolExecutor(max_workers=args.warmup_workers) as pool:\n        warmup = list(pool.map(lambda i: process(i, False), range(min(12, len(samples)))))\n    warmup_ms = (time.perf_counter() - warmup_start) * 1000\n    shared_modes = [False, True] if args.shared_decode == 'both' else [args.shared_decode == 'on']\n    configurations = [(workers, shared, size, window)\n                      for shared in shared_modes for workers in args.workers\n                      for size in args.clip_batch_sizes\n                      for window in ([0] if size == 1 else args.clip_batch_windows_ms)]\n    reports, reference, clip_reference = [], {}, {}\n    for round_index in range(args.rounds):\n        for workers, shared, size, window in (configurations if round_index % 2 == 0 else configurations[::-1]):\n            cpu_before, stat_before = time.process_time(), cpu_stat()\n            started = time.perf_counter()\n            with metrics.accounting() as wave_counter, vision_utils.image_embedding_batches(\n                    source_workers=workers, batch_size=size, window=window / 1000), ThreadPoolExecutor(max_workers=workers) as pool:\n                futures = [pool.submit(copy_context().run, process, i, shared) for i in range(len(samples))]\n                rows = [future.result() for future in futures]\n            seconds = time.perf_counter() - started\n            process_cpu = time.process_time() - cpu_before\n            quality_changes, max_error, min_cosine = [], 0., 1.\n            import numpy as np\n            for row in rows:\n                reference.setdefault(row['sample'], row['hash'])\n                vector, decisions = row.pop('_clip_vector'), row.pop('_clip_decisions')\n                base, base_decisions = clip_reference.setdefault(row['sample'], (vector, decisions))\n                actual, expected = np.asarray(vector), np.asarray(base)\n                max_error = max(max_error, float(np.max(np.abs(actual - expected))))\n                min_cosine = min(min_cosine, float(np.dot(actual, expected) / (np.linalg.norm(actual) * np.linalg.norm(expected))))\n                if decisions != base_decisions:\n                    quality_changes.append(row['sample'])\n            metric_names = ['clip_preprocess_ms', 'clip_lock_wait_ms', 'clip_inference_ms',\n                            'ocr_engine_init_ms', 'ocr_recognition_ms']\n            report = {'round': round_index, 'workers': workers, 'shared_decode': shared,\n                      'clip_batch_size': size, 'clip_batch_window_ms': window,\n                      'clip_changed_decision_samples': quality_changes,\n                      'clip_max_embedding_abs_error': max_error, 'clip_min_embedding_cosine': min_cosine,\n                      'wave_metrics': {k: v for k, v in wave_counter.snapshot().items()\n                                       if k.startswith('clip_')},\n                      'process_cpu_seconds': process_cpu,\n                      'cgroup_delta': {k: v - stat_before.get(k, 0) for k, v in cpu_stat().items()},\n                      'wall_seconds': seconds, 'images_per_second': len(rows) / seconds,\n                      'per_image_ms': {stage: distribution([r['ms'][stage] for r in rows])\n                                       for stage in ('face', 'clip', 'ocr', 'total')},\n                      'face_stages_mean_ms': {k: statistics.mean(r['face_stages_ms'][k] for r in rows)\n                                              for k in rows[0]['face_stages_ms']},\n                      'face_stages_per_image_ms': {k: distribution([r['face_stages_ms'][k] for r in rows])\n                                                  for k in rows[0]['face_stages_ms']},\n                      'face_embedding_ms_per_embedded_face': (\n                          sum(r['face_stages_ms']['embed'] for r in rows) /\n                          sum(r['embedded_count'] for r in rows)\n                          if sum(r['embedded_count'] for r in rows) else None),\n                      'metrics_mean_ms': {k: statistics.mean(r['metrics'].get(k, 0) for r in rows)\n                                          for k in metric_names},\n                      'face_positive': sum(r['face_count'] > 0 for r in rows),\n                      'accepted_faces': sum(r['face_count'] for r in rows),\n                      'text_positive': sum(r['text_positive'] for r in rows),\n                      'changed_samples': [r['sample'] for r in rows if r['hash'] != reference[r['sample']]],\n                      'samples': rows}\n            reports.append(report)\n            print(json.dumps({k: v for k, v in report.items() if k != 'samples'}), flush=True)\n            args.output.write_text(json.dumps({'platform': platform.platform(),\n                'python': platform.python_version(), 'device': vision_utils._device(),\n                'torch_threads': vision_utils.torch.get_num_threads(),\n                'versions': {n: importlib.metadata.version(n) for n in\n                             ('torch', 'onnxruntime', 'mediapipe', 'tesserocr', 'open_clip_torch')},\n                'sample_count': len(samples), 'clip_load_ms': model_load_ms,\n                'input_preview_sha256': [hashlib.sha256(data).hexdigest() for _, data in samples],\n                'thread_environment': {k: os.environ.get(k) for k in\n                                       ('OMP_THREAD_LIMIT', 'OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS')},\n                'native_threadpools': threadpool_info(),\n                'cpu_quota': Path('/sys/fs/cgroup/cpu.max').read_text() if Path('/sys/fs/cgroup/cpu.max').exists() else None,\n                'cpu_model': next((line for line in Path('/proc/cpuinfo').read_text().splitlines()\n                                   if line.startswith('model name')), None) if Path('/proc/cpuinfo').exists() else platform.processor(),\n                'onnx_inputs': {name: [{'name': value.name, 'shape': value.shape}\n                                       for value in session.get_inputs()]\n                                for name, session in [('yolo', face._get_yolo_session()),\n                                                      ('adaface', face._get_adaface_session())]},\n                'warmup_ms': warmup_ms, 'reports': reports}, indent=2))\n\n\nif __name__ == '__main__':\n    main()\n"
+  },
+  "reports": [
+    {
+      "section": "qualification",
+      "library": "bench-5ffbc33074fb43a9b9d899f48cf6b9e9",
+      "images": 1000,
+      "faces": 1,
+      "background": 0,
+      "mode": "serial",
+      "wall_seconds": 49.05878307297826,
+      "process_cpu_seconds": 15.693239304000002,
+      "sdk_calls": 7000,
+      "calls": {
+        "jobs.get_entity": 5000,
+        "metadata.get_entity": 2000
+      },
+      "cgroup_delta": {
+        "usage_usec": 15695306,
+        "user_usec": 14710125,
+        "system_usec": 985182,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 490,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "755146434064703ed6de43934e9ee085c9488cf0ee918834634f42c635a9f154",
+      "round": 0
+    },
+    {
+      "section": "qualification",
+      "library": "bench-5ffbc33074fb43a9b9d899f48cf6b9e9",
+      "images": 1000,
+      "faces": 1,
+      "background": 0,
+      "mode": "parallel",
+      "wall_seconds": 15.60440498002572,
+      "process_cpu_seconds": 13.811763245999998,
+      "sdk_calls": 7000,
+      "calls": {
+        "jobs.get_entity": 5000,
+        "metadata.get_entity": 2000
+      },
+      "cgroup_delta": {
+        "usage_usec": 13827500,
+        "user_usec": 12541134,
+        "system_usec": 1286366,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 156,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "755146434064703ed6de43934e9ee085c9488cf0ee918834634f42c635a9f154",
+      "round": 0
+    },
+    {
+      "section": "qualification",
+      "library": "bench-5ffbc33074fb43a9b9d899f48cf6b9e9",
+      "images": 1000,
+      "faces": 1,
+      "background": 0,
+      "mode": "batch",
+      "wall_seconds": 15.669126797001809,
+      "process_cpu_seconds": 4.8298162159999976,
+      "sdk_calls": 1600,
+      "calls": {
+        "metadata.query_entities": 100,
+        "jobs.query_entities": 500,
+        "metadata.get_entity": 1000
+      },
+      "cgroup_delta": {
+        "usage_usec": 4830428,
+        "user_usec": 4456242,
+        "system_usec": 374186,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 155,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "755146434064703ed6de43934e9ee085c9488cf0ee918834634f42c635a9f154",
+      "round": 0
+    },
+    {
+      "section": "qualification",
+      "library": "bench-5ffbc33074fb43a9b9d899f48cf6b9e9",
+      "images": 1000,
+      "faces": 1,
+      "background": 0,
+      "mode": "batch",
+      "wall_seconds": 12.072701010969467,
+      "process_cpu_seconds": 4.758219665999995,
+      "sdk_calls": 1600,
+      "calls": {
+        "metadata.query_entities": 100,
+        "jobs.query_entities": 500,
+        "metadata.get_entity": 1000
+      },
+      "cgroup_delta": {
+        "usage_usec": 4759124,
+        "user_usec": 4471359,
+        "system_usec": 287766,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 121,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "755146434064703ed6de43934e9ee085c9488cf0ee918834634f42c635a9f154",
+      "round": 1
+    },
+    {
+      "section": "qualification",
+      "library": "bench-5ffbc33074fb43a9b9d899f48cf6b9e9",
+      "images": 1000,
+      "faces": 1,
+      "background": 0,
+      "mode": "parallel",
+      "wall_seconds": 16.543960449984297,
+      "process_cpu_seconds": 14.277622528999999,
+      "sdk_calls": 7000,
+      "calls": {
+        "jobs.get_entity": 5000,
+        "metadata.get_entity": 2000
+      },
+      "cgroup_delta": {
+        "usage_usec": 14292774,
+        "user_usec": 12799636,
+        "system_usec": 1493138,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 166,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "755146434064703ed6de43934e9ee085c9488cf0ee918834634f42c635a9f154",
+      "round": 1
+    },
+    {
+      "section": "qualification",
+      "library": "bench-5ffbc33074fb43a9b9d899f48cf6b9e9",
+      "images": 1000,
+      "faces": 1,
+      "background": 0,
+      "mode": "serial",
+      "wall_seconds": 46.12411835801322,
+      "process_cpu_seconds": 14.920693118000003,
+      "sdk_calls": 7000,
+      "calls": {
+        "jobs.get_entity": 5000,
+        "metadata.get_entity": 2000
+      },
+      "cgroup_delta": {
+        "usage_usec": 14921647,
+        "user_usec": 13841247,
+        "system_usec": 1080400,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 458,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "755146434064703ed6de43934e9ee085c9488cf0ee918834634f42c635a9f154",
+      "round": 1
+    },
+    {
+      "section": "qualification",
+      "library": "bench-5ffbc33074fb43a9b9d899f48cf6b9e9",
+      "images": 1000,
+      "faces": 1,
+      "background": 0,
+      "mode": "serial",
+      "wall_seconds": 47.28294392902171,
+      "process_cpu_seconds": 15.103865495000008,
+      "sdk_calls": 7000,
+      "calls": {
+        "jobs.get_entity": 5000,
+        "metadata.get_entity": 2000
+      },
+      "cgroup_delta": {
+        "usage_usec": 15104875,
+        "user_usec": 14077272,
+        "system_usec": 1027603,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 473,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "755146434064703ed6de43934e9ee085c9488cf0ee918834634f42c635a9f154",
+      "round": 2
+    },
+    {
+      "section": "qualification",
+      "library": "bench-5ffbc33074fb43a9b9d899f48cf6b9e9",
+      "images": 1000,
+      "faces": 1,
+      "background": 0,
+      "mode": "parallel",
+      "wall_seconds": 15.434613512014039,
+      "process_cpu_seconds": 13.617407477,
+      "sdk_calls": 7000,
+      "calls": {
+        "jobs.get_entity": 5000,
+        "metadata.get_entity": 2000
+      },
+      "cgroup_delta": {
+        "usage_usec": 13634653,
+        "user_usec": 12356555,
+        "system_usec": 1278098,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 154,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "755146434064703ed6de43934e9ee085c9488cf0ee918834634f42c635a9f154",
+      "round": 2
+    },
+    {
+      "section": "qualification",
+      "library": "bench-5ffbc33074fb43a9b9d899f48cf6b9e9",
+      "images": 1000,
+      "faces": 1,
+      "background": 0,
+      "mode": "batch",
+      "wall_seconds": 11.997307464014739,
+      "process_cpu_seconds": 4.51095521500001,
+      "sdk_calls": 1600,
+      "calls": {
+        "metadata.query_entities": 100,
+        "jobs.query_entities": 500,
+        "metadata.get_entity": 1000
+      },
+      "cgroup_delta": {
+        "usage_usec": 4512080,
+        "user_usec": 4231186,
+        "system_usec": 280894,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 120,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "755146434064703ed6de43934e9ee085c9488cf0ee918834634f42c635a9f154",
+      "round": 2
+    },
+    {
+      "section": "qualification",
+      "library": "bench-f9aa20e42b39433db961b07bf9886828",
+      "images": 200,
+      "faces": 1,
+      "background": 10000,
+      "mode": "serial",
+      "wall_seconds": 10.07247172301868,
+      "process_cpu_seconds": 3.17225415099999,
+      "sdk_calls": 1400,
+      "calls": {
+        "jobs.get_entity": 1000,
+        "metadata.get_entity": 400
+      },
+      "cgroup_delta": {
+        "usage_usec": 3173429,
+        "user_usec": 2896436,
+        "system_usec": 276993,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 101,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "4770bb09ccda74de08531a267149e14be3cb1c35d8eccfef4044b365905f360f",
+      "round": 0
+    },
+    {
+      "section": "qualification",
+      "library": "bench-f9aa20e42b39433db961b07bf9886828",
+      "images": 200,
+      "faces": 1,
+      "background": 10000,
+      "mode": "parallel",
+      "wall_seconds": 3.100628387008328,
+      "process_cpu_seconds": 2.749860585999997,
+      "sdk_calls": 1400,
+      "calls": {
+        "jobs.get_entity": 1000,
+        "metadata.get_entity": 400
+      },
+      "cgroup_delta": {
+        "usage_usec": 2753350,
+        "user_usec": 2439565,
+        "system_usec": 313785,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 31,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "4770bb09ccda74de08531a267149e14be3cb1c35d8eccfef4044b365905f360f",
+      "round": 0
+    },
+    {
+      "section": "qualification",
+      "library": "bench-f9aa20e42b39433db961b07bf9886828",
+      "images": 200,
+      "faces": 1,
+      "background": 10000,
+      "mode": "batch",
+      "wall_seconds": 2.6261849150178023,
+      "process_cpu_seconds": 0.9018567979999972,
+      "sdk_calls": 320,
+      "calls": {
+        "metadata.query_entities": 20,
+        "jobs.query_entities": 100,
+        "metadata.get_entity": 200
+      },
+      "cgroup_delta": {
+        "usage_usec": 902840,
+        "user_usec": 852676,
+        "system_usec": 50164,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 26,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "4770bb09ccda74de08531a267149e14be3cb1c35d8eccfef4044b365905f360f",
+      "round": 0
+    },
+    {
+      "section": "qualification",
+      "library": "bench-f9aa20e42b39433db961b07bf9886828",
+      "images": 200,
+      "faces": 1,
+      "background": 10000,
+      "mode": "batch",
+      "wall_seconds": 2.5329119150410406,
+      "process_cpu_seconds": 0.9668684120000108,
+      "sdk_calls": 320,
+      "calls": {
+        "metadata.query_entities": 20,
+        "jobs.query_entities": 100,
+        "metadata.get_entity": 200
+      },
+      "cgroup_delta": {
+        "usage_usec": 967802,
+        "user_usec": 920616,
+        "system_usec": 47186,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 25,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "4770bb09ccda74de08531a267149e14be3cb1c35d8eccfef4044b365905f360f",
+      "round": 1
+    },
+    {
+      "section": "qualification",
+      "library": "bench-f9aa20e42b39433db961b07bf9886828",
+      "images": 200,
+      "faces": 1,
+      "background": 10000,
+      "mode": "parallel",
+      "wall_seconds": 3.336738951038569,
+      "process_cpu_seconds": 2.7230990890000015,
+      "sdk_calls": 1400,
+      "calls": {
+        "jobs.get_entity": 1000,
+        "metadata.get_entity": 400
+      },
+      "cgroup_delta": {
+        "usage_usec": 2727331,
+        "user_usec": 2430445,
+        "system_usec": 296885,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 34,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "4770bb09ccda74de08531a267149e14be3cb1c35d8eccfef4044b365905f360f",
+      "round": 1
+    },
+    {
+      "section": "qualification",
+      "library": "bench-f9aa20e42b39433db961b07bf9886828",
+      "images": 200,
+      "faces": 1,
+      "background": 10000,
+      "mode": "serial",
+      "wall_seconds": 9.545281529019121,
+      "process_cpu_seconds": 2.8874352200000146,
+      "sdk_calls": 1400,
+      "calls": {
+        "jobs.get_entity": 1000,
+        "metadata.get_entity": 400
+      },
+      "cgroup_delta": {
+        "usage_usec": 2888570,
+        "user_usec": 2712727,
+        "system_usec": 175844,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 95,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "4770bb09ccda74de08531a267149e14be3cb1c35d8eccfef4044b365905f360f",
+      "round": 1
+    },
+    {
+      "section": "qualification",
+      "library": "bench-f9aa20e42b39433db961b07bf9886828",
+      "images": 200,
+      "faces": 1,
+      "background": 10000,
+      "mode": "serial",
+      "wall_seconds": 9.334993257012684,
+      "process_cpu_seconds": 2.8794658539999887,
+      "sdk_calls": 1400,
+      "calls": {
+        "jobs.get_entity": 1000,
+        "metadata.get_entity": 400
+      },
+      "cgroup_delta": {
+        "usage_usec": 2880504,
+        "user_usec": 2698692,
+        "system_usec": 181812,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 93,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "4770bb09ccda74de08531a267149e14be3cb1c35d8eccfef4044b365905f360f",
+      "round": 2
+    },
+    {
+      "section": "qualification",
+      "library": "bench-f9aa20e42b39433db961b07bf9886828",
+      "images": 200,
+      "faces": 1,
+      "background": 10000,
+      "mode": "parallel",
+      "wall_seconds": 2.981995387992356,
+      "process_cpu_seconds": 2.676297132000002,
+      "sdk_calls": 1400,
+      "calls": {
+        "jobs.get_entity": 1000,
+        "metadata.get_entity": 400
+      },
+      "cgroup_delta": {
+        "usage_usec": 2680863,
+        "user_usec": 2439748,
+        "system_usec": 241114,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 30,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "4770bb09ccda74de08531a267149e14be3cb1c35d8eccfef4044b365905f360f",
+      "round": 2
+    },
+    {
+      "section": "qualification",
+      "library": "bench-f9aa20e42b39433db961b07bf9886828",
+      "images": 200,
+      "faces": 1,
+      "background": 10000,
+      "mode": "batch",
+      "wall_seconds": 2.466809543024283,
+      "process_cpu_seconds": 0.9091916130000186,
+      "sdk_calls": 320,
+      "calls": {
+        "metadata.query_entities": 20,
+        "jobs.query_entities": 100,
+        "metadata.get_entity": 200
+      },
+      "cgroup_delta": {
+        "usage_usec": 910652,
+        "user_usec": 853077,
+        "system_usec": 57576,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 25,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "4770bb09ccda74de08531a267149e14be3cb1c35d8eccfef4044b365905f360f",
+      "round": 2
+    },
+    {
+      "section": "qualification",
+      "library": "bench-942f09ad7ee6401d815a86431a1bb28c",
+      "images": 20,
+      "faces": 0,
+      "background": 0,
+      "mode": "serial",
+      "wall_seconds": 0.802658544969745,
+      "process_cpu_seconds": 0.23760885500001905,
+      "sdk_calls": 120,
+      "calls": {
+        "jobs.get_entity": 80,
+        "metadata.get_entity": 40
+      },
+      "cgroup_delta": {
+        "usage_usec": 238086,
+        "user_usec": 233865,
+        "system_usec": 4220,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 8,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "5823406ed56c67cac0b55ddea43ed763e2f83b5df6a6b65cd8cad584138917f6",
+      "round": 0
+    },
+    {
+      "section": "qualification",
+      "library": "bench-942f09ad7ee6401d815a86431a1bb28c",
+      "images": 20,
+      "faces": 0,
+      "background": 0,
+      "mode": "parallel",
+      "wall_seconds": 0.22344312502536923,
+      "process_cpu_seconds": 0.21624531700001626,
+      "sdk_calls": 120,
+      "calls": {
+        "jobs.get_entity": 80,
+        "metadata.get_entity": 40
+      },
+      "cgroup_delta": {
+        "usage_usec": 217758,
+        "user_usec": 209455,
+        "system_usec": 8303,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 2,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "5823406ed56c67cac0b55ddea43ed763e2f83b5df6a6b65cd8cad584138917f6",
+      "round": 0
+    },
+    {
+      "section": "qualification",
+      "library": "bench-942f09ad7ee6401d815a86431a1bb28c",
+      "images": 20,
+      "faces": 0,
+      "background": 0,
+      "mode": "batch",
+      "wall_seconds": 0.24745132896350697,
+      "process_cpu_seconds": 0.08016440899999111,
+      "sdk_calls": 30,
+      "calls": {
+        "metadata.query_entities": 2,
+        "jobs.query_entities": 8,
+        "metadata.get_entity": 20
+      },
+      "cgroup_delta": {
+        "usage_usec": 81281,
+        "user_usec": 73516,
+        "system_usec": 7765,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 2,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "5823406ed56c67cac0b55ddea43ed763e2f83b5df6a6b65cd8cad584138917f6",
+      "round": 0
+    },
+    {
+      "section": "qualification",
+      "library": "bench-942f09ad7ee6401d815a86431a1bb28c",
+      "images": 20,
+      "faces": 0,
+      "background": 0,
+      "mode": "batch",
+      "wall_seconds": 0.2654453229624778,
+      "process_cpu_seconds": 0.07728306100000282,
+      "sdk_calls": 30,
+      "calls": {
+        "metadata.query_entities": 2,
+        "jobs.query_entities": 8,
+        "metadata.get_entity": 20
+      },
+      "cgroup_delta": {
+        "usage_usec": 78485,
+        "user_usec": 70605,
+        "system_usec": 7881,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 3,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "5823406ed56c67cac0b55ddea43ed763e2f83b5df6a6b65cd8cad584138917f6",
+      "round": 1
+    },
+    {
+      "section": "qualification",
+      "library": "bench-942f09ad7ee6401d815a86431a1bb28c",
+      "images": 20,
+      "faces": 0,
+      "background": 0,
+      "mode": "parallel",
+      "wall_seconds": 0.21685796097153798,
+      "process_cpu_seconds": 0.2118731989999958,
+      "sdk_calls": 120,
+      "calls": {
+        "jobs.get_entity": 80,
+        "metadata.get_entity": 40
+      },
+      "cgroup_delta": {
+        "usage_usec": 213405,
+        "user_usec": 162106,
+        "system_usec": 51298,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 2,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "5823406ed56c67cac0b55ddea43ed763e2f83b5df6a6b65cd8cad584138917f6",
+      "round": 1
+    },
+    {
+      "section": "qualification",
+      "library": "bench-942f09ad7ee6401d815a86431a1bb28c",
+      "images": 20,
+      "faces": 0,
+      "background": 0,
+      "mode": "serial",
+      "wall_seconds": 0.7417230010032654,
+      "process_cpu_seconds": 0.2333198809999999,
+      "sdk_calls": 120,
+      "calls": {
+        "jobs.get_entity": 80,
+        "metadata.get_entity": 40
+      },
+      "cgroup_delta": {
+        "usage_usec": 233832,
+        "user_usec": 218799,
+        "system_usec": 15034,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 7,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "5823406ed56c67cac0b55ddea43ed763e2f83b5df6a6b65cd8cad584138917f6",
+      "round": 1
+    },
+    {
+      "section": "qualification",
+      "library": "bench-942f09ad7ee6401d815a86431a1bb28c",
+      "images": 20,
+      "faces": 0,
+      "background": 0,
+      "mode": "serial",
+      "wall_seconds": 0.7163848660420626,
+      "process_cpu_seconds": 0.23946450399998298,
+      "sdk_calls": 120,
+      "calls": {
+        "jobs.get_entity": 80,
+        "metadata.get_entity": 40
+      },
+      "cgroup_delta": {
+        "usage_usec": 240959,
+        "user_usec": 215361,
+        "system_usec": 25597,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 7,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "5823406ed56c67cac0b55ddea43ed763e2f83b5df6a6b65cd8cad584138917f6",
+      "round": 2
+    },
+    {
+      "section": "qualification",
+      "library": "bench-942f09ad7ee6401d815a86431a1bb28c",
+      "images": 20,
+      "faces": 0,
+      "background": 0,
+      "mode": "parallel",
+      "wall_seconds": 0.2451583839720115,
+      "process_cpu_seconds": 0.24237534599998867,
+      "sdk_calls": 120,
+      "calls": {
+        "jobs.get_entity": 80,
+        "metadata.get_entity": 40
+      },
+      "cgroup_delta": {
+        "usage_usec": 243884,
+        "user_usec": 210968,
+        "system_usec": 32916,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 3,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "5823406ed56c67cac0b55ddea43ed763e2f83b5df6a6b65cd8cad584138917f6",
+      "round": 2
+    },
+    {
+      "section": "qualification",
+      "library": "bench-942f09ad7ee6401d815a86431a1bb28c",
+      "images": 20,
+      "faces": 0,
+      "background": 0,
+      "mode": "batch",
+      "wall_seconds": 0.20107287797145545,
+      "process_cpu_seconds": 0.0803162360000158,
+      "sdk_calls": 30,
+      "calls": {
+        "metadata.query_entities": 2,
+        "jobs.query_entities": 8,
+        "metadata.get_entity": 20
+      },
+      "cgroup_delta": {
+        "usage_usec": 80751,
+        "user_usec": 68829,
+        "system_usec": 11921,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 2,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "5823406ed56c67cac0b55ddea43ed763e2f83b5df6a6b65cd8cad584138917f6",
+      "round": 2
+    },
+    {
+      "section": "qualification",
+      "library": "bench-77d536ce0b7c49618b4599f97386fc0b",
+      "images": 100,
+      "faces": 8,
+      "background": 0,
+      "mode": "serial",
+      "wall_seconds": 9.035816846007947,
+      "process_cpu_seconds": 2.7332330860000127,
+      "sdk_calls": 1400,
+      "calls": {
+        "jobs.get_entity": 1200,
+        "metadata.get_entity": 200
+      },
+      "cgroup_delta": {
+        "usage_usec": 2734233,
+        "user_usec": 2597270,
+        "system_usec": 136964,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 90,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "64070a741cf7e2477e4f8296794c9a9c74756a9461b11b8175e69edd22d4d36f",
+      "round": 0
+    },
+    {
+      "section": "qualification",
+      "library": "bench-77d536ce0b7c49618b4599f97386fc0b",
+      "images": 100,
+      "faces": 8,
+      "background": 0,
+      "mode": "parallel",
+      "wall_seconds": 3.112871573015582,
+      "process_cpu_seconds": 2.554346105999997,
+      "sdk_calls": 1400,
+      "calls": {
+        "jobs.get_entity": 1200,
+        "metadata.get_entity": 200
+      },
+      "cgroup_delta": {
+        "usage_usec": 2557051,
+        "user_usec": 2334649,
+        "system_usec": 222401,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 31,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "64070a741cf7e2477e4f8296794c9a9c74756a9461b11b8175e69edd22d4d36f",
+      "round": 0
+    },
+    {
+      "section": "qualification",
+      "library": "bench-77d536ce0b7c49618b4599f97386fc0b",
+      "images": 100,
+      "faces": 8,
+      "background": 0,
+      "mode": "batch",
+      "wall_seconds": 1.4612385120126419,
+      "process_cpu_seconds": 0.6296578189999877,
+      "sdk_calls": 210,
+      "calls": {
+        "metadata.query_entities": 10,
+        "jobs.query_entities": 100,
+        "metadata.get_entity": 100
+      },
+      "cgroup_delta": {
+        "usage_usec": 630300,
+        "user_usec": 588876,
+        "system_usec": 41425,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 15,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "64070a741cf7e2477e4f8296794c9a9c74756a9461b11b8175e69edd22d4d36f",
+      "round": 0
+    },
+    {
+      "section": "qualification",
+      "library": "bench-77d536ce0b7c49618b4599f97386fc0b",
+      "images": 100,
+      "faces": 8,
+      "background": 0,
+      "mode": "batch",
+      "wall_seconds": 1.5500036380253732,
+      "process_cpu_seconds": 0.6329181079999842,
+      "sdk_calls": 210,
+      "calls": {
+        "metadata.query_entities": 10,
+        "jobs.query_entities": 100,
+        "metadata.get_entity": 100
+      },
+      "cgroup_delta": {
+        "usage_usec": 634382,
+        "user_usec": 593761,
+        "system_usec": 40620,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 15,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "64070a741cf7e2477e4f8296794c9a9c74756a9461b11b8175e69edd22d4d36f",
+      "round": 1
+    },
+    {
+      "section": "qualification",
+      "library": "bench-77d536ce0b7c49618b4599f97386fc0b",
+      "images": 100,
+      "faces": 8,
+      "background": 0,
+      "mode": "parallel",
+      "wall_seconds": 3.118001908005681,
+      "process_cpu_seconds": 2.4723710390000235,
+      "sdk_calls": 1400,
+      "calls": {
+        "jobs.get_entity": 1200,
+        "metadata.get_entity": 200
+      },
+      "cgroup_delta": {
+        "usage_usec": 2475266,
+        "user_usec": 2232858,
+        "system_usec": 242408,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 31,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "64070a741cf7e2477e4f8296794c9a9c74756a9461b11b8175e69edd22d4d36f",
+      "round": 1
+    },
+    {
+      "section": "qualification",
+      "library": "bench-77d536ce0b7c49618b4599f97386fc0b",
+      "images": 100,
+      "faces": 8,
+      "background": 0,
+      "mode": "serial",
+      "wall_seconds": 8.798071174998768,
+      "process_cpu_seconds": 2.4905760380000004,
+      "sdk_calls": 1400,
+      "calls": {
+        "jobs.get_entity": 1200,
+        "metadata.get_entity": 200
+      },
+      "cgroup_delta": {
+        "usage_usec": 2492113,
+        "user_usec": 2311925,
+        "system_usec": 180188,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 88,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "64070a741cf7e2477e4f8296794c9a9c74756a9461b11b8175e69edd22d4d36f",
+      "round": 1
+    },
+    {
+      "section": "qualification",
+      "library": "bench-77d536ce0b7c49618b4599f97386fc0b",
+      "images": 100,
+      "faces": 8,
+      "background": 0,
+      "mode": "serial",
+      "wall_seconds": 9.133369432995096,
+      "process_cpu_seconds": 2.714936007999995,
+      "sdk_calls": 1400,
+      "calls": {
+        "jobs.get_entity": 1200,
+        "metadata.get_entity": 200
+      },
+      "cgroup_delta": {
+        "usage_usec": 2716445,
+        "user_usec": 2565304,
+        "system_usec": 151141,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 91,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "64070a741cf7e2477e4f8296794c9a9c74756a9461b11b8175e69edd22d4d36f",
+      "round": 2
+    },
+    {
+      "section": "qualification",
+      "library": "bench-77d536ce0b7c49618b4599f97386fc0b",
+      "images": 100,
+      "faces": 8,
+      "background": 0,
+      "mode": "parallel",
+      "wall_seconds": 3.208055718045216,
+      "process_cpu_seconds": 2.6210091500000203,
+      "sdk_calls": 1400,
+      "calls": {
+        "jobs.get_entity": 1200,
+        "metadata.get_entity": 200
+      },
+      "cgroup_delta": {
+        "usage_usec": 2623669,
+        "user_usec": 2359825,
+        "system_usec": 263845,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 32,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "64070a741cf7e2477e4f8296794c9a9c74756a9461b11b8175e69edd22d4d36f",
+      "round": 2
+    },
+    {
+      "section": "qualification",
+      "library": "bench-77d536ce0b7c49618b4599f97386fc0b",
+      "images": 100,
+      "faces": 8,
+      "background": 0,
+      "mode": "batch",
+      "wall_seconds": 1.2985277710249647,
+      "process_cpu_seconds": 0.6270047920000081,
+      "sdk_calls": 210,
+      "calls": {
+        "metadata.query_entities": 10,
+        "jobs.query_entities": 100,
+        "metadata.get_entity": 100
+      },
+      "cgroup_delta": {
+        "usage_usec": 628740,
+        "user_usec": 582621,
+        "system_usec": 46119,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 13,
+        "nr_throttled": 0,
+        "throttled_usec": 0,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "output_digest": "64070a741cf7e2477e4f8296794c9a9c74756a9461b11b8175e69edd22d4d36f",
+      "round": 2
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-e4d72e398de24e3dbd8cf6a43e7065b2",
+      "mode": "current3",
+      "qualification": "serial",
+      "images": 48,
+      "wall_seconds": 23.032453443971463,
+      "process_cpu_seconds": 34.79264515599999,
+      "cgroup_delta": {
+        "usage_usec": 34831393,
+        "user_usec": 34074740,
+        "system_usec": 756652,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 226,
+        "nr_throttled": 110,
+        "throttled_usec": 5446309,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 1682,
+      "calls": {
+        "jobs.get_entity": 472,
+        "jobs.submit_transaction": 159,
+        "metadata.get_entity": 462,
+        "metadata.update_entity": 144,
+        "lookup.get_entity": 222,
+        "lookup.update_entity": 96,
+        "photoembeddings.upsert_entity": 48,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 17,
+        "embeddings.get_entity": 30,
+        "embeddings.create_entity": 13,
+        "faces.create_entity": 13
+      },
+      "timings": {
+        "compute_seconds_sum": 35.61410750087816,
+        "apply_seconds_sum": 21.686107956047636,
+        "qualification_seconds": 2.4127076839795336
+      },
+      "queue_stats": [],
+      "process_peak_rss_bytes": 2410545152,
+      "output_digest": "35887b1a233ecc47fff068f3ad26bd3f96b1e3c4c474845dfb72d3205b3058bd",
+      "profile": "mixed",
+      "round": 0
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-b262f57bca374d308d9e9b4696049cb2",
+      "mode": "handoff2x1",
+      "qualification": "serial",
+      "images": 48,
+      "wall_seconds": 23.71957477997057,
+      "process_cpu_seconds": 33.606202903000025,
+      "cgroup_delta": {
+        "usage_usec": 33641167,
+        "user_usec": 32701456,
+        "system_usec": 939711,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 237,
+        "nr_throttled": 48,
+        "throttled_usec": 1484472,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 1671,
+      "calls": {
+        "jobs.get_entity": 464,
+        "jobs.submit_transaction": 156,
+        "metadata.get_entity": 462,
+        "metadata.update_entity": 144,
+        "lookup.get_entity": 222,
+        "lookup.update_entity": 96,
+        "photoembeddings.upsert_entity": 48,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 17,
+        "embeddings.get_entity": 30,
+        "embeddings.create_entity": 13,
+        "faces.create_entity": 13
+      },
+      "timings": {
+        "compute_seconds_sum": 30.01822765090037,
+        "apply_seconds_sum": 17.994521210435778,
+        "qualification_seconds": 2.558054047054611
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 3,
+          "peak_apply_bytes": 51784,
+          "inflight_limit": 3,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 3,
+          "peak_apply_bytes": 52011,
+          "inflight_limit": 3,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 3,
+          "peak_apply_bytes": 42824,
+          "inflight_limit": 3,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2433482752,
+      "output_digest": "35887b1a233ecc47fff068f3ad26bd3f96b1e3c4c474845dfb72d3205b3058bd",
+      "profile": "mixed",
+      "round": 0
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-b37f9c58e40f49509ce11433d8e6bf76",
+      "mode": "handoff2x2",
+      "qualification": "serial",
+      "images": 48,
+      "wall_seconds": 22.951651606010273,
+      "process_cpu_seconds": 37.331292512000005,
+      "cgroup_delta": {
+        "usage_usec": 37368655,
+        "user_usec": 36195421,
+        "system_usec": 1173233,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 230,
+        "nr_throttled": 97,
+        "throttled_usec": 4632301,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 1673,
+      "calls": {
+        "jobs.get_entity": 465,
+        "jobs.submit_transaction": 157,
+        "metadata.get_entity": 462,
+        "metadata.update_entity": 144,
+        "lookup.get_entity": 222,
+        "lookup.update_entity": 96,
+        "photoembeddings.upsert_entity": 48,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 17,
+        "embeddings.get_entity": 30,
+        "embeddings.create_entity": 13,
+        "faces.create_entity": 13
+      },
+      "timings": {
+        "compute_seconds_sum": 36.09967207495356,
+        "apply_seconds_sum": 26.367991754144896,
+        "qualification_seconds": 2.443796858016867
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 51787,
+          "inflight_limit": 4,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 66122,
+          "inflight_limit": 4,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 42656,
+          "inflight_limit": 4,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2458693632,
+      "output_digest": "35887b1a233ecc47fff068f3ad26bd3f96b1e3c4c474845dfb72d3205b3058bd",
+      "profile": "mixed",
+      "round": 0
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-97e5d2493e954a078fe2f1b988d228d2",
+      "mode": "handoff2x3",
+      "qualification": "serial",
+      "images": 48,
+      "wall_seconds": 21.385177092975937,
+      "process_cpu_seconds": 34.92577959800002,
+      "cgroup_delta": {
+        "usage_usec": 34965227,
+        "user_usec": 33841980,
+        "system_usec": 1123247,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 214,
+        "nr_throttled": 104,
+        "throttled_usec": 4897924,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 1676,
+      "calls": {
+        "jobs.get_entity": 467,
+        "jobs.submit_transaction": 158,
+        "metadata.get_entity": 462,
+        "metadata.update_entity": 144,
+        "lookup.get_entity": 222,
+        "lookup.update_entity": 96,
+        "photoembeddings.upsert_entity": 48,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 17,
+        "embeddings.get_entity": 30,
+        "embeddings.create_entity": 13,
+        "faces.create_entity": 13
+      },
+      "timings": {
+        "compute_seconds_sum": 33.83352192083839,
+        "apply_seconds_sum": 23.901149735727813,
+        "qualification_seconds": 2.344789991970174
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 51784,
+          "inflight_limit": 5,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 5,
+          "peak_apply_bytes": 54318,
+          "inflight_limit": 5,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 5,
+          "peak_apply_bytes": 42826,
+          "inflight_limit": 5,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2458693632,
+      "output_digest": "35887b1a233ecc47fff068f3ad26bd3f96b1e3c4c474845dfb72d3205b3058bd",
+      "profile": "mixed",
+      "round": 0
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-9f4b815a57db4276ba7a07bb781aacdf",
+      "mode": "handoff2x3",
+      "qualification": "serial",
+      "images": 48,
+      "wall_seconds": 21.76171832100954,
+      "process_cpu_seconds": 35.639880930000004,
+      "cgroup_delta": {
+        "usage_usec": 35677920,
+        "user_usec": 34760241,
+        "system_usec": 917678,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 217,
+        "nr_throttled": 109,
+        "throttled_usec": 5368856,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 1676,
+      "calls": {
+        "jobs.get_entity": 467,
+        "jobs.submit_transaction": 158,
+        "metadata.get_entity": 462,
+        "metadata.update_entity": 144,
+        "lookup.get_entity": 222,
+        "lookup.update_entity": 96,
+        "photoembeddings.upsert_entity": 48,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 17,
+        "embeddings.get_entity": 30,
+        "embeddings.create_entity": 13,
+        "faces.create_entity": 13
+      },
+      "timings": {
+        "compute_seconds_sum": 34.53920011111768,
+        "apply_seconds_sum": 25.860623564978596,
+        "qualification_seconds": 2.4315168549655937
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 51844,
+          "inflight_limit": 5,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 5,
+          "peak_apply_bytes": 66045,
+          "inflight_limit": 5,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 5,
+          "peak_apply_bytes": 42655,
+          "inflight_limit": 5,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2458693632,
+      "output_digest": "35887b1a233ecc47fff068f3ad26bd3f96b1e3c4c474845dfb72d3205b3058bd",
+      "profile": "mixed",
+      "round": 1
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-7ec380a0c6e842d6882cf63c0d357413",
+      "mode": "handoff2x2",
+      "qualification": "serial",
+      "images": 48,
+      "wall_seconds": 22.218422102974728,
+      "process_cpu_seconds": 35.48894697200001,
+      "cgroup_delta": {
+        "usage_usec": 35526957,
+        "user_usec": 34592082,
+        "system_usec": 934876,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 222,
+        "nr_throttled": 114,
+        "throttled_usec": 4708498,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 1671,
+      "calls": {
+        "jobs.get_entity": 464,
+        "jobs.submit_transaction": 156,
+        "metadata.get_entity": 462,
+        "metadata.update_entity": 144,
+        "lookup.get_entity": 222,
+        "lookup.update_entity": 96,
+        "photoembeddings.upsert_entity": 48,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 17,
+        "embeddings.get_entity": 30,
+        "embeddings.create_entity": 13,
+        "faces.create_entity": 13
+      },
+      "timings": {
+        "compute_seconds_sum": 34.577474709949456,
+        "apply_seconds_sum": 24.188544549047947,
+        "qualification_seconds": 2.6925937019404955
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 51785,
+          "inflight_limit": 4,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 66046,
+          "inflight_limit": 4,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 42963,
+          "inflight_limit": 4,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2458693632,
+      "output_digest": "35887b1a233ecc47fff068f3ad26bd3f96b1e3c4c474845dfb72d3205b3058bd",
+      "profile": "mixed",
+      "round": 1
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-5712050267c74c6b8248805db63e53f3",
+      "mode": "handoff2x1",
+      "qualification": "serial",
+      "images": 48,
+      "wall_seconds": 22.39783836895367,
+      "process_cpu_seconds": 33.371162873,
+      "cgroup_delta": {
+        "usage_usec": 33419130,
+        "user_usec": 32570851,
+        "system_usec": 848280,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 224,
+        "nr_throttled": 64,
+        "throttled_usec": 2031114,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 1671,
+      "calls": {
+        "jobs.get_entity": 464,
+        "jobs.submit_transaction": 156,
+        "metadata.get_entity": 462,
+        "metadata.update_entity": 144,
+        "lookup.get_entity": 222,
+        "lookup.update_entity": 96,
+        "photoembeddings.upsert_entity": 48,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 17,
+        "embeddings.get_entity": 30,
+        "embeddings.create_entity": 13,
+        "faces.create_entity": 13
+      },
+      "timings": {
+        "compute_seconds_sum": 28.906866843171883,
+        "apply_seconds_sum": 16.81032647914253,
+        "qualification_seconds": 2.671247071994003
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 3,
+          "peak_apply_bytes": 51787,
+          "inflight_limit": 3,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 3,
+          "peak_apply_bytes": 66045,
+          "inflight_limit": 3,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 3,
+          "peak_apply_bytes": 28656,
+          "inflight_limit": 3,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2499018752,
+      "output_digest": "35887b1a233ecc47fff068f3ad26bd3f96b1e3c4c474845dfb72d3205b3058bd",
+      "profile": "mixed",
+      "round": 1
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-b0f29a3da3e8497480aaf24dae3235f8",
+      "mode": "current3",
+      "qualification": "serial",
+      "images": 48,
+      "wall_seconds": 22.5483905459987,
+      "process_cpu_seconds": 36.34375395400002,
+      "cgroup_delta": {
+        "usage_usec": 36385307,
+        "user_usec": 35404981,
+        "system_usec": 980326,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 226,
+        "nr_throttled": 117,
+        "throttled_usec": 6100485,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 1667,
+      "calls": {
+        "jobs.get_entity": 463,
+        "jobs.submit_transaction": 153,
+        "metadata.get_entity": 462,
+        "metadata.update_entity": 144,
+        "lookup.get_entity": 222,
+        "lookup.update_entity": 96,
+        "photoembeddings.upsert_entity": 48,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 17,
+        "embeddings.get_entity": 30,
+        "embeddings.create_entity": 13,
+        "faces.create_entity": 13
+      },
+      "timings": {
+        "compute_seconds_sum": 36.93716318404768,
+        "apply_seconds_sum": 20.946307091217022,
+        "qualification_seconds": 2.2426967400242575
+      },
+      "queue_stats": [],
+      "process_peak_rss_bytes": 2545774592,
+      "output_digest": "35887b1a233ecc47fff068f3ad26bd3f96b1e3c4c474845dfb72d3205b3058bd",
+      "profile": "mixed",
+      "round": 1
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-2114987ae8984f4b9115b429d298d87f",
+      "mode": "current3",
+      "qualification": "serial",
+      "images": 48,
+      "wall_seconds": 21.89946584700374,
+      "process_cpu_seconds": 35.04256582199997,
+      "cgroup_delta": {
+        "usage_usec": 35084187,
+        "user_usec": 34108699,
+        "system_usec": 975487,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 219,
+        "nr_throttled": 116,
+        "throttled_usec": 6451156,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 1673,
+      "calls": {
+        "jobs.get_entity": 467,
+        "jobs.submit_transaction": 155,
+        "metadata.get_entity": 462,
+        "metadata.update_entity": 144,
+        "lookup.get_entity": 222,
+        "lookup.update_entity": 96,
+        "photoembeddings.upsert_entity": 48,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 17,
+        "embeddings.get_entity": 30,
+        "embeddings.create_entity": 13,
+        "faces.create_entity": 13
+      },
+      "timings": {
+        "compute_seconds_sum": 35.99073364090873,
+        "apply_seconds_sum": 19.666488205257338,
+        "qualification_seconds": 2.3311535610700957
+      },
+      "queue_stats": [],
+      "process_peak_rss_bytes": 2545774592,
+      "output_digest": "35887b1a233ecc47fff068f3ad26bd3f96b1e3c4c474845dfb72d3205b3058bd",
+      "profile": "mixed",
+      "round": 2
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-6fd1d4eb96f944688b977375dfb73308",
+      "mode": "handoff2x1",
+      "qualification": "serial",
+      "images": 48,
+      "wall_seconds": 21.657794838014524,
+      "process_cpu_seconds": 32.39509072699991,
+      "cgroup_delta": {
+        "usage_usec": 32444967,
+        "user_usec": 31678557,
+        "system_usec": 766410,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 217,
+        "nr_throttled": 63,
+        "throttled_usec": 2047283,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 1671,
+      "calls": {
+        "jobs.get_entity": 464,
+        "jobs.submit_transaction": 156,
+        "metadata.get_entity": 462,
+        "metadata.update_entity": 144,
+        "lookup.get_entity": 222,
+        "lookup.update_entity": 96,
+        "photoembeddings.upsert_entity": 48,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 17,
+        "embeddings.get_entity": 30,
+        "embeddings.create_entity": 13,
+        "faces.create_entity": 13
+      },
+      "timings": {
+        "compute_seconds_sum": 28.270726993796416,
+        "apply_seconds_sum": 16.37549873732496,
+        "qualification_seconds": 2.2338179910439067
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 3,
+          "peak_apply_bytes": 51784,
+          "inflight_limit": 3,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 3,
+          "peak_apply_bytes": 66123,
+          "inflight_limit": 3,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 3,
+          "peak_apply_bytes": 42402,
+          "inflight_limit": 3,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2545774592,
+      "output_digest": "35887b1a233ecc47fff068f3ad26bd3f96b1e3c4c474845dfb72d3205b3058bd",
+      "profile": "mixed",
+      "round": 2
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-00478188caf341239aa8aa0dc4fa85a9",
+      "mode": "handoff2x2",
+      "qualification": "serial",
+      "images": 48,
+      "wall_seconds": 22.855221783043817,
+      "process_cpu_seconds": 37.22075549700003,
+      "cgroup_delta": {
+        "usage_usec": 37267008,
+        "user_usec": 36242032,
+        "system_usec": 1024976,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 229,
+        "nr_throttled": 109,
+        "throttled_usec": 5615527,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 1671,
+      "calls": {
+        "jobs.get_entity": 464,
+        "jobs.submit_transaction": 156,
+        "metadata.get_entity": 462,
+        "metadata.update_entity": 144,
+        "lookup.get_entity": 222,
+        "lookup.update_entity": 96,
+        "photoembeddings.upsert_entity": 48,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 17,
+        "embeddings.get_entity": 30,
+        "embeddings.create_entity": 13,
+        "faces.create_entity": 13
+      },
+      "timings": {
+        "compute_seconds_sum": 36.4261764959665,
+        "apply_seconds_sum": 26.768783228704706,
+        "qualification_seconds": 2.291719504049979
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 65939,
+          "inflight_limit": 4,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 54367,
+          "inflight_limit": 4,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 28658,
+          "inflight_limit": 4,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2545774592,
+      "output_digest": "35887b1a233ecc47fff068f3ad26bd3f96b1e3c4c474845dfb72d3205b3058bd",
+      "profile": "mixed",
+      "round": 2
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-2cc9e84ba54e4bcc9a1e5485558f86a6",
+      "mode": "handoff2x3",
+      "qualification": "serial",
+      "images": 48,
+      "wall_seconds": 22.766660750028677,
+      "process_cpu_seconds": 37.21843864499999,
+      "cgroup_delta": {
+        "usage_usec": 37263300,
+        "user_usec": 36224793,
+        "system_usec": 1038507,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 228,
+        "nr_throttled": 115,
+        "throttled_usec": 5398564,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 1671,
+      "calls": {
+        "jobs.get_entity": 464,
+        "jobs.submit_transaction": 156,
+        "metadata.get_entity": 462,
+        "metadata.update_entity": 144,
+        "lookup.get_entity": 222,
+        "lookup.update_entity": 96,
+        "photoembeddings.upsert_entity": 48,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 17,
+        "embeddings.get_entity": 30,
+        "embeddings.create_entity": 13,
+        "faces.create_entity": 13
+      },
+      "timings": {
+        "compute_seconds_sum": 36.672816908801906,
+        "apply_seconds_sum": 26.390691951906774,
+        "qualification_seconds": 2.2357199079706334
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 51786,
+          "inflight_limit": 5,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 5,
+          "peak_apply_bytes": 66123,
+          "inflight_limit": 5,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 28655,
+          "inflight_limit": 5,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2545774592,
+      "output_digest": "35887b1a233ecc47fff068f3ad26bd3f96b1e3c4c474845dfb72d3205b3058bd",
+      "profile": "mixed",
+      "round": 2
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-d7402261c7504a5bb04c6318e603478b",
+      "mode": "current3",
+      "qualification": "serial",
+      "images": 60,
+      "wall_seconds": 35.45854819798842,
+      "process_cpu_seconds": 56.333727683999996,
+      "cgroup_delta": {
+        "usage_usec": 56397118,
+        "user_usec": 55058242,
+        "system_usec": 1338876,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 350,
+        "nr_throttled": 194,
+        "throttled_usec": 10626072,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 2613,
+      "calls": {
+        "jobs.get_entity": 682,
+        "jobs.submit_transaction": 235,
+        "metadata.get_entity": 660,
+        "metadata.update_entity": 180,
+        "lookup.get_entity": 360,
+        "lookup.update_entity": 120,
+        "embeddings.get_entity": 120,
+        "embeddings.create_entity": 52,
+        "faces.create_entity": 52,
+        "photoembeddings.upsert_entity": 60,
+        "faces.get_entity": 68,
+        "embeddings.query_entities": 8,
+        "embeddings.submit_transaction": 8,
+        "faces.submit_transaction": 8
+      },
+      "timings": {
+        "compute_seconds_sum": 59.44377228419762,
+        "apply_seconds_sum": 31.29504814709071,
+        "qualification_seconds": 3.51053063897416
+      },
+      "queue_stats": [],
+      "process_peak_rss_bytes": 2594246656,
+      "output_digest": "19bea92d9a600f288e4ca9d57d8cde96fd87ad9ef19c495d4c8e24241708171b",
+      "profile": "face_positive",
+      "round": 0
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-b0701482818f436ea7c56f758184ad1d",
+      "mode": "handoff2x1",
+      "qualification": "serial",
+      "images": 60,
+      "wall_seconds": 33.299564387998544,
+      "process_cpu_seconds": 51.959235433,
+      "cgroup_delta": {
+        "usage_usec": 52017648,
+        "user_usec": 50890023,
+        "system_usec": 1127625,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 333,
+        "nr_throttled": 93,
+        "throttled_usec": 3062206,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 2607,
+      "calls": {
+        "jobs.get_entity": 674,
+        "jobs.submit_transaction": 237,
+        "metadata.get_entity": 660,
+        "metadata.update_entity": 180,
+        "lookup.get_entity": 360,
+        "lookup.update_entity": 120,
+        "embeddings.query_entities": 8,
+        "embeddings.submit_transaction": 8,
+        "faces.submit_transaction": 8,
+        "photoembeddings.upsert_entity": 60,
+        "faces.get_entity": 68,
+        "embeddings.get_entity": 120,
+        "embeddings.create_entity": 52,
+        "faces.create_entity": 52
+      },
+      "timings": {
+        "compute_seconds_sum": 44.758146700041834,
+        "apply_seconds_sum": 25.49980803875951,
+        "qualification_seconds": 3.313620454922784
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 3,
+          "peak_apply_bytes": 75288,
+          "inflight_limit": 3,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 3,
+          "peak_apply_bytes": 63530,
+          "inflight_limit": 3,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 3,
+          "peak_apply_bytes": 63525,
+          "inflight_limit": 3,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2594246656,
+      "output_digest": "19bea92d9a600f288e4ca9d57d8cde96fd87ad9ef19c495d4c8e24241708171b",
+      "profile": "face_positive",
+      "round": 0
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-d1252c3b97ce47f88885c35ad5069304",
+      "mode": "handoff2x2",
+      "qualification": "serial",
+      "images": 60,
+      "wall_seconds": 32.45783912600018,
+      "process_cpu_seconds": 54.881159866000075,
+      "cgroup_delta": {
+        "usage_usec": 54940381,
+        "user_usec": 53764336,
+        "system_usec": 1176046,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 324,
+        "nr_throttled": 191,
+        "throttled_usec": 10258283,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 2610,
+      "calls": {
+        "jobs.get_entity": 676,
+        "jobs.submit_transaction": 238,
+        "metadata.get_entity": 660,
+        "metadata.update_entity": 180,
+        "lookup.get_entity": 360,
+        "lookup.update_entity": 120,
+        "embeddings.query_entities": 8,
+        "embeddings.submit_transaction": 8,
+        "faces.submit_transaction": 8,
+        "photoembeddings.upsert_entity": 60,
+        "faces.get_entity": 68,
+        "embeddings.get_entity": 120,
+        "embeddings.create_entity": 52,
+        "faces.create_entity": 52
+      },
+      "timings": {
+        "compute_seconds_sum": 51.921766375307925,
+        "apply_seconds_sum": 35.3347444460378,
+        "qualification_seconds": 3.1170649449341
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 75286,
+          "inflight_limit": 4,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 77572,
+          "inflight_limit": 4,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 77582,
+          "inflight_limit": 4,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2594246656,
+      "output_digest": "19bea92d9a600f288e4ca9d57d8cde96fd87ad9ef19c495d4c8e24241708171b",
+      "profile": "face_positive",
+      "round": 0
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-8d7b29049cd74337a9c49e68cfb91c5c",
+      "mode": "handoff2x3",
+      "qualification": "serial",
+      "images": 60,
+      "wall_seconds": 32.428034364013,
+      "process_cpu_seconds": 54.152538757,
+      "cgroup_delta": {
+        "usage_usec": 54209784,
+        "user_usec": 53058432,
+        "system_usec": 1151352,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 324,
+        "nr_throttled": 196,
+        "throttled_usec": 10955004,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 2610,
+      "calls": {
+        "jobs.get_entity": 676,
+        "jobs.submit_transaction": 238,
+        "metadata.get_entity": 660,
+        "metadata.update_entity": 180,
+        "lookup.get_entity": 360,
+        "lookup.update_entity": 120,
+        "embeddings.query_entities": 8,
+        "embeddings.submit_transaction": 8,
+        "faces.submit_transaction": 8,
+        "photoembeddings.upsert_entity": 60,
+        "faces.get_entity": 68,
+        "embeddings.get_entity": 120,
+        "embeddings.create_entity": 52,
+        "faces.create_entity": 52
+      },
+      "timings": {
+        "compute_seconds_sum": 51.93067035637796,
+        "apply_seconds_sum": 34.8141161504318,
+        "qualification_seconds": 3.8268267980311066
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 75290,
+          "inflight_limit": 5,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 75291,
+          "inflight_limit": 5,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 63523,
+          "inflight_limit": 5,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2594246656,
+      "output_digest": "19bea92d9a600f288e4ca9d57d8cde96fd87ad9ef19c495d4c8e24241708171b",
+      "profile": "face_positive",
+      "round": 0
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-5fac2d3a4bd84330b1d170c59b48d62c",
+      "mode": "handoff2x3",
+      "qualification": "serial",
+      "images": 60,
+      "wall_seconds": 32.16215635201661,
+      "process_cpu_seconds": 54.88204763899989,
+      "cgroup_delta": {
+        "usage_usec": 54936072,
+        "user_usec": 53590250,
+        "system_usec": 1345821,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 321,
+        "nr_throttled": 203,
+        "throttled_usec": 11114984,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 2609,
+      "calls": {
+        "jobs.get_entity": 675,
+        "jobs.submit_transaction": 238,
+        "metadata.get_entity": 660,
+        "metadata.update_entity": 180,
+        "lookup.get_entity": 360,
+        "lookup.update_entity": 120,
+        "embeddings.query_entities": 8,
+        "embeddings.submit_transaction": 8,
+        "faces.submit_transaction": 8,
+        "photoembeddings.upsert_entity": 60,
+        "faces.get_entity": 68,
+        "embeddings.get_entity": 120,
+        "embeddings.create_entity": 52,
+        "faces.create_entity": 52
+      },
+      "timings": {
+        "compute_seconds_sum": 52.29340503405547,
+        "apply_seconds_sum": 33.776909604959656,
+        "qualification_seconds": 3.495914718019776
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 75291,
+          "inflight_limit": 5,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 75289,
+          "inflight_limit": 5,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 63521,
+          "inflight_limit": 5,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2594246656,
+      "output_digest": "19bea92d9a600f288e4ca9d57d8cde96fd87ad9ef19c495d4c8e24241708171b",
+      "profile": "face_positive",
+      "round": 1
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-ae06509bf91448d6aee514f36856ba5e",
+      "mode": "handoff2x2",
+      "qualification": "serial",
+      "images": 60,
+      "wall_seconds": 33.16663635603618,
+      "process_cpu_seconds": 55.110598926999955,
+      "cgroup_delta": {
+        "usage_usec": 55169466,
+        "user_usec": 54089944,
+        "system_usec": 1079522,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 328,
+        "nr_throttled": 208,
+        "throttled_usec": 11388369,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 2608,
+      "calls": {
+        "jobs.get_entity": 675,
+        "jobs.submit_transaction": 237,
+        "metadata.get_entity": 660,
+        "metadata.update_entity": 180,
+        "lookup.get_entity": 360,
+        "lookup.update_entity": 120,
+        "embeddings.query_entities": 8,
+        "embeddings.submit_transaction": 8,
+        "faces.submit_transaction": 8,
+        "photoembeddings.upsert_entity": 60,
+        "faces.get_entity": 68,
+        "embeddings.get_entity": 120,
+        "embeddings.create_entity": 52,
+        "faces.create_entity": 52
+      },
+      "timings": {
+        "compute_seconds_sum": 52.870795219845604,
+        "apply_seconds_sum": 33.53756348468596,
+        "qualification_seconds": 4.234107855998445
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 75286,
+          "inflight_limit": 4,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 63523,
+          "inflight_limit": 4,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 63521,
+          "inflight_limit": 4,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2594246656,
+      "output_digest": "19bea92d9a600f288e4ca9d57d8cde96fd87ad9ef19c495d4c8e24241708171b",
+      "profile": "face_positive",
+      "round": 1
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-8d3e869110b44cd4a1bdf66df6b06c9c",
+      "mode": "handoff2x1",
+      "qualification": "serial",
+      "images": 60,
+      "wall_seconds": 34.06430805596756,
+      "process_cpu_seconds": 50.17811266000001,
+      "cgroup_delta": {
+        "usage_usec": 50243509,
+        "user_usec": 49252223,
+        "system_usec": 991286,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 335,
+        "nr_throttled": 100,
+        "throttled_usec": 2885551,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 2608,
+      "calls": {
+        "jobs.get_entity": 675,
+        "jobs.submit_transaction": 237,
+        "metadata.get_entity": 660,
+        "metadata.update_entity": 180,
+        "lookup.get_entity": 360,
+        "lookup.update_entity": 120,
+        "embeddings.query_entities": 8,
+        "embeddings.submit_transaction": 8,
+        "faces.submit_transaction": 8,
+        "photoembeddings.upsert_entity": 60,
+        "faces.get_entity": 68,
+        "embeddings.get_entity": 120,
+        "embeddings.create_entity": 52,
+        "faces.create_entity": 52
+      },
+      "timings": {
+        "compute_seconds_sum": 43.02434664015891,
+        "apply_seconds_sum": 26.124250047840178,
+        "qualification_seconds": 3.9041065979981795
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 3,
+          "peak_apply_bytes": 75287,
+          "inflight_limit": 3,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 3,
+          "peak_apply_bytes": 63533,
+          "inflight_limit": 3,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 3,
+          "peak_apply_bytes": 63521,
+          "inflight_limit": 3,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2594246656,
+      "output_digest": "19bea92d9a600f288e4ca9d57d8cde96fd87ad9ef19c495d4c8e24241708171b",
+      "profile": "face_positive",
+      "round": 1
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-a6b1caa6039843629ba94ccb35dfdd6d",
+      "mode": "current3",
+      "qualification": "serial",
+      "images": 60,
+      "wall_seconds": 33.48531180201098,
+      "process_cpu_seconds": 55.550766432000046,
+      "cgroup_delta": {
+        "usage_usec": 55614972,
+        "user_usec": 54358364,
+        "system_usec": 1256608,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 335,
+        "nr_throttled": 209,
+        "throttled_usec": 11138908,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 2611,
+      "calls": {
+        "jobs.get_entity": 679,
+        "jobs.submit_transaction": 236,
+        "metadata.get_entity": 660,
+        "metadata.update_entity": 180,
+        "lookup.get_entity": 360,
+        "lookup.update_entity": 120,
+        "embeddings.get_entity": 120,
+        "embeddings.create_entity": 52,
+        "faces.create_entity": 52,
+        "photoembeddings.upsert_entity": 60,
+        "faces.get_entity": 68,
+        "embeddings.query_entities": 8,
+        "embeddings.submit_transaction": 8,
+        "faces.submit_transaction": 8
+      },
+      "timings": {
+        "compute_seconds_sum": 56.69853231898742,
+        "apply_seconds_sum": 28.895450553041883,
+        "qualification_seconds": 3.671055267972406
+      },
+      "queue_stats": [],
+      "process_peak_rss_bytes": 2594246656,
+      "output_digest": "19bea92d9a600f288e4ca9d57d8cde96fd87ad9ef19c495d4c8e24241708171b",
+      "profile": "face_positive",
+      "round": 1
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-adb08e73c6224e6197b7c9eb385fd756",
+      "mode": "current3",
+      "qualification": "serial",
+      "images": 60,
+      "wall_seconds": 34.03729015297722,
+      "process_cpu_seconds": 55.29880132199992,
+      "cgroup_delta": {
+        "usage_usec": 55353177,
+        "user_usec": 54095113,
+        "system_usec": 1258064,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 340,
+        "nr_throttled": 191,
+        "throttled_usec": 11001172,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 2618,
+      "calls": {
+        "jobs.get_entity": 684,
+        "jobs.submit_transaction": 238,
+        "metadata.get_entity": 660,
+        "metadata.update_entity": 180,
+        "lookup.get_entity": 360,
+        "lookup.update_entity": 120,
+        "embeddings.get_entity": 120,
+        "embeddings.create_entity": 52,
+        "faces.create_entity": 52,
+        "photoembeddings.upsert_entity": 60,
+        "faces.get_entity": 68,
+        "embeddings.query_entities": 8,
+        "embeddings.submit_transaction": 8,
+        "faces.submit_transaction": 8
+      },
+      "timings": {
+        "compute_seconds_sum": 57.528272867784835,
+        "apply_seconds_sum": 30.569118284911383,
+        "qualification_seconds": 3.0470991050242446
+      },
+      "queue_stats": [],
+      "process_peak_rss_bytes": 2594246656,
+      "output_digest": "19bea92d9a600f288e4ca9d57d8cde96fd87ad9ef19c495d4c8e24241708171b",
+      "profile": "face_positive",
+      "round": 2
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-9f6db58e80284968b2822987d5943d1a",
+      "mode": "handoff2x1",
+      "qualification": "serial",
+      "images": 60,
+      "wall_seconds": 33.34788303897949,
+      "process_cpu_seconds": 51.48024006200012,
+      "cgroup_delta": {
+        "usage_usec": 51536534,
+        "user_usec": 50514369,
+        "system_usec": 1022165,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 333,
+        "nr_throttled": 90,
+        "throttled_usec": 2873065,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 2607,
+      "calls": {
+        "jobs.get_entity": 674,
+        "jobs.submit_transaction": 237,
+        "metadata.get_entity": 660,
+        "metadata.update_entity": 180,
+        "lookup.get_entity": 360,
+        "lookup.update_entity": 120,
+        "embeddings.query_entities": 8,
+        "embeddings.submit_transaction": 8,
+        "faces.submit_transaction": 8,
+        "photoembeddings.upsert_entity": 60,
+        "faces.get_entity": 68,
+        "embeddings.get_entity": 120,
+        "embeddings.create_entity": 52,
+        "faces.create_entity": 52
+      },
+      "timings": {
+        "compute_seconds_sum": 43.77491820970317,
+        "apply_seconds_sum": 25.83244630403351,
+        "qualification_seconds": 3.4183967689750716
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 3,
+          "peak_apply_bytes": 89397,
+          "inflight_limit": 3,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 3,
+          "peak_apply_bytes": 63534,
+          "inflight_limit": 3,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 3,
+          "peak_apply_bytes": 63533,
+          "inflight_limit": 3,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2594246656,
+      "output_digest": "19bea92d9a600f288e4ca9d57d8cde96fd87ad9ef19c495d4c8e24241708171b",
+      "profile": "face_positive",
+      "round": 2
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-0aa62abecaa64e8c9ed837ffe1fef882",
+      "mode": "handoff2x2",
+      "qualification": "serial",
+      "images": 60,
+      "wall_seconds": 32.96344387996942,
+      "process_cpu_seconds": 55.24055237500011,
+      "cgroup_delta": {
+        "usage_usec": 55301826,
+        "user_usec": 54005851,
+        "system_usec": 1295976,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 328,
+        "nr_throttled": 201,
+        "throttled_usec": 11247979,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 2608,
+      "calls": {
+        "jobs.get_entity": 675,
+        "jobs.submit_transaction": 237,
+        "metadata.get_entity": 660,
+        "metadata.update_entity": 180,
+        "lookup.get_entity": 360,
+        "lookup.update_entity": 120,
+        "embeddings.query_entities": 8,
+        "embeddings.submit_transaction": 8,
+        "faces.submit_transaction": 8,
+        "photoembeddings.upsert_entity": 60,
+        "faces.get_entity": 68,
+        "embeddings.get_entity": 120,
+        "embeddings.create_entity": 52,
+        "faces.create_entity": 52
+      },
+      "timings": {
+        "compute_seconds_sum": 52.9430017087725,
+        "apply_seconds_sum": 35.17022174806334,
+        "qualification_seconds": 3.286229885998182
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 75289,
+          "inflight_limit": 4,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 63524,
+          "inflight_limit": 4,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 63532,
+          "inflight_limit": 4,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2594246656,
+      "output_digest": "19bea92d9a600f288e4ca9d57d8cde96fd87ad9ef19c495d4c8e24241708171b",
+      "profile": "face_positive",
+      "round": 2
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-b5c4bd88cf6e4b1c80ae129d8f96ce25",
+      "mode": "handoff2x3",
+      "qualification": "serial",
+      "images": 60,
+      "wall_seconds": 33.42148498899769,
+      "process_cpu_seconds": 57.23820726300005,
+      "cgroup_delta": {
+        "usage_usec": 57299956,
+        "user_usec": 55949225,
+        "system_usec": 1350730,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 334,
+        "nr_throttled": 218,
+        "throttled_usec": 12605575,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 2612,
+      "calls": {
+        "jobs.get_entity": 677,
+        "jobs.submit_transaction": 239,
+        "metadata.get_entity": 660,
+        "metadata.update_entity": 180,
+        "lookup.get_entity": 360,
+        "lookup.update_entity": 120,
+        "embeddings.query_entities": 8,
+        "embeddings.submit_transaction": 8,
+        "faces.submit_transaction": 8,
+        "photoembeddings.upsert_entity": 60,
+        "faces.get_entity": 68,
+        "embeddings.get_entity": 120,
+        "embeddings.create_entity": 52,
+        "faces.create_entity": 52
+      },
+      "timings": {
+        "compute_seconds_sum": 54.6181232718518,
+        "apply_seconds_sum": 37.529503090074286,
+        "qualification_seconds": 3.348745328024961
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 75289,
+          "inflight_limit": 5,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 75292,
+          "inflight_limit": 5,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        },
+        {
+          "peak_inflight": 5,
+          "peak_apply_bytes": 77756,
+          "inflight_limit": 5,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2594246656,
+      "output_digest": "19bea92d9a600f288e4ca9d57d8cde96fd87ad9ef19c495d4c8e24241708171b",
+      "profile": "face_positive",
+      "round": 2
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-37bcb863aa334fbc8627d8d6cf5eb222",
+      "mode": "current3",
+      "qualification": "serial",
+      "images": 20,
+      "wall_seconds": 11.00610229402082,
+      "process_cpu_seconds": 17.804385812999953,
+      "cgroup_delta": {
+        "usage_usec": 17823722,
+        "user_usec": 17356826,
+        "system_usec": 466896,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 107,
+        "nr_throttled": 67,
+        "throttled_usec": 4035800,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 655,
+      "calls": {
+        "jobs.get_entity": 191,
+        "jobs.submit_transaction": 62,
+        "metadata.get_entity": 184,
+        "metadata.update_entity": 60,
+        "lookup.get_entity": 84,
+        "lookup.update_entity": 40,
+        "photoembeddings.upsert_entity": 20,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 4,
+        "embeddings.get_entity": 4
+      },
+      "timings": {
+        "compute_seconds_sum": 19.05722968489863,
+        "apply_seconds_sum": 8.238354208995588,
+        "qualification_seconds": 1.5057815040345304
+      },
+      "queue_stats": [],
+      "process_peak_rss_bytes": 2603450368,
+      "output_digest": "e04ed0752d47a4758c5dbd7a27ab159b9102fc3e37eaaaea6a11bd13ecf2d9f0",
+      "profile": "small",
+      "round": 0
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-a2575a7185834a2bb132a0e017e6cf10",
+      "mode": "handoff2x1",
+      "qualification": "serial",
+      "images": 20,
+      "wall_seconds": 9.85434320004424,
+      "process_cpu_seconds": 16.742072416999918,
+      "cgroup_delta": {
+        "usage_usec": 16760728,
+        "user_usec": 16394168,
+        "system_usec": 366561,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 99,
+        "nr_throttled": 46,
+        "throttled_usec": 1799592,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 651,
+      "calls": {
+        "jobs.get_entity": 188,
+        "jobs.submit_transaction": 61,
+        "metadata.get_entity": 184,
+        "metadata.update_entity": 60,
+        "lookup.get_entity": 84,
+        "lookup.update_entity": 40,
+        "photoembeddings.upsert_entity": 20,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 4,
+        "embeddings.get_entity": 4
+      },
+      "timings": {
+        "compute_seconds_sum": 15.340521152073052,
+        "apply_seconds_sum": 7.002444440033287,
+        "qualification_seconds": 0.8159875069977716
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 3,
+          "peak_apply_bytes": 51787,
+          "inflight_limit": 3,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2603450368,
+      "output_digest": "e04ed0752d47a4758c5dbd7a27ab159b9102fc3e37eaaaea6a11bd13ecf2d9f0",
+      "profile": "small",
+      "round": 0
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-ac5881a2da8d4aacb50adbd1a56f3b33",
+      "mode": "handoff2x2",
+      "qualification": "serial",
+      "images": 20,
+      "wall_seconds": 10.605267525010277,
+      "process_cpu_seconds": 16.894595594000066,
+      "cgroup_delta": {
+        "usage_usec": 16909965,
+        "user_usec": 16459463,
+        "system_usec": 450502,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 102,
+        "nr_throttled": 61,
+        "throttled_usec": 2862209,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 651,
+      "calls": {
+        "jobs.get_entity": 188,
+        "jobs.submit_transaction": 61,
+        "metadata.get_entity": 184,
+        "metadata.update_entity": 60,
+        "lookup.get_entity": 84,
+        "lookup.update_entity": 40,
+        "photoembeddings.upsert_entity": 20,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 4,
+        "embeddings.get_entity": 4
+      },
+      "timings": {
+        "compute_seconds_sum": 16.1681982880109,
+        "apply_seconds_sum": 9.407230671029538,
+        "qualification_seconds": 1.110304163012188
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 51783,
+          "inflight_limit": 4,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2603450368,
+      "output_digest": "e04ed0752d47a4758c5dbd7a27ab159b9102fc3e37eaaaea6a11bd13ecf2d9f0",
+      "profile": "small",
+      "round": 0
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-2e08aedcef9e44108d476e9952b114f6",
+      "mode": "handoff2x3",
+      "qualification": "serial",
+      "images": 20,
+      "wall_seconds": 9.85452140797861,
+      "process_cpu_seconds": 17.078014310999833,
+      "cgroup_delta": {
+        "usage_usec": 17092618,
+        "user_usec": 16686229,
+        "system_usec": 406389,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 98,
+        "nr_throttled": 58,
+        "throttled_usec": 2935451,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 651,
+      "calls": {
+        "jobs.get_entity": 188,
+        "jobs.submit_transaction": 61,
+        "metadata.get_entity": 184,
+        "metadata.update_entity": 60,
+        "lookup.get_entity": 84,
+        "lookup.update_entity": 40,
+        "photoembeddings.upsert_entity": 20,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 4,
+        "embeddings.get_entity": 4
+      },
+      "timings": {
+        "compute_seconds_sum": 16.37137628387427,
+        "apply_seconds_sum": 8.255660211958457,
+        "qualification_seconds": 0.9647807650035247
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 51786,
+          "inflight_limit": 5,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2603450368,
+      "output_digest": "e04ed0752d47a4758c5dbd7a27ab159b9102fc3e37eaaaea6a11bd13ecf2d9f0",
+      "profile": "small",
+      "round": 0
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-bd9b266ebcfa42c085ea9c941d2c7c7b",
+      "mode": "handoff2x3",
+      "qualification": "serial",
+      "images": 20,
+      "wall_seconds": 9.845276282983832,
+      "process_cpu_seconds": 16.927794424000012,
+      "cgroup_delta": {
+        "usage_usec": 16945414,
+        "user_usec": 16512292,
+        "system_usec": 433123,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 99,
+        "nr_throttled": 54,
+        "throttled_usec": 2639815,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 651,
+      "calls": {
+        "jobs.get_entity": 188,
+        "jobs.submit_transaction": 61,
+        "metadata.get_entity": 184,
+        "metadata.update_entity": 60,
+        "lookup.get_entity": 84,
+        "lookup.update_entity": 40,
+        "photoembeddings.upsert_entity": 20,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 4,
+        "embeddings.get_entity": 4
+      },
+      "timings": {
+        "compute_seconds_sum": 15.942924134025816,
+        "apply_seconds_sum": 9.297595279174857,
+        "qualification_seconds": 0.9553494379506446
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 37658,
+          "inflight_limit": 5,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2603450368,
+      "output_digest": "e04ed0752d47a4758c5dbd7a27ab159b9102fc3e37eaaaea6a11bd13ecf2d9f0",
+      "profile": "small",
+      "round": 1
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-a184048a193c4cc5b43517a9f8842ab8",
+      "mode": "handoff2x2",
+      "qualification": "serial",
+      "images": 20,
+      "wall_seconds": 10.022139207983855,
+      "process_cpu_seconds": 17.121137170999873,
+      "cgroup_delta": {
+        "usage_usec": 17135193,
+        "user_usec": 16759058,
+        "system_usec": 376136,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 100,
+        "nr_throttled": 64,
+        "throttled_usec": 2552644,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 651,
+      "calls": {
+        "jobs.get_entity": 188,
+        "jobs.submit_transaction": 61,
+        "metadata.get_entity": 184,
+        "metadata.update_entity": 60,
+        "lookup.get_entity": 84,
+        "lookup.update_entity": 40,
+        "photoembeddings.upsert_entity": 20,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 4,
+        "embeddings.get_entity": 4
+      },
+      "timings": {
+        "compute_seconds_sum": 16.47361942892894,
+        "apply_seconds_sum": 8.514794859918766,
+        "qualification_seconds": 1.028889382025227
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 51783,
+          "inflight_limit": 4,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2603450368,
+      "output_digest": "e04ed0752d47a4758c5dbd7a27ab159b9102fc3e37eaaaea6a11bd13ecf2d9f0",
+      "profile": "small",
+      "round": 1
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-985831452a224aa494a50824eca9bbfd",
+      "mode": "handoff2x1",
+      "qualification": "serial",
+      "images": 20,
+      "wall_seconds": 9.7266324700322,
+      "process_cpu_seconds": 16.20462551500009,
+      "cgroup_delta": {
+        "usage_usec": 16224139,
+        "user_usec": 15858673,
+        "system_usec": 365466,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 97,
+        "nr_throttled": 48,
+        "throttled_usec": 1574946,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 651,
+      "calls": {
+        "jobs.get_entity": 188,
+        "jobs.submit_transaction": 61,
+        "metadata.get_entity": 184,
+        "metadata.update_entity": 60,
+        "lookup.get_entity": 84,
+        "lookup.update_entity": 40,
+        "photoembeddings.upsert_entity": 20,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 4,
+        "embeddings.get_entity": 4
+      },
+      "timings": {
+        "compute_seconds_sum": 15.081531909818295,
+        "apply_seconds_sum": 6.387914512073621,
+        "qualification_seconds": 1.0234972460311837
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 3,
+          "peak_apply_bytes": 51783,
+          "inflight_limit": 3,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2609422336,
+      "output_digest": "e04ed0752d47a4758c5dbd7a27ab159b9102fc3e37eaaaea6a11bd13ecf2d9f0",
+      "profile": "small",
+      "round": 1
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-f9c378fd10574da39605b428891294d3",
+      "mode": "current3",
+      "qualification": "serial",
+      "images": 20,
+      "wall_seconds": 9.882827170949895,
+      "process_cpu_seconds": 16.704637401000127,
+      "cgroup_delta": {
+        "usage_usec": 16720585,
+        "user_usec": 16298888,
+        "system_usec": 421698,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 98,
+        "nr_throttled": 61,
+        "throttled_usec": 3244541,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 651,
+      "calls": {
+        "jobs.get_entity": 188,
+        "jobs.submit_transaction": 61,
+        "metadata.get_entity": 184,
+        "metadata.update_entity": 60,
+        "lookup.get_entity": 84,
+        "lookup.update_entity": 40,
+        "photoembeddings.upsert_entity": 20,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 4,
+        "embeddings.get_entity": 4
+      },
+      "timings": {
+        "compute_seconds_sum": 17.56828195991693,
+        "apply_seconds_sum": 7.740959340240806,
+        "qualification_seconds": 1.0243521200027317
+      },
+      "queue_stats": [],
+      "process_peak_rss_bytes": 2609422336,
+      "output_digest": "e04ed0752d47a4758c5dbd7a27ab159b9102fc3e37eaaaea6a11bd13ecf2d9f0",
+      "profile": "small",
+      "round": 1
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-273c0a63086747359f579901c8582569",
+      "mode": "current3",
+      "qualification": "serial",
+      "images": 20,
+      "wall_seconds": 9.975110416009557,
+      "process_cpu_seconds": 17.049858408999853,
+      "cgroup_delta": {
+        "usage_usec": 17065556,
+        "user_usec": 16738642,
+        "system_usec": 326913,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 99,
+        "nr_throttled": 67,
+        "throttled_usec": 3372813,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 651,
+      "calls": {
+        "jobs.get_entity": 189,
+        "jobs.submit_transaction": 60,
+        "metadata.get_entity": 184,
+        "metadata.update_entity": 60,
+        "lookup.get_entity": 84,
+        "lookup.update_entity": 40,
+        "photoembeddings.upsert_entity": 20,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 4,
+        "embeddings.get_entity": 4
+      },
+      "timings": {
+        "compute_seconds_sum": 18.03387047193246,
+        "apply_seconds_sum": 7.589725733036175,
+        "qualification_seconds": 0.9485682570375502
+      },
+      "queue_stats": [],
+      "process_peak_rss_bytes": 2609422336,
+      "output_digest": "e04ed0752d47a4758c5dbd7a27ab159b9102fc3e37eaaaea6a11bd13ecf2d9f0",
+      "profile": "small",
+      "round": 2
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-90086fcb462f4dc4a0be8c8cd05650af",
+      "mode": "handoff2x1",
+      "qualification": "serial",
+      "images": 20,
+      "wall_seconds": 9.95719901798293,
+      "process_cpu_seconds": 16.413713633999805,
+      "cgroup_delta": {
+        "usage_usec": 16428202,
+        "user_usec": 16065517,
+        "system_usec": 362686,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 100,
+        "nr_throttled": 42,
+        "throttled_usec": 1594509,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 651,
+      "calls": {
+        "jobs.get_entity": 188,
+        "jobs.submit_transaction": 61,
+        "metadata.get_entity": 184,
+        "metadata.update_entity": 60,
+        "lookup.get_entity": 84,
+        "lookup.update_entity": 40,
+        "photoembeddings.upsert_entity": 20,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 4,
+        "embeddings.get_entity": 4
+      },
+      "timings": {
+        "compute_seconds_sum": 14.952286469808314,
+        "apply_seconds_sum": 7.001995647151489,
+        "qualification_seconds": 1.0582703950349241
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 3,
+          "peak_apply_bytes": 51784,
+          "inflight_limit": 3,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2609422336,
+      "output_digest": "e04ed0752d47a4758c5dbd7a27ab159b9102fc3e37eaaaea6a11bd13ecf2d9f0",
+      "profile": "small",
+      "round": 2
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-49a5b23cedd14d02b021e944e4bb46c5",
+      "mode": "handoff2x2",
+      "qualification": "serial",
+      "images": 20,
+      "wall_seconds": 10.114027016970795,
+      "process_cpu_seconds": 17.180387915999972,
+      "cgroup_delta": {
+        "usage_usec": 17198773,
+        "user_usec": 16809941,
+        "system_usec": 388831,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 101,
+        "nr_throttled": 56,
+        "throttled_usec": 2841381,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 651,
+      "calls": {
+        "jobs.get_entity": 188,
+        "jobs.submit_transaction": 61,
+        "metadata.get_entity": 184,
+        "metadata.update_entity": 60,
+        "lookup.get_entity": 84,
+        "lookup.update_entity": 40,
+        "photoembeddings.upsert_entity": 20,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 4,
+        "embeddings.get_entity": 4
+      },
+      "timings": {
+        "compute_seconds_sum": 16.41996423684759,
+        "apply_seconds_sum": 9.358502162969671,
+        "qualification_seconds": 1.0784964499762282
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 51784,
+          "inflight_limit": 4,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2609422336,
+      "output_digest": "e04ed0752d47a4758c5dbd7a27ab159b9102fc3e37eaaaea6a11bd13ecf2d9f0",
+      "profile": "small",
+      "round": 2
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-0391e2dd6ca44e19b9a4c0051592b366",
+      "mode": "handoff2x3",
+      "qualification": "serial",
+      "images": 20,
+      "wall_seconds": 9.89725311199436,
+      "process_cpu_seconds": 16.75335393499995,
+      "cgroup_delta": {
+        "usage_usec": 16771653,
+        "user_usec": 16332917,
+        "system_usec": 438737,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 99,
+        "nr_throttled": 61,
+        "throttled_usec": 2986148,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 651,
+      "calls": {
+        "jobs.get_entity": 188,
+        "jobs.submit_transaction": 61,
+        "metadata.get_entity": 184,
+        "metadata.update_entity": 60,
+        "lookup.get_entity": 84,
+        "lookup.update_entity": 40,
+        "photoembeddings.upsert_entity": 20,
+        "embeddings.query_entities": 2,
+        "embeddings.submit_transaction": 2,
+        "faces.submit_transaction": 2,
+        "faces.get_entity": 4,
+        "embeddings.get_entity": 4
+      },
+      "timings": {
+        "compute_seconds_sum": 16.125048285000958,
+        "apply_seconds_sum": 10.34716684219893,
+        "qualification_seconds": 1.1315921670175157
+      },
+      "queue_stats": [
+        {
+          "peak_inflight": 4,
+          "peak_apply_bytes": 51784,
+          "inflight_limit": 5,
+          "byte_limit": 33554432,
+          "pending_at_finish": 0
+        }
+      ],
+      "process_peak_rss_bytes": 2609422336,
+      "output_digest": "e04ed0752d47a4758c5dbd7a27ab159b9102fc3e37eaaaea6a11bd13ecf2d9f0",
+      "profile": "small",
+      "round": 2
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-57fdb4a57fe04cd487111e23996370ce",
+      "mode": "current3",
+      "qualification": "serial",
+      "images": 60,
+      "wall_seconds": 34.863532575021964,
+      "process_cpu_seconds": 56.10945340000012,
+      "cgroup_delta": {
+        "usage_usec": 56167505,
+        "user_usec": 54916515,
+        "system_usec": 1250990,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 349,
+        "nr_throttled": 195,
+        "throttled_usec": 10992728,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 2615,
+      "calls": {
+        "jobs.get_entity": 683,
+        "jobs.submit_transaction": 236,
+        "metadata.get_entity": 660,
+        "metadata.update_entity": 180,
+        "lookup.get_entity": 360,
+        "lookup.update_entity": 120,
+        "embeddings.get_entity": 120,
+        "embeddings.create_entity": 52,
+        "faces.create_entity": 52,
+        "photoembeddings.upsert_entity": 60,
+        "faces.get_entity": 68,
+        "embeddings.query_entities": 8,
+        "embeddings.submit_transaction": 8,
+        "faces.submit_transaction": 8
+      },
+      "timings": {
+        "compute_seconds_sum": 57.573984155023936,
+        "apply_seconds_sum": 30.125467903912067,
+        "qualification_seconds": 3.750117508985568
+      },
+      "queue_stats": [],
+      "process_peak_rss_bytes": 2609422336,
+      "output_digest": "19bea92d9a600f288e4ca9d57d8cde96fd87ad9ef19c495d4c8e24241708171b",
+      "profile": "qualification_integrated",
+      "round": 0
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-88130e6a4bea4c649f81815b10f4cc2a",
+      "mode": "current3",
+      "qualification": "batch",
+      "images": 60,
+      "wall_seconds": 31.504553720995318,
+      "process_cpu_seconds": 54.95990297499998,
+      "cgroup_delta": {
+        "usage_usec": 55017461,
+        "user_usec": 53873368,
+        "system_usec": 1144093,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 315,
+        "nr_throttled": 198,
+        "throttled_usec": 10328550,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 2275,
+      "calls": {
+        "jobs.get_entity": 369,
+        "jobs.submit_transaction": 234,
+        "metadata.get_entity": 600,
+        "metadata.update_entity": 180,
+        "lookup.get_entity": 360,
+        "lookup.update_entity": 120,
+        "embeddings.get_entity": 120,
+        "embeddings.create_entity": 52,
+        "faces.create_entity": 52,
+        "photoembeddings.upsert_entity": 60,
+        "faces.get_entity": 68,
+        "embeddings.query_entities": 8,
+        "embeddings.submit_transaction": 8,
+        "faces.submit_transaction": 8,
+        "metadata.query_entities": 6,
+        "jobs.query_entities": 30
+      },
+      "timings": {
+        "compute_seconds_sum": 56.16025258455193,
+        "apply_seconds_sum": 30.70867180096684,
+        "qualification_seconds": 1.1044249949627556
+      },
+      "queue_stats": [],
+      "process_peak_rss_bytes": 2609422336,
+      "output_digest": "19bea92d9a600f288e4ca9d57d8cde96fd87ad9ef19c495d4c8e24241708171b",
+      "profile": "qualification_integrated",
+      "round": 0
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-094f43aa999745c49721a152f52e9b7d",
+      "mode": "current3",
+      "qualification": "batch",
+      "images": 60,
+      "wall_seconds": 31.32573882100405,
+      "process_cpu_seconds": 54.968273140000065,
+      "cgroup_delta": {
+        "usage_usec": 55026624,
+        "user_usec": 53798221,
+        "system_usec": 1228404,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 313,
+        "nr_throttled": 196,
+        "throttled_usec": 10646956,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 2276,
+      "calls": {
+        "jobs.get_entity": 370,
+        "jobs.submit_transaction": 234,
+        "metadata.get_entity": 600,
+        "metadata.update_entity": 180,
+        "lookup.get_entity": 360,
+        "lookup.update_entity": 120,
+        "embeddings.get_entity": 120,
+        "embeddings.create_entity": 52,
+        "faces.create_entity": 52,
+        "photoembeddings.upsert_entity": 60,
+        "faces.get_entity": 68,
+        "embeddings.query_entities": 8,
+        "embeddings.submit_transaction": 8,
+        "faces.submit_transaction": 8,
+        "metadata.query_entities": 6,
+        "jobs.query_entities": 30
+      },
+      "timings": {
+        "compute_seconds_sum": 57.21136998635484,
+        "apply_seconds_sum": 28.996316130273044,
+        "qualification_seconds": 0.9462539330124855
+      },
+      "queue_stats": [],
+      "process_peak_rss_bytes": 2643177472,
+      "output_digest": "19bea92d9a600f288e4ca9d57d8cde96fd87ad9ef19c495d4c8e24241708171b",
+      "profile": "qualification_integrated",
+      "round": 1
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-1cbb9b6fdf5f4d21a2c5fc6351e3ad49",
+      "mode": "current3",
+      "qualification": "serial",
+      "images": 60,
+      "wall_seconds": 33.706516966049094,
+      "process_cpu_seconds": 54.036137412000016,
+      "cgroup_delta": {
+        "usage_usec": 54094513,
+        "user_usec": 52770600,
+        "system_usec": 1323913,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 337,
+        "nr_throttled": 199,
+        "throttled_usec": 10484247,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 2605,
+      "calls": {
+        "jobs.get_entity": 675,
+        "jobs.submit_transaction": 234,
+        "metadata.get_entity": 660,
+        "metadata.update_entity": 180,
+        "lookup.get_entity": 360,
+        "lookup.update_entity": 120,
+        "embeddings.get_entity": 120,
+        "embeddings.create_entity": 52,
+        "faces.create_entity": 52,
+        "photoembeddings.upsert_entity": 60,
+        "faces.get_entity": 68,
+        "embeddings.query_entities": 8,
+        "embeddings.submit_transaction": 8,
+        "faces.submit_transaction": 8
+      },
+      "timings": {
+        "compute_seconds_sum": 54.598040573706385,
+        "apply_seconds_sum": 30.841218053828925,
+        "qualification_seconds": 3.923927176045254
+      },
+      "queue_stats": [],
+      "process_peak_rss_bytes": 2643177472,
+      "output_digest": "19bea92d9a600f288e4ca9d57d8cde96fd87ad9ef19c495d4c8e24241708171b",
+      "profile": "qualification_integrated",
+      "round": 1
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-bcc0e0959fca4ed8b00d7ab0f2fecc7a",
+      "mode": "current3",
+      "qualification": "serial",
+      "images": 60,
+      "wall_seconds": 33.26219353196211,
+      "process_cpu_seconds": 54.12090256400006,
+      "cgroup_delta": {
+        "usage_usec": 54172768,
+        "user_usec": 52932923,
+        "system_usec": 1239845,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 331,
+        "nr_throttled": 193,
+        "throttled_usec": 10128794,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 2604,
+      "calls": {
+        "jobs.get_entity": 674,
+        "jobs.submit_transaction": 234,
+        "metadata.get_entity": 660,
+        "metadata.update_entity": 180,
+        "lookup.get_entity": 360,
+        "lookup.update_entity": 120,
+        "embeddings.get_entity": 120,
+        "embeddings.create_entity": 52,
+        "faces.create_entity": 52,
+        "photoembeddings.upsert_entity": 60,
+        "faces.get_entity": 68,
+        "embeddings.query_entities": 8,
+        "embeddings.submit_transaction": 8,
+        "faces.submit_transaction": 8
+      },
+      "timings": {
+        "compute_seconds_sum": 54.980797602038365,
+        "apply_seconds_sum": 29.451497315836605,
+        "qualification_seconds": 3.2325009380001575
+      },
+      "queue_stats": [],
+      "process_peak_rss_bytes": 2643177472,
+      "output_digest": "19bea92d9a600f288e4ca9d57d8cde96fd87ad9ef19c495d4c8e24241708171b",
+      "profile": "qualification_integrated",
+      "round": 2
+    },
+    {
+      "section": "pipeline",
+      "library": "bench-568046c9f08c4f3eb413c725f26c13ae",
+      "mode": "current3",
+      "qualification": "batch",
+      "images": 60,
+      "wall_seconds": 31.665464238030836,
+      "process_cpu_seconds": 55.16278311399992,
+      "cgroup_delta": {
+        "usage_usec": 55219189,
+        "user_usec": 53780345,
+        "system_usec": 1438844,
+        "core_sched.force_idle_usec": 0,
+        "nr_periods": 317,
+        "nr_throttled": 210,
+        "throttled_usec": 11472802,
+        "nr_bursts": 0,
+        "burst_usec": 0
+      },
+      "sdk_calls": 2285,
+      "calls": {
+        "jobs.get_entity": 375,
+        "jobs.submit_transaction": 238,
+        "metadata.get_entity": 600,
+        "metadata.update_entity": 180,
+        "lookup.get_entity": 360,
+        "lookup.update_entity": 120,
+        "embeddings.get_entity": 120,
+        "embeddings.create_entity": 52,
+        "faces.create_entity": 52,
+        "photoembeddings.upsert_entity": 60,
+        "faces.get_entity": 68,
+        "embeddings.query_entities": 8,
+        "embeddings.submit_transaction": 8,
+        "faces.submit_transaction": 8,
+        "metadata.query_entities": 6,
+        "jobs.query_entities": 30
+      },
+      "timings": {
+        "compute_seconds_sum": 57.35157054720912,
+        "apply_seconds_sum": 30.097995955788065,
+        "qualification_seconds": 1.022193411074113
+      },
+      "queue_stats": [],
+      "process_peak_rss_bytes": 2664292352,
+      "output_digest": "19bea92d9a600f288e4ca9d57d8cde96fd87ad9ef19c495d4c8e24241708171b",
+      "profile": "qualification_integrated",
+      "round": 2
+    }
+  ],
+  "cleanup_verified": "2026-10-29T15:51:48.721985+00:00"
+}

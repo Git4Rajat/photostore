@@ -1,0 +1,3877 @@
+{
+  "scope": "Real Azure SDK persistence/capture/metadata-CAS/completion-inbox component benchmark; no model/blob/queue/wave/ack timing",
+  "date": "2026-10-29",
+  "image": "ghcr.io/git4rajat/photostore-ipworker:32b9e9b7e014e1eeb8204ceff6536a0ffad94006",
+  "cpu": 2,
+  "memory": "4Gi",
+  "source_workers": 3,
+  "request_count_semantics": "requests counts outer SDK table method invocations, not HTTP retries or paginated wire requests",
+  "measured_image_passes": 4096,
+  "measured_comparisons": 128,
+  "rounds_per_scenario": 4,
+  "paired_change_semantics": "100 * (1 - candidate_wall/current_wall) within the same scenario and round; positive means less wall time",
+  "durable_validation": {
+    "durable_sources": 4096,
+    "verified_face_snapshots": 7168,
+    "job_rows": 15360,
+    "manifest_scope_digest_and_inbox_parity": true,
+    "verified_at": "2026-10-29T14:24:09.470893+00:00"
+  },
+  "local_validation": "43 tests passed: benchmark prototype correctness and existing processing receipt suite",
+  "production_changed": false,
+  "source_sha256": {
+    "initial": "3378ecb6a61b596329486b305da1a6fb47781ab66cacfaf8faba3c510de528aa",
+    "parallel_followup": "199593f818fd46db3cfa43a3bd3eb8bbbe6f5a9145b6ab91020fa3d4878e9744"
+  },
+  "runner_sources": {
+    "initial": "\"\"\"Isolated persistence prototypes; never imported by the application.\n\nUses production face writers, capture and completion acceptance. Only immutable\nreceipt rereads and bounded cross-image artifact writes are intercepted. No\nmodel, blob promotion, wave orchestration or full-upload throughput is measured.\n\"\"\"\nimport argparse\nfrom collections import Counter\nfrom concurrent.futures import ThreadPoolExecutor\nfrom contextlib import contextmanager\nfrom contextvars import ContextVar\nfrom datetime import datetime, timedelta, timezone\nimport hashlib\nimport json\nimport os\nfrom pathlib import Path\nimport threading\nimport time\nimport uuid\n\nfrom azure.core import MatchConditions\nfrom azure.core.exceptions import ResourceNotFoundError\nfrom azure.data.tables import UpdateMode\nimport processing_fence as fencing\nfrom processing_completion import STEPS, prepare_completion\nfrom processing_receipts import ArtifactReceipts\nfrom upload_waves import ShadowWaves\nimport storage_utils as storage\n\n\n@contextmanager\ndef patch(obj, name, value):\n    previous = getattr(obj, name)\n    setattr(obj, name, value)\n    try:\n        yield previous\n    finally:\n        setattr(obj, name, previous)\n\n\n_receipts = ContextVar('benchmark_committed_receipts', default=None)\n\n\n@contextmanager\ndef receipt_prototype(enabled):\n    \"\"\"Cache only successfully committed immutable payloads in this call scope.\"\"\"\n    if not enabled:\n        yield\n        return\n    get, put, many = ArtifactReceipts._get, ArtifactReceipts._put, ArtifactReceipts._put_many\n    def key(self, rowkey):\n        return id(self.table), self.partition, rowkey\n    def cached_get(self, rowkey):\n        cache = _receipts.get()\n        found = cache.get(key(self, rowkey)) if cache is not None else None\n        return dict(found) if found is not None else get(self, rowkey)\n    def remember(self, kind, payload):\n        identity, row = self._prepare(kind, payload)\n        cache = _receipts.get()\n        if cache is not None:\n            cache[key(self, row['RowKey'])] = row\n        return identity\n    def committed_put(self, kind, payload):\n        identity = put(self, kind, payload)\n        remember(self, kind, payload)  # Never populated before durable success.\n        return identity\n    def committed_many(self, kind, payloads):\n        payloads = list(payloads)\n        identities = many(self, kind, payloads)\n        for payload in payloads:\n            remember(self, kind, payload)\n        return identities\n    with patch(ArtifactReceipts, '_get', cached_get), patch(ArtifactReceipts, '_put', committed_put), \\\n            patch(ArtifactReceipts, '_put_many', committed_many):\n        yield\n\n\n@contextmanager\ndef receipt_scope():\n    token = _receipts.set({})\n    try:\n        yield\n    finally:\n        _receipts.reset(token)\n\n\nclass CrossImageBatch:\n    \"\"\"Bounded queue; no caller may publish completion until flush succeeds.\n\n    Keeps original artifact ETags, fresh per-source/lookup guards, embedding\n    before face ordering, and complete lookup publication strictly last.\n    \"\"\"\n    def __init__(self):\n        self.operations, self.finishes = {}, []\n        self.lock = threading.Lock()\n        self.original_finish = storage._finish_face_filename_write\n        self.original_renew = storage._renew_face_filename_write\n\n    def enqueue(self, table, entity, *, previous=None, previous_known=False):\n        fence = fencing.current_fence(entity['PartitionKey'], entity.get('filename'))\n        if fence is None:\n            raise ValueError('Source fence required')\n        if not previous_known:\n            try:\n                previous = table.get_entity(entity['PartitionKey'], entity['RowKey'])\n            except ResourceNotFoundError:\n                previous = None\n        row = dict(entity, **fence.headers())\n        operation = ('create', row) if previous is None else ('update', row, dict(\n            mode=UpdateMode.REPLACE, etag=previous.metadata['etag'], match_condition=MatchConditions.IfNotModified))\n        with self.lock:\n            self.operations.setdefault(table, []).append((operation, fence))\n\n    def finish(self, *args, **kwargs):\n        if args[3] is None:\n            return self.original_finish(*args, **kwargs)\n        with self.lock:\n            self.finishes.append((args, kwargs, fencing.current_fence()))\n\n    def renew(self, *args, **kwargs):\n        # This preparation only queues writes. Flush performs fresh checks.\n        if not kwargs.get('artifact_checks_source'):\n            return self.original_renew(*args, **kwargs)\n\n    @contextmanager\n    def installed(self):\n        with patch(fencing, 'write_artifact', self.enqueue), \\\n                patch(storage, '_finish_face_filename_write', self.finish), \\\n                patch(storage, '_renew_face_filename_write', self.renew):\n            yield self\n\n    def flush(self):\n        generations = {(f.library, f.filename): args[2] for args, _, f in self.finishes}\n        # Explicit ordering; thread scheduling must not determine table order.\n        ordered = [storage._CTX['face_embeddings_table_client'], storage._CTX['face_table_client']]\n        for table in ordered:\n            entries = self.operations.get(table, [])\n            # Conservative byte cap plus Azure's 100-operation transaction cap.\n            pages, page, size = [], [], 0\n            for entry in entries:\n                estimate = len(json.dumps(entry[0][1], default=str).encode()) * 2 + 1024\n                if page and (len(page) == 100 or size + estimate > 3_000_000):\n                    pages.append(page); page, size = [], 0\n                page.append(entry); size += estimate\n            if page:\n                pages.append(page)\n            for page in pages:\n                guards = {(f.library, f.filename): f for _, f in page}\n                for source, fence in guards.items():\n                    with fencing.result_fence(fence):\n                        self.original_renew(*source, generations[source], artifact_checks_source=True)\n                        fence.check()\n                table.submit_transaction([operation for operation, _ in page])\n        for args, kwargs, fence in self.finishes:\n            with fencing.result_fence(fence):\n                self.original_finish(*args, **kwargs)\n        self.operations.clear(); self.finishes.clear()\n\n\nclass Meter:\n    def __init__(self, table, name, counts, lock):\n        self.table, self.name, self.counts, self.lock = table, name, counts, lock\n    def __getattr__(self, name):\n        fn = getattr(self.table, name)\n        def call(*args, **kwargs):\n            with self.lock:\n                self.counts[self.name + '.' + name] += 1\n            return fn(*args, **kwargs)\n        return call\n\n\ndef configure(tables):\n    storage._CTX.update(metadata_table_client=tables['metadata'], face_table_client=tables['faces'],\n        face_embeddings_table_client=tables['embeddings'], face_by_filename_table_client=tables['lookup'],\n        blob_service_client=None, person_table_client=None, person_members_table_client=None,\n        face_summary_lookup=None, face_summary_cache_writer=None, source_policy_check=None)\n    storage.touch_user_search_indexes_state = lambda *a, **k: None\n    storage._start_face_crop_warming = lambda *a, **k: None\n\n\ndef inputs(count):\n    return [dict(embedding=[((j+i)%31-15)/100 for j in range(512)], confidence=.9,\n        bbox=dict(left=i*20, top=0, width=10, height=10), imageWidth=200, imageHeight=200,\n        embeddingVersion='benchmark-v1') for i in range(count)]\n\n\ndef execute(raw, *, mode, face_count, images, group, workers=3, seeded=False, library=None):\n    library = library or 'benchmark-' + uuid.uuid4().hex\n    counts, lock = Counter(), threading.Lock()\n    tables = {n: Meter(t, n, counts, lock) for n, t in raw.items()}\n    configure(tables)\n    rows, fences = [], []\n    for i in range(images):\n        filename = f'{i:04}.jpg'\n        row = dict(PartitionKey=library, RowKey=filename, anonymousImageId=f'photo-{i}',\n            processingRevision='rev', processingGeneration='b'*64, processingFence='attempt',\n            processing_lease_owner='owner', processing_lease_expires_at=(datetime.now(timezone.utc)+timedelta(hours=2)).isoformat(),\n            faceCount=face_count, **{step+'_status': 'no_data' for step in STEPS})\n        if face_count:\n            row['face_status'] = 'done'\n        tables['metadata'].create_entity(row)\n        tables['lookup'].create_entity(dict(PartitionKey=library, RowKey=filename,\n            schemaVersion=storage._FACE_FILENAME_SCHEMA_VERSION, generation=uuid.uuid4().hex,\n            state='complete', faceIds='[]', leaseExpiresAt=''))\n        fence = fencing.ResultFence(tables['metadata'], library, filename, 'rev', 'attempt', 'owner', f'photo-{i}', generation='b'*64)\n        rows.append(row); fences.append(fence)\n        if seeded:\n            with fencing.result_fence(fence):\n                ids = storage._store_client_face_entities(library, filename, inputs(face_count))\n            for fid in ids:\n                previous = tables['faces'].get_entity(library, fid)\n                entity = dict(previous)\n                entity.update(personId='curated-person', confirmedByUser=True, reviewStatus='confirmed')\n                tables['faces'].update_entity(entity, mode=UpdateMode.REPLACE,\n                    etag=previous.metadata['etag'], match_condition=MatchConditions.IfNotModified)\n    counts.clear()\n    phases = Counter()\n    def persist(i):\n        with fencing.result_fence(fences[i]):\n            storage._store_client_face_entities(library, rows[i]['RowKey'], inputs(face_count))\n    def complete(i):\n        row = dict(rows[i])\n        with receipt_scope(), fencing.result_fence(fences[i]):\n            with fencing.immutable_artifact_checks(fences[i]):\n                reference = ArtifactReceipts(tables['jobs'], library).capture(storage, row)\n            row['artifactReceipt'] = json.dumps(reference)\n            previous = tables['metadata'].get_entity(library, row['RowKey'])\n            row.update(processing_lease_owner='', processing_lease_expires_at='')\n            prepare_completion(row)\n            tables['metadata'].update_entity(row, mode=UpdateMode.REPLACE,\n                etag=previous.metadata['etag'], match_condition=MatchConditions.IfNotModified)\n            intent = json.loads(row['processingCompletionOutbox'])[0]\n            accepted = ShadowWaves(tables['jobs'], library).accept_source_completion(intent)\n            assert accepted['artifactReceiptQualified']\n    start, cpu = time.perf_counter(), time.process_time()\n    with ThreadPoolExecutor(workers) as pool, receipt_prototype(mode in ('receipts', 'combined')):\n        for offset in range(0, images, group):\n            indices = list(range(offset, min(images, offset+group)))\n            then = time.perf_counter()\n            if mode in ('batch', 'combined'):\n                with CrossImageBatch().installed() as batch:\n                    list(pool.map(persist, indices))\n                    batch.flush()\n            else:\n                list(pool.map(persist, indices))\n            phases['face_seconds'] += time.perf_counter()-then\n            then = time.perf_counter()\n            list(pool.map(complete, indices))\n            phases['capture_delivery_seconds'] += time.perf_counter()-then\n    wall, cpu = time.perf_counter()-start, time.process_time()-cpu\n    # Readbacks outside timing, compare semantic output rather than random IDs.\n    canonical = []\n    for row in rows:\n        lookup = raw['lookup'].get_entity(library, row['RowKey'])\n        ids = json.loads(lookup['faceIds'])\n        assert lookup['state'] == 'complete' and len(ids) == face_count\n        values = []\n        for fid in ids:\n            face = raw['faces'].get_entity(library, fid)\n            embedding = raw['embeddings'].get_entity(library, fid)\n            values.append({k: face.get(k) for k in ('bbox', 'confidence', 'personId', 'confirmedByUser', 'reviewStatus')} |\n                          dict(embedding=embedding.get('embedding')))\n        canonical.append(sorted(values, key=lambda x: json.dumps(x, sort_keys=True)))\n    return dict(mode=mode, faces=face_count, images=images, group=group, workers=workers, seeded=seeded,\n        wall_seconds=wall, cpu_seconds=cpu, milliseconds_per_image=wall*1000/images,\n        requests=sum(counts.values()), calls=dict(counts), phases=dict(phases),\n        output_digest=hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest())\n\n\ndef main():\n    from azure.data.tables import TableServiceClient\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument('--output', type=Path, required=True)\n    parser.add_argument('--rounds', type=int, default=4)\n    parser.add_argument('--images', type=int, default=32)\n    args = parser.parse_args()\n    service = TableServiceClient.from_connection_string(os.environ['BENCHMARK_STORAGE_CONNECTION'])\n    tables = {n: service.get_table_client('bench'+n) for n in ('metadata', 'faces', 'embeddings', 'lookup', 'jobs')}\n    storage._LOGGER.setLevel('ERROR')\n    reports, references = [], {}\n    for faces, seeded, groups in [(1, False, (1, 8, 16)), (0, False, (8,)), (8, False, (8,)), (1, True, (8,))]:\n        for group in groups:\n            for round_number in range(args.rounds):\n                modes = ['current', 'batch', 'receipts', 'combined']\n                for mode in modes if round_number%2 == 0 else reversed(modes):\n                    row = execute(tables, mode=mode, face_count=faces, seeded=seeded,\n                        images=args.images, group=group)\n                    key = faces, seeded\n                    references.setdefault(key, row['output_digest'])\n                    assert references[key] == row['output_digest'], 'Output mismatch'\n                    row['round'] = round_number; reports.append(row)\n                    args.output.write_text(json.dumps(dict(scope=__doc__, output_parity=True, reports=reports), indent=2))\n                    print('ROUND '+json.dumps({k: row[k] for k in ('mode', 'faces', 'seeded', 'group', 'round', 'wall_seconds', 'requests')}), flush=True)\n\n\nif __name__ == '__main__':\n    main()\n",
+    "parallel_followup": "\"\"\"Isolated persistence prototypes; never imported by the application.\n\nUses production face writers, capture and completion acceptance. Only immutable\nreceipt rereads and bounded cross-image artifact writes are intercepted. No\nmodel, blob promotion, wave orchestration or full-upload throughput is measured.\n\"\"\"\nimport argparse\nfrom collections import Counter\nfrom concurrent.futures import ThreadPoolExecutor\nfrom contextlib import contextmanager\nfrom contextvars import ContextVar\nfrom datetime import datetime, timedelta, timezone\nimport hashlib\nimport json\nimport os\nfrom pathlib import Path\nimport threading\nimport time\nimport uuid\n\nfrom azure.core import MatchConditions\nfrom azure.core.exceptions import ResourceNotFoundError\nfrom azure.data.tables import UpdateMode\nimport processing_fence as fencing\nfrom processing_completion import STEPS, prepare_completion, validate_intent\nfrom processing_receipts import ArtifactReceipts\nfrom upload_waves import ShadowWaves\nimport storage_utils as storage\n\n\n@contextmanager\ndef patch(obj, name, value):\n    previous = getattr(obj, name)\n    setattr(obj, name, value)\n    try:\n        yield previous\n    finally:\n        setattr(obj, name, previous)\n\n\n_receipts = ContextVar('benchmark_committed_receipts', default=None)\n\n\n@contextmanager\ndef receipt_prototype(enabled):\n    \"\"\"Cache only successfully committed immutable payloads in this call scope.\"\"\"\n    if not enabled:\n        yield\n        return\n    get, put, many = ArtifactReceipts._get, ArtifactReceipts._put, ArtifactReceipts._put_many\n    def key(self, rowkey):\n        return id(self.table), self.partition, rowkey\n    def cached_get(self, rowkey):\n        cache = _receipts.get()\n        found = cache.get(key(self, rowkey)) if cache is not None else None\n        return dict(found) if found is not None else get(self, rowkey)\n    def remember(self, kind, payload):\n        identity, row = self._prepare(kind, payload)\n        cache = _receipts.get()\n        if cache is not None:\n            cache[key(self, row['RowKey'])] = row\n        return identity\n    def committed_put(self, kind, payload):\n        identity = put(self, kind, payload)\n        remember(self, kind, payload)  # Never populated before durable success.\n        return identity\n    def committed_many(self, kind, payloads):\n        payloads = list(payloads)\n        identities = many(self, kind, payloads)\n        for payload in payloads:\n            remember(self, kind, payload)\n        return identities\n    with patch(ArtifactReceipts, '_get', cached_get), patch(ArtifactReceipts, '_put', committed_put), \\\n            patch(ArtifactReceipts, '_put_many', committed_many):\n        yield\n\n\n@contextmanager\ndef receipt_scope():\n    token = _receipts.set({})\n    try:\n        yield\n    finally:\n        _receipts.reset(token)\n\n\nclass CrossImageBatch:\n    \"\"\"Bounded queue; no caller may publish completion until flush succeeds.\n\n    Keeps original artifact ETags, fresh per-source/lookup guards, embedding\n    before face ordering, and complete lookup publication strictly last.\n    \"\"\"\n    def __init__(self, guard_workers=1):\n        self.operations, self.finishes = {}, []\n        self.lock = threading.Lock()\n        self.original_finish = storage._finish_face_filename_write\n        self.original_renew = storage._renew_face_filename_write\n        self.guard_workers = guard_workers\n        self.timings = Counter()\n\n    def enqueue(self, table, entity, *, previous=None, previous_known=False):\n        fence = fencing.current_fence(entity['PartitionKey'], entity.get('filename'))\n        if fence is None:\n            raise ValueError('Source fence required')\n        if not previous_known:\n            try:\n                previous = table.get_entity(entity['PartitionKey'], entity['RowKey'])\n            except ResourceNotFoundError:\n                previous = None\n        row = dict(entity, **fence.headers())\n        operation = ('create', row) if previous is None else ('update', row, dict(\n            mode=UpdateMode.REPLACE, etag=previous.metadata['etag'], match_condition=MatchConditions.IfNotModified))\n        with self.lock:\n            self.operations.setdefault(table, []).append((operation, fence))\n\n    def finish(self, *args, **kwargs):\n        if args[3] is None:\n            return self.original_finish(*args, **kwargs)\n        with self.lock:\n            self.finishes.append((args, kwargs, fencing.current_fence()))\n\n    def renew(self, *args, **kwargs):\n        # This preparation only queues writes. Flush performs fresh checks.\n        if not kwargs.get('artifact_checks_source'):\n            return self.original_renew(*args, **kwargs)\n\n    @contextmanager\n    def installed(self):\n        with patch(fencing, 'write_artifact', self.enqueue), \\\n                patch(storage, '_finish_face_filename_write', self.finish), \\\n                patch(storage, '_renew_face_filename_write', self.renew):\n            yield self\n\n    def flush(self):\n        generations = {(f.library, f.filename): args[2] for args, _, f in self.finishes}\n        # Explicit ordering; thread scheduling must not determine table order.\n        ordered = [storage._CTX['face_embeddings_table_client'], storage._CTX['face_table_client']]\n        for table in ordered:\n            entries = self.operations.get(table, [])\n            # Conservative byte cap plus Azure's 100-operation transaction cap.\n            pages, page, size = [], [], 0\n            for entry in entries:\n                estimate = len(json.dumps(entry[0][1], default=str).encode()) * 2 + 1024\n                if page and (len(page) == 100 or size + estimate > 3_000_000):\n                    pages.append(page); page, size = [], 0\n                page.append(entry); size += estimate\n            if page:\n                pages.append(page)\n            for page in pages:\n                guards = {(f.library, f.filename): f for _, f in page}\n                started = time.perf_counter()\n                def check(item):\n                    source, fence = item\n                    with fencing.result_fence(fence):\n                        self.original_renew(*source, generations[source], artifact_checks_source=True)\n                        fence.check()\n                if self.guard_workers > 1:\n                    with ThreadPoolExecutor(self.guard_workers) as pool:\n                        list(pool.map(check, guards.items()))\n                else:\n                    for item in guards.items():\n                        check(item)\n                self.timings['batch_guard_seconds'] += time.perf_counter()-started\n                started = time.perf_counter()\n                table.submit_transaction([operation for operation, _ in page])\n                self.timings['batch_write_seconds'] += time.perf_counter()-started\n        started = time.perf_counter()\n        def finish(entry):\n            args, kwargs, fence = entry\n            with fencing.result_fence(fence):\n                self.original_finish(*args, **kwargs)\n        if self.guard_workers > 1:\n            with ThreadPoolExecutor(self.guard_workers) as pool:\n                list(pool.map(finish, self.finishes))\n        else:\n            for entry in self.finishes:\n                finish(entry)\n        self.timings['batch_lookup_publish_seconds'] += time.perf_counter()-started\n        self.operations.clear(); self.finishes.clear()\n\n\nclass Meter:\n    def __init__(self, table, name, counts, lock):\n        self.table, self.name, self.counts, self.lock = table, name, counts, lock\n    def __getattr__(self, name):\n        fn = getattr(self.table, name)\n        def call(*args, **kwargs):\n            with self.lock:\n                self.counts[self.name + '.' + name] += 1\n            return fn(*args, **kwargs)\n        return call\n\n\ndef configure(tables):\n    storage._CTX.update(metadata_table_client=tables['metadata'], face_table_client=tables['faces'],\n        face_embeddings_table_client=tables['embeddings'], face_by_filename_table_client=tables['lookup'],\n        blob_service_client=None, person_table_client=None, person_members_table_client=None,\n        face_summary_lookup=None, face_summary_cache_writer=None, source_policy_check=None)\n    storage.touch_user_search_indexes_state = lambda *a, **k: None\n    storage._start_face_crop_warming = lambda *a, **k: None\n\n\ndef inputs(count):\n    return [dict(embedding=[((j+i)%31-15)/100 for j in range(512)], confidence=.9,\n        bbox=dict(left=i*20, top=0, width=10, height=10), imageWidth=200, imageHeight=200,\n        embeddingVersion='benchmark-v1') for i in range(count)]\n\n\ndef execute(raw, *, mode, face_count, images, group, workers=3, seeded=False, library=None):\n    library = library or 'benchmark-' + uuid.uuid4().hex\n    counts, lock = Counter(), threading.Lock()\n    tables = {n: Meter(t, n, counts, lock) for n, t in raw.items()}\n    configure(tables)\n    rows, fences = [], []\n    for i in range(images):\n        filename = f'{i:04}.jpg'\n        row = dict(PartitionKey=library, RowKey=filename, anonymousImageId=f'photo-{i}',\n            processingRevision='rev', processingGeneration='b'*64, processingFence='attempt',\n            processing_lease_owner='owner', processing_lease_expires_at=(datetime.now(timezone.utc)+timedelta(hours=2)).isoformat(),\n            faceCount=face_count, **{step+'_status': 'no_data' for step in STEPS})\n        if face_count:\n            row['face_status'] = 'done'\n        tables['metadata'].create_entity(row)\n        tables['lookup'].create_entity(dict(PartitionKey=library, RowKey=filename,\n            schemaVersion=storage._FACE_FILENAME_SCHEMA_VERSION, generation=uuid.uuid4().hex,\n            state='complete', faceIds='[]', leaseExpiresAt=''))\n        fence = fencing.ResultFence(tables['metadata'], library, filename, 'rev', 'attempt', 'owner', f'photo-{i}', generation='b'*64)\n        rows.append(row); fences.append(fence)\n        if seeded:\n            with fencing.result_fence(fence):\n                ids = storage._store_client_face_entities(library, filename, inputs(face_count))\n            for fid in ids:\n                previous = tables['faces'].get_entity(library, fid)\n                entity = dict(previous)\n                entity.update(personId='curated-person', confirmedByUser=True, reviewStatus='confirmed')\n                tables['faces'].update_entity(entity, mode=UpdateMode.REPLACE,\n                    etag=previous.metadata['etag'], match_condition=MatchConditions.IfNotModified)\n    counts.clear()\n    phases, delivered = Counter(), {}\n    def persist(i):\n        with fencing.result_fence(fences[i]):\n            storage._store_client_face_entities(library, rows[i]['RowKey'], inputs(face_count))\n    def complete(i):\n        row = dict(rows[i])\n        with receipt_scope(), fencing.result_fence(fences[i]):\n            previous = tables['metadata'].get_entity(library, row['RowKey'])\n            with fencing.immutable_artifact_checks(fences[i]):\n                reference = ArtifactReceipts(tables['jobs'], library).capture(storage, row)\n            row['artifactReceipt'] = json.dumps(reference)\n            row.update(processing_lease_owner='', processing_lease_expires_at='')\n            prepare_completion(row)\n            tables['metadata'].update_entity(row, mode=UpdateMode.REPLACE,\n                etag=previous.metadata['etag'], match_condition=MatchConditions.IfNotModified)\n            intent = json.loads(row['processingCompletionOutbox'])[0]\n            accepted = ShadowWaves(tables['jobs'], library).accept_source_completion(intent)\n            assert accepted['artifactReceiptQualified']\n            with lock:\n                delivered[i] = reference, intent, accepted\n    start, cpu = time.perf_counter(), time.process_time()\n    with ThreadPoolExecutor(workers) as pool, receipt_prototype(mode in ('receipts', 'combined', 'combined_parallel')):\n        for offset in range(0, images, group):\n            indices = list(range(offset, min(images, offset+group)))\n            then = time.perf_counter()\n            if mode in ('batch', 'combined', 'batch_parallel', 'combined_parallel'):\n                with CrossImageBatch(workers if mode.endswith('_parallel') else 1).installed() as batch:\n                    list(pool.map(persist, indices))\n                    batch.flush()\n                    phases.update(batch.timings)\n            else:\n                list(pool.map(persist, indices))\n            phases['face_seconds'] += time.perf_counter()-then\n            then = time.perf_counter()\n            list(pool.map(complete, indices))\n            phases['capture_delivery_seconds'] += time.perf_counter()-then\n    wall, cpu = time.perf_counter()-start, time.process_time()-cpu\n    # Readbacks outside timing, compare semantic output rather than random IDs.\n    canonical = []\n    for row in rows:\n        lookup = raw['lookup'].get_entity(library, row['RowKey'])\n        ids = json.loads(lookup['faceIds'])\n        assert lookup['state'] == 'complete' and len(ids) == face_count\n        values = []\n        for fid in ids:\n            face = raw['faces'].get_entity(library, fid)\n            embedding = raw['embeddings'].get_entity(library, fid)\n            values.append({k: face.get(k) for k in ('bbox', 'confidence', 'personId', 'confirmedByUser', 'reviewStatus')} |\n                          dict(embedding=embedding.get('embedding')))\n        canonical.append(sorted(values, key=lambda x: json.dumps(x, sort_keys=True)))\n    for reference, intent, accepted in delivered.values():\n        ArtifactReceipts(raw['jobs'], library).verify_reference(reference, intent)\n        inbox = raw['jobs'].get_entity(accepted['PartitionKey'], accepted['RowKey'])\n        assert inbox['artifactReceiptQualified'] and json.loads(inbox['payload']) == validate_intent(intent, library)\n    return dict(mode=mode, faces=face_count, images=images, group=group, workers=workers, seeded=seeded,\n        wall_seconds=wall, cpu_seconds=cpu, milliseconds_per_image=wall*1000/images,\n        requests=sum(counts.values()), calls=dict(counts), phases=dict(phases),\n        output_digest=hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest())\n\n\ndef main():\n    from azure.data.tables import TableServiceClient\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument('--output', type=Path, required=True)\n    parser.add_argument('--rounds', type=int, default=4)\n    parser.add_argument('--images', type=int, default=32)\n    parser.add_argument('--parallel-followup', action='store_true')\n    args = parser.parse_args()\n    service = TableServiceClient.from_connection_string(os.environ['BENCHMARK_STORAGE_CONNECTION'])\n    tables = {n: service.get_table_client('bench'+n) for n in ('metadata', 'faces', 'embeddings', 'lookup', 'jobs')}\n    storage._LOGGER.setLevel('ERROR')\n    reports, references = [], {}\n    matrix = [(1, False, (1, 8, 16)), (0, False, (8,)), (8, False, (8,)), (1, True, (8,))]\n    if args.parallel_followup:\n        matrix = [(1, False, (8, 16))]\n    for faces, seeded, groups in matrix:\n        for group in groups:\n            for round_number in range(args.rounds):\n                modes = ['current', 'batch', 'receipts', 'combined']\n                if args.parallel_followup:\n                    modes = ['current', 'batch_parallel', 'receipts', 'combined_parallel']\n                for mode in modes if round_number%2 == 0 else reversed(modes):\n                    row = execute(tables, mode=mode, face_count=faces, seeded=seeded,\n                        images=args.images, group=group)\n                    key = faces, seeded\n                    references.setdefault(key, row['output_digest'])\n                    assert references[key] == row['output_digest'], 'Output mismatch'\n                    row['round'] = round_number; reports.append(row)\n                    args.output.write_text(json.dumps(dict(scope=__doc__, output_parity=True, reports=reports), indent=2))\n                    print('ROUND '+json.dumps({k: row[k] for k in ('mode', 'faces', 'seeded', 'group', 'round', 'wall_seconds', 'requests')}), flush=True)\n\n\nif __name__ == '__main__':\n    main()\n"
+  },
+  "experiments": {
+    "initial": {
+      "scope": "Isolated persistence prototypes; never imported by the application.\n\nUses production face writers, capture and completion acceptance. Only immutable\nreceipt rereads and bounded cross-image artifact writes are intercepted. No\nmodel, blob promotion, wave orchestration or full-upload throughput is measured.\n",
+      "output_parity": true,
+      "reports": [
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 1,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 6.188159896002617,
+          "cpu_seconds": 1.7961298929999998,
+          "milliseconds_per_image": 193.37999675008177,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 2.870215900882613,
+            "capture_delivery_seconds": 3.3176217870786786
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 0
+        },
+        {
+          "mode": "batch",
+          "faces": 1,
+          "images": 32,
+          "group": 1,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 6.693832406948786,
+          "cpu_seconds": 2.0845399330000003,
+          "milliseconds_per_image": 209.18226271714957,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 32,
+            "faces.submit_transaction": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 3.199462804128416,
+            "capture_delivery_seconds": 3.494053586036898
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 0
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 1,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 6.037308247992769,
+          "cpu_seconds": 1.762782584,
+          "milliseconds_per_image": 188.66588274977403,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 3.03655071411049,
+            "capture_delivery_seconds": 3.000410185952205
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 0
+        },
+        {
+          "mode": "combined",
+          "faces": 1,
+          "images": 32,
+          "group": 1,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 6.052222119004,
+          "cpu_seconds": 1.9636879500000006,
+          "milliseconds_per_image": 189.131941218875,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 32,
+            "faces.submit_transaction": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 3.178862108848989,
+            "capture_delivery_seconds": 2.8730625009629875
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 0
+        },
+        {
+          "mode": "combined",
+          "faces": 1,
+          "images": 32,
+          "group": 1,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 6.077414821018465,
+          "cpu_seconds": 1.9568350720000005,
+          "milliseconds_per_image": 189.91921315682703,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 32,
+            "faces.submit_transaction": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 3.2672231360920705,
+            "capture_delivery_seconds": 2.80989482201403
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 1
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 1,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 6.350313617964275,
+          "cpu_seconds": 1.8356262010000002,
+          "milliseconds_per_image": 198.4473005613836,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 3.2467838400625624,
+            "capture_delivery_seconds": 3.1031867771525867
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 1
+        },
+        {
+          "mode": "batch",
+          "faces": 1,
+          "images": 32,
+          "group": 1,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 6.5411608290160075,
+          "cpu_seconds": 2.1995402470000016,
+          "milliseconds_per_image": 204.41127590675023,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 32,
+            "faces.submit_transaction": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 3.0229348511784337,
+            "capture_delivery_seconds": 3.517824745969847
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 1
+        },
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 1,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 6.539138816995546,
+          "cpu_seconds": 1.9228026549999981,
+          "milliseconds_per_image": 204.34808803111082,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 3.2011634050286375,
+            "capture_delivery_seconds": 3.3376695859478787
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 1
+        },
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 1,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 6.122420837986283,
+          "cpu_seconds": 1.8652983810000023,
+          "milliseconds_per_image": 191.32565118707134,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 2.8269365619053133,
+            "capture_delivery_seconds": 3.2951252469210885
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 2
+        },
+        {
+          "mode": "batch",
+          "faces": 1,
+          "images": 32,
+          "group": 1,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 6.59928458801005,
+          "cpu_seconds": 2.2228645389999997,
+          "milliseconds_per_image": 206.22764337531407,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 32,
+            "faces.submit_transaction": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 3.2162437679362483,
+            "capture_delivery_seconds": 3.3825826810789295
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 2
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 1,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 6.066348808992188,
+          "cpu_seconds": 1.8338319969999972,
+          "milliseconds_per_image": 189.5734002810059,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 2.988393983861897,
+            "capture_delivery_seconds": 3.0776049737469293
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 2
+        },
+        {
+          "mode": "combined",
+          "faces": 1,
+          "images": 32,
+          "group": 1,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 6.919343303015921,
+          "cpu_seconds": 1.9553132219999974,
+          "milliseconds_per_image": 216.22947821924754,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 32,
+            "faces.submit_transaction": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 3.624383924063295,
+            "capture_delivery_seconds": 3.294643545872532
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 2
+        },
+        {
+          "mode": "combined",
+          "faces": 1,
+          "images": 32,
+          "group": 1,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 6.383661619969644,
+          "cpu_seconds": 1.913234225,
+          "milliseconds_per_image": 199.48942562405136,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 32,
+            "faces.submit_transaction": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 3.3452958741108887,
+            "capture_delivery_seconds": 3.03806247364264
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 3
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 1,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 5.987653774034698,
+          "cpu_seconds": 1.7436555370000022,
+          "milliseconds_per_image": 187.1141804385843,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 2.9321437890757807,
+            "capture_delivery_seconds": 3.0551852231146768
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 3
+        },
+        {
+          "mode": "batch",
+          "faces": 1,
+          "images": 32,
+          "group": 1,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 6.538432484026998,
+          "cpu_seconds": 2.139814993999998,
+          "milliseconds_per_image": 204.3260151258437,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 32,
+            "faces.submit_transaction": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 3.1439186599454843,
+            "capture_delivery_seconds": 3.3941768688964657
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 3
+        },
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 1,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 6.413602680026088,
+          "cpu_seconds": 1.9449489420000035,
+          "milliseconds_per_image": 200.42508375081525,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 2.9659431587788276,
+            "capture_delivery_seconds": 3.4473025358165614
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 3
+        },
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.478063271031715,
+          "cpu_seconds": 1.7744198150000017,
+          "milliseconds_per_image": 77.4394772197411,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 1.1164231490693055,
+            "capture_delivery_seconds": 1.3614117989782244
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 0
+        },
+        {
+          "mode": "batch",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 3.734604358964134,
+          "cpu_seconds": 1.8411016049999986,
+          "milliseconds_per_image": 116.70638621762919,
+          "requests": 776,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 2.135706029017456,
+            "capture_delivery_seconds": 1.598481287015602
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 0
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.4077428730088286,
+          "cpu_seconds": 1.812112949000003,
+          "milliseconds_per_image": 75.2419647815259,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.128972597885877,
+            "capture_delivery_seconds": 1.2785415889811702
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 0
+        },
+        {
+          "mode": "combined",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 3.1378640469629318,
+          "cpu_seconds": 1.647687826000002,
+          "milliseconds_per_image": 98.05825146759162,
+          "requests": 712,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.975800771964714,
+            "capture_delivery_seconds": 1.1618388719507493
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 0
+        },
+        {
+          "mode": "combined",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 3.2965086459880695,
+          "cpu_seconds": 1.6877811429999952,
+          "milliseconds_per_image": 103.01589518712717,
+          "requests": 712,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 2.097049380012322,
+            "capture_delivery_seconds": 1.1992239579558372
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 1
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.211390422016848,
+          "cpu_seconds": 1.670665635000006,
+          "milliseconds_per_image": 69.1059506880265,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.0903312009759247,
+            "capture_delivery_seconds": 1.1208472149446607
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 1
+        },
+        {
+          "mode": "batch",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 3.0335622070124373,
+          "cpu_seconds": 1.7354112880000017,
+          "milliseconds_per_image": 94.79881896913867,
+          "requests": 776,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 1.7308578419615515,
+            "capture_delivery_seconds": 1.3025003740331158
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 1
+        },
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.2533483050065115,
+          "cpu_seconds": 1.7206811240000022,
+          "milliseconds_per_image": 70.41713453145348,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 0.9938849679892883,
+            "capture_delivery_seconds": 1.2592326170415618
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 1
+        },
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.338070011988748,
+          "cpu_seconds": 1.738428251000002,
+          "milliseconds_per_image": 73.06468787464837,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 1.0263504090253264,
+            "capture_delivery_seconds": 1.3113757880055346
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 2
+        },
+        {
+          "mode": "batch",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 3.1263712419895455,
+          "cpu_seconds": 1.7372740980000003,
+          "milliseconds_per_image": 97.6991013121733,
+          "requests": 776,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 1.7603044339339249,
+            "capture_delivery_seconds": 1.3658712860196829
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 2
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.1511554080061615,
+          "cpu_seconds": 1.666836087,
+          "milliseconds_per_image": 67.22360650019255,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 0.9680555459926836,
+            "capture_delivery_seconds": 1.182832118065562
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 2
+        },
+        {
+          "mode": "combined",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.922624768980313,
+          "cpu_seconds": 1.624906230999997,
+          "milliseconds_per_image": 91.33202403063478,
+          "requests": 712,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.8244138790178113,
+            "capture_delivery_seconds": 1.0980017320252955
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 2
+        },
+        {
+          "mode": "combined",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 3.0570662419777364,
+          "cpu_seconds": 1.6695446270000076,
+          "milliseconds_per_image": 95.53332006180426,
+          "requests": 712,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.9142189809936099,
+            "capture_delivery_seconds": 1.1425297589739785
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 3
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.195552870980464,
+          "cpu_seconds": 1.6721057970000004,
+          "milliseconds_per_image": 68.6110272181395,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.0810183450230397,
+            "capture_delivery_seconds": 1.114322612003889
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 3
+        },
+        {
+          "mode": "batch",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.820079841010738,
+          "cpu_seconds": 1.6322753219999981,
+          "milliseconds_per_image": 88.12749503158557,
+          "requests": 776,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 1.5230555460439064,
+            "capture_delivery_seconds": 1.296760721015744
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 3
+        },
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.238216169993393,
+          "cpu_seconds": 1.702527607999997,
+          "milliseconds_per_image": 69.94425531229354,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 0.9807101909536868,
+            "capture_delivery_seconds": 1.2572629900532775
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 3
+        },
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.2108337359968573,
+          "cpu_seconds": 1.8192313810000087,
+          "milliseconds_per_image": 69.08855424990179,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 0.9358004109817557,
+            "capture_delivery_seconds": 1.274848569999449
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 0
+        },
+        {
+          "mode": "batch",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 3.2088688100338914,
+          "cpu_seconds": 1.7372405050000026,
+          "milliseconds_per_image": 100.2771503135591,
+          "requests": 772,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 2,
+            "faces.submit_transaction": 2,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 1.881693316041492,
+            "capture_delivery_seconds": 1.3268980829743668
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 0
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.073443002998829,
+          "cpu_seconds": 1.7198445989999982,
+          "milliseconds_per_image": 64.7950938437134,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 0.9884673110209405,
+            "capture_delivery_seconds": 1.084729827940464
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 0
+        },
+        {
+          "mode": "combined",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.926145294040907,
+          "cpu_seconds": 1.6172771819999952,
+          "milliseconds_per_image": 91.44204043877835,
+          "requests": 708,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 2,
+            "faces.submit_transaction": 2,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.8536650849855505,
+            "capture_delivery_seconds": 1.072246619965881
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 0
+        },
+        {
+          "mode": "combined",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.964423600991722,
+          "cpu_seconds": 1.7655579599999953,
+          "milliseconds_per_image": 92.63823753099132,
+          "requests": 708,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 2,
+            "faces.submit_transaction": 2,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.7553929049754515,
+            "capture_delivery_seconds": 1.2088135139783844
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 1
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.162606735015288,
+          "cpu_seconds": 1.7891522319999922,
+          "milliseconds_per_image": 67.58146046922775,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 0.9728118710336275,
+            "capture_delivery_seconds": 1.1895437380298972
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 1
+        },
+        {
+          "mode": "batch",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 3.1175027770223096,
+          "cpu_seconds": 1.9234982279999997,
+          "milliseconds_per_image": 97.42196178194718,
+          "requests": 772,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 2,
+            "faces.submit_transaction": 2,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 1.7843020069994964,
+            "capture_delivery_seconds": 1.3329795559984632
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 1
+        },
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.479941455007065,
+          "cpu_seconds": 2.0626493470000042,
+          "milliseconds_per_image": 77.49817046897078,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 1.1244257270009257,
+            "capture_delivery_seconds": 1.3552885790122673
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 1
+        },
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.4094558649812825,
+          "cpu_seconds": 1.9255079450000068,
+          "milliseconds_per_image": 75.29549578066508,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 0.9708083179430105,
+            "capture_delivery_seconds": 1.438340636959765
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 2
+        },
+        {
+          "mode": "batch",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 3.005202712956816,
+          "cpu_seconds": 1.8141214720000107,
+          "milliseconds_per_image": 93.9125847799005,
+          "requests": 772,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 2,
+            "faces.submit_transaction": 2,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 1.6884910259395838,
+            "capture_delivery_seconds": 1.3164970470243134
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 2
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.279973427997902,
+          "cpu_seconds": 1.861953181000004,
+          "milliseconds_per_image": 71.24916962493444,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.073705337010324,
+            "capture_delivery_seconds": 1.2059307200252078
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 2
+        },
+        {
+          "mode": "combined",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.676359746954404,
+          "cpu_seconds": 1.7540657269999969,
+          "milliseconds_per_image": 83.63624209232512,
+          "requests": 708,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 2,
+            "faces.submit_transaction": 2,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.4349320189794526,
+            "capture_delivery_seconds": 1.2411956880241632
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 2
+        },
+        {
+          "mode": "combined",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.852994309971109,
+          "cpu_seconds": 1.772337087000011,
+          "milliseconds_per_image": 89.15607218659716,
+          "requests": 708,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 2,
+            "faces.submit_transaction": 2,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.640973664005287,
+            "capture_delivery_seconds": 1.2117761389818043
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 3
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.2400632139761,
+          "cpu_seconds": 1.8943426769999974,
+          "milliseconds_per_image": 70.00197543675313,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.0268092679907568,
+            "capture_delivery_seconds": 1.2129974370473064
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 3
+        },
+        {
+          "mode": "batch",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 3.430044854991138,
+          "cpu_seconds": 1.9675592630000125,
+          "milliseconds_per_image": 107.18890171847306,
+          "requests": 772,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 2,
+            "faces.submit_transaction": 2,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 1.996636542957276,
+            "capture_delivery_seconds": 1.4331905999570154
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 3
+        },
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.3425184080260806,
+          "cpu_seconds": 1.8799840499999902,
+          "milliseconds_per_image": 73.20370025081502,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 0.9896891530952416,
+            "capture_delivery_seconds": 1.3525741389603354
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 3
+        },
+        {
+          "mode": "current",
+          "faces": 0,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 1.3129608670133166,
+          "cpu_seconds": 1.0618305840000062,
+          "milliseconds_per_image": 41.030027094166144,
+          "requests": 480,
+          "calls": {
+            "lookup.get_entity": 128,
+            "metadata.get_entity": 128,
+            "lookup.update_entity": 64,
+            "jobs.submit_transaction": 64,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 64
+          },
+          "phases": {
+            "face_seconds": 0.4585093180066906,
+            "capture_delivery_seconds": 0.8542192399618216
+          },
+          "output_digest": "e9d8b2cab4ac01663a23b64083cf6cd14e424a1012bd30c121bbe09480864f8e",
+          "round": 0
+        },
+        {
+          "mode": "batch",
+          "faces": 0,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 1.7787590909865685,
+          "cpu_seconds": 1.0675008929999876,
+          "milliseconds_per_image": 55.586221593330265,
+          "requests": 480,
+          "calls": {
+            "lookup.get_entity": 128,
+            "metadata.get_entity": 128,
+            "lookup.update_entity": 64,
+            "jobs.submit_transaction": 64,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 64
+          },
+          "phases": {
+            "face_seconds": 0.9014084858936258,
+            "capture_delivery_seconds": 0.8770977800013497
+          },
+          "output_digest": "e9d8b2cab4ac01663a23b64083cf6cd14e424a1012bd30c121bbe09480864f8e",
+          "round": 0
+        },
+        {
+          "mode": "receipts",
+          "faces": 0,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 1.2985424930229783,
+          "cpu_seconds": 1.0342416160000028,
+          "milliseconds_per_image": 40.57945290696807,
+          "requests": 448,
+          "calls": {
+            "lookup.get_entity": 128,
+            "metadata.get_entity": 128,
+            "lookup.update_entity": 64,
+            "jobs.submit_transaction": 64,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 0.4950790470466018,
+            "capture_delivery_seconds": 0.8032579639693722
+          },
+          "output_digest": "e9d8b2cab4ac01663a23b64083cf6cd14e424a1012bd30c121bbe09480864f8e",
+          "round": 0
+        },
+        {
+          "mode": "combined",
+          "faces": 0,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 1.6867766839568503,
+          "cpu_seconds": 0.9872171000000094,
+          "milliseconds_per_image": 52.71177137365157,
+          "requests": 448,
+          "calls": {
+            "lookup.get_entity": 128,
+            "metadata.get_entity": 128,
+            "lookup.update_entity": 64,
+            "jobs.submit_transaction": 64,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 0.7522056110319681,
+            "capture_delivery_seconds": 0.9343244120827876
+          },
+          "output_digest": "e9d8b2cab4ac01663a23b64083cf6cd14e424a1012bd30c121bbe09480864f8e",
+          "round": 0
+        },
+        {
+          "mode": "combined",
+          "faces": 0,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 1.8244317829958163,
+          "cpu_seconds": 1.132545883000006,
+          "milliseconds_per_image": 57.01349321861926,
+          "requests": 448,
+          "calls": {
+            "lookup.get_entity": 128,
+            "metadata.get_entity": 128,
+            "lookup.update_entity": 64,
+            "jobs.submit_transaction": 64,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 0.9023406920023263,
+            "capture_delivery_seconds": 0.9217573080095463
+          },
+          "output_digest": "e9d8b2cab4ac01663a23b64083cf6cd14e424a1012bd30c121bbe09480864f8e",
+          "round": 1
+        },
+        {
+          "mode": "receipts",
+          "faces": 0,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 1.5226337040076032,
+          "cpu_seconds": 1.2418822730000016,
+          "milliseconds_per_image": 47.5823032502376,
+          "requests": 448,
+          "calls": {
+            "lookup.get_entity": 128,
+            "metadata.get_entity": 128,
+            "lookup.update_entity": 64,
+            "jobs.submit_transaction": 64,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 0.5167754190042615,
+            "capture_delivery_seconds": 1.0055643699597567
+          },
+          "output_digest": "e9d8b2cab4ac01663a23b64083cf6cd14e424a1012bd30c121bbe09480864f8e",
+          "round": 1
+        },
+        {
+          "mode": "batch",
+          "faces": 0,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 1.770123106020037,
+          "cpu_seconds": 1.1241305340000025,
+          "milliseconds_per_image": 55.31634706312616,
+          "requests": 480,
+          "calls": {
+            "lookup.get_entity": 128,
+            "metadata.get_entity": 128,
+            "lookup.update_entity": 64,
+            "jobs.submit_transaction": 64,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 64
+          },
+          "phases": {
+            "face_seconds": 0.8619559690123424,
+            "capture_delivery_seconds": 0.9079529519658536
+          },
+          "output_digest": "e9d8b2cab4ac01663a23b64083cf6cd14e424a1012bd30c121bbe09480864f8e",
+          "round": 1
+        },
+        {
+          "mode": "current",
+          "faces": 0,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 1.4601260570343584,
+          "cpu_seconds": 1.147374861000003,
+          "milliseconds_per_image": 45.6289392823237,
+          "requests": 480,
+          "calls": {
+            "lookup.get_entity": 128,
+            "metadata.get_entity": 128,
+            "lookup.update_entity": 64,
+            "jobs.submit_transaction": 64,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 64
+          },
+          "phases": {
+            "face_seconds": 0.5117721810238436,
+            "capture_delivery_seconds": 0.9480632559861988
+          },
+          "output_digest": "e9d8b2cab4ac01663a23b64083cf6cd14e424a1012bd30c121bbe09480864f8e",
+          "round": 1
+        },
+        {
+          "mode": "current",
+          "faces": 0,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 1.3557818689732812,
+          "cpu_seconds": 1.0735045429999985,
+          "milliseconds_per_image": 42.36818340541504,
+          "requests": 480,
+          "calls": {
+            "lookup.get_entity": 128,
+            "metadata.get_entity": 128,
+            "lookup.update_entity": 64,
+            "jobs.submit_transaction": 64,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 64
+          },
+          "phases": {
+            "face_seconds": 0.47151972993742675,
+            "capture_delivery_seconds": 0.884051434986759
+          },
+          "output_digest": "e9d8b2cab4ac01663a23b64083cf6cd14e424a1012bd30c121bbe09480864f8e",
+          "round": 2
+        },
+        {
+          "mode": "batch",
+          "faces": 0,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 1.7969218569924124,
+          "cpu_seconds": 1.098852008999998,
+          "milliseconds_per_image": 56.153808031012886,
+          "requests": 480,
+          "calls": {
+            "lookup.get_entity": 128,
+            "metadata.get_entity": 128,
+            "lookup.update_entity": 64,
+            "jobs.submit_transaction": 64,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 64
+          },
+          "phases": {
+            "face_seconds": 0.884709000994917,
+            "capture_delivery_seconds": 0.9119788309908472
+          },
+          "output_digest": "e9d8b2cab4ac01663a23b64083cf6cd14e424a1012bd30c121bbe09480864f8e",
+          "round": 2
+        },
+        {
+          "mode": "receipts",
+          "faces": 0,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 1.2865613750182092,
+          "cpu_seconds": 0.9850347470000003,
+          "milliseconds_per_image": 40.20504296931904,
+          "requests": 448,
+          "calls": {
+            "lookup.get_entity": 128,
+            "metadata.get_entity": 128,
+            "lookup.update_entity": 64,
+            "jobs.submit_transaction": 64,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 0.44571777404053137,
+            "capture_delivery_seconds": 0.8405664450256154
+          },
+          "output_digest": "e9d8b2cab4ac01663a23b64083cf6cd14e424a1012bd30c121bbe09480864f8e",
+          "round": 2
+        },
+        {
+          "mode": "combined",
+          "faces": 0,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 1.5225000460050069,
+          "cpu_seconds": 0.9817694969999877,
+          "milliseconds_per_image": 47.578126437656465,
+          "requests": 448,
+          "calls": {
+            "lookup.get_entity": 128,
+            "metadata.get_entity": 128,
+            "lookup.update_entity": 64,
+            "jobs.submit_transaction": 64,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 0.764742388157174,
+            "capture_delivery_seconds": 0.7575288279913366
+          },
+          "output_digest": "e9d8b2cab4ac01663a23b64083cf6cd14e424a1012bd30c121bbe09480864f8e",
+          "round": 2
+        },
+        {
+          "mode": "combined",
+          "faces": 0,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 1.772374027990736,
+          "cpu_seconds": 1.0537490590000118,
+          "milliseconds_per_image": 55.3866883747105,
+          "requests": 448,
+          "calls": {
+            "lookup.get_entity": 128,
+            "metadata.get_entity": 128,
+            "lookup.update_entity": 64,
+            "jobs.submit_transaction": 64,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 0.8780379290110432,
+            "capture_delivery_seconds": 0.8940785540617071
+          },
+          "output_digest": "e9d8b2cab4ac01663a23b64083cf6cd14e424a1012bd30c121bbe09480864f8e",
+          "round": 3
+        },
+        {
+          "mode": "receipts",
+          "faces": 0,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 1.2236952150124125,
+          "cpu_seconds": 0.9578979789999948,
+          "milliseconds_per_image": 38.24047546913789,
+          "requests": 448,
+          "calls": {
+            "lookup.get_entity": 128,
+            "metadata.get_entity": 128,
+            "lookup.update_entity": 64,
+            "jobs.submit_transaction": 64,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 0.4557086279965006,
+            "capture_delivery_seconds": 0.7677447499590926
+          },
+          "output_digest": "e9d8b2cab4ac01663a23b64083cf6cd14e424a1012bd30c121bbe09480864f8e",
+          "round": 3
+        },
+        {
+          "mode": "batch",
+          "faces": 0,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 1.7460609879926778,
+          "cpu_seconds": 1.0767038200000059,
+          "milliseconds_per_image": 54.56440587477118,
+          "requests": 480,
+          "calls": {
+            "lookup.get_entity": 128,
+            "metadata.get_entity": 128,
+            "lookup.update_entity": 64,
+            "jobs.submit_transaction": 64,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 64
+          },
+          "phases": {
+            "face_seconds": 0.8670650539570488,
+            "capture_delivery_seconds": 0.878763928078115
+          },
+          "output_digest": "e9d8b2cab4ac01663a23b64083cf6cd14e424a1012bd30c121bbe09480864f8e",
+          "round": 3
+        },
+        {
+          "mode": "current",
+          "faces": 0,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 1.3348398649832234,
+          "cpu_seconds": 1.0654534890000065,
+          "milliseconds_per_image": 41.71374578072573,
+          "requests": 480,
+          "calls": {
+            "lookup.get_entity": 128,
+            "metadata.get_entity": 128,
+            "lookup.update_entity": 64,
+            "jobs.submit_transaction": 64,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 64
+          },
+          "phases": {
+            "face_seconds": 0.4871388089377433,
+            "capture_delivery_seconds": 0.8474371459451504
+          },
+          "output_digest": "e9d8b2cab4ac01663a23b64083cf6cd14e424a1012bd30c121bbe09480864f8e",
+          "round": 3
+        },
+        {
+          "mode": "current",
+          "faces": 8,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 3.933478386956267,
+          "cpu_seconds": 3.0969907400000096,
+          "milliseconds_per_image": 122.92119959238335,
+          "requests": 1056,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.query_entities": 64,
+            "embeddings.submit_transaction": 32,
+            "faces.submit_transaction": 32,
+            "faces.query_entities": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 320
+          },
+          "phases": {
+            "face_seconds": 1.617666839971207,
+            "capture_delivery_seconds": 2.315485514001921
+          },
+          "output_digest": "39e66119b1174be17db75ec4992c41293ddda8807608182c2df413c68bc43684",
+          "round": 0
+        },
+        {
+          "mode": "batch",
+          "faces": 8,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 5.919850794016384,
+          "cpu_seconds": 3.1781397789999914,
+          "milliseconds_per_image": 184.995337313012,
+          "requests": 1224,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 256,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.query_entities": 32,
+            "embeddings.query_entities": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 320
+          },
+          "phases": {
+            "face_seconds": 3.2216674759984016,
+            "capture_delivery_seconds": 2.6979261090164073
+          },
+          "output_digest": "39e66119b1174be17db75ec4992c41293ddda8807608182c2df413c68bc43684",
+          "round": 0
+        },
+        {
+          "mode": "receipts",
+          "faces": 8,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 3.5211641259957105,
+          "cpu_seconds": 2.6292965519999996,
+          "milliseconds_per_image": 110.03637893736595,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.query_entities": 64,
+            "embeddings.submit_transaction": 32,
+            "faces.submit_transaction": 32,
+            "faces.query_entities": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.8281550799147226,
+            "capture_delivery_seconds": 1.6926702180644497
+          },
+          "output_digest": "39e66119b1174be17db75ec4992c41293ddda8807608182c2df413c68bc43684",
+          "round": 0
+        },
+        {
+          "mode": "combined",
+          "faces": 8,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 4.546516707981937,
+          "cpu_seconds": 2.6370706380000115,
+          "milliseconds_per_image": 142.07864712443552,
+          "requests": 936,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 256,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.query_entities": 32,
+            "embeddings.query_entities": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 2.78421997994883,
+            "capture_delivery_seconds": 1.7620625010458753
+          },
+          "output_digest": "39e66119b1174be17db75ec4992c41293ddda8807608182c2df413c68bc43684",
+          "round": 0
+        },
+        {
+          "mode": "combined",
+          "faces": 8,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 4.502491744991858,
+          "cpu_seconds": 2.7098026310000023,
+          "milliseconds_per_image": 140.70286703099555,
+          "requests": 936,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 256,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.query_entities": 32,
+            "embeddings.query_entities": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 3.0172810920048505,
+            "capture_delivery_seconds": 1.48500238195993
+          },
+          "output_digest": "39e66119b1174be17db75ec4992c41293ddda8807608182c2df413c68bc43684",
+          "round": 1
+        },
+        {
+          "mode": "receipts",
+          "faces": 8,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 3.1154205719940364,
+          "cpu_seconds": 2.5807642450000117,
+          "milliseconds_per_image": 97.35689287481364,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.query_entities": 64,
+            "embeddings.submit_transaction": 32,
+            "faces.submit_transaction": 32,
+            "faces.query_entities": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.596379730035551,
+            "capture_delivery_seconds": 1.5188147199805826
+          },
+          "output_digest": "39e66119b1174be17db75ec4992c41293ddda8807608182c2df413c68bc43684",
+          "round": 1
+        },
+        {
+          "mode": "batch",
+          "faces": 8,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 5.123345319007058,
+          "cpu_seconds": 2.974034832000001,
+          "milliseconds_per_image": 160.10454121897055,
+          "requests": 1224,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 256,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.query_entities": 32,
+            "embeddings.query_entities": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 320
+          },
+          "phases": {
+            "face_seconds": 2.9766632340615615,
+            "capture_delivery_seconds": 2.1464381639962085
+          },
+          "output_digest": "39e66119b1174be17db75ec4992c41293ddda8807608182c2df413c68bc43684",
+          "round": 1
+        },
+        {
+          "mode": "current",
+          "faces": 8,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 3.747501206002198,
+          "cpu_seconds": 2.9784497710000153,
+          "milliseconds_per_image": 117.10941268756869,
+          "requests": 1056,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.query_entities": 64,
+            "embeddings.submit_transaction": 32,
+            "faces.submit_transaction": 32,
+            "faces.query_entities": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 320
+          },
+          "phases": {
+            "face_seconds": 1.6023912030505016,
+            "capture_delivery_seconds": 2.1448469398892485
+          },
+          "output_digest": "39e66119b1174be17db75ec4992c41293ddda8807608182c2df413c68bc43684",
+          "round": 1
+        },
+        {
+          "mode": "current",
+          "faces": 8,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 3.8460173470084555,
+          "cpu_seconds": 2.982678261000018,
+          "milliseconds_per_image": 120.18804209401424,
+          "requests": 1056,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.query_entities": 64,
+            "embeddings.submit_transaction": 32,
+            "faces.submit_transaction": 32,
+            "faces.query_entities": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 320
+          },
+          "phases": {
+            "face_seconds": 1.6457308709505014,
+            "capture_delivery_seconds": 2.200058782065753
+          },
+          "output_digest": "39e66119b1174be17db75ec4992c41293ddda8807608182c2df413c68bc43684",
+          "round": 2
+        },
+        {
+          "mode": "batch",
+          "faces": 8,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 5.055656305979937,
+          "cpu_seconds": 3.0463208940000186,
+          "milliseconds_per_image": 157.98925956187304,
+          "requests": 1224,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 256,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.query_entities": 32,
+            "embeddings.query_entities": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 320
+          },
+          "phases": {
+            "face_seconds": 2.86984050803585,
+            "capture_delivery_seconds": 2.1855818659532815
+          },
+          "output_digest": "39e66119b1174be17db75ec4992c41293ddda8807608182c2df413c68bc43684",
+          "round": 2
+        },
+        {
+          "mode": "receipts",
+          "faces": 8,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 3.063104026019573,
+          "cpu_seconds": 2.507161488999998,
+          "milliseconds_per_image": 95.72200081311166,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.query_entities": 64,
+            "embeddings.submit_transaction": 32,
+            "faces.submit_transaction": 32,
+            "faces.query_entities": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.5529978009872139,
+            "capture_delivery_seconds": 1.5098760759574361
+          },
+          "output_digest": "39e66119b1174be17db75ec4992c41293ddda8807608182c2df413c68bc43684",
+          "round": 2
+        },
+        {
+          "mode": "combined",
+          "faces": 8,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 4.4084084469941445,
+          "cpu_seconds": 2.5691941210000095,
+          "milliseconds_per_image": 137.76276396856701,
+          "requests": 936,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 256,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.query_entities": 32,
+            "embeddings.query_entities": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 2.9504360359860584,
+            "capture_delivery_seconds": 1.4577199860941619
+          },
+          "output_digest": "39e66119b1174be17db75ec4992c41293ddda8807608182c2df413c68bc43684",
+          "round": 2
+        },
+        {
+          "mode": "combined",
+          "faces": 8,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 4.527846135024447,
+          "cpu_seconds": 2.560296208000011,
+          "milliseconds_per_image": 141.49519171951397,
+          "requests": 936,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 256,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.query_entities": 32,
+            "embeddings.query_entities": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 3.041702452930622,
+            "capture_delivery_seconds": 1.485896278056316
+          },
+          "output_digest": "39e66119b1174be17db75ec4992c41293ddda8807608182c2df413c68bc43684",
+          "round": 3
+        },
+        {
+          "mode": "receipts",
+          "faces": 8,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 3.1788578869891353,
+          "cpu_seconds": 2.5377086359999907,
+          "milliseconds_per_image": 99.33930896841048,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.query_entities": 64,
+            "embeddings.submit_transaction": 32,
+            "faces.submit_transaction": 32,
+            "faces.query_entities": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.6075184919754975,
+            "capture_delivery_seconds": 1.5710817979997955
+          },
+          "output_digest": "39e66119b1174be17db75ec4992c41293ddda8807608182c2df413c68bc43684",
+          "round": 3
+        },
+        {
+          "mode": "batch",
+          "faces": 8,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 5.140798935026396,
+          "cpu_seconds": 2.9852881369999977,
+          "milliseconds_per_image": 160.64996671957488,
+          "requests": 1224,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 256,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.query_entities": 32,
+            "embeddings.query_entities": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 320
+          },
+          "phases": {
+            "face_seconds": 2.9607740430510603,
+            "capture_delivery_seconds": 2.179793251969386
+          },
+          "output_digest": "39e66119b1174be17db75ec4992c41293ddda8807608182c2df413c68bc43684",
+          "round": 3
+        },
+        {
+          "mode": "current",
+          "faces": 8,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 3.796308188000694,
+          "cpu_seconds": 3.0161571959999947,
+          "milliseconds_per_image": 118.63463087502168,
+          "requests": 1056,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.query_entities": 64,
+            "embeddings.submit_transaction": 32,
+            "faces.submit_transaction": 32,
+            "faces.query_entities": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 320
+          },
+          "phases": {
+            "face_seconds": 1.722980745951645,
+            "capture_delivery_seconds": 2.0730739290011115
+          },
+          "output_digest": "39e66119b1174be17db75ec4992c41293ddda8807608182c2df413c68bc43684",
+          "round": 3
+        },
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": true,
+          "wall_seconds": 2.3113885350176133,
+          "cpu_seconds": 1.7491770999999972,
+          "milliseconds_per_image": 72.23089171930042,
+          "requests": 864,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "faces.get_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.update_entity": 32,
+            "faces.update_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 1.0755561719997786,
+            "capture_delivery_seconds": 1.235635542019736
+          },
+          "output_digest": "b6fe7051228f86d3bf92db410d20b33f46e99f295be3944d41619c27991e729c",
+          "round": 0
+        },
+        {
+          "mode": "batch",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": true,
+          "wall_seconds": 3.184395963966381,
+          "cpu_seconds": 1.774055126999997,
+          "milliseconds_per_image": 99.5123738739494,
+          "requests": 808,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "faces.get_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 1.9488805459695868,
+            "capture_delivery_seconds": 1.2353076380677521
+          },
+          "output_digest": "b6fe7051228f86d3bf92db410d20b33f46e99f295be3944d41619c27991e729c",
+          "round": 0
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": true,
+          "wall_seconds": 2.2183998959953897,
+          "cpu_seconds": 1.7248936449999803,
+          "milliseconds_per_image": 69.32499674985593,
+          "requests": 800,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "faces.get_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.update_entity": 32,
+            "faces.update_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.0793289929861203,
+            "capture_delivery_seconds": 1.1387010519974865
+          },
+          "output_digest": "b6fe7051228f86d3bf92db410d20b33f46e99f295be3944d41619c27991e729c",
+          "round": 0
+        },
+        {
+          "mode": "combined",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": true,
+          "wall_seconds": 2.9688340720022097,
+          "cpu_seconds": 1.624310386000019,
+          "milliseconds_per_image": 92.77606475006905,
+          "requests": 744,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "faces.get_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.8657373859896325,
+            "capture_delivery_seconds": 1.1028577769757248
+          },
+          "output_digest": "b6fe7051228f86d3bf92db410d20b33f46e99f295be3944d41619c27991e729c",
+          "round": 0
+        },
+        {
+          "mode": "combined",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": true,
+          "wall_seconds": 2.8250900100101717,
+          "cpu_seconds": 1.6494543790000193,
+          "milliseconds_per_image": 88.28406281281787,
+          "requests": 744,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "faces.get_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.6746479360153899,
+            "capture_delivery_seconds": 1.1502359199803323
+          },
+          "output_digest": "b6fe7051228f86d3bf92db410d20b33f46e99f295be3944d41619c27991e729c",
+          "round": 1
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": true,
+          "wall_seconds": 2.271495404012967,
+          "cpu_seconds": 1.6968424889999767,
+          "milliseconds_per_image": 70.98423137540522,
+          "requests": 800,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "faces.get_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.update_entity": 32,
+            "faces.update_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.0868151640170254,
+            "capture_delivery_seconds": 1.1844795580254868
+          },
+          "output_digest": "b6fe7051228f86d3bf92db410d20b33f46e99f295be3944d41619c27991e729c",
+          "round": 1
+        },
+        {
+          "mode": "batch",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": true,
+          "wall_seconds": 3.239046178001445,
+          "cpu_seconds": 1.6969718229999842,
+          "milliseconds_per_image": 101.22019306254515,
+          "requests": 808,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "faces.get_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 1.9907497059903108,
+            "capture_delivery_seconds": 1.24809585994808
+          },
+          "output_digest": "b6fe7051228f86d3bf92db410d20b33f46e99f295be3944d41619c27991e729c",
+          "round": 1
+        },
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": true,
+          "wall_seconds": 2.372399664018303,
+          "cpu_seconds": 1.7534795170000166,
+          "milliseconds_per_image": 74.13748950057197,
+          "requests": 864,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "faces.get_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.update_entity": 32,
+            "faces.update_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 1.0382825860287994,
+            "capture_delivery_seconds": 1.3338547340244986
+          },
+          "output_digest": "b6fe7051228f86d3bf92db410d20b33f46e99f295be3944d41619c27991e729c",
+          "round": 1
+        },
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": true,
+          "wall_seconds": 2.3512316130218096,
+          "cpu_seconds": 1.855906066999978,
+          "milliseconds_per_image": 73.47598790693155,
+          "requests": 864,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "faces.get_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.update_entity": 32,
+            "faces.update_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 1.0642071850015782,
+            "capture_delivery_seconds": 1.2868183159735054
+          },
+          "output_digest": "b6fe7051228f86d3bf92db410d20b33f46e99f295be3944d41619c27991e729c",
+          "round": 2
+        },
+        {
+          "mode": "batch",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": true,
+          "wall_seconds": 3.064584309991915,
+          "cpu_seconds": 1.8162173529999848,
+          "milliseconds_per_image": 95.76825968724734,
+          "requests": 808,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "faces.get_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 1.8153761719586328,
+            "capture_delivery_seconds": 1.2489994859788567
+          },
+          "output_digest": "b6fe7051228f86d3bf92db410d20b33f46e99f295be3944d41619c27991e729c",
+          "round": 2
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": true,
+          "wall_seconds": 2.1101833669818006,
+          "cpu_seconds": 1.6541338250000024,
+          "milliseconds_per_image": 65.94323021818127,
+          "requests": 800,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "faces.get_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.update_entity": 32,
+            "faces.update_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.0004830640391447,
+            "capture_delivery_seconds": 1.1094947109813802
+          },
+          "output_digest": "b6fe7051228f86d3bf92db410d20b33f46e99f295be3944d41619c27991e729c",
+          "round": 2
+        },
+        {
+          "mode": "combined",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": true,
+          "wall_seconds": 3.2381254610372707,
+          "cpu_seconds": 1.7483711169999765,
+          "milliseconds_per_image": 101.19142065741471,
+          "requests": 744,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "faces.get_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.952944881923031,
+            "capture_delivery_seconds": 1.284847862960305
+          },
+          "output_digest": "b6fe7051228f86d3bf92db410d20b33f46e99f295be3944d41619c27991e729c",
+          "round": 2
+        },
+        {
+          "mode": "combined",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": true,
+          "wall_seconds": 3.0820337629993446,
+          "cpu_seconds": 1.7381563419999964,
+          "milliseconds_per_image": 96.31355509372952,
+          "requests": 744,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "faces.get_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.92205049097538,
+            "capture_delivery_seconds": 1.159742429968901
+          },
+          "output_digest": "b6fe7051228f86d3bf92db410d20b33f46e99f295be3944d41619c27991e729c",
+          "round": 3
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": true,
+          "wall_seconds": 2.2564526660135016,
+          "cpu_seconds": 1.743540190999994,
+          "milliseconds_per_image": 70.51414581292192,
+          "requests": 800,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "faces.get_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.update_entity": 32,
+            "faces.update_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.1061641899868846,
+            "capture_delivery_seconds": 1.1500723080243915
+          },
+          "output_digest": "b6fe7051228f86d3bf92db410d20b33f46e99f295be3944d41619c27991e729c",
+          "round": 3
+        },
+        {
+          "mode": "batch",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": true,
+          "wall_seconds": 3.2641869130311534,
+          "cpu_seconds": 1.8618003139999928,
+          "milliseconds_per_image": 102.00584103222354,
+          "requests": 808,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "faces.get_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 1.937425289012026,
+            "capture_delivery_seconds": 1.3264619009569287
+          },
+          "output_digest": "b6fe7051228f86d3bf92db410d20b33f46e99f295be3944d41619c27991e729c",
+          "round": 3
+        },
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": true,
+          "wall_seconds": 2.411740954965353,
+          "cpu_seconds": 1.8788942850000012,
+          "milliseconds_per_image": 75.36690484266728,
+          "requests": 864,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "faces.get_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.update_entity": 32,
+            "faces.update_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 1.0777426939457655,
+            "capture_delivery_seconds": 1.3337504000519402
+          },
+          "output_digest": "b6fe7051228f86d3bf92db410d20b33f46e99f295be3944d41619c27991e729c",
+          "round": 3
+        }
+      ]
+    },
+    "parallel_followup": {
+      "scope": "Isolated persistence prototypes; never imported by the application.\n\nUses production face writers, capture and completion acceptance. Only immutable\nreceipt rereads and bounded cross-image artifact writes are intercepted. No\nmodel, blob promotion, wave orchestration or full-upload throughput is measured.\n",
+      "output_parity": true,
+      "reports": [
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.483182105992455,
+          "cpu_seconds": 1.7053549020000007,
+          "milliseconds_per_image": 77.59944081226422,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 1.0689190350822173,
+            "capture_delivery_seconds": 1.4140035409945995
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 0
+        },
+        {
+          "mode": "batch_parallel",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.619518141960725,
+          "cpu_seconds": 1.7148049360000002,
+          "milliseconds_per_image": 81.85994193627266,
+          "requests": 776,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "batch_guard_seconds": 0.3011935740360059,
+            "batch_write_seconds": 0.23522612993838266,
+            "batch_lookup_publish_seconds": 0.24897562799742445,
+            "face_seconds": 1.1217367129866034,
+            "capture_delivery_seconds": 1.4975092409877107
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 0
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.0615259030018933,
+          "cpu_seconds": 1.5943987180000008,
+          "milliseconds_per_image": 64.42268446880917,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 0.9802949680015445,
+            "capture_delivery_seconds": 1.0809841869049706
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 0
+        },
+        {
+          "mode": "combined_parallel",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.244458339002449,
+          "cpu_seconds": 1.5748555839999998,
+          "milliseconds_per_image": 70.13932309382653,
+          "requests": 712,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "batch_guard_seconds": 0.32030551810748875,
+            "batch_write_seconds": 0.27223456784849986,
+            "batch_lookup_publish_seconds": 0.22587535803904757,
+            "face_seconds": 1.142916994926054,
+            "capture_delivery_seconds": 1.1013007570290938
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 0
+        },
+        {
+          "mode": "combined_parallel",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.244865845015738,
+          "cpu_seconds": 1.6117033850000002,
+          "milliseconds_per_image": 70.15205765674182,
+          "requests": 712,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "batch_guard_seconds": 0.2911845629569143,
+            "batch_write_seconds": 0.2261160350171849,
+            "batch_lookup_publish_seconds": 0.26335975294932723,
+            "face_seconds": 1.0972781620221213,
+            "capture_delivery_seconds": 1.1472926410497166
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 1
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.1532705340068787,
+          "cpu_seconds": 1.6662955180000019,
+          "milliseconds_per_image": 67.28970418771496,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.0328339549596421,
+            "capture_delivery_seconds": 1.1201905120396987
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 1
+        },
+        {
+          "mode": "batch_parallel",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.298369869007729,
+          "cpu_seconds": 1.7086484190000029,
+          "milliseconds_per_image": 71.82405840649153,
+          "requests": 776,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "batch_guard_seconds": 0.3040474579902366,
+            "batch_write_seconds": 0.1820306150475517,
+            "batch_lookup_publish_seconds": 0.2494304919964634,
+            "face_seconds": 1.0437563300947659,
+            "capture_delivery_seconds": 1.2541204189765267
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 1
+        },
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.3323865569545887,
+          "cpu_seconds": 1.7222747240000018,
+          "milliseconds_per_image": 72.8870799048309,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 0.9911586359958164,
+            "capture_delivery_seconds": 1.3410142181091942
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 1
+        },
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.335879735997878,
+          "cpu_seconds": 1.6923116989999976,
+          "milliseconds_per_image": 72.99624174993369,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 1.0434848989825696,
+            "capture_delivery_seconds": 1.2921543139382266
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 2
+        },
+        {
+          "mode": "batch_parallel",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.3137344229617156,
+          "cpu_seconds": 1.7188023079999972,
+          "milliseconds_per_image": 72.30420071755361,
+          "requests": 776,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "batch_guard_seconds": 0.30581646494101733,
+            "batch_write_seconds": 0.17557526601012796,
+            "batch_lookup_publish_seconds": 0.24553877190919593,
+            "face_seconds": 1.047447320946958,
+            "capture_delivery_seconds": 1.2660508870030753
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 2
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.179583796998486,
+          "cpu_seconds": 1.6973696280000006,
+          "milliseconds_per_image": 68.11199365620269,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.010589612997137,
+            "capture_delivery_seconds": 1.1687340780044906
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 2
+        },
+        {
+          "mode": "combined_parallel",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.1786011590156704,
+          "cpu_seconds": 1.6017540130000008,
+          "milliseconds_per_image": 68.0812862192397,
+          "requests": 712,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "batch_guard_seconds": 0.3076445151818916,
+            "batch_write_seconds": 0.17852887604385614,
+            "batch_lookup_publish_seconds": 0.2280228700255975,
+            "face_seconds": 1.0350543690728955,
+            "capture_delivery_seconds": 1.14327283896273
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 2
+        },
+        {
+          "mode": "combined_parallel",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.1966919570113532,
+          "cpu_seconds": 1.58804855,
+          "milliseconds_per_image": 68.64662365660479,
+          "requests": 712,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "batch_guard_seconds": 0.3298183820443228,
+            "batch_write_seconds": 0.19252848904579878,
+            "batch_lookup_publish_seconds": 0.23155988805228844,
+            "face_seconds": 1.0951236170367338,
+            "capture_delivery_seconds": 1.1013321258942597
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 3
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.2193541359738447,
+          "cpu_seconds": 1.6227853420000002,
+          "milliseconds_per_image": 69.35481674918265,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.0628043480101041,
+            "capture_delivery_seconds": 1.1563018040033057
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 3
+        },
+        {
+          "mode": "batch_parallel",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.3469872149871662,
+          "cpu_seconds": 1.7450678559999986,
+          "milliseconds_per_image": 73.34335046834894,
+          "requests": 776,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 4,
+            "faces.submit_transaction": 4,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "batch_guard_seconds": 0.2992398400674574,
+            "batch_write_seconds": 0.18122478801524267,
+            "batch_lookup_publish_seconds": 0.24525507091311738,
+            "face_seconds": 1.0513594379881397,
+            "capture_delivery_seconds": 1.2954056879971176
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 3
+        },
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 8,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.3978850479470566,
+          "cpu_seconds": 1.8136160190000012,
+          "milliseconds_per_image": 74.93390774834552,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 1.0588232189766131,
+            "capture_delivery_seconds": 1.3388033950468525
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 3
+        },
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.1789212549920194,
+          "cpu_seconds": 1.7210503439999982,
+          "milliseconds_per_image": 68.0912892185006,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 0.9761613839655183,
+            "capture_delivery_seconds": 1.202546258980874
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 0
+        },
+        {
+          "mode": "batch_parallel",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.187106124998536,
+          "cpu_seconds": 1.6933334619999982,
+          "milliseconds_per_image": 68.34706640620425,
+          "requests": 772,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 2,
+            "faces.submit_transaction": 2,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "batch_guard_seconds": 0.27695285103982314,
+            "batch_write_seconds": 0.13828948698937893,
+            "batch_lookup_publish_seconds": 0.2260168389766477,
+            "face_seconds": 0.9405686379759572,
+            "capture_delivery_seconds": 1.2462987609324045
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 0
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.0985094300122,
+          "cpu_seconds": 1.6227839730000042,
+          "milliseconds_per_image": 65.57841968788125,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 0.9684652959695086,
+            "capture_delivery_seconds": 1.1297790890093893
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 0
+        },
+        {
+          "mode": "combined_parallel",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.007164553971961,
+          "cpu_seconds": 1.571227160999996,
+          "milliseconds_per_image": 62.723892311623786,
+          "requests": 708,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 2,
+            "faces.submit_transaction": 2,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "batch_guard_seconds": 0.273783638025634,
+            "batch_write_seconds": 0.13795395498163998,
+            "batch_lookup_publish_seconds": 0.2046760730445385,
+            "face_seconds": 0.9195093809394166,
+            "capture_delivery_seconds": 1.0874344969633967
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 0
+        },
+        {
+          "mode": "combined_parallel",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.029459493001923,
+          "cpu_seconds": 1.5612258649999973,
+          "milliseconds_per_image": 63.42060915631009,
+          "requests": 708,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 2,
+            "faces.submit_transaction": 2,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "batch_guard_seconds": 0.2736397789558396,
+            "batch_write_seconds": 0.13959541206713766,
+            "batch_lookup_publish_seconds": 0.21490198001265526,
+            "face_seconds": 0.9376195869408548,
+            "capture_delivery_seconds": 1.091571354016196
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 1
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.139874944987241,
+          "cpu_seconds": 1.6332457600000012,
+          "milliseconds_per_image": 66.87109203085129,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 0.9649091849569231,
+            "capture_delivery_seconds": 1.1746986939688213
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 1
+        },
+        {
+          "mode": "batch_parallel",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.1706022830330767,
+          "cpu_seconds": 1.6856714420000003,
+          "milliseconds_per_image": 67.83132134478365,
+          "requests": 772,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 2,
+            "faces.submit_transaction": 2,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "batch_guard_seconds": 0.26349540206138045,
+            "batch_write_seconds": 0.17978548910468817,
+            "batch_lookup_publish_seconds": 0.2167650010669604,
+            "face_seconds": 0.940947504946962,
+            "capture_delivery_seconds": 1.2294066360336728
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 1
+        },
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.291712278034538,
+          "cpu_seconds": 1.788236830999999,
+          "milliseconds_per_image": 71.61600868857931,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 1.009585209947545,
+            "capture_delivery_seconds": 1.281893473060336
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 1
+        },
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.2293929959996603,
+          "cpu_seconds": 1.6982346679999978,
+          "milliseconds_per_image": 69.66853112498939,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 0.9410421340144239,
+            "capture_delivery_seconds": 1.2881223260774277
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 2
+        },
+        {
+          "mode": "batch_parallel",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.2518802040140145,
+          "cpu_seconds": 1.7758629559999974,
+          "milliseconds_per_image": 70.37125637543795,
+          "requests": 772,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 2,
+            "faces.submit_transaction": 2,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "batch_guard_seconds": 0.2921564640128054,
+            "batch_write_seconds": 0.14537517708959058,
+            "batch_lookup_publish_seconds": 0.21588088799035177,
+            "face_seconds": 0.949616273981519,
+            "capture_delivery_seconds": 1.302037674060557
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 2
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.1833448390243575,
+          "cpu_seconds": 1.741609797999999,
+          "milliseconds_per_image": 68.22952621951117,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 0.993401488987729,
+            "capture_delivery_seconds": 1.1896861860295758
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 2
+        },
+        {
+          "mode": "combined_parallel",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.2359841919969767,
+          "cpu_seconds": 1.7148507380000027,
+          "milliseconds_per_image": 69.87450599990552,
+          "requests": 708,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 2,
+            "faces.submit_transaction": 2,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "batch_guard_seconds": 0.28181226702872664,
+            "batch_write_seconds": 0.14448471297509968,
+            "batch_lookup_publish_seconds": 0.2454727590084076,
+            "face_seconds": 0.9892845279537141,
+            "capture_delivery_seconds": 1.2464637419907376
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 2
+        },
+        {
+          "mode": "combined_parallel",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.0743152640061453,
+          "cpu_seconds": 1.6168128520000025,
+          "milliseconds_per_image": 64.82235200019204,
+          "requests": 708,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 2,
+            "faces.submit_transaction": 2,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "batch_guard_seconds": 0.26480118598556146,
+            "batch_write_seconds": 0.14566311100497842,
+            "batch_lookup_publish_seconds": 0.23423003597417846,
+            "face_seconds": 0.9540987309883349,
+            "capture_delivery_seconds": 1.1198686020215973
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 3
+        },
+        {
+          "mode": "receipts",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.1720746870269068,
+          "cpu_seconds": 1.702799412999994,
+          "milliseconds_per_image": 67.87733396959084,
+          "requests": 768,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 32
+          },
+          "phases": {
+            "face_seconds": 1.0607967200339772,
+            "capture_delivery_seconds": 1.1109938790323213
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 3
+        },
+        {
+          "mode": "batch_parallel",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.5430980550008826,
+          "cpu_seconds": 1.8467282280000035,
+          "milliseconds_per_image": 79.47181421877758,
+          "requests": 772,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.submit_transaction": 2,
+            "faces.submit_transaction": 2,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "batch_guard_seconds": 0.3032659270102158,
+            "batch_write_seconds": 0.1632361959782429,
+            "batch_lookup_publish_seconds": 0.2438711579889059,
+            "face_seconds": 1.1334614949882962,
+            "capture_delivery_seconds": 1.4093364600557834
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 3
+        },
+        {
+          "mode": "current",
+          "faces": 1,
+          "images": 32,
+          "group": 16,
+          "workers": 3,
+          "seeded": false,
+          "wall_seconds": 2.4646376929595135,
+          "cpu_seconds": 1.8616143229999977,
+          "milliseconds_per_image": 77.0199279049848,
+          "requests": 832,
+          "calls": {
+            "lookup.get_entity": 192,
+            "metadata.get_entity": 192,
+            "lookup.update_entity": 64,
+            "embeddings.get_entity": 64,
+            "embeddings.create_entity": 32,
+            "faces.create_entity": 32,
+            "faces.get_entity": 32,
+            "jobs.submit_transaction": 96,
+            "metadata.update_entity": 32,
+            "jobs.get_entity": 96
+          },
+          "phases": {
+            "face_seconds": 1.042078019992914,
+            "capture_delivery_seconds": 1.422252387041226
+          },
+          "output_digest": "365c8a95a1e7d1e5e5520ee96ec335a0abeafde0befc016faac8a91c591f245f",
+          "round": 3
+        }
+      ]
+    }
+  },
+  "cleanup_verified": "2026-10-29T14:25:02.850965+00:00"
+}
