@@ -1689,17 +1689,20 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
             // See _write_cluster_buffer_checkpoint / _recover_stranded_cluster_buffer_checkpoints.
             { name: 'CLUSTER_BUFFER_CHECKPOINT_DIR', value: '/mnt/photostore/shared/cluster-buffers' }
             // How many photos one replica processes concurrently (see
-            // IPWORKER_CONCURRENCY in backend/app.py). Was raised live to 3
-            // out-of-band at some point (found as bicep/live drift on
-            // 2026-08-25). Lowered back to 2 on 2026-08-27 after per-step
-            // timing logs (see _run_ipwork_steps/_handle_ipwork_queue_payload)
-            // showed 3 concurrent OCR/face passes (both CPU-bound: pytesseract
-            // shells out to the tesseract binary, face runs YOLO+AdaFace)
-            // fighting over only 2 vCPU -- per-message wall time (steps_ms)
-            // ran 2-5x higher than any single photo's own step-sum, the
-            // signature of CPU oversubscription rather than I/O wait.
-            // Re-benchmark before raising this again without also raising cpu.
-            { name: 'IPWORKER_CONCURRENCY', value: '2' }
+            // IPWORKER_CONCURRENCY in backend/app.py). History: raised live to 3
+            // out-of-band (bicep/live drift 2026-08-25), then lowered to 2 on
+            // 2026-08-27 when 3 concurrent OCR/face passes oversubscribed 2 vCPU
+            // (per-message steps_ms ran 2-5x a single photo's own step-sum --
+            // CPU oversubscription, not I/O wait). That oversubscription was
+            // then fixed at its source by the native-thread caps below
+            // (OMP_THREAD_LIMIT=1, OPENBLAS_NUM_THREADS=1). A matched Azure run
+            // (docs/benchmarks/vision-concurrency-azure-20261029.md) showed 3
+            // workers beat 2 by ~15-24% while apply/storage still has wait to
+            // overlap, and 3 has run live since. 3 is now the source of truth
+            // (was still '2' in bicep -- drift corrected 2026-10-30). Retest and
+            // consider returning to 2 if apply/persistence gets much faster
+            // under the same 2 vCPU quota.
+            { name: 'IPWORKER_CONCURRENCY', value: '3' }
             // Confirmed live 2026-08-27: this image's tesseract build spawns
             // multiple OS threads per image_to_string() call by default (no
             // prior thread cap existed anywhere in this Dockerfile/entrypoint).
@@ -1717,8 +1720,20 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
             // Separate from Tesseract's OpenMP cap: NumPy/SciPy/OpenCV use
             // OpenBLAS pools. Matched two-CPU runs measured 29.5% less stage
             // wall time at one BLAS thread, with identical outputs on 48 inputs.
-            // Keep aligned with the Vision image default; source workers stay 2.
+            // Keep aligned with the Vision image default; this single-thread cap
+            // is what makes IPWORKER_CONCURRENCY=3 safe on 2 vCPU.
             { name: 'OPENBLAS_NUM_THREADS', value: '1' }
+            // Run the per-image CLIP image/text encode through a one-thread FP32
+            // ONNX session instead of PyTorch (backend/vision_utils.py). Same
+            // weights, preprocessing, normalization and shared model lock; a
+            // matched local run (docs/benchmarks/vision-next-gains-independent-
+            // 20261029.md) measured ~7% less wall AND CPU per encode at identical
+            // embeddings (cosine > 0.999999). Fixed batch size 1 (a dynamic axis
+            // regressed the single-image case). Exports the towers once at warmup
+            // and falls back to PyTorch if export/load fails, so it can degrade
+            // but never break encoding. Enabled live 2026-10-30 (was an az
+            // env-var override before this; bicep is now the source of truth).
+            { name: 'IPWORK_CLIP_ONNX', value: 'true' }
             // receive_messages() with no visibility_timeout defaults to Azure's
             // 30s, which a single ipwork pass (YOLO + MediaPipe + AdaFace + CLIP
             // + tesseract OCR in sequence) can exceed -- see
