@@ -157,6 +157,29 @@ class ExecutionLeases:
                 continue
         raise RuntimeError('Execution claim contention')
 
+    def active(self, library):
+        """True if any stage for `library` currently holds a live (running,
+        unexpired) execution lease.
+
+        Background artifact cleanup uses this to yield to an in-flight wave
+        instead of fencing it. Unlike the per-photo source lease -- which is
+        released between page groups and so leaves gaps a cleanup pass can slip
+        into -- the stage lease is held for a wave's whole stage, so this also
+        covers the inter-page-group windows. It is partition-local and bounded,
+        and a crashed holder's lease expires, so a dead wave cannot block
+        cleanup forever. The status filter is applied again in Python because
+        some table backends ignore secondary predicates."""
+        now = self.clock()
+        prefix = f'{library}!'
+        partition = self.partition.replace("'", "''")
+        rows = self.table.query_entities(f"PartitionKey eq '{partition}' and status eq 'running'")
+        for row in rows:
+            if (str(row.get('RowKey', '')).startswith(prefix)
+                    and row.get('status') == 'running'
+                    and float(row.get('leaseUntil') or 0) > now):
+                return True
+        return False
+
     def _authoritative(self, ownership):
         current = self._get(ownership.key)
         if (current is None or current['owner'] != ownership.owner or current['epoch'] != ownership.epoch

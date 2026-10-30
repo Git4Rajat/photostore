@@ -393,6 +393,16 @@ def collect_library_artifacts(table,storage,metadata,library,*,limit=50,purge=Fa
     store=_wave_store(table,library)
     if not store:return dict(deletedManifests=0)
     if not 1<=limit<=1000:raise ValueError('Cleanup bound exceeded')
+    # Yield to an in-flight wave rather than fencing it. Acquiring gcUntil below
+    # while a stage is mid-wave is exactly what stalled Vision (and, via repeated
+    # re-fencing, stranded it far past the 600s lease). Abandoned-artifact GC can
+    # wait; the caller reschedules. Full library cleanup (cleanupState) still
+    # proceeds -- intake is already closed for it, and its fencing is intended.
+    policy_snapshot=store._get('policy')
+    if not (policy_snapshot and policy_snapshot.get('cleanupState')):
+        from execution_lease import ExecutionLeases
+        if ExecutionLeases(store.table,partition=store.partition,clock=store.clock).active(library):
+            return dict(deletedManifests=0,deferred=True,reason='wave_active')
     import uuid
     from upload_waves import Conflict
     owner=uuid.uuid4().hex
@@ -499,6 +509,10 @@ def finish_library_cleanup(table,library,*,purged=False):
 
 
 GC_PARTITION='upload-wave-cleanup-pending'
+# How long background artifact GC waits before retrying when it yielded to a
+# live wave stage. Short enough to run soon after the wave frees the library,
+# long enough not to spin while a multi-hour wave is still processing.
+WAVE_ACTIVE_RETRY_DELAY_SECONDS=60
 
 
 def request_artifact_cleanup(table,library):
@@ -548,6 +562,11 @@ def run_artifact_cleanup(payload):
         with publication(work,claim) as guard:
             result=collect_library_artifacts(store.table,app.storage_utils_module,app.metadata_table_client,
                 library,lease_check=guard.check)
+        if result.get('reason')=='wave_active':
+            # Deferred because a wave stage is live; reschedule past it rather
+            # than hot-looping. gcRequested stays set so the GC is never lost.
+            work.release(claim,deferred=True,retry_delay=WAVE_ACTIVE_RETRY_DELAY_SECONDS,retry_reason='wave_active')
+            return result
         if store._required('policy').get('gcRequested'):
             work.release(claim,deferred=True)
         else:work.finish(claim)

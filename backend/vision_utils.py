@@ -43,6 +43,104 @@ _MODEL_PRETRAINED = ''
 # ipworker threads can't corrupt each other's inference.
 _MODEL_LOCK = threading.Lock()
 
+# Opt-in: run the per-image CLIP image/text encode through a one-thread FP32
+# ONNX session instead of PyTorch. Same FP32 weights, same preprocessing, same
+# normalization and shared lock -- only the forward() kernel changes. A local
+# matched benchmark measured ~7% less wall AND less CPU per encode at identical
+# outputs (cosine > 0.999999); see docs/benchmarks/vision-next-gains-independent
+# -20261029.md. Fixed batch size 1 on purpose: a dynamic batch axis regressed
+# the single-image case (same effect seen for AdaFace), so only the single-item
+# hot paths route here; the rarely-used batch/vocab encoders stay on PyTorch.
+# Default off: enabling it is the matched two-vCPU validation the benchmark
+# flagged as the required next step, and any export/load failure falls back to
+# PyTorch so the flag can never break encoding.
+_ONNX_IMAGE = None
+_ONNX_TEXT = None
+_ONNX_LOADED: Optional[bool] = None
+_ONNX_LOCK = threading.Lock()
+
+
+def _clip_onnx_enabled() -> bool:
+    return os.getenv('IPWORK_CLIP_ONNX', '').strip().lower() in ('1', 'true', 'yes')
+
+
+def _load_onnx_towers() -> bool:
+    """Export the image/text towers to fixed-batch-1 FP32 ONNX once per process
+    and build one-thread sessions. Returns False (and leaves encoding on
+    PyTorch) when disabled or if export/load fails for any reason."""
+    global _ONNX_IMAGE, _ONNX_TEXT, _ONNX_LOADED
+    if not _clip_onnx_enabled():
+        return False
+    if _ONNX_LOADED is not None:
+        return _ONNX_LOADED
+    with _ONNX_LOCK:
+        if _ONNX_LOADED is not None:
+            return _ONNX_LOADED
+        try:
+            import tempfile
+            import onnxruntime as ort
+            if not _load_model():
+                raise RuntimeError('CLIP model unavailable for ONNX export')
+
+            class _Tower(torch.nn.Module):
+                def __init__(self, model, kind):
+                    super().__init__()
+                    self.model, self.kind = model, kind
+
+                def forward(self, value):
+                    # Raw (un-normalized) features: the callers normalize, so
+                    # this stays numerically identical to the PyTorch path.
+                    return (self.model.encode_image(value) if self.kind == 'image'
+                            else self.model.encode_text(value))
+
+            directory = tempfile.mkdtemp(prefix='photostore-clip-onnx-')
+            example = {'image': _PREPROCESS(Image.new('RGB', (224, 224))).unsqueeze(0).to(_device()),
+                       'text': _TOKENIZER(['a']).to(_device())}
+            # The legacy exporter needs the decomposed attention path rather than
+            # the CPU fast-path native-attention operator; live inference keeps
+            # its normal fast path.
+            fastpath = torch.backends.mha.get_fastpath_enabled()
+            torch.backends.mha.set_fastpath_enabled(False)
+            try:
+                with torch.no_grad():
+                    for kind in ('image', 'text'):
+                        torch.onnx.export(_Tower(_MODEL, kind).eval(), (example[kind],),
+                            os.path.join(directory, kind + '.onnx'), input_names=['input'],
+                            output_names=['features'], opset_version=17, dynamo=False)
+            finally:
+                torch.backends.mha.set_fastpath_enabled(fastpath)
+            options = ort.SessionOptions()
+            options.intra_op_num_threads, options.inter_op_num_threads = 1, 1
+            _ONNX_IMAGE = ort.InferenceSession(os.path.join(directory, 'image.onnx'),
+                sess_options=options, providers=['CPUExecutionProvider'])
+            _ONNX_TEXT = ort.InferenceSession(os.path.join(directory, 'text.onnx'),
+                sess_options=options, providers=['CPUExecutionProvider'])
+            _ONNX_LOADED = True
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning('ONNX CLIP towers unavailable; using PyTorch', exc_info=True)
+            _ONNX_IMAGE = _ONNX_TEXT = None
+            _ONNX_LOADED = False
+        return _ONNX_LOADED
+
+
+def _image_tower_features(pixels):
+    """encode_image for a single prepared [1,3,H,W] tensor, via ONNX when
+    enabled and loaded, else PyTorch. Returns raw (un-normalized) features."""
+    if _load_onnx_towers():
+        output = _ONNX_IMAGE.run(['features'], {'input': pixels.detach().cpu().numpy()})[0]
+        return torch.from_numpy(output)
+    return _MODEL.encode_image(pixels)
+
+
+def _text_tower_features(tokens):
+    """encode_text for a single prepared [1,T] token tensor, via ONNX when
+    enabled and loaded, else PyTorch. Returns raw (un-normalized) features."""
+    if _load_onnx_towers():
+        output = _ONNX_TEXT.run(['features'], {'input': tokens.detach().cpu().numpy()})[0]
+        return torch.from_numpy(output)
+    return _MODEL.encode_text(tokens)
+
 _FALLBACK_EMBEDDING_DIMS = max(256, int(os.getenv('TEXT_EMBEDDING_FALLBACK_DIMS', '1024')))
 if _FALLBACK_EMBEDDING_DIMS % 2:
     _FALLBACK_EMBEDDING_DIMS += 1
@@ -162,7 +260,7 @@ def _encode_text_embedding_single(text: str) -> List[float]:
                 metrics.add(text_lock_wait_ms=(time.monotonic() - waiting) * 1000)
                 started = time.monotonic()
                 try:
-                    text_features = _MODEL.encode_text(tokens)
+                    text_features = _text_tower_features(tokens)
                 finally:
                     metrics.add(text_inference_ms=(time.monotonic() - started) * 1000)
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
@@ -240,7 +338,7 @@ def _encode_image_tensor_single(tensor):
             metrics.add(clip_lock_wait_ms=(time.monotonic() - waiting) * 1000)
             started = time.monotonic()
             try:
-                features = _MODEL.encode_image(tensor)
+                features = _image_tower_features(tensor)
             finally:
                 metrics.add(clip_inference_ms=(time.monotonic() - started) * 1000)
         features = features / features.norm(dim=-1, keepdim=True)

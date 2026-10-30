@@ -180,3 +180,41 @@ def test_local_keepalive_checks_do_not_read_tables_and_cannot_extend_expiry(leas
             assert len(reads) == baseline
             now[0] += leases.lease_seconds + 1
             check()
+
+
+def test_active_detects_a_live_running_stage_lease(leases):
+    leases.claim('lib', 'wave-1', 'vision', 'rev-1')
+    assert leases.active('lib') is True
+
+
+def test_active_ignores_an_expired_lease(leases):
+    leases.claim('lib', 'wave-1', 'vision', 'rev-1')
+    leases.clock.value += 1000  # Past lease_seconds -- a crashed holder must not block cleanup forever.
+    assert leases.active('lib') is False
+
+
+def test_active_ignores_a_released_lease(leases):
+    ownership = leases.claim('lib', 'wave-1', 'vision', 'rev-1')
+    leases.release(ownership)
+    assert leases.active('lib') is False
+
+
+def test_active_ignores_a_completed_lease(leases):
+    ownership = leases.claim('lib', 'wave-1', 'vision', 'rev-1')
+    leases.complete(ownership, 'receipt')
+    assert leases.active('lib') is False
+
+
+def test_active_is_scoped_to_the_library(leases):
+    leases.claim('lib-a', 'wave-1', 'vision', 'rev-1')
+    assert leases.active('lib-a') is True
+    assert leases.active('lib-b') is False
+
+
+def test_active_is_false_with_no_leases(leases):
+    assert leases.active('lib') is False
+
+
+def test_active_sees_any_live_stage_not_just_vision(leases):
+    leases.claim('lib', 'wave-1', 'cluster', 'rev-1')
+    assert leases.active('lib') is True

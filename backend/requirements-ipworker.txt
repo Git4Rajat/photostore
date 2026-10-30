@@ -17,6 +17,10 @@
 torch==2.13.0
 open_clip_torch==3.3.0
 onnxruntime==1.28.0
+# Export-only (torch.onnx.export) for the opt-in one-thread ONNX CLIP path in
+# vision_utils (IPWORK_CLIP_ONNX). onnxruntime above runs the exported graph;
+# this is needed only to produce it at warmup. Unused when the flag is off.
+onnx==1.23.2
 opencv-python-headless==5.0.0.93
 mediapipe==1.0.0
 tesserocr==2.8.0

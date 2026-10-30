@@ -16843,6 +16843,11 @@ def _prewarm_ipwork_models() -> None:
     try:
         import vision_utils
         processing_diagnostics.call('vision', 'warm_clip', vision_utils._load_model)
+        # Opt-in one-thread ONNX CLIP (IPWORK_CLIP_ONNX): export the towers here
+        # so the one-time cost is paid at warmup, not on the first photo. A
+        # no-op when the flag is off; falls back to PyTorch if export fails.
+        if vision_utils._clip_onnx_enabled():
+            processing_diagnostics.call('vision', 'warm_clip_onnx', vision_utils._load_onnx_towers)
     except Exception:
         worker_logger.exception('vision_utils CLIP model pre-warm failed')
     try:

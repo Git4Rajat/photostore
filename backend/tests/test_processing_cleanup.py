@@ -6,8 +6,9 @@ from azure.core.exceptions import ResourceNotFoundError
 from fakes import FakeTable
 from processing_artifacts import staging_name
 from processing_cleanup import (
-    delete_orphaned_manifest, delete_staging_attempt, orphaned_manifest_candidates,
-    protected_artifacts, referenced_manifest_ids, retained_manifest_rows,
+    collect_library_artifacts, delete_orphaned_manifest, delete_staging_attempt,
+    orphaned_manifest_candidates, protected_artifacts, referenced_manifest_ids,
+    retained_manifest_rows,
 )
 from upload_waves import digest
 
@@ -170,3 +171,23 @@ def test_delete_orphaned_manifest_never_deletes_a_blob_or_snapshot_shared_with_a
     assert (partition, 'manifest!kept') in table.rows
     assert (partition, 'face!shared-snap') in table.rows
     assert storage.existing == {'shared.jpg'}  # Blob delete_blob() never called.
+
+
+def test_collect_defers_without_fencing_while_a_wave_stage_is_live():
+    # A background GC pass that lands mid-wave must yield, not acquire gcUntil:
+    # fencing a live wave is what stalled Vision and (via repeated re-fencing)
+    # stranded it far past the 600s lease. See docs tail analysis 2026-10-29.
+    from wave_policy import PROTOCOL
+    table = FakeTable()
+    partition = 'upload-wave-shadow-' + digest('lib')
+    table.upsert_entity(dict(PartitionKey=partition, RowKey='policy', protocol=PROTOCOL))
+    # A live (running, unexpired) execution stage lease in the wave partition.
+    table.upsert_entity(dict(PartitionKey=partition, RowKey='lib!wave-1!vision',
+                             status='running', leaseUntil=10 ** 12))
+
+    result = collect_library_artifacts(table, _Storage(), FakeTable(), 'lib')
+
+    assert result == dict(deletedManifests=0, deferred=True, reason='wave_active')
+    # The GC fence was never acquired: the policy row has no gcUntil/gcOwner.
+    policy = table.get_entity(partition, 'policy')
+    assert not policy.get('gcUntil') and not policy.get('gcOwner')
