@@ -578,6 +578,11 @@ def _dedicated_queue(monkeypatch, queue=None):
     queue = queue or _FakeQueue()
     monkeypatch.setattr(app, 'INDEX_MAINTENANCE_QUEUE_NAME', 'index-maintenance')
     monkeypatch.setattr(app, 'index_maintenance_queue_client', queue)
+    # Delayed wakeups route to the deferred queue (see
+    # INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME) -- same fake sink here since
+    # these tests assert on message content/routing, not which physical
+    # queue a send landed on.
+    monkeypatch.setattr(app, 'index_maintenance_deferred_queue_client', queue)
     monkeypatch.setattr(app, 'jobs_table_client', EtagTable())
     return queue
 

@@ -49,11 +49,15 @@ def send_stage(library,scope,revision,delay=0):
     # scheduled retry kept 'all' reporting queueLength>=1 for its whole delay,
     # waking or holding open a replica that finds nothing to do until it's due
     # (measured live 2026-10-30: ~45% of cluster replica wake-ups did zero
-    # work). Deferred continuations go to a sibling queue instead, scaled with
-    # queueLengthStrategy='visibleonly' so it correctly reports empty while a
-    # retry is still waiting out its delay.
-    if stage=='cluster' and delay:
+    # work; indexer had the identical pattern, ~84% zero-job wake-ups over a
+    # 14-day window). Deferred continuations for cluster/index go to a sibling
+    # queue instead, scaled with queueLengthStrategy='visibleonly' so it
+    # correctly reports empty while a retry is still waiting out its delay.
+    # Vision has the same exposure and is an unshipped follow-up.
+    if delay and stage=='cluster':
         queue=app.clustering_deferred_queue_client
+    elif delay and stage=='index':
+        queue=app.index_maintenance_deferred_queue_client
     else:
         queue={'vision':app.ipwork_queue_client,'cluster':app.clustering_queue_client,
                'index':app.index_maintenance_queue_client}[stage]

@@ -430,6 +430,7 @@ var backendEnv = [
 
   { name: 'INDEX_EVENTS_ENDPOINT', value: enableIndexPush ? 'https://${indexPush!.properties.hostName}' : '' }
   { name: 'INDEX_MAINTENANCE_QUEUE_NAME', value: 'photostore-index-maintenance' }
+  { name: 'INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME', value: 'photostore-index-maintenance-deferred' }
   { name: 'INDEX_BUILD_ROLES', value: 'index-worker' }
   { name: 'STORAGE_ACCOUNT_NAME', value: storageAccountName }
   { name: 'USE_MANAGED_IDENTITY', value: 'true' }
@@ -1088,6 +1089,24 @@ resource indexer 'Microsoft.App/containerApps@2025-01-01' = {
                 queueLength: '1'
                 // Claimed messages remain work until ACK, including long builds.
                 queueLengthStrategy: 'all'
+              }
+              identity: 'system'
+            }
+          }
+          {
+            // Delayed wakeups (coalescing / dedup-idle wait / retry backoff --
+            // see INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME) are never actively
+            // held, only waiting out a schedule, so 'visibleonly' correctly
+            // reports empty while they wait -- same fix shape as
+            // clustering-deferred-queue (see docs/benchmarks/cluster-false-starts-20261030.md).
+            name: 'index-maintenance-deferred-queue'
+            custom: {
+              type: 'azure-queue'
+              metadata: {
+                accountName: storageAccountName
+                queueName: 'photostore-index-maintenance-deferred'
+                queueLength: '1'
+                queueLengthStrategy: 'visibleonly'
               }
               identity: 'system'
             }

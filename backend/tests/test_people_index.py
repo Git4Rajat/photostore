@@ -686,7 +686,15 @@ def test_full_rebuild_is_forced_once_the_last_full_build_is_old(people_ctx, monk
     assert built == [1]
 
 
-def test_dirty_people_manifest_requires_full_coverage_not_just_explicit_ids(people_ctx, monkeypatch):
+def test_dirty_manifest_flag_does_not_block_a_trusted_affected_ids_rebuild(people_ctx, monkeypatch):
+    """The blanket manifest `dirty` flag is set by _InvalidatingTableClient on
+    every person/face write, including the very mutation that produced
+    affected_person_ids -- so gating the ID-targeted path on it was always
+    true and forced a full rebuild every time, regardless of how complete
+    affected_person_ids was. Every writer now marks its touched IDs via
+    mark_people_dirty (see _set_faces_source_deleted_for_filenames), so
+    affected_person_ids is trusted on its own and the ID-targeted path must
+    fire even while the manifest is (as it always is in production) dirty."""
     people, faces, _ = people_ctx
     _seed_person(people, 'rename', 'p1', name='Alice', faceIds='["f1"]')
     _seed_person(people, 'rename', 'p2', name='Unchanged', faceIds='[]')
@@ -694,12 +702,30 @@ def test_dirty_people_manifest_requires_full_coverage_not_just_explicit_ids(peop
     storage_utils.refresh_user_people_index('rename', source_version='v1')
     _seed_person(people, 'rename', 'p1', name='Beatrice', faceIds='["f1"]')
     storage_utils.touch_user_people_index_state('rename')
-    calls = []
+    full_calls = []
     full = storage_utils._build_user_people_index_snapshot
-    monkeypatch.setattr(storage_utils, '_build_user_people_index_snapshot', lambda *args: (calls.append(args), full(*args))[1])
+    monkeypatch.setattr(storage_utils, '_build_user_people_index_snapshot', lambda *args: (full_calls.append(args), full(*args))[1])
     snapshot = storage_utils.refresh_user_people_index('rename', source_version='v2', affected_person_ids={'p1'})
-    assert calls
+    assert not full_calls
     assert {row['personId']: row['name'] for row in snapshot.rows} == {'p1': 'Beatrice', 'p2': 'Unchanged'}
+
+
+def test_affected_ids_rebuild_still_falls_back_when_the_base_snapshot_is_unusable(people_ctx, monkeypatch):
+    """Unlike the blanket dirty flag, a mismatched base snapshot still
+    disqualifies the ID-targeted path -- affected_person_ids only tells us
+    what changed, not that the previous blob is a safe merge base."""
+    people, faces, blobs = people_ctx
+    _seed_person(people, 'mismatch2', 'p1', name='Alice', faceIds='["f1"]')
+    _seed_face(faces, 'mismatch2', 'f1', filename='one.jpg', personId='p1')
+    storage_utils.refresh_user_people_index('mismatch2', source_version='v1')
+    manifest_key = 'lexical-index/' + storage_utils._people_index_manifest_blob_name('mismatch2')
+    manifest = json.loads(blobs.blobs[manifest_key])
+    blobs.blobs[manifest_key] = json.dumps({**manifest, 'sourceVersion': 'different'}).encode()
+    full_calls = []
+    full = storage_utils._build_user_people_index_snapshot
+    monkeypatch.setattr(storage_utils, '_build_user_people_index_snapshot', lambda *args: (full_calls.append(args), full(*args))[1])
+    storage_utils.refresh_user_people_index('mismatch2', source_version='v2', affected_person_ids={'p1'})
+    assert full_calls
 
 
 def test_clean_manifest_mismatch_does_not_qualify_as_an_incremental_base(people_ctx, monkeypatch):
@@ -847,6 +873,8 @@ def test_soft_delete_marks_face_and_member_rows_hidden_then_restore_clears_them(
     monkeypatch.setattr(app, 'get_face_ids_for_filename', lambda uid, name: ['f1'])
     touched = []
     monkeypatch.setattr(app, 'touch_user_people_index_state', lambda uid: touched.append(uid) or 'v')
+    dirtied = []
+    monkeypatch.setattr(app, 'mark_people_dirty', lambda uid, ids: dirtied.append((uid, sorted(ids))))
 
     hidden = app._set_faces_source_deleted_for_filenames('u', ['a.jpg'], True)
 
@@ -855,6 +883,10 @@ def test_soft_delete_marks_face_and_member_rows_hidden_then_restore_clears_them(
     assert members.rows[('p1', 'f1')]['sourceDeleted'] == '1'
     assert persons.rows[('u', 'p1')]['sourceVisibilityUpdatedAt']
     assert touched == ['u']
+    # The touched person must land in the ID-tracked dirty set too, not just
+    # the blanket manifest flag -- otherwise a later people rebuild can never
+    # trust affected_person_ids and always falls back to a full scan.
+    assert dirtied == [('u', ['p1'])]
 
     visible = app._set_faces_source_deleted_for_filenames('u', ['a.jpg'], False)
 

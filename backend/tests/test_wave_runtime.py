@@ -94,23 +94,49 @@ def test_delayed_cluster_wake_uses_deferred_queue_undelayed_does_not(monkeypatch
     assert deferred_sent[0][1]['visibility_timeout']==30
 
 
-def test_delayed_vision_and_index_wakes_still_use_their_main_queue(monkeypatch):
-    # Only cluster has a deferred sibling queue wired up so far -- vision and
-    # index keep today's behavior (still subject to the same false-start
+def test_delayed_vision_wake_still_uses_its_main_queue(monkeypatch):
+    # Only cluster and index have a deferred sibling queue wired up so far --
+    # vision keeps today's behavior (still subject to the same false-start
     # pattern, tracked separately) rather than silently no-op-ing or raising.
     monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED','true')
-    sent={stage:[] for stage in ('vision','index')}
+    sent=[]
     app=SimpleNamespace(
-        ipwork_queue_client=SimpleNamespace(send_message=lambda body,**o:sent['vision'].append((json.loads(body),o))),
-        index_maintenance_queue_client=SimpleNamespace(send_message=lambda body,**o:sent['index'].append((json.loads(body),o))),
+        ipwork_queue_client=SimpleNamespace(send_message=lambda body,**o:sent.append((json.loads(body),o))),
+        index_maintenance_queue_client=SimpleNamespace(send_message=lambda *a,**k:None),
+        index_maintenance_deferred_queue_client=SimpleNamespace(send_message=lambda *a,**k:None),
         clustering_queue_client=SimpleNamespace(send_message=lambda *a,**k:None),
-        clustering_deferred_queue_client=SimpleNamespace(send_message=lambda *a,**k:(_ for _ in ()).throw(AssertionError('vision/index must not use the cluster deferred queue'))),
+        clustering_deferred_queue_client=SimpleNamespace(send_message=lambda *a,**k:(_ for _ in ()).throw(AssertionError('vision must not use the cluster deferred queue'))),
     )
     monkeypatch.setitem(sys.modules,'app',app)
     runtime.send_stage('u','wave-vision:w:key','r',delay=30)
+    assert len(sent)==1 and sent[0][1]['visibility_timeout']==30
+
+
+def test_delayed_index_wake_uses_deferred_queue_undelayed_does_not(monkeypatch):
+    # Same false-start exposure and fix shape as cluster (see
+    # test_delayed_cluster_wake_uses_deferred_queue_undelayed_does_not):
+    # index's main queue also uses queueLengthStrategy='all', so a delayed
+    # continuation must route to its sibling deferred queue instead.
+    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED','true')
+    main_sent=[];deferred_sent=[]
+    app=SimpleNamespace(
+        ipwork_queue_client=SimpleNamespace(send_message=lambda *a,**k:None),
+        clustering_queue_client=SimpleNamespace(send_message=lambda *a,**k:None),
+        clustering_deferred_queue_client=SimpleNamespace(send_message=lambda *a,**k:None),
+        index_maintenance_queue_client=SimpleNamespace(
+            send_message=lambda body,**options:main_sent.append((json.loads(body),options))),
+        index_maintenance_deferred_queue_client=SimpleNamespace(
+            send_message=lambda body,**options:deferred_sent.append((json.loads(body),options))),
+    )
+    monkeypatch.setitem(sys.modules,'app',app)
+
+    runtime.send_stage('u','wave-index:w:key','r',delay=0)
+    assert len(main_sent)==1 and not deferred_sent
+    assert main_sent[0][1].get('visibility_timeout') is None
+
     runtime.send_stage('u','wave-index:w:key','r',delay=30)
-    assert len(sent['vision'])==1 and sent['vision'][0][1]['visibility_timeout']==30
-    assert len(sent['index'])==1 and sent['index'][0][1]['visibility_timeout']==30
+    assert len(deferred_sent)==1 and len(main_sent)==1  # still just the one from above
+    assert deferred_sent[0][0]['stage']=='index' and deferred_sent[0][0]['intentRevision']=='r'
 
 
 def test_worker_cannot_consume_another_roles_stage(monkeypatch):

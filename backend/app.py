@@ -763,6 +763,14 @@ CLUSTERING_WORKER_MAX_RETRIES = int(os.getenv('CLUSTERING_WORKER_MAX_RETRIES', '
 LIBRARY_OPS_QUEUE_NAME = os.getenv('LIBRARY_OPS_QUEUE_NAME', 'photostore-library-ops')
 # Explicit queue configuration is required; never fall back to cluster builds.
 INDEX_MAINTENANCE_QUEUE_NAME = os.getenv('INDEX_MAINTENANCE_QUEUE_NAME', '').strip()
+# Delayed wakeups (coalescing / dedup-idle wait / WorkStore retry backoff) are
+# invisible-by-design, not an actively-renewed in-flight job -- same
+# false-start exposure as clustering (see wave_runtime.send_stage and
+# CLUSTERING_DEFERRED_QUEUE_NAME). Routed to this sibling queue instead, so
+# the main queue's queueLengthStrategy='all' KEDA rule isn't kept reporting
+# work while a retry just waits out its delay.
+INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME = os.getenv(
+    'INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME', 'photostore-index-maintenance-deferred')
 INDEX_MAINTENANCE_DEADLETTER_QUEUE_NAME = os.getenv(
     'INDEX_MAINTENANCE_DEADLETTER_QUEUE_NAME', 'photostore-index-maintenance-deadletter')
 # _execute_library_clean (and _execute_library_download) are naturally
@@ -1143,6 +1151,7 @@ queue_service_client = None
 ipwork_queue_client = None
 library_ops_queue_client = None
 index_maintenance_queue_client = None
+index_maintenance_deferred_queue_client = None
 clustering_deadletter_queue_client = None
 library_ops_deadletter_queue_client = None
 
@@ -1442,7 +1451,7 @@ def _init_storage_clients():
     global invites_table_client, audit_table_client, clean_requests_table_client, library_store
     global clustering_queue_client, clustering_deferred_queue_client, queue_service_client
     global ipwork_queue_client, library_ops_queue_client
-    global index_maintenance_queue_client
+    global index_maintenance_queue_client, index_maintenance_deferred_queue_client
     global clustering_deadletter_queue_client, library_ops_deadletter_queue_client
 
     account_name = STORAGE_ACCOUNT_NAME or os.getenv('AZURE_STORAGE_ACCOUNT_NAME')
@@ -1589,6 +1598,9 @@ def _init_storage_clients():
     library_ops_queue_client = library_ops_queue_client_local
     index_maintenance_queue_client = (
         queue_service_client_local.get_queue_client(INDEX_MAINTENANCE_QUEUE_NAME)
+        if INDEX_MAINTENANCE_QUEUE_NAME else None)
+    index_maintenance_deferred_queue_client = (
+        queue_service_client_local.get_queue_client(INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME)
         if INDEX_MAINTENANCE_QUEUE_NAME else None)
     clustering_deadletter_queue_client = clustering_deadletter_queue_client_local
     library_ops_deadletter_queue_client = library_ops_deadletter_queue_client_local
@@ -10937,7 +10949,11 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, 
 
 def _send_index_wakeup(library, scope, revision, delay=0, *, reason='pending-recovery'):
     import index_work
-    queue = index_maintenance_queue_client
+    # Delayed (coalescing / dedup-idle / WorkStore retry-backoff) wakeups are
+    # invisible-by-design -- route them off the main queue so KEDA's 'all'
+    # strategy there doesn't treat a scheduled-but-not-due retry as live work
+    # (see INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME).
+    queue = index_maintenance_deferred_queue_client if delay else index_maintenance_queue_client
     if queue is None:
         raise RuntimeError('Index maintenance queue unavailable')
     job = _index_build_job_id(library) + (f'-{scope}' if scope != 'full' else '')
@@ -13969,6 +13985,12 @@ def _set_faces_source_deleted_for_filenames(user_id: str, filenames, deleted: bo
 
         _io_pool_map(_touch_person, sorted(touched_people), workers=12)
     if touched_people:
+        # Record the touched IDs in the same ID-tracked dirty set the
+        # rename/merge/delete paths use, not just the blanket manifest-dirty
+        # flag -- otherwise refresh_user_people_index's ID-targeted incremental
+        # path can never trust affected_person_ids to be complete (see its
+        # comment) and every people rebuild degrades to a full scan.
+        mark_people_dirty(user_id, sorted(touched_people))
         try:
             touch_user_people_index_state(user_id)
         except Exception:
@@ -16002,9 +16024,12 @@ def run_index_worker() -> None:
     queue = index_maintenance_queue_client
     if queue is None:
         raise RuntimeError('Index maintenance queue unavailable')
+    deferred_queue = index_maintenance_deferred_queue_client
+    if deferred_queue is None:
+        raise RuntimeError('Index maintenance deferred queue unavailable')
     deadletter = queue_service_client.get_queue_client(INDEX_MAINTENANCE_DEADLETTER_QUEUE_NAME)
     from azure.core.exceptions import ResourceExistsError
-    for client in (queue, deadletter):
+    for client in (queue, deferred_queue, deadletter):
         try:
             client.create_queue()
         except ResourceExistsError:
@@ -16026,6 +16051,10 @@ def run_index_worker() -> None:
                 last_recovery = now
             processed = _poll_clustering_queue_once(
                 queue, INDEX_MAINTENANCE_QUEUE_NAME, INDEX_BUILD_MAX_RETRIES, deadletter, dispatch=dispatch)
+            if not processed:
+                processed = _poll_clustering_queue_once(
+                    deferred_queue, INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME, INDEX_BUILD_MAX_RETRIES,
+                    deadletter, dispatch=dispatch)
             if not processed:
                 stop.wait(2)
         except Exception:

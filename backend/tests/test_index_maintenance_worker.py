@@ -20,6 +20,11 @@ def worker(monkeypatch):
     monkeypatch.setattr(app, 'jobs_table_client', table)
     monkeypatch.setattr(app, 'index_maintenance_queue_client', SimpleNamespace(
         send_message=lambda body, **kw: sent.append(json.loads(body))))
+    # Delayed wakeups route to the deferred queue (see
+    # INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME) -- same sink here since these
+    # tests assert on message content/routing, not which physical queue.
+    monkeypatch.setattr(app, 'index_maintenance_deferred_queue_client', SimpleNamespace(
+        send_message=lambda body, **kw: sent.append(json.loads(body))))
     monkeypatch.setattr(app, 'library_ops_queue_client', SimpleNamespace(
         send_message=Mock(side_effect=AssertionError('legacy queue'))))
     monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **kw: statuses.append((a, kw)))
@@ -38,7 +43,10 @@ def test_queue_status_is_written_before_a_fast_consumer(worker, monkeypatch):
     def send(*args, **kwargs):
         assert worker.statuses[-1][0][3] == 'queued'
         app._upsert_job_status('job', 'A', app.INDEX_BUILD_JOB_TYPE, 'done')
+    # Default coalesce=True gives this a non-zero delay, so it routes to the
+    # deferred queue, not the main one -- patch both.
     monkeypatch.setattr(app, 'index_maintenance_queue_client', SimpleNamespace(send_message=send))
+    monkeypatch.setattr(app, 'index_maintenance_deferred_queue_client', SimpleNamespace(send_message=send))
     app.enqueue_index_build('A', scope='people')
     assert worker.statuses[-1][0][3] == 'done'
 
@@ -129,8 +137,11 @@ def test_exhausted_old_wakeup_cannot_fail_the_new_revision_or_notification(worke
 
 
 def test_queue_failure_keeps_work_recoverable(worker, monkeypatch):
-    monkeypatch.setattr(app, 'index_maintenance_queue_client', SimpleNamespace(
-        send_message=Mock(side_effect=OSError('queue unavailable'))))
+    # Default coalesce=True gives this a non-zero delay, so it routes to the
+    # deferred queue, not the main one -- patch both to fail.
+    failing = SimpleNamespace(send_message=Mock(side_effect=OSError('queue unavailable')))
+    monkeypatch.setattr(app, 'index_maintenance_queue_client', failing)
+    monkeypatch.setattr(app, 'index_maintenance_deferred_queue_client', failing)
     assert app.enqueue_index_build('A', reason='person-label', scope='people') == 'unavailable'
     row = next(iter(worker.table.rows.values()))
     assert row['revision'] and not row['failed']

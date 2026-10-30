@@ -6910,9 +6910,17 @@ def delete_user_people_index_data(user_id: str) -> None:
 
 
 def touch_user_people_index_state(user_id: str) -> str:
-    """Mark the people index's manifest dirty with a fresh sourceVersion --
-    mirrors touch_user_albums_index_state. No per-person dirty-tracking (see
-    module comment above).
+    """Mark the people index's manifest dirty, preserving the fields the
+    ID-targeted incremental rebuild (refresh_user_people_index's
+    affected_person_ids path) needs to trust the previously-published blob as
+    a safe merge base -- sourceVersion/builtThrough/fullBuiltAt/rowCount.
+    Unlike touch_user_albums_index_state (which has no per-ID incremental path
+    to protect), replacing the whole manifest here with a brand-new
+    sourceVersion made every later prev.source_version==manifest.sourceVersion
+    check fail unconditionally -- this runs on every write via
+    _invalidate_people_scan_cache, including the very mutation that enqueues
+    the rebuild job, so the ID-targeted path was unreachable in practice. See
+    docs/benchmarks/people-index-incremental-guard-20261030.md.
 
     Gated by _manifest_already_marked_dirty: this is called from
     _invalidate_people_scan_cache, the one choke point hit on EVERY write to
@@ -6924,13 +6932,15 @@ def touch_user_people_index_state(user_id: str) -> str:
         return ''
     if _manifest_already_marked_dirty(key, 'people'):
         return ''
-    source_version = datetime.now(timezone.utc).isoformat()
+    previous = _load_people_index_manifest(key)
+    source_version = str(previous.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
     manifest = {
+        **previous,
         'userId': key,
         'sourceVersion': source_version,
         'schemaVersion': _PEOPLE_INDEX_SCHEMA_VERSION,
         'dirty': True,
-        'updatedAt': source_version,
+        'updatedAt': datetime.now(timezone.utc).isoformat(),
     }
     blob_client = _people_index_blob_client(_people_index_manifest_blob_name(key))
     if blob_client is not None:
@@ -7393,10 +7403,19 @@ def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = N
     if affected_person_ids and len(affected_person_ids) <= 100:
         prev = _load_people_index_blob(key)
         if (prev is not None and prev.schema_version == _PEOPLE_INDEX_SCHEMA_VERSION
-                and not previous_manifest.get('dirty')
                 and prev.source_version == str(previous_manifest.get('sourceVersion') or '')):
-            # The IDs are only complete relative to a known clean base. A dirty
-            # manifest may include visibility changes that have no per-person ID.
+            # Deliberately NOT gated on `previous_manifest.get('dirty')`: that
+            # blanket flag is set by _InvalidatingTableClient on every write to
+            # person_table_client/face_table_client, including the very
+            # mutation that produced affected_person_ids and enqueued this
+            # job -- so it was always true here, forcing a full rebuild on
+            # every call regardless of how complete affected_person_ids was.
+            # affected_person_ids (the caller's get_dirty_people() read) is
+            # trustworthy on its own now that every writer -- including the
+            # soft-delete/restore visibility path,
+            # _set_faces_source_deleted_for_filenames -- calls
+            # mark_people_dirty() with its touched IDs. See
+            # docs/benchmarks/people-index-incremental-guard-20261030.md.
             snapshot = _incremental_people_index_snapshot_by_ids(key, source_version, affected_person_ids, prev.rows)
             if snapshot is not None:
                 perf_instrumentation.log_event(
