@@ -529,15 +529,27 @@ def test_refresh_incremental_merge_only_refetches_dirty_filenames(sort_ctx):
 
 def test_dirty_set_too_large_to_merge_thresholds(monkeypatch):
     monkeypatch.setattr(storage_utils, '_INDEX_MERGE_MAX_DIRTY_ABS', 2000)
-    monkeypatch.setattr(storage_utils, '_INDEX_MERGE_MAX_DIRTY_FRACTION', 0.10)
+    # concurrency=10, point_read=10ms -> merge_ms = ceil(dirty/10)*10.
+    # scan=1ms/row -> scan_ms = rows. Round numbers to keep the arithmetic
+    # legible: merge cost and scan cost are compared directly, not via a
+    # fixed fraction of the library (see _dirty_set_too_large_to_merge).
+    monkeypatch.setattr(storage_utils, '_INDEX_MERGE_CONCURRENCY', 10)
+    monkeypatch.setattr(storage_utils, '_INDEX_MERGE_POINT_READ_MS', 10.0)
+    monkeypatch.setattr(storage_utils, '_INDEX_MERGE_SCAN_MS_PER_ROW', 1.0)
     # Below the absolute floor -> always stay on the cheap point-read merge,
-    # no matter how large the library is.
+    # no matter how large the library is (not even reached: a huge scan would
+    # obviously win on cost, but the floor short-circuits before computing it).
     monkeypatch.setattr(storage_utils, '_library_row_count', lambda _u: 1_000_000)
     assert storage_utils._dirty_set_too_large_to_merge('u', 1999) is False
-    # Past the floor and >= 10% of the library -> a bulk scan is cheaper.
+    # Past the floor: dirty=2000 -> merge_ms=2000, a 10k-row library's
+    # scan_ms=10000 -> merge is cheaper, still merge.
     monkeypatch.setattr(storage_utils, '_library_row_count', lambda _u: 10_000)
+    assert storage_utils._dirty_set_too_large_to_merge('u', 2000) is False
+    # Same dirty count against a library small enough that scanning it beats
+    # merging: 1,500 rows -> scan_ms=1500 < merge_ms=2000 -> scan.
+    monkeypatch.setattr(storage_utils, '_library_row_count', lambda _u: 1_500)
     assert storage_utils._dirty_set_too_large_to_merge('u', 2000) is True
-    # Past the floor but a small fraction of a big library -> still merge.
+    # Past the floor but a huge library -> merge stays far cheaper than scan.
     monkeypatch.setattr(storage_utils, '_library_row_count', lambda _u: 1_000_000)
     assert storage_utils._dirty_set_too_large_to_merge('u', 2000) is False
     # Library size unknown (no search DB yet) but past the floor -> scan.

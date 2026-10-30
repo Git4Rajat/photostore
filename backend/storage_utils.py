@@ -4582,16 +4582,23 @@ def touch_user_lexical_index_state(user_id: str) -> str:
 _SEARCH_INDEX_KINDS = ('lexical', 'sort', 'access')
 
 # Crossover from the incremental merge (one point-read per dirty filename) to a
-# single bulk partition scan. A merge is O(dirty) round trips but a scan is
-# O(library/page_size) *sequential* pages -- so the merge only wins while the
-# dirty set is a small fraction of the library. Past that it's cheaper (and
-# avoids the ~20k-point-read, minutes-long builds measured on large backfills)
-# to re-stream the whole partition once. The absolute floor keeps a handful of
-# edits on a big library on the cheap point-read path; the fraction handles the
-# scaling crossover (a bulk scan of L rows ~ L/1000 page fetches, so it starts
-# beating D parallel point reads around D ~ 10% of L under load).
+# single bulk partition scan. A merge is O(dirty) concurrent round trips; a
+# scan is O(library) sequential paged rows -- so which is cheaper depends on
+# both how much changed AND how big the library is, not on either one alone:
+# a scan's own cost scales with library size, so "how much change justifies
+# a scan" can't be decided from the change in isolation. Earlier versions of
+# this used a fixed fraction-of-library constant (10%, then 50%) as a proxy
+# for that tradeoff; replaced with a direct comparison of the two paths'
+# actual projected costs (see _dirty_set_too_large_to_merge), using per-op
+# rates measured on this deployment (2026-10-30, docs/benchmarks/index-dirty-
+# merge-threshold-20261030.md): point-read ~10.6ms (clustering
+# receipt_prefetch_point_ms), bulk scan ~0.65ms/row (index.sort.table_scan).
+# Self-calibrating: if Azure's real per-op latency changes, the comparison
+# adjusts automatically instead of needing a constant retuned by hand.
 _INDEX_MERGE_MAX_DIRTY_ABS = int(os.getenv('INDEX_MERGE_MAX_DIRTY_ABS', '2000'))
-_INDEX_MERGE_MAX_DIRTY_FRACTION = float(os.getenv('INDEX_MERGE_MAX_DIRTY_FRACTION', '0.10'))
+_INDEX_MERGE_POINT_READ_MS = float(os.getenv('INDEX_MERGE_POINT_READ_MS', '10.6'))
+_INDEX_MERGE_SCAN_MS_PER_ROW = float(os.getenv('INDEX_MERGE_SCAN_MS_PER_ROW', '0.65'))
+_INDEX_MERGE_CONCURRENCY = int(os.getenv('INDEX_MERGE_CONCURRENCY', '16'))
 
 
 def _search_index_dirty_partition_key(user_id: str, index_kind: str) -> str:
@@ -4772,9 +4779,11 @@ def _dirty_set_too_large_to_merge(user_id: str, dirty_count: int) -> bool:
     """True when the incremental merge's per-dirty-row point reads would cost
     more than just re-streaming the whole partition once, so the rows-index
     rebuild should take the full-scan branch instead (see
-    _refresh_rows_index_on_disk and _INDEX_MERGE_MAX_DIRTY_*). Cheap: one
-    manifest read for the library size, only reached once the dirty set is
-    already past the absolute floor."""
+    _refresh_rows_index_on_disk). Cheap below the absolute floor: merge always
+    wins there regardless of library size, so it's not worth paying for a
+    manifest read just to confirm it. Above the floor, compares the two
+    paths' actual projected costs directly -- not a fixed fraction of the
+    library -- since a scan's cost is itself a function of library size."""
     if dirty_count < _INDEX_MERGE_MAX_DIRTY_ABS:
         return False
     rows = _library_row_count(user_id)
@@ -4783,7 +4792,9 @@ def _dirty_set_too_large_to_merge(user_id: str, dirty_count: int) -> bool:
         # past the floor -- a single bulk scan is the safer bet than thousands
         # of point reads against an unknown-but-clearly-non-trivial partition.
         return True
-    return dirty_count >= rows * _INDEX_MERGE_MAX_DIRTY_FRACTION
+    merge_ms = math.ceil(dirty_count / _INDEX_MERGE_CONCURRENCY) * _INDEX_MERGE_POINT_READ_MS
+    scan_ms = rows * _INDEX_MERGE_SCAN_MS_PER_ROW
+    return merge_ms >= scan_ms
 
 
 def sort_index_skipped(user_id: str) -> bool:
