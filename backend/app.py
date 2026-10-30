@@ -712,6 +712,12 @@ if PROCESSING_MODE not in ('browser', 'backend', 'both'):
 # can't drift out of sync the way hand-edited bicep literals have before.
 BROWSER_ONLY_PROCESSING = PROCESSING_MODE == 'browser'
 CLUSTERING_QUEUE_NAME = os.getenv('CLUSTERING_QUEUE_NAME', 'photostore-clustering')
+# Deferred wave-continuation retries (progress/barrier_wait/artifact_cleanup/
+# wave_active) land here instead of CLUSTERING_QUEUE_NAME -- see send_stage's
+# comment in wave_runtime.py for why that queue's 'all' KEDA strategy can't
+# be used for a message that's invisible only because it's intentionally
+# scheduled for later, not because a live job is renewing it.
+CLUSTERING_DEFERRED_QUEUE_NAME = os.getenv('CLUSTERING_DEFERRED_QUEUE_NAME', 'photostore-clustering-deferred')
 # receive_messages() with no visibility_timeout defaults to Azure's 30s -- a
 # full DBSCAN pass over a large library (or a multi-hour library_download
 # export) can exceed that, making Azure redeliver the same message before
@@ -1132,6 +1138,7 @@ audit_table_client = None
 clean_requests_table_client = None
 library_store = None
 clustering_queue_client = None
+clustering_deferred_queue_client = None
 queue_service_client = None
 ipwork_queue_client = None
 library_ops_queue_client = None
@@ -1433,7 +1440,8 @@ def _init_storage_clients():
     global config_table_client
     global users_table_client, libraries_table_client, memberships_table_client
     global invites_table_client, audit_table_client, clean_requests_table_client, library_store
-    global clustering_queue_client, queue_service_client, ipwork_queue_client, library_ops_queue_client
+    global clustering_queue_client, clustering_deferred_queue_client, queue_service_client
+    global ipwork_queue_client, library_ops_queue_client
     global index_maintenance_queue_client
     global clustering_deadletter_queue_client, library_ops_deadletter_queue_client
 
@@ -1476,6 +1484,7 @@ def _init_storage_clients():
             blob_service_client_local = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
         queue_service_client_local = QueueServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
         clustering_queue_client_local = queue_service_client_local.get_queue_client(CLUSTERING_QUEUE_NAME)
+        clustering_deferred_queue_client_local = queue_service_client_local.get_queue_client(CLUSTERING_DEFERRED_QUEUE_NAME)
         ipwork_queue_client_local = queue_service_client_local.get_queue_client(IPWORKER_QUEUE_NAME)
         library_ops_queue_client_local = queue_service_client_local.get_queue_client(LIBRARY_OPS_QUEUE_NAME)
         clustering_deadletter_queue_client_local = queue_service_client_local.get_queue_client(CLUSTERING_DEADLETTER_QUEUE_NAME)
@@ -1502,6 +1511,7 @@ def _init_storage_clients():
             connection_pool_maxsize=STORAGE_CONNECTION_POOL_MAXSIZE,
         )
         clustering_queue_client_local = queue_service_client_local.get_queue_client(CLUSTERING_QUEUE_NAME)
+        clustering_deferred_queue_client_local = queue_service_client_local.get_queue_client(CLUSTERING_DEFERRED_QUEUE_NAME)
         ipwork_queue_client_local = queue_service_client_local.get_queue_client(IPWORKER_QUEUE_NAME)
         library_ops_queue_client_local = queue_service_client_local.get_queue_client(LIBRARY_OPS_QUEUE_NAME)
         clustering_deadletter_queue_client_local = queue_service_client_local.get_queue_client(CLUSTERING_DEADLETTER_QUEUE_NAME)
@@ -1574,6 +1584,7 @@ def _init_storage_clients():
     audit_table_client = audit_table_client_local
     clean_requests_table_client = clean_requests_table_client_local
     clustering_queue_client = clustering_queue_client_local
+    clustering_deferred_queue_client = clustering_deferred_queue_client_local
     ipwork_queue_client = ipwork_queue_client_local
     library_ops_queue_client = library_ops_queue_client_local
     index_maintenance_queue_client = (
@@ -16061,17 +16072,23 @@ def run_clustering_worker() -> None:
     # LIBRARY_OPS_QUEUE_NAME's comment. One extra empty-queue receive_messages
     # call per idle poll cycle is a negligible transaction cost next to that.
     library_ops_client = queue_service_client_local.get_queue_client(LIBRARY_OPS_QUEUE_NAME)
+    # Deferred wave-continuation retries (see send_stage in wave_runtime.py) --
+    # polled like library_ops_client above, not folded into queue_client,
+    # because it's a separate Azure queue with its own KEDA rule.
+    clustering_deferred_client = queue_service_client_local.get_queue_client(CLUSTERING_DEFERRED_QUEUE_NAME)
     clustering_deadletter_client = queue_service_client_local.get_queue_client(CLUSTERING_DEADLETTER_QUEUE_NAME)
     library_ops_deadletter_client = queue_service_client_local.get_queue_client(LIBRARY_OPS_DEADLETTER_QUEUE_NAME)
-    for ensure_client in (queue_client, library_ops_client, clustering_deadletter_client, library_ops_deadletter_client):
+    for ensure_client in (queue_client, library_ops_client, clustering_deferred_client,
+                          clustering_deadletter_client, library_ops_deadletter_client):
         try:
             ensure_client.create_queue()
         except Exception:
             pass
     worker_logger.info(
-        'Worker polling queue %s (priority) then %s every %ss',
+        'Worker polling queue %s (priority) then %s then %s every %ss',
         LIBRARY_OPS_QUEUE_NAME,
         CLUSTERING_QUEUE_NAME,
+        CLUSTERING_DEFERRED_QUEUE_NAME,
         poll_seconds,
     )
     processing_diagnostics.ready('cluster', page_size=batch_size, target_size=target_batch_size,
@@ -16137,6 +16154,13 @@ def run_clustering_worker() -> None:
                             target_size=target_batch_size, idle_timeout_seconds=idle_timeout_seconds,
                             poll_seconds=poll_seconds, shutdown_requested=shutdown_requested,
                             max_wait_seconds=max_accumulation_seconds)
+                if not processed_any and not shutdown_requested.is_set():
+                    # Deferred retries land here once their delay elapses (see
+                    # send_stage) -- same payload shape as the main queue, so
+                    # the same dispatch function handles it unchanged.
+                    processed_any = _poll_clustering_queue_once(
+                        clustering_deferred_client, CLUSTERING_DEFERRED_QUEUE_NAME,
+                        CLUSTERING_WORKER_MAX_RETRIES, clustering_deadletter_client)
                 if not processed_any and not shutdown_requested.is_set():
                     time.sleep(poll_seconds)
             except Exception:

@@ -1633,6 +1633,31 @@ resource cluster 'Microsoft.App/containerApps@2025-01-01' = {
               identity: 'system'
             }
           }
+          {
+            // Deferred wave-continuation retries (progress/barrier_wait/
+            // artifact_cleanup/wave_active -- see send_stage in
+            // wave_runtime.py) land on this sibling queue instead of
+            // photostore-clustering, specifically so they can use
+            // 'visibleonly' here. The main clustering-queue rule above needs
+            // 'all' to avoid SIGTERM-killing an actively-renewed in-flight
+            // job, but that same setting can't distinguish a real in-flight
+            // message from one that's invisible only because it's
+            // deliberately scheduled for later -- every scheduled retry was
+            // keeping that rule's queueLength>=1 for its whole delay,
+            // measured live 2026-10-30 at ~45% of cluster wake-ups doing zero
+            // work (docs/benchmarks/cluster-false-starts-20261030.md).
+            name: 'clustering-deferred-queue'
+            custom: {
+              type: 'azure-queue'
+              metadata: {
+                accountName: storageAccountName
+                queueName: 'photostore-clustering-deferred'
+                queueLength: '1'
+                queueLengthStrategy: 'visibleonly'
+              }
+              identity: 'system'
+            }
+          }
         ]
       }
     }

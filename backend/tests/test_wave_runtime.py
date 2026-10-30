@@ -55,6 +55,7 @@ def test_stage_wakes_use_only_existing_role_queue(monkeypatch):
     for stage,attr in [('vision','ipwork_queue_client'),('cluster','clustering_queue_client'),('index','index_maintenance_queue_client')]:
         def send(body,_stage=stage,**options):sent[_stage].append((json.loads(body),options))
         setattr(app,attr,SimpleNamespace(send_message=send))
+    app.clustering_deferred_queue_client=SimpleNamespace(send_message=lambda *a,**k:(_ for _ in ()).throw(AssertionError('undelayed cluster wake must not use the deferred queue')))
     monkeypatch.setitem(sys.modules,'app',app)
     for stage in runtime.ROLES:
         runtime.send_stage('u',f'wave-{stage}:w:key','r')
@@ -62,6 +63,54 @@ def test_stage_wakes_use_only_existing_role_queue(monkeypatch):
         assert sent[stage][0][0]['stage']==stage
         assert sent[stage][0][0]['intentRevision']=='r'
     assert sum(map(len,sent.values()))==3
+
+
+def test_delayed_cluster_wake_uses_deferred_queue_undelayed_does_not(monkeypatch):
+    # The main cluster queue's KEDA rule uses queueLengthStrategy='all', which
+    # can't distinguish "a live job is renewing this message's visibility"
+    # from "this retry is deliberately scheduled for later" -- so a delayed
+    # continuation must route to the sibling deferred queue (scaled with
+    # 'visibleonly') instead, while an immediate (delay=0) wake keeps using
+    # the main queue exactly as before.
+    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED','true')
+    main_sent=[];deferred_sent=[]
+    app=SimpleNamespace(
+        ipwork_queue_client=SimpleNamespace(send_message=lambda *a,**k:None),
+        index_maintenance_queue_client=SimpleNamespace(send_message=lambda *a,**k:None),
+        clustering_queue_client=SimpleNamespace(
+            send_message=lambda body,**options:main_sent.append((json.loads(body),options))),
+        clustering_deferred_queue_client=SimpleNamespace(
+            send_message=lambda body,**options:deferred_sent.append((json.loads(body),options))),
+    )
+    monkeypatch.setitem(sys.modules,'app',app)
+
+    runtime.send_stage('u','wave-cluster:w:key','r',delay=0)
+    assert len(main_sent)==1 and not deferred_sent
+    assert main_sent[0][1].get('visibility_timeout') is None
+
+    runtime.send_stage('u','wave-cluster:w:key','r',delay=30)
+    assert len(deferred_sent)==1 and len(main_sent)==1  # still just the one from above
+    assert deferred_sent[0][0]['stage']=='cluster' and deferred_sent[0][0]['intentRevision']=='r'
+    assert deferred_sent[0][1]['visibility_timeout']==30
+
+
+def test_delayed_vision_and_index_wakes_still_use_their_main_queue(monkeypatch):
+    # Only cluster has a deferred sibling queue wired up so far -- vision and
+    # index keep today's behavior (still subject to the same false-start
+    # pattern, tracked separately) rather than silently no-op-ing or raising.
+    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED','true')
+    sent={stage:[] for stage in ('vision','index')}
+    app=SimpleNamespace(
+        ipwork_queue_client=SimpleNamespace(send_message=lambda body,**o:sent['vision'].append((json.loads(body),o))),
+        index_maintenance_queue_client=SimpleNamespace(send_message=lambda body,**o:sent['index'].append((json.loads(body),o))),
+        clustering_queue_client=SimpleNamespace(send_message=lambda *a,**k:None),
+        clustering_deferred_queue_client=SimpleNamespace(send_message=lambda *a,**k:(_ for _ in ()).throw(AssertionError('vision/index must not use the cluster deferred queue'))),
+    )
+    monkeypatch.setitem(sys.modules,'app',app)
+    runtime.send_stage('u','wave-vision:w:key','r',delay=30)
+    runtime.send_stage('u','wave-index:w:key','r',delay=30)
+    assert len(sent['vision'])==1 and sent['vision'][0][1]['visibility_timeout']==30
+    assert len(sent['index'])==1 and sent['index'][0][1]['visibility_timeout']==30
 
 
 def test_worker_cannot_consume_another_roles_stage(monkeypatch):

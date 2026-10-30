@@ -40,8 +40,23 @@ def send_stage(library,scope,revision,delay=0):
     if len(parts)!=3 or parts[0] not in ('wave-vision','wave-cluster','wave-index'):
         raise ValueError('Invalid wave wakeup scope')
     stage=parts[0][5:]
-    queue={'vision':app.ipwork_queue_client,'cluster':app.clustering_queue_client,
-           'index':app.index_maintenance_queue_client}[stage]
+    # A delayed continuation (progress/barrier_wait/artifact_cleanup/wave_active
+    # retries) is invisible-by-design, not an active job being renewed -- but
+    # the main stage queue's KEDA rule uses queueLengthStrategy='all' (needed
+    # so a *real* in-flight job's renewed-invisible message doesn't look idle
+    # and get SIGTERM-killed mid-run; see CLUSTERING_WORKER_LEASE_RENEWAL_SECONDS).
+    # 'all' can't tell these two invisible-message cases apart, so every
+    # scheduled retry kept 'all' reporting queueLength>=1 for its whole delay,
+    # waking or holding open a replica that finds nothing to do until it's due
+    # (measured live 2026-10-30: ~45% of cluster replica wake-ups did zero
+    # work). Deferred continuations go to a sibling queue instead, scaled with
+    # queueLengthStrategy='visibleonly' so it correctly reports empty while a
+    # retry is still waiting out its delay.
+    if stage=='cluster' and delay:
+        queue=app.clustering_deferred_queue_client
+    else:
+        queue={'vision':app.ipwork_queue_client,'cluster':app.clustering_queue_client,
+               'index':app.index_maintenance_queue_client}[stage]
     if queue is None: raise RuntimeError('Wave stage queue unavailable')
     queue.send_message(json.dumps(dict(type=TYPE,userId=library,waveId=parts[1],
         stage=stage,scope=scope,intentRevision=revision)),visibility_timeout=delay or None)
