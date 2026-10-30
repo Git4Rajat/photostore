@@ -59,14 +59,10 @@ import { UploadPreparationPipeline, type PreparedUpload, type UploadAssetTargets
 import type { UploadMetadataDescriptor } from '../utils/uploadMetadata';
 import { prewarmBrowserExifTool } from '../utils/browserExifTool';
 import {
-    isFileSystemDirectoryAccessSupported,
-    isFileSystemDirectoryHandle,
+    isFileSystemAccessSupported,
     isFileSystemFileHandle,
-    pickUploadFolderViaFileSystemAccess,
-    ensureDirectoryReadPermission,
-    resolveFileFromDirectoryEntry,
+    pickUploadFilesViaFileSystemAccess,
     resolveFileFromHandle,
-    type FileSystemDirectoryHandle,
     type FileSystemFileHandle,
 } from '../services/fileSystemAccess';
 import {
@@ -151,7 +147,7 @@ const withPhotoGalleryRuntime = async <T,>(select: (runtime: PhotoGalleryRuntime
 const dataUrlToBlob = (dataUrl: string) => withPhotoGalleryRuntime((runtime) => runtime.dataUrlToBlob(dataUrl));
 const idbDelete = (key: string) => withPhotoGalleryRuntime((runtime) => runtime.idbDelete(key));
 const idbGet = (key: string) => withPhotoGalleryRuntime((runtime) => runtime.idbGet(key));
-const idbPut = (key: string, value: Blob | File | FileSystemFileHandle | FileSystemDirectoryHandle) => withPhotoGalleryRuntime((runtime) => runtime.idbPut(key, value));
+const idbPut = (key: string, value: Blob | File | FileSystemFileHandle) => withPhotoGalleryRuntime((runtime) => runtime.idbPut(key, value));
 const readBlobArrayBuffer = (blob: Blob | File) => withPhotoGalleryRuntime((runtime) => runtime.readBlobArrayBuffer(blob));
 const runBrowserProcessing = (...args: Parameters<PhotoGalleryRuntime['runBrowserProcessing']>) => (
     withPhotoGalleryRuntime((runtime) => runtime.runBrowserProcessing(...args))
@@ -275,10 +271,7 @@ interface AppServicesContextValue {
     requestUpload: () => void;
     // Directly upload a set of files (e.g. drag-and-drop), bypassing the native
     // picker that requestUpload opens.
-    startUpload: (
-        filesToUpload: File[],
-        folder?: { directoryHandle: FileSystemDirectoryHandle; relativePaths: Map<File, string> },
-    ) => Promise<void>;
+    startUpload: (filesToUpload: File[], handlesToUpload?: Map<File, FileSystemFileHandle>) => Promise<void>;
     resumeAllPendingUploads: () => Promise<void>;
     stopActiveUpload: () => void;
     retryPersistedUploadSession: () => Promise<void>;
@@ -351,31 +344,6 @@ const getUploadErrorMessage = (err: unknown, fallback: string): string => {
 const FINALIZATION_STILL_IN_FLIGHT_PATTERN = /finalization is still in flight/i;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-// A folder-based pick's directory handle is shared by every file in the
-// session, unlike per-file handles (keyed by each file's own key in the same
-// IndexedDB store) -- this derives one dedicated key per session so it can
-// live in that same store without colliding with any real file's key.
-const directoryHandleKey = (sessionId: string): string => `${sessionId}:__directory__`;
-
-// Caches the result of fn's first call for the lifetime of the returned
-// function, ignoring the argument on every later call -- correct here
-// because every call within one run targets the same logical resource (one
-// shared handle, or whichever handle a worker lane happens to check first as
-// a reliable proxy for the whole batch). No `await` happens between a
-// caller's null-check and the cache assignment, so concurrent callers can't
-// interleave and each kick off their own call to fn -- that race is exactly
-// what this exists to prevent (see runUploadSession's use of this for
-// permission checks that must fire at most once per run, not once per file).
-function memoizeFirstCall<Arg, T>(fn: (arg: Arg) => Promise<T>): (arg: Arg) => Promise<T> {
-    let cached: Promise<T> | null = null;
-    return (arg: Arg) => {
-        if (cached === null) {
-            cached = fn(arg);
-        }
-        return cached;
-    };
-}
 
 const waitForUploadRetry = (delay: number, signal: AbortSignal): Promise<void> => new Promise((resolve,reject) => {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1174,13 +1142,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // source of truth for resuming beyond this tab session is IndexedDB
     // (cacheUploadFilesForResume persists these handles there too).
     const uploadHandlesRef = useRef<Map<string, FileSystemFileHandle>>(new Map());
-    // Set once per folder-based pick (see pickUploadFolderViaFileSystemAccess):
-    // one shared handle for every file in that session, instead of
-    // uploadHandlesRef's one-entry-per-file map. Cleared alongside it; the
-    // durable copy for resuming beyond this tab session lives in IndexedDB
-    // under directoryHandleKey(session.id) (cacheUploadFilesForResume persists
-    // it there too).
-    const uploadDirectoryHandleRef = useRef<FileSystemDirectoryHandle | null>(null);
     const uploadStopRequestedRef = useRef<boolean>(false);
     const uploadDiscardInProgressRef = useRef(false);
     const uploadAbortControllersRef = useRef<Set<AbortController>>(new Set());
@@ -1916,10 +1877,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const current = uploadSessionRef.current;
         if (current) {
             await Promise.all(current.files.map((file) => idbDelete(file.key).catch(() => undefined)));
-            // The shared directory handle (folder-based picks) lives under
-            // its own key, not any individual file's key -- see
-            // cacheUploadFilesForResume/directoryHandleKey.
-            await idbDelete(directoryHandleKey(current.id)).catch(() => undefined);
         }
         persistSession(null);
         clearUploadRetryAttempts(localStorage);
@@ -3714,53 +3671,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 }
             };
 
-            // File System Access handle permissions reset together for a
-            // browsing session (e.g. a full page reload drops them all at
-            // once), not file-by-file -- so querying (never prompting) just
-            // the first handle this run actually needs is a reliable proxy
-            // for the whole batch. Caching that answer means a resume with
-            // hundreds of lapsed handles shows the browser's native "Allow
-            // this site to read <filename>" dialog for ZERO of them (they
-            // fall through to the existing "please reselect" error instead)
-            // rather than once per file as each worker in turn calls
-            // resolveFileFromHandle, which would otherwise call
-            // requestPermission -- and granting permission on one handle via
-            // that prompt doesn't grant it on any of the others anyway, so
-            // there's no accuracy lost by never prompting here at all.
-            const handleLikelyGranted = memoizeFirstCall((handle: FileSystemFileHandle) => (
-                handle.queryPermission({ mode: 'read' }).then((state) => state === 'granted').catch(() => false)
-            ));
-
-            // Folder-based picks (see pickUploadFolderViaFileSystemAccess) carry
-            // one shared directory handle for the whole session instead of a
-            // handle per file -- loaded once per run, from memory if this tab
-            // still has it (no reload since picking) or from IndexedDB
-            // otherwise.
-            let directoryHandlePromise: Promise<FileSystemDirectoryHandle | null> | null = null;
-            const getDirectoryHandle = (): Promise<FileSystemDirectoryHandle | null> => {
-                if (directoryHandlePromise === null) {
-                    directoryHandlePromise = uploadDirectoryHandleRef.current
-                        ? Promise.resolve(uploadDirectoryHandleRef.current)
-                        : idbGet(directoryHandleKey(normalized.id))
-                            .then((value) => (isFileSystemDirectoryHandle(value) ? value : null))
-                            .catch(() => null);
-                }
-                return directoryHandlePromise;
-            };
-            // Memoized for the same reason as handleLikelyGranted above:
-            // several worker lanes can reach a folder-based file at once, and
-            // ensureDirectoryReadPermission is deliberately NOT self-memoizing
-            // (see its own comment in fileSystemAccess.ts) -- without this,
-            // concurrent lanes could each see the shared handle not-yet-granted
-            // and each independently call requestPermission before any of
-            // their calls resolve, showing the browser's native dialog more
-            // than once for the same handle. All lanes await this exact same
-            // in-flight promise instead, so only the first one to reach it can
-            // ever prompt.
-            const directoryLikelyGranted = memoizeFirstCall((directoryHandle: FileSystemDirectoryHandle) => (
-                ensureDirectoryReadPermission(directoryHandle).catch(() => false)
-            ));
-
             let nextFileIndex = 0;
             const worker = async () => {
                 while (true) {
@@ -3780,29 +3690,16 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     try {
                         const sourceFile = uploadSourceFilesRef.current.get(fileMeta.key);
                         let file: File | null = sourceFile || null;
-                        if (!file && fileMeta.relativePath !== undefined) {
-                            // Folder-based pick: re-derive from the session's
-                            // one shared directory handle instead of any
-                            // per-file handle/blob lookup below.
-                            const directoryHandle = await getDirectoryHandle();
-                            file = directoryHandle && await directoryLikelyGranted(directoryHandle)
-                                ? await resolveFileFromDirectoryEntry(directoryHandle, fileMeta.relativePath)
-                                : null;
-                        } else if (!file) {
+                        if (!file) {
                             // Prefer the in-memory handle over a round trip
                             // through IndexedDB when this tab still has it
                             // (e.g. resuming right after a Stop, not a
                             // reload) -- only one of a handle or a cached
                             // blob will exist per key, so a single idbGet
-                            // covers the reload case either way. Only reached
-                            // for sessions persisted under the old per-file-
-                            // handle shape (see fileSystemAccess.ts) -- a
-                            // folder-based pick never populates
-                            // uploadHandlesRef or a FileSystemFileHandle in
-                            // IndexedDB for its files, only the branch above.
+                            // covers the reload case either way.
                             const handleFromMemory = uploadHandlesRef.current.get(fileMeta.key);
                             if (handleFromMemory) {
-                                file = await handleLikelyGranted(handleFromMemory) ? await resolveFileFromHandle(handleFromMemory) : null;
+                                file = await resolveFileFromHandle(handleFromMemory);
                             } else if (!idbUnavailable) {
                                 // A broken IDB backing store (see idbUnavailable
                                 // above) is treated the same as "no cached blob
@@ -3814,13 +3711,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                                     return null;
                                 });
                                 if (cached && isFileSystemFileHandle(cached)) {
-                                    file = await handleLikelyGranted(cached) ? await resolveFileFromHandle(cached) : null;
-                                } else if (cached && !isFileSystemDirectoryHandle(cached)) {
-                                    // A directory handle is only ever stored under
-                                    // directoryHandleKey(sessionId), never under a
-                                    // plain file key -- this check just satisfies
-                                    // the type now that idbGet's return type
-                                    // includes it; it can't actually happen here.
+                                    file = await resolveFileFromHandle(cached);
+                                } else if (cached) {
                                     file = new File([cached], fileMeta.name, { type: fileMeta.type, lastModified: fileMeta.lastModified });
                                 }
                             }
@@ -4048,19 +3940,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             let autoRetryRound = 0;
             while (autoRetryRound < AUTO_RETRY_MAX_ROUNDS && !uploadStopRequestedRef.current) {
                 const latestForRetry = uploadSessionRef.current || normalized;
-                // getDirectoryHandle is memoized (see above) and, for a
-                // folder-based session, already resolved by now -- any
-                // relativePath file that just failed is retryable as long as
-                // the session has a directory handle at all, the same way a
-                // legacy file is retryable via uploadSourceFilesRef/
-                // uploadHandlesRef.
-                const directoryHandleForRetry = await getDirectoryHandle();
                 const retryCandidates = latestForRetry.files.filter((retryFile) => (
                     retryFile.status === 'failed'
                     && (!options.fileKeys || options.fileKeys.has(retryFile.key))
-                    && (uploadSourceFilesRef.current.has(retryFile.key)
-                        || uploadHandlesRef.current.has(retryFile.key)
-                        || (retryFile.relativePath !== undefined && directoryHandleForRetry !== null))
+                    && (uploadSourceFilesRef.current.has(retryFile.key) || uploadHandlesRef.current.has(retryFile.key))
                 ));
                 if (retryCandidates.length === 0) {
                     break;
@@ -4234,7 +4117,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 if (!uploadSessionRef.current) {
                     uploadSourceFilesRef.current.clear();
                     uploadHandlesRef.current.clear();
-                    uploadDirectoryHandleRef.current = null;
                 }
                 uploadAbortControllersRef.current.clear();
                 uploadStopRequestedRef.current = false;
@@ -4380,15 +4262,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             return;
         }
         const unfinishedFiles = session.files.filter((file) => file.status !== 'done');
-        // Folder-based files (relativePath set) are never individually
-        // cached under their own key -- they all share the session's one
-        // directory handle instead (see cacheUploadFilesForResume), so
-        // there's nothing to gain checking each one separately. One lookup
-        // upfront, reused for every such file in the loop below.
-        const hasFolderHandle = unfinishedFiles.some((file) => file.relativePath !== undefined)
-            ? Boolean(uploadDirectoryHandleRef.current)
-                || isFileSystemDirectoryHandle(await idbGet(directoryHandleKey(session.id)).catch(() => null))
-            : false;
         // Throttled the same way as cacheUploadFilesForResume: an unfinished
         // batch of 1000+ files, most missing from uploadSourceFilesRef after a
         // reload, used to fire that many simultaneous idbGet calls via a bare
@@ -4404,19 +4277,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     return;
                 }
                 const file = unfinishedFiles[index];
-                // uploadSourceFilesRef wins regardless of relativePath: a file
-                // that's already in memory -- e.g. just reselected via the
-                // plain <input> fallback, which matches by name+size+lastModified
-                // and places it there -- is resumable even when the folder's
-                // directory handle is genuinely gone, not just permission-lapsed.
-                // Checking hasFolderHandle alone would otherwise loop such a
-                // file back to "please reselect" forever despite it already
-                // being available.
                 const hasCachedBlob = uploadSourceFilesRef.current.has(file.key)
-                    || (file.relativePath !== undefined
-                        ? hasFolderHandle
-                        : uploadHandlesRef.current.has(file.key)
-                            || Boolean(await idbGet(file.key).catch(() => null)));
+                    || uploadHandlesRef.current.has(file.key)
+                    || Boolean(await idbGet(file.key).catch(() => null));
                 cacheChecks[index] = { file, hasCachedBlob };
             }
         };
@@ -4496,7 +4359,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             }
             uploadSourceFilesRef.current.clear();
             uploadHandlesRef.current.clear();
-            uploadDirectoryHandleRef.current = null;
             await clearPersistedSession();
             setPendingUploadSessionLive(null);
             uploadStopRequestedRef.current = false;
@@ -4548,36 +4410,21 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         );
     }, [addNotification, uploading]);
 
-    // Best-effort resume cache, so an interrupted upload can resume after a
-    // page reload (uploadSourceFilesRef already covers the CURRENT tab
-    // session regardless -- this is only for surviving a reload/crash). For
-    // a folder-based pick (directoryHandle passed), this persists just that
-    // one shared handle and skips every file with a relativePath entirely --
-    // the directory handle alone is enough to re-derive any of them later,
-    // so there's nothing to gain (and real memory cost to lose) caching
-    // their bytes too. For anything else, it writes each file's bytes into
-    // IndexedDB, throttled to a small worker pool instead of firing every
-    // idbPut concurrently: a 1000-file batch used to open ~1000 simultaneous
-    // IndexedDB connections at once, exactly the kind of burst that trips
-    // iOS Safari's much tighter per-tab memory/storage ceilings.
+    // Best-effort resume cache: writes each file's bytes into IndexedDB so an
+    // interrupted upload can resume after a page reload (uploadSourceFilesRef
+    // already covers the CURRENT tab session regardless -- this is only for
+    // surviving a reload/crash). Throttled to a small worker pool instead of
+    // firing every idbPut concurrently: a 1000-file batch used to open ~1000
+    // simultaneous IndexedDB connections at once, exactly the kind of burst
+    // that trips iOS Safari's much tighter per-tab memory/storage ceilings.
     //
     // That throttle alone wasn't enough for a large mobile batch -- see
     // CONSTRAINED_DEVICE_CACHE_BUDGET_BYTES's own comment above.
     const cacheUploadFilesForResume = async (
         session: PersistedUploadSession,
         filesToUpload: File[],
-        directoryHandle?: FileSystemDirectoryHandle,
+        handlesToUpload: Map<string, FileSystemFileHandle>,
     ) => {
-        if (directoryHandle) {
-            // One handle for the whole session -- persisted once under its
-            // own key rather than once per file.
-            try {
-                await idbPut(directoryHandleKey(session.id), directoryHandle);
-            } catch {
-                // Falls back to the in-memory uploadDirectoryHandleRef entry
-                // for this tab's own session -- not fatal.
-            }
-        }
         const budgetBytes = isConstrainedUploadDevice() ? CONSTRAINED_DEVICE_CACHE_BUDGET_BYTES : Infinity;
         let cachedBytes = 0;
         let cursor = 0;
@@ -4591,13 +4438,20 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 if (index >= session.files.length) {
                     return;
                 }
-                const meta = session.files[index];
-                if (meta.relativePath !== undefined) {
-                    // Folder-based file: already covered by the one shared
-                    // directory handle persisted above -- no per-file blob
-                    // needed (and caching its full bytes here would defeat
-                    // the whole memory-pressure reason to use a handle at
-                    // all over blob caching).
+                const key = session.files[index].key;
+                // A FileSystemFileHandle (Chrome/Edge desktop) is a few bytes,
+                // not the file's content -- persist it unconditionally,
+                // bypassing the blob budget entirely, since it can re-derive
+                // a live File later instead of needing its bytes duplicated
+                // now.
+                const handle = handlesToUpload.get(key);
+                if (handle) {
+                    try {
+                        await idbPut(key, handle);
+                    } catch {
+                        // Falls back to the in-memory uploadHandlesRef entry
+                        // for this tab's own session -- not fatal.
+                    }
                     continue;
                 }
                 if (cachedBytes >= budgetBytes) {
@@ -4608,7 +4462,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 }
                 const file = filesToUpload[index];
                 try {
-                    await idbPut(meta.key, file);
+                    await idbPut(key, file);
                     cachedBytes += file.size;
                 } catch {
                     // Resume-after-reload won't find this file, but the
@@ -4623,10 +4477,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         ));
     };
 
-    const startUpload = useCallback(async (
-        filesToUpload: File[],
-        folder?: { directoryHandle: FileSystemDirectoryHandle; relativePaths: Map<File, string> },
-    ) => {
+    const startUpload = useCallback(async (filesToUpload: File[], handlesToUpload?: Map<File, FileSystemFileHandle>) => {
         if (filesToUpload.length === 0) {
             return;
         }
@@ -4767,10 +4618,18 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 uploadedBytes: 0,
                 skippedDuplicate: false,
                 status: 'pending',
-                relativePath: folder?.relativePaths.get(file),
             })),
         };
         bindWaveChild(filesToUpload, session);
+        const keyedHandles = new Map<string, FileSystemFileHandle>();
+        if (handlesToUpload) {
+            filesToUpload.forEach((file, index) => {
+                const handle = handlesToUpload.get(file);
+                if (handle) {
+                    keyedHandles.set(session.files[index].key, handle);
+                }
+            });
+        }
 
         let uploadRunStarted = false;
         try {
@@ -4779,18 +4638,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // Shadow failures are contained by the sync client.
             await ensureWaveShadowSessionOpened(session);
             uploadSourceFilesRef.current = new Map(session.files.map((meta, index) => [meta.key, filesToUpload[index]]));
-            // Cleared, not populated: nothing creates a new per-file handle
-            // anymore (see fileSystemAccess.ts's header comment) -- this only
-            // still matters for resuming a session persisted under the old
-            // per-file-handle shape before this changed, read via IndexedDB
-            // in the worker loop, never written here.
-            uploadHandlesRef.current = new Map();
-            uploadDirectoryHandleRef.current = folder?.directoryHandle ?? null;
+            uploadHandlesRef.current = keyedHandles;
             // Not awaited: the actual upload only needs uploadSourceFilesRef
             // (already set above), so there's no reason to block starting on
             // this -- resume-after-reload is a nice-to-have, not a
             // prerequisite for this tab's own upload to proceed.
-            void cacheUploadFilesForResume(session, filesToUpload, folder?.directoryHandle);
+            void cacheUploadFilesForResume(session, filesToUpload, keyedHandles);
             if (uploadStopRequestedRef.current) {
                 await cleanupUnfinishedUploadArtifacts(session);
                 await clearPersistedSession();
@@ -4883,32 +4736,25 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             }
         }
         // Chrome/Edge desktop only (unsupported in Safari/Firefox and on
-        // mobile -- isFileSystemDirectoryAccessSupported() is false there, so
-        // this always falls through to the classic <input> picker below).
-        // Picking a folder instead of individual files gets ONE handle for
-        // the whole selection, which is what lets a large desktop batch (the
+        // mobile -- isFileSystemAccessSupported() is false there, so this
+        // always falls through to the classic <input> picker below). Picking
+        // via File System Access instead of the hidden <input> gets each file
+        // a persistable handle, which is what lets a large desktop batch (the
         // camera-import case) resume after a reload without the manual
-        // reselect-and-match flow the <input> path still needs -- and,
-        // unlike the old per-file-handle picker this replaced, without the
-        // browser's native permission dialog firing once per file on resume
-        // (see pickUploadFolderViaFileSystemAccess's and
-        // resolveFileFromDirectoryEntry's own comments). Not run through
-        // attachSelectedFilesToPendingSession's paused-session matching: any
-        // earlier paused session on this browser is expected to resume on
-        // its own via its own handle (see retryPersistedUploadSession/the
-        // auto-resume effect), so a fresh pick here is always a new batch.
-        if (isFileSystemDirectoryAccessSupported()) {
+        // reselect-and-match flow the <input> path still needs. Not run
+        // through attachSelectedFilesToPendingSession's paused-session
+        // matching: any earlier paused session on this browser is expected to
+        // resume on its own via those same handles (see retryPersistedUploadSession/
+        // the auto-resume effect), so a fresh pick here is always a new batch.
+        if (isFileSystemAccessSupported()) {
             void (async () => {
-                const picked = await pickUploadFolderViaFileSystemAccess();
+                const picked = await pickUploadFilesViaFileSystemAccess();
                 stopUploadWarmup();
-                if (!picked || picked.files.length === 0) {
+                if (picked.length === 0) {
                     return;
                 }
-                const relativePaths = new Map(picked.files.map(({ file, relativePath }) => [file, relativePath]));
-                await startUpload(picked.files.map(({ file }) => file), {
-                    directoryHandle: picked.directoryHandle,
-                    relativePaths,
-                });
+                const handles = new Map(picked.map(({ file, handle }) => [file, handle]));
+                await startUpload(picked.map(({ file }) => file), handles);
             })();
             return;
         }

@@ -60,14 +60,6 @@ export interface PersistedUploadFile {
     // capped per-session (see MAX_FAILED_FILE_PREVIEWS) since it's stored in
     // the persisted session written to localStorage.
     previewDataUrl?: string;
-    // Path of this file relative to the folder picked via
-    // pickUploadFolderViaFileSystemAccess (e.g. "2026-10-29/IMG_0001.jpg"),
-    // present only for a folder-based pick. Lets a resumed session re-derive
-    // this file from the session's persisted directory handle (see
-    // resolveFileFromDirectoryEntry / directoryHandleKey in
-    // AppServicesProvider.tsx) instead of needing its own independently
-    // persisted FileSystemFileHandle.
-    relativePath?: string;
 }
 
 export interface PersistedUploadSession {

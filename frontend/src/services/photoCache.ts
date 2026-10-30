@@ -1,5 +1,5 @@
 import { getActiveLibraryFromToken } from './passwordAuthClient';
-import type { FileSystemDirectoryHandle, FileSystemFileHandle } from './fileSystemAccess';
+import type { FileSystemFileHandle } from './fileSystemAccess';
 import { PHOTO_CACHE_STORAGE_KEY } from '../components/browserAiShared';
 
 /**
@@ -24,11 +24,11 @@ const openUploadDb = (): Promise<IDBDatabase> => new Promise((resolve, reject) =
     request.onerror = () => reject(request.error || new Error('Failed to open upload database.'));
 });
 
-// Also accepts a FileSystemFileHandle or FileSystemDirectoryHandle
-// (Chrome/Edge desktop's resume path -- see fileSystemAccess.ts): IndexedDB's
-// structured clone algorithm supports storing handles directly, and they're
-// far cheaper to persist than the file's actual bytes.
-export const idbPut = async (key: string, value: Blob | FileSystemFileHandle | FileSystemDirectoryHandle): Promise<void> => {
+// Also accepts a FileSystemFileHandle (Chrome/Edge desktop's resume path --
+// see fileSystemAccess.ts): IndexedDB's structured clone algorithm supports
+// storing handles directly, and they're far cheaper to persist than the
+// file's actual bytes.
+export const idbPut = async (key: string, value: Blob | FileSystemFileHandle): Promise<void> => {
     const db = await openUploadDb();
     await new Promise<void>((resolve, reject) => {
         const tx = db.transaction(UPLOAD_DB_STORE, 'readwrite');
@@ -39,12 +39,12 @@ export const idbPut = async (key: string, value: Blob | FileSystemFileHandle | F
     db.close();
 };
 
-export const idbGet = async (key: string): Promise<Blob | FileSystemFileHandle | FileSystemDirectoryHandle | null> => {
+export const idbGet = async (key: string): Promise<Blob | FileSystemFileHandle | null> => {
     const db = await openUploadDb();
-    const result = await new Promise<Blob | FileSystemFileHandle | FileSystemDirectoryHandle | null>((resolve, reject) => {
+    const result = await new Promise<Blob | FileSystemFileHandle | null>((resolve, reject) => {
         const tx = db.transaction(UPLOAD_DB_STORE, 'readonly');
         const req = tx.objectStore(UPLOAD_DB_STORE).get(key);
-        req.onsuccess = () => resolve((req.result as Blob | FileSystemFileHandle | FileSystemDirectoryHandle | undefined) || null);
+        req.onsuccess = () => resolve((req.result as Blob | FileSystemFileHandle | undefined) || null);
         req.onerror = () => reject(req.error || new Error('Failed to load upload blob.'));
     });
     db.close();
