@@ -820,6 +820,7 @@ def run_cluster_release(leases, store, library, wave_id, outbox_key, *,
     return next_wave
 
 
+@processing_diagnostics.index_wave_summary
 def run_index_release(leases, store, library, wave_id, outbox_key, ledger, *, publisher=None, prepare=None):
     from execution_lease import execution_scope
     ownership, wave = claim_release(leases, store, library, wave_id, 'index', outbox_key, 'index')
@@ -839,7 +840,8 @@ def run_index_release(leases, store, library, wave_id, outbox_key, ledger, *, pu
             check.boundary = lambda: check(force=True)
             if publisher is not None:
                 if prepare is not None:
-                    prepare(check)
+                    with processing_diagnostics.wave_phase_scope('prepare'):
+                        prepare(check)
                 manifest,specs=ledger._specs()
                 if manifest is None or manifest['requiredSetId'] != wave.get('requiredPublicationId'):
                     raise ValueError('Index obligation set is not the committed wave frontier')
@@ -851,7 +853,8 @@ def run_index_release(leases, store, library, wave_id, outbox_key, ledger, *, pu
                         if any(not ledger._valid_receipt(ledger._get(parent),manifest) for parent in spec['prerequisites']):
                             continue
                         check.boundary()
-                        generation=publisher(scope,spec['id'],check)
+                        with processing_diagnostics.wave_phase_scope('publish:'+scope):
+                            generation=publisher(scope,spec['id'],check)
                         check()
                         ledger.record_receipt(spec['id'],output_generation=generation)
                         leases.checkpoint(ownership,'published:'+scope)

@@ -197,5 +197,26 @@ def test_wave_metrics_report_failure_and_restore_context(caplog):
     phase, = records(caplog, 'cluster_wave_phase')
     assert summary['outcome'] == 'error' and summary['faces_processed'] == 1
     assert phase['errors'] == 1
+
+
+def test_index_wave_summary_emits_per_scope_phases_under_index_events(caplog):
+    @d.index_wave_summary
+    def run(leases, store, library, wave_id):
+        for scope in ('people', 'albums', 'search'):
+            with d.wave_phase_scope('publish:' + scope):
+                pass
+        return {'state': 'complete'}
+
+    assert run(None, None, 'private-library', 'wave-idx')['state'] == 'complete'
+    # Emitted under index_wave_* events, tagged role=index -- never the cluster ones.
+    assert records(caplog, 'cluster_wave_summary') == []
+    summary, = records(caplog, 'index_wave_summary')
+    assert summary['role'] == 'index'
+    assert summary['wave_id'] == 'wave-idx' and summary['outcome'] == 'success'
+    assert summary['state'] == 'complete'
+    assert 'private-library' not in json.dumps(summary)  # Library id stays hashed.
+    phases = {r['phase'] for r in records(caplog, 'index_wave_phase')}
+    assert {'publish:people', 'publish:albums', 'publish:search'} <= phases
+    assert d._WAVE.get() is None  # Context restored after the stage.
     assert 'sdk_calls' not in summary  # No scope is not zero I/O.
     assert d._WAVE.get() is None

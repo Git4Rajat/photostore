@@ -252,9 +252,9 @@ def _io_delta(before):
 
 
 class WaveMetrics:
-    def __init__(self, library, wave_id):
+    def __init__(self, library, wave_id, role='cluster'):
         self.fields = dict(_TRACE.get() or {})
-        self.fields.update(role='cluster', library_id=file_id(library, ''), wave_id=wave_id)
+        self.fields.update(role=role, library_id=file_id(library, ''), wave_id=wave_id)
         self.phases = {}
         self.faces = 0
         self.faces_processed = 0
@@ -315,10 +315,10 @@ def wave_phase(name):
     return decorate
 
 
-def cluster_wave_summary(function):
+def _wave_summary(function, *, role, phase_event, summary_event):
     @wraps(function)
     def wrapped(leases, store, library, wave_id, *args, **kwargs):
-        metrics = WaveMetrics(library, wave_id)
+        metrics = WaveMetrics(library, wave_id, role=role)
         token = _WAVE.set(metrics)
         started, cpu, before = time.monotonic(), time.process_time(), _scope_io()
         outcome = 'error'
@@ -330,9 +330,9 @@ def cluster_wave_summary(function):
             finally:
                 _WAVE.reset(token)
                 for name, totals in metrics.phases.items():
-                    emit('cluster_wave_phase', **metrics.fields, phase=name,
+                    emit(phase_event, **metrics.fields, phase=name,
                          inclusive=True, sdk_attribution='shared_scope', **totals)
-                emit('cluster_wave_summary', **metrics.fields, outcome=outcome,
+                emit(summary_event, **metrics.fields, outcome=outcome,
                      milliseconds=max(0, time.monotonic() - started) * 1000,
                      process_cpu_ms=max(0, time.process_time() - cpu) * 1000,
                      cpu_attribution='process', faces=metrics.faces,
@@ -341,6 +341,20 @@ def cluster_wave_summary(function):
                      storage_tracing_enabled=storage_tracing_enabled(),
                      **counters.snapshot(), **_io_delta(before))
     return wrapped
+
+
+def cluster_wave_summary(function):
+    return _wave_summary(function, role='cluster',
+                         phase_event='cluster_wave_phase', summary_event='cluster_wave_summary')
+
+
+def index_wave_summary(function):
+    # Same accounting as clustering, under index_wave_* events. The index stage
+    # was the one downstream stage with no per-phase/io telemetry, so its
+    # ~5m44s/1k-wave cost could not be attributed. Per-scope phases are added at
+    # the publish loop in run_index_release.
+    return _wave_summary(function, role='index',
+                         phase_event='index_wave_phase', summary_event='index_wave_summary')
 
 
 def payload(message):
