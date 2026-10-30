@@ -65,15 +65,20 @@ hand-derived and re-derived as real per-op costs drift. `_INDEX_MERGE_MAX_DIRTY_
 (2,000) is unchanged -- it's a correctly-sized cheap short-circuit below which
 merge always wins regardless of library size, avoiding a manifest read.
 
-One caveat intentionally left unresolved: `_INDEX_MERGE_CONCURRENCY` is **not**
-wired to the real `ThreadPoolExecutor(max_workers=min(16, ...))` caps in the
-actual merge code (five call sites in `storage_utils.py`, all hardcoded `16`).
-Changing the env var retunes the decision math only; it does not change real
-merge concurrency. Today both are `16`, so the model is accurate, but this is
-a latent drift risk if either is ever retuned independently.
+**Update (2026-10-31):** the caveat below is resolved -- all five
+`ThreadPoolExecutor(max_workers=min(16, ...))` call sites in
+`storage_utils.py` now read `_INDEX_MERGE_CONCURRENCY` instead of a
+hardcoded `16`, so retuning the env var changes real merge concurrency and
+the decision math together.
+
+~~One caveat intentionally left unresolved: `_INDEX_MERGE_CONCURRENCY` is
+**not** wired to the real `ThreadPoolExecutor(max_workers=min(16, ...))` caps
+in the actual merge code (five call sites in `storage_utils.py`, all
+hardcoded `16`). Changing the env var retunes the decision math only; it
+does not change real merge concurrency. Today both are `16`, so the model is
+accurate, but this is a latent drift risk if either is ever retuned
+independently.~~
 
 **Recommendation:** keep the direct-cost-comparison model; if `point_read_ms`
 or `scan_ms_per_row` drift (e.g. a storage account tier change, throttling),
-retune the two rate constants rather than reintroducing a fraction. If
-`_INDEX_MERGE_CONCURRENCY` is ever changed, change the five hardcoded `16`s
-in the same commit, or wire them to read the constant instead.
+retune the two rate constants rather than reintroducing a fraction.

@@ -2892,7 +2892,7 @@ def _merge_user_vector_index_snapshot(
         return filename, _compute_photo_vector(filename, row, embedding_row, photo_embeddings_compatible)
 
     if dirty_filenames:
-        with ThreadPoolExecutor(max_workers=min(16, max(1, len(dirty_filenames)))) as executor:
+        with ThreadPoolExecutor(max_workers=min(_INDEX_MERGE_CONCURRENCY, max(1, len(dirty_filenames)))) as executor:
             for filename, vector in executor.map(_refresh_one, dirty_filenames):
                 if vector is None:
                     by_filename.pop(filename, None)
@@ -4967,7 +4967,7 @@ def _merge_user_lexical_index_snapshot(
         return filename, {k: v for k, v in dict(row).items() if k not in _LEXICAL_INDEX_EXCLUDED_FIELDS}
 
     if dirty_filenames:
-        with ThreadPoolExecutor(max_workers=min(16, max(1, len(dirty_filenames)))) as executor:
+        with ThreadPoolExecutor(max_workers=min(_INDEX_MERGE_CONCURRENCY, max(1, len(dirty_filenames)))) as executor:
             for filename, trimmed_row in executor.map(_refresh_one, dirty_filenames):
                 if trimmed_row is None:
                     by_filename.pop(filename, None)
@@ -5488,7 +5488,7 @@ def _merge_user_sort_index_snapshot(
         return filename, _sort_index_row(dict(entity))
 
     if dirty_filenames:
-        with ThreadPoolExecutor(max_workers=min(16, max(1, len(dirty_filenames)))) as executor:
+        with ThreadPoolExecutor(max_workers=min(_INDEX_MERGE_CONCURRENCY, max(1, len(dirty_filenames)))) as executor:
             for filename, trimmed_row in executor.map(_refresh_one, dirty_filenames):
                 if trimmed_row is None:
                     by_filename.pop(filename, None)
@@ -5608,7 +5608,7 @@ def _refresh_rows_index_on_disk(
                         return filename, row_fn(dict(entity))
 
                     if dirty:
-                        with ThreadPoolExecutor(max_workers=min(16, max(1, len(dirty)))) as executor:
+                        with ThreadPoolExecutor(max_workers=min(_INDEX_MERGE_CONCURRENCY, max(1, len(dirty)))) as executor:
                             refreshed = dict(executor.map(_one, list(dirty)))
                     written: Set[str] = set()
                     for row in index_files.iter_rows(previous):
@@ -6079,7 +6079,7 @@ def _merge_user_access_index_snapshot(
         return filename, _access_index_row(dict(entity))
 
     if dirty_filenames:
-        with ThreadPoolExecutor(max_workers=min(16, max(1, len(dirty_filenames)))) as executor:
+        with ThreadPoolExecutor(max_workers=min(_INDEX_MERGE_CONCURRENCY, max(1, len(dirty_filenames)))) as executor:
             for filename, trimmed_row in executor.map(_refresh_one, dirty_filenames):
                 if trimmed_row is None:
                     by_filename.pop(filename, None)
