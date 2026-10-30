@@ -1064,7 +1064,10 @@ resource indexer 'Microsoft.App/containerApps@2025-01-01' = {
         { name: 'index-cache', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
       ]
       scale: {
-        cooldownPeriod: 300
+        // Lowered from 300s: idle-cooldown tail was ~50% of billed replica
+        // time (see docs/benchmarks/cluster-false-starts-20261030.md);
+        // background worker, no user-facing cold-start latency to protect.
+        cooldownPeriod: 60
         minReplicas: 0
         // One publisher process during migration; API and queue work are
         // isolated containers, while work leases protect restart overlap.
@@ -1177,7 +1180,9 @@ resource recovery 'Microsoft.App/containerApps@2025-01-01' = {
         }
       ]
       scale: {
-        cooldownPeriod: 300
+        // Lowered from 300s: background worker, no user-facing cold-start
+        // latency to protect (see docs/benchmarks/cluster-false-starts-20261030.md).
+        cooldownPeriod: 60
         minReplicas: 0
         maxReplicas: 2
         rules: [
@@ -1294,7 +1299,9 @@ resource archive 'Microsoft.App/containerApps@2025-01-01' = {
         { name: 'index-cache', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
       ]
       scale: {
-        cooldownPeriod: 300
+        // Lowered from 300s: background worker, no user-facing cold-start
+        // latency to protect (see docs/benchmarks/cluster-false-starts-20261030.md).
+        cooldownPeriod: 60
         minReplicas: 0
         maxReplicas: 3
         rules: [
@@ -1391,7 +1398,9 @@ resource upload 'Microsoft.App/containerApps@2025-01-01' = {
         }
       ]
       scale: {
-        cooldownPeriod: 300
+        // Lowered from 300s: background worker, no user-facing cold-start
+        // latency to protect (see docs/benchmarks/cluster-false-starts-20261030.md).
+        cooldownPeriod: 60
         minReplicas: 0
         maxReplicas: 5
         rules: [
@@ -1467,7 +1476,8 @@ resource web 'Microsoft.App/containerApps@2025-01-01' = {
         }
       ]
       scale: {
-        cooldownPeriod: 300
+        // Lowered from 300s: idle-cooldown tail is pure waste here too.
+        cooldownPeriod: 60
         // Scale-to-zero: nginx serving the SPA cold-starts in a couple of
         // seconds, and an idle deployment should cost nothing.
         minReplicas: 0
@@ -1597,7 +1607,10 @@ resource cluster 'Microsoft.App/containerApps@2025-01-01' = {
         { name: 'faiss-checkpoints', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
       ]
       scale: {
-        cooldownPeriod: 300
+        // Lowered from 300s: measured ~50% of billed replica-time was
+        // idle-cooldown tail (docs/benchmarks/cluster-false-starts-20261030.md).
+        // Background worker, no user-facing cold-start latency to protect.
+        cooldownPeriod: 60
         // Queued and claimed work keep this worker active. Once queues drain,
         // scale to zero; checkpoints support the next cold start.
         minReplicas: clusterMinReplicas
