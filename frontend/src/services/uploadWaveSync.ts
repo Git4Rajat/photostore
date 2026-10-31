@@ -1,4 +1,4 @@
-import { waveParentFor, recordWaveItemResolved, waveParentResolved, waveSelectionSession, waveFileBelongs, loadWaveOperation, retireWaveOperation, retryWaveOperation } from './uploadWaveOperations';
+import { waveParentFor, recordWaveItemResolved, waveParentResolved, waveSelectionSession, waveFileBelongs, loadWaveOperation, retireWaveOperation, retryWaveOperation, type Operation } from './uploadWaveOperations';
 import { sessionScope } from './sessionScope';
 import type { PersistedUploadFile, PersistedUploadSession } from '../types/browserProcessing';
 import {
@@ -21,6 +21,13 @@ import {
 // Optional shadow protocol for full-selection parents and their transport children.
 // Legacy checkpoints remain readable. Requests are serialized per parent; errors
 // hold diagnostic intake open and never fail the underlying byte upload.
+
+// waveParentFor can return either a real Operation (declaredCount present)
+// or, for a session with no waveOperationId yet, the plain checkpoint itself
+// ("pre-parent diagnostic sessions") -- fall back to its own files.length in
+// that case, since there's no separate declared manifest to consult yet.
+const declaredCountFor = (parent: PersistedUploadSession): number =>
+    'declaredCount' in parent ? (parent as Operation).declaredCount : parent.files.length;
 
 interface WaveShadowSessionState {
     manifestRevision: string | null;
@@ -62,26 +69,32 @@ const liveOutcomeForFile = (file: PersistedUploadFile): WaveShadowOutcome | null
 // registration is idempotent per itemId, and this module also tracks what it
 // already believes is done so a healthy tab doesn't re-send on every call.
 const ensureRegistered = async (child: PersistedUploadSession): Promise<void> => {
-    const session = waveParentFor(child);
-    if (!session) return;
-    const state = stateFor(session.id);
-    if ('closed' in session && session.closed === true) {
+    const parent = waveParentFor(child);
+    if (!parent) return;
+    const state = stateFor(parent.id);
+    if ('closed' in parent && parent.closed === true) {
         state.opened = state.registered = state.closed = true;
         return;
     }
-    if (state.closed || state.expired || state.discarding || session.files.length === 0) return;
+    // declaredCount, not parent.files.length/child.files.length: the
+    // Operation's persisted files array is dropped on reload (see
+    // uploadWaveOperations.ts's encode()), and the checkpoint's files array
+    // is intentionally the WRONG size once any file is done and removed
+    // (see removePersistedFile) -- declaredCount is the one field that
+    // survives both and still means "how many files this wave has."
+    if (state.closed || state.expired || state.discarding || declaredCountFor(parent) === 0) return;
     if (!state.opened) {
         // A previous admission may have failed before this browser retried.
         // Ensure the linked parent exists server-side before opening its retry.
-        if (session.resumedFromSessionId && 'scope' in session && typeof session.scope === 'string') {
-            const previous = loadWaveOperation(session.resumedFromSessionId, session.scope);
+        if (parent.resumedFromSessionId && 'scope' in parent && typeof parent.scope === 'string') {
+            const previous = loadWaveOperation(parent.resumedFromSessionId, parent.scope);
             if (!previous) return;
             await ensureRegistered(previous);
             if (!stateFor(previous.id).opened) return;
         }
-        const opened = session.resumedFromSessionId
-            ? await openWaveShadowSession(session.id, session.files.length, session.resumedFromSessionId)
-            : await openWaveShadowSession(session.id, session.files.length);
+        const opened = parent.resumedFromSessionId
+            ? await openWaveShadowSession(parent.id, declaredCountFor(parent), parent.resumedFromSessionId)
+            : await openWaveShadowSession(parent.id, declaredCountFor(parent));
         if (!opened) return; // disabled, or a transient failure -- a later call retries
         state.opened = true;
         state.manifestRevision = opened.manifestRevision;
@@ -92,11 +105,16 @@ const ensureRegistered = async (child: PersistedUploadSession): Promise<void> =>
         }
     }
     if (state.registered) return;
-    for (let i = state.registeredCount; i < session.files.length; i += WAVE_SHADOW_MAX_PAGE) {
+    // child.files (the checkpoint), not parent.files: always a safe,
+    // idempotent subset of what's already registered -- a file can't reach
+    // `done` (and be dropped from the checkpoint) before its whole
+    // registration round has already completed, so re-registering only
+    // what's left in the checkpoint never skips anything that still needs it.
+    for (let i = state.registeredCount; i < child.files.length; i += WAVE_SHADOW_MAX_PAGE) {
         if (state.discarding || !waveParentFor(child)) return;
-        const page = session.files.slice(i, i + WAVE_SHADOW_MAX_PAGE)
+        const page = child.files.slice(i, i + WAVE_SHADOW_MAX_PAGE)
             .map((file) => ({ itemId: file.key, filename: file.name }));
-        const result = await registerWaveShadowItems(session.id, page);
+        const result = await registerWaveShadowItems(parent.id, page);
         if (!result) return; // Replay only the unacknowledged HTTP batch on retry.
         state.manifestRevision = result.manifestRevision;
         state.registeredCount = i + page.length;
@@ -276,7 +294,11 @@ export const discardWaveShadowSession = async (session: PersistedUploadSession):
                                 }
                                 throw new Error('Upload recovery information requires an updated upload service.');
                             }
-                            const opened=await openWaveShadowSession(currentId,candidate.files.length,candidate.resumedFromSessionId);
+                            // declaredCountFor, not candidate.files.length -- candidate
+                            // may be a cold-reloaded Operation whose persisted
+                            // files array is now [] (see uploadWaveOperations.ts's
+                            // encode()).
+                            const opened=await openWaveShadowSession(currentId,declaredCountFor(candidate),candidate.resumedFromSessionId);
                             if (!opened) throw new Error('Upload discard could not be acknowledged. Retry Discard.');
                             revision=opened.manifestRevision;
                             if (['closed','abandoned'].includes(opened.state || '')) {

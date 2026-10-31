@@ -49,7 +49,9 @@ it('admits 901 items before transport and closes only after both 900/1 children 
     await finalizeWaveShadowSession(first);
     expect(mocks.close).not.toHaveBeenCalled();
     clearWaveOperationCachesForTests(); __resetWaveShadowStateForTests();
-    expect(loadWaveOperation(parent.id, mocks.scope)?.files).toHaveLength(901);
+    // No per-file array survives a cold reload (see encode()) -- declaredCount
+    // is the one field that does, and is what registration/admission now key off.
+    expect(loadWaveOperation(parent.id, mocks.scope)?.declaredCount).toBe(901);
     await finalizeWaveShadowSession(last);
     expect(mocks.close).toHaveBeenCalledTimes(1);
     expect(mocks.close.mock.calls[0][0]).toBe(parent.id);
@@ -162,16 +164,26 @@ it('recovers quota space by compacting legacy manifests without removing unfinis
     localStorage.setItem(oldKey + ':old-0', 'resolved');
     localStorage.setItem('photostore.upload.session', 'keep checkpoint');
     const save = localStorage.setItem.bind(localStorage);
+    // Threshold lowered from 12500: encode() no longer persists a per-file
+    // array for ANY record (new or legacy, see uploadWaveOperations.ts), so
+    // a fresh 20-file operation's own write is now ~100 bytes instead of
+    // large enough to blow quota by itself -- this must still force the
+    // quota-exceeded-then-compact path on the strength of the OLD legacy
+    // record's size alone (~12KB), not the new write's.
     vi.spyOn(localStorage, 'setItem').mockImplementation((storageKey, value) => {
         const total = Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index)!)
             .filter(key => key !== storageKey).reduce((sum, key) => sum + localStorage.getItem(key)!.length, value.length);
-        if (total > 12500) throw new DOMException('Quota exceeded', 'QuotaExceededError');
+        if (total > 1000) throw new DOMException('Quota exceeded', 'QuotaExceededError');
         save(storageKey, value);
     });
     const files = Array.from({ length: 20 }, (_, i) => new File(['x'], `${i}.webp`));
     expect(declareWaveSelection(files)).not.toBeNull();
     const restored = loadWaveOperation('old', mocks.scope)!;
-    expect(restored.files[0]).toMatchObject({ key: 'old-0', name: 'unfinished.webp' });
+    // Compacted records carry no per-file array at all (see encode()) --
+    // declaredCount (derived here from the legacy record's files.length,
+    // since it predates declaredCount) is the one thing that survives.
+    expect(restored.declaredCount).toBe(1);
+    expect(restored.files).toEqual([]);
     expect(localStorage.getItem(oldKey)!.length).toBeLessThan(300);
     expect(localStorage.getItem(oldKey + ':old-0')).toBe('resolved');
     expect(localStorage.getItem('photostore.upload.session')).toBe('keep checkpoint');

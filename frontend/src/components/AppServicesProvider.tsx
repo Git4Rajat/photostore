@@ -1867,6 +1867,21 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         uploadSessionStoreRef.current!.update(fileKey, updates);
     }, []);
 
+    // Drops a settled file's checkpoint entry entirely rather than merely
+    // trimming it -- nothing ever reads a `done` file's record again (every
+    // consumer only filters `done` files out), so this keeps a large wave's
+    // checkpoint bounded by its in-flight/failed working set instead of its
+    // total size. Call only after every updatePersistedFile write for this
+    // file has already happened; a later update() against a removed key is a
+    // silent no-op (see UploadSessionStore.update's index guard).
+    const removePersistedFile = useCallback((fileKey: string) => {
+        const current = uploadSessionRef.current;
+        if (!current || discardedUploadSessionIdsRef.current.has(current.id)) {
+            return;
+        }
+        uploadSessionStoreRef.current!.remove(fileKey);
+    }, []);
+
     const releaseCachedUploadFile = useCallback(async (fileKey: string) => {
         uploadSourceFilesRef.current.delete(fileKey);
         if (await uploadSessionStoreRef.current!.checkpoint()) {
@@ -3663,7 +3678,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         freshlyUploadedFilenamesRef.current.add(fileMeta.name);
                         if (!prepared.clientProcessing?.thumbnail) kickOffThumbnailForFile(file, fileMeta.name, fileMeta.blobName);
                     }
+                    // Source bytes must outlive the checkpoint that marks them
+                    // done (see releaseCachedUploadFile), so this checkpoint
+                    // entry is only dropped AFTER that checkpoint+IDB cleanup
+                    // has happened, not before.
                     await releaseCachedUploadFile(fileMeta.key);
+                    removePersistedFile(fileMeta.key);
                     updateUploadNotification({
                         title: 'Upload in progress',
                         details: `Uploaded ${totalUploaded}/${plural(totalCount, 'file')}. Skipped duplicates: ${totalSkippedDuplicates}.`,
@@ -3854,9 +3874,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                                 skippedDuplicate: true,
                                 error: undefined,
                             });
+                            // Dropped only AFTER releaseCachedUploadFile's checkpoint
+                            // +IDB cleanup, same reasoning as the non-duplicate path above.
                             const cleanupTask = releaseCachedUploadFile(fileMeta.key)
                                 .catch(() => undefined)
-                                .finally(() => { pendingFinalizeTasks.delete(cleanupTask); });
+                                .finally(() => {
+                                    pendingFinalizeTasks.delete(cleanupTask);
+                                    removePersistedFile(fileMeta.key);
+                                });
                             pendingFinalizeTasks.add(cleanupTask);
                             updateUploadNotification({
                                 title: 'Upload in progress',
@@ -4214,6 +4239,17 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
         const matchedPairs: Array<{ key: string; file: File }> = [];
         const unfinishedFiles = session.files.filter((file) => file.status !== 'done');
+        // `doneFiles` is now always empty: removePersistedFile drops a file's
+        // checkpoint entry entirely as soon as it's done (see
+        // UploadSessionStore.remove), rather than leaving it in `session.files`
+        // for this fast-path lookup. Reselecting an already-uploaded file now
+        // falls through to unmatchedFiles and gets queued as "new" -- it isn't
+        // re-uploaded or duplicated, since the existing SHA-256 known-hash
+        // check (before /upload/init) and the backend's own finalize-time
+        // duplicate detection both still catch it; it just pays a redundant
+        // local hash/read instead of being skipped here. Not worth a parallel
+        // structure that would reintroduce the same "scales with wave size"
+        // problem removePersistedFile exists to avoid.
         const doneFiles = session.files.filter((file) => file.status === 'done');
         const unmatchedFiles: File[] = [];
 

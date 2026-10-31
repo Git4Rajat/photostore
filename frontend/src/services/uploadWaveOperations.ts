@@ -4,7 +4,7 @@ import { waveShadowEnabled } from './uploadWaveClient';
 
 const PREFIX = 'photostore.upload.wave-operation.v1:';
 type Ref = { operationId: string; scope: string; itemKey: string };
-export type Operation = PersistedUploadSession & { scope: string; resumedFromSessionId?: string; closed?: boolean };
+export type Operation = PersistedUploadSession & { scope: string; resumedFromSessionId?: string; closed?: boolean; declaredCount: number };
 const selections = new WeakMap<File[], Ref[]>();
 const unadmitted = new WeakSet<File[]>();
 const operations = new Map<string, Operation>();
@@ -12,13 +12,32 @@ const outcomes = new Map<string, Set<string>>();
 const key = (scope: string, id: string) => PREFIX + JSON.stringify([scope, id]);
 const outcomeKey = (scope: string, id: string, item: string) => key(scope, id) + ':' + item;
 
-// A manifest needs only stable item IDs and names. Blob checkpoints, previews
-// and errors belong to the separate upload session, never to each retry parent.
+// All outcome-receipt keys for one operation, regardless of which (possibly
+// cold-reloaded, possibly multiple) child session wrote them -- used instead
+// of iterating a specific files list, since neither a cold-reloaded parent's
+// files (now [], see encode()) nor any single child's own files (when
+// multiple children share one parent, e.g. a selection split across
+// transport chunks) is the right set to check against.
+const outcomeKeysFor = (scope: string, id: string): string[] => {
+    const prefix = key(scope, id) + ':';
+    try {
+        const keys = Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index));
+        return keys.filter((storageKey): storageKey is string => Boolean(storageKey?.startsWith(prefix)));
+    } catch { return []; }
+};
+
+// Only the operation's identity and declared size need to survive a reload --
+// no per-file array. bindWaveChild/waveSelectionSession/declareWaveSelection's
+// existence check all work from the in-memory `selections`/`operations`
+// caches populated at declare time, never from this persisted record; the
+// full per-file manifest already reaches the backend separately via
+// registerWaveShadowItems. Keeping `files` here was an 8MB-at-50k-files
+// blob duplicating data nothing ever read back after a cold reload.
 const encode = (operation: Operation): string => JSON.stringify({
     id: operation.id, scope: operation.scope, createdAt: operation.createdAt,
+    declaredCount: operation.declaredCount,
     ...(operation.resumedFromSessionId ? { resumedFromSessionId: operation.resumedFromSessionId } : {}),
     ...(operation.closed ? { closed: true } : {}),
-    files: operation.files.map(file => ({ key: file.key, name: file.name })),
 });
 
 // Upgrade old records in place, including unfinished manifests. No file IDs,
@@ -36,7 +55,10 @@ const compactExisting = (): boolean => {
                 if (!operation || typeof operation.id !== 'string' || typeof operation.scope !== 'string'
                     || storageKey !== key(operation.scope, operation.id) || !Array.isArray(operation.files)
                     || !operation.files.every(file => typeof file.key === 'string' && typeof file.name === 'string')) continue;
-                const compact = encode(operation);
+                // Legacy pre-declaredCount records: derive it from the files
+                // array being stripped below, so a compacted record never
+                // loses the one thing loadWaveOperation needs from it.
+                const compact = encode({ ...operation, declaredCount: operation.declaredCount ?? operation.files.length });
                 if (compact.length >= raw.length) continue;
                 localStorage.setItem(storageKey, compact);
                 changed = true;
@@ -63,7 +85,16 @@ export const loadWaveOperation = (id: string, scope: string): Operation | null =
     if (operations.has(cacheKey)) return operations.get(cacheKey)!;
     try {
         const stored = JSON.parse(localStorage.getItem(cacheKey) || 'null') as Operation | null;
-        if (!stored || stored.id !== id || stored.scope !== scope || !Array.isArray(stored.files)) return null;
+        if (!stored || stored.id !== id || stored.scope !== scope) return null;
+        // Current records carry no `files` at all (see encode()) -- only
+        // their identity and declaredCount survive a reload. Fall back to
+        // `files.length` only for not-yet-compacted legacy records that
+        // still happen to carry the old array.
+        if (!Array.isArray(stored.files)) stored.files = [];
+        if (typeof stored.declaredCount !== 'number') {
+            if (!stored.files.every(file => typeof file?.key === 'string' && typeof file?.name === 'string')) return null;
+            stored.declaredCount = stored.files.length;
+        }
         stored.files = stored.files.map(file => Object.assign({ size: 0, type: '', lastModified: 0,
             uploadedBytes: 0, skippedDuplicate: false, status: 'pending' as const }, file));
         operations.set(cacheKey, stored);
@@ -79,7 +110,8 @@ export const declareWaveSelection = (files: File[]): Operation | null => {
     if (existing) return loadWaveOperation(existing[0].operationId, existing[0].scope);
     const id = crypto.randomUUID();
     const scope = sessionScope();
-    const operation: Operation = { id, scope, createdAt: Date.now(), files: files.map((file, index) => ({
+    const operation: Operation = { id, scope, createdAt: Date.now(), declaredCount: files.length,
+        files: files.map((file, index) => ({
         key: `${id}-${index}`, name: file.name, size: file.size, type: file.type,
         lastModified: file.lastModified, uploadedBytes: 0, skippedDuplicate: false, status: 'pending',
     })) };
@@ -119,10 +151,12 @@ export const recordWaveItemResolved = (session: PersistedUploadSession, file: Pe
     const parent = loadWaveOperation(session.waveOperationId, session.waveScope!);
     if (!parent || parent.closed) return;
     const cacheKey = key(parent.scope, parent.id);
+    // Write-only: nothing ever reads this Set via `.has()` -- it only exists
+    // to avoid rebuilding on every call. No seed needed (and parent.files may
+    // be [] after a cold reload, see encode()); just start empty.
     let resolved = outcomes.get(cacheKey);
     if (!resolved) {
-        resolved = new Set(parent.files.filter(item => localStorage.getItem(outcomeKey(parent.scope, parent.id, item.key)))
-            .map(item => item.key));
+        resolved = new Set<string>();
         outcomes.set(cacheKey, resolved);
     }
     try {
@@ -137,12 +171,13 @@ export const retireWaveOperation = (session: PersistedUploadSession): void => {
     if (!session.waveOperationId || session.waveScope !== sessionScope()) return;
     const parent = loadWaveOperation(session.waveOperationId, session.waveScope!);
     if (!parent || parent.closed) return;
-    const receipt: Operation = { id: parent.id, scope: parent.scope, createdAt: parent.createdAt, closed: true, files: [] };
+    const receipt: Operation = { id: parent.id, scope: parent.scope, createdAt: parent.createdAt,
+        declaredCount: parent.declaredCount, closed: true, files: [] };
     if (!persist(receipt)) return;
     operations.set(key(parent.scope, parent.id), receipt);
     outcomes.delete(key(parent.scope, parent.id));
-    for (const file of parent.files) {
-        try { localStorage.removeItem(outcomeKey(parent.scope, parent.id, file.key)); } catch { /* Receipt is already durable. */ }
+    for (const storageKey of outcomeKeysFor(parent.scope, parent.id)) {
+        try { localStorage.removeItem(storageKey); } catch { /* Receipt is already durable. */ }
     }
 };
 
@@ -150,7 +185,19 @@ export const waveParentResolved = (session: PersistedUploadSession): boolean => 
     if (!session.waveOperationId) return true;
     const parent = loadWaveOperation(session.waveOperationId, session.waveScope || '');
     if (!parent) return false;
-    return parent.files.every(file => Boolean(localStorage.getItem(outcomeKey(parent.scope, parent.id, file.key))));
+    // A closed parent is resolved by definition -- retireWaveOperation has
+    // already deliberately deleted its outcome receipts, so the count below
+    // would otherwise read as 0 and wrongly report "not resolved."
+    if ('closed' in parent && parent.closed) return true;
+    // Count receipts against declaredCount rather than checking each file in
+    // parent.files/session.files individually: parent.files may be [] after
+    // a cold reload (see encode()), and session.files is only the CALLING
+    // child's own subset -- when one parent is split across multiple child
+    // sessions (e.g. a selection chunked into transport batches), neither is
+    // "all items this parent declared." A plain count against declaredCount
+    // is correct regardless of how many children wrote receipts or whether
+    // this tab ever saw the full list.
+    return outcomeKeysFor(parent.scope, parent.id).length >= parent.declaredCount;
 };
 
 export const waveSelectionSession = (files: File[]): PersistedUploadSession | null => {
@@ -174,7 +221,7 @@ export const retryWaveOperation = (session: PersistedUploadSession): PersistedUp
     if (!unfinished.length) return session;
     const id = crypto.randomUUID();
     const scope = sessionScope();
-    const parent: Operation = { id, scope, createdAt: Date.now(),
+    const parent: Operation = { id, scope, createdAt: Date.now(), declaredCount: unfinished.length,
         ...(session.waveOperationId ? { resumedFromSessionId: session.waveOperationId } : {}),
         files: unfinished.map((file, index) => ({ ...file, key: `${id}-${index}`, status: 'pending' })) };
     if (!persist(parent)) return session;

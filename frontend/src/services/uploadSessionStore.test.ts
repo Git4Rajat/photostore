@@ -100,6 +100,54 @@ describe('upload recovery checkpoints', () => {
         expect(oldFile.status).toBe('pending');
     });
 
+    it('drops a file entirely via remove(), not just trims it, without disturbing other entries', async () => {
+        const { store, storage } = setup();
+        const source = session(5);
+        store.set(source);
+        const untouched1 = store.current!.files[1];
+        const untouched3 = store.current!.files[3];
+        const splice = vi.spyOn(Array.prototype, 'splice');
+        store.update('session:4', { status: 'done' });
+        store.remove('session:4');
+        expect(splice).not.toHaveBeenCalled();
+        expect(store.current!.files).toHaveLength(4);
+        expect(store.current!.files.some((file) => file.key === 'session:4')).toBe(false);
+        // Swap-and-pop moves the last element into the removed slot rather
+        // than shifting everything -- untouched entries keep their object
+        // identity (no copy), only the swapped one's position metadata changes.
+        expect(store.current!.files).toContain(untouched1);
+        expect(store.current!.files).toContain(untouched3);
+        await vi.advanceTimersByTimeAsync(UPLOAD_CHECKPOINT_INTERVAL_MS);
+        const persisted = JSON.parse(storage.getItem(KEY)!);
+        expect(persisted.files).toHaveLength(4);
+        expect(persisted.files.some((file: { key: string }) => file.key === 'session:4')).toBe(false);
+        // Removing a key a second time, or one that was never present, is a
+        // silent no-op (mirrors update()'s own missing-key guard).
+        store.remove('session:4');
+        store.remove('never-existed');
+        expect(store.current!.files).toHaveLength(4);
+    });
+
+    it('keeps checkpoint size bounded by the in-flight/failed working set, not the total wave size', async () => {
+        const { store, storage } = setup();
+        const total = 50000;
+        const stillPending = 10000;
+        store.set(session(total));
+        for (let index = stillPending; index < total; index += 1) {
+            const key = `session:${index}`;
+            store.update(key, { status: 'done' });
+            store.remove(key);
+        }
+        await vi.advanceTimersByTimeAsync(UPLOAD_CHECKPOINT_INTERVAL_MS);
+        const persisted = JSON.parse(storage.getItem(KEY)!);
+        expect(persisted.files).toHaveLength(stillPending);
+        // A 50,000-entry blob measured ~23MB (UTF-16) in practice; bounding it
+        // to the still-pending working set keeps a wave of ANY total size
+        // from ever approaching that regardless of how large the wave is.
+        const serializedLength = storage.getItem(KEY)!.length;
+        expect(serializedLength).toBeLessThan(2_000_000);
+    });
+
     it('flushes immediately on lifecycle boundaries without a redundant timer write', async () => {
         const { store, storage } = setup();
         store.set(session());

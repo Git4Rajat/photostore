@@ -48,6 +48,29 @@ export class UploadSessionStore {
         this.schedule();
     }
 
+    // A `done` file's entry is never read again (every consumer only filters
+    // `done` files out) and the whole session already gets deleted once
+    // nothing is left pending -- so dropping it the moment it's done costs
+    // nothing that isn't already lost at end-of-session, while keeping a
+    // large wave's checkpoint bounded by its in-flight/failed working set
+    // instead of its total size. Swap-and-pop keeps `current.files` a real
+    // array (no splice/reindex), preserving the zero-copy-on-progress
+    // behavior other updates rely on for untouched entries.
+    remove(key: string): void {
+        const index = this.positions.get(key);
+        if (!this.current || index === undefined) return;
+        const files = this.current.files;
+        const last = files.length - 1;
+        if (index !== last) {
+            files[index] = files[last];
+            this.positions.set(files[index].key, index);
+        }
+        files.pop();
+        this.positions.delete(key);
+        this.dirty = true;
+        this.schedule();
+    }
+
     // Finalized source bytes must outlive the checkpoint that marks them done.
     // All completions in a window share this promise, without holding transfer lanes.
     checkpoint(): Promise<boolean> {

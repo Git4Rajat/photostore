@@ -840,6 +840,78 @@ describe('browser upload selection and startup', () => {
         expect(services.queuedUploadFileCount).toBe(0);
     });
 
+    it('reselecting an already-uploaded-and-removed file dedups by hash instead of a stale local match', async () => {
+        const files = filesFor(5);
+        const failingNames = new Set(['original-3.heic', 'original-4.heic']);
+        const failingNamesAtStart = new Set(failingNames);
+        mocks.postUpload.mockImplementation(async (url: string, payload: { filename: string; files: Array<{ filename: string }> }) => {
+            if (url === '/upload/init') {
+                return { uploadId: payload.filename, blobName: `blob-${payload.filename}`,
+                    blobUrl: `https://test.blob.core.windows.net/images/${payload.filename}` };
+            }
+            if (url === '/upload/init-batch') {
+                return { results: payload.files.map((file) => ({
+                    uploadId: file.filename, blobName: `blob-${file.filename}`,
+                    blobUrl: `https://test.blob.core.windows.net/images/${file.filename}`,
+                    uploadPreparationEnabled: true,
+                    previewBlobUrl: 'https://test.blob.core.windows.net/thumbnails/preview.jpg',
+                    metadataBlobUrl: 'https://test.blob.core.windows.net/thumbnails/metadata.bin',
+                })) };
+            }
+            if (url === '/upload/finalize-batch') {
+                return { results: payload.files.map((file) => (
+                    failingNames.has(file.filename)
+                        ? { filename: file.filename, error: 'Test finalize failure' }
+                        : { filename: file.filename, complete: true, duplicates: [] }
+                )) };
+            }
+            return {};
+        });
+        const input = select(files);
+        await advance(20000);
+        // Confirms the core fix directly: fileCount reflects only the 2 still-
+        // failed files, not all 5 -- the 3 succeeded files are already gone
+        // from the checkpoint (removePersistedFile), not merely marked done.
+        expect(services.pendingUploadSummary?.fileCount).toBe(2);
+        expect(finalizedFiles().filter((file) => !failingNames.has(file.filename))).toHaveLength(3);
+
+        // The 3 already-uploaded files are now known server-side duplicates
+        // (as they genuinely would be, having actually uploaded). Stop
+        // failing finalize from here on (in place -- failingNames.clear()
+        // rather than swapping the mock implementation, so every other
+        // endpoint this flow needs keeps the same coverage it already had).
+        mocks.getUpload.mockResolvedValue({ hashes: Object.fromEntries(
+            files.filter((file) => !failingNames.has(file.name))
+                .map((file) => [Array.from(new TextEncoder().encode(file.name)).join('-'), `stored-${file.name}`]),
+        ) });
+        failingNames.clear();
+        mocks.staged.mockClear();
+        mocks.postUpload.mockClear();
+        // fetchKnownHashes caches for 60s -- advance past it so the reselect
+        // below queries the updated hashes above instead of the stale (empty)
+        // ones fetched during the first run.
+        await advance(61000);
+        // Reselecting the FULL original 5-file picker selection -- same as a
+        // user re-adding the same folder -- not just the 2 that paused.
+        fireEvent.change(input, { target: { files } });
+        for (let tick = 0; tick < 40 && finalizedFiles().length < 2; tick += 1) {
+            await advance(1000);
+        }
+        // The 3 deduped files are queued (not started immediately, since the
+        // 2 reattached retries were already running) -- give their own
+        // dedup-only run time to complete and emit its notification too.
+        await advance(20000);
+        expect(services.pendingUploadSummary).toBeNull();
+        // Only the 2 originally-failed files go through finalize this round.
+        expect(finalizedFiles()).toHaveLength(2);
+        expect(new Set(finalizedFiles().map((file) => file.filename))).toEqual(failingNamesAtStart);
+        // The 3 already-done files are caught by the hash-dedup check before
+        // any bytes transfer -- not silently skipped via a stale local match,
+        // and not re-uploaded/duplicated either.
+        expect(mocks.staged).not.toHaveBeenCalled();
+        expect(services.notifications.some((notification) => notification.progress?.skippedDuplicateCount === 3)).toBe(true);
+    });
+
     it('still skips a confirmed duplicate without transferring bytes', async () => {
         const file = filesFor(1)[0];
         const hash = Array.from(new TextEncoder().encode(file.name)).join('-');
