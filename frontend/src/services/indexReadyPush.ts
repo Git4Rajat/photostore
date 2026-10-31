@@ -1,4 +1,5 @@
 import { hasForegroundDemand, onForegroundReturn } from './foregroundDemand';
+import { hasIndexDemand, onIndexDemandReturn } from './indexDemand';
 import { postTools } from './apiClient';
 import { getActiveLibraryFromToken } from './passwordAuthClient';
 import { isLikelyAuthenticated } from './jobNotifications';
@@ -12,7 +13,7 @@ export const startIndexReadyPush = (ready: () => void): (() => void) => {
     let retry = 1000;
     let generation = 0;
     let scope = pendingEditScope();
-    const isGated = () => !hasForegroundDemand();
+    const isGated = () => !hasForegroundDemand() || !hasIndexDemand();
     const connect = async () => {
         const attempt = ++generation;
         const requestedScope = pendingEditScope();
@@ -75,9 +76,14 @@ export const startIndexReadyPush = (ready: () => void): (() => void) => {
         gated = false; generation += 1; clearTimeout(timer); socket?.close(); socket = null;
         void connect();
     });
+    const indexDemandReturn = onIndexDemandReturn(() => {
+        gated = false; generation += 1; clearTimeout(timer); socket?.close(); socket = null;
+        void connect();
+    });
     void connect();
     return () => {
         foregroundReturn();
+        indexDemandReturn();
         stopped = true; generation += 1;
         clearTimeout(timer); clearInterval(scopeTimer); socket?.close();
     };

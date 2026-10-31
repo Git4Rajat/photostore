@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { noteForegroundActivity } from './foregroundDemand';
+import { __resetIndexDemandForTests, noteIndexActivity, setIndexDemandTab } from './indexDemand';
 const mocks = vi.hoisted(() => ({ post: vi.fn(), library: 'A', user: 'u1', authenticated: true }));
 vi.mock('./apiClient', () => ({ postTools: mocks.post }));
 vi.mock('./passwordAuthClient', () => ({ getActiveLibraryFromToken: () => mocks.library }));
@@ -16,10 +17,15 @@ const flush = async () => { await Promise.resolve(); await Promise.resolve(); };
 beforeEach(() => {
     vi.useFakeTimers(); sockets.length = 0; mocks.library = 'A'; mocks.user = 'u1'; mocks.authenticated = true;
     noteForegroundActivity();
+    // Tab-based demand (unlike noteIndexActivity()) never decays, so it keeps
+    // every pre-existing test below -- which exercises the *foreground* gate,
+    // not this one -- isolated from the index-demand gate's own 5-minute
+    // window. The index-demand gate itself is covered separately below.
+    setIndexDemandTab('tools');
     mocks.post.mockReset().mockResolvedValue({ available: true, url: 'wss://service/client', libraryId: 'A' });
     vi.stubGlobal('WebSocket', FakeSocket);
 });
-afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); __resetIndexDemandForTests(); });
 
 describe('index publication push', () => {
     it('refreshes on connection and library-ready messages without user navigation', async () => {
@@ -140,6 +146,63 @@ describe('visible unattended upload page', () => {
         await vi.advanceTimersByTimeAsync(301000);
         resolve({available:true,url:'wss://service/client',libraryId:'A'});await flush();
         expect(sockets).toHaveLength(0);
+        stop();
+    });
+});
+
+describe('index publication push index-demand gate', () => {
+    // These tests exercise the *index-demand* dimension specifically, so they
+    // must not inherit the outer beforeEach's setIndexDemandTab('tools'), nor
+    // any leftover lastActivity from a previous test in this file.
+    beforeEach(() => __resetIndexDemandForTests());
+
+    it('does not negotiate with no recent activity and no tools/sharing tab open', async () => {
+        const { startIndexReadyPush } = await import('./indexReadyPush');
+        const stop = startIndexReadyPush(vi.fn()); await flush();
+        expect(mocks.post).not.toHaveBeenCalled();
+        stop();
+    });
+
+    it('negotiates once real activity is noted, then stops again after it decays', async () => {
+        const { startIndexReadyPush } = await import('./indexReadyPush');
+        const stop = startIndexReadyPush(vi.fn()); await flush();
+        expect(mocks.post).not.toHaveBeenCalled();
+        noteIndexActivity();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(mocks.post).toHaveBeenCalledTimes(1);
+        sockets[0].onopen?.();
+        // The periodic self-close/reconnect (every 4 min) still fires once
+        // more while inside the 5-minute activity window.
+        await vi.advanceTimersByTimeAsync(4 * 60000);
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(mocks.post.mock.calls.length).toBe(2);
+        sockets[1]?.onopen?.();
+        const callsAtActive = mocks.post.mock.calls.length;
+        // The activity window has now long expired, so the next scheduled
+        // self-close's reconnect attempt gets gated off before it negotiates.
+        await vi.advanceTimersByTimeAsync(6 * 60000);
+        expect(mocks.post.mock.calls.length).toBe(callsAtActive);
+        stop();
+    });
+
+    it('negotiates for as long as the Tools/Sharing tab stays open, with no decay', async () => {
+        const { startIndexReadyPush } = await import('./indexReadyPush');
+        setIndexDemandTab('sharing');
+        const stop = startIndexReadyPush(vi.fn()); await flush();
+        expect(mocks.post).toHaveBeenCalled();
+        const callsAtOpen = mocks.post.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(10 * 60000); // well past the activity window
+        expect(mocks.post.mock.calls.length).toBeGreaterThanOrEqual(callsAtOpen);
+        stop();
+    });
+
+    it('starts negotiating as soon as demand appears, without waiting for the next tick', async () => {
+        const { startIndexReadyPush } = await import('./indexReadyPush');
+        const stop = startIndexReadyPush(vi.fn()); await flush();
+        expect(mocks.post).not.toHaveBeenCalled();
+        setIndexDemandTab('tools');
+        await flush();
+        expect(mocks.post).toHaveBeenCalled();
         stop();
     });
 });
