@@ -93,7 +93,11 @@ const liveOutcomeForFile = (file: PersistedUploadFile): WaveShadowOutcome | null
 // the same session.id (e.g. at creation and again on mount-restore) -- the
 // state.opened guard makes every repeat call after the first a near-instant
 // no-op.
-const ensureOpened = async (child: PersistedUploadSession): Promise<void> => {
+// Exported for callers that need to confirm a session is admitted before
+// starting byte uploads, without blocking on the whole manifest -- see
+// liveWaveAdmission below for the same pattern (open, then kick the full
+// registration loop in the background via ensureWaveShadowSessionOpened).
+export const ensureOpened = async (child: PersistedUploadSession): Promise<void> => {
     const parent = waveParentFor(child);
     if (!parent) return;
     const state = stateFor(parent.id);

@@ -8,7 +8,7 @@ import { preloadLocalIndexes } from '../services/preloadLocalIndexes';
 import { startMediaTokenAutoRefresh } from '../services/mediaToken';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { get, getUpload, post, postTools, postUpload, resolveApiUrl } from '../services/apiClient';
-import { heartbeatWaveSession, discardWaveShadowSession, stopWaveShadowSession, liveWaveAdmission, ensureWaveShadowSessionOpened, finalizeWaveShadowSession, resolveWaveShadowFile, acknowledgeWaveFinalizedFile, cancelQueuedWaveSelection } from '../services/uploadWaveSync';
+import { heartbeatWaveSession, discardWaveShadowSession, stopWaveShadowSession, liveWaveAdmission, ensureWaveShadowSessionOpened, ensureOpened as ensureWaveShadowSessionAdmitted, finalizeWaveShadowSession, resolveWaveShadowFile, acknowledgeWaveFinalizedFile, cancelQueuedWaveSelection } from '../services/uploadWaveSync';
 import { hashLargeFile, LARGE_FILE_HASH_THRESHOLD } from '../utils/largeFileHash';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
 import { getRuntimeConfig } from '../config/appConfig';
@@ -4417,7 +4417,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const retryableKeys = new Set(retryableFiles.map((file) => file.key));
         session = retryWaveOperation(session);
         persistSession(session);
-        await ensureWaveShadowSessionOpened(session);
+        // Open only (fast); the full manifest registers in the background
+        // (per-file byte uploads each wait on just their own page, see
+        // liveWaveAdmission) instead of blocking this whole retry on it.
+        await ensureWaveShadowSessionAdmitted(session);
+        void ensureWaveShadowSessionOpened(session);
         await runUploadSession(session, { resumed: true, fileKeys: retryableKeys });
     }, [addNotification, loadPersistedSession, pendingUploadSession, persistSession, runUploadSession, setUploadError, uploading]);
 
@@ -4729,9 +4733,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         let uploadRunStarted = false;
         try {
             persistSession(session);
-            // Serialize optional parent admission before this child starts bytes.
+            // Open only (fast, single call); the full manifest registers in
+            // the background instead of blocking the start of byte uploads
+            // on it -- liveWaveAdmission waits on just each file's own page.
             // Shadow failures are contained by the sync client.
-            await ensureWaveShadowSessionOpened(session);
+            await ensureWaveShadowSessionAdmitted(session);
+            void ensureWaveShadowSessionOpened(session);
             uploadSourceFilesRef.current = new Map(session.files.map((meta, index) => [meta.key, filesToUpload[index]]));
             uploadHandlesRef.current = keyedHandles;
             // Not awaited: the actual upload only needs uploadSourceFilesRef
