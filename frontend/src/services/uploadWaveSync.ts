@@ -44,6 +44,7 @@ interface WaveShadowSessionState {
     leaseCheckAt?: number;
     expired?: boolean;
     renewal?: Promise<void>;
+    registrationWaiters: Array<{ through: number; resolve: () => void }>;
 }
 
 const sessionState = new Map<string, WaveShadowSessionState>();
@@ -51,10 +52,35 @@ const sessionState = new Map<string, WaveShadowSessionState>();
 const stateFor = (sessionId: string): WaveShadowSessionState => {
     let state = sessionState.get(sessionId);
     if (!state) {
-        state = { manifestRevision: null, opened: false, registered: false, registeredCount: 0, queued: new Map(), resolutionScheduled: false, closed: false, resolved: new Set(), pending: Promise.resolve() };
+        state = { manifestRevision: null, opened: false, registered: false, registeredCount: 0, queued: new Map(), resolutionScheduled: false, closed: false, resolved: new Set(), pending: Promise.resolve(), registrationWaiters: [] };
         sessionState.set(sessionId, state);
     }
     return state;
+};
+
+// Lets an admission call for file N proceed as soon as the page containing
+// item N has registered, without waiting for the rest of the manifest.
+const waitForRegisteredThrough = (state: WaveShadowSessionState, through: number): Promise<void> => {
+    if (state.registered || state.registeredCount >= through) return Promise.resolve();
+    return new Promise<void>((resolve) => { state.registrationWaiters.push({ through, resolve }); });
+};
+
+const notifyRegistrationWaiters = (state: WaveShadowSessionState): void => {
+    const remaining: WaveShadowSessionState['registrationWaiters'] = [];
+    for (const waiter of state.registrationWaiters) {
+        if (state.registered || state.registeredCount >= waiter.through) waiter.resolve();
+        else remaining.push(waiter);
+    }
+    state.registrationWaiters = remaining;
+};
+
+// waveItemKey is always `${operationId}-${index}` (declareWaveSelection/
+// retryWaveOperation). Recovering the index lets admission wait only for
+// this file's own registration page instead of the whole manifest.
+const itemIndex = (operationId: string, key: string): number => {
+    if (!key.startsWith(operationId + '-')) return -1;
+    const index = Number(key.slice(operationId.length + 1));
+    return Number.isInteger(index) && index >= 0 ? index : -1;
 };
 
 const liveOutcomeForFile = (file: PersistedUploadFile): WaveShadowOutcome | null => {
@@ -63,12 +89,11 @@ const liveOutcomeForFile = (file: PersistedUploadFile): WaveShadowOutcome | null
     return null;
 };
 
-// Opens the shadow session (if not already) and registers every declared
-// item, paged by WAVE_SHADOW_MAX_PAGE. Safe to call more than once for the
-// same session.id (e.g. at creation and again on mount-restore) -- backend
-// registration is idempotent per itemId, and this module also tracks what it
-// already believes is done so a healthy tab doesn't re-send on every call.
-const ensureRegistered = async (child: PersistedUploadSession): Promise<void> => {
+// Opens the shadow session (if not already). Safe to call more than once for
+// the same session.id (e.g. at creation and again on mount-restore) -- the
+// state.opened guard makes every repeat call after the first a near-instant
+// no-op.
+const ensureOpened = async (child: PersistedUploadSession): Promise<void> => {
     const parent = waveParentFor(child);
     if (!parent) return;
     const state = stateFor(parent.id);
@@ -82,44 +107,72 @@ const ensureRegistered = async (child: PersistedUploadSession): Promise<void> =>
     // is intentionally the WRONG size once any file is done and removed
     // (see removePersistedFile) -- declaredCount is the one field that
     // survives both and still means "how many files this wave has."
-    if (state.closed || state.expired || state.discarding || declaredCountFor(parent) === 0) return;
-    if (!state.opened) {
-        // A previous admission may have failed before this browser retried.
-        // Ensure the linked parent exists server-side before opening its retry.
-        if (parent.resumedFromSessionId && 'scope' in parent && typeof parent.scope === 'string') {
-            const previous = loadWaveOperation(parent.resumedFromSessionId, parent.scope);
-            if (!previous) return;
-            await ensureRegistered(previous);
-            if (!stateFor(previous.id).opened) return;
-        }
-        const opened = parent.resumedFromSessionId
-            ? await openWaveShadowSession(parent.id, declaredCountFor(parent), parent.resumedFromSessionId)
-            : await openWaveShadowSession(parent.id, declaredCountFor(parent));
-        if (!opened) return; // disabled, or a transient failure -- a later call retries
-        state.opened = true;
-        state.manifestRevision = opened.manifestRevision;
-        observeLease(state,opened);
-        if (opened.leaseActive === false || ['closed','abandoned'].includes(opened.state || '')) {
-            state.expired = true;
-            return;
-        }
+    if (state.closed || state.expired || state.discarding || declaredCountFor(parent) === 0 || state.opened) return;
+    // A previous admission may have failed before this browser retried.
+    // Ensure the linked parent exists server-side before opening its retry.
+    if (parent.resumedFromSessionId && 'scope' in parent && typeof parent.scope === 'string') {
+        const previous = loadWaveOperation(parent.resumedFromSessionId, parent.scope);
+        if (!previous) return;
+        await ensureOpened(previous);
+        if (!stateFor(previous.id).opened) return;
     }
-    if (state.registered) return;
-    // child.files (the checkpoint), not parent.files: always a safe,
-    // idempotent subset of what's already registered -- a file can't reach
-    // `done` (and be dropped from the checkpoint) before its whole
-    // registration round has already completed, so re-registering only
-    // what's left in the checkpoint never skips anything that still needs it.
-    for (let i = state.registeredCount; i < child.files.length; i += WAVE_SHADOW_MAX_PAGE) {
-        if (state.discarding || !waveParentFor(child)) return;
-        const page = child.files.slice(i, i + WAVE_SHADOW_MAX_PAGE)
-            .map((file) => ({ itemId: file.key, filename: file.name }));
-        const result = await registerWaveShadowItems(parent.id, page);
-        if (!result) return; // Replay only the unacknowledged HTTP batch on retry.
-        state.manifestRevision = result.manifestRevision;
-        state.registeredCount = i + page.length;
+    const opened = parent.resumedFromSessionId
+        ? await openWaveShadowSession(parent.id, declaredCountFor(parent), parent.resumedFromSessionId)
+        : await openWaveShadowSession(parent.id, declaredCountFor(parent));
+    if (!opened) return; // disabled, or a transient failure -- a later call retries
+    state.opened = true;
+    state.manifestRevision = opened.manifestRevision;
+    observeLease(state,opened);
+    if (opened.leaseActive === false || ['closed','abandoned'].includes(opened.state || '')) {
+        state.expired = true;
     }
-    if (!state.discarding) state.registered = true;
+};
+
+// Registers every declared item, paged by WAVE_SHADOW_MAX_PAGE. Safe to call
+// more than once for the same session.id -- backend registration is
+// idempotent per itemId, and this module also tracks what it already
+// believes is done so a healthy tab doesn't re-send on every call. Runs in
+// the background relative to byte uploads -- liveWaveAdmission only waits
+// for each file's own page via waitForRegisteredThrough, not this whole loop.
+const ensureRegistered = async (child: PersistedUploadSession): Promise<void> => {
+    const parent = waveParentFor(child);
+    if (!parent) return;
+    const state = stateFor(parent.id);
+    try {
+        await ensureOpened(child);
+        if (state.closed || state.expired || state.discarding || !state.opened || state.registered) return;
+        // child.files (the checkpoint), not parent.files: always a safe,
+        // idempotent subset of what's already registered -- a file can't reach
+        // `done` (and be dropped from the checkpoint) before its whole
+        // registration round has already completed, so re-registering only
+        // what's left in the checkpoint never skips anything that still needs it.
+        for (let i = state.registeredCount; i < child.files.length; i += WAVE_SHADOW_MAX_PAGE) {
+            if (state.discarding || !waveParentFor(child)) return;
+            const page = child.files.slice(i, i + WAVE_SHADOW_MAX_PAGE)
+                .map((file) => ({ itemId: file.key, filename: file.name }));
+            const result = await registerWaveShadowItems(parent.id, page);
+            if (!result) return; // Replay only the unacknowledged HTTP batch on retry.
+            state.manifestRevision = result.manifestRevision;
+            state.registeredCount = i + page.length;
+            notifyRegistrationWaiters(state);
+        }
+        if (!state.discarding) state.registered = true;
+    } catch (error) {
+        // Set synchronously here (not left to serialized()'s own .catch,
+        // which runs a tick later) so admissionError is already visible by
+        // the time the finally below wakes any waiter -- otherwise
+        // liveWaveAdmission can resume and check admissionError before it's
+        // actually set.
+        state.admissionError = error instanceof Error ? error : new Error('Upload admission failed.');
+        throw error;
+    } finally {
+        // Unconditional: on early return/throw, release every waiter even if
+        // unsatisfied -- liveWaveAdmission re-checks progress and throws its
+        // own "admission unavailable" rather than hanging forever. A later
+        // retry re-kicks registration and sets up a fresh, satisfiable wait.
+        for (const waiter of state.registrationWaiters) waiter.resolve();
+        state.registrationWaiters = [];
+    }
 };
 
 // Registration, resolutions and close share one ordered chain. The upload
@@ -405,7 +458,11 @@ export const liveWaveAdmission = async (session: PersistedUploadSession, file: P
     let pending=admissions.get(session);
     if (!pending) {
         pending=(async () => {
-            await ensureWaveShadowSessionOpened(session);
+            // Open eagerly (fast, single call). The registration loop is
+            // kicked off later, synchronously adjacent to this file's own
+            // wait (see below) -- not here, so there's exactly one kickoff
+            // per admission attempt instead of two racing/duplicating calls.
+            await ensureOpened(session);
             let parent=waveParentFor(session);
             if (parent) {
                 let state=stateFor(parent.id);
@@ -421,7 +478,7 @@ export const liveWaveAdmission = async (session: PersistedUploadSession, file: P
                     session.waveScope=next.waveScope;
                     session.files.forEach((entry,index) => { entry.waveItemKey=next.files[index].waveItemKey; });
                     onRebind?.();
-                    await ensureWaveShadowSessionOpened(session);
+                    await ensureOpened(session);
                     parent=waveParentFor(session);
                     state=stateFor(parent!.id);
                 }
@@ -439,9 +496,29 @@ export const liveWaveAdmission = async (session: PersistedUploadSession, file: P
     if (session.waveAdmissionFailed) {
         throw new Error('Upload admission could not be saved in browser storage. Free space for this site, then retry.');
     }
-    if (!parent || !session.waveOperationId || !waveFileBelongs(session,file)
-        || !stateFor(parent.id).registered || stateFor(parent.id).expired) {
-        if (parent && stateFor(parent.id).admissionError) throw stateFor(parent.id).admissionError;
+    if (!parent || !session.waveOperationId || !waveFileBelongs(session,file)) {
+        throw new Error('Upload wave admission is unavailable. Retry before uploading files.');
+    }
+    const state=stateFor(parent.id);
+    // Wait only for THIS file's own registration page, not the whole
+    // manifest -- the background loop keeps advancing registeredCount
+    // independently of which file is currently waiting. The re-kick here is
+    // synchronous and immediately followed by the wait (no await between
+    // them) so a kickoff that fails/flushes fast can never race ahead of
+    // this waiter being registered -- it's also what retries a registration
+    // attempt that failed before this call ever reached state.registered.
+    const requiredIndex=itemIndex(parent.id, file.waveItemKey || file.key);
+    if (!state.registered) {
+        if (requiredIndex>=0) {
+            void ensureWaveShadowSessionOpened(session);
+            await waitForRegisteredThrough(state, requiredIndex+1);
+        } else {
+            await ensureWaveShadowSessionOpened(session); // can't determine this file's page; fall back to the full wait
+        }
+    }
+    const admitted=state.registered || (requiredIndex>=0 && state.registeredCount>requiredIndex);
+    if (!admitted || state.expired) {
+        if (state.admissionError) throw state.admissionError;
         throw new Error('Upload wave admission is unavailable. Retry before uploading files.');
     }
     return {waveSessionId:parent.id,waveItemId:await wireItemId(file.waveItemKey || file.key)};
