@@ -7,6 +7,25 @@ from test_face_by_filename_lookup import FilenameLookupTable
 from test_upload_waves import AtomicTable
 
 
+@pytest.fixture(autouse=True)
+def restore_benchmark_context():
+    # b.run() -> benchmark_vision_persistence.configure() raw-assigns
+    # storage.touch_user_search_indexes_state/_start_face_crop_warming (not
+    # via monkeypatch) with no restore of its own -- leaks the real
+    # functions permanently for the rest of the pytest process otherwise.
+    # Same pattern test_benchmark_vision_pipeline.py/
+    # test_benchmark_vision_persistence.py already guard against.
+    storage = b.base.storage
+    saved = dict(storage._CTX)
+    touch = storage.touch_user_search_indexes_state
+    warm = storage._start_face_crop_warming
+    yield
+    storage._CTX.clear()
+    storage._CTX.update(saved)
+    storage.touch_user_search_indexes_state = touch
+    storage._start_face_crop_warming = warm
+
+
 def tables():
     t={n:FilenameLookupTable() for n in ('metadata','faces','embeddings','lookup')};t['jobs']=AtomicTable();return t
 

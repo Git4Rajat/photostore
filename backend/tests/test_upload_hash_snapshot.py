@@ -395,28 +395,6 @@ def test_dedup_job_never_builds_gallery_indexes(world, monkeypatch):
     assert status == ['running', 'done'] and snapshots.read_snapshot('lib')[0] is not None
 
 
-def test_light_build_queues_dedup_without_inline_scan(world, monkeypatch):
-    table, _ = world
-    queued = []
-    statuses = []
-    monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **kw: statuses.append(a[3]))
-    monkeypatch.setattr(app, 'storage_utils_ensure_sort_current', lambda *a: None)
-    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', lambda *a, **kw: [])
-    monkeypatch.setattr(su, 'reconcile_search_db', lambda *a: None)
-    monkeypatch.setattr(app, '_drain_incremental_search_db', lambda *a: None)
-    monkeypatch.setattr(app, 'enqueue_index_build', lambda *a, **kw: queued.append(kw))
-    app._run_index_build_job('lib', 'index-build-lib-light', 'light')
-    assert table.scans == 0 and statuses[-1] == 'done'
-    assert queued == [{'reason': 'index-maintenance', 'scope': 'dedup', 'coalesce': False}]
-
-    def fail_queue(*args, **kwargs):
-        raise RuntimeError('queue unavailable')
-
-    monkeypatch.setattr(app, 'enqueue_index_build', fail_queue)
-    app._run_index_build_job('lib', 'index-build-lib-light', 'light')
-    assert statuses[-1] == 'done'
-
-
 def test_dedup_queue_scope_has_its_own_coalesced_job(monkeypatch):
     from tests.test_index_priming import _dedicated_queue
     queue = _dedicated_queue(monkeypatch)

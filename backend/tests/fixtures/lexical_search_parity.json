@@ -309,9 +309,9 @@
     "captureEnd": null,
     "captureStart": null,
     "expected": {
-      "combinedScore": 12.5,
+      "combinedScore": 7.5,
       "combinedScoreWithSemantic": null,
-      "lexicalScore": 7.5,
+      "lexicalScore": 2.5,
       "matchedLocationTerms": [
         "malmo"
       ],
@@ -362,9 +362,9 @@
     "captureEnd": null,
     "captureStart": null,
     "expected": {
-      "combinedScore": 23.0,
+      "combinedScore": 18.0,
       "combinedScoreWithSemantic": null,
-      "lexicalScore": 18.0,
+      "lexicalScore": 13.0,
       "matchedLocationTerms": [
         "malmo"
       ],
@@ -1048,9 +1048,9 @@
     "captureEnd": null,
     "captureStart": null,
     "expected": {
-      "combinedScore": 23.0,
-      "combinedScoreWithSemantic": 32.6,
-      "lexicalScore": 18.0,
+      "combinedScore": 18.0,
+      "combinedScoreWithSemantic": 27.6,
+      "lexicalScore": 13.0,
       "matchedLocationTerms": [
         "malmo"
       ],

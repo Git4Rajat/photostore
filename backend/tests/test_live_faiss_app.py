@@ -122,8 +122,11 @@ def live(monkeypatch):
                         lambda user, filename: list(h.filenames[filename]))
     monkeypatch.setattr(app, 'touch_user_search_indexes_state', Mock())
     monkeypatch.setattr(app, 'touch_user_sort_index_dirty', Mock())
+    # _metadata_scan_cache was removed (it OOM-ed the 1Gi backend at ~130k
+    # photos) -- metadata reads no longer go through an in-process cache at
+    # all, see app._invalidate_metadata_scan_cache's docstring.
     for name in ('_person_scan_cache', '_face_summary_scan_cache',
-                 '_people_embedding_index_cache', '_metadata_scan_cache'):
+                 '_people_embedding_index_cache'):
         monkeypatch.setattr(app, name, app._UserScanCache(20))
     h.forbidden = _forbid_legacy_helpers(monkeypatch)
 

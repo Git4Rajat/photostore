@@ -12,6 +12,25 @@ from processing_completion import StaleProcessingResult
 from azure.core.exceptions import ResourceModifiedError
 
 
+@pytest.fixture(autouse=True)
+def restore_benchmark_context():
+    # bench.configure() raw-assigns storage.touch_user_search_indexes_state/
+    # _start_face_crop_warming (not via monkeypatch) with no restore of its
+    # own -- every test here leaked the real functions permanently for the
+    # rest of the pytest process otherwise, breaking any later, unrelated
+    # test that depends on touch_user_search_indexes_state actually marking
+    # anything dirty. Same pattern test_benchmark_vision_pipeline.py already
+    # guards against for the same reason.
+    saved = dict(bench.storage._CTX)
+    touch = bench.storage.touch_user_search_indexes_state
+    warm = bench.storage._start_face_crop_warming
+    yield
+    bench.storage._CTX.clear()
+    bench.storage._CTX.update(saved)
+    bench.storage.touch_user_search_indexes_state = touch
+    bench.storage._start_face_crop_warming = warm
+
+
 @pytest.mark.parametrize('faces,seeded', [(0, False), (1, False), (8, False), (1, True)])
 def test_pipeline_equivalence(faces, seeded):
     reports = []

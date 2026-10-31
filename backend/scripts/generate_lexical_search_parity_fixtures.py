@@ -2,18 +2,15 @@
 (row, query, ...) inputs run through the REAL search_utils.py / app.py
 lexical-matching functions to produce "golden" expected outputs.
 
-This fixture is the shared contract between the Python implementation and
-its TypeScript port (frontend/src/services/localLexicalSearch.ts, which
-mirrors it for client-side search -- see backend-cpu-optimization-2026-09
-memory). Two tests guard it from opposite directions:
-  - backend/tests/test_lexical_search_parity_fixture.py fails if live
-    search_utils.py output no longer matches the committed fixture (i.e.
-    someone changed the scoring and forgot this exists).
-  - frontend's localLexicalSearch.parity.test.ts fails if the TS port no
-    longer matches the same fixture.
+Originally the shared contract between this and a TypeScript port
+(frontend/src/services/localLexicalSearch.ts, for client-side search) --
+that port and its own parity test were removed in 70deac5 ("Remove
+browser-side search"), so the only remaining guard is
+backend/tests/test_lexical_search_parity_fixture.py, which fails if live
+search_utils.py output no longer matches the committed fixture.
 
-Run this script and commit the regenerated fixture (after also updating the
-TS port to match) whenever search_utils.py's lexical scoring changes.
+Run this script and commit the regenerated fixture whenever
+search_utils.py's lexical scoring changes intentionally.
 """
 import json
 import os
@@ -21,6 +18,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import exif_utils  # noqa: E402
 import search_utils  # noqa: E402
 import app as app_module  # noqa: E402
 
@@ -253,7 +251,7 @@ def build_fixture():
         capture_end = _parse_date(case['capture_end'])
 
         tokens = search_utils.parse_search_query(query)
-        exif_data = search_utils.parse_exif_data(row.get('exifData', '{}'))
+        exif_data = exif_utils.parse_exif_data(row.get('exifData', '{}'))
         matched_person_groups = app_module._matched_query_people_groups(query, name_to_ids)
         matched_location_terms = app_module._matched_query_locations(query, [row])
         passes_filters = app_module._row_passes_search_filters(
