@@ -12465,7 +12465,13 @@ def _split_face_into_new_person(user_id: str, person_id: str, face_id: str) -> D
     }
 
 
-MAX_INIT_BATCH_FILES = 20
+#  2026-10-31: raised 20->40 alongside frontend's INIT_BATCH_MAX_SIZE/
+# FINALIZE_BATCH_MAX_SIZE (12->24, see AppServicesProvider.tsx) -- finalize's
+# sequential per-file loop does real I/O (Table Storage), not CPU-bound work,
+# so a bigger batch means a longer-held thread, not GIL contention (see the
+# `upload` app's GUNICORN_THREADS comment in resources.bicep for the
+# CPU-bound case this doesn't apply to).
+MAX_INIT_BATCH_FILES = 40
 
 
 def _create_blob_sas_url(

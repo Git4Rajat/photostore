@@ -533,7 +533,20 @@ const CONSTRAINED_DEVICE_CACHE_BUDGET_BYTES = 200 * MB;
 // selection into chunks and only starting the first one immediately (queuing
 // the rest through the exact same deferred mechanism) gives every chunk after
 // the first that same "settled" treatment.
-const MAX_FRESH_UPLOAD_BATCH_SIZE = 900;
+//
+// 2026-10-31: that iOS-Safari memory-pressure window is specific to
+// isConstrainedUploadDevice() devices -- desktop has no analog, and the
+// queue-stall fix below (a batch ending with leftover failures no longer
+// blocks every later queued batch) removed the other reason to keep desktop
+// chunks small. Desktop keeps chunking at all (rather than handing a 50k
+// selection to one runUploadSession/one localStorage checkpoint blob) only to
+// bound a single batch's in-memory bookkeeping and checkpoint size, not to
+// dodge a known crash.
+const MAX_FRESH_UPLOAD_BATCH_SIZE_MOBILE = 900;
+const MAX_FRESH_UPLOAD_BATCH_SIZE_DESKTOP = 8000;
+const getMaxFreshUploadBatchSize = (): number => (
+    isConstrainedUploadDevice() ? MAX_FRESH_UPLOAD_BATCH_SIZE_MOBILE : MAX_FRESH_UPLOAD_BATCH_SIZE_DESKTOP
+);
 
 // Live-tested 2026-09-02: a single mobile Safari/iPadOS picker selection
 // breaks around ~6000 files -- the native picker itself never hands files
@@ -1233,6 +1246,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // active session finishes cleanly -- see queuedUploadBatchesRef usage.
     const queuedUploadBatchesRef = useRef<File[][]>([]);
     const [queuedUploadFileCount, setQueuedUploadFileCount] = useState<number>(0);
+    // Names of files dropped (not blocking-paused) because their batch wasn't
+    // the wave's last one -- see runUploadSession's pause branch. Surfaced
+    // once as a single summary when the whole queue finally drains, instead
+    // of either losing them silently or freezing every later batch on them.
+    const waveDeferredFailuresRef = useRef<string[]>([]);
     const [uploadQueueDrainSignal, setUploadQueueDrainSignal] = useState<number>(0);
     const backendKeepaliveTimerRef = useRef<number | null>(null);
     const backendWarmupInFlightRef = useRef<boolean>(false);
@@ -2097,7 +2115,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // instead of dispatching a stream of small ones), while the
     // same-filename guard and the hard size cap below pass force=true (must
     // close now, no matter what).
-    const INIT_BATCH_MAX_SIZE = 12;
+    // 2026-10-31: raised 12->24 alongside backend's MAX_INIT_BATCH_FILES
+    // (20->40, see backend/app.py) now that the upload app has its own
+    // isolated capacity -- stays under the backend's enforced per-request cap.
+    const INIT_BATCH_MAX_SIZE = 24;
     const INIT_BATCH_DEBOUNCE_MS = 50;
     const INIT_BATCH_MAX_WAIT_MS = 250;
 
@@ -2192,7 +2213,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // additional background delay for meaningfully larger batches is free.
     //
     // Same `force` split as flushInitBatch above, same reasoning.
-    const FINALIZE_BATCH_MAX_SIZE = 12;
+    //
+    // 2026-10-31: raised 12->24 alongside backend's MAX_INIT_BATCH_FILES
+    // (20->40, see backend/app.py -- shared cap with init-batch). Safe on the
+    // latency math: measured finalize-batch latency today is 1-3s per batch
+    // of up to 12 (dominated by sequential per-file Table Storage writes, not
+    // CPU-bound work), so 24 lands around 2-6s -- nowhere near gunicorn's
+    // 600s --timeout or Container Apps' request ceiling.
+    const FINALIZE_BATCH_MAX_SIZE = 24;
     const FINALIZE_BATCH_DEBOUNCE_MS = 200;
     const FINALIZE_BATCH_MAX_WAIT_MS = 2500;
 
@@ -4020,7 +4048,38 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 setPendingUploadSessionLive(null);
             }
 
-            if (totalFailed === 0 && !hasPending) {
+            // A batch with leftover failures/pending files normally blocks
+            // every later queued batch via pendingUploadSession (see the drain
+            // effect below) -- fine for a single fresh selection, but across a
+            // large wave split into many MAX_FRESH_UPLOAD_BATCH_SIZE chunks it
+            // meant the first batch to hit even one unrecoverable transient
+            // failure froze the entire rest of the wave with no network
+            // activity, only an easy-to-miss "Upload paused" notification.
+            // When more batches are already queued behind this one, demote
+            // instead of blocking: drop this batch's unresolved files (their
+            // names are recorded for one summary notification once the queue
+            // fully drains) and clear the session so the queue keeps moving.
+            // The trade-off is explicit -- those specific files need
+            // reselecting rather than a one-click Retry -- because the
+            // paused-session machinery (uploadSourceFilesRef/uploadHandlesRef,
+            // the single localStorage checkpoint slot) is single-session and
+            // would otherwise collide with the next batch's own run. The
+            // last/only batch in a wave keeps the original blocking-pause
+            // behavior, since there's nothing queued after it to protect.
+            const hasMoreQueuedBatches = queuedUploadBatchesRef.current.length > 0;
+            if ((totalFailed > 0 || hasPending) && hasMoreQueuedBatches) {
+                const deferredNames = (latest?.files || [])
+                    .filter((file) => file.status !== 'done')
+                    .map((file) => file.name);
+                waveDeferredFailuresRef.current.push(...deferredNames);
+                await clearPersistedSession();
+                setPendingUploadSessionLive(null);
+                updateUploadNotification({
+                    title: 'Batch finished, continuing wave',
+                    details: `Uploaded ${totalUploaded}/${plural(totalCount, 'file')} in this batch; ${plural(deferredNames.length, 'file')} will need reselecting. Starting the next batch now.`,
+                });
+                setUploadError(null);
+            } else if (totalFailed === 0 && !hasPending) {
                 updateUploadNotification({
                     title: 'Upload complete',
                     details: `Uploaded ${plural(totalUploaded, 'file')} successfully. Skipped duplicates: ${totalSkippedDuplicates}.`,
@@ -4785,8 +4844,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
         const parent = declareWaveSelection(files);
         if (parent) void ensureWaveShadowSessionOpened(parent);
-        for (let i = 0; i < files.length; i += MAX_FRESH_UPLOAD_BATCH_SIZE) {
-            queuedUploadBatchesRef.current.push(sliceWaveSelection(files, i, i + MAX_FRESH_UPLOAD_BATCH_SIZE));
+        const maxBatchSize = getMaxFreshUploadBatchSize();
+        for (let i = 0; i < files.length; i += maxBatchSize) {
+            queuedUploadBatchesRef.current.push(sliceWaveSelection(files, i, i + maxBatchSize));
         }
         setQueuedUploadFileCount((count) => count + files.length);
     }, []);
@@ -4798,16 +4858,17 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
         const parent = declareWaveSelection(files);
         if (parent) void ensureWaveShadowSessionOpened(parent);
-        if (files.length <= MAX_FRESH_UPLOAD_BATCH_SIZE) {
+        const maxBatchSize = getMaxFreshUploadBatchSize();
+        if (files.length <= maxBatchSize) {
             void startUpload(files);
             return;
         }
-        const firstBatch = sliceWaveSelection(files, 0, MAX_FRESH_UPLOAD_BATCH_SIZE);
-        const remainder = sliceWaveSelection(files, MAX_FRESH_UPLOAD_BATCH_SIZE);
+        const firstBatch = sliceWaveSelection(files, 0, maxBatchSize);
+        const remainder = sliceWaveSelection(files, maxBatchSize);
         enqueueUploadFilesInBatches(remainder);
         addNotification(
             'Large selection split into batches',
-            `${plural(files.length, 'file')} split into batches of up to ${MAX_FRESH_UPLOAD_BATCH_SIZE}. The first batch is starting now; the rest will follow automatically as each one finishes.`,
+            `${plural(files.length, 'file')} split into batches of up to ${maxBatchSize}. The first batch is starting now; the rest will follow automatically as each one finishes.`,
         );
         void startUpload(firstBatch);
     }, [addNotification, startUpload, enqueueUploadFilesInBatches]);
@@ -5023,6 +5084,17 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             return;
         }
         if (queuedUploadBatchesRef.current.length === 0) {
+            // The wave that was deferring failures (see runUploadSession's
+            // pause branch) has now fully drained -- surface everything it
+            // dropped in one summary instead of per-batch noise.
+            if (waveDeferredFailuresRef.current.length > 0) {
+                const deferred = waveDeferredFailuresRef.current;
+                waveDeferredFailuresRef.current = [];
+                addNotification(
+                    'Some files need reselecting',
+                    `${plural(deferred.length, 'file')} across this wave failed and couldn't be auto-retried. Reselect them to upload: ${deferred.slice(0, 10).join(', ')}${deferred.length > 10 ? `, and ${deferred.length - 10} more` : ''}.`,
+                );
+            }
             return;
         }
         const nextBatch = queuedUploadBatchesRef.current.shift();
@@ -5030,7 +5102,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             setQueuedUploadFileCount((count) => Math.max(0, count - nextBatch.length));
             void startUpload(nextBatch);
         }
-    }, [uploading, pendingUploadSession, backgroundUploadTailActive, uploadQueueDrainSignal, startUpload]);
+    }, [uploading, pendingUploadSession, backgroundUploadTailActive, uploadQueueDrainSignal, startUpload, addNotification]);
 
     useEffect(() => {
         const restored = loadPersistedSession();

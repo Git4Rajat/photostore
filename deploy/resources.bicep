@@ -1392,13 +1392,34 @@ resource upload 'Microsoft.App/containerApps@2025-01-01' = {
             // SHA-256 hash of a large RAW file during dedup check) will
             // throttle slightly at 0.5 vCPU, but that only slows one hash
             // op by a few seconds -- not worth 50% more idle-replica cost.
-            cpu: json('0.5')
-            memory: '1Gi'
+            //
+            // 2026-10-31: partially reverted (0.5->0.75 vCPU, 1Gi->1.5Gi) to
+            // retest more per-replica capacity -- but via GUNICORN_WORKERS,
+            // not GUNICORN_THREADS. Raising THREADS for these exact handlers
+            // (finalize/init-batch/client-processing) was already tried live
+            // (2026-08-28, 4->12) and made things WORSE: p90 latency 85-94s
+            // -> 197-240s, clustered right at the gateway timeout -- because
+            // those handlers do real CPU-bound work per call (the SHA-256
+            // dedup hash above) that holds the GIL, so more threads in one
+            // process just adds contention, not parallelism. WORKERS are
+            // separate processes with their own GIL, so this is a genuinely
+            // different lever, not a retry of the disproven one. The CPU/
+            // memory bump pairs with it because a 2nd worker duplicates the
+            // ~250-350MB numpy/Pillow/Azure-SDK import baseline (see
+            // backend's own GUNICORN_WORKERS comment) and needs real spare
+            // CPU to actually run concurrently with the first instead of
+            // time-slicing the same 0.5 vCPU. Watch WorkingSetBytes/
+            // UsageNanoCores after this ships; revert both the worker count
+            // and this sizing together if it doesn't hold up live.
+            cpu: json('0.75')
+            memory: '1.5Gi'
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'upload' }
             { name: 'UPLOAD_WAVE_DEPLOYMENT_ID', value: coreImage }
-            { name: 'GUNICORN_WORKERS', value: '1' }
+            // 2026-10-31: 1->2, see the resources comment above for why this
+            // (not GUNICORN_THREADS) is the lever being retested.
+            { name: 'GUNICORN_WORKERS', value: '2' }
             { name: 'GUNICORN_THREADS', value: '4' }
             { name: 'GUNICORN_MAX_REQUESTS', value: '4000' }
             { name: 'GUNICORN_MAX_REQUESTS_JITTER', value: '400' }
@@ -1420,7 +1441,13 @@ resource upload 'Microsoft.App/containerApps@2025-01-01' = {
             name: 'http-scaler'
             http: {
               metadata: {
-                concurrentRequests: '4'
+                // 2026-10-31: 4->8, matching GUNICORN_WORKERS=2 x
+                // GUNICORN_THREADS=4 (see resources comment above) -- same
+                // 1x-real-capacity convention this threshold has followed
+                // historically (not 2x), so sustained demand still has to
+                // clearly exceed one replica's real capacity to trigger
+                // scale-out rather than sitting flush with it.
+                concurrentRequests: '8'
               }
             }
           }
