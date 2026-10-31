@@ -685,7 +685,8 @@ def test_trigger_prefers_the_queue_over_the_tools_http_path(monkeypatch):
     monkeypatch.setattr(app, '_INDEXER_REBUILD_TRIGGER_LAST', {})
     monkeypatch.setenv('INDEXER_INTERNAL_URL', 'https://indexer.example')
     seen = []
-    monkeypatch.setattr(app, 'enqueue_index_build', lambda uid, reason='', scope='full': seen.append(uid) or 'queued')
+    monkeypatch.setattr(app, 'enqueue_index_build',
+                         lambda uid, reason='', scope='full', **kw: seen.append(uid) or 'queued')
     posted = []
     monkeypatch.setattr('requests.post', lambda *a, **k: posted.append(a))
     app._trigger_indexer_rebuild('lib-9')

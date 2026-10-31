@@ -5538,6 +5538,28 @@ def _timed_fetch(kind: str, client, dest: str) -> bool:
         return _fetch_blob_to_file(client, dest)
 
 
+def _rows_merge_eligible(user_id: str, kind: str) -> bool:
+    """Cheap, read-only check mirroring _refresh_rows_index_on_disk's
+    merge-vs-full-scan decision for sort/access -- shared with
+    inline_index_merge's pre-submission check. Unlike people/albums this
+    doesn't fetch the previous DATA blob (that's the one part of the real
+    merge path that isn't cheap) -- it only checks the dirty-filename set's
+    cost model and the manifest's schema/base-version, both inexpensive
+    manifest-only reads. A false positive here just means a wasted inline
+    attempt (the real function still re-validates against the actual blob
+    and safely falls back if needed; see _refresh_rows_index_on_disk's own
+    merge decision for the authoritative check)."""
+    key = str(user_id or '').strip()
+    if kind not in ('sort', 'access'):
+        return False
+    dirty = _get_dirty_search_index_filenames(key, kind)
+    if not dirty or _dirty_set_too_large_to_merge(key, len(dirty)):
+        return False
+    manifest = (_load_sort_index_manifest if kind == 'sort' else _load_access_index_manifest)(key)
+    schema_version = _SORT_INDEX_SCHEMA_VERSION if kind == 'sort' else _ACCESS_INDEX_SCHEMA_VERSION
+    return bool(manifest.get('sourceVersion') and manifest.get('schemaVersion') == schema_version)
+
+
 def _refresh_rows_index_on_disk(
     kind: str,
     key: str,
@@ -6649,6 +6671,29 @@ def _incremental_albums_index_snapshot(
     )
 
 
+def _albums_merge_eligible(user_id: str, affected_album_ids: Optional[set]) -> Optional[LexicalIndexSnapshot]:
+    """Cheap, read-only check mirroring refresh_user_albums_index's
+    ID-targeted merge precondition -- shared with inline_index_merge's
+    pre-submission check so the two conditions can never drift apart.
+    Deliberately NOT @catalog_publisher-gated: this must be callable from
+    `core` to decide eligibility BEFORE entering allow_inline_merge.
+
+    Returns the validated previous snapshot (not just a bool) so the caller
+    merges against the EXACT blob this check validated instead of a second,
+    independent fetch -- see _people_merge_eligible's docstring for why a
+    second fetch is a real TOCTOU risk (_rebuild_albums_index_in_background
+    publishes to the same blob guarded only by an in-process lock)."""
+    key = str(user_id or '').strip()
+    if not key or not affected_album_ids or len(affected_album_ids) > 100:
+        return None
+    prev_manifest = _load_albums_index_manifest(key)
+    prev_snapshot = _load_albums_index_blob(key) if prev_manifest else None
+    if (prev_snapshot and prev_snapshot.schema_version == _ALBUMS_INDEX_SCHEMA_VERSION
+            and prev_snapshot.source_version == str(prev_manifest.get('sourceVersion') or '')):
+        return prev_snapshot
+    return None
+
+
 @catalog_publisher
 def refresh_user_albums_index(user_id: str, *, source_version: Optional[str] = None, affected_album_ids: Optional[set] = None) -> Optional[LexicalIndexSnapshot]:
     """Refresh albums index, optionally incrementally for specific albums.
@@ -6663,12 +6708,8 @@ def refresh_user_albums_index(user_id: str, *, source_version: Optional[str] = N
 
     # Try incremental if affected IDs provided
     if affected_album_ids:
-        prev_manifest = _load_albums_index_manifest(key)
-        prev_snapshot = _load_albums_index_blob(key) if prev_manifest else None
-        if (prev_snapshot and
-            prev_snapshot.schema_version == _ALBUMS_INDEX_SCHEMA_VERSION and
-            prev_snapshot.source_version == str(prev_manifest.get('sourceVersion') or '') and
-            len(affected_album_ids) <= 100):  # Cap affected albums to avoid degradation
+        prev_snapshot = _albums_merge_eligible(key, affected_album_ids)
+        if prev_snapshot is not None:
             snapshot = _incremental_albums_index_snapshot(key, source_version, affected_album_ids, prev_snapshot.rows)
             if snapshot is not None:
                 perf_instrumentation.log_event('albums_index_incremental', user=key, ok=True, albums=len(affected_album_ids))
@@ -7383,6 +7424,33 @@ def _incremental_people_index_snapshot_by_ids(
     )
 
 
+def _people_merge_eligible(user_id: str, affected_person_ids: Optional[set]) -> Optional[LexicalIndexSnapshot]:
+    """Cheap, read-only check: would refresh_user_people_index's ID-targeted
+    merge path accept this affected set right now? Shared by the real
+    refresh function (below) and inline_index_merge's pre-submission check
+    so the two conditions can never drift apart. Deliberately NOT
+    @catalog_publisher-gated: this must be callable from `core` to decide
+    eligibility BEFORE entering allow_inline_merge.
+
+    Returns the validated previous snapshot (not just a bool) so the caller
+    merges against the EXACT blob this check validated, instead of a second,
+    independent fetch -- a second fetch reopened a TOCTOU window a prior
+    version of this code had closed: _rebuild_people_index_in_background
+    publishes to the same blob guarded only by an in-process lock (not the
+    index_work.WorkStore claim the ID-targeted path relies on), so a second
+    fetch could silently pick up a blob of a different schema/source version
+    than the one just validated."""
+    key = str(user_id or '').strip()
+    if not key or not affected_person_ids or len(affected_person_ids) > 100:
+        return None
+    previous_manifest = _load_people_index_manifest(key)
+    prev = _load_people_index_blob(key)
+    if (prev is not None and prev.schema_version == _PEOPLE_INDEX_SCHEMA_VERSION
+            and prev.source_version == str(previous_manifest.get('sourceVersion') or '')):
+        return prev
+    return None
+
+
 @catalog_publisher
 def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = None, affected_person_ids: Optional[set] = None, force_full: bool = False) -> Optional[LexicalIndexSnapshot]:
     """Refresh people index, optionally incrementally for specific people.
@@ -7399,28 +7467,25 @@ def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = N
     snapshot = None
     previous_manifest = {} if force_full else _load_people_index_manifest(key)
 
-    # Try incremental with affected IDs first
-    if affected_person_ids and len(affected_person_ids) <= 100:
-        prev = _load_people_index_blob(key)
-        if (prev is not None and prev.schema_version == _PEOPLE_INDEX_SCHEMA_VERSION
-                and prev.source_version == str(previous_manifest.get('sourceVersion') or '')):
-            # Deliberately NOT gated on `previous_manifest.get('dirty')`: that
-            # blanket flag is set by _InvalidatingTableClient on every write to
-            # person_table_client/face_table_client, including the very
-            # mutation that produced affected_person_ids and enqueued this
-            # job -- so it was always true here, forcing a full rebuild on
-            # every call regardless of how complete affected_person_ids was.
-            # affected_person_ids (the caller's get_dirty_people() read) is
-            # trustworthy on its own now that every writer -- including the
-            # soft-delete/restore visibility path,
-            # _set_faces_source_deleted_for_filenames -- calls
-            # mark_people_dirty() with its touched IDs. See
-            # docs/benchmarks/people-index-incremental-guard-20261030.md.
-            snapshot = _incremental_people_index_snapshot_by_ids(key, source_version, affected_person_ids, prev.rows)
-            if snapshot is not None:
-                perf_instrumentation.log_event(
-                    'people_index_incremental_by_ids', user=key, ok=True,
-                    people=len(affected_person_ids))
+    # Try incremental with affected IDs first. Deliberately NOT gated on
+    # `previous_manifest.get('dirty')`: that blanket flag is set by
+    # _InvalidatingTableClient on every write to person_table_client/
+    # face_table_client, including the very mutation that produced
+    # affected_person_ids and enqueued this job -- so it was always true
+    # here, forcing a full rebuild on every call regardless of how complete
+    # affected_person_ids was. affected_person_ids (the caller's
+    # get_dirty_people() read) is trustworthy on its own now that every
+    # writer -- including the soft-delete/restore visibility path,
+    # _set_faces_source_deleted_for_filenames -- calls mark_people_dirty()
+    # with its touched IDs. See
+    # docs/benchmarks/people-index-incremental-guard-20261030.md.
+    prev = None if force_full else _people_merge_eligible(key, affected_person_ids)
+    if prev is not None:
+        snapshot = _incremental_people_index_snapshot_by_ids(key, source_version, affected_person_ids, prev.rows)
+        if snapshot is not None:
+            perf_instrumentation.log_event(
+                'people_index_incremental_by_ids', user=key, ok=True,
+                people=len(affected_person_ids))
 
     # Fall back to timestamp-based incremental if ID-based didn't work
     if snapshot is None:

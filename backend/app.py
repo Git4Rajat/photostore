@@ -8812,7 +8812,7 @@ def _mark_album_dirty(entity: Dict) -> None:
     # reconcile_dirty_albums to pick up later, so this is best-effort.
     if partition_key:
         try:
-            if enqueue_index_build(partition_key, reason='album-mutation', scope='albums') == 'unavailable':
+            if dispatch_scoped_rebuild(partition_key, 'album-mutation', 'albums') == 'unavailable':
                 worker_logger.warning('Album index enqueue unavailable for %s; dirty row retained for recovery', partition_key)
         except Exception:
             worker_logger.warning('Album index enqueue failed for %s; dirty row retained for recovery', partition_key, exc_info=True)
@@ -9365,8 +9365,8 @@ def _request_scoped_index_build(user_id: str, kind: Optional[str] = None):
 
 
 storage_utils_module.INDEX_BUILD_REQUEST_HOOK = _request_scoped_index_build
-storage_utils_module.METADATA_INDEX_REQUEST_HOOK = lambda user_id, scope: enqueue_index_build(
-    user_id, reason='metadata-change', scope=scope)
+storage_utils_module.METADATA_INDEX_REQUEST_HOOK = lambda user_id, scope: dispatch_scoped_rebuild(
+    user_id, 'metadata-change', scope)
 
 
 SUGGESTION_UNNAMED_FACE_THRESHOLD = int(os.getenv('SUGGESTION_UNNAMED_FACE_THRESHOLD', '10'))
@@ -10904,11 +10904,24 @@ def light_index_build_needed(user_id: str) -> bool:
     return bool(_load_sort_index_manifest(key).get('dirty')) or access_index_is_dirty(key)
 
 
-def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, coalesce: bool = True) -> str:
+def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, coalesce: bool = True,
+                         capture: Optional[list] = None, delay_override: Optional[int] = None) -> str:
     """Persist scoped work for index-worker; missing configuration fails closed.
 
     Returns 'queued', 'already_active' or 'unavailable'. Library-ops and cluster
     are never a fallback for failed/missing index queue publication.
+
+    capture: optional mutable list the caller passes in to receive the sent
+    QueueMessage (id/pop_receipt) when a NEW message is actually sent this
+    call -- used by inline_index_merge.py to cancel a now-redundant wakeup
+    after an inline merge succeeds. Left untouched (stays empty) when the
+    call coalesces into an already-pending intent ('already_active') or
+    fails, since there's no new message to cancel in that case.
+
+    delay_override: when set, replaces the normally-computed coalescing
+    delay outright (still floored at >=1s) -- used by inline-attempting CRUD
+    sites to give their inline attempt a longer head start before the
+    durable backstop message would become visible.
     """
     from wave_policy import source_change_active
     if (source_change_active() or reason.startswith(('upload', 'ipwork', 'post-finalize'))) and _library_cut_over_to_waves(user_id):
@@ -10932,9 +10945,11 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, 
         try:
             delay = (max(1, int(UPLOAD_ACTIVITY_WINDOW_SECONDS)) if scope == 'dedup-idle'
                      else (2 if coalesce and reason not in index_updates.READ_REASONS else 0))
+            if delay_override is not None:
+                delay = max(1, int(delay_override))
             token = store.request(key, scope, advance=reason not in index_updates.READ_REASONS, delay=delay)
             sent = store.notify(token, lambda library, kind, revision, wait: _send_index_wakeup(
-                library, kind, revision, wait, reason=reason))
+                library, kind, revision, wait, reason=reason, capture=capture))
             if not sent and reason in index_updates.READ_REASONS:
                 current = store._get(token)
                 if current and current.get('failed'):
@@ -10947,7 +10962,38 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, 
     return 'unavailable'
 
 
-def _send_index_wakeup(library, scope, revision, delay=0, *, reason='pending-recovery'):
+def dispatch_scoped_rebuild(user_id: str, reason: str, scope: str, *, coalesce: bool = True) -> str:
+    """enqueue_index_build, plus a best-effort inline attempt in `core` for
+    the bounded lexical scopes (see inline_index_merge.py). The durable
+    queue call below is unchanged and always happens first; inline only
+    ever cancels the resulting message on success, it never replaces it.
+    Safe to call from any role/scope -- inline_index_merge.submit() is a
+    no-op everywhere this doesn't apply.
+
+    The longer delay_override is only applied when the local queue actually
+    has room to accept the attempt (has_capacity(), a cheap in-process
+    check) -- otherwise every bounded-scope mutation would have its durable
+    backstop message's visibility stretched from ~2s to
+    BACKSTOP_DELAY_SECONDS even when inline was never going to be attempted
+    at all. Live-state eligibility (dirty-set size, schema/version match)
+    is still only knowable inside _attempt, after submission, since that
+    needs I/O this cheap pre-check deliberately avoids -- so a longer delay
+    can still be paid on an attempt that later turns out ineligible; this
+    only closes the no-chance-of-attempting-at-all case."""
+    import index_updates
+    import inline_index_merge
+    attempt_inline = (scope in index_updates.INLINE_MERGE_SCOPES
+                       and inline_index_merge.enabled() and inline_index_merge.has_capacity())
+    capture = [] if attempt_inline else None
+    status = enqueue_index_build(
+        user_id, reason=reason, scope=scope, coalesce=coalesce, capture=capture,
+        delay_override=inline_index_merge.BACKSTOP_DELAY_SECONDS if attempt_inline else None)
+    if attempt_inline and status == 'queued':
+        inline_index_merge.submit(user_id, scope, capture=capture)
+    return status
+
+
+def _send_index_wakeup(library, scope, revision, delay=0, *, reason='pending-recovery', capture=None):
     import index_work
     # Delayed (coalescing / dedup-idle / WorkStore retry-backoff) wakeups are
     # invisible-by-design -- route them off the main queue so KEDA's 'all'
@@ -10960,11 +11006,13 @@ def _send_index_wakeup(library, scope, revision, delay=0, *, reason='pending-rec
     # Publish queued status first: a fast consumer must not have its terminal
     # status overwritten by the producer after receiving the wakeup.
     _upsert_job_status(job, library, INDEX_BUILD_JOB_TYPE, 'queued', indexScope=scope)
-    queue.send_message(json.dumps({
+    sent = queue.send_message(json.dumps({
         'type': INDEX_BUILD_JOB_TYPE, 'userId': library, 'jobId': job,
         'scope': scope, 'reason': reason,
         'maintenanceKey': index_work.WorkStore.key(library, scope), 'intentRevision': revision,
     }), visibility_timeout=delay or None)
+    if capture is not None:
+        capture.append((queue, sent))
 
 
 def recover_pending_index_work(library=None, *, retry_failed=False):
@@ -11089,7 +11137,12 @@ def publish_person_label_intent(user_id, person_id, person):
             'pendingToken': person['labelPending'],
         })
         mark_people_dirty(user_id, [person_id])
-        if enqueue_index_build(user_id, reason='person-label', scope='people') == 'unavailable':
+        # Note: inline_index_merge's eligibility check bails whenever
+        # _pending_person_labels(user_id) is non-empty (label ack isn't
+        # replicated inline) -- the pending token this call just wrote means
+        # inline will always decline here. Routed through the shared
+        # dispatcher anyway for uniformity; the durable enqueue is unaffected.
+        if dispatch_scoped_rebuild(user_id, 'person-label', 'people') == 'unavailable':
             raise RuntimeError('People maintenance queue unavailable')
         return True
     except Exception:
@@ -17131,11 +17184,13 @@ def _trigger_indexer_rebuild(user_id: str, reason: str = 'trigger', scope: str =
         if last is not None and (now - last) < _INDEXER_REBUILD_TRIGGER_COOLDOWN_SECONDS:
             return
         _INDEXER_REBUILD_TRIGGER_LAST[cooldown_key] = now
-    # Preferred: queue the build on the worker (see enqueue_index_build). The
-    # indexer HTTP path below is only the fallback when no queue is configured.
+    # Preferred: queue the build on the worker (see enqueue_index_build), and
+    # also try an inline merge in `core` for the bounded scopes (see
+    # dispatch_scoped_rebuild). The indexer HTTP path below is only the
+    # fallback when no queue is configured.
     if index_maintenance_queue_client is not None:
         try:
-            if enqueue_index_build(key, reason=reason, scope=scope) != 'unavailable':
+            if dispatch_scoped_rebuild(key, reason, scope) != 'unavailable':
                 return
         except Exception:
             worker_logger.exception('Failed to enqueue index build for %s', key)

@@ -432,6 +432,18 @@ var backendEnv = [
   { name: 'INDEX_MAINTENANCE_QUEUE_NAME', value: 'photostore-index-maintenance' }
   { name: 'INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME', value: 'photostore-index-maintenance-deferred' }
   { name: 'INDEX_BUILD_ROLES', value: 'index-worker' }
+  // Inline merge (see backend/inline_index_merge.py): lets `core` finish a
+  // small CRUD-triggered people/albums/sort/access rebuild itself, through a
+  // bounded local queue, instead of always waking the dedicated index-worker
+  // role. Only takes effect on APP_ROLE=core regardless of this flag's value
+  // elsewhere. Enabled 2026-10-31 after the TOCTOU/newer-signal/delay-gating
+  // fixes from the code review landed (see git history); requires a built
+  // image containing inline_index_merge.py to actually do anything.
+  { name: 'INLINE_INDEX_MERGE_ENABLED', value: 'true' }
+  { name: 'INLINE_INDEX_MERGE_WORKERS', value: '2' }
+  { name: 'INLINE_INDEX_MERGE_QUEUE_SIZE', value: '32' }
+  { name: 'INLINE_INDEX_MERGE_MAX_ROWS', value: '5000' }
+  { name: 'INLINE_INDEX_MERGE_BACKSTOP_DELAY_SECONDS', value: '20' }
   { name: 'STORAGE_ACCOUNT_NAME', value: storageAccountName }
   { name: 'USE_MANAGED_IDENTITY', value: 'true' }
   // 'sas': browsers fetch media straight from blob storage via short-lived

@@ -45,7 +45,8 @@ def test_rename_only_saves_name_and_queues_people(env):
     row = env.table.get_entity('u1', 'p1')
     assert row['name'] == 'Bob' and row['faceIds'] == '["f1"]'
     assert row['labelPending'] and not row['labelMembershipPending']
-    assert env.queued == [('u1', {'reason': 'person-label', 'scope': 'people'})]
+    assert env.queued == [('u1', {'reason': 'person-label', 'scope': 'people',
+                                  'coalesce': True, 'capture': None, 'delay_override': None})]
 
 
 def test_repeated_identical_name_is_a_noop(env):
