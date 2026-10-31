@@ -38,6 +38,21 @@ beforeEach(() => {
     mocks.resolve.mockResolvedValue({ manifestRevision: 'resolved' });
     mocks.close.mockResolvedValue({ state: 'closed' });
 });
+it('registers each item under the same identity liveWaveAdmission later references, not the bare checkpoint key', async () => {
+    const files = [new File(['x'], 'a.jpg')];
+    const parent = declareWaveSelection(files)!;
+    const current = child(files, 'identity-check');
+    // The checkpoint key (`${sessionId}:${index}`) and the wave item key
+    // (`${operationId}-${index}`) are deliberately different strings --
+    // registering under the wrong one means admission can never find what
+    // it registered (backend reports "Unknown session, member or wave").
+    expect(current.files[0].key).not.toBe(current.files[0].waveItemKey);
+    const binding = await liveWaveAdmission(current, current.files[0]);
+    expect(mocks.register).toHaveBeenCalledTimes(1);
+    const registeredItemId = mocks.register.mock.calls[0][1][0].itemId;
+    expect(`wire:${registeredItemId}`).toBe(binding.waveItemId);
+    expect(registeredItemId).toBe(current.files[0].waveItemKey);
+});
 it('admits 901 items before transport and closes only after both 900/1 children settle', async () => {
     const files = Array.from({ length: 901 }, (_, i) => new File(['x'], `${i}.jpg`));
     const parent = declareWaveSelection(files)!;

@@ -152,8 +152,13 @@ const ensureRegistered = async (child: PersistedUploadSession): Promise<void> =>
         // what's left in the checkpoint never skips anything that still needs it.
         for (let i = state.registeredCount; i < child.files.length; i += WAVE_SHADOW_MAX_PAGE) {
             if (state.discarding || !waveParentFor(child)) return;
+            // waveItemKey (not the bare checkpoint key) is what every other
+            // reference to this file's item -- resolve, admission, finalize
+            // -- hashes into the wire itemId (see wireItemId call sites
+            // below). Registering under file.key instead would register a
+            // different identity than anything ever looks up again.
             const page = child.files.slice(i, i + WAVE_SHADOW_MAX_PAGE)
-                .map((file) => ({ itemId: file.key, filename: file.name }));
+                .map((file) => ({ itemId: file.waveItemKey || file.key, filename: file.name }));
             const result = await registerWaveShadowItems(parent.id, page);
             if (!result) return; // Replay only the unacknowledged HTTP batch on retry.
             state.manifestRevision = result.manifestRevision;
