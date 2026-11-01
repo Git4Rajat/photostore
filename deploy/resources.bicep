@@ -1431,9 +1431,16 @@ resource upload 'Microsoft.App/containerApps@2025-01-01' = {
         }
       ]
       scale: {
-        // Lowered from 300s: background worker, no user-facing cold-start
-        // latency to protect (see docs/benchmarks/cluster-false-starts-20261030.md).
-        cooldownPeriod: 60
+        // Reverted to 300s (was briefly lowered to 60s alongside the other
+        // background-worker apps, see fe773f3) -- upload is user-facing
+        // during active uploads, unlike cluster/indexer/recovery/archive.
+        // Confirmed live on forenklaprep1-dev: a 60s cooldown let KEDA scale
+        // 5->1 replicas during a lull mid-upload, then a resumed burst
+        // pushed the lone survivor to 55-58% CPU for ~9 minutes and timed
+        // out a client-side 15s admission call ("Upload admission failed:
+        // The server took too long to respond"). 300s rides out that kind
+        // of lull instead of scaling down into it.
+        cooldownPeriod: 300
         minReplicas: 0
         maxReplicas: 5
         rules: [

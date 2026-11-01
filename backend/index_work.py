@@ -24,12 +24,50 @@ def etag(row):
 
 
 class DirtySnapshot(set):
-    def __init__(self, rows=()):
-        self.rows = {str(row['RowKey']): row for row in rows if row.get('RowKey')}
+    """ETag-bearing capture; a bounded read consumes at most max_rows + 1 rows."""
+    def __init__(self, rows=(), *, max_rows=None, truncated=False):
+        if max_rows is not None and (not isinstance(max_rows, int) or isinstance(max_rows, bool) or max_rows < 0):
+            raise ValueError('max_rows must be a nonnegative integer or None')
+        self.rows = {}
+        self.truncated = bool(truncated or getattr(rows, 'has_more', False) or getattr(rows, 'truncated', False))
+        if isinstance(rows, DirtySnapshot):
+            rows = rows.rows.values()
+        for index, row in enumerate(rows):
+            if max_rows is not None and index >= max_rows:
+                self.truncated = True
+                break
+            if row.get('RowKey'):
+                self.rows[str(row['RowKey'])] = row
         super().__init__(self.rows)
 
+    @property
+    def has_more(self):
+        return self.truncated
+
     def subset(self, names):
-        return DirtySnapshot(self.rows[name] for name in names if name in self.rows)
+        return DirtySnapshot((self.rows[name] for name in names if name in self.rows), truncated=self.truncated)
+
+
+def read_bounded_dirty(reader, *args, max_rows):
+    """Call a capped API, supporting legacy adapters without retrying internal TypeErrors."""
+    import inspect
+    signature = inspect.signature(reader)
+    try:
+        signature.bind(*args, max_rows=max_rows)
+    except TypeError:
+        result = reader(*args)
+    else:
+        result = reader(*args, max_rows=max_rows)
+    if result is None or not isinstance(result, (set, list, tuple)):
+        return result
+    incomplete = bool(getattr(result, 'has_more', False) or getattr(result, 'truncated', False))
+    if isinstance(result, DirtySnapshot):
+        return DirtySnapshot(result.rows.values(), max_rows=max_rows, truncated=incomplete)
+    if len(result) > max_rows or incomplete:
+        # Legacy collections have no row versions; never bless a partial
+        # capture as complete, including an empty truncated capture.
+        return DirtySnapshot(({'RowKey': name} for name in result), max_rows=max_rows, truncated=True)
+    return result
 
 
 def acknowledge_dirty(table, snapshot):

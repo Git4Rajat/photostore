@@ -46,6 +46,7 @@ import library_utils
 from index_ownership import catalog_publisher
 import processing_diagnostics
 from index_publication import serialize_catalog
+from automatic_index_updates import quiesced_cleanup
 from ipworker_metrics import Metrics as IpworkerMetrics, replica_identity, resource_sample
 from ordering_utils import (
     order_photo_entries,
@@ -1561,9 +1562,9 @@ def _init_storage_clients():
         albums_dirty_set_table_client_local = tbl_svc.get_table_client(ALBUMS_DIRTY_SET_TABLE)
 
     # assign to globals
-    metadata_table_client = metadata_table_client_local
-    embeddings_table_client = embeddings_table_client_local
-    face_embeddings_table_client = face_embeddings_table_client_local
+    metadata_table_client = storage_utils_module.track_index_source_table(metadata_table_client_local, 'metadata')
+    embeddings_table_client = storage_utils_module.track_index_source_table(embeddings_table_client_local, 'embeddings')
+    face_embeddings_table_client = storage_utils_module.track_index_source_table(face_embeddings_table_client_local, 'face_embeddings')
     search_index_dirty_table_client = search_index_dirty_table_client_local
     config_table_client = config_table_client_local
     blob_service_client = blob_service_client_local
@@ -1571,8 +1572,10 @@ def _init_storage_clients():
     album_token_index_table_client = album_token_index_table_client_local
     # Wrap so every write (from anywhere in app.py or storage_utils.py) auto-invalidates
     # the people/faces scan cache -- see _InvalidatingTableClient.
-    face_table_client = _InvalidatingTableClient(face_table_client_local, _invalidate_people_scan_cache)
-    person_table_client = _InvalidatingTableClient(person_table_client_local, _invalidate_people_scan_cache)
+    face_table_client = _InvalidatingTableClient(
+        storage_utils_module.track_index_source_table(face_table_client_local, 'face'), _invalidate_people_scan_cache)
+    person_table_client = _InvalidatingTableClient(
+        storage_utils_module.track_index_source_table(person_table_client_local, 'person'), _invalidate_people_scan_cache)
     face_by_filename_table_client = face_by_filename_table_client_local
     person_members_table_client = person_members_table_client_local
     album_members_table_client = album_members_table_client_local
@@ -1583,7 +1586,7 @@ def _init_storage_clients():
     people_dirty_set_table_client = people_dirty_set_table_client_local
     albums_dirty_set_table_client = albums_dirty_set_table_client_local
     image_names_table_client = image_names_table_client_local
-    hash_index_table_client = hash_index_table_client_local
+    hash_index_table_client = storage_utils_module.track_index_source_table(hash_index_table_client_local, 'hash')
     filename_owners_table_client = filename_owners_table_client_local
     trash_index_table_client = trash_index_table_client_local
     users_table_client = users_table_client_local
@@ -6224,6 +6227,11 @@ def _live_faiss_metadata_update(user_id: str, filename: str) -> None:
             'faceCount': len(rows), 'peopleIds': json.dumps(people_ids),
         })
     # Drop legacy/UI snapshots, without scheduling a giant representative build.
+    # FAISS persists through the inner SourceTable proxy, retaining old/new
+    # owners before writes. Replays also re-mark resulting owners here, so
+    # completion retries deliver the durable scheduling signal again.
+    import automatic_index_updates as automatic
+    automatic.people_completion(user_id, person_ids)
     _person_scan_cache.invalidate(user_id)
     _face_summary_scan_cache.invalidate(user_id)
     _people_embedding_index_cache.invalidate(user_id)
@@ -9311,30 +9319,35 @@ class _TimelineSink:
 
 @catalog_publisher
 def _finalize_library_summaries(user_id: str, db) -> None:
-    """Explore (places/things) and the timeline, computed from the library's finished database --
-    a local pass over its rows, no table scan. Run after a chunked first build and after each
-    compaction."""
-    accumulator = ExploreAccumulator()
-    for row in db.iter_smart_rows():
-        accumulator.add(row)
-    summary = accumulator.finalize(user_id)
-    store_explore_summary(user_id, {
-        'sourceVersion': datetime.now(timezone.utc).isoformat(),
-        'updatedAt': datetime.now(timezone.utc).isoformat(),
-        'places': summary.get('places', []),
-        'things': summary.get('things', []),
-    })
-    store_timeline_summary(user_id, db.timeline_summary())
+    """Full-build finalization using indexed reduced-row Explore + SQL timeline.
+
+    iter_smart_rows-only test/full-builder adapters remain supported here, not
+    in incremental refresh. Real legacy DBs require explicit compaction first.
+    """
+    import summary_runtime
+    explore, timeline = summary_runtime.finalized_payloads(
+        db, user_id, accumulator_factory=ExploreAccumulator, allow_full_adapter=True)
+    store_explore_summary(user_id, explore)
+    store_timeline_summary(user_id, timeline)
 
 
+@catalog_publisher
 def _refresh_library_summaries(user_id: str) -> None:
+    """Post-successful-search-drain hook, including drains without compaction.
+
+    Maintenance owns serialization/retries. Never scan a missing legacy schema
+    here; surface failure so its dirty work is retained until compaction.
+    """
     import search_db
-    try:
-        db = search_db.open_database(user_id)
-        if db is not None:
-            _finalize_library_summaries(user_id, db)
-    except Exception:
-        worker_logger.exception('Library summaries refresh failed for %s', user_id)
+    import summary_runtime
+    db = search_db.open_database(user_id)
+    if db is None:
+        raise RuntimeError('search database unavailable for summary refresh')
+    explore, timeline = summary_runtime.finalized_payloads(
+        db, user_id, accumulator_factory=ExploreAccumulator)
+    summary_runtime.publish_indexed_payloads(
+        user_id, explore, timeline, store_explore=store_explore_summary, store_timeline=store_timeline_summary,
+        load_explore=load_explore_summary, load_timeline=load_timeline_summary)
 
 
 @catalog_publisher
@@ -9344,13 +9357,14 @@ def _streaming_lexical_build(user_id: str, source_version: Optional[str] = None)
     SQLite search database, the Explore summary and the timeline summary (see
     storage_utils.stream_library_artifacts). Memory stays flat in library size."""
     import search_db
+    import summary_runtime
 
     def _factory(version: str, workdir: str):
         return [
             ListingSink(user_id, version, workdir),
             search_db.SearchDbSink(user_id, version, workdir),
-            _ExploreSink(user_id, version),
-            _TimelineSink(user_id),
+            summary_runtime.RawExploreSink(user_id, version, ExploreAccumulator(), store_explore_summary),
+            summary_runtime.RawTimelineSink(user_id, version, TimelineAccumulator(), store_timeline_summary),
         ]
     return stream_library_artifacts(user_id, source_version, _factory)
 
@@ -9367,6 +9381,7 @@ def _request_scoped_index_build(user_id: str, kind: Optional[str] = None):
 storage_utils_module.INDEX_BUILD_REQUEST_HOOK = _request_scoped_index_build
 storage_utils_module.METADATA_INDEX_REQUEST_HOOK = lambda user_id, scope: dispatch_scoped_rebuild(
     user_id, 'metadata-change', scope)
+storage_utils_module.PEOPLE_EMBEDDING_MODEL_VERSION_HOOK = lambda: FACE_CLUSTER_EMBEDDING_VERSION
 
 
 SUGGESTION_UNNAMED_FACE_THRESHOLD = int(os.getenv('SUGGESTION_UNNAMED_FACE_THRESHOLD', '10'))
@@ -9884,11 +9899,16 @@ def _cleanup_row_batches(rows, size=100):
         yield batch
 
 
-def _cleanup_delete_row(client, row) -> None:
+def _cleanup_delete_row(client, row, *, quiesced_check=None) -> None:
     """Retry idempotent deletes; do not report a successful incomplete wipe."""
     for attempt in range(3):
         try:
-            client.delete_entity(partition_key=row['PartitionKey'], row_key=row['RowKey'])
+            if quiesced_check is None:
+                client.delete_entity(partition_key=row['PartitionKey'], row_key=row['RowKey'])
+            else:
+                from automatic_index_updates import quiesced_source_cleanup
+                with quiesced_source_cleanup(row['PartitionKey'], quiesced_check):
+                    client.delete_entity(partition_key=row['PartitionKey'], row_key=row['RowKey'])
             return
         except ResourceNotFoundError:
             return
@@ -9907,6 +9927,19 @@ def _cleanup_library_shadow_rows(library_id: str) -> None:
     """
     pk = _escape_odata(library_id)
     try:
+        if filename_owners_table_client is not None:
+            # Ownership partitions are filenames, with library IDs as RowKey.
+            # Cleanup-only streamed scan also catches orphaned metadata names;
+            # never use a library PartitionKey or remove another owner's row.
+            from automatic_index_updates import current_cleanup_check
+            check = current_cleanup_check(library_id)
+            for row in filename_owners_table_client.query_entities(
+                    f"RowKey eq '{pk}'", select=['PartitionKey', 'RowKey']):
+                if check is not None:
+                    check()
+                _cleanup_delete_row(filename_owners_table_client, row)
+                if check is not None:
+                    check()
         if face_by_filename_table_client is not None:
             for row in face_by_filename_table_client.query_entities(
                     f"PartitionKey eq '{pk}'", select=['PartitionKey', 'RowKey']):
@@ -9928,6 +9961,7 @@ def _cleanup_library_shadow_rows(library_id: str) -> None:
 
 
 @serialize_catalog
+@quiesced_cleanup
 def _purge_library_data(library_id: str) -> None:
     """Best-effort delete of every data row in a library's partition across the
     photo tables. Image/thumbnail blobs are content-addressed (and may be shared
@@ -9936,11 +9970,14 @@ def _purge_library_data(library_id: str) -> None:
     The image_names table is included so no anonymous_id -> original_filename
     mapping (which still holds the plaintext filename) outlives the library."""
     import processing_cleanup
+    if storage_utils_module.DURABLE_INDEX_UPDATES:
+        _require_quiesced_index_purge(library_id)
     processing_cleanup.begin_library_cleanup(jobs_table_client,metadata_table_client,library_id)
     pk = _escape_odata(library_id)
     _cleanup_library_shadow_rows(library_id)
     for client in (metadata_table_client, face_table_client, person_table_client,
-                   albums_table_client, merge_table_client, image_names_table_client):
+                   albums_table_client, merge_table_client, image_names_table_client,
+                   hash_index_table_client, embeddings_table_client):
         if client is None:
             continue
         try:
@@ -9948,13 +9985,16 @@ def _purge_library_data(library_id: str) -> None:
                 _cleanup_delete_row(client, row)
         except Exception as exc:
             app.logger.warning('Purge skipped a table for %s: %s', library_id, exc)
-            if _library_cut_over_to_waves(library_id):raise
+            if storage_utils_module.DURABLE_INDEX_UPDATES or _library_cut_over_to_waves(library_id):
+                raise
     try:
         invalidate_image_names_cache(library_id)
     except Exception:
         pass
 
     processing_cleanup.collect_library_artifacts(jobs_table_client,storage_utils_module,metadata_table_client,library_id,purge=True)
+    if storage_utils_module.DURABLE_INDEX_UPDATES:
+        quiesced_user_index_artifact_purge(library_id)
     processing_cleanup.finish_library_cleanup(jobs_table_client,library_id,purged=True)
 
 
@@ -10208,12 +10248,35 @@ def _library_cleanup_block_reason(library_id: str) -> Optional[str]:
 
 
 @serialize_catalog
+def _require_quiesced_index_purge(library_id):
+    from index_artifact_cleanup import artifact_catalog_serialization
+    import automatic_index_updates as automatic
+    with artifact_catalog_serialization(library_id, storage=storage_utils_module) as guard:
+        automatic.quiescence_check(library_id, guard=guard)()
+
+
+@serialize_catalog
+def quiesced_user_index_artifact_purge(library_id):
+    from index_artifact_cleanup import artifact_catalog_serialization, purge_quiesced_library_artifacts
+    import automatic_index_updates as automatic
+    with artifact_catalog_serialization(library_id, storage=storage_utils_module) as guard:
+        check = automatic.quiescence_check(library_id, guard=guard)
+        return purge_quiesced_library_artifacts(storage_utils_module, jobs_table_client,
+                                               library_id, quiesced_check=check)
+
+
+@serialize_catalog
+@quiesced_cleanup
 def _execute_library_clean(library_id: str) -> Dict:
     """Delete every photo/video and its derived data for a library. Runs on the
     queue-scaled worker (see _enqueue_library_clean_job) since it walks the
     library's full metadata partition, mirroring the existing clustering jobs'
     "don't do full scans inline" rule."""
     import processing_cleanup
+    if storage_utils_module.DURABLE_INDEX_UPDATES:
+        _require_quiesced_index_purge(library_id)
+    from automatic_index_updates import current_cleanup_check
+    quiesced_check = current_cleanup_check(library_id)
     processing_cleanup.begin_library_cleanup(jobs_table_client,metadata_table_client,library_id)
     pk = _escape_odata(library_id)
     try:
@@ -10319,7 +10382,7 @@ def _execute_library_clean(library_id: str) -> Dict:
                 blob_name = str(row.get('payloadBlobName') or '')
                 if blob_name:
                     _delete_blob_if_present(BLOB_MERGE_PAYLOADS_CONTAINER, blob_name)
-            _cleanup_delete_row(client, row)
+            _cleanup_delete_row(client, row, quiesced_check=quiesced_check)
 
         with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
             for _ in _bounded_io_map(executor, _delete_row, rows_to_delete):
@@ -10333,6 +10396,7 @@ def _execute_library_clean(library_id: str) -> Dict:
     delete_user_vector_index_data(library_id)
     delete_user_lexical_index_data(library_id)
     delete_user_tag_embedding_index_data(library_id)
+    storage_utils_module.delete_user_people_embedding_index_data(library_id)
     delete_user_sort_index_data(library_id)
     delete_user_access_index_data(library_id)
     delete_user_albums_index_data(library_id)
@@ -10340,6 +10404,8 @@ def _execute_library_clean(library_id: str) -> Dict:
     _invalidate_metadata_scan_cache(library_id)
 
     processing_cleanup.collect_library_artifacts(jobs_table_client,storage_utils_module,metadata_table_client,library_id)
+    if storage_utils_module.DURABLE_INDEX_UPDATES:
+        quiesced_user_index_artifact_purge(library_id)
     processing_cleanup.finish_library_cleanup(jobs_table_client,library_id)
     return {'photosDeleted': photos_deleted, 'blobsDeleted': blobs_deleted, 'blobErrors': blob_errors}
 
@@ -10937,6 +11003,20 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, 
         tail=waves._get(waves.wave_key(control['tailWaveId'])) if control and control.get('tailWaveId') else None
         if tail and tail['state'] not in ('complete','cancelled'):return 'wave_owned'
     scope = index_updates.validate_scope(scope)
+    if INDEX_MAINTENANCE_QUEUE_NAME and scope == 'tag_embedding':
+        # Model work is persisted in jobs, but never sent to index-worker's
+        # queue. Vision's existing sweep is the sole claimant for this scope.
+        import automatic_index_updates as automatic
+        import index_work
+        if jobs_table_client is None:
+            return 'unavailable'
+        try:
+            index_work.WorkStore(jobs_table_client, partition=automatic.TAG_PARTITION).request(key, scope,
+                advance=reason not in index_updates.READ_REASONS)
+            return 'queued'
+        except Exception:
+            worker_logger.exception('Tag maintenance intent unavailable for %s', key)
+            return 'unavailable'
     if INDEX_MAINTENANCE_QUEUE_NAME:
         if index_maintenance_queue_client is None or jobs_table_client is None:
             return 'unavailable'
@@ -11015,10 +11095,25 @@ def _send_index_wakeup(library, scope, revision, delay=0, *, reason='pending-rec
         capture.append((queue, sent))
 
 
+_INDEX_ARTIFACT_RECOVERY = threading.local()
+
+
 def recover_pending_index_work(library=None, *, retry_failed=False):
+    from bisect import insort
     import index_work
     if jobs_table_client is None or index_maintenance_queue_client is None:
         return 0
+    # Only the worker's unscoped periodic sweep may discover GC work. Reuse
+    # the existing controls scan, not a metadata scan or another WorkStore scope.
+    gc_limit = 0
+    if library is None and os.getenv('APP_ROLE', 'core').strip().lower() == 'index-worker':
+        try:
+            gc_limit = max(0, min(1000, int(os.getenv('INDEX_ARTIFACT_CLEANUP_LIBRARIES_PER_RECOVERY', '25'))))
+        except ValueError:
+            worker_logger.warning('Invalid INDEX_ARTIFACT_CLEANUP_LIBRARIES_PER_RECOVERY; using 25')
+            gc_limit = 25
+    cursor = getattr(_INDEX_ARTIFACT_RECOVERY, 'cursor', '')
+    after, before = [], []
     store = index_work.WorkStore(jobs_table_client)
     if retry_failed:
         # Explicit user repair only; poison jobs never restart on a polling read.
@@ -11026,12 +11121,59 @@ def recover_pending_index_work(library=None, *, retry_failed=False):
         for row in jobs_table_client.query_entities(query):
             if row.get('failed'):
                 store.request(row['libraryId'], row['scope'])
-    return store.recover(_send_index_wakeup, library=library)
+    # Source coverage survives a failed post-write scheduler call. Do not
+    # restart poison work automatically: request(advance=False) preserves it.
+    import automatic_index_updates as automatic
+    if search_index_dirty_table_client is not None:
+        query = "RowKey eq '!coverage'"
+        if library:
+            query += f" and libraryId eq '{_escape_odata(library)}'"
+        for row in search_index_dirty_table_client.query_entities(query):
+            user, kind = row.get('libraryId'), row.get('kind')
+            # A malformed/cross-library control must not schedule either work
+            # or cleanup for a library named only by its untrusted payload.
+            if (not isinstance(user, str) or not user or user != user.strip()
+                    or kind not in automatic.KINDS
+                    or row.get('RowKey') != automatic.CONTROL
+                    or row.get('PartitionKey') != automatic.partition(user, kind)
+                    or (library is not None and user != library)
+                    or type(row.get('coverageVersion')) is not int
+                    or row['coverageVersion'] != automatic.VERSION):
+                continue
+            if row.get('coveredRevision') == row.get('revision'):
+                if (gc_limit and kind == 'hash' and row.get('revision')
+                        and type(row.get('active')) is int and row['active'] == 0
+                        and row.get('fullRequired') is False and row.get('base')):
+                    # Two bounded sorted windows allow wraparound in one scan,
+                    # independent of page order. No all-library IDs set survives
+                    # the scan; one exact hash control exists per library.
+                    item = (row['PartitionKey'], user)
+                    window = after if item[0] > cursor else before
+                    insort(window, item)
+                    if len(window) > gc_limit:
+                        window.pop()
+                continue
+            if automatic.wave_pending(user):
+                continue
+            target = (index_work.WorkStore(jobs_table_client, partition=automatic.TAG_PARTITION)
+                      if kind == 'tag_embedding' else store)
+            target.request(user, automatic.SCOPES.get(kind, kind), advance=False)
+    recovered = store.recover(_send_index_wakeup, library=library)
+    # Publish pending wakeups first. Even a failing/deferred cleanup consumes
+    # its rotation slot so busy/broken first libraries cannot starve later ones.
+    for key, user in (after + before)[:gc_limit]:
+        _INDEX_ARTIFACT_RECOVERY.cursor = key
+        try:
+            _cleanup_completed_index_artifacts(user)
+        except Exception:
+            worker_logger.warning('Periodic index artifact cleanup failed for %s', user, exc_info=True)
+    return recovered
 
 
 def _run_index_maintenance_payload(payload):
     import index_work
     import index_publication
+    import automatic_index_updates as automatic
     store = index_work.WorkStore(jobs_table_client)
     library, scope = str(payload['userId']), str(payload['scope'])
     key = index_work.WorkStore.key(library, scope)
@@ -11056,6 +11198,11 @@ def _run_index_maintenance_payload(payload):
         with index_publication.publication(store, claim):
             _run_index_build_job(library, str(payload['jobId']), scope)
         newer = store.finish(claim)
+    except automatic.SourceBusy:
+        # A healthy source barrier wait does not consume the poison budget.
+        store.release(claim, deferred=True, retry_delay=10, retry_reason='barrier_wait')
+        store.notify(key, _send_index_wakeup)
+        return
     except Exception:
         try:
             store.release(claim)
@@ -11064,7 +11211,40 @@ def _run_index_maintenance_payload(payload):
         raise
     if newer:
         store.notify(key, _send_index_wakeup)
+    _cleanup_completed_index_artifacts(library)
     _notify_index_ready(library, str(payload['jobId']), scope)
+
+
+def _cleanup_completed_index_artifacts(library):
+    # No publication/WorkStore claim is held here. GC must acquire the SAME
+    # real all-library catalog lease as hash, model, full and wave publishers.
+    if os.getenv('APP_ROLE', 'core').strip().lower() != 'index-worker':
+        return None
+    from contextlib import contextmanager
+    import automatic_index_updates as automatic
+    from index_artifact_cleanup import cleanup_user_index_artifacts, artifact_catalog_serialization
+
+    def check_quiet(user):
+        if automatic._quiescence_row(user) is not None:
+            raise automatic.SourceBusy('Library is operator-quiesced')
+        if automatic.wave_pending(user):
+            raise automatic.SourceBusy('Library has an active upload wave')
+
+    @contextmanager
+    def serialization(user):
+        with artifact_catalog_serialization(user, storage=storage_utils_module) as guard:
+            check_quiet(user)
+            yield guard
+
+    try:
+        check_quiet(library)
+        report = cleanup_user_index_artifacts(library, storage=storage_utils_module,
+            jobs=jobs_table_client, serialization=serialization)
+    except Exception as error:
+        worker_logger.warning('Index artifact cleanup failed for %s', library, exc_info=True)
+        report = dict(status='deferred', deleted=0, examined=0, reason=f'{type(error).__name__}: {error}')
+    worker_logger.info('Index artifact cleanup library=%s report=%s', library, report)
+    return report
 
 
 def _notify_index_ready(library, job_id, scope):
@@ -11310,17 +11490,23 @@ def _drain_incremental_search_db(user_id: str, scope: str) -> Dict[str, object]:
     """Consume all currently dirty search rows using bounded delta periods."""
     import search_db
 
-    compacted = False
     for pass_number in range(1, INDEX_BUILD_INCREMENTAL_MAX_PASSES + 1):
         outcome = refresh_user_search_db_incremental(user_id)
         perf_instrumentation.log_event('search_db_incremental', user=user_id, scope=scope, pass_number=pass_number, **{
             k: v for k, v in outcome.items() if isinstance(v, (int, str))})
         status = str(outcome.get('status') or '')
         if status in ('noop', 'delta'):
-            if compacted:
-                # open_database applies any final deltas before deriving these,
-                # so summaries include the complete progressively-drained set.
+            # A prior delta may already be durable when summary publication
+            # fails. The claim/dirty dependency work stays retryable, and even
+            # noop replay MUST republish from the committed SQLite snapshot.
+            from summary_incremental import SummarySchemaMissing
+            try:
                 _refresh_library_summaries(user_id)
+            except SummarySchemaMissing:
+                if INDEX_MAINTENANCE_QUEUE_NAME:
+                    if enqueue_index_build(user_id, reason='summary-schema-upgrade', scope='compact') == 'unavailable':
+                        raise RuntimeError('Could not schedule summary schema compaction')
+                raise
             return outcome
         if status == 'more':
             continue
@@ -11331,7 +11517,6 @@ def _drain_incremental_search_db(user_id: str, scope: str) -> Dict[str, object]:
                 return {'status': 'deferred', 'nextScope': 'compact'}
             if search_db.compact_database(user_id) is None:
                 raise RuntimeError('search database compaction made no progress')
-            compacted = True
             continue
         if status == 'no_base':
             # Documented, expected outcome for a library with no search database
@@ -11368,7 +11553,7 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
     dead -- and if the process really dies the heartbeat stops and the normal
     staleness sweep (plus queue redelivery) takes over."""
     from index_ownership import require_catalog_owner
-    require_catalog_owner()
+    require_catalog_owner(model_owned_tag=scope == 'tag_embedding')
     import index_updates
     scope = index_updates.validate_scope(scope)
     started = time.monotonic()
@@ -11414,13 +11599,19 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
                         activity = metadata_table_client.get_entity('clustering_maintenance', user_id)
                     except ResourceNotFoundError:
                         pass
-                if upload_hash_snapshot.covers_upload_activity(user_id, activity.get('lastUploadActivityAt')):
+                if (not INDEX_MAINTENANCE_QUEUE_NAME and
+                    upload_hash_snapshot.covers_upload_activity(user_id, activity.get('lastUploadActivityAt'))):
                     _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done')
                     return
             if scope in ('dedup', 'dedup-idle'):
-                if upload_hash_snapshot.rebuild_snapshot(user_id) is None:
+                if INDEX_MAINTENANCE_QUEUE_NAME:
+                    import automatic_index_updates as automatic
+                    result = automatic.run(user_id, 'hash', people_model=FACE_CLUSTER_EMBEDDING_VERSION)
+                elif upload_hash_snapshot.rebuild_snapshot(user_id) is None:
                     raise RuntimeError('upload hash index is not configured')
-                _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done')
+                else:
+                    result = None
+                _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done', result=result)
                 return
             if scope in ('compact', 'reconcile'):
                 if scope == 'compact':
@@ -11444,11 +11635,20 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
                 return
             if scope in ('full', 'light', 'sort'):
                 storage_utils_ensure_sort_current(user_id)
-            if scope in ('vector', 'tag_embedding', 'people_embedding'):
+            if scope in ('vector', 'tag_embedding', 'people_embedding', 'lexical_artifact'):
                 if (scope == 'tag_embedding' and INDEX_MAINTENANCE_QUEUE_NAME
-                        and not vision_utils.image_encoder_available()):
+                        and (os.getenv('APP_ROLE', '').strip().lower() != 'vision'
+                             or not vision_utils.image_encoder_available())):
                     raise RuntimeError('Tag embedding maintenance requires the vision model owner')
-                refresher = getattr(storage_utils_module, f'refresh_user_{scope}_index')
+                if INDEX_MAINTENANCE_QUEUE_NAME:
+                    import automatic_index_updates as automatic
+                    # The configured face/person lineage, not a fabricated
+                    # schema number, identifies the representative space.
+                    result = automatic.run(user_id, scope, people_model=FACE_CLUSTER_EMBEDDING_VERSION)
+                    _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done', result=result)
+                    return
+                refresher = getattr(storage_utils_module,
+                    'refresh_user_lexical_index' if scope == 'lexical_artifact' else f'refresh_user_{scope}_index')
                 snapshot = refresher(user_id)
                 if snapshot is None:
                     raise RuntimeError(f'index build produced no {scope} index')
@@ -13382,6 +13582,42 @@ def _sweep_tag_embedding_indexes() -> Dict[str, int]:
     reason its lexical/vector-index siblings avoid an expensive synchronous
     rebuild during an interactive request."""
     stats = {'librariesChecked': 0, 'indexesAvailable': 0}
+    if INDEX_MAINTENANCE_QUEUE_NAME:
+        # Durable model-only jobs share the existing jobs table. Do not claim
+        # any other maintenance scope from vision, even if a malformed row is
+        # inserted into the model partition.
+        import automatic_index_updates as automatic
+        import index_work
+        import index_publication
+        if (jobs_table_client is None or os.getenv('APP_ROLE', '').strip().lower() != 'vision'
+                or not vision_utils.image_encoder_available()):
+            return stats
+        store = index_work.WorkStore(jobs_table_client, partition=automatic.TAG_PARTITION)
+        for row in jobs_table_client.query_entities(f"PartitionKey eq '{automatic.TAG_PARTITION}'"):
+            if row.get('scope') != 'tag_embedding' or row.get('failed') or float(row.get('notBefore') or 0) > time.time():
+                continue
+            claim = None
+            try:
+                claim = store.claim(row['RowKey'])
+                if claim is None:
+                    continue
+                stats['librariesChecked'] += 1
+                if claim.attempt > INDEX_BUILD_MAX_RETRIES:
+                    store.finish(claim, failed=True)
+                    continue
+                with index_publication.publication(store, claim):
+                    _run_index_build_job(claim.library,
+                        _index_build_job_id(claim.library) + '-tag_embedding', 'tag_embedding')
+                store.finish(claim)
+                stats['indexesAvailable'] += 1
+            except automatic.SourceBusy:
+                if claim is not None:
+                    store.release(claim, deferred=True, retry_delay=10, retry_reason='barrier_wait')
+            except Exception:
+                if claim is not None:
+                    store.release(claim, retry_delay=30)
+                worker_logger.exception('Durable tag maintenance failed for %s', row.get('libraryId'))
+        return stats
     if library_store is None or not vision_utils.image_encoder_available():
         return stats
     try:

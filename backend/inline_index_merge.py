@@ -20,12 +20,11 @@ storage_utils._people_merge_eligible and friends).
 
 Correctness note: `index_ownership.allow_inline_merge` is a narrow, explicit
 exception to the index-worker-only catalog gate -- restricted to exactly the
-four bounded lexical scopes below. Cross-process mutual exclusion against a
-concurrent real worker run for the same (user, scope) is provided by
-`index_work.WorkStore.claim`, the same mechanism `_run_index_maintenance_payload`
-already depends on -- NOT by `serialize_catalog`/`catalog_serialization`,
-which is a no-op for any library not migrated onto the wave pipeline and
-doesn't etag-fence these writes even when it is real.
+four bounded lexical scopes below. The WorkStore claim is renewed under the
+same publication guard as the durable worker. A real library catalog lease
+also serializes overlapping scopes; legacy libraries where that lease is a
+no-op defer to durable maintenance. Strict publishers capture artifact and
+manifest ETags before reading the base and condition both writes.
 """
 import logging
 import os
@@ -34,6 +33,7 @@ import threading
 from typing import Optional
 
 import index_ownership
+import index_publication
 import index_updates
 import index_work
 import storage_utils
@@ -120,27 +120,70 @@ def _worker_loop(q: 'queue_module.Queue') -> None:
             q.task_done()
 
 
+def _bounded_ids(user_id, scope):
+    import app
+    table = getattr(app, f'{scope}_dirty_set_table_client')
+    if table is not None:
+        partition = user_id.replace("'", "''")
+        return index_work.DirtySnapshot(table.query_entities(f"PartitionKey eq '{partition}'"), max_rows=100)
+    # Legacy adapters used by tests/local configurations have no dirty table.
+    return index_work.read_bounded_dirty(getattr(app, f'get_dirty_{scope}'), user_id, max_rows=100)
+
+
+def _serialized_library(user_id):
+    # A per-scope claim cannot fence full/light/wave publishers. Legacy
+    # libraries have no shared catalog lease: retain their durable worker.
+    import app
+    from wave_policy import owned
+    return bool(app.jobs_table_client is not None and app.blob_service_client is not None
+                and owned(app.jobs_table_client, user_id))
+
+
+def _conflicting_work(store, user_id, scope):
+    kinds = set(index_updates.SCOPE_KINDS[scope])
+    for other, other_kinds in index_updates.SCOPE_KINDS.items():
+        if other != scope and (kinds.intersection(other_kinds)
+                or scope == 'albums' and other in index_updates.SEARCH_SCOPES):
+            row = store._get(store.key(user_id, other))
+            if row is not None and (not row.get('failed')
+                    or float(row.get('leaseUntil') or 0) > store.clock()):
+                return True
+    return False
+
+
 def _eligible(user_id: str, scope: str):
     """Re-derive eligibility from the live dirty-tracking state -- returns
     (ok, dirty_people, dirty_albums). Mirrors the exact scope!='full' branch
     _run_index_build_job (app.py) already runs, so the inline path and the
     real worker path can never disagree about what counts as eligible."""
     import app
+    if not storage_utils._inline_artifact_within_limit(user_id, scope, _MAX_PREV_ROWS):
+        return False, None, None
     if scope == 'people':
-        if app._pending_person_labels(user_id):
+        table = app.people_dirty_set_table_client
+        labels = (index_work.DirtySnapshot(table.query_entities(
+            f"PartitionKey eq '{app._label_dirty_partition(user_id).replace(chr(39), chr(39) * 2)}'"), max_rows=1)
+            if table is not None else app._pending_person_labels(user_id))
+        if labels is None or labels or getattr(labels, 'has_more', False) or getattr(labels, 'truncated', False):
             return False, None, None  # label acknowledgement path -- not replicated inline
-        dirty_people = app.get_dirty_people(user_id)
-        dirty_albums = app.get_dirty_albums(user_id)
-        if dirty_albums:
+        dirty_people = _bounded_ids(user_id, 'people')
+        dirty_albums = _bounded_ids(user_id, 'albums')
+        if dirty_people is None or getattr(dirty_people, 'has_more', False) or getattr(dirty_people, 'truncated', False) or len(dirty_people) > 100:
+            return False, None, None
+        if dirty_albums is None or dirty_albums or getattr(dirty_albums, 'has_more', False) or getattr(dirty_albums, 'truncated', False):
             # Legacy clustering producers mark both sets; a people-only
             # inline attempt must not silently drop the albums side.
             return False, None, None
-        if not storage_utils._people_merge_eligible(user_id, set(dirty_people or ()) or None):
+        if not index_work.read_bounded_dirty(storage_utils._people_merge_eligible,
+            user_id, dirty_people or None, max_rows=_MAX_PREV_ROWS):
             return False, None, None
         return True, dirty_people, None
     if scope == 'albums':
-        dirty_albums = app.get_dirty_albums(user_id)
-        if not storage_utils._albums_merge_eligible(user_id, dirty_albums or None):
+        dirty_albums = _bounded_ids(user_id, 'albums')
+        if dirty_albums is None or getattr(dirty_albums, 'has_more', False) or getattr(dirty_albums, 'truncated', False) or len(dirty_albums) > 100:
+            return False, None, None
+        if not index_work.read_bounded_dirty(storage_utils._albums_merge_eligible,
+            user_id, dirty_albums or None, max_rows=_MAX_PREV_ROWS):
             return False, None, None
         return True, None, dirty_albums
     if scope in ('sort', 'access'):
@@ -152,53 +195,79 @@ def _eligible(user_id: str, scope: str):
 
 def _attempt(user_id: str, scope: str, capture: Optional[list]) -> None:
     import app
+    if not _serialized_library(user_id):
+        return
+    # Hold the same real library lease as durable/wave publishers across
+    # eligibility, source reads, publication and acknowledgement.
+    with index_publication.catalog_serialization(app.jobs_table_client, user_id,
+            app.blob_service_client, app.BLOB_LEXICAL_INDEX_CONTAINER):
+        _attempt_serialized(user_id, scope, capture)
+
+
+def _attempt_serialized(user_id, scope, capture):
+    import app
     ok, dirty_people, dirty_albums = _eligible(user_id, scope)
     if not ok:
         return
-    if storage_utils._library_row_count(user_id) > _MAX_PREV_ROWS:
-        return
     store = index_work.WorkStore(app.jobs_table_client)
+    if _conflicting_work(store, user_id, scope):
+        return
     key = store.key(user_id, scope)
     try:
         claim = store.claim(key)
     except RuntimeError:
-        return  # already leased by the real worker (or a concurrent inline attempt)
+        return
     if claim is None:
-        return  # no pending intent -- nothing to do, or already handled
+        return
     try:
-        kinds = index_updates.SCOPE_KINDS[scope]
-        with index_ownership.allow_inline_merge(scope):
-            bad = storage_utils.prime_all_user_indexes_sequentially(
-                user_id, wait=True, kinds=kinds,
-                affected_person_ids=set(dirty_people or ()) or None,
-                affected_album_ids=dirty_albums or None,
-            )
-        if bad:
-            raise RuntimeError(f'inline index merge produced no {", ".join(bad)} index')
-        if scope == 'people':
-            app._drain_incremental_search_db(user_id, scope)
-        if dirty_people:
-            app.clear_dirty_people(user_id, dirty_people)
-        if dirty_albums:
-            app.clear_dirty_albums(user_id, dirty_albums)
+        with index_publication.publication(store, claim) as guard:
+            completed = _merge_claimed(store, claim, guard, user_id, scope)
+        if not completed:
+            store.release(claim, deferred=True)
+            return
         newer = store.finish(claim)
     except Exception:
-        store.release(claim)
+        try:
+            store.release(claim)
+        except Exception:
+            _LOGGER.warning('Inline lease could not be released', exc_info=True)
         raise
-    if newer:
-        # A second mutation advanced this key's revision while this merge
-        # was running (finish() left the intent row open for it instead of
-        # deleting it -- mirrors _run_index_maintenance_payload's own
-        # `if newer: store.notify(...)` handling). The already-captured
-        # backstop message is still sitting durably in the queue (inline
-        # attempts are never triggered by consuming it, only by the local
-        # submit() queue), so leaving it in place is enough: whenever it's
-        # eventually delivered, the real worker's claim() reads whatever is
-        # current and correctly picks up the newer revision. Cancelling it
-        # here would drop that newer work until the next unrelated mutation
-        # or the 60s recover_pending_index_work() sweep.
+    if newer is None or newer:
         return
     _cancel_backstop(capture)
+
+
+def _merge_claimed(store, claim, guard, user_id, scope):
+    import app
+    # Dirty IDs/base size may have changed while waiting for the claim.
+    ok, dirty_people, dirty_albums = _eligible(user_id, scope)
+    if not ok or _conflicting_work(store, user_id, scope):
+        return
+    kinds = index_updates.SCOPE_KINDS[scope]
+    with index_ownership.allow_inline_merge(scope):
+        bad = storage_utils.prime_all_user_indexes_sequentially(
+            user_id, wait=True, kinds=kinds,
+            affected_person_ids=dirty_people or None,
+            affected_album_ids=dirty_albums or None,
+            incremental_only=True,
+        )
+    if bad:
+        raise RuntimeError(f'inline index merge produced no {", ".join(bad)} index')
+    if scope == 'people':
+        # This is a backstop-retention probe, NOT dependency readiness.
+        # Never drain search on core; incomplete/unavailable captures retain
+        # the durable worker's wakeup even after a successful people merge.
+        dirty_search = index_work.read_bounded_dirty(
+            storage_utils._get_dirty_search_index_filenames, user_id, 'lexical', max_rows=1)
+        if dirty_search is None or dirty_search or getattr(dirty_search, 'has_more', False) or getattr(dirty_search, 'truncated', False):
+            return
+    guard.check()
+    if dirty_people:
+        app.clear_dirty_people(user_id, dirty_people)
+    if dirty_albums:
+        app.clear_dirty_albums(user_id, dirty_albums)
+    guard.check()
+    return True
 
 
 def _cancel_backstop(capture: Optional[list]) -> None:

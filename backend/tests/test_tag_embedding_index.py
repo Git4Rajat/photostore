@@ -218,7 +218,13 @@ def test_next_wave_invalidates_clean_tag_snapshot_and_recovers_new_tags(tag_embe
     assert storage_utils.get_user_tag_embedding_index('lib-A',allow_refresh=False)['tags']==['dog']
     invalidate_wave_tags(storage_utils,'lib-A')
     assert storage_utils.get_user_tag_embedding_index('lib-A',allow_refresh=False) is None
-    assert storage_utils.get_user_tag_embedding_index('lib-A',allow_refresh=True)['tags']==['beach','dog']
+    requested = []
+    monkeypatch.setattr(storage_utils, 'INDEX_BUILD_REQUEST_HOOK', lambda user, kind: requested.append((user, kind)))
+    assert storage_utils.get_user_tag_embedding_index('lib-A',allow_refresh=True) is None
+    assert requested == [('lib-A', 'tag_embedding')]
+    seeded = storage_utils.refresh_user_tag_embedding_index('lib-A', bootstrap_incremental=True,
+                                                            model_version='clip-test')
+    assert seeded.tags == ['beach', 'dog']
 
 
 def test_wave_tag_invalidation_cannot_silently_lose_a_blob_write(tag_embedding_ctx,monkeypatch):

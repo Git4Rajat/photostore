@@ -9,6 +9,9 @@ dirty subset into the existing snapshot instead of re-scanning everything.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+from azure.core import MatchConditions
+from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
 import pytest
 
 import storage_utils
@@ -20,12 +23,27 @@ class _FakeBlob:
         self._store = store
         self._key = key
 
-    def upload_blob(self, data, overwrite=True, content_settings=None):
+    def get_blob_properties(self):
+        if self._key not in self._store:
+            raise ResourceNotFoundError(self._key)
+        data = self._store[self._key]
+        return SimpleNamespace(size=len(data), etag=str(hash(data)))
+
+    def _check(self, options):
+        if 'etag' in options:
+            assert options['match_condition'] == MatchConditions.IfNotModified
+            if options['etag'] != self.get_blob_properties().etag:
+                raise ResourceModifiedError('CAS conflict')
+
+    def upload_blob(self, data, overwrite=True, content_settings=None, **options):
+        self._check(options)
+        if not overwrite and self._key in self._store:
+            raise ResourceExistsError(self._key)
         self._store[self._key] = data
 
-    def download_blob(self):
-        if self._key not in self._store:
-            raise KeyError(self._key)
+    def download_blob(self, **options):
+        self._check(options)
+        self.get_blob_properties()
         return _Downloaded(self._store[self._key])
 
     def delete_blob(self):
@@ -73,6 +91,8 @@ def _seed_row(table, user_id: str, filename: str, **overrides) -> None:
 
 @pytest.fixture
 def ctx(monkeypatch):
+    import search_db
+    monkeypatch.setattr(search_db, 'write_for_snapshot', lambda *args: True)
     metadata = _CountingTable()
     dirty = FakeTable()
     blob_service = _FakeBlobServiceClient()
@@ -196,23 +216,16 @@ def test_new_buffered_edit_survives_acknowledging_an_older_snapshot(ctx):
 
 # --- manifest dirty-flag debounce (Part 1) -----------------------------------
 
-def test_repeated_touches_only_write_the_manifest_blob_once(ctx):
-    """touch_user_lexical_index_state gets called once per relevant metadata
-    write -- during a large upload's per-step processing, that's the same
-    user's manifest being told "dirty" over and over. Once it's already
-    marked dirty in this process, repeat calls should skip the redundant
-    blob rewrite (and cache invalidation) entirely until a real rebuild
-    clears the flag. See _manifest_already_marked_dirty."""
+def test_repeated_lexical_touches_fence_snapshot_upgrades_while_shared_dirty(ctx):
+    """The shared dirty latch cannot suppress snapshot invalidation/CAS fences."""
     _metadata, _dirty, _blobs = ctx
     first = storage_utils.touch_user_lexical_index_state('lib-Z')
     second = storage_utils.touch_user_lexical_index_state('lib-Z')
     third = storage_utils.touch_user_lexical_index_state('lib-Z')
 
-    # A real write returns the sourceVersion it wrote; a skipped (already
-    # known dirty) call returns '' -- see touch_user_lexical_index_state.
     assert first != ''
-    assert second == ''
-    assert third == ''
+    assert second != ''
+    assert third != ''
     assert storage_utils._INDEX_MANIFEST_DIRTY_FLAGS[('lib-Z', 'lexical')] is True
 
 
@@ -374,8 +387,17 @@ def test_lexical_refresh_clears_dirty_set_after_full_rebuild_fallback(ctx):
 
 # --- vector incremental merge ------------------------------------------------
 
-def test_vector_refresh_is_a_disk_backed_full_pass_and_holds_no_embeddings(ctx, monkeypatch):
-    metadata, _dirty, _blobs = ctx
+@pytest.fixture
+def vector_ctx(ctx, monkeypatch):
+    # Vector publication requires real CAS semantics; legacy lexical fakes
+    # deliberately have no properties/conditional upload implementation.
+    from tests.test_vector_incremental import Service
+    monkeypatch.setitem(storage_utils._CTX, 'blob_service_client', Service())
+    return ctx
+
+
+def test_vector_refresh_is_a_disk_backed_full_pass_and_holds_no_embeddings(vector_ctx, monkeypatch):
+    metadata, _dirty, _blobs = vector_ctx
     monkeypatch.setattr(storage_utils, 'PHOTO_EMBEDDING_DIMENSION', 2)
     monkeypatch.setattr(storage_utils.vision_utils, 'get_text_embedding_dimension', lambda: 2)
     monkeypatch.setattr(storage_utils.vision_utils, 'get_text_embedding_version', lambda: 'textv1')
@@ -398,8 +420,8 @@ def test_vector_refresh_is_a_disk_backed_full_pass_and_holds_no_embeddings(ctx, 
     assert set(second.row_keys) == {'a.jpg', 'b.jpg'}
 
 
-def test_vector_refresh_falls_back_to_full_build_when_embedding_version_changes(ctx, monkeypatch):
-    metadata, _dirty, _blobs = ctx
+def test_vector_refresh_falls_back_to_full_build_when_embedding_version_changes(vector_ctx, monkeypatch):
+    metadata, _dirty, _blobs = vector_ctx
     monkeypatch.setattr(storage_utils, 'PHOTO_EMBEDDING_DIMENSION', 2)
     monkeypatch.setattr(storage_utils.vision_utils, 'get_text_embedding_dimension', lambda: 2)
     monkeypatch.setattr(storage_utils.vision_utils, 'get_text_embedding_version', lambda: 'textv1')

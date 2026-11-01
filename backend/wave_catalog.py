@@ -12,7 +12,7 @@ from azure.core import MatchConditions
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 
 from execution_lease import guard_operations
-from index_publication import guarded_publication
+from index_publication import guarded_publication, serialize_catalog
 from upload_waves import digest
 
 SCOPES = ('sort', 'access', 'people', 'albums', 'search', 'vector', 'people_embedding', 'dedup')
@@ -116,6 +116,7 @@ class CatalogPublisher:
                     or props.metadata.get('sha256') != output['sha256']):
                 raise RuntimeError('Publication generation missing or changed')
 
+    @serialize_catalog
     def publish(self, scope, obligation):
         from index_ownership import require_catalog_owner
         require_catalog_owner()

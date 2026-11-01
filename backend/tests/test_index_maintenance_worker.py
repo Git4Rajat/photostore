@@ -236,7 +236,7 @@ def test_rating_queues_only_search_sort_and_album_covers(source):
 
 def test_location_does_not_dirty_media_access_or_gallery_sort(source):
     app._update_metadata_entity_fields('A', 'one.jpg', {'locationCity': 'Paris'})
-    assert source.queued == [('A', 'search')]
+    assert source.queued == [('A', 'search'), ('A', 'vector')]
     su.touch_user_sort_index_state.assert_not_called()
     su.touch_user_access_index_state.assert_not_called()
 
@@ -258,7 +258,7 @@ def test_noop_edit_still_repairs_a_stale_derived_completion_flag(source):
 
 def test_unchanged_fields_in_a_real_edit_do_not_expand_dependencies(source):
     app._update_metadata_entity_fields('A', 'one.jpg', {'locationCity': 'Paris', 'rating': 0, 'tags': '[]'})
-    assert source.queued == [('A', 'search')]
+    assert source.queued == [('A', 'search'), ('A', 'vector')]
     su.touch_user_sort_index_state.assert_not_called()
     su.touch_user_tag_embedding_index_state.assert_not_called()
 

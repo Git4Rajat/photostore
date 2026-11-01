@@ -103,13 +103,15 @@ def test_build_streams_one_library_and_reads_without_scanning(world):
     assert b'private.heic' not in gzip.decompress(payload)
 
 
-def test_rebuild_replaces_snapshot_and_removes_superseded_blob(world):
+def test_rebuild_replaces_snapshot_and_retains_superseded_blob_for_reader_grace(world):
     table, blobs = world
     old = snapshots.rebuild_snapshot('lib')
     table.upsert_entity({'PartitionKey': 'lib', 'RowKey': 'c' * 64, 'filename': 'new.heic'})
     new = snapshots.rebuild_snapshot('lib')
     assert new['rows'] == 2 and new['blobName'] != old['blobName']
-    assert 'lexical-index/' + old['blobName'] not in blobs.store
+    assert 'lexical-index/' + old['blobName'] in blobs.store
+    assert json.loads(gzip.decompress(blobs.store['lexical-index/' + old['blobName']])) == {
+        'hashes': {'a' * 64: 'original.heic'}}
     assert json.loads(gzip.decompress(snapshots.read_snapshot('lib')[0]))['hashes']['c' * 64] == 'new.heic'
 
 

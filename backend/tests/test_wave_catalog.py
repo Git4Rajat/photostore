@@ -306,3 +306,117 @@ def test_required_publisher_without_output_identifies_its_scope(world, monkeypat
         with pytest.raises(RuntimeError, match=r'no artifact \(scope=sort\)'):
             CatalogPublisher(store, wave['waveId'], su, check).publish('sort', 'e'*64)
     assert not store._get(f"publication!{wave['waveId']}!" + 'e'*64)
+
+
+@pytest.fixture
+def full_embedding_world(world, monkeypatch):
+    from test_wave_recovery import RuntimeTable
+    *_, blobs, _check = world
+    for name in ('metadata_table_client', 'embeddings_table_client'):
+        monkeypatch.setitem(su._CTX, name, RuntimeTable())
+    for scope in ('vector', 'people_embedding', 'tag_embedding'):
+        monkeypatch.setitem(su._CTX, f'blob_{scope}_index_container', scope)
+    monkeypatch.setattr(su.vision_utils, 'get_text_embedding_version', lambda: 'test')
+    monkeypatch.setattr(su.vision_utils, 'get_text_embedding_dimension', lambda: su.PHOTO_EMBEDDING_DIMENSION)
+    monkeypatch.setattr(su.vision_utils, 'image_encoder_available', lambda: True)
+    return blobs
+
+
+def embedding_aliases(scope):
+    container = getattr(su, f'_{scope}_index_container_name')()
+    return [(container, getattr(su, f'_{scope}_index_{suffix}_blob_name')('u'))
+            for suffix in ('npz', 'manifest')]
+
+
+@pytest.mark.parametrize('scope', ['vector', 'people_embedding', 'tag_embedding'])
+@pytest.mark.parametrize('existing', [False, True])
+def test_full_embedding_build_uses_only_declared_aliases_and_guard_etags(full_embedding_world, monkeypatch, scope, existing):
+    from index_publication import guarded_publication
+    blobs = full_embedding_world
+    aliases = embedding_aliases(scope)
+    raw = blobs.get_blob_client
+    if existing:
+        for pair in aliases:
+            raw(*pair).upload_blob(b'{}')
+    reads, uploads = [], []
+    def client(container, blob):
+        result = raw(container, blob)
+        properties, upload = result.get_blob_properties, result.upload_blob
+        def props():
+            reads.append((container, blob))
+            return properties()
+        def publish(data, **options):
+            uploads.append(((container, blob), dict(options)))
+            return upload(data, **options)
+        result.get_blob_properties, result.upload_blob = props, publish
+        return result
+    monkeypatch.setattr(blobs, 'get_blob_client', client)
+    guard = BuildGuard(client, aliases, lambda: None)
+    captured = dict(guard.aliases)
+    with guarded_publication(guard):
+        result = getattr(su, f'refresh_user_{scope}_index')('u', source_version='full')
+        assert result is not None
+    assert set(guard.outputs) == set(aliases)
+    assert set(blobs.rows) == set(aliases)  # No unchecked random output.
+    assert [pair for pair, _ in uploads] == aliases
+    for pair, options in uploads:
+        assert reads.count(pair) == 2  # Guard capture + post-upload verification only.
+        if existing:
+            from azure.core import MatchConditions
+            assert options['etag'] == captured[pair]
+            assert options['match_condition'] == MatchConditions.IfNotModified
+        else:
+            assert options['overwrite'] is False and 'etag' not in options
+    manifest = json.loads(blobs.rows[aliases[1]][0])
+    assert manifest['sourceVersion'] == 'full'
+    assert manifest['blobName' if scope == 'vector' else 'npzBlobName'] == aliases[0][1]
+    assert getattr(su, f'_load_{scope}_index_npz')('u').source_version == 'full'
+
+
+@pytest.mark.parametrize('scope', ['vector', 'people_embedding', 'tag_embedding'])
+@pytest.mark.parametrize('existing', [False, True])
+@pytest.mark.parametrize('target', [0, 1], ids=['data', 'manifest'])
+def test_full_embedding_build_cannot_overwrite_concurrent_declared_alias(full_embedding_world, monkeypatch, scope, existing, target):
+    from index_publication import guarded_publication
+    blobs = full_embedding_world
+    aliases = embedding_aliases(scope)
+    if existing:
+        for pair in aliases:
+            blobs.get_blob_client(*pair).upload_blob(b'{}')
+    guard = BuildGuard(blobs.get_blob_client, aliases, lambda: None)
+    name = '_build_user_vector_index_file' if scope == 'vector' else f'_build_user_{scope}_index_snapshot'
+    build = getattr(su, name)
+    def race(*args, **kwargs):
+        result = build(*args, **kwargs)
+        blobs.get_blob_client(*aliases[target]).upload_blob(b'concurrent', overwrite=True)
+        return result
+    monkeypatch.setattr(su, name, race)
+    with pytest.raises(ResourceModifiedError if existing else ResourceExistsError):
+        with guarded_publication(guard):
+            getattr(su, f'refresh_user_{scope}_index')('u', source_version='stale')
+    assert blobs.rows[aliases[target]][0] == b'concurrent'
+    assert aliases[1] not in guard.outputs
+
+
+@pytest.mark.parametrize('scope', ['vector', 'people_embedding', 'tag_embedding'])
+@pytest.mark.parametrize('target', [0, 1], ids=['data', 'manifest'])
+def test_full_embedding_build_preserves_original_guarded_upload_error(full_embedding_world, monkeypatch, scope, target):
+    from index_publication import guarded_publication
+    blobs = full_embedding_world
+    aliases = embedding_aliases(scope)
+    original = blobs.get_blob_client
+    error = OSError('original embedding upload failure')
+    def fail(*args, **kwargs):
+        raise error
+    def client(container, blob):
+        result = original(container, blob)
+        if (container, blob) == aliases[target]:
+            result.upload_blob = fail
+        return result
+    monkeypatch.setattr(blobs, 'get_blob_client', client)
+    guard = BuildGuard(client, aliases, lambda: None)
+    with pytest.raises(OSError) as caught:
+        with guarded_publication(guard):
+            getattr(su, f'refresh_user_{scope}_index')('u', source_version='failed')
+    assert caught.value is error
+    assert aliases[1] not in guard.outputs

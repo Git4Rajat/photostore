@@ -13,40 +13,8 @@ import time
 import pytest
 
 import storage_utils
+from tests.blob_fakes import FakeBlobServiceClient
 from tests.fakes import FakeTable
-
-
-class _FakeBlob:
-    def __init__(self, store: dict, key: str) -> None:
-        self._store = store
-        self._key = key
-
-    def upload_blob(self, data, overwrite=True, content_settings=None):
-        self._store[self._key] = data
-
-    def download_blob(self):
-        if self._key not in self._store:
-            raise KeyError(self._key)
-        return _Downloaded(self._store[self._key])
-
-    def delete_blob(self):
-        self._store.pop(self._key, None)
-
-
-class _Downloaded:
-    def __init__(self, data: bytes) -> None:
-        self._data = data
-
-    def readall(self) -> bytes:
-        return self._data
-
-
-class _FakeBlobServiceClient:
-    def __init__(self) -> None:
-        self.blobs: dict = {}
-
-    def get_blob_client(self, container, blob):
-        return _FakeBlob(self.blobs, f'{container}/{blob}')
 
 
 def _seed_row(table, user_id: str, filename: str, **overrides) -> None:
@@ -54,9 +22,12 @@ def _seed_row(table, user_id: str, filename: str, **overrides) -> None:
 
 
 @pytest.fixture
-def ctx(monkeypatch):
+def ctx(monkeypatch, tmp_path):
+    import search_db
+    monkeypatch.setattr(search_db, 'SEARCH_DB_DIR', str(tmp_path))
+    search_db.invalidate_manifest_cache('u1')
     metadata = FakeTable()
-    blob_service = _FakeBlobServiceClient()
+    blob_service = FakeBlobServiceClient()
     monkeypatch.setitem(storage_utils._CTX, 'metadata_table_client', metadata)
     monkeypatch.setitem(storage_utils._CTX, 'embeddings_table_client', None)
     monkeypatch.setitem(storage_utils._CTX, 'search_index_dirty_table_client', None)
@@ -112,6 +83,9 @@ def test_listing_index_written_as_side_effect_not_separate_rebuild(ctx):
     listing = storage_utils.get_user_listing_index('u1', allow_refresh=False)
     assert listing is not None
     assert [r['RowKey'] for r in listing['rows']] == ['a.jpg']
+    import search_db
+    assert search_db.load_manifest('u1')['sourceVersion'] == listing['source_version'] == 'v1'
+    assert storage_utils._load_lexical_index_manifest('u1')['sourceVersion'] == 'v1'
 
 
 def test_listing_index_never_builds_the_full_lexical_snapshot_when_stale(ctx, monkeypatch):

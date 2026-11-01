@@ -16,7 +16,10 @@ import gzip
 import json
 import threading
 import time
+from types import SimpleNamespace
 
+from azure.core import MatchConditions
+from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
 import pytest
 
 import app
@@ -30,12 +33,27 @@ class _FakeBlob:
         self._store = store
         self._key = key
 
-    def upload_blob(self, data, overwrite=True, content_settings=None):
+    def get_blob_properties(self):
+        if self._key not in self._store:
+            raise ResourceNotFoundError(self._key)
+        data = self._store[self._key]
+        return SimpleNamespace(size=len(data), etag=str(hash(data)))
+
+    def _check(self, options):
+        if 'etag' in options:
+            assert options['match_condition'] == MatchConditions.IfNotModified
+            if options['etag'] != self.get_blob_properties().etag:
+                raise ResourceModifiedError('CAS conflict')
+
+    def upload_blob(self, data, overwrite=True, content_settings=None, **options):
+        self._check(options)
+        if not overwrite and self._key in self._store:
+            raise ResourceExistsError(self._key)
         self._store[self._key] = data
 
-    def download_blob(self):
-        if self._key not in self._store:
-            raise KeyError(self._key)
+    def download_blob(self, **options):
+        self._check(options)
+        self.get_blob_properties()
         return _Downloaded(self._store[self._key])
 
     def delete_blob(self):
@@ -65,6 +83,9 @@ def _seed_row(table: FakeTable, user_id: str, filename: str, **overrides) -> Non
 
 @pytest.fixture
 def lexical_ctx(monkeypatch):
+    import search_db
+    # Lexical tests do not exercise SQLite's independent storage setup.
+    monkeypatch.setattr(search_db, 'write_for_snapshot', lambda *args: True)
     table = FakeTable()
     blob_service = _FakeBlobServiceClient()
     monkeypatch.setitem(storage_utils._CTX, 'metadata_table_client', table)

@@ -16,6 +16,7 @@ import storage_utils as su
 from test_index_work import EtagTable
 from tests.test_people_index import _seed_face, _seed_person, people_ctx  # noqa: F401
 from tests.test_albums_index import _seed_album, albums_ctx  # noqa: F401
+from tests.test_incremental_search_index import ctx as rows_ctx, _seed_row  # noqa: F401
 
 
 @pytest.fixture(autouse=True)
@@ -217,12 +218,14 @@ def test_has_capacity_reflects_queue_fullness(monkeypatch):
 # --- inline_index_merge._eligible / _attempt --------------------------------
 
 def test_eligible_people_bails_on_pending_labels(monkeypatch):
+    monkeypatch.setattr(su, '_inline_artifact_within_limit', lambda *a: True)
     monkeypatch.setattr(app, '_pending_person_labels', lambda uid: {'p1'})
     ok, _, _ = inline_index_merge._eligible('lib', 'people')
     assert ok is False
 
 
 def test_eligible_people_bails_when_albums_also_dirty(monkeypatch):
+    monkeypatch.setattr(su, '_inline_artifact_within_limit', lambda *a: True)
     monkeypatch.setattr(app, '_pending_person_labels', lambda uid: set())
     monkeypatch.setattr(app, 'get_dirty_people', lambda uid: {'p1'})
     monkeypatch.setattr(app, 'get_dirty_albums', lambda uid: {'a1'})
@@ -231,6 +234,7 @@ def test_eligible_people_bails_when_albums_also_dirty(monkeypatch):
 
 
 def test_eligible_people_defers_to_the_shared_predicate(monkeypatch):
+    monkeypatch.setattr(su, '_inline_artifact_within_limit', lambda *a: True)
     monkeypatch.setattr(app, '_pending_person_labels', lambda uid: set())
     monkeypatch.setattr(app, 'get_dirty_people', lambda uid: {'p1'})
     monkeypatch.setattr(app, 'get_dirty_albums', lambda uid: set())
@@ -240,6 +244,7 @@ def test_eligible_people_defers_to_the_shared_predicate(monkeypatch):
 
 
 def test_eligible_albums_defers_to_the_shared_predicate(monkeypatch):
+    monkeypatch.setattr(su, '_inline_artifact_within_limit', lambda *a: True)
     monkeypatch.setattr(app, 'get_dirty_albums', lambda uid: {'a1'})
     monkeypatch.setattr(su, '_albums_merge_eligible', lambda uid, ids: True)
     ok, dirty_people, dirty_albums = inline_index_merge._eligible('lib', 'albums')
@@ -247,6 +252,7 @@ def test_eligible_albums_defers_to_the_shared_predicate(monkeypatch):
 
 
 def test_eligible_sort_access_defer_to_the_shared_predicate(monkeypatch):
+    monkeypatch.setattr(su, '_inline_artifact_within_limit', lambda *a: True)
     monkeypatch.setattr(su, '_rows_merge_eligible', lambda uid, kind: kind == 'sort')
     assert inline_index_merge._eligible('lib', 'sort')[0] is True
     assert inline_index_merge._eligible('lib', 'access')[0] is False
@@ -254,6 +260,9 @@ def test_eligible_sort_access_defer_to_the_shared_predicate(monkeypatch):
 
 @pytest.fixture
 def attempt_ctx(monkeypatch):
+    from contextlib import nullcontext
+    monkeypatch.setattr(inline_index_merge, '_serialized_library', lambda uid: True)
+    monkeypatch.setattr('index_publication.catalog_serialization', lambda *a: nullcontext())
     table = EtagTable()
     monkeypatch.setattr(app, 'jobs_table_client', table)
     # A pending intent row must already exist -- this mirrors the durable
@@ -266,6 +275,7 @@ def attempt_ctx(monkeypatch):
     monkeypatch.setattr(su, 'prime_all_user_indexes_sequentially', prime)
     drain = Mock()
     monkeypatch.setattr(app, '_drain_incremental_search_db', drain)
+    monkeypatch.setattr(su, '_get_dirty_search_index_filenames', lambda *a, **k: set())
     clear_people = Mock()
     monkeypatch.setattr(app, 'clear_dirty_people', clear_people)
     clear_albums = Mock()
@@ -284,7 +294,8 @@ def test_attempt_claims_merges_clears_and_cancels_on_success(attempt_ctx, monkey
 
     attempt_ctx.prime.assert_called_once()
     assert attempt_ctx.prime.call_args.kwargs['affected_person_ids'] == {'p1'}
-    attempt_ctx.drain.assert_called_once_with('lib', 'people')
+    assert attempt_ctx.prime.call_args.kwargs['incremental_only'] is True
+    attempt_ctx.drain.assert_not_called()
     attempt_ctx.clear_people.assert_called_once_with('lib', {'p1'})
     attempt_ctx.clear_albums.assert_not_called()
     assert deleted == [('m1', 'r1')]
@@ -323,10 +334,13 @@ def test_attempt_skips_cleanly_when_ineligible(attempt_ctx, monkeypatch):
     attempt_ctx.prime.assert_not_called()
 
 
-def test_attempt_respects_the_row_count_ceiling(attempt_ctx, monkeypatch):
-    monkeypatch.setattr(su, '_library_row_count', lambda uid: 10 ** 9)
+def test_attempt_revalidates_eligibility_after_claim(attempt_ctx, monkeypatch):
+    answers = iter([(True, {'p1'}, None), (False, None, None)])
+    monkeypatch.setattr(inline_index_merge, '_eligible', lambda *a: next(answers))
     inline_index_merge._attempt('lib', 'people', [])
     attempt_ctx.prime.assert_not_called()
+    assert attempt_ctx.table.rows
+    assert not next(iter(attempt_ctx.table.rows.values())).get('owner')
 
 
 def test_attempt_backs_off_silently_when_already_leased(attempt_ctx, monkeypatch):
@@ -449,3 +463,478 @@ def test_enqueue_index_build_delay_override_floors_at_one_second(monkeypatch):
     monkeypatch.setattr(app, '_send_index_wakeup', fake_wakeup)
     app.enqueue_index_build('lib', scope='sort', delay_override=0)
     assert seen_delays == [1]
+
+
+@pytest.mark.parametrize('kind', ['people', 'albums'])
+@pytest.mark.parametrize('count', [None, -1, '5', True, 5001])
+def test_inline_rejects_unknown_or_oversize_snapshot_before_blob_load(monkeypatch, kind, count):
+    schema = getattr(su, f'_{kind.upper()}_INDEX_SCHEMA_VERSION')
+    monkeypatch.setattr(su, f'_load_{kind}_index_manifest', lambda uid: {
+        'sourceVersion': 'v1', 'schemaVersion': schema, 'rowCount': count})
+    loader = Mock(side_effect=AssertionError('must not load oversized blob'))
+    monkeypatch.setattr(su, f'_load_{kind}_index_blob', loader)
+    assert inline_index_merge._eligible('lib', kind)[0] is False
+    loader.assert_not_called()
+
+
+def test_large_photo_library_with_small_people_index_is_inline_eligible(people_ctx, monkeypatch):
+    people, faces, _ = people_ctx
+    _seed_person(people, 'lib', 'p1', name='Alice', faceIds='["f1"]')
+    _seed_face(faces, 'lib', 'f1', personId='p1', filename='a.jpg')
+    su.refresh_user_people_index('lib', source_version='v1')
+    monkeypatch.setattr(su, '_library_row_count', lambda uid: 1000000)
+    monkeypatch.setattr(app, '_pending_person_labels', lambda uid: set())
+    monkeypatch.setattr(app, 'get_dirty_people', lambda uid: {'p1'})
+    monkeypatch.setattr(app, 'get_dirty_albums', lambda uid: set())
+    assert inline_index_merge._eligible('lib', 'people')[0] is True
+    assert su.refresh_user_people_index('lib', affected_person_ids={'p1'}, incremental_only=True)
+
+
+@pytest.mark.parametrize('kind', ['people', 'albums'])
+def test_strict_missing_base_never_calls_full_or_timestamp_build(monkeypatch, kind):
+    monkeypatch.setattr(su, f'_load_{kind}_index_manifest', lambda uid: {})
+    full = Mock(side_effect=AssertionError('full scan'))
+    monkeypatch.setattr(su, f'_build_user_{kind}_index_snapshot', full)
+    timestamp = Mock(side_effect=AssertionError('timestamp scan'))
+    monkeypatch.setattr(su, '_incremental_people_index_snapshot', timestamp)
+    kwargs = {'affected_person_ids' if kind == 'people' else 'affected_album_ids': {'one'}}
+    assert getattr(su, f'refresh_user_{kind}_index')('lib', incremental_only=True, **kwargs) is None
+    full.assert_not_called()
+    timestamp.assert_not_called()
+
+
+def test_strict_people_membership_cap_and_read_failure_never_scan(people_ctx, monkeypatch):
+    people, faces, _ = people_ctx
+    _seed_person(people, 'lib', 'p1', name='Alice', faceIds='["f1"]')
+    _seed_face(faces, 'lib', 'f1', personId='p1', filename='a.jpg')
+    su.refresh_user_people_index('lib', source_version='v1')
+    full = Mock(side_effect=AssertionError('full scan'))
+    monkeypatch.setattr(su, '_build_user_people_index_snapshot', full)
+    monkeypatch.setattr(su, '_STRICT_INCREMENTAL_MAX_MEMBERS', 0)
+    assert su.refresh_user_people_index('lib', affected_person_ids={'p1'}, incremental_only=True) is None
+    monkeypatch.setattr(su, '_STRICT_INCREMENTAL_MAX_MEMBERS', 10)
+    monkeypatch.setattr(faces, 'get_entity', Mock(side_effect=RuntimeError('storage down')))
+    assert su.refresh_user_people_index('lib', affected_person_ids={'p1'}, incremental_only=True) is None
+    full.assert_not_called()
+
+
+def test_album_transient_point_failure_is_not_a_deletion(albums_ctx, monkeypatch):
+    albums, _, _ = albums_ctx
+    _seed_album(albums, 'lib', 'a1', name='Trip')
+    initial = su.refresh_user_albums_index('lib', source_version='v1')
+    monkeypatch.setattr(albums, 'get_entity', Mock(side_effect=RuntimeError('storage down')))
+    assert su._incremental_albums_index_snapshot('lib', 'v2', {'a1'}, initial.rows) is None
+    full = Mock(side_effect=AssertionError('full scan'))
+    monkeypatch.setattr(su, '_build_user_albums_index_snapshot', full)
+    assert su.refresh_user_albums_index('lib', affected_album_ids={'a1'}, incremental_only=True) is None
+    assert su._load_albums_index_blob('lib').rows == initial.rows
+    full.assert_not_called()
+
+
+def test_album_confirmed_missing_removes_only_affected_album(albums_ctx, monkeypatch):
+    _ready_album_search(monkeypatch)
+    albums, _, _ = albums_ctx
+    _seed_album(albums, 'lib', 'a1', name='Trip')
+    _seed_album(albums, 'lib', 'a2', name='Other')
+    initial = su.refresh_user_albums_index('lib', source_version='v1')
+    monkeypatch.setattr(albums, 'get_entity', Mock(side_effect=ResourceNotFoundError('gone')))
+    result = su._incremental_albums_index_snapshot('lib', 'v2', {'a1'}, initial.rows, incremental_only=True)
+    assert [row['albumId'] for row in result.rows] == ['a2']
+
+
+@pytest.mark.parametrize('manifest_failure', [False, True])
+def test_album_publication_failure_propagates_without_caching_success(albums_ctx, monkeypatch, manifest_failure):
+    albums, _, blobs = albums_ctx
+    _seed_album(albums, 'lib', 'a1', name='Trip')
+    su.refresh_user_albums_index('lib', source_version='v1')
+    original = su._get_blob_client
+    def client(container, name):
+        if name == (su._albums_index_manifest_blob_name('lib') if manifest_failure else su._albums_index_json_blob_name('lib')):
+            return SimpleNamespace(upload_blob=Mock(side_effect=RuntimeError('publication failed')))
+        return original(container, name)
+    monkeypatch.setattr(su, '_get_blob_client', client)
+    with pytest.raises(RuntimeError, match='publication failed'):
+        su.refresh_user_albums_index('lib', source_version='v2')
+    assert su._ALBUMS_INDEX_CACHE['lib']['source_version'] == 'v1'
+
+
+@pytest.mark.parametrize('kind', ['sort', 'access'])
+def test_strict_rows_missing_base_never_scans(monkeypatch, kind):
+    metadata = SimpleNamespace(query_entities=Mock(side_effect=AssertionError('full scan')))
+    monkeypatch.setitem(su._CTX, 'metadata_table_client', metadata)
+    monkeypatch.setattr(su, '_get_dirty_search_index_filenames', lambda uid, scope: {'a.jpg'})
+    monkeypatch.setattr(su, f'_load_{kind}_index_manifest', lambda uid: {})
+    assert getattr(su, f'refresh_user_{kind}_index')('lib', incremental_only=True) is None
+    metadata.query_entities.assert_not_called()
+
+
+def test_inline_failed_result_retains_intent_dirty_and_backstop(attempt_ctx):
+    attempt_ctx.prime.return_value = ['people']
+    delete = Mock()
+    with pytest.raises(RuntimeError, match='produced no people'):
+        inline_index_merge._attempt('lib', 'people', [(SimpleNamespace(delete_message=delete), SimpleNamespace(id='m', pop_receipt='r'))])
+    delete.assert_not_called()
+    attempt_ctx.clear_people.assert_not_called()
+    assert attempt_ctx.table.rows
+
+
+@pytest.mark.parametrize('kind', ['sort', 'access'])
+@pytest.mark.parametrize('reason', ['cost', 'read', 'schema', 'source', 'dirty_cap', 'photo_cap'])
+def test_strict_rows_revalidation_never_falls_back_to_scan(rows_ctx, monkeypatch, kind, reason):
+    import search_db
+    monkeypatch.setattr(search_db, 'load_manifest', lambda uid: {'rowCount': 1})
+    metadata, dirty, _ = rows_ctx
+    _seed_row(metadata, 'lib', 'a.jpg', anonymousImageId='a')
+    getattr(su, f'refresh_user_{kind}_index')('lib', source_version='v1', force_full=True)
+    su._mark_search_index_dirty_filenames('lib', ['a.jpg'], kinds=(kind,))
+    metadata.scan_count = 0
+    if reason == 'cost':
+        monkeypatch.setattr(su, '_dirty_set_too_large_to_merge', lambda *a: True)
+    elif reason == 'read':
+        monkeypatch.setattr(su, '_timed_fetch', lambda *a: False)
+    elif reason == 'schema':
+        monkeypatch.setattr(su, f'_load_{kind}_index_manifest', lambda uid: {
+            'sourceVersion': 'v1', 'schemaVersion': 'stale', 'rowCount': 1})
+    elif reason == 'source':
+        schema = getattr(su, f'_{kind.upper()}_INDEX_SCHEMA_VERSION')
+        monkeypatch.setattr(su, f'_load_{kind}_index_manifest', lambda uid: {
+            'sourceVersion': 'different', 'schemaVersion': schema, 'rowCount': 1})
+    elif reason == 'dirty_cap':
+        monkeypatch.setattr(su, '_STRICT_INCREMENTAL_MAX_MEMBERS', 0)
+    else:
+        monkeypatch.setattr(su, '_library_row_count', lambda uid, **kw: 1000000)
+    assert getattr(su, f'refresh_user_{kind}_index')('lib', incremental_only=True) is None
+    assert metadata.scan_count == 0
+    assert su._get_dirty_search_index_filenames('lib', kind) == {'a.jpg'}
+
+
+@pytest.mark.parametrize('kind', ['sort', 'access'])
+def test_strict_rows_success_uses_point_reads_and_acknowledges(rows_ctx, monkeypatch, kind):
+    import search_db
+    monkeypatch.setattr(search_db, 'load_manifest', lambda uid: {'rowCount': 1})
+    metadata, _, _ = rows_ctx
+    _seed_row(metadata, 'lib', 'a.jpg', anonymousImageId='a')
+    getattr(su, f'refresh_user_{kind}_index')('lib', source_version='v1', force_full=True)
+    getattr(su, f'touch_user_{kind}_index_state')('lib')
+    su._mark_search_index_dirty_filenames('lib', ['a.jpg'], kinds=(kind,))
+    metadata.scan_count = 0
+    assert getattr(su, f'refresh_user_{kind}_index')('lib', incremental_only=True)
+    assert metadata.scan_count == 0
+    assert su._get_dirty_search_index_filenames('lib', kind) == set()
+
+
+def test_album_dirty_touch_preserves_snapshot_size_and_lineage(albums_ctx, monkeypatch):
+    _ready_album_search(monkeypatch)
+    albums, _, _ = albums_ctx
+    _seed_album(albums, 'lib', 'a1', name='Trip')
+    su.refresh_user_albums_index('lib', source_version='v1')
+    su.touch_user_albums_index_state('lib')
+    manifest = su._load_albums_index_manifest('lib')
+    assert manifest['dirty'] and manifest['sourceVersion'] == 'v1' and manifest['rowCount'] == 1
+    assert su.refresh_user_albums_index('lib', affected_album_ids={'a1'}, incremental_only=True)
+
+
+def test_album_full_build_keeps_legacy_cover_read_fallback(albums_ctx, monkeypatch):
+    import search_db
+    albums, _, _ = albums_ctx
+    _seed_album(albums, 'lib', 'a1', name='Trip', filenames='["a.jpg"]')
+    monkeypatch.setattr(search_db, 'open_database', Mock(side_effect=RuntimeError('database down')))
+    result = su.refresh_user_albums_index('lib')
+    assert result.rows[0]['coverFilename'] == 'a.jpg'
+
+
+def test_strict_primer_forwards_flag_to_all_supported_refreshers(monkeypatch):
+    refreshers = {}
+    for kind in ('sort', 'access', 'people', 'albums'):
+        refreshers[kind] = Mock(return_value=object())
+        monkeypatch.setattr(su, f'refresh_user_{kind}_index', refreshers[kind])
+    assert su.prime_all_user_indexes_sequentially('lib', wait=True,
+        kinds=tuple(refreshers), incremental_only=True,
+        affected_person_ids={'p1'}, affected_album_ids={'a1'}) == []
+    for refresher in refreshers.values():
+        assert refresher.call_args.kwargs['incremental_only'] is True
+
+
+def test_strict_primer_rejects_lexical_without_full_build(monkeypatch):
+    full = Mock(side_effect=AssertionError('full build'))
+    monkeypatch.setattr(su, 'refresh_user_lexical_artifacts', full)
+    assert su.prime_all_user_indexes_sequentially('lib', wait=True,
+        kinds=('lexical',), incremental_only=True) == ['lexical']
+    full.assert_not_called()
+
+
+def test_inline_people_retains_search_work_without_worker_drain(attempt_ctx, monkeypatch):
+    monkeypatch.setattr(su, '_get_dirty_search_index_filenames', lambda *a, **k: {'a.jpg'})
+    delete = Mock()
+    inline_index_merge._attempt('lib', 'people', [(SimpleNamespace(delete_message=delete), SimpleNamespace(id='m', pop_receipt='r'))])
+    attempt_ctx.prime.assert_called_once()
+    attempt_ctx.drain.assert_not_called()
+    attempt_ctx.clear_people.assert_not_called()
+    delete.assert_not_called()
+    assert attempt_ctx.table.rows
+
+
+def test_album_membership_cap_defers_without_publishing(albums_ctx, monkeypatch):
+    albums, _, _ = albums_ctx
+    _seed_album(albums, 'lib', 'a1', name='Trip', filenames='["a.jpg", "b.jpg"]')
+    initial = su.refresh_user_albums_index('lib', source_version='v1')
+    monkeypatch.setattr(su, '_STRICT_INCREMENTAL_MAX_MEMBERS', 1)
+    full = Mock(side_effect=AssertionError('full scan'))
+    monkeypatch.setattr(su, '_build_user_albums_index_snapshot', full)
+    assert su.refresh_user_albums_index('lib', affected_album_ids={'a1'}, incremental_only=True) is None
+    assert su._load_albums_index_blob('lib').source_version == initial.source_version
+    full.assert_not_called()
+
+
+@pytest.mark.parametrize('kind', ['people', 'albums'])
+def test_strict_eligibility_rejects_oversize_before_data_load(monkeypatch, kind):
+    schema = getattr(su, f'_{kind.upper()}_INDEX_SCHEMA_VERSION')
+    monkeypatch.setattr(su, f'_load_{kind}_index_manifest', lambda uid: {
+        'rowCount': 5001, 'sourceVersion': 'v1', 'schemaVersion': schema})
+    blob = Mock(side_effect=AssertionError('oversized blob'))
+    monkeypatch.setattr(su, f'_load_{kind}_index_blob', blob)
+    assert getattr(su, f'_{kind}_merge_eligible')('lib', {'one'}, max_rows=5000) is None
+    blob.assert_not_called()
+
+
+@pytest.mark.parametrize('count', [None, '5', -1, True])
+def test_unknown_photo_size_disables_strict_photo_artifacts(monkeypatch, count):
+    import search_db
+    monkeypatch.setattr(search_db, 'load_manifest', lambda uid: {'rowCount': count})
+    monkeypatch.setattr(su, '_load_sort_index_manifest', lambda uid: {
+        'sourceVersion': 'v1', 'schemaVersion': su._SORT_INDEX_SCHEMA_VERSION})
+    assert not su._inline_artifact_within_limit('lib', 'sort', 5000)
+
+
+def _ready_album_search(monkeypatch, *, seq=0, applied=0, dirty=False):
+    import search_db
+    from tests.fakes import FakeTable
+    manifest = {'sourceVersion': 'search-v1', 'schemaVersion': search_db.SCHEMA_VERSION,
+                'deltaSeq': seq, 'lineage': 'catalog-v1'}
+    monkeypatch.setattr(search_db, 'load_manifest', lambda uid: manifest)
+    monkeypatch.setattr(su, '_load_lexical_index_manifest', lambda uid: {
+        'sourceVersion': 'catalog-v1', 'dirty': dirty})
+    db = SimpleNamespace(path=search_db._local_path('lib', 'search-v1'),
+                         applied_seq=lambda: applied, top_rated=lambda names, limit: names[:limit])
+    monkeypatch.setattr(search_db, 'open_database', lambda uid: db)
+    table = FakeTable()
+    monkeypatch.setitem(su._CTX, 'search_index_dirty_table_client', table)
+    monkeypatch.setattr(su, '_flush_dirty_filename_buffer', lambda *a: None)
+    return db, table, manifest
+
+
+@pytest.mark.parametrize('reason', ['absent', 'stale', 'dirty', 'member_pending', 'lookup_error', 'empty_result', 'lineage', 'building'])
+def test_strict_album_search_not_ready_retains_artifacts_intent_and_backstop(albums_ctx, attempt_ctx, monkeypatch, reason):
+    import search_db
+    albums, _, blobs = albums_ctx
+    _seed_album(albums, 'lib', 'a1', name='Trip', filenames='["a.jpg"]')
+    su.refresh_user_albums_index('lib', source_version='v1')
+    db, table, manifest = _ready_album_search(monkeypatch, seq=1 if reason == 'stale' else 0,
+                                             dirty=reason == 'dirty')
+    if reason == 'absent':
+        monkeypatch.setattr(search_db, 'open_database', lambda uid: None)
+    elif reason == 'member_pending':
+        table.upsert_entity({'PartitionKey': su._search_index_dirty_partition_key('lib', 'lexical'), 'RowKey': 'a.jpg'})
+    elif reason == 'lookup_error':
+        db.top_rated = Mock(side_effect=RuntimeError('search down'))
+    elif reason == 'empty_result':
+        db.top_rated = lambda *a, **k: []
+    elif reason == 'lineage':
+        manifest['lineage'] = 'old'
+    elif reason == 'building':
+        manifest['building'] = True
+    before = dict(blobs.blobs)
+    store = index_work.WorkStore(attempt_ctx.table)
+    store.request('lib', 'albums')
+    # Remove the unrelated people intent (albums conservatively conflicts
+    # with people search work) and run the real strict primer.
+    attempt_ctx.table.rows.pop((index_work.PARTITION, store.key('lib', 'people')))
+    monkeypatch.setattr(inline_index_merge, '_eligible', lambda *a: (True, None, {'a1'}))
+    monkeypatch.setattr(su, 'prime_all_user_indexes_sequentially', _REAL_PRIMER)
+    delete = Mock()
+    with pytest.raises(RuntimeError, match='produced no albums'):
+        inline_index_merge._attempt('lib', 'albums', [(SimpleNamespace(delete_message=delete), SimpleNamespace(id='m', pop_receipt='r'))])
+    assert blobs.blobs == before
+    attempt_ctx.clear_albums.assert_not_called()
+    delete.assert_not_called()
+    assert attempt_ctx.table.rows
+
+
+_REAL_PRIMER = su.prime_all_user_indexes_sequentially
+
+
+def test_strict_album_ready_uses_targeted_dependency_reads(albums_ctx, monkeypatch):
+    albums, _, _ = albums_ctx
+    _seed_album(albums, 'lib', 'a1', filenames='["a.jpg"]')
+    su.refresh_user_albums_index('lib', source_version='v1')
+    db, table, _ = _ready_album_search(monkeypatch)
+    table.upsert_entity({'PartitionKey': su._search_index_dirty_partition_key('lib', 'lexical'), 'RowKey': 'unrelated.jpg'})
+    table.query_entities = Mock(side_effect=AssertionError('whole dirty partition read'))
+    assert su.refresh_user_albums_index('lib', affected_album_ids={'a1'}, incremental_only=True)
+
+
+def test_inline_without_real_catalog_serialization_defers(attempt_ctx, monkeypatch):
+    monkeypatch.setattr(inline_index_merge, '_serialized_library', lambda uid: False)
+    inline_index_merge._attempt('lib', 'people', [])
+    attempt_ctx.prime.assert_not_called()
+    assert attempt_ctx.table.rows
+
+
+@pytest.mark.parametrize('scope,conflict', [('people', 'full'), ('albums', 'full'), ('sort', 'light'), ('access', 'full'), ('albums', 'search')])
+def test_inline_overlapping_pending_scopes_defer(attempt_ctx, monkeypatch, scope, conflict):
+    store = index_work.WorkStore(attempt_ctx.table)
+    store.request('lib', scope)
+    store.request('lib', conflict)
+    inline_index_merge._attempt('lib', scope, [])
+    attempt_ctx.prime.assert_not_called()
+
+
+def test_inline_claim_loss_cannot_upload_or_ack(attempt_ctx, monkeypatch):
+    import index_publication
+    client = SimpleNamespace(get_blob_properties=lambda: SimpleNamespace(etag='base'), upload_blob=Mock())
+    def lose_then_publish(*a, **k):
+        guard = index_publication._ACTIVE.get()
+        assert guard is not None and guard.thread.is_alive()
+        guard.lost = RuntimeError('claim lost')
+        index_publication.fenced(client).upload_blob(b'new', overwrite=True)
+    attempt_ctx.prime.side_effect = lose_then_publish
+    with pytest.raises(RuntimeError, match='lease lost'):
+        inline_index_merge._attempt('lib', 'people', [])
+    client.upload_blob.assert_not_called()
+    attempt_ctx.clear_people.assert_not_called()
+    assert attempt_ctx.table.rows
+
+
+def test_inline_publication_renews_claim_during_merge(attempt_ctx, monkeypatch):
+    import threading
+    original = index_work.WorkStore
+    renewed = threading.Event()
+    class ShortStore(original):
+        def __init__(self, table):
+            super().__init__(table, lease_seconds=0.15)
+        def renew(self, claim):
+            super().renew(claim)
+            renewed.set()
+    monkeypatch.setattr(index_work, 'WorkStore', ShortStore)
+    def merge(*a, **k):
+        assert renewed.wait(timeout=2)
+        return []
+    attempt_ctx.prime.side_effect = merge
+    inline_index_merge._attempt('lib', 'people', [])
+    assert renewed.is_set() and not attempt_ctx.table.rows
+
+
+def test_strict_prebuild_manifest_change_cannot_publish():
+    capture = [(SimpleNamespace(get_blob_properties=lambda: SimpleNamespace(etag='changed')),
+                {'etag': 'base'})]
+    with pytest.raises(RuntimeError, match='base changed'):
+        su._strict_check_publication(capture)
+
+
+@pytest.mark.parametrize('kind', ['people', 'albums'])
+def test_strict_merge_race_before_publication_retains_previous_data(request, monkeypatch, kind):
+    table, _, blobs = request.getfixturevalue(f'{kind}_ctx')
+    if kind == 'people':
+        _seed_person(table, 'lib', 'one', name='Alice')
+    else:
+        _seed_album(table, 'lib', 'one')
+        _ready_album_search(monkeypatch)
+    refresh = getattr(su, f'refresh_user_{kind}_index')
+    refresh('lib', source_version='v1')
+    fn = '_incremental_people_index_snapshot_by_ids' if kind == 'people' else '_incremental_albums_index_snapshot'
+    original = getattr(su, fn)
+    name = 'lexical-index/' + getattr(su, f'_{kind}_index_manifest_blob_name')('lib')
+    data_name = 'lexical-index/' + getattr(su, f'_{kind}_index_json_blob_name')('lib')
+    before = blobs.blobs[data_name]
+    def racing(*a, **k):
+        result = original(*a, **k)
+        blobs.blobs[name] += b' '
+        return result
+    monkeypatch.setattr(su, fn, racing)
+    with pytest.raises(RuntimeError, match='base changed'):
+        refresh('lib', incremental_only=True, **{
+            'affected_person_ids' if kind == 'people' else 'affected_album_ids': {'one'}})
+    assert blobs.blobs[data_name] == before
+
+
+@pytest.mark.parametrize('kind', ['people', 'albums'])
+def test_capped_previous_snapshot_requires_exact_manifest_count(monkeypatch, kind):
+    schema = getattr(su, f'_{kind.upper()}_INDEX_SCHEMA_VERSION')
+    monkeypatch.setattr(su, f'_load_{kind}_index_manifest', lambda uid: {
+        'rowCount': 1, 'sourceVersion': 'v1', 'schemaVersion': schema})
+    monkeypatch.setattr(su, f'_load_{kind}_index_blob', lambda uid: SimpleNamespace(
+        source_version='v1', schema_version=schema, rows=[{}, {}]))
+    assert getattr(su, f'_{kind}_merge_eligible')('lib', {'one'}, max_rows=5000) is None
+
+
+def test_strict_primer_cannot_lose_guard_to_background_thread(monkeypatch):
+    refresh = Mock(side_effect=AssertionError('unguarded background build'))
+    monkeypatch.setattr(su, 'refresh_user_people_index', refresh)
+    assert su.prime_all_user_indexes_sequentially('lib', kinds=('people',), incremental_only=True) == ['people']
+    refresh.assert_not_called()
+
+
+@pytest.mark.parametrize('kind', ['sort', 'access'])
+def test_strict_rows_manifest_race_cannot_publish_or_ack(rows_ctx, monkeypatch, kind):
+    import search_db
+    metadata, _, blobs = rows_ctx
+    monkeypatch.setattr(search_db, 'load_manifest', lambda uid: {'rowCount': 1})
+    _seed_row(metadata, 'lib', 'a.jpg', anonymousImageId='a')
+    refresh = getattr(su, f'refresh_user_{kind}_index')
+    refresh('lib', source_version='v1', force_full=True)
+    su._mark_search_index_dirty_filenames('lib', ['a.jpg'], kinds=(kind,))
+    manifest_name = 'lexical-index/' + getattr(su, f'_{kind}_index_manifest_blob_name')('lib')
+    data_name = 'lexical-index/' + getattr(su, f'_{kind}_index_json_blob_name')('lib')
+    before = blobs.blobs[data_name]
+    original = su._timed_fetch
+    def racing(*a):
+        result = original(*a)
+        blobs.blobs[manifest_name] += b' '
+        return result
+    monkeypatch.setattr(su, '_timed_fetch', racing)
+    with pytest.raises(RuntimeError, match='base changed'):
+        refresh('lib', incremental_only=True)
+    assert blobs.blobs[data_name] == before
+    assert su._get_dirty_search_index_filenames('lib', kind) == {'a.jpg'}
+
+
+@pytest.mark.parametrize('kind', ['people', 'albums'])
+def test_strict_manifest_cas_race_does_not_bless_cache(request, monkeypatch, kind):
+    from azure.core.exceptions import ResourceModifiedError
+    table, _, blobs = request.getfixturevalue(f'{kind}_ctx')
+    if kind == 'people':
+        _seed_person(table, 'lib', 'one', name='Alice')
+    else:
+        _seed_album(table, 'lib', 'one')
+        _ready_album_search(monkeypatch)
+    refresh = getattr(su, f'refresh_user_{kind}_index')
+    refresh('lib', source_version='v1')
+    data_name = getattr(su, f'_{kind}_index_json_blob_name')('lib')
+    manifest_name = 'lexical-index/' + getattr(su, f'_{kind}_index_manifest_blob_name')('lib')
+    original = blobs.get_blob_client
+    def client(container, blob):
+        result = original(container, blob)
+        if blob == data_name:
+            upload = result.upload_blob
+            def racing(*a, **kw):
+                outcome = upload(*a, **kw)
+                blobs.blobs[manifest_name] += b' '
+                return outcome
+            result.upload_blob = racing
+        return result
+    monkeypatch.setattr(blobs, 'get_blob_client', client)
+    with pytest.raises(ResourceModifiedError, match='CAS conflict'):
+        refresh('lib', incremental_only=True, **{
+            'affected_person_ids' if kind == 'people' else 'affected_album_ids': {'one'}})
+    assert getattr(su, f'_{kind.upper()}_INDEX_CACHE')['lib']['source_version'] == 'v1'
+
+
+@pytest.mark.parametrize('kind', ['people', 'albums', 'sort', 'access'])
+def test_strict_without_conditional_storage_defers_without_build(monkeypatch, kind):
+    monkeypatch.setattr(su, '_get_blob_client', lambda *a: SimpleNamespace(upload_blob=Mock()))
+    full = Mock(side_effect=AssertionError('full build'))
+    monkeypatch.setattr(su, f'_build_user_{kind}_index_snapshot', full)
+    extra = {'affected_person_ids': {'one'}} if kind == 'people' else {
+        'affected_album_ids': {'one'}} if kind == 'albums' else {}
+    assert getattr(su, f'refresh_user_{kind}_index')('lib', incremental_only=True, **extra) is None
+    full.assert_not_called()

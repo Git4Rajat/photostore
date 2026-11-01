@@ -795,6 +795,9 @@ def _job_env(monkeypatch):
     monkeypatch.setattr(app, 'storage_utils_ensure_sort_current', lambda uid: None)
     monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **k: status.append(a[3]))
     monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', lambda uid, **k: primed.append(k.get('kinds')))
+    # These orchestration unit tests fake the search drain, not a SQLite base.
+    # Real summary publication/replay is covered by runtime integration tests.
+    monkeypatch.setattr(app, '_refresh_library_summaries', lambda uid: None)
     return primed, status
 
 

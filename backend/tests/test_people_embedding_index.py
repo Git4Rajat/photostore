@@ -3,14 +3,14 @@ app.py's in-process _load_people_embedding_index/_people_embedding_index_cache
 -- a person-level rep-embedding index for worker's clustering matcher. Not
 to be confused with the photo-level vector index (search) or the People-page
 listing index (touch_user_people_index_state, names/cover photos, no
-embeddings). Deliberately simpler than the photo vector index: a full
-rebuild every time, no incremental per-person dirty-set merge, since a full
-scan is already cheap at real-world person-count scale.
+embeddings). Full-builder and legacy-reader coverage; opt-in bounded merges
+are exercised by the dedicated incremental tests.
 """
 from __future__ import annotations
 
 import json
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,10 +23,21 @@ class _FakeBlob:
         self._store = store
         self._key = key
 
-    def upload_blob(self, data, overwrite=True, content_settings=None):
+    def get_blob_properties(self):
+        from azure.core.exceptions import ResourceNotFoundError
+        if self._key not in self._store:
+            raise ResourceNotFoundError(self._key)
+        return SimpleNamespace(etag=str(hash(self._store[self._key])), size=len(self._store[self._key]))
+
+    def upload_blob(self, data, overwrite=True, content_settings=None, **kwargs):
+        from azure.core.exceptions import ResourceModifiedError
+        if 'etag' in kwargs and kwargs['etag'] != self.get_blob_properties().etag:
+            raise ResourceModifiedError('manifest changed')
+        if hasattr(data, 'read'):
+            data = data.read()
         self._store[self._key] = data
 
-    def download_blob(self):
+    def download_blob(self, **kwargs):
         if self._key not in self._store:
             raise KeyError(self._key)
         return _Downloaded(self._store[self._key])
@@ -41,6 +52,9 @@ class _Downloaded:
 
     def readall(self) -> bytes:
         return self._data
+
+    def readinto(self, stream):
+        return stream.write(self._data)
 
 
 class _FakeBlobServiceClient:

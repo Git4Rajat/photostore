@@ -77,17 +77,27 @@ def require_catalog_owner(*, model_owned_tag=False):
                               'or core may run an explicitly-scoped inline merge)')
 
 
-def catalog_publisher(function):
+def _publisher(function, *, model_owned_tag=False):
+    from index_publication import serialize_catalog
+    @wraps(function)
+    def admitted(*args, **kwargs):
+        from automatic_index_updates import check_source_admission
+        first = args[0] if args else kwargs.get('user_id')
+        library = getattr(first, 'user_id', first)
+        if isinstance(library, str) and library:
+            check_source_admission(library)
+        return function(*args, **kwargs)
+    serialized = serialize_catalog(admitted)
     @wraps(function)
     def guarded(*args, **kwargs):
-        require_catalog_owner()
-        return function(*args, **kwargs)
+        require_catalog_owner(model_owned_tag=model_owned_tag)
+        return serialized(*args, **kwargs)
     return guarded
+
+
+def catalog_publisher(function):
+    return _publisher(function)
 
 
 def model_tag_publisher(function):
-    @wraps(function)
-    def guarded(*args, **kwargs):
-        require_catalog_owner(model_owned_tag=True)
-        return function(*args, **kwargs)
-    return guarded
+    return _publisher(function, model_owned_tag=True)

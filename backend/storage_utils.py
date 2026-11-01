@@ -891,6 +891,13 @@ def metadata_updates_affect_sort_index(updates: Dict) -> bool:
 
 DURABLE_INDEX_UPDATES = bool(os.getenv('INDEX_MAINTENANCE_QUEUE_NAME', '').strip())
 METADATA_INDEX_REQUEST_HOOK = None
+PEOPLE_EMBEDDING_MODEL_VERSION_HOOK = None
+
+
+def track_index_source_table(table, source):
+    """Install at client construction, inside cache proxies (also used by FAISS)."""
+    from automatic_index_updates import SourceTable
+    return table if isinstance(table, SourceTable) else SourceTable(table, source)
 
 
 #  peopleIds/faces/faceCount are deliberately absent: a person-only change
@@ -968,10 +975,8 @@ def publish_metadata_index_intent(user_id, filename, entity):
             raise RuntimeError('Metadata index scheduler unavailable')
         import index_updates
         for kind in sorted(kinds):
-            # These retain specialized ownership: tag embeddings need the
-            # vision model, and the legacy photo vector artifact is on-demand.
-            if kind in ('tag_embedding', 'vector'):
-                continue
+            # Scheduler routes model-owned tags into vision's durable scope;
+            # neither the HTTP role nor the index worker loads CLIP.
             if kind == 'sort' and sort_index_skipped(user_id):
                 continue
             if METADATA_INDEX_REQUEST_HOOK(user_id, index_updates.scope_for_index(kind)) == 'unavailable':
@@ -2216,10 +2221,10 @@ def _get_blob_client(container_name: str, filename: str):
     return client
 
 
-def _user_index_blob_locations(user_id: str) -> List[Tuple[str, str]]:
+def _user_index_blob_locations(user_id: str, *, include_immutable=False):
     key = str(user_id or '').strip()
     lexical = _lexical_index_container_name()
-    return [
+    locations = [
         (lexical, _sort_index_json_blob_name(key)),
         (lexical, _listing_index_json_blob_name(key)),
         (lexical, _access_index_json_blob_name(key)),
@@ -2230,6 +2235,26 @@ def _user_index_blob_locations(user_id: str) -> List[Tuple[str, str]]:
         (_people_embedding_index_container_name(), _people_embedding_index_npz_blob_name(key)),
         (_tag_embedding_index_container_name(), _tag_embedding_index_npz_blob_name(key)),
     ]
+    if not include_immutable or not key:
+        return locations
+    # Purge discovery only. Session warming retains its fixed, scan-free list;
+    # immutable generations/sidecars are streamed, never materialized in RAM.
+    import index_artifact_cleanup
+    from itertools import chain
+    import sys
+    return chain(locations, ((container, item.name) for container, item in
+                 index_artifact_cleanup.iter_immutable_locations(sys.modules[__name__], key)))
+
+
+def _purge_user_immutable_index_artifacts(user_id, kind):
+    """Existing library/account purge fence owns quiescence, not read-side GC."""
+    service = _CTX.get('blob_service_client')
+    if service is None or not callable(getattr(service, 'get_container_client', None)):
+        return
+    import index_artifact_cleanup
+    import sys
+    # Conditional-delete failures deliberately reach the purge's retry path.
+    index_artifact_cleanup.purge_immutable_artifacts(sys.modules[__name__], user_id, kinds=(kind,))
 
 
 _WARM_LOCK = threading.Lock()
@@ -2381,7 +2406,8 @@ def get_vector_index_blob_location(user_id: str) -> Tuple[str, str]:
     its own SAS URL (see routes/photos.py:photos_search_index, which hands
     this straight to the browser for client-side semantic search -- Phase B
     of backend-cpu-optimization-2026-09)."""
-    return _vector_index_container_name(), _vector_index_npz_blob_name(user_id)
+    manifest = _load_vector_index_manifest(user_id)
+    return _vector_index_container_name(), _vector_index_manifest_data_name(user_id, manifest)
 
 
 def _vector_index_blob_key(user_id: str) -> str:
@@ -2394,6 +2420,16 @@ def _vector_index_npz_blob_name(user_id: str) -> str:
 
 def _vector_index_manifest_blob_name(user_id: str) -> str:
     return f'{_vector_index_blob_key(user_id)}.json'
+
+
+def _vector_index_manifest_data_name(user_id: str, manifest: Dict) -> str:
+    """Only an absent pointer permits the legacy alias; present pointers fail closed."""
+    name = manifest.get('blobName', _vector_index_npz_blob_name(user_id))
+    if (not isinstance(name, str) or
+            not name.startswith(_vector_index_blob_key(user_id) + '.') or
+            not name.endswith('.npz')):
+        raise ValueError('invalid vector manifest blob pointer')
+    return name
 
 
 def _vector_index_blob_client(blob_name: str):
@@ -2415,6 +2451,7 @@ def delete_user_vector_index_data(user_id: str) -> None:
     key = str(user_id or '').strip()
     if not key:
         return
+    _purge_user_immutable_index_artifacts(key, 'vector')
     for blob_name in (_vector_index_npz_blob_name(key), _vector_index_manifest_blob_name(key)):
         blob_client = _vector_index_blob_client(blob_name)
         if blob_client is None:
@@ -2500,23 +2537,37 @@ def touch_user_vector_index_state(user_id: str, *, embedding_version: Optional[s
     if _manifest_already_marked_dirty(key, 'vector'):
         return ''
     source_version = datetime.now(timezone.utc).isoformat()
-    manifest = {
-        'userId': key,
-        'sourceVersion': source_version,
-        'embeddingVersion': str(embedding_version or vision_utils.get_text_embedding_version()),
-        'dirty': True,
-        'updatedAt': source_version,
-    }
     blob_client = _vector_index_blob_client(_vector_index_manifest_blob_name(key))
     if blob_client is not None:
         try:
+            # Preserve committed NPZ/model provenance; never replace the
+            # immutable pointer or relabel the base embeddings on a touch.
+            try:
+                props = blob_client.get_blob_properties()
+            except ResourceNotFoundError:
+                props = None
+            if props is not None:
+                manifest = json.loads(blob_client.download_blob(
+                    etag=props.etag, match_condition=MatchConditions.IfNotModified,
+                ).readall())
+                if not isinstance(manifest, dict):
+                    raise ValueError('invalid vector manifest')
+            else:
+                manifest = {'userId': key, 'embeddingVersion': str(
+                    embedding_version or vision_utils.get_text_embedding_version())}
+            if not manifest.get('dirty'):
+                manifest['baseSourceVersion'] = manifest.get('sourceVersion', '')
+            manifest.update(sourceVersion=source_version, dirty=True, updatedAt=source_version)
             blob_client.upload_blob(
                 json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
-                overwrite=True,
+                overwrite=props is not None,
                 content_settings=BlobContentSettings(content_type='application/json'),
+                **({'etag': props.etag, 'match_condition': MatchConditions.IfNotModified} if props is not None else {}),
             )
         except Exception:
-            pass
+            _clear_manifest_dirty_flag(key, 'vector')  # Let a later touch retry.
+    else:
+        _clear_manifest_dirty_flag(key, 'vector')
     invalidate_user_vector_index_cache(key)
     return source_version
 
@@ -2570,7 +2621,12 @@ def _load_vector_index_manifest(user_id: str) -> Dict[str, str]:
 
 
 def _load_vector_index_npz(user_id: str) -> Optional[VectorIndexSnapshot]:
-    blob_client = _vector_index_blob_client(_vector_index_npz_blob_name(user_id))
+    manifest = _load_vector_index_manifest(user_id)
+    try:
+        blob_name = _vector_index_manifest_data_name(user_id, manifest)
+    except ValueError:
+        return None
+    blob_client = _vector_index_blob_client(blob_name)
     if blob_client is None:
         return None
     try:
@@ -2923,54 +2979,119 @@ def _merge_user_vector_index_snapshot(
 @catalog_publisher
 def refresh_user_vector_index(
     user_id: str, *, source_version: Optional[str] = None, force_full: bool = False,
-) -> Optional[VectorIndexSnapshot]:
+    affected_filenames: Optional[Sequence[str]] = None,
+    incremental_only: bool = False, previous_source_version: Optional[str] = None,
+):
     """Rebuild the vector index with a disk-backed full build and publish the file.
     (The old incremental path loaded the entire existing array into RAM; nothing
     reads this index on a serving path any more, so a streamed full rebuild --
     run only on demand/by the worker -- is the safe shape.) Returns a snapshot
     carrying the row keys and versions but NOT the matrix, which now lives only in
-    the published blob."""
+    the published blob. Explicit affected_filenames opts into a strict bounded
+    merge and returns a VectorPublication receipt (no keys/matrix). The caller
+    MUST supply every changed/deleted filename since previous_source_version
+    and serialize source mutations. Automatic dirty sets are incomplete and
+    never used for this API. incremental_only without explicit IDs defers.
+    No implicit full fallback, even when incremental_only is False. Omit both
+    options to retain existing full-builder behavior."""
     key = str(user_id or '').strip()
     if not key:
         return None
     source_version = str(source_version or datetime.now(timezone.utc).isoformat())
-    dirty_to_clear = _get_dirty_search_index_filenames(key, 'vector') or set()
-
-    with index_files.workspace() as workdir, index_files.workspace(sqlite=True) as sqlite_dir:
-        built = _build_user_vector_index_file(key, source_version, workdir, sqlite_dir)
-        if built is None:
+    if affected_filenames is not None or incremental_only:
+        import vector_incremental
+        if affected_filenames is None or force_full:
             return None
-        npz_path, row_keys, embedding_version = built
-        container_name = _vector_index_container_name()
-        if container_name:
-            blob_client = _get_blob_client(container_name, _vector_index_npz_blob_name(key))
-            if blob_client is not None:
-                try:
-                    with open(npz_path, 'rb') as fh:
-                        blob_client.upload_blob(
-                            fh, overwrite=True,
-                            content_settings=BlobContentSettings(content_type='application/octet-stream'),
-                        )
-                except Exception:
-                    _LOGGER.exception('Vector index upload failed for user %s', key)
-                    return None
-            _clear_manifest_dirty_flag(key, 'vector')
-            manifest_client = _get_blob_client(container_name, _vector_index_manifest_blob_name(key))
-            if manifest_client is not None:
-                try:
-                    manifest_client.upload_blob(
-                        json.dumps({
-                            'userId': key, 'sourceVersion': source_version, 'embeddingVersion': embedding_version,
-                            'rowCount': len(row_keys), 'dirty': False, 'updatedAt': source_version,
-                        }, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
-                        overwrite=True,
-                        content_settings=BlobContentSettings(content_type='application/json'),
-                    )
-                except Exception:
-                    pass
-    invalidate_user_vector_index_cache(key)
-    if dirty_to_clear:
-        _clear_dirty_search_index_filenames(key, 'vector', dirty_to_clear)
+        try:
+            ids = vector_incremental.bounded_ids(affected_filenames)
+            compatible = vision_utils.get_text_embedding_dimension() == PHOTO_EMBEDDING_DIMENSION
+
+            def compute(filename, row, embedding_row):
+                if embedding_row is None:
+                    return _compute_photo_vector(filename, row, row, compatible)
+                stored = _stored_photo_vector(embedding_row, compatible)
+                return stored if stored is not None else _text_photo_vector(filename, row)
+
+            receipt = vector_incremental.merge_and_publish(
+                user=key, ids=ids, source=source_version,
+                expected=str(previous_source_version or ''),
+                version=vision_utils.get_text_embedding_version(), dim=PHOTO_EMBEDDING_DIMENSION,
+                metadata_table=_CTX.get('metadata_table_client'),
+                embeddings_table=_CTX.get('embeddings_table_client'),
+                manifest_client=_vector_index_blob_client(_vector_index_manifest_blob_name(key)),
+                blob_client=_vector_index_blob_client, blob_prefix=_vector_index_blob_key(key),
+                compute=compute, content_settings=lambda kind: BlobContentSettings(content_type=kind),
+            )
+        except Exception:
+            _LOGGER.exception('Vector incremental refresh deferred for user %s', key)
+            return None
+        _clear_manifest_dirty_flag(key, 'vector')
+        invalidate_user_vector_index_cache(key)
+        return receipt
+    import index_publication
+    # Retain captured row versions (not a set copy) for conditional dirty ack.
+    dirty_to_clear = _get_dirty_search_index_filenames(key, 'vector')
+    try:
+        manifest_client = _vector_index_blob_client(_vector_index_manifest_blob_name(key))
+        if manifest_client is None:
+            raise RuntimeError('Vector manifest storage unavailable')
+        # Re-arm touches BEFORE capture/build so a touch while already dirty
+        # changes the manifest ETag and fences this build. Never clear this
+        # flag after commit: that could erase a concurrent post-commit touch.
+        _clear_manifest_dirty_flag(key, 'vector')
+        index_publication.check()
+        condition = index_publication.declared_build_alias_conditions(manifest_client)
+        guarded_full = condition is not None
+        if guarded_full:
+            blob_name = _vector_index_npz_blob_name(key)
+            blob_client = _vector_index_blob_client(blob_name)
+            data_condition = index_publication.declared_build_alias_conditions(blob_client)
+        else:
+            try:
+                props = manifest_client.get_blob_properties()
+            except ResourceNotFoundError:
+                props = None
+            if props is not None and not props.etag:
+                raise RuntimeError('Vector manifest ETag unavailable')
+            condition = ({'overwrite': True, 'etag': props.etag,
+                          'match_condition': MatchConditions.IfNotModified}
+                         if props is not None else {'overwrite': False})
+            data_condition = {'overwrite': False}
+
+        with index_files.workspace() as workdir, index_files.workspace(sqlite=True) as sqlite_dir:
+            built = _build_user_vector_index_file(key, source_version, workdir, sqlite_dir)
+            if built is None:
+                return None
+            npz_path, row_keys, embedding_version = built
+            if not guarded_full:
+                blob_name = _vector_index_blob_key(key) + '.' + uuid.uuid4().hex + '.npz'
+                blob_client = _vector_index_blob_client(blob_name)
+            if blob_client is None:
+                raise RuntimeError('Vector data storage unavailable')
+            index_publication.check()
+            with open(npz_path, 'rb') as fh:
+                blob_client.upload_blob(
+                    fh, **data_condition,
+                    content_settings=BlobContentSettings(content_type='application/octet-stream'),
+                )
+            index_publication.check()
+            manifest_client.upload_blob(
+                json.dumps({
+                    'userId': key, 'sourceVersion': source_version, 'embeddingVersion': embedding_version,
+                    'rowCount': len(row_keys), 'dirty': False, 'updatedAt': source_version,
+                    'blobName': blob_name, 'schemaVersion': 1,
+                }, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+                content_settings=BlobContentSettings(content_type='application/json'),
+                **condition,
+            )
+        index_publication.check()
+        if dirty_to_clear:
+            _clear_dirty_search_index_filenames(key, 'vector', dirty_to_clear)
+        invalidate_user_vector_index_cache(key)
+    except Exception as error:
+        _LOGGER.exception('Vector full publication failed for user %s', key)
+        index_publication.propagate_build_failure(error)
+        return None
     return VectorIndexSnapshot(
         user_id=key, source_version=source_version, embedding_version=embedding_version,
         updated_at=source_version, row_keys=row_keys, embeddings=np.zeros((0, 0), dtype=np.float32),
@@ -3086,7 +3207,15 @@ def delete_user_people_embedding_index_data(user_id: str) -> None:
     key = str(user_id or '').strip()
     if not key:
         return
-    for blob_name in (_people_embedding_index_npz_blob_name(key), _people_embedding_index_manifest_blob_name(key)):
+    _purge_user_immutable_index_artifacts(key, 'people_embedding')
+    published = _load_people_embedding_index_manifest(key).get('npzBlobName')
+    blob_names = [_people_embedding_index_npz_blob_name(key), _people_embedding_index_manifest_blob_name(key)]
+    # Never trust a corrupt manifest to expand an account's deletion scope.
+    if (isinstance(published, str)
+            and re.fullmatch(re.escape(_people_embedding_index_blob_key(key))
+                             + r'\.[0-9a-f]{32}\.npz', published)):
+        blob_names.append(published)
+    for blob_name in blob_names:
         blob_client = _people_embedding_index_blob_client(blob_name)
         if blob_client is None:
             continue
@@ -3117,6 +3246,7 @@ def touch_user_people_embedding_index_state(user_id: str) -> str:
     if _manifest_already_marked_dirty(key, 'people_embedding'):
         return ''
     source_version = datetime.now(timezone.utc).isoformat()
+    previous = _load_people_embedding_index_manifest(key)
     manifest = {
         'userId': key,
         'sourceVersion': source_version,
@@ -3124,6 +3254,11 @@ def touch_user_people_embedding_index_state(user_id: str) -> str:
         'dirty': True,
         'updatedAt': source_version,
     }
+    # Retain the published base provenance/pointer across dirty marking.
+    for field in ('modelVersion', 'rowCount', 'npzBlobName'):
+        if field in previous:
+            manifest[field] = previous[field]
+    manifest['baseSourceVersion'] = previous.get('baseSourceVersion') if previous.get('dirty') else previous.get('sourceVersion')
     blob_client = _people_embedding_index_blob_client(_people_embedding_index_manifest_blob_name(key))
     if blob_client is not None:
         try:
@@ -3154,7 +3289,15 @@ def _load_people_embedding_index_manifest(user_id: str) -> Dict[str, str]:
 
 
 def _load_people_embedding_index_npz(user_id: str) -> Optional[PeopleEmbeddingIndexSnapshot]:
-    blob_client = _people_embedding_index_blob_client(_people_embedding_index_npz_blob_name(user_id))
+    manifest = _load_people_embedding_index_manifest(user_id)
+    # Only an absent pointer permits the legacy alias, not a present empty or
+    # invalid pointer (which could otherwise hide a failed publication).
+    blob_name = manifest.get('npzBlobName', _people_embedding_index_npz_blob_name(user_id))
+    if (not isinstance(blob_name, str) or len(blob_name) > 1024 or '/' in blob_name
+            or not blob_name.startswith(_people_embedding_index_blob_key(user_id) + '.')
+            or not blob_name.endswith('.npz')):
+        return None
+    blob_client = _people_embedding_index_blob_client(blob_name)
     if blob_client is None:
         return None
     try:
@@ -3191,6 +3334,10 @@ def _load_people_embedding_index_npz(user_id: str) -> Optional[PeopleEmbeddingIn
 
 def _serialize_people_embedding_index(snapshot: PeopleEmbeddingIndexSnapshot) -> bytes:
     buffer = io.BytesIO()
+    extra = {}
+    if hasattr(snapshot, '_incremental_rep_sizes'):
+        extra['rep_sizes'] = np.asarray([json.dumps(snapshot._incremental_rep_sizes, separators=(',', ':'))])
+        extra['model_version'] = np.asarray([getattr(snapshot, '_incremental_model_version', '')])
     np.savez_compressed(
         buffer,
         embeddings=np.asarray(snapshot.embeddings, dtype=np.float32),
@@ -3199,6 +3346,7 @@ def _serialize_people_embedding_index(snapshot: PeopleEmbeddingIndexSnapshot) ->
         source_version=np.asarray([snapshot.source_version]),
         embedding_version=np.asarray([snapshot.embedding_version]),
         updated_at=np.asarray([snapshot.updated_at]),
+        **extra,
     )
     return buffer.getvalue()
 
@@ -3211,6 +3359,7 @@ def _build_user_people_embedding_index_snapshot(user_id: str, source_version: st
         embedding_version=_PEOPLE_EMBEDDING_INDEX_SCHEMA_VERSION, updated_at=source_version,
         person_ids=[], embeddings=np.zeros((0, 0), dtype=np.float32), people_meta=[],
     )
+    empty._incremental_rep_sizes = []
     if person_table_client is None or face_table_client is None:
         return None
     try:
@@ -3276,8 +3425,9 @@ def _build_user_people_embedding_index_snapshot(user_id: str, source_version: st
     for index, rep in enumerate(raw_reps):
         width = min(rep.size, target_dim)   # longer reps truncate, shorter ones zero-pad
         embeddings[index, :width] = rep[:width]
+    rep_sizes = [int(rep.size) for rep in raw_reps]
     del raw_reps
-    return PeopleEmbeddingIndexSnapshot(
+    snapshot = PeopleEmbeddingIndexSnapshot(
         user_id=str(user_id),
         source_version=source_version,
         embedding_version=_PEOPLE_EMBEDDING_INDEX_SCHEMA_VERSION,
@@ -3286,32 +3436,120 @@ def _build_user_people_embedding_index_snapshot(user_id: str, source_version: st
         embeddings=embeddings,
         people_meta=people_meta,
     )
+    snapshot._incremental_rep_sizes = rep_sizes
+    return snapshot
 
 
 @catalog_publisher
 def refresh_user_people_embedding_index(
     user_id: str, *, source_version: Optional[str] = None,
-) -> Optional[PeopleEmbeddingIndexSnapshot]:
+    affected_person_ids=None, incremental_only: bool = False,
+    previous_source_version: Optional[str] = None, model_version: Optional[str] = None,
+) -> Optional[object]:
+    """Full snapshot by default; explicit deltas return a publication receipt.
+
+    Incremental callers must supply a complete bounded dirty set since
+    previous_source_version and the representative embedding model identity.
+    Strict calls return None on any deferral, never scan or hydrate the index.
+    Non-strict incompatibility/read failure falls back to the existing builder.
+    Publication failures never fall back and never report success.
+    """
     key = str(user_id or '').strip()
     if not key:
         return None
     source_version = str(source_version or datetime.now(timezone.utc).isoformat())
+    if affected_person_ids is None and model_version is None and PEOPLE_EMBEDDING_MODEL_VERSION_HOOK:
+        # Seed the full snapshot with the actual configured representative
+        # lineage. Never label it with a synthetic schema/model placeholder.
+        model_version = PEOPLE_EMBEDDING_MODEL_VERSION_HOOK()
+    if affected_person_ids is not None:
+        from people_embedding_incremental import bounded_ids, merge_and_publish
+        try:
+            ids = bounded_ids(affected_person_ids)
+        except Exception:
+            # Invalid/incomplete captures are not permission for a full scan.
+            return None
+        try:
+            # Do not use the whole-snapshot loader or cache in this path.
+            result = merge_and_publish(
+                user=key, ids=ids, source=source_version,
+                expected=str(previous_source_version or ''), model=str(model_version or ''),
+                schema=_PEOPLE_EMBEDDING_INDEX_SCHEMA_VERSION,
+                person_table=_CTX.get('person_table_client'), face_table=_CTX.get('face_table_client'),
+                manifest_client=_people_embedding_index_blob_client(_people_embedding_index_manifest_blob_name(key)),
+                blob_client=_people_embedding_index_blob_client,
+                blob_prefix=_people_embedding_index_blob_key(key),
+                content_settings=lambda mime: BlobContentSettings(content_type=mime),
+            )
+        except Exception as error:
+            # merge_and_publish marks publication exceptions separately so a
+            # failed commit cannot accidentally trigger a full fallback.
+            from people_embedding_incremental import PublicationFailed
+            if incremental_only or isinstance(error, PublicationFailed):
+                return None
+            _LOGGER.debug('People embedding merge deferred for %s; using full builder', key, exc_info=True)
+        else:
+            _clear_manifest_dirty_flag(key, 'people_embedding')
+            invalidate_user_people_embedding_index_cache(key)
+            return result
+    elif incremental_only:
+        return None
+    import index_publication
+    try:
+        manifest_client = _people_embedding_index_blob_client(_people_embedding_index_manifest_blob_name(key))
+        if manifest_client is None:
+            raise RuntimeError('People embedding manifest storage unavailable')
+        # Re-arm dirty touches before capturing the ETag, so mutations during
+        # the full build fence its commit rather than being deduplicated away.
+        _clear_manifest_dirty_flag(key, 'people_embedding')
+        condition = index_publication.declared_build_alias_conditions(manifest_client)
+        guarded_full = condition is not None
+        if guarded_full:
+            blob_name = _people_embedding_index_npz_blob_name(key)
+            blob_client = _people_embedding_index_blob_client(blob_name)
+            data_condition = index_publication.declared_build_alias_conditions(blob_client)
+        else:
+            condition = {'overwrite': True}
+            data_condition = {'overwrite': False}
+        # Older in-process fakes have no properties API. Still publish a new
+        # immutable pointer; real Azure clients always take the CAS path.
+        if not guarded_full and callable(getattr(manifest_client, 'get_blob_properties', None)):
+            from azure.core import MatchConditions
+            try:
+                props = manifest_client.get_blob_properties()
+            except ResourceNotFoundError as error:
+                if getattr(error, 'error_code', None) not in (None, 'BlobNotFound', 'ResourceNotFound'):
+                    raise
+                condition = {'overwrite': False}
+            else:
+                if not props.etag:
+                    return None
+                condition = {'overwrite': True, 'etag': props.etag,
+                             'match_condition': MatchConditions.IfNotModified}
+    except Exception as error:
+        index_publication.propagate_build_failure(error)
+        return None
     snapshot = _build_user_people_embedding_index_snapshot(key, source_version)
     if snapshot is None:
         return None
+    snapshot._incremental_model_version = str(model_version or '')
     container_name = _people_embedding_index_container_name()
     if container_name:
-        blob_client = _people_embedding_index_blob_client(_people_embedding_index_npz_blob_name(key))
+        if not guarded_full:
+            blob_name = _people_embedding_index_blob_key(key) + '.' + uuid.uuid4().hex + '.npz'
+            blob_client = _people_embedding_index_blob_client(blob_name)
         if blob_client is not None:
             try:
                 blob_client.upload_blob(
                     _serialize_people_embedding_index(snapshot),
-                    overwrite=True,
+                    **data_condition,
                     content_settings=BlobContentSettings(content_type='application/octet-stream'),
                 )
-            except Exception:
-                pass
-        _clear_manifest_dirty_flag(key, 'people_embedding')
+            except Exception as error:
+                index_publication.propagate_build_failure(error)
+                return None
+        else:
+            return None
         manifest = {
             'userId': key,
             'sourceVersion': snapshot.source_version,
@@ -3319,17 +3557,23 @@ def refresh_user_people_embedding_index(
             'rowCount': len(snapshot.person_ids),
             'dirty': False,
             'updatedAt': snapshot.updated_at,
+            'modelVersion': snapshot._incremental_model_version,
+            'npzBlobName': blob_name,
         }
-        manifest_client = _people_embedding_index_blob_client(_people_embedding_index_manifest_blob_name(key))
         if manifest_client is not None:
             try:
                 manifest_client.upload_blob(
                     json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
-                    overwrite=True,
                     content_settings=BlobContentSettings(content_type='application/json'),
+                    **condition,
                 )
-            except Exception:
-                pass
+            except Exception as error:
+                index_publication.propagate_build_failure(error)
+                return None
+        else:
+            return None
+    else:
+        return None
     with _PEOPLE_EMBEDDING_INDEX_CACHE_LOCK:
         _PEOPLE_EMBEDDING_INDEX_CACHE[key] = {
             'source_version': snapshot.source_version,
@@ -3498,7 +3742,16 @@ def delete_user_tag_embedding_index_data(user_id: str) -> None:
     key = str(user_id or '').strip()
     if not key:
         return
-    for blob_name in (_tag_embedding_index_npz_blob_name(key), _tag_embedding_index_manifest_blob_name(key)):
+    _purge_user_immutable_index_artifacts(key, 'tag_embedding')
+    manifest = _load_tag_embedding_index_manifest(key)
+    names = [_tag_embedding_index_npz_blob_name(key), _tag_embedding_index_manifest_blob_name(key)]
+    for field, suffix in [('npzBlobName', '.npz'), ('blobName', '.npz'),
+                          ('contributionBlobName', '.sqlite'), ('stateBlobName', '.sqlite')]:
+        name = manifest.get(field)
+        if (isinstance(name, str) and re.fullmatch(re.escape(_tag_embedding_index_blob_key(key))
+                + r'\.[0-9a-f]{32}' + re.escape(suffix), name)):
+            names.append(name)
+    for blob_name in names:
         blob_client = _tag_embedding_index_blob_client(blob_name)
         if blob_client is None:
             continue
@@ -3515,25 +3768,39 @@ def touch_user_tag_embedding_index_state(user_id: str) -> str:
         return ''
     if _manifest_already_marked_dirty(key, 'tag_embedding'):
         return ''
-    source_version = datetime.now(timezone.utc).isoformat()
-    manifest = {
-        'userId': key,
-        'sourceVersion': source_version,
-        'schemaVersion': _TAG_EMBEDDING_INDEX_SCHEMA_VERSION,
-        'embeddingVersion': vision_utils.get_text_embedding_version(),
-        'dirty': True,
-        'updatedAt': source_version,
-    }
-    blob_client = _tag_embedding_index_blob_client(_tag_embedding_index_manifest_blob_name(key))
-    if blob_client is not None:
-        try:
-            blob_client.upload_blob(
-                json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
-                overwrite=True,
-                content_settings=BlobContentSettings(content_type='application/json'),
-            )
-        except Exception:
-            pass
+    published = False
+    try:
+        source_version = datetime.now(timezone.utc).isoformat()
+        blob_client = _tag_embedding_index_blob_client(_tag_embedding_index_manifest_blob_name(key))
+        from tag_embedding_incremental import _manifest
+        from azure.core import MatchConditions
+        previous, etag = _manifest(blob_client, allow_missing=True)
+        # Dirty sourceVersion is NOT the source represented by the NPZ or
+        # sidecar. Preserve the real model and base across repeated touches,
+        # including default full generations without contribution state.
+        manifest = dict(previous) if previous else {
+            'userId': key,
+            'schemaVersion': _TAG_EMBEDDING_INDEX_SCHEMA_VERSION,
+            'embeddingVersion': vision_utils.get_text_embedding_version(),
+        }
+        manifest.update(sourceVersion=source_version, dirty=True, updatedAt=source_version,
+                        baseSourceVersion=previous.get('baseSourceVersion') if previous.get('dirty')
+                        else previous.get('sourceVersion'))
+        condition = ({'overwrite': True, 'etag': etag, 'match_condition': MatchConditions.IfNotModified}
+                     if etag is not None else {'overwrite': False})
+        blob_client.upload_blob(
+            json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+            content_settings=BlobContentSettings(content_type='application/json'),
+            **condition,
+        )
+        published = True
+    except Exception:
+        return ''
+    finally:
+        # The latch certifies a durable write, not an attempted write. Missing
+        # clients and failures at any stage must permit the next caller retry.
+        if not published:
+            _clear_manifest_dirty_flag(key, 'tag_embedding')
     invalidate_user_tag_embedding_index_cache(key)
     return source_version
 
@@ -3553,8 +3820,13 @@ def _load_tag_embedding_index_manifest(user_id: str) -> Dict[str, str]:
         return {}
 
 
-def _load_tag_embedding_index_npz(user_id: str) -> Optional[TagEmbeddingIndexSnapshot]:
-    blob_client = _tag_embedding_index_blob_client(_tag_embedding_index_npz_blob_name(user_id))
+def _load_tag_embedding_index_npz(user_id: str, manifest=None) -> Optional[TagEmbeddingIndexSnapshot]:
+    manifest = _load_tag_embedding_index_manifest(user_id) if manifest is None else manifest
+    name = manifest.get('npzBlobName', _tag_embedding_index_npz_blob_name(user_id))
+    if (not isinstance(name, str) or not name.startswith(_tag_embedding_index_blob_key(user_id) + '.')
+            or not name.endswith('.npz') or '/' in name or len(name) > 1024):
+        return None
+    blob_client = _tag_embedding_index_blob_client(name)
     if blob_client is None:
         return None
     try:
@@ -3606,7 +3878,7 @@ _TAG_META_COLUMNS = [
 ]
 
 
-def _build_user_tag_embedding_index_snapshot(user_id: str, source_version: str) -> Optional[TagEmbeddingIndexSnapshot]:
+def _build_user_tag_embedding_index_snapshot(user_id: str, source_version: str, *, contribution_hook=None) -> Optional[TagEmbeddingIndexSnapshot]:
     # The one guard that matters: only ever build where real CLIP is loaded.
     # Building this from the backend role would silently produce hash-
     # fallback vectors that could never meaningfully compare against the
@@ -3625,6 +3897,8 @@ def _build_user_tag_embedding_index_snapshot(user_id: str, source_version: str) 
         for row in _query_projected(
             metadata_table_client, f"PartitionKey eq '{_escape_odata(user_id)}'", _TAG_META_COLUMNS,
         ):
+            if contribution_hook is not None:
+                contribution_hook(row)
             tag_set.update(effective_tags(row))
     except Exception:
         _LOGGER.exception('Tag embedding index scan failed for user %s', user_id)
@@ -3650,27 +3924,111 @@ def _build_user_tag_embedding_index_snapshot(user_id: str, source_version: str) 
 
 
 @model_tag_publisher
-def refresh_user_tag_embedding_index(user_id: str, *, source_version: Optional[str] = None) -> Optional[TagEmbeddingIndexSnapshot]:
+def refresh_user_tag_embedding_index(
+    user_id: str, *, source_version: Optional[str] = None,
+    affected_filenames=None, previous_source_version: Optional[str] = None,
+    model_version: Optional[str] = None, incremental_only: bool = False,
+    bootstrap_incremental: bool = False,
+) -> Optional[object]:
+    """Full streamed build by default; explicit deltas never fall back to scans.
+
+    bootstrap_incremental seeds per-photo contributions in the existing full
+    scan and publishes immutable NPZ/SQLite with manifest CAS. Delta callers
+    must certify complete coverage since previous_source_version and serialize
+    source mutations; dirty-touch notifications alone are NOT such coverage.
+    model_version must match the real encoder's version. Returns a bounded
+    publication receipt for deltas, a snapshot for full/bootstrap, None on defer.
+    """
     key = str(user_id or '').strip()
     if not key:
         return None
     source_version = str(source_version or datetime.now(timezone.utc).isoformat())
+    if affected_filenames is not None or bootstrap_incremental or incremental_only:
+        if (not vision_utils.image_encoder_available() or
+                model_version != vision_utils.get_text_embedding_version() or
+                (bootstrap_incremental and (affected_filenames is not None or incremental_only))):
+            return None
+        from tag_embedding_incremental import bounded_ids, bootstrap_and_publish, merge_and_publish
+        try:
+            def checked_encode(tags):
+                if vision_utils.get_text_embedding_version() != model_version:
+                    raise ValueError('tag model changed before encoding')
+                encoded = vision_utils.encode_text_embeddings_batch(tags)
+                if vision_utils.get_text_embedding_version() != model_version:
+                    raise ValueError('tag model changed during encoding')
+                return encoded
+
+            def checked_build(hook):
+                built = _build_user_tag_embedding_index_snapshot(key, source_version, contribution_hook=hook)
+                if vision_utils.get_text_embedding_version() != model_version:
+                    raise ValueError('tag model changed during bootstrap')
+                return built
+
+            options = dict(user=key, source=source_version, model=model_version,
+                           schema=_TAG_EMBEDDING_INDEX_SCHEMA_VERSION, columns=_TAG_META_COLUMNS,
+                           effective=effective_tags,
+                           manifest_client=_tag_embedding_index_blob_client(_tag_embedding_index_manifest_blob_name(key)),
+                           blob_client=_tag_embedding_index_blob_client, blob_prefix=_tag_embedding_index_blob_key(key),
+                           content_settings=lambda mime: BlobContentSettings(content_type=mime))
+            if bootstrap_incremental:
+                result = bootstrap_and_publish(**options, build=checked_build)
+            elif affected_filenames is not None:
+                result = merge_and_publish(**options, ids=bounded_ids(affected_filenames),
+                                           expected=str(previous_source_version or ''),
+                                           table=_CTX.get('metadata_table_client'),
+                                           encode=checked_encode)
+            else:
+                return None
+        except Exception:
+            _LOGGER.debug('Tag embedding incremental publication deferred for %s', key, exc_info=True)
+            return None
+        _clear_manifest_dirty_flag(key, 'tag_embedding')
+        invalidate_user_tag_embedding_index_cache(key)
+        return result
+    import index_publication
+    try:
+        manifest_client = _tag_embedding_index_blob_client(_tag_embedding_index_manifest_blob_name(key))
+        # Capture before the original full scan. A concurrent touch/publisher
+        # must prevent this build from advertising a stale generation.
+        _clear_manifest_dirty_flag(key, 'tag_embedding')
+        condition = index_publication.declared_build_alias_conditions(manifest_client)
+        guarded_full = condition is not None
+        if guarded_full:
+            blob_name = _tag_embedding_index_npz_blob_name(key)
+            blob_client = _tag_embedding_index_blob_client(blob_name)
+            data_condition = index_publication.declared_build_alias_conditions(blob_client)
+        else:
+            from tag_embedding_incremental import _manifest
+            from azure.core import MatchConditions
+            _, etag = _manifest(manifest_client, allow_missing=True)
+            condition = ({'overwrite': True, 'etag': etag, 'match_condition': MatchConditions.IfNotModified}
+                         if etag is not None else {'overwrite': False})
+            data_condition = {'overwrite': False}
+    except Exception as error:
+        index_publication.propagate_build_failure(error)
+        # Retain the default builder/owner behavior even when publication is
+        # unavailable, but never upload or report success without a capture.
+        manifest_client = None
     snapshot = _build_user_tag_embedding_index_snapshot(key, source_version)
-    if snapshot is None:
+    if snapshot is None or manifest_client is None:
         return None
     container_name = _tag_embedding_index_container_name()
     if container_name:
-        blob_client = _get_blob_client(container_name, _tag_embedding_index_npz_blob_name(key))
+        if not guarded_full:
+            blob_name = _tag_embedding_index_blob_key(key) + '.' + uuid.uuid4().hex + '.npz'
+            blob_client = _tag_embedding_index_blob_client(blob_name)
         if blob_client is not None:
             try:
                 blob_client.upload_blob(
                     _serialize_tag_embedding_index(snapshot),
-                    overwrite=True,
+                    **data_condition,
                     content_settings=BlobContentSettings(content_type='application/octet-stream'),
                 )
-            except Exception:
-                pass
-        _clear_manifest_dirty_flag(key, 'tag_embedding')
+            except Exception as error:
+                index_publication.propagate_build_failure(error)
+                return None
+        else:
+            return None
         manifest = {
             'userId': key,
             'sourceVersion': snapshot.source_version,
@@ -3679,17 +4037,22 @@ def refresh_user_tag_embedding_index(user_id: str, *, source_version: Optional[s
             'tagCount': len(snapshot.tags),
             'dirty': False,
             'updatedAt': snapshot.updated_at,
+            'npzBlobName': blob_name,
         }
-        manifest_client = _get_blob_client(container_name, _tag_embedding_index_manifest_blob_name(key))
         if manifest_client is not None:
             try:
                 manifest_client.upload_blob(
                     json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
-                    overwrite=True,
                     content_settings=BlobContentSettings(content_type='application/json'),
+                    **condition,
                 )
-            except Exception:
-                pass
+            except Exception as error:
+                index_publication.propagate_build_failure(error)
+                return None
+        else:
+            return None
+    else:
+        return None
     with _TAG_EMBEDDING_INDEX_CACHE_LOCK:
         _TAG_EMBEDDING_INDEX_CACHE[key] = {
             'source_version': snapshot.source_version,
@@ -3721,7 +4084,7 @@ def get_user_tag_embedding_index(user_id: str, *, allow_refresh: bool = True) ->
             ):
                 return cached
 
-    snapshot = _load_tag_embedding_index_npz(key)
+    snapshot = _load_tag_embedding_index_npz(key, manifest)
     if snapshot and snapshot.source_version == manifest_source_version and snapshot.embedding_version == current_embedding_version and not manifest_dirty:
         data = {
             'source_version': snapshot.source_version,
@@ -3735,6 +4098,12 @@ def get_user_tag_embedding_index(user_id: str, *, allow_refresh: bool = True) ->
         return data
 
     if not allow_refresh:
+        return None
+    if DURABLE_INDEX_UPDATES:
+        # Even the model owner uses the durable worker policy so cold builds
+        # seed the tag contribution sidecar. Read paths never do a legacy
+        # untracked full build (and core never attempts to load CLIP).
+        request_index_build(key, kind='tag_embedding')
         return None
     model_owner = (DURABLE_INDEX_UPDATES and os.getenv('APP_ROLE', '').strip().lower() == 'vision'
                    and vision_utils.image_encoder_available())
@@ -3823,7 +4192,12 @@ def get_lexical_index_blob_location(user_id: str) -> Tuple[str, str]:
     routes/photos.py:photos_search_index, which hands this blob straight to
     the browser for client-side lexical search instead of proxying it
     through a backend request)."""
-    return _lexical_index_container_name(), _lexical_index_json_blob_name(user_id)
+    # Snapshot data is immutable now; SAS consumers must use the same pointer
+    # as the server loader rather than the obsolete fixed-name alias.
+    name = _lexical_index_data_blob_name(user_id, _load_lexical_index_manifest(user_id))
+    if name is None:
+        raise ValueError('Invalid lexical snapshot pointer')
+    return _lexical_index_container_name(), name
 
 
 def _lexical_index_manifest_blob_name(user_id: str) -> str:
@@ -4373,10 +4747,12 @@ def refresh_user_search_db_incremental(user_id: str) -> Dict[str, object]:
       noop        nothing is dirty
       delta       one or more deltas were published (``published`` of them)
       no_base     the library has no database yet (a full build is needed first)
-      more        this bounded pass made progress; call again without compacting
+    more        this bounded pass made progress; call again without compacting
       needs_full  this pass filled the delta budget; compact, then call again
       unavailable the dirty-name table cannot be read (never treated as "nothing changed")
       conflict    a concurrent rebuild/publisher won; nothing is lost, the names stay dirty
+        For truncated captures, remaining is a lower bound (at least one), not
+        an exact partition-sized count. has_more identifies that lookahead.
     """
     import search_db
     key = str(user_id or '').strip()
@@ -4386,12 +4762,14 @@ def refresh_user_search_db_incremental(user_id: str) -> Dict[str, object]:
     manifest = search_db.load_manifest(key)
     if not manifest.get('sourceVersion') or manifest.get('schemaVersion') != search_db.SCHEMA_VERSION:
         return {'status': 'no_base'}
-    dirty = _get_dirty_search_index_filenames(key, 'lexical')
+    capacity = search_db.available_delta_row_capacity(manifest, SEARCH_DB_DELTA_CHUNK)
+    pass_limit = min(max(1, capacity), max(1, SEARCH_DB_DELTA_MAX_NAMES))
+    from index_work import read_bounded_dirty
+    dirty = read_bounded_dirty(_get_dirty_search_index_filenames, key, 'lexical', max_rows=pass_limit)
     if dirty is None:
         return {'status': 'unavailable'}
     if not dirty:
         return {'status': 'noop'}
-    capacity = search_db.available_delta_row_capacity(manifest, SEARCH_DB_DELTA_CHUNK)
     if capacity <= 0:
         return {'status': 'needs_full', 'dirty': len(dirty), 'remaining': len(dirty)}
 
@@ -4399,7 +4777,6 @@ def refresh_user_search_db_incremental(user_id: str) -> Dict[str, object]:
     # for one delta period. The worker compacts after this capacity is used and
     # calls us again, so a 100k import cannot remain permanently dirty merely
     # because it is larger than 25% of the current base.
-    pass_limit = min(capacity, max(1, SEARCH_DB_DELTA_MAX_NAMES))
     names = sorted(dirty)[:pass_limit]
     published = 0
     upserted = removed = 0
@@ -4424,7 +4801,8 @@ def refresh_user_search_db_incremental(user_id: str) -> Dict[str, object]:
             published += 1
             upserted += len(upserts)
             removed += len(deletes)
-    remaining = max(0, len(dirty) - len(names))
+    has_more = bool(getattr(dirty, 'has_more', False))
+    remaining = max(0, len(dirty) - len(names)) + int(has_more)
     if remaining:
         # Hitting capacity requires compaction. Hitting only the per-pass
         # safety cap can continue immediately against the same delta period.
@@ -4432,6 +4810,7 @@ def refresh_user_search_db_incremental(user_id: str) -> Dict[str, object]:
         return {
             'status': status, 'published': published, 'upserts': upserted,
             'deletes': removed, 'dirty': len(dirty), 'remaining': remaining,
+            'has_more': has_more,
         }
     return {'status': 'delta', 'published': published, 'upserts': upserted, 'deletes': removed, 'remaining': 0}
 
@@ -4523,6 +4902,8 @@ def delete_user_lexical_index_data(user_id: str) -> None:
     key = str(user_id or '').strip()
     if not key:
         return
+    _purge_user_immutable_index_artifacts(key, 'lexical_artifact')
+    _purge_user_immutable_index_artifacts(key, 'hash')
     for blob_name in (
         _lexical_index_json_blob_name(key), _lexical_index_manifest_blob_name(key),
         _listing_index_json_blob_name(key), _listing_index_manifest_blob_name(key),
@@ -4553,26 +4934,31 @@ def touch_user_lexical_index_state(user_id: str) -> str:
     key = str(user_id or '').strip()
     if not key:
         return ''
-    if _manifest_already_marked_dirty(key, 'lexical'):
-        return ''
+    # Snapshot upgrades do not clear the shared dirty latch. Each touch must
+    # still dirty/fence a newly upgraded snapshot, including repeated touches
+    # during the SAME shared catalog dirty period.
+    _manifest_already_marked_dirty(key, 'lexical')
     source_version = datetime.now(timezone.utc).isoformat()
-    manifest = {
-        'userId': key,
-        'sourceVersion': source_version,
-        'schemaVersion': _LEXICAL_INDEX_SCHEMA_VERSION,
-        'dirty': True,
-        'updatedAt': source_version,
-    }
     blob_client = _lexical_index_blob_client(_lexical_index_manifest_blob_name(key))
     if blob_client is not None:
         try:
-            blob_client.upload_blob(
-                json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
-                overwrite=True,
-                content_settings=BlobContentSettings(content_type='application/json'),
-            )
+            import lexical_incremental
+            manifest, props = lexical_incremental.capture_manifest(blob_client)
+            snapshot_version = lexical_incremental.effective_snapshot_version(manifest)
+            if not manifest.get('dirty'):
+                manifest['baseSourceVersion'] = manifest.get('sourceVersion', '')
+            manifest.update(userId=key, sourceVersion=source_version,
+                            schemaVersion=_LEXICAL_INDEX_SCHEMA_VERSION,
+                            dirty=True, updatedAt=source_version,
+                            lexicalSnapshotSourceVersion=snapshot_version or '',
+                            lexicalSnapshotDirty=True)
+            lexical_incremental.commit_manifest(
+                blob_client, manifest, props, BlobContentSettings(content_type='application/json'))
         except Exception:
-            pass
+            _clear_manifest_dirty_flag(key, 'lexical')
+            _LOGGER.warning('Lexical dirty touch failed for %s', key, exc_info=True)
+    else:
+        _clear_manifest_dirty_flag(key, 'lexical')
     invalidate_user_lexical_index_cache(key)
     return source_version
 
@@ -4726,12 +5112,15 @@ def _mark_search_index_dirty_filenames(user_id: str, filenames, kinds=None) -> N
     _schedule_dirty_flush()
 
 
-def _get_dirty_search_index_filenames(user_id: str, index_kind: str) -> Optional[Set[str]]:
+def _get_dirty_search_index_filenames(user_id: str, index_kind: str, *, max_rows=None) -> Optional[Set[str]]:
     """Filenames marked dirty for this user's index_kind since its last
     successful rebuild, or None if the dirty table isn't usable (unconfigured,
     or the query failed). None never means "nothing changed". Dedicated
     Sort/Access maintenance retries rather than promoting failure to a scan;
     legacy builders can still fall back to a full rebuild.
+
+    max_rows=None preserves the legacy complete capture; a cap returns at
+    most that many captured row versions with has_more/truncated lookahead.
 
     Flushes the in-memory dirty-filename buffer for this (user, kind) first
     (see _mark_search_index_dirty_filenames) so a rebuild reading "what's
@@ -4742,12 +5131,11 @@ def _get_dirty_search_index_filenames(user_id: str, index_kind: str) -> Optional
     if table is None:
         return None
     partition_key = _search_index_dirty_partition_key(user_id, index_kind)
+    from index_work import DirtySnapshot
     try:
-        rows = list(table.query_entities(f"PartitionKey eq '{_escape_odata(partition_key)}'"))
+        return DirtySnapshot(table.query_entities(f"PartitionKey eq '{_escape_odata(partition_key)}'"), max_rows=max_rows)
     except Exception:
         return None
-    from index_work import DirtySnapshot
-    return DirtySnapshot(rows)
 
 
 def _clear_dirty_search_index_filenames(user_id: str, index_kind: str, filenames) -> None:
@@ -4767,11 +5155,16 @@ def _clear_dirty_search_index_filenames(user_id: str, index_kind: str, filenames
 SORT_INDEX_MAX_ROWS = int(os.getenv('SORT_INDEX_CLIENT_MAX_ROWS', '200000'))
 
 
-def _library_row_count(user_id: str) -> int:
+def _library_row_count(user_id: str, *, strict: bool = False) -> int:
     try:
         import search_db
-        return int(search_db.load_manifest(user_id).get('rowCount') or 0)
+        count = search_db.load_manifest(user_id).get('rowCount')
+        if strict and (not isinstance(count, int) or isinstance(count, bool) or count < 0):
+            raise ValueError('Photo artifact row count unavailable')
+        return int(count or 0)
     except Exception:
+        if strict:
+            raise
         return 0
 
 
@@ -4874,8 +5267,30 @@ def _load_lexical_index_manifest(user_id: str) -> Dict[str, str]:
         return {}
 
 
+def _lexical_index_data_blob_name(user_id: str, manifest: Dict) -> Optional[str]:
+    legacy_name = _lexical_index_json_blob_name(user_id)
+    name = manifest.get('blobName', legacy_name)
+    # A committed pointer is authoritative: no stale fixed-blob fallback.
+    if (not isinstance(name, str) or not name.endswith('.json.gz') or
+            (name != legacy_name and not name.startswith(legacy_name[:-len('.json.gz')] + '.'))):
+        return None
+    return name
+
+
 def _load_lexical_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
-    return _load_gz_json_index_blob('lexical', user_id, _lexical_index_blob_client(_lexical_index_json_blob_name(user_id)))
+    manifest = _load_lexical_index_manifest(user_id)
+    name = _lexical_index_data_blob_name(user_id, manifest)
+    if name is None:
+        return None
+    snapshot = _load_gz_json_index_blob('lexical', user_id, _lexical_index_blob_client(name))
+    if manifest and snapshot is not None:
+        import lexical_incremental
+        if (manifest.get('userId') != user_id or
+                snapshot.source_version != lexical_incremental.effective_snapshot_version(manifest) or
+                snapshot.schema_version != manifest.get('schemaVersion') or
+                len(snapshot.rows) != lexical_incremental.snapshot_row_count(manifest)):
+            return None
+    return snapshot
 
 
 def _serialize_lexical_index(snapshot: LexicalIndexSnapshot) -> bytes:
@@ -4983,15 +5398,69 @@ def _merge_user_lexical_index_snapshot(
     )
 
 
+from lexical_incremental import LexicalPublication
+
+
 @catalog_publisher
 def refresh_user_lexical_index(
     user_id: str, *, source_version: Optional[str] = None, force_full: bool = False,
-) -> Optional[LexicalIndexSnapshot]:
+    affected_filenames=None, previous_source_version: Optional[str] = None,
+    incremental_only: bool = False,
+) -> Optional[Union[LexicalIndexSnapshot, LexicalPublication]]:
+    """Legacy snapshot API, or explicit bounded merge returning a receipt.
+
+    Explicit callers certify the COMPLETE affected set since the required
+    previous_source_version and serialize source writes. No implicit dirty
+    capture, full fallback, cache hydration, or derived artifact refresh occurs
+    on this path. Missing/incompatible bases and IO/CAS failures return None.
+
+    The existing manifest holds TWO lineages: sourceVersion/dirty remain the
+    shared catalog token; lexicalSnapshotSourceVersion/lexicalSnapshotDirty
+    describe the immutable JSON pointer. Explicit commits update ONLY snapshot
+    fields, retaining shared baseSourceVersion, rowCount, updatedAt and latch.
+    Legacy manifests derive snapshot provenance from sourceVersion (clean) or
+    baseSourceVersion (dirty). Default refresh keeps the full/legacy merge
+    algorithm and snapshot return, but acknowledges the shared catalog only
+    after durable listing + SQLite coverage and immutable upload/manifest CAS.
+    """
     key = str(user_id or '').strip()
     if not key:
         return None
     source_version = str(source_version or datetime.now(timezone.utc).isoformat())
 
+    if incremental_only or affected_filenames is not None:
+        import lexical_incremental
+        try:
+            if force_full:
+                raise lexical_incremental.Deferred('force_full conflicts with explicit incremental merge')
+            ids = lexical_incremental.bounded_ids(affected_filenames)
+            receipt = lexical_incremental.merge_and_publish(
+                user=key, ids=ids, source=source_version, expected=previous_source_version,
+                schema=_LEXICAL_INDEX_SCHEMA_VERSION,
+                metadata_table=_CTX.get('metadata_table_client'),
+                manifest_client=_lexical_index_blob_client(_lexical_index_manifest_blob_name(key)),
+                blob_client=_lexical_index_blob_client, legacy_name=_lexical_index_json_blob_name(key),
+                excluded=_LEXICAL_INDEX_EXCLUDED_FIELDS,
+                content_settings=lambda compressed: BlobContentSettings(
+                    content_type='application/json', content_encoding='gzip' if compressed else None),
+            )
+        except Exception:
+            _LOGGER.warning('Explicit lexical incremental merge deferred for %s', key, exc_info=True)
+            return None
+        invalidate_user_lexical_index_cache(key)
+        return receipt
+
+    import lexical_incremental
+    import index_publication
+    # Capture before any source reads. Every lexical touch changes this ETag;
+    # a race must fail publication rather than acknowledge unseen mutations.
+    try:
+        manifest_client = _lexical_index_blob_client(_lexical_index_manifest_blob_name(key))
+        previous_manifest, manifest_props = lexical_incremental.capture_manifest(manifest_client)
+        index_publication.check()
+    except Exception as error:
+        index_publication.propagate_build_failure(error)
+        return None
     snapshot = None
     dirty_before = _get_dirty_search_index_filenames(key, 'lexical')
     dirty_to_clear: Optional[Set[str]] = None
@@ -5014,37 +5483,56 @@ def refresh_user_lexical_index(
             dirty_to_clear = dirty_before
     if snapshot is None:
         return None
-    container_name = _lexical_index_container_name()
-    if container_name:
-        blob_client = _get_blob_client(container_name, _lexical_index_json_blob_name(key))
-        if blob_client is not None:
-            try:
-                blob_client.upload_blob(
-                    _serialize_lexical_index(snapshot),
-                    overwrite=True,
-                    content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
-                )
-            except Exception:
-                pass
-        _clear_manifest_dirty_flag(key, 'lexical')
+    try:
+        blob_name = (_lexical_index_json_blob_name(key)[:-len('.json.gz')] +
+                     '.' + uuid.uuid4().hex + '.json.gz')
+        blob_client = _lexical_index_blob_client(blob_name)
+        if blob_client is None:
+            raise RuntimeError('Lexical data storage unavailable')
+        index_publication.check()
+        blob_client.upload_blob(
+            _serialize_lexical_index(snapshot), overwrite=False,
+            content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'))
+        # Shared lineage can advance only with dependent build coverage. The
+        # legacy listing helper swallows errors, so verify its durable payload.
+        _write_user_listing_index(key, snapshot)
+        listing = _load_listing_index_blob(key)
+        listing_manifest_client = _listing_index_blob_client(_listing_index_manifest_blob_name(key))
+        if listing_manifest_client is None:
+            raise RuntimeError('Lexical dependent listing manifest storage unavailable')
+        listing_manifest = json.loads(listing_manifest_client.download_blob().readall())
+        import search_db
+        if (listing is None or listing.source_version != snapshot.source_version or
+                len(listing.rows) != len(snapshot.rows) or
+            not isinstance(listing_manifest, dict) or
+            listing_manifest.get('sourceVersion') != snapshot.source_version or
+            listing_manifest.get('rowCount') != len(snapshot.rows) or
+                not search_db.write_for_snapshot(key, snapshot)):
+            raise RuntimeError('Lexical dependent listing/search publication failed')
         manifest = {
+            **previous_manifest,
             'userId': key,
             'sourceVersion': snapshot.source_version,
             'schemaVersion': snapshot.schema_version,
             'rowCount': len(snapshot.rows),
             'dirty': False,
             'updatedAt': snapshot.updated_at,
+            'baseSourceVersion': snapshot.source_version,
+            'lexicalSnapshotSourceVersion': snapshot.source_version,
+            'lexicalSnapshotDirty': False,
+            'lexicalSnapshotRowCount': len(snapshot.rows),
+            'lexicalSnapshotUpdatedAt': snapshot.updated_at,
+            'blobName': blob_name,
         }
-        manifest_client = _get_blob_client(container_name, _lexical_index_manifest_blob_name(key))
-        if manifest_client is not None:
-            try:
-                manifest_client.upload_blob(
-                    json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
-                    overwrite=True,
-                    content_settings=BlobContentSettings(content_type='application/json'),
-                )
-            except Exception:
-                pass
+        index_publication.check()
+        # Re-arm before CAS, not afterwards (a post-commit touch owns its latch).
+        _clear_manifest_dirty_flag(key, 'lexical')
+        lexical_incremental.commit_manifest(
+            manifest_client, manifest, manifest_props, BlobContentSettings(content_type='application/json'))
+    except Exception as error:
+        _LOGGER.exception('Lexical full publication failed for user %s', key)
+        index_publication.propagate_build_failure(error)
+        return None
     with _LEXICAL_INDEX_CACHE_LOCK:
         _LEXICAL_INDEX_CACHE[key] = {
             'source_version': snapshot.source_version,
@@ -5052,9 +5540,6 @@ def refresh_user_lexical_index(
             'updated_at': snapshot.updated_at,
             'rows': snapshot.rows,
         }
-    _write_user_listing_index(key, snapshot)
-    import search_db
-    search_db.write_for_snapshot(key, snapshot)
     if dirty_to_clear:
         _clear_dirty_search_index_filenames(key, 'lexical', dirty_to_clear)
     return snapshot
@@ -5064,8 +5549,9 @@ def _lexical_index_fresh_cache_entry(key: str, manifest: Dict[str, str]) -> Opti
     """Fresh in-memory-or-blob snapshot dict for key if one matches manifest
     and isn't dirty, else None. Factored out so get_user_lexical_index can
     run the identical check both before and after taking the rebuild lock."""
-    manifest_source_version = str(manifest.get('sourceVersion') or '').strip()
-    manifest_dirty = bool(manifest.get('dirty'))
+    import lexical_incremental
+    manifest_source_version = str(lexical_incremental.effective_snapshot_version(manifest) or '').strip()
+    manifest_dirty = bool(manifest.get('lexicalSnapshotDirty', manifest.get('dirty')))
 
     with _LEXICAL_INDEX_CACHE_LOCK:
         cached = _LEXICAL_INDEX_CACHE.get(key)
@@ -5538,6 +6024,65 @@ def _timed_fetch(kind: str, client, dest: str) -> bool:
         return _fetch_blob_to_file(client, dest)
 
 
+_STRICT_INCREMENTAL_MAX_ROWS = int(os.getenv('INLINE_INDEX_MERGE_MAX_ROWS', '5000'))
+_STRICT_INCREMENTAL_MAX_IDS = 100
+_STRICT_INCREMENTAL_MAX_MEMBERS = int(os.getenv('INLINE_INDEX_MERGE_MAX_MEMBERS', '2000'))
+
+
+def _strict_capture_publication(user_id, kind):
+    """Capture both mutable artifacts BEFORE reading the merge base.
+
+    Late ETag reads protect only the upload, not the base used to build it.
+    Without conditional storage support strict publication must defer.
+    """
+    from azure.core import MatchConditions
+    names = (globals()[f'_{kind}_index_json_blob_name'](user_id),
+             globals()[f'_{kind}_index_manifest_blob_name'](user_id))
+    clients = [_get_blob_client(_lexical_index_container_name(), name) for name in names]
+    try:
+        versions = [client.get_blob_properties().etag for client in clients]
+        if not all(versions):
+            return None
+    except Exception:
+        return None
+    return [(client, {'etag': version, 'match_condition': MatchConditions.IfNotModified})
+            for client, version in zip(clients, versions)]
+
+
+def _strict_check_publication(capture):
+    import index_publication
+    index_publication.check()
+    for client, condition in capture:
+        if client.get_blob_properties().etag != condition['etag']:
+            raise RuntimeError('Incremental publication base changed')
+
+
+def _incremental_manifest_within_limit(manifest, schema_version, max_rows):
+    """Fail closed before downloading a whole JSON snapshot."""
+    count = manifest.get('rowCount')
+    return (bool(manifest.get('sourceVersion')) and manifest.get('schemaVersion') == schema_version
+            and isinstance(count, int) and not isinstance(count, bool) and 0 <= count <= max_rows)
+
+
+def _inline_artifact_within_limit(user_id: str, kind: str, max_rows: int) -> bool:
+    if kind not in ('people', 'albums', 'sort', 'access'):
+        return False
+    if kind in ('people', 'albums'):
+        loader, schema = ((_load_people_index_manifest, _PEOPLE_INDEX_SCHEMA_VERSION) if kind == 'people'
+                          else (_load_albums_index_manifest, _ALBUMS_INDEX_SCHEMA_VERSION))
+        return _incremental_manifest_within_limit(loader(user_id), schema, max_rows)
+    # Per-photo artifacts retain the photo-library ceiling too.
+    loader, schema = ((_load_sort_index_manifest, _SORT_INDEX_SCHEMA_VERSION) if kind == 'sort'
+                      else (_load_access_index_manifest, _ACCESS_INDEX_SCHEMA_VERSION))
+    manifest = loader(user_id)
+    try:
+        count = _library_row_count(user_id, strict=True)
+    except Exception:
+        return False
+    return (count <= max_rows
+            and bool(manifest.get('sourceVersion')) and manifest.get('schemaVersion') == schema)
+
+
 def _rows_merge_eligible(user_id: str, kind: str) -> bool:
     """Cheap, read-only check mirroring _refresh_rows_index_on_disk's
     merge-vs-full-scan decision for sort/access -- shared with
@@ -5546,14 +6091,14 @@ def _rows_merge_eligible(user_id: str, kind: str) -> bool:
     merge path that isn't cheap) -- it only checks the dirty-filename set's
     cost model and the manifest's schema/base-version, both inexpensive
     manifest-only reads. A false positive here just means a wasted inline
-    attempt (the real function still re-validates against the actual blob
-    and safely falls back if needed; see _refresh_rows_index_on_disk's own
-    merge decision for the authoritative check)."""
+    attempt: strict refresh revalidates the actual blob and defers without
+    a scan; the normal worker retains its legacy full fallback."""
     key = str(user_id or '').strip()
     if kind not in ('sort', 'access'):
         return False
-    dirty = _get_dirty_search_index_filenames(key, kind)
-    if not dirty or _dirty_set_too_large_to_merge(key, len(dirty)):
+    from index_work import read_bounded_dirty
+    dirty = read_bounded_dirty(_get_dirty_search_index_filenames, key, kind, max_rows=_STRICT_INCREMENTAL_MAX_MEMBERS)
+    if not dirty or getattr(dirty, 'has_more', False) or getattr(dirty, 'truncated', False) or len(dirty) > _STRICT_INCREMENTAL_MAX_MEMBERS or _dirty_set_too_large_to_merge(key, len(dirty)):
         return False
     manifest = (_load_sort_index_manifest if kind == 'sort' else _load_access_index_manifest)(key)
     schema_version = _SORT_INDEX_SCHEMA_VERSION if kind == 'sort' else _ACCESS_INDEX_SCHEMA_VERSION
@@ -5572,6 +6117,7 @@ def _refresh_rows_index_on_disk(
     row_fn,
     keep_entity,
     force_full: bool,
+    incremental_only: bool = False,
     cache_lock,
     cache: Dict,
 ) -> Optional['LexicalIndexSnapshot']:
@@ -5585,7 +6131,19 @@ def _refresh_rows_index_on_disk(
     if metadata_table_client is None:
         return None
     blob_client = _get_blob_client(container_name, blob_name) if container_name else None
-    dirty_before = _get_dirty_search_index_filenames(key, kind)
+    publication_capture = _strict_capture_publication(key, kind) if incremental_only else None
+    if incremental_only and publication_capture is None:
+        return None
+    if incremental_only and (blob_client is None or _get_blob_client(container_name, manifest_blob_name) is None):
+        return None
+    from index_work import read_bounded_dirty
+    dirty_before = (read_bounded_dirty(_get_dirty_search_index_filenames, key, kind,
+                                     max_rows=_STRICT_INCREMENTAL_MAX_MEMBERS) if incremental_only
+                    else _get_dirty_search_index_filenames(key, kind))
+    if incremental_only and (force_full or dirty_before is None
+            or getattr(dirty_before, 'has_more', False) or getattr(dirty_before, 'truncated', False) or len(dirty_before) > _STRICT_INCREMENTAL_MAX_MEMBERS
+            or not _inline_artifact_within_limit(key, kind, _STRICT_INCREMENTAL_MAX_ROWS)):
+        return None
     if DURABLE_INDEX_UPDATES and dirty_before is None:
         raise RuntimeError('Index dirty state unavailable')
     dirty = None if force_full else dirty_before
@@ -5611,9 +6169,18 @@ def _refresh_rows_index_on_disk(
                                            dirty=len(dirty), rows=_library_row_count(key))
         elif dirty is not None and blob_client is not None and _timed_fetch(kind, blob_client, previous):
             try:
-                merge = index_files.read_header(previous).get('schemaVersion') == schema_version
+                previous_header = index_files.read_header(previous)
+                merge = previous_header.get('schemaVersion') == schema_version
+                if incremental_only:
+                    current = (_load_sort_index_manifest if kind == 'sort' else _load_access_index_manifest)(key)
+                    # Legacy sort/access touches advance sourceVersion and
+                    # replace rowCount. A dirty manifest's version is NOT the
+                    # previous blob's lineage; the photo ceiling bounds it.
+                    merge = merge and (current.get('dirty') or previous_header.get('sourceVersion') == current.get('sourceVersion'))
             except Exception:
                 merge = False
+        if incremental_only and not merge:
+            return None  # Never promote missing/schema/cost/read failures to a scan.
         try:
             writer = index_files.RowsWriter(out_path, header)
             try:
@@ -5660,6 +6227,8 @@ def _refresh_rows_index_on_disk(
                                 writer.add(row)
                     dirty_to_clear = dirty_before
                 count = writer.close()
+                if incremental_only and count > _STRICT_INCREMENTAL_MAX_ROWS:
+                    return None
             except BaseException:
                 writer.abort()
                 raise
@@ -5667,22 +6236,30 @@ def _refresh_rows_index_on_disk(
             # A failed scan must never be persisted as an empty, clean index.
             _LOGGER.exception('Streaming %s index build failed user=%s', kind, key)
             from index_publication import propagate_build_failure
+            if incremental_only:
+                raise
             propagate_build_failure(error)
             return None
         if blob_client is not None:
             try:
+                if incremental_only:
+                    _strict_check_publication(publication_capture)
                 with perf_instrumentation.step(f'index.{kind}.upload', user=key, mb=round(os.path.getsize(out_path) / 1048576, 1)):
                     _upload_file_to_blob(
                         blob_client, out_path, overwrite=True,
                         content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
+                        **(publication_capture[0][1] if incremental_only else {}),
                     )
             except Exception as error:
                 _LOGGER.warning('Uploading %s index failed user=%s', kind, key, exc_info=True)
                 from index_publication import propagate_build_failure
+                if incremental_only:
+                    raise
                 propagate_build_failure(error)
                 return None
     if container_name:
-        _clear_manifest_dirty_flag(key, kind)
+        if not incremental_only:
+            _clear_manifest_dirty_flag(key, kind)
         manifest = {
             'userId': key, 'sourceVersion': source_version, 'schemaVersion': schema_version,
             'rowCount': count, 'dirty': False, 'updatedAt': source_version,
@@ -5694,11 +6271,16 @@ def _refresh_rows_index_on_disk(
                     json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
                     overwrite=True,
                     content_settings=BlobContentSettings(content_type='application/json'),
+                    **(publication_capture[1][1] if incremental_only else {}),
                 )
             except Exception as error:
                 from index_publication import propagate_build_failure
+                if incremental_only:
+                    raise
                 propagate_build_failure(error)
                 pass
+            if incremental_only:
+                _clear_manifest_dirty_flag(key, kind)
     with cache_lock:
         cache.pop(key, None)  # the rows are on disk/blob, not held here
     if dirty_to_clear:
@@ -5713,12 +6295,14 @@ def _refresh_rows_index_on_disk(
 
 @catalog_publisher
 def refresh_user_sort_index(
-    user_id: str, *, source_version: Optional[str] = None, force_full: bool = False,
+    user_id: str, *, source_version: Optional[str] = None, force_full: bool = False, incremental_only: bool = False,
 ) -> Optional[LexicalIndexSnapshot]:
     key = str(user_id or '').strip()
     if not key:
         return None
     if sort_index_skipped(key):
+        if incremental_only:
+            return None
         version = str(source_version or datetime.now(timezone.utc).isoformat())
         _publish_skipped_sort_manifest(key, version, _library_row_count(key))
         return LexicalIndexSnapshot(user_id=key, source_version=version, schema_version=_SORT_INDEX_SCHEMA_VERSION,
@@ -5732,6 +6316,7 @@ def refresh_user_sort_index(
         row_fn=_sort_index_row,
         keep_entity=lambda e: str(e.get('processing_state') or '').strip().lower() != 'deleted',
         force_full=force_full,
+        incremental_only=incremental_only,
         cache_lock=_SORT_INDEX_CACHE_LOCK, cache=_SORT_INDEX_CACHE,
     )
 
@@ -6119,7 +6704,7 @@ def _merge_user_access_index_snapshot(
 
 @catalog_publisher
 def refresh_user_access_index(
-    user_id: str, *, source_version: Optional[str] = None, force_full: bool = False,
+    user_id: str, *, source_version: Optional[str] = None, force_full: bool = False, incremental_only: bool = False,
 ) -> Optional[LexicalIndexSnapshot]:
     # Trashed rows stay in this index (see the module comment above).
     key = str(user_id or '').strip()
@@ -6134,6 +6719,7 @@ def refresh_user_access_index(
         row_fn=_access_index_row,
         keep_entity=lambda e: True,
         force_full=force_full,
+        incremental_only=incremental_only,
         cache_lock=_ACCESS_INDEX_CACHE_LOCK, cache=_ACCESS_INDEX_CACHE,
     )
 
@@ -6364,8 +6950,8 @@ def delete_user_albums_index_data(user_id: str) -> None:
 
 
 def touch_user_albums_index_state(user_id: str) -> str:
-    """Mark the albums index's manifest dirty with a fresh sourceVersion --
-    mirrors touch_user_sort_index_state. No per-album dirty-filenames
+    """Mark albums dirty while preserving the published merge base's
+    sourceVersion and rowCount, as the people index does. No per-album dirty-filenames
     partition (see module comment above): a full rebuild is cheap enough that
     incremental tracking isn't worth the complexity here. Still gated by
     _manifest_already_marked_dirty (see that function's comment) -- a rapid
@@ -6377,13 +6963,15 @@ def touch_user_albums_index_state(user_id: str) -> str:
         return ''
     if _manifest_already_marked_dirty(key, 'albums'):
         return ''
-    source_version = datetime.now(timezone.utc).isoformat()
+    previous = _load_albums_index_manifest(key)
+    source_version = str(previous.get('sourceVersion') or '') or datetime.now(timezone.utc).isoformat()
     manifest = {
+        **previous,
         'userId': key,
         'sourceVersion': source_version,
         'schemaVersion': _ALBUMS_INDEX_SCHEMA_VERSION,
         'dirty': True,
-        'updatedAt': source_version,
+        'updatedAt': datetime.now(timezone.utc).isoformat(),
     }
     blob_client = _albums_index_blob_client(_albums_index_manifest_blob_name(key))
     if blob_client is not None:
@@ -6595,6 +7183,7 @@ def _build_user_albums_index_snapshot(user_id: str, source_version: str) -> Opti
 
 def _incremental_albums_index_snapshot(
     user_id: str, source_version: str, affected_album_ids: set, prev_rows: List[Dict[str, object]],
+    *, incremental_only: bool = False,
 ) -> Optional[LexicalIndexSnapshot]:
     """Rebuild only the specified albums and merge with previous snapshot.
     Much faster than full rebuild for bulk operations (e.g., moving 100 photos to one album)."""
@@ -6606,7 +7195,11 @@ def _incremental_albums_index_snapshot(
     try:
         library_db = search_db.open_database(user_id)
     except Exception:
+        if incremental_only:
+            raise
         library_db = None
+    if incremental_only and (library_db is None or not _strict_album_search_ready(user_id, library_db, ())):
+        return None
 
     def _cover(names: List[str]) -> str:
         if not names:
@@ -6617,7 +7210,11 @@ def _incremental_albums_index_snapshot(
                 if best:
                     return best[0]
             except Exception:
+                if incremental_only:
+                    raise
                 pass
+        if incremental_only:
+            raise RuntimeError('Album cover search produced no result')
         return names[0] if names else ''
 
     # Fetch only affected albums
@@ -6627,7 +7224,7 @@ def _incremental_albums_index_snapshot(
             try:
                 row = albums_table_client.get_entity(partition_key=user_id, row_key=str(album_id))
                 affected_rows[str(album_id)] = row
-            except Exception:
+            except ResourceNotFoundError:
                 # Album deleted, will be filtered out below
                 pass
     except Exception:
@@ -6635,11 +7232,19 @@ def _incremental_albums_index_snapshot(
 
     # Build updated rows for affected albums
     updated_rows: Dict[str, Dict[str, object]] = {}
+    member_count = 0
     for album_id, row in affected_rows.items():
         if str(row.get('deleted') or '').strip().lower() in ('true', '1'):
             # Album was deleted, skip it
             continue
+        if incremental_only and album_store.is_table_backed(row) and not album_store.members_available():
+            return None
         filenames = album_store.sample(row) if album_store.is_table_backed(row) else album_store.read_filenames(row)
+        member_count += len(filenames)
+        if incremental_only and member_count > _STRICT_INCREMENTAL_MAX_MEMBERS:
+            return None
+        if incremental_only and not _strict_album_search_ready(user_id, library_db, filenames):
+            return None
         updated_rows[album_id] = {
             'albumId': album_id,
             'name': str(row.get('name') or ''),
@@ -6671,7 +7276,40 @@ def _incremental_albums_index_snapshot(
     )
 
 
-def _albums_merge_eligible(user_id: str, affected_album_ids: Optional[set]) -> Optional[LexicalIndexSnapshot]:
+def _strict_album_search_ready(user_id, db, filenames):
+    """Validate this database's coverage and only the bounded dependencies.
+
+    Do not read a whole dirty partition to infer readiness from one row.
+    Unavailable tracking, pending member metadata, or a stale local DB defer.
+    """
+    import search_db
+    try:
+        manifest = search_db.load_manifest(user_id)
+        lexical = _load_lexical_index_manifest(user_id)
+        if (not manifest.get('sourceVersion') or manifest.get('schemaVersion') != search_db.SCHEMA_VERSION
+                or manifest.get('building') or lexical.get('dirty')
+                or not lexical.get('sourceVersion')
+                or search_db._lineage(manifest) != str(lexical['sourceVersion'])
+                or db.path != search_db._local_path(user_id, str(manifest['sourceVersion']))
+                or db.applied_seq() != int(manifest.get('deltaSeq') or manifest.get('baseSeq') or 0)):
+            return False
+        _flush_dirty_filename_buffer(user_id, 'lexical')
+        table = _CTX.get('search_index_dirty_table_client')
+        if table is None:
+            return False
+        partition = _search_index_dirty_partition_key(user_id, 'lexical')
+        for filename in filenames:
+            try:
+                table.get_entity(partition_key=partition, row_key=filename)
+                return False
+            except ResourceNotFoundError:
+                pass
+        return True
+    except Exception:
+        return False
+
+
+def _albums_merge_eligible(user_id: str, affected_album_ids: Optional[set], *, max_rows=None) -> Optional[LexicalIndexSnapshot]:
     """Cheap, read-only check mirroring refresh_user_albums_index's
     ID-targeted merge precondition -- shared with inline_index_merge's
     pre-submission check so the two conditions can never drift apart.
@@ -6684,30 +7322,43 @@ def _albums_merge_eligible(user_id: str, affected_album_ids: Optional[set]) -> O
     second fetch is a real TOCTOU risk (_rebuild_albums_index_in_background
     publishes to the same blob guarded only by an in-process lock)."""
     key = str(user_id or '').strip()
-    if not key or not affected_album_ids or len(affected_album_ids) > 100:
+    if not key or not affected_album_ids or len(affected_album_ids) > _STRICT_INCREMENTAL_MAX_IDS or getattr(affected_album_ids, 'has_more', False) or getattr(affected_album_ids, 'truncated', False):
         return None
     prev_manifest = _load_albums_index_manifest(key)
+    if max_rows is not None and not _incremental_manifest_within_limit(prev_manifest, _ALBUMS_INDEX_SCHEMA_VERSION, max_rows):
+        return None
     prev_snapshot = _load_albums_index_blob(key) if prev_manifest else None
     if (prev_snapshot and prev_snapshot.schema_version == _ALBUMS_INDEX_SCHEMA_VERSION
-            and prev_snapshot.source_version == str(prev_manifest.get('sourceVersion') or '')):
+            and prev_snapshot.source_version == str(prev_manifest.get('sourceVersion') or '')
+            and (max_rows is None or len(prev_snapshot.rows) == prev_manifest['rowCount'] <= max_rows)):
         return prev_snapshot
     return None
 
 
 @catalog_publisher
-def refresh_user_albums_index(user_id: str, *, source_version: Optional[str] = None, affected_album_ids: Optional[set] = None) -> Optional[LexicalIndexSnapshot]:
+def refresh_user_albums_index(user_id: str, *, source_version: Optional[str] = None, affected_album_ids: Optional[set] = None, incremental_only: bool = False) -> Optional[LexicalIndexSnapshot]:
     """Refresh albums index, optionally incrementally for specific albums.
 
     If affected_album_ids is provided, only those albums are recomputed and merged
     with the previous snapshot, avoiding a full library scan. Falls back to full
-    rebuild if affected set is too large or previous snapshot missing."""
+    rebuild if affected set is too large or previous snapshot missing, unless
+    incremental_only=True: that path returns None without a full scan."""
     key = str(user_id or '').strip()
     if not key:
         return None
     source_version = str(source_version or datetime.now(timezone.utc).isoformat())
 
+    publication_capture = _strict_capture_publication(key, 'albums') if incremental_only else None
+    if incremental_only and publication_capture is None:
+        return None
+    if incremental_only:
+        prev_snapshot = _albums_merge_eligible(key, affected_album_ids, max_rows=_STRICT_INCREMENTAL_MAX_ROWS)
+        if prev_snapshot is None:
+            return None
+        snapshot = _incremental_albums_index_snapshot(key, source_version, affected_album_ids, prev_snapshot.rows,
+                                                     incremental_only=True)
     # Try incremental if affected IDs provided
-    if affected_album_ids:
+    elif affected_album_ids:
         prev_snapshot = _albums_merge_eligible(key, affected_album_ids)
         if prev_snapshot is not None:
             snapshot = _incremental_albums_index_snapshot(key, source_version, affected_album_ids, prev_snapshot.rows)
@@ -6721,19 +7372,28 @@ def refresh_user_albums_index(user_id: str, *, source_version: Optional[str] = N
         snapshot = _build_user_albums_index_snapshot(key, source_version)
     if snapshot is None:
         return None
+    if incremental_only and len(snapshot.rows) > _STRICT_INCREMENTAL_MAX_ROWS:
+        return None
     container_name = _lexical_index_container_name()
+    if not container_name or _get_blob_client(container_name, _albums_index_json_blob_name(key)) is None or _get_blob_client(container_name, _albums_index_manifest_blob_name(key)) is None:
+        raise RuntimeError('Albums index blob storage is unavailable')
     if container_name:
         blob_client = _get_blob_client(container_name, _albums_index_json_blob_name(key))
         if blob_client is not None:
             try:
+                if incremental_only:
+                    _strict_check_publication(publication_capture)
                 blob_client.upload_blob(
                     _serialize_albums_index(snapshot),
                     overwrite=True,
                     content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
+                    **(publication_capture[0][1] if incremental_only else {}),
                 )
             except Exception:
                 _LOGGER.exception('Failed to upload albums index data blob for user %s', key)
-        _clear_manifest_dirty_flag(key, 'albums')
+                raise
+        if not incremental_only:
+            _clear_manifest_dirty_flag(key, 'albums')
         manifest = {
             'userId': key,
             'sourceVersion': snapshot.source_version,
@@ -6749,9 +7409,13 @@ def refresh_user_albums_index(user_id: str, *, source_version: Optional[str] = N
                     json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
                     overwrite=True,
                     content_settings=BlobContentSettings(content_type='application/json'),
+                    **(publication_capture[1][1] if incremental_only else {}),
                 )
             except Exception:
                 _LOGGER.exception('Failed to upload albums index manifest blob for user %s', key)
+                raise
+            if incremental_only:
+                _clear_manifest_dirty_flag(key, 'albums')
     with _ALBUMS_INDEX_CACHE_LOCK:
         _ALBUMS_INDEX_CACHE[key] = {
             'source_version': snapshot.source_version,
@@ -7163,11 +7827,16 @@ def _build_user_people_index_snapshot(user_id: str, source_version: str) -> Opti
 
 def _people_index_rows_from_scan(
     user_id: str, source_version: str, person_rows: List[Dict], face_kv, person_table_client, face_table_client,
+    *, incremental_only: bool = False,
 ) -> LexicalIndexSnapshot:
     def _resolve_missing_face(face_id: str) -> Tuple[str, Optional[Dict[str, object]]]:
         try:
             return face_id, face_table_client.get_entity(partition_key=user_id, row_key=face_id)
+        except ResourceNotFoundError:
+            return face_id, None
         except Exception:
+            if incremental_only:
+                raise
             return face_id, None
 
     trimmed_rows: List[Dict[str, object]] = []
@@ -7237,7 +7906,11 @@ def _people_index_rows_from_scan(
                 continue
             try:
                 person_table_client.delete_entity(partition_key=user_id, row_key=person_id)
+            except ResourceNotFoundError:
+                pass
             except Exception:
+                if incremental_only:
+                    raise
                 pass
             continue
 
@@ -7358,6 +8031,7 @@ def _incremental_people_index_snapshot(
 
 def _incremental_people_index_snapshot_by_ids(
     user_id: str, source_version: str, affected_person_ids: set, prev_rows: List[Dict[str, object]],
+    *, incremental_only: bool = False,
 ) -> Optional[LexicalIndexSnapshot]:
     """Rebuild only the specified people and merge with previous snapshot.
     Faster than timestamp-based incremental for bulk operations."""
@@ -7383,10 +8057,20 @@ def _incremental_people_index_snapshot_by_ids(
 
     # Rebuild only affected people
     try:
+        if incremental_only:
+            member_count = 0
+            for person in affected_people.values():
+                ids = json.loads(person.get('faceIds') or '[]')
+                if not isinstance(ids, list):
+                    return None
+                member_count += len(ids)
+                if member_count > _STRICT_INCREMENTAL_MAX_MEMBERS:
+                    return None
         fresh_rows = _people_index_rows_from_scan(
             user_id, source_version,
             list(affected_people.values()),
             _PointReadFaces(), person_table_client, face_table_client,
+            **({'incremental_only': True} if incremental_only else {}),
         )
         if fresh_rows is None:
             return None
@@ -7424,7 +8108,7 @@ def _incremental_people_index_snapshot_by_ids(
     )
 
 
-def _people_merge_eligible(user_id: str, affected_person_ids: Optional[set]) -> Optional[LexicalIndexSnapshot]:
+def _people_merge_eligible(user_id: str, affected_person_ids: Optional[set], *, max_rows=None) -> Optional[LexicalIndexSnapshot]:
     """Cheap, read-only check: would refresh_user_people_index's ID-targeted
     merge path accept this affected set right now? Shared by the real
     refresh function (below) and inline_index_merge's pre-submission check
@@ -7441,29 +8125,36 @@ def _people_merge_eligible(user_id: str, affected_person_ids: Optional[set]) -> 
     fetch could silently pick up a blob of a different schema/source version
     than the one just validated."""
     key = str(user_id or '').strip()
-    if not key or not affected_person_ids or len(affected_person_ids) > 100:
+    if not key or not affected_person_ids or len(affected_person_ids) > _STRICT_INCREMENTAL_MAX_IDS or getattr(affected_person_ids, 'has_more', False) or getattr(affected_person_ids, 'truncated', False):
         return None
     previous_manifest = _load_people_index_manifest(key)
+    if max_rows is not None and not _incremental_manifest_within_limit(previous_manifest, _PEOPLE_INDEX_SCHEMA_VERSION, max_rows):
+        return None
     prev = _load_people_index_blob(key)
     if (prev is not None and prev.schema_version == _PEOPLE_INDEX_SCHEMA_VERSION
-            and prev.source_version == str(previous_manifest.get('sourceVersion') or '')):
+            and prev.source_version == str(previous_manifest.get('sourceVersion') or '')
+            and (max_rows is None or len(prev.rows) == previous_manifest['rowCount'] <= max_rows)):
         return prev
     return None
 
 
 @catalog_publisher
-def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = None, affected_person_ids: Optional[set] = None, force_full: bool = False) -> Optional[LexicalIndexSnapshot]:
+def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = None, affected_person_ids: Optional[set] = None, force_full: bool = False, incremental_only: bool = False) -> Optional[LexicalIndexSnapshot]:
     """Refresh people index, optionally incrementally for specific people.
 
     If affected_person_ids is provided, only those people are recomputed and merged
     with the previous snapshot, avoiding a full library scan. Falls back to full
-    rebuild if affected set is too large or previous snapshot missing."""
+    rebuild if affected set is too large or previous snapshot missing, unless
+    incremental_only=True: no timestamp or full scan is then permitted."""
     key = str(user_id or '').strip()
     if not key:
         return None
     source_version = str(source_version or datetime.now(timezone.utc).isoformat())
     started = datetime.now(timezone.utc)
 
+    publication_capture = _strict_capture_publication(key, 'people') if incremental_only else None
+    if incremental_only and publication_capture is None:
+        return None
     snapshot = None
     previous_manifest = {} if force_full else _load_people_index_manifest(key)
 
@@ -7479,14 +8170,22 @@ def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = N
     # _set_faces_source_deleted_for_filenames -- calls mark_people_dirty()
     # with its touched IDs. See
     # docs/benchmarks/people-index-incremental-guard-20261030.md.
-    prev = None if force_full else _people_merge_eligible(key, affected_person_ids)
+    if incremental_only and force_full:
+        return None
+    prev = None if force_full else _people_merge_eligible(key, affected_person_ids,
+        **({'max_rows': _STRICT_INCREMENTAL_MAX_ROWS} if incremental_only else {}))
     if prev is not None:
-        snapshot = _incremental_people_index_snapshot_by_ids(key, source_version, affected_person_ids, prev.rows)
+        snapshot = _incremental_people_index_snapshot_by_ids(key, source_version, affected_person_ids, prev.rows,
+            **({'incremental_only': True} if incremental_only else {}))
         if snapshot is not None:
             perf_instrumentation.log_event(
                 'people_index_incremental_by_ids', user=key, ok=True,
                 people=len(affected_person_ids))
 
+    if incremental_only and snapshot is None:
+        return None
+    if incremental_only and len(snapshot.rows) > _STRICT_INCREMENTAL_MAX_ROWS:
+        return None
     # Fall back to timestamp-based incremental if ID-based didn't work
     if snapshot is None:
         since = str(previous_manifest.get('builtThrough') or '')
@@ -7518,12 +8217,16 @@ def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = N
     try:
         # Publish data before advertising readiness. Failures must reach the
         # queue worker; a process-local cache cannot make other roles ready.
+        if incremental_only:
+            _strict_check_publication(publication_capture)
         blob_client.upload_blob(
             _serialize_people_index(snapshot),
             overwrite=True,
             content_settings=BlobContentSettings(content_type='application/json', content_encoding='gzip'),
+            **(publication_capture[0][1] if incremental_only else {}),
         )
-        _clear_manifest_dirty_flag(key, 'people')
+        if not incremental_only:
+            _clear_manifest_dirty_flag(key, 'people')
         manifest = {
             'userId': key,
             'sourceVersion': snapshot.source_version,
@@ -7538,10 +8241,13 @@ def refresh_user_people_index(user_id: str, *, source_version: Optional[str] = N
             json.dumps(manifest, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
             overwrite=True,
             content_settings=BlobContentSettings(content_type='application/json'),
+            **(publication_capture[1][1] if incremental_only else {}),
         )
     except Exception:
         _LOGGER.exception('Failed to publish people index for user %s', key)
         raise
+    if incremental_only:
+        _clear_manifest_dirty_flag(key, 'people')
     with _PEOPLE_INDEX_CACHE_LOCK:
         _PEOPLE_INDEX_CACHE[key] = {
             'source_version': snapshot.source_version,
@@ -7683,6 +8389,7 @@ def prime_all_user_indexes_sequentially(
     kinds: Optional[Sequence[str]] = None,
     affected_person_ids: Optional[set] = None,
     affected_album_ids: Optional[set] = None,
+    incremental_only: bool = False,
 ) -> List[str]:
     """Returns (wait=True) the kinds whose build raised or produced nothing, else [].
 
@@ -7728,6 +8435,11 @@ def prime_all_user_indexes_sequentially(
     failed: List[str] = []
     if not key:
         return failed
+    if incremental_only and kinds is not None and any(kind not in ('sort', 'access', 'albums', 'people') for kind in kinds):
+        return list(kinds)
+    if incremental_only and not wait:
+        # ContextVar publication guards do not transfer to daemon threads.
+        return list(kinds or ('sort', 'access', 'albums', 'people'))
     lock = _INDEX_PRIME_LOCKS.lock_for(key)
     if not lock.acquire(blocking=False):
         if wait:
@@ -7778,6 +8490,10 @@ def prime_all_user_indexes_sequentially(
                     continue
                 try:
                     extra_kwargs: Dict[str, object] = {}
+                    if incremental_only:
+                        if kind not in ('sort', 'access', 'people', 'albums'):
+                            raise ValueError('Strict incremental priming only supports bounded lexical indexes')
+                        extra_kwargs['incremental_only'] = True
                     if kind == 'people' and affected_person_ids:
                         extra_kwargs['affected_person_ids'] = affected_person_ids
                     elif kind == 'albums' and affected_album_ids:

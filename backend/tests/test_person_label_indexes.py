@@ -31,6 +31,7 @@ def env(monkeypatch):
     monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **kw: None)
     monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', Mock(return_value=[]))
     monkeypatch.setattr(app, 'refresh_user_search_db_incremental', lambda user: {'status': 'noop'})
+    monkeypatch.setattr(app, '_refresh_library_summaries', Mock())
     return state
 
 

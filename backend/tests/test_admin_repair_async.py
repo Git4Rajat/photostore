@@ -166,11 +166,16 @@ def test_worker_dispatch_handler_exception_is_caught_and_recorded_as_failed(env,
 
 def test_vector_index_rebuild_route_uses_dedicated_worker(env, monkeypatch):
     import storage_utils
+    import automatic_index_updates
+    from tests.test_automatic_index_updates import Table
     from types import SimpleNamespace
     from tests.test_index_priming import _dedicated_queue
     _table, legacy_queue = env
     queue = _dedicated_queue(monkeypatch)
     monkeypatch.setenv('APP_ROLE', 'index-worker')
+    monkeypatch.setitem(storage_utils._CTX, 'search_index_dirty_table_client', Table())
+    monkeypatch.setattr(automatic_index_updates, 'artifact_base', lambda user, kind: 'v1')
+    monkeypatch.setattr(automatic_index_updates, 'wave_pending', lambda user: False)
     built = []
     monkeypatch.setattr(storage_utils, 'refresh_user_vector_index',
                         lambda uid, **kw: built.append(uid) or SimpleNamespace(
@@ -191,7 +196,7 @@ def test_vector_index_rebuild_route_uses_dedicated_worker(env, monkeypatch):
         status_response = admin_job_status()
     assert status_response.get_json()['status'] == 'done'
     assert status_response.get_json()['result']['rowCount'] == 3
-    assert status_response.get_json()['result']['status'] == 'rebuilt'
+    assert status_response.get_json()['result']['status'] == 'full'
     assert built == ['owner']
 
 

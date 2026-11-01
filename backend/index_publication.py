@@ -51,7 +51,8 @@ def publication(store, claim):
 class ConditionalBlob:
     def __init__(self, client, guard):
         self.client, self.guard = client, guard
-        self.catalog_guard = _CATALOG.get()
+        catalog = _CATALOG.get()
+        self.catalog_guard = catalog[1] if catalog is not None else None
 
     def __getattr__(self, name):
         return getattr(self.client, name)
@@ -104,13 +105,39 @@ class ConditionalBlob:
 
 def fenced(client):
     guard = _ACTIVE.get()
-    return ConditionalBlob(client, guard) if client is not None and guard is not None else client
+    if client is None:
+        return None
+    if guard is not None:
+        return ConditionalBlob(client, guard)
+    catalog = _CATALOG.get()
+    return CatalogBlob(client, catalog[1]) if catalog is not None else client
 
 
 def check():
+    catalog_check()
     guard = _ACTIVE.get()
     if guard is not None:
         guard.check()
+
+
+def declared_build_alias_conditions(client):
+    """Capture a full wave alias using the guard's pre-build ETag only.
+
+    None means this is not a wave BuildGuard; ordinary publishers retain
+    their independent immutable-data/manifest-CAS protocol. Never declare
+    dynamic outputs or re-read properties to replace the guard's snapshot.
+    The fenced uploader remains authoritative at commit time.
+    """
+    from wave_catalog import BuildGuard
+    guard = _ACTIVE.get()
+    if not isinstance(guard, BuildGuard):
+        return None
+    guard.check()
+    if client is None:
+        raise RuntimeError('Declared full-build alias storage unavailable')
+    options = {'overwrite': True}
+    guard.before_upload(client, options)
+    return options
 
 
 def propagate_build_failure(error):
@@ -137,19 +164,67 @@ def guarded_publication(guard):
 _CATALOG = ContextVar('library_catalog_lease',default=None)
 
 
+class CatalogBlob:
+    """Keep a captured live guard on uploads, including full legacy publishers."""
+    def __init__(self, client, guard):
+        self.client, self.guard = client, guard
+
+    def __getattr__(self, name):
+        return getattr(self.client, name)
+
+    def upload_blob(self, data, **kwargs):
+        self.guard.check()
+        result = self.client.upload_blob(data, **kwargs)
+        self.guard.check()
+        return result
+
+    def upload_file(self, path, **kwargs):
+        with open(path, 'rb') as data:
+            return self.upload_blob(data, **kwargs)
+
+
 def catalog_check():
-    guard=_CATALOG.get()
-    if guard is not None:guard.check()
+    active = _CATALOG.get()
+    if active is not None:
+        active[1].check()
+
+
+def require_catalog_guard(library, guard):
+    active = _CATALOG.get()
+    if active is None or active[0] != library or active[1] is not guard:
+        raise RuntimeError('Active shared real catalog guard required')
+    guard.check()
 
 
 @contextmanager
-def catalog_serialization(table,library,blobs,container):
-    """Wave and foreground CRUD builders read/build/publish under one library lease.
-    This prevents a CRUD build started earlier from replacing a wave's aliases.
+def catalog_serialization(table,library,blobs,container, *, require_real=False):
+    """Universal renewable library lock, held BEFORE base capture through commit.
+
+    Nested same-library publishers reuse the live guard. Legacy storage fakes
+    without lease support may publish under their own CAS tests, but yield None:
+    they can NEVER authorize GC or quiesced recovery. Native Azure failures do
+    not fall back to a no-op. No wave ownership predicate is involved.
     """
-    from wave_policy import owned
-    if not owned(table,library):
-        yield
+    active = _CATALOG.get()
+    if active is not None:
+        if active[0] != library:
+            raise RuntimeError('Cross-library nested catalog publication')
+        active[1].check()
+        yield active[1]
+        active[1].check()
+        return
+    if blobs is None or not container or not callable(getattr(blobs, 'get_blob_client', None)):
+        if require_real:
+            raise RuntimeError('Real catalog serialization storage unavailable')
+        yield None
+        return
+    import hashlib
+    probe = blobs.get_blob_client(container=container, blob='catalog-publication-locks/' +
+                                  hashlib.sha256(library.encode()).hexdigest() + '.json')
+    if not callable(getattr(probe, 'acquire_lease', None)):
+        if require_real:
+            raise RuntimeError('Real catalog lease required')
+        yield None
         return
     from clustering_lease import BlobLibraryLeaseFactory, RetryableLibraryLeaseError
     factory=BlobLibraryLeaseFactory(blobs,container,namespace='catalog-publication-locks')
@@ -172,17 +247,22 @@ def catalog_serialization(table,library,blobs,container):
                 if remaining<=0:raise
                 attempt+=1
                 time.sleep(min(2**attempt,8,remaining))
-        token=_CATALOG.set(guard)
+        token=_CATALOG.set((library, guard))
         try:
-            guard.check();yield;guard.check()
+            guard.check();yield guard;guard.check()
         finally:_CATALOG.reset(token)
 
 
 def serialize_catalog(function):
     from functools import wraps
     @wraps(function)
-    def wrapped(library,*args,**kwargs):
-        import app
-        with catalog_serialization(app.jobs_table_client,library,app.blob_service_client,app.BLOB_LEXICAL_INDEX_CONTAINER):
-            return function(library,*args,**kwargs)
+    def wrapped(*args,**kwargs):
+        import storage_utils as su
+        first = args[0] if args else kwargs.get('user_id', kwargs.get('library_id',
+                            kwargs.get('user', kwargs.get('library'))))
+        library = getattr(first, 'user_id', getattr(getattr(first, 'store', None), 'library', first))
+        if not isinstance(library, str) or not library:
+            return function(*args, **kwargs)
+        with catalog_serialization(None,library,su._CTX.get('blob_service_client'),su._lexical_index_container_name()):
+            return function(*args,**kwargs)
     return wrapped

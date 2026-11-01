@@ -17,6 +17,7 @@ SCOPE_KINDS = {
     'vector': ('vector',),
     'tag_embedding': ('tag_embedding',),
     'people_embedding': ('people_embedding',),
+    'lexical_artifact': (),
     'dedup': (),
     'dedup-idle': (),
 }
@@ -47,5 +48,5 @@ def validate_scope(scope: str) -> str:
 
 
 def scope_for_index(kind: str) -> str:
-    scope = 'search' if kind == 'lexical' else kind
+    scope = {'lexical': 'search', 'hash': 'dedup'}.get(kind, kind)
     return validate_scope(scope)
