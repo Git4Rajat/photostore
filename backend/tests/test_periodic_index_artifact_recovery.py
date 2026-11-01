@@ -146,11 +146,13 @@ def test_malformed_controls_never_cross_library_schedule_or_gc(recovery, monkeyp
     ('active', 1), ('active', False), ('active', '0'), ('fullRequired', True),
     ('fullRequired', None), ('revision', ''), ('base', ''),
 ])
-def test_uncertified_hash_control_is_not_gc_candidate(recovery, monkeypatch, field, value):
+def test_uncertified_hash_control_does_not_prevent_family_discovery(recovery, monkeypatch, field, value):
     row = recovery.dirty.rows[automatic.partition(USER, 'hash'), automatic.CONTROL]
     row[field] = value
-    monkeypatch.setattr(app, '_cleanup_completed_index_artifacts', lambda *a: pytest.fail('unsafe GC'))
+    calls = []
+    monkeypatch.setattr(app, '_cleanup_completed_index_artifacts', calls.append)
     assert app.recover_pending_index_work() >= 0
+    assert calls == [USER]
     assert not recovery.service.deleted
 
 
@@ -170,6 +172,12 @@ def test_periodic_recovery_never_deletes_active_or_quiesced_library(recovery, mo
     else:
         monkeypatch.setattr(automatic, 'wave_pending', lambda user: True)
     assert app.recover_pending_index_work() == 0
+    if problem == 'source':
+        assert len(recovery.service.deleted) == 4
+        report = recovery.reports[-1][1]
+        assert report['status'] == 'partial'
+        assert report['kinds']['vector']['status'] == 'deferred'
+        return
     assert not recovery.service.deleted
     if problem in ('quiescence', 'wave'):
         assert not recovery.reports and not recovery.service.queries
@@ -296,7 +304,7 @@ def test_gc_exception_does_not_stop_wakeups_or_later_libraries(recovery, monkeyp
 
     monkeypatch.setattr(app, '_cleanup_completed_index_artifacts', broken)
     assert app.recover_pending_index_work() == 1
-    assert len(calls) == 3
+    assert len(calls) == 4
     assert 'Periodic index artifact cleanup failed' in caplog.text
     assert index_work.WorkStore(recovery.jobs)._get(index_work.WorkStore.key('pending', 'vector'))
 
@@ -322,3 +330,42 @@ def test_unavailable_recovery_never_scans_gc(recovery, monkeypatch, missing):
     monkeypatch.setattr(app, missing, None)
     assert app.recover_pending_index_work() == 0
     assert not recovery.scans and not recovery.service.queries
+
+
+@pytest.mark.parametrize('hash_state', ['missing', 'uncertified'])
+def test_quiet_vector_cleanup_discovered_without_ready_hash(recovery, hash_state):
+    vector, current, _ = setup_scope(recovery)
+    orphan = add(recovery, vector, 1)
+    previous = add(recovery, vector, 2)
+    key = automatic.partition(USER, 'hash'), automatic.CONTROL
+    if hash_state == 'missing':
+        del recovery.dirty.rows[key]
+    else:
+        recovery.dirty.rows[key]['fullRequired'] = True
+    assert app.recover_pending_index_work() == 0
+    assert len(recovery.reports) == 1
+    report = recovery.reports[0][1]
+    assert report['status'] == 'partial'
+    assert report['kinds']['vector']['status'] == 'complete'
+    assert report['kinds']['hash']['status'] == 'deferred'
+    assert report['deleted'] == 1
+    assert (vector.container, orphan) not in recovery.service.data
+    assert all((vector.container, name) in recovery.service.data for name in (current, previous))
+
+
+def test_rotation_deduplicates_interleaved_family_controls_without_hash(recovery, monkeypatch):
+    recovery.dirty.rows.clear()
+    users = [f'library-{i}' for i in range(31)]
+    for kind in ('tag_embedding', 'vector', 'lexical_artifact', 'people_embedding'):
+        for user in reversed(users):
+            row = certified(recovery, user, kind)
+            row['fullRequired'] = True
+    calls = []
+    monkeypatch.setattr(app, '_cleanup_completed_index_artifacts', calls.append)
+    ordered = sorted(users, key=lambda user: automatic.partition(user, 'hash'))
+    for sweep in range(3):
+        assert app.recover_pending_index_work() == 0
+        assert calls[sweep * 25:] == [ordered[i % len(users)]
+                                    for i in range(sweep * 25, (sweep + 1) * 25)]
+    assert len(set(calls[:25])) == 25
+    assert len(recovery.scans) == 3

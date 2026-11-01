@@ -177,7 +177,7 @@ def _write_header(stream, shape, dtype):
     })
 
 
-def _write_json_member(archive, name, values, directory):
+def _write_json_member(archive, name, values, directory, *, progress=None):
     # UTF-32 NPY needs character count in its header: spool encoded JSON first.
     path = Path(directory) / (name + '.text')
     count = 0
@@ -186,6 +186,8 @@ def _write_json_member(archive, name, values, directory):
             nonlocal count
             count += len(text)
             stream.write(text.encode('utf-32-le'))
+            if progress is not None:
+                progress()
         write('[')
         first = True
         for value in values:
@@ -197,7 +199,10 @@ def _write_json_member(archive, name, values, directory):
     with archive.open(name + '.npy', 'w', force_zip64=True) as member:
         _write_header(member, (1,), '<U' + str(count))
         with path.open('rb') as stream:
-            shutil.copyfileobj(stream, member, CHUNK)
+            while chunk := stream.read(CHUNK):
+                member.write(chunk)
+                if progress is not None:
+                    progress()
     path.unlink()
 
 

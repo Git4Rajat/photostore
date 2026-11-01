@@ -8,6 +8,8 @@ verified against current code on **2026-11-01**; automatic source coverage,
 scheduling, summary refresh and immutable-artifact cleanup are integrated.
 This documentation update changes no code or infrastructure and performs no
 deployment; it does not establish which versions are running in production.
+The goal remains additive upgrades: no new artifact overlays or expansion of
+Core ownership.
 
 ## Operational compatibility: cleanup now requires operator quiescence
 
@@ -85,13 +87,46 @@ including FAISS writes, follows the same reservation path. Face changes include
 old and new owners; uncertain/racy source reads force full coverage rather than
 guessing a complete affected set.
 
+Exact internal metadata partitions `clustering_maintenance`, `__system__`,
+`jobs` and `performance`, and shared hash `CONTROL_ROWS`, bypass old-row reads,
+source admission and coverage tracking. These are exact reserved identities,
+not filename/field heuristics: media reservations, processing rows, tombstones
+and odd/extensionless names remain tracked even without finalization fields.
+`__init__` belongs to the separate trash table, not a media exclusion.
+
 Before source storage, writers persist WorkStore intent, active reservations and
-versioned dirty IDs; after storage they advance coverage again and reschedule.
+versioned dirty IDs. After storage, **all successfully begun reservations finish
+before any post-write scheduling is attempted**, then all schedules are attempted
+even if finalization fails. Every finish/schedule failure is preserved in a
+`BaseExceptionGroup`; an original source/begin error remains primary with that
+group chained beneath it. Successful source writes with failed finalization
+still raise a caller-visible retryable error. Failed/partially committed begins
+are not decremented: their uncertain active state deliberately fails closed.
 Controls/dirty IDs reuse `searchdirty`; jobs reuse the existing `WorkStore` ledger
-and queue recovery. Tag work uses the existing jobs table's model-tag pending
-partition and is consumed only by the vision process, not by core/index-worker
-loading the model. Guarded waves retain their declared outputs/receipts and force
+and queue recovery. Guarded waves retain their declared outputs/receipts and force
 an automatic coverage seed after wave completion.
+
+Tag requests persist model-tag WorkStore intent and use `notify()` to coalesce
+a targeted `tag_index_maintenance` version-1 payload on the **existing vision
+queue**, with no fabricated filename/steps or photo-processing job. The consumer
+validates exact library, scope, job/key/partition and protocol identities, requires
+the vision role/model, and holds renewable publication ownership plus the real
+catalog lock. Core/index-worker never claims or model-loads tag work; recovery
+only publishes tag wakeups. `SourceBusy` keeps durable retry timing and re-delays
+the original queue receipt by 10 seconds, without charging the failure budget
+or multiplying replacement messages. Post-write revisions/newer requests and
+expired-wakeup recovery preserve the next wake; poison work needs explicit repair.
+The configured roughly five-day vision sweep is now a recovery backstop for
+durable tag work, not its normal trigger: tag writes enqueue an immediate wake
+subject to ordinary coalescing/queue visibility and source barriers.
+
+Queued tag maintenance reports completed source rows, bounded encoding batches,
+SQLite VM work and artifact bytes to Vision's existing stall watchdog. Transfer
+streams capture the task callback for Azure SDK threads. Queue/catalog lease
+renewals, seeks and empty reads do not count as work; stalled source, encoder or
+transfer calls still trigger process recycling. Full vocabulary encoding uses
+64-tag batches so a healthy bootstrap can exceed the photo-task timeout while
+continuing to demonstrate progress.
 
 The worker captures an idle source revision plus **at most 512 dirty IDs** with
 bounded lookahead. Missing/uncertified bases, truncated captures, uncertain
@@ -116,10 +151,14 @@ that same lock **after successful WorkStore completion and claim release**, only
 in `APP_ROLE=index-worker`, not from readers or ordinary HTTP handlers.
 
 The existing 60-second worker recovery scan also retries GC for quiet libraries
-after grace expires. Certified hash controls select one candidate per library;
-bounded rotating windows prevent deferred libraries from starving later ones.
+after grace expires. **Any canonical supported family control** can nominate its
+library, independently of certification or hash readiness; GC certifies each
+family under the lock. Two bounded rotating windows deduplicate one slot per
+library using its canonical hash-partition rotation key, without an unbounded
+all-library set, and prevent deferred libraries from starving later ones.
 The default cap is **25 libraries per recovery**, configurable with
-`INDEX_ARTIFACT_CLEANUP_LIBRARIES_PER_RECOVERY`. No new queue, timer resource,
+`INDEX_ARTIFACT_CLEANUP_LIBRARIES_PER_RECOVERY` (clamped to 0–1000).
+No new queue, timer resource,
 maintenance scope or metadata-wide scan is required. Operator-fenced libraries
 and active waves are skipped; cleanup failures do not block queue wakeups.
 
@@ -127,19 +166,33 @@ and active waves are skipped; cleanup failures do not block queue wakeups.
 defaults to **24-hour grace, current references plus the newest previous
 generation, and at most 100 blob deletions per pass**. Discovery is paged,
 SHA-library-prefix scoped and bounded (default 256 items/page, 100-page survey
-cap); an incomplete survey defers before deletion. Grace applies to both artifact
+cap); each family completes its own retention survey before deleting any of its
+bytes. An incomplete survey defers that family, not unrelated eligible families.
+Grace applies to both artifact
 age and the latest manifest/pointer update as a conservative retirement time.
 Frequently updated manifests can therefore defer GC. Fixed aliases and wave
-projections are not immutable GC candidates.
+projections are not immutable GC candidates. Tag NPZ/SQLite sidecars are retained
+as whole generations, using the newest sibling timestamp; a young sibling
+protects the entire generation through bounded point reads.
 
-GC requires all **five** controls idle, fully certified and matching current
-manifest lineage, and no live maintenance/model-tag claims. It rechecks control
-ETags, references and the guard before conditional candidate deletion. Unknown
-or missing evidence defers; a pointer commit alone is not coverage certification.
+GC eligibility is **per family**, not an all-five-controls prerequisite: that
+family's exact control must be idle, fully certified and match its current
+manifest lineage. Missing/stale unrelated controls or changed inactive unrelated
+jobs do not block it. The same universal real lock and **global active publication
+claim gate across both maintenance/model-tag partitions** remain conservative.
+Related builder work ETags, including full/reconcile/compact and shared lexical
+dependencies, remain part of each family's proof, not just its output scope.
+Control/work ETags, references and the guard are rechecked before conditional
+candidate deletion; loss of the shared guard stops the pass. Unknown/missing
+family evidence defers that family; a pointer commit alone is not certification.
+Reports include per-kind `status`, `deleted`, `examined` and `reason`, plus
+compatible aggregate totals/status (`complete`, `partial`, `deferred`, `capped`).
 Grace, retention and deletion caps are configurable via
 `INDEX_ARTIFACT_CLEANUP_GRACE_SECONDS`,
 `INDEX_ARTIFACT_CLEANUP_RETAIN_GENERATIONS` and
-`INDEX_ARTIFACT_CLEANUP_MAX_DELETIONS`. Readers must finish within the configured
+`INDEX_ARTIFACT_CLEANUP_MAX_DELETIONS`; the deletion budget is global across
+families and never exceeds 100 blobs per call, even if configured higher.
+Readers must finish within the configured
 grace; indefinitely paused readers are not protected by this retention policy.
 
 ## Important cost distinction
@@ -201,11 +254,15 @@ Model-dependent tag inference stays with the existing model owner.
 
 ## Validation
 
-Latest verified combined backend suite: **5,154 passed, 14 skipped**. All 14 skips
-require the unavailable private TIFF corpus. Frontend: **816 passed across
-57 files**, rerun against the combined implementation. Coverage includes full/incremental equivalence,
+Latest agent-reported full backend suite after feedback 1, 2, 3 and 6:
+**5,300 passed, 14 skipped, 12 existing warnings**. All 14 skips require the
+unavailable private TIFF corpus. Frontend is unchanged; its last verified run
+was **816 passed across 57 files**, a prior run, not a rerun of the current state.
+Neither suite was rerun for this documentation-only update.
+Coverage includes full/incremental equivalence,
 source reservations/CAS, bounded fallback, failed publication/replay, noop/delta
-summary drains, wave guards, conservative and periodic GC, fair bounded recovery
+summary drains, wave guards, tag queue wake/retry, independent per-family and
+periodic GC, fair bounded recovery
 and quiesced purge retry/order. Patch whitespace checks are clean; unrelated
 existing Bicep and frontend TypeScript configuration diagnostics remain untouched.
 No deployment or infrastructure change was performed for this update; these

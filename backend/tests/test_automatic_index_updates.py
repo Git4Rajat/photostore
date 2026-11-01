@@ -80,6 +80,8 @@ def runtime(monkeypatch):
     monkeypatch.setattr(app, '_library_cut_over_to_waves', lambda _: False)
     monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **kw: None)
     monkeypatch.setattr(app, '_send_index_wakeup', lambda *a, **kw: None)
+    monkeypatch.setattr(app, '_send_tag_index_wakeup', lambda *a, **kw: None)
+    monkeypatch.setattr(app, 'ipwork_queue_client', object())
     monkeypatch.setattr(app, 'index_maintenance_queue_client', object())
     monkeypatch.setattr(app, 'index_maintenance_deferred_queue_client', object())
     monkeypatch.setattr(su, 'METADATA_INDEX_REQUEST_HOOK', lambda user, scope:
@@ -273,7 +275,7 @@ def test_vision_sweep_uses_tag_bootstrap_with_real_model_version(runtime, monkey
     monkeypatch.setattr(app.vision_utils, 'image_encoder_available', lambda: True)
     monkeypatch.setattr(app.vision_utils, 'get_text_embedding_version', lambda: 'clip-real')
     mark(runtime, 'tag_embedding', ['one'])
-    app.enqueue_index_build('A', reason='metadata-change', scope='tag_embedding')
+    app.enqueue_index_build('A', reason='metadata-change', scope='tag_embedding', coalesce=False)
     assert app._sweep_tag_embedding_indexes()['indexesAvailable'] == 1
     assert runtime.calls[-1] == ('tag_embedding', {'model_version': 'clip-real', 'bootstrap_incremental': True})
 
@@ -376,3 +378,181 @@ def test_actual_hash_worker_applies_tombstone_and_expected_epoch(monkeypatch):
     payload = json.loads(gzip.decompress(blobs.data['lexical/' + manifest['blobName']]))
     assert payload['hashes'] == {two: 'two'}
     assert not automatic.configured_store().capture('u1', 'hash').ids
+
+
+@pytest.mark.parametrize('source_fails', [False, True])
+@pytest.mark.parametrize('failure_phase', ['schedule', 'finish', 'both'])
+def test_multikind_finalization_attempts_all_passes_and_preserves_source_error(
+        runtime, monkeypatch, source_fails, failure_phase):
+    kinds = ['lexical_artifact', 'tag_embedding', 'vector']
+    events, schedule_counts, failures = [], {}, []
+    source_error = OSError('original source failure')
+    original_write = runtime.source.upsert_entity
+    original_transaction = runtime.dirty.submit_transaction
+
+    def write(entity, **kwargs):
+        events.append(('source', None))
+        if source_fails:
+            raise source_error
+        return original_write(entity, **kwargs)
+
+    def transaction(operations, **kwargs):
+        operations = list(operations)
+        row = operations[0][1]
+        if row.get('RowKey') == automatic.CONTROL and row.get('active') == 0:
+            events.append(('finish', row['kind']))
+            if row['kind'] == kinds[0] and failure_phase in {'finish', 'both'}:
+                error = OSError('finish storage failure')
+                failures.append(error)
+                raise error
+        return original_transaction(operations, **kwargs)
+
+    def schedule(user, kind):
+        schedule_counts[kind] = schedule_counts.get(kind, 0) + 1
+        phase = 'pre' if schedule_counts[kind] == 1 else 'post'
+        events.append((phase, kind))
+        if phase == 'post' and kind == kinds[0] and failure_phase in {'schedule', 'both'}:
+            error = RuntimeError('post-write scheduling failure')
+            failures.append(error)
+            raise error
+
+    monkeypatch.setattr(runtime.source, 'upsert_entity', write)
+    monkeypatch.setattr(runtime.dirty, 'submit_transaction', transaction)
+    monkeypatch.setattr(automatic, 'schedule', schedule)
+    table = su.track_index_source_table(runtime.source, 'metadata')
+    with pytest.raises(OSError if source_fails else ExceptionGroup) as caught:
+        table.upsert_entity({'PartitionKey': 'A', 'RowKey': 'odd name', 'tags': '["cat"]'})
+    if source_fails:
+        assert caught.value is source_error
+        finalization = caught.value.__cause__
+    else:
+        finalization = caught.value
+        assert ('A', 'odd name') in runtime.source.rows
+    assert isinstance(finalization, ExceptionGroup)
+    assert list(finalization.exceptions) == failures
+    assert all(error.__notes__ for error in failures)
+    assert 'retry required' in str(finalization)
+    assert events == ([('pre', kind) for kind in kinds] + [('source', None)] +
+                      [('finish', kind) for kind in kinds] + [('post', kind) for kind in kinds])
+    for kind in kinds:
+        row = runtime.store.control('A', kind)
+        blocked = kind == kinds[0] and failure_phase in {'finish', 'both'}
+        assert row['active'] == int(blocked)
+        assert row['fullRequired']
+        if not blocked:
+            capture = runtime.store.capture('A', kind)
+            assert capture.ids == ['odd name']
+        else:
+            with pytest.raises(automatic.SourceBusy):
+                runtime.store.capture('A', kind)
+
+
+def test_partial_failed_begin_remains_failclosed_but_prior_begin_finishes(runtime, monkeypatch):
+    events = []
+    original_begin = runtime.store.begin
+    original_finish = runtime.store.finish
+    begin_error = OSError('begin committed then response failed')
+    schedule_error = RuntimeError('post schedule failed')
+    counts = {}
+
+    def begin(user, kind, ids, **kwargs):
+        original_begin(user, kind, ids, **kwargs)
+        if kind == 'tag_embedding':
+            raise begin_error
+
+    def finish(user, kind, **kwargs):
+        events.append(kind)
+        original_finish(user, kind, **kwargs)
+
+    def schedule(user, kind):
+        counts[kind] = counts.get(kind, 0) + 1
+        if counts[kind] == 2:
+            raise schedule_error
+
+    monkeypatch.setattr(automatic, 'configured_store', lambda: runtime.store)
+    monkeypatch.setattr(runtime.store, 'begin', begin)
+    monkeypatch.setattr(runtime.store, 'finish', finish)
+    monkeypatch.setattr(automatic, 'schedule', schedule)
+    table = su.track_index_source_table(runtime.source, 'metadata')
+    with pytest.raises(OSError) as caught:
+        table.upsert_entity({'PartitionKey': 'A', 'RowKey': 'one', 'tags': '[]'})
+    assert caught.value is begin_error
+    assert caught.value.__cause__.exceptions == (schedule_error,)
+    assert events == ['lexical_artifact']
+    assert runtime.store.control('A', 'lexical_artifact')['active'] == 0
+    assert runtime.store.control('A', 'tag_embedding')['active'] == 1
+    assert runtime.store.control('A', 'vector') is None
+    assert not runtime.source.rows
+
+
+@pytest.mark.parametrize('user,key', [
+    ('clustering_maintenance', 'lib-A'),
+    ('__system__', 'media_delegation_key_20261101'),
+    ('__system__', 'ipwork_sweep_lock'),
+    ('jobs', 'legacy_job_status'),
+    ('performance', 'legacy_upload_metric'),
+])
+@pytest.mark.parametrize('operation', ['create', 'upsert', 'update', 'delete', 'transaction'])
+def test_internal_metadata_bypasses_reads_admission_and_coverage(runtime, monkeypatch, user, key, operation):
+    entity = {'PartitionKey': user, 'RowKey': key, 'lease_owner': 'worker'}
+    if operation in {'update', 'delete'}:
+        runtime.source.upsert_entity(entity)
+    monkeypatch.setattr(runtime.source, 'get_entity', lambda *a, **kw: pytest.fail('internal old read'))
+    monkeypatch.setattr(automatic, 'check_source_admission', lambda *a: pytest.fail('bogus library admission'))
+    monkeypatch.setattr(automatic, 'configured_store', lambda: pytest.fail('internal coverage'))
+    monkeypatch.setattr(automatic, 'schedule', lambda *a: pytest.fail('internal wakeup'))
+    assert automatic.mutation_targets('metadata', runtime.source, 'delete', entity, {}) == (user, {}, False, True)
+    table = su.track_index_source_table(runtime.source, 'metadata')
+    if operation == 'transaction':
+        table.submit_transaction(iter([('upsert', entity), ('delete', entity)]))
+    elif operation == 'delete':
+        table.delete_entity(partition_key=user, row_key=key)
+    else:
+        getattr(table, operation + '_entity')(entity)
+    assert not runtime.dirty.rows and not runtime.jobs.rows
+    assert ((user, key) in runtime.source.rows) == (operation not in {'delete', 'transaction'})
+
+
+def test_hash_controls_bypass_old_reads_and_admission(runtime, monkeypatch):
+    from upload_hash_snapshot import CONTROL_ROWS
+    monkeypatch.setattr(runtime.source, 'get_entity', lambda *a: pytest.fail('hash control old read'))
+    monkeypatch.setattr(automatic, 'check_source_admission', lambda *a: pytest.fail('hash control admission'))
+    table = su.track_index_source_table(runtime.source, 'hash')
+    for key in CONTROL_ROWS:
+        entity = {'PartitionKey': 'A', 'RowKey': key}
+        assert automatic.mutation_targets('hash', runtime.source, 'upsert', entity, {}) == ('A', {}, False, False)
+        table.upsert_entity(entity)
+        table.delete_entity('A', key)
+    assert not runtime.dirty.rows and not runtime.jobs.rows
+
+
+@pytest.mark.parametrize('key', ['extensionless', 'ODD.MediaSuffix', '__init__',
+                                'ipwork_sweep_lock', 'media_delegation_key_20261101',
+                                'clustering_maintenance', 'jobs', 'performance', '!coverage'])
+@pytest.mark.parametrize('fields', [
+    {'processing_state': 'deleted'},
+    {'pendingAnonymousBlob': 'reservation', 'upload_started_at': '2026-11-01'},
+    {'thumbnail_status': 'running'},
+    {'tags': '["cat"]'},
+])
+def test_true_media_rows_without_finalization_fields_remain_tracked(runtime, key, fields):
+    table = su.track_index_source_table(runtime.source, 'metadata')
+    table.upsert_entity({'PartitionKey': 'A', 'RowKey': key, **fields})
+    assert runtime.store.capture('A', 'lexical_artifact').ids == [key]
+    # Identity-only hard deletes must cover all kinds, even if the old row is
+    # absent (redelivery) or contains no photo/finalization fields.
+    table.delete_entity('A', key)
+    table.delete_entity(partition_key='A', row_key=key)
+    for kind in ('lexical_artifact', 'tag_embedding', 'vector'):
+        capture = runtime.store.capture('A', kind)
+        assert capture.ids == [key]
+        assert all(row['tombstone'] for row in capture.dirty.rows.values())
+
+
+def test_media_admission_fence_still_applies_to_internal_looking_filename(runtime, monkeypatch):
+    monkeypatch.setattr(automatic, 'check_source_admission', lambda user:
+                        (_ for _ in ()).throw(automatic.SourceBusy('fenced ' + user)))
+    table = su.track_index_source_table(runtime.source, 'metadata')
+    with pytest.raises(automatic.SourceBusy, match='fenced A'):
+        table.upsert_entity({'PartitionKey': 'A', 'RowKey': 'ipwork_sweep_lock', 'caption': 'cat'})
+    assert not runtime.source.rows and not runtime.dirty.rows

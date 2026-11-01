@@ -399,12 +399,35 @@ def schedule(user, kind):
         raise RuntimeError('Automatic artifact scheduling unavailable')
 
 
+def _is_internal_source_row(source, user, key):
+    """Exact reserved identities, never filename/field-based media admission.
+
+    Metadata reserves clustering_maintenance for per-library coordination and
+    __system__ for media_delegation_key_YYYYMMDD and ipwork_sweep_lock records.
+    Legacy jobs and performance partitions hold job status and throughput
+    records (still read by app fallback paths). All four whole partitions are
+    internal. No library-partition sentinel is
+    reserved here: __init__ belongs to the separate trash index table. Preserve
+    media reservations, processing rows, tombstones and odd/extensionless names,
+    even when finalization fields are absent. Hash control identities are shared
+    with their schema. Apply this before old reads AND source admission checks.
+    """
+    if source == 'metadata':
+        return user in {'clustering_maintenance', '__system__', 'jobs', 'performance'}
+    if source == 'hash':
+        from upload_hash_snapshot import CONTROL_ROWS
+        return key in CONTROL_ROWS
+    return False
+
+
 def mutation_targets(source, table, operation, entity, options):
-    """Derive old AND new owners before face writes, including batch deletes."""
+    """Exclude exact internal rows, then derive old AND new owners before writes."""
     import storage_utils as su
     user, key = str(entity.get('PartitionKey') or ''), str(entity.get('RowKey') or '')
     if not user or not key:
         raise ValueError('Source mutation requires partition and row identity')
+    if _is_internal_source_row(source, user, key):
+        return user, {}, False, operation == 'delete'
     old, uncertain = None, False
     try:
         old = table.get_entity(user, key)
@@ -438,9 +461,6 @@ def mutation_targets(source, table, operation, entity, options):
     if source == 'embeddings':
         return user, {'vector': [key]}, uncertain, deleted
     if source == 'hash':
-        from upload_hash_snapshot import CONTROL_ROWS
-        if key in CONTROL_ROWS:
-            return user, {}, False, deleted
         return user, {'hash': [key]}, uncertain, deleted
     if source == 'person':
         return user, {'people_embedding': [key]}, uncertain, deleted
@@ -466,7 +486,16 @@ def mutation_targets(source, table, operation, entity, options):
 
 
 class SourceTable:
-    """All source writes, even raw FAISS persistence, pass this before-write hook."""
+    """Reserve before source writes; finalize every successfully begun intent.
+
+    Finish ALL reservations before attempting ALL post-write schedules, even
+    when either pass fails. Report failures as an exception group (chained under
+    the original source/begin error when present), so successful source writes
+    with failed finalization remain caller-visible/retryable. A failed begin is
+    NOT balanced: partial/unknown commits intentionally leave active fail-closed.
+    Exact internal identities bypass tracking; media admission does not depend
+    on filename extensions, processing state or finalization fields.
+    """
     MUTATIONS = {'create_entity', 'update_entity', 'upsert_entity', 'delete_entity', 'submit_transaction'}
 
     def __init__(self, table, source):
@@ -505,6 +534,9 @@ class SourceTable:
                 op, entity = operation[:2]
                 options = operation[2] if len(operation) > 2 else {}
                 user = str(entity.get('PartitionKey') or '')
+                key = str(entity.get('RowKey') or '')
+                if user and key and _is_internal_source_row(self.source, user, key):
+                    continue
                 cleanup_check = current_cleanup_check(user)
                 if cleanup_check is not None:
                     cleanup_check()
@@ -530,6 +562,7 @@ class SourceTable:
             store = configured_store()
             reserved = []
             success = False
+            source_error = None
             try:
                 for (user, kind), ids in sorted(targets.items()):
                     check_source_admission(user)
@@ -544,13 +577,33 @@ class SourceTable:
                 result = method(*args, **kwargs)
                 success = True
                 return result
+            except BaseException as error:
+                source_error = error
+                raise
             finally:
+                failures = []
                 for user, kind in reserved:
-                    store.finish(user, kind, failed=not success)
-                    if not (source_change_active() and su._CTX.get('wave_owned') and su._CTX['wave_owned'](user)):
-                        # A very fast worker may consume the pre-write wakeup
-                        # before begin(). Advance again AFTER the source commit.
-                        schedule(user, kind)
+                    try:
+                        store.finish(user, kind, failed=not success)
+                    except BaseException as error:
+                        error.add_note(f'Automatic source finish failed: library={user!r}, kind={kind}')
+                        failures.append(error)
+                for user, kind in reserved:
+                    try:
+                        if not (source_change_active() and su._CTX.get('wave_owned') and su._CTX['wave_owned'](user)):
+                            # A very fast worker may consume the pre-write wakeup
+                            # before begin(). Advance again AFTER the source commit.
+                            schedule(user, kind)
+                    except BaseException as error:
+                        error.add_note(f'Automatic source schedule failed: library={user!r}, kind={kind}')
+                        failures.append(error)
+                if failures:
+                    finalization = BaseExceptionGroup('Automatic source finalization failed; retry required', failures)
+                    if source_error is not None:
+                        # Preserve type, identity and traceback of the original
+                        # source failure while exposing EVERY finalization error.
+                        raise source_error from finalization
+                    raise finalization
         return write
 
 

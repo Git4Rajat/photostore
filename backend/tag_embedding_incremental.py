@@ -26,6 +26,7 @@ from azure.core import MatchConditions
 from azure.core.exceptions import ResourceNotFoundError
 
 from people_embedding_incremental import Deferred, PublicationFailed, _write_header, _write_json_member
+import index_progress
 
 MAX_IDS = 512
 MAX_TAGS_PER_PHOTO = 128
@@ -87,6 +88,7 @@ def _photo_tags(row, columns, effective):
 
 def _open(path):
     db = sqlite3.connect(str(path))
+    db.set_progress_handler(index_progress.sqlite_progress, 10000)
     db.execute('PRAGMA cache_size = -2048')
     db.execute('PRAGMA temp_store = FILE')
     db.execute('PRAGMA trusted_schema = OFF')
@@ -152,8 +154,10 @@ def _write_output(db, path, directory, source, model, dim):
                 if not np.isfinite(np.frombuffer(vector, dtype='<f4')).all():
                     raise Deferred('nonfinite stored vector')
                 member.write(vector)
+                index_progress.completed()
         _write_json_member(archive, 'tags', (r[0] for r in db.execute(
-            'SELECT tag FROM tags WHERE refs > 0 ORDER BY tag')), directory)
+            'SELECT tag FROM tags WHERE refs > 0 ORDER BY tag')), directory,
+                           progress=index_progress.completed)
         for name, value in [('source_version', source), ('embedding_version', model), ('updated_at', source)]:
             with archive.open(name + '.npy', 'w') as member:
                 np.lib.format.write_array(member, np.asarray([value]), allow_pickle=False)
@@ -174,7 +178,7 @@ def _publish(db, state_path, directory, *, user, source, model, schema, dim,
     try:
         for path, name in [(output, manifest['npzBlobName']), (state_path, manifest['contributionBlobName'])]:
             with path.open('rb') as stream:
-                blob_client(name).upload_blob(stream, overwrite=False,
+                blob_client(name).upload_blob(index_progress.Stream(stream), overwrite=False,
                                              content_settings=content_settings('application/octet-stream'))
         condition = {'overwrite': True, 'etag': etag, 'match_condition': MatchConditions.IfNotModified} if etag is not None else {'overwrite': False}
         manifest_client.upload_blob(json.dumps(manifest).encode(), content_settings=content_settings('application/json'), **condition)
@@ -202,6 +206,7 @@ def bootstrap_and_publish(*, user, source, model, schema, build, columns, effect
                 if db.execute('SELECT 1 FROM photos WHERE filename = ?', (filename,)).fetchone():
                     raise Deferred('duplicate bootstrap filename')
                 _replace(db, filename, tags)
+                index_progress.completed()
             snapshot = build(hook)
             if snapshot is None or snapshot.embedding_version != model:
                 raise Deferred('bootstrap builder failed or model changed')
@@ -217,6 +222,7 @@ def bootstrap_and_publish(*, user, source, model, schema, build, columns, effect
                 changed = db.execute('UPDATE tags SET vector = ? WHERE tag = ?', (vector.astype('<f4').tobytes(), tag))
                 if changed.rowcount != 1:
                     raise Deferred('bootstrap contributions mismatch')
+                index_progress.completed()
             db.execute('INSERT INTO provenance VALUES (?, ?, ?, ?, ?, ?)', (user, source, model, schema, STATE_VERSION, dim))
             _publish(db, path, directory, user=user, source=source, model=model, schema=schema, dim=dim,
                      manifest_client=manifest_client, etag=etag, blob_client=blob_client,
@@ -252,7 +258,7 @@ def merge_and_publish(*, user, ids, source, expected, model, schema, table, colu
         client = blob_client(manifest['contributionBlobName'])
         props = client.get_blob_properties()
         with path.open('wb') as stream:
-            client.download_blob(etag=props.etag, match_condition=MatchConditions.IfNotModified).readinto(stream)
+            client.download_blob(etag=props.etag, match_condition=MatchConditions.IfNotModified).readinto(index_progress.Stream(stream))
         db = _open(path)
         try:
             provenance = db.execute('SELECT user, source, model, schema, version, dim FROM provenance').fetchmany(2)
@@ -297,6 +303,7 @@ def merge_and_publish(*, user, ids, source, expected, model, schema, table, colu
                     row = None
                 tags = None if row is None else _photo_tags(row, columns, effective)
                 _replace(db, filename, tags)
+                index_progress.completed()
             # Stream pending tags in bounded batches; retain zero-ref vectors
             # so a later re-add never has to re-encode an existing tag.
             while True:
@@ -323,6 +330,7 @@ def merge_and_publish(*, user, ids, source, expected, model, schema, table, colu
                 matrix = (matrix / norms).astype('<f4', copy=False)
                 for tag, vector in zip(pending, matrix):
                     db.execute('UPDATE tags SET vector = ? WHERE tag = ?', (vector.tobytes(), tag))
+                index_progress.completed()
             return _publish(db, path, directory, user=user, source=source, model=model, schema=schema, dim=dim,
                             manifest_client=manifest_client, etag=etag, blob_client=blob_client,
                             blob_prefix=blob_prefix, content_settings=content_settings)

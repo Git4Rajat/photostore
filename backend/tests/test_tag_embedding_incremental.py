@@ -10,6 +10,7 @@ from azure.core.exceptions import ResourceNotFoundError
 import storage_utils as storage
 import tag_embedding_incremental as incremental
 import vision_utils
+import index_progress
 from tests.fakes import FakeTable
 from tests.test_people_embedding_index import _FakeBlobServiceClient, _FakeBlob, _Downloaded
 
@@ -92,6 +93,47 @@ def test_bootstrap_one_existing_projected_scan(ctx, monkeypatch):
     with np.load(io.BytesIO(blobs.blobs['tags/' + published['npzBlobName']]), allow_pickle=False) as data:
         assert set(data.files) == {'tags', 'embeddings', 'source_version', 'embedding_version', 'updated_at'}
     assert_equivalent('v1')
+
+
+def test_bootstrap_and_merge_report_encoding_and_transfer_progress(ctx, monkeypatch):
+    table, blobs, encoded = ctx
+    seed(table, 'a', ['dog'])
+    phases = []
+    original = incremental._write_output
+
+    def output(*args, **kwargs):
+        phases.append('output')
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(incremental, '_write_output', output)
+    callbacks = []
+    with index_progress.reporting_to(lambda: callbacks.append(phases[-1] if phases else 'scan')):
+        assert bootstrap() is not None
+        seed(table, 'b', ['beach'])
+        assert refresh(['b']) is not None
+    assert 'scan' in callbacks and 'output' in callbacks
+    assert encoded == [['dog'], ['beach']]
+    assert_equivalent()
+
+
+def test_full_encoding_reports_progress_between_bounded_batches(ctx, monkeypatch):
+    table, _, _ = ctx
+    seed(table, 'a', ['dog'])
+    tags = [f'tag-{i}' for i in range(incremental.ENCODE_BATCH * 2 + 1)]
+    monkeypatch.setattr(storage, 'effective_tags', lambda row: tags)
+    completed = []
+    batches = []
+
+    def encode(values):
+        batches.append((len(values), len(completed)))
+        return [[1.0, 0.0] for _ in values]
+
+    monkeypatch.setattr(vision_utils, 'encode_text_embeddings_batch', encode)
+    with index_progress.reporting_to(lambda: completed.append(True)):
+        result = storage._build_user_tag_embedding_index_snapshot('u', 'v1')
+    assert result.tags == sorted(tags)
+    assert [size for size, _ in batches] == [64, 64, 1]
+    assert batches[0][1] < batches[1][1] < batches[2][1]
 
 
 def test_add_remove_shared_tags_and_only_new_encodings(ctx, monkeypatch):

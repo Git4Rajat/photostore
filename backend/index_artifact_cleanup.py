@@ -215,25 +215,37 @@ def _reference_snapshot(storage, service, scope, user, expected_base):
     return version, _time(modified), _references(scope, row, user)
 
 
-def _idle_snapshot(storage, jobs, user, now):
-    from automatic_index_updates import CoverageStore, VERSION, TAG_PARTITION
+def _idle_snapshot(storage, jobs, user, now, kind):
+    """Certify only this output's source; keep a global active-claim gate.
+
+    SCOPE_KINDS describes projections, not every builder's artifact inputs.
+    Full/reconcile/compact and shared lexical builders can consume multiple
+    outputs, so their work ETags remain relevant to every family. Unmapped
+    active claims conservatively block all GC; an unused family's absent or
+    stale source control does not. The universal catalog lock is unchanged.
+    """
+    from automatic_index_updates import CoverageStore, VERSION, TAG_PARTITION, CONTROL, partition as source_partition
     from index_work import WorkStore, PARTITION, etag
     from index_updates import SCOPE_KINDS
     store = CoverageStore(storage._CTX.get('search_index_dirty_table_client'))
     versions = []
-    for kind in KINDS:
-        row = store.control(user, kind)
-        if (row is None or type(row.get('coverageVersion')) is not int
-            or row.get('coverageVersion') != VERSION
-                or row.get('libraryId') != user or row.get('kind') != kind
-                or type(row.get('active')) is not int or row['active'] != 0
-                or row.get('fullRequired') is not False
-                or not row.get('revision') or row.get('coveredRevision') != row['revision']
-                or not row.get('base')):
-            raise CleanupDeferred('SourceBusy or uncertified full source coverage')
-        versions.append((kind, _version({'etag': etag(row)}), row['base']))
+    row = store.control(user, kind)
+    if (row is None or type(row.get('coverageVersion')) is not int
+        or row.get('coverageVersion') != VERSION
+            or row.get('libraryId') != user or row.get('kind') != kind
+            or row.get('PartitionKey') != source_partition(user, kind) or row.get('RowKey') != CONTROL
+            or type(row.get('active')) is not int or row['active'] != 0
+            or row.get('fullRequired') is not False
+            or not row.get('revision') or row.get('coveredRevision') != row['revision']
+            or not row.get('base')):
+        raise CleanupDeferred('SourceBusy or uncertified full source coverage: ' + kind)
+    versions.append((kind, _version({'etag': etag(row)}), row['base']))
     if jobs is None:
         raise CleanupDeferred('Publication work storage unavailable')
+    related = {'full', 'reconcile', 'compact', 'search', 'light', 'people',
+               'albums', 'sort', 'access', 'lexical_artifact', kind}
+    if kind == 'hash':
+        related.update(('dedup', 'dedup-idle'))
     for partition in (PARTITION, TAG_PARTITION):
         for scope in SCOPE_KINDS:
             try:
@@ -245,7 +257,8 @@ def _idle_snapshot(storage, jobs, user, now):
             until = float(row.get('leaseUntil') or 0)
             if not math.isfinite(until) or until > now:
                 raise CleanupDeferred('Active publication lease')
-            versions.append((partition, scope, _version({'etag': etag(row)})))
+            if scope in related:
+                versions.append((partition, scope, _version({'etag': etag(row)})))
     return tuple(versions)
 
 
@@ -262,6 +275,29 @@ def _items(service, scope, policy, check, *, bounded=True):
             check()
             if scope.generation(item.name) is not None:
                 yield item
+
+
+def _young_sibling(service, scope, item, now, policy, check):
+    """Protect the whole tag generation if either existing sidecar is young.
+
+    Fixed-size point reads avoid retaining an unbounded set of young UUIDs.
+    Absent siblings are allowed for old, never-committed orphan generations;
+    other read failures defer the family rather than authorizing half-GC.
+    """
+    generation = scope.generation(item.name)
+    for suffix in scope.suffixes:
+        name = scope.prefix + generation + suffix
+        if name == item.name:
+            continue
+        check()
+        client = service.get_blob_client(container=scope.container, blob=name)
+        try:
+            props = client.get_blob_properties()
+        except ResourceNotFoundError:
+            continue
+        if now - _time(props.last_modified) < policy.grace_seconds:
+            return True
+    return False
 
 
 @contextmanager
@@ -288,7 +324,13 @@ def artifact_catalog_serialization(user, *, storage=None):
 
 def cleanup_user_index_artifacts(user, *, storage=None, jobs=None, serialization=None,
                                  policy=None, now=None, kinds=KINDS):
-    """Return a retryable report; never hide deleted count after partial failure.
+    """Return aggregate and per-kind retryable reports with exact deleted counts.
+
+    Each family completes its entire bounded retention survey before deleting
+    any of its bytes. Failed evidence defers only that family; source and
+    pointer CAS proofs are rechecked per deletion under the SAME renewable
+    library catalog lock. RAM is bounded by one family's references/retention.
+    The deletion budget is global and never exceeds 100 blobs per call.
 
     ``serialization(user)`` must hold the universal catalog lock, yield a guard
     with check(), and cover every publisher/base reader for this library. Call
@@ -307,10 +349,35 @@ def cleanup_user_index_artifacts(user, *, storage=None, jobs=None, serialization
     if not selected or len(set(selected)) != len(selected) or set(selected) - set(KINDS):
         raise ValueError('Unknown or duplicate cleanup kind')
     all_scopes = scopes(storage, user)
-    report = dict(status='deferred', deleted=0, examined=0, reason='catalog serialization required')
-    if serialization is None or policy.max_deletions == 0:
+    reports = {kind: dict(status='deferred', deleted=0, examined=0,
+                          reason='catalog serialization required') for kind in selected}
+    report = dict(status='deferred', deleted=0, examined=0,
+                  reason='catalog serialization required', kinds=reports)
+
+    def finish():
+        report['deleted'] = sum(row['deleted'] for row in reports.values())
+        report['examined'] = sum(row['examined'] for row in reports.values())
+        statuses = {row['status'] for row in reports.values()}
+        if statuses == {'complete'}:
+            report['status'] = 'complete'
+        elif 'capped' in statuses:
+            report['status'] = 'capped'
+        elif 'complete' in statuses or report['deleted']:
+            report['status'] = 'partial'
+        else:
+            report['status'] = 'deferred'
+        report['reason'] = '; '.join(kind + ': ' + row['reason']
+                                    for kind, row in reports.items() if row['reason'])
         return report
+
+    if serialization is None or policy.max_deletions == 0:
+        if policy.max_deletions == 0:
+            for row in reports.values():
+                row.update(status='capped', reason='deletion cap reached')
+        return finish()
     service = storage._CTX.get('blob_service_client')
+    limit = min(100, policy.max_deletions)
+    deleted = 0
     try:
         with serialization(user) as guard:
             def check():
@@ -319,62 +386,86 @@ def cleanup_user_index_artifacts(user, *, storage=None, jobs=None, serialization
                 index_publication.catalog_check()
 
             check()
-            idle = _idle_snapshot(storage, jobs, user, now)
-            bases = {entry[0]: entry[2] for entry in idle if entry[0] in KINDS}
-            plans = []
-            # Finish every reference/retention survey BEFORE deleting any bytes.
-            # At most retain_generations + bounded pointer fields live in RAM.
             for scope in all_scopes:
                 if scope.kind not in selected:
                     continue
-                version, modified, refs = _reference_snapshot(storage, service, scope, user, bases[scope.kind])
-                if now - modified < policy.grace_seconds:
-                    raise CleanupDeferred('Pointer retirement is inside reader grace')
-                newest = []
-                for item in _items(service, scope, policy, check):
-                    report['examined'] += 1
-                    generation = scope.generation(item.name)
-                    if item.name in refs or any(entry[1] == generation for entry in newest):
-                        continue
-                    entry = (_time(item.last_modified), generation)
-                    heapq.heappush(newest, entry)
-                    if len(newest) > policy.retain_generations - 1:
-                        heapq.heappop(newest)
-                retained = {generation for _, generation in newest}
-                plans.append((scope, version, modified, refs, retained))
-
-            for scope, version, modified, refs, retained in plans:
-                for item in _items(service, scope, policy, check):
-                    if report['deleted'] >= policy.max_deletions:
-                        report.update(status='capped', reason='deletion cap reached')
-                        return report
-                    if (item.name in refs or scope.generation(item.name) in retained
-                            or now - _time(item.last_modified) < policy.grace_seconds):
-                        continue
-                    candidate_version = _version(item)
-                    client = service.get_blob_client(container=scope.container, blob=item.name)
-                    props = client.get_blob_properties()
-                    if (_version(props) != candidate_version
-                            or now - _time(props.last_modified) < policy.grace_seconds):
-                        raise CleanupDeferred('Candidate changed or became young')
+                result = reports[scope.kind]
+                try:
                     check()
-                    if _idle_snapshot(storage, jobs, user, now) != idle:
-                        raise CleanupDeferred('Source coverage changed')
-                    live = _reference_snapshot(storage, service, scope, user, bases[scope.kind])
-                    if live != (version, modified, refs):
-                        raise CleanupDeferred('Manifest changed during cleanup')
+                    idle = _idle_snapshot(storage, jobs, user, now, scope.kind)
+                    base = idle[0][2]
+                    version, modified, refs = _reference_snapshot(storage, service, scope, user, base)
+                    if now - modified < policy.grace_seconds:
+                        raise CleanupDeferred('Pointer retirement is inside reader grace')
+                    newest = []
+                    for item in _items(service, scope, policy, check):
+                        result['examined'] += 1
+                        generation = scope.generation(item.name)
+                        if item.name in refs:
+                            continue
+                        entry = (_time(item.last_modified), generation)
+                        existing = next((i for i, value in enumerate(newest)
+                                         if value[1] == generation), None)
+                        if existing is not None:
+                            # A newer sidecar retires the entire generation,
+                            # not just the first suffix encountered in listing.
+                            if entry > newest[existing]:
+                                newest[existing] = entry
+                                heapq.heapify(newest)
+                            continue
+                        heapq.heappush(newest, entry)
+                        if len(newest) > policy.retain_generations - 1:
+                            heapq.heappop(newest)
+                    retained = {generation for _, generation in newest}
+                    for item in _items(service, scope, policy, check):
+                        if (item.name in refs or scope.generation(item.name) in retained
+                                or now - _time(item.last_modified) < policy.grace_seconds):
+                            continue
+                        if _young_sibling(service, scope, item, now, policy, check):
+                            continue
+                        if deleted >= limit:
+                            result.update(status='capped', reason='deletion cap reached')
+                            break
+                        candidate_version = _version(item)
+                        client = service.get_blob_client(container=scope.container, blob=item.name)
+                        props = client.get_blob_properties()
+                        if (_version(props) != candidate_version
+                                or now - _time(props.last_modified) < policy.grace_seconds):
+                            raise CleanupDeferred('Candidate changed or became young')
+                        check()
+                        if _idle_snapshot(storage, jobs, user, now, scope.kind) != idle:
+                            raise CleanupDeferred('Source coverage changed')
+                        live = _reference_snapshot(storage, service, scope, user, base)
+                        if live != (version, modified, refs):
+                            raise CleanupDeferred('Manifest changed during cleanup')
+                        check()
+                        try:
+                            client.delete_blob(etag=candidate_version,
+                                               match_condition=MatchConditions.IfNotModified)
+                        except ResourceNotFoundError:
+                            continue
+                        result['deleted'] += 1
+                        deleted += 1
+                    else:
+                        result.update(status='complete', reason='')
                     check()
-                    try:
-                        client.delete_blob(etag=candidate_version,
-                                           match_condition=MatchConditions.IfNotModified)
-                    except ResourceNotFoundError:
-                        continue
-                    report['deleted'] += 1
+                except Exception as error:
+                    result.update(status='partial' if result['deleted'] else 'deferred',
+                                  reason=f'{type(error).__name__}: {error}')
+                    # A family failure can be isolated only while the shared
+                    # renewable guard remains live. Never continue after loss.
+                    check()
             check()
-            report.update(status='complete', reason='')
     except Exception as error:
-        report.update(status='deferred', reason=f'{type(error).__name__}: {error}')
-    return report
+        if all(row['status'] == 'complete' for row in reports.values()):
+            # A context-exit renewal/check failure is still a retryable pass,
+            # even if all deletions completed before the guard failed.
+            reports[scope.kind]['status'] = 'partial' if reports[scope.kind]['deleted'] else 'deferred'
+        for row in reports.values():
+            if row['status'] != 'complete':
+                row.update(status='partial' if row['deleted'] else 'deferred',
+                           reason=f'{type(error).__name__}: {error}')
+    return finish()
 
 
 def iter_immutable_locations(storage, user, *, kinds=KINDS):

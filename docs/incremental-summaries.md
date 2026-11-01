@@ -32,7 +32,8 @@ stripped `INDEX_MAINTENANCE_QUEUE_NAME`, not a separate environment-variable
 opt-in. Automatic work reuses existing jobs/queue and `searchdirty` storage.
 All running source writers must use the tracked-client version; mixed-version
 or external raw writers invalidate the coverage assumptions. This documentation
-update changes no code/infrastructure and performs no deployment.
+update changes no code/infrastructure and performs no deployment; it adds no
+artifact overlays or expansion of Core ownership.
 
 ## Search-database integration
 
@@ -97,8 +98,20 @@ Runtime tests in
 exercise the real SQLite hook on noop, delta and multi-pass drains without
 compaction/full scans, summary publication failure/replay, retained dependency
 dirty IDs and missing-schema compaction scheduling. Immutable-artifact GC runs
-only after successful maintenance completion/claim release and requires all five
-automatic source controls idle/certified; it is not a summary read-side hook.
+after successful maintenance completion/claim release and during the existing
+60-second index-worker recovery scan; it is not a summary read-side hook.
+Eligibility is **per artifact family**, requiring only that family's exact
+idle/full-certified control, matching manifest lineage and complete bounded
+retention survey, not all five controls. Missing/stale unrelated controls do not
+block eligible families. The same real renewable catalog lock, global active
+maintenance/model-tag claim gate and conservative related-builder ETag checks
+remain required. Reports expose per-kind outcomes and aggregate
+`complete`/`partial`/`deferred`/`capped` status; default grace is 24 hours with a
+global hard cap of 100 blob deletions per call. Periodic discovery accepts any
+canonical supported family control, not only certified hash controls, and uses
+bounded rotating deduplication (default 25 libraries per recovery). See the
+[GC policy](incremental-index-upgrades.md#universal-publication-lock-and-immutable-gc)
+for retention, sidecars, configuration and fail-closed checks.
 
 Publication and source writes are not one atomic blob/table transaction. Readers
 may temporarily observe a stale, uncertified artifact pointer if a source writer
@@ -265,8 +278,9 @@ live distributed concurrency/load certification. Every running source writer
 must use the current tracked-client version, and ordinary cleanup still needs
 the explicit external all-writer shutdown/proof described above.
 
-Latest verified combined backend suite: **5,098 passed, 14 skipped**; all skips
-require the unavailable private TIFF corpus. Frontend: **816 passed across
-57 files in the previously rerun suite**; a rerun against the current main state
-is pending. These are prior verified results, not tests rerun for this
-documentation-only update. No infrastructure change or deployment was performed.
+Latest agent-reported full backend suite after feedback 1, 2, 3 and 6:
+**5,300 passed, 14 skipped, 12 existing warnings**; all skips require the
+unavailable private TIFF corpus. Frontend is unchanged; its last verified run
+was **816 passed across 57 files**, a prior run, not a rerun of the current state.
+Neither suite was rerun for this documentation-only update. No production/code
+edits, infrastructure change or deployment was performed.

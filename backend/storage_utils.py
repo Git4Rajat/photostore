@@ -3879,6 +3879,7 @@ _TAG_META_COLUMNS = [
 
 
 def _build_user_tag_embedding_index_snapshot(user_id: str, source_version: str, *, contribution_hook=None) -> Optional[TagEmbeddingIndexSnapshot]:
+    import index_progress
     # The one guard that matters: only ever build where real CLIP is loaded.
     # Building this from the backend role would silently produce hash-
     # fallback vectors that could never meaningfully compare against the
@@ -3900,6 +3901,7 @@ def _build_user_tag_embedding_index_snapshot(user_id: str, source_version: str, 
             if contribution_hook is not None:
                 contribution_hook(row)
             tag_set.update(effective_tags(row))
+            index_progress.completed()
     except Exception:
         _LOGGER.exception('Tag embedding index scan failed for user %s', user_id)
         return None   # never persist "no tags" because a scan failed
@@ -3910,9 +3912,17 @@ def _build_user_tag_embedding_index_snapshot(user_id: str, source_version: str, 
             updated_at=source_version, tags=[], embeddings=np.zeros((0, 0), dtype=np.float32),
         )
 
-    raw_embeddings = vision_utils.encode_text_embeddings_batch(tags)
-    if not raw_embeddings or len(raw_embeddings) != len(tags):
-        return None
+    # Complete bounded encoding batches so a large vocabulary reports real
+    # work to Vision's watchdog. A blocked encoder emits no progress.
+    from tag_embedding_incremental import ENCODE_BATCH
+    raw_embeddings = []
+    for start in range(0, len(tags), ENCODE_BATCH):
+        batch = tags[start:start + ENCODE_BATCH]
+        encoded = vision_utils.encode_text_embeddings_batch(batch)
+        if not encoded or len(encoded) != len(batch):
+            return None
+        raw_embeddings.extend(encoded)
+        index_progress.completed()
     matrix = np.asarray(raw_embeddings, dtype=np.float32)
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     norms[norms == 0] = 1.0

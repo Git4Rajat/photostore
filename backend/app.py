@@ -11004,16 +11004,25 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, 
         if tail and tail['state'] not in ('complete','cancelled'):return 'wave_owned'
     scope = index_updates.validate_scope(scope)
     if INDEX_MAINTENANCE_QUEUE_NAME and scope == 'tag_embedding':
-        # Model work is persisted in jobs, but never sent to index-worker's
-        # queue. Vision's existing sweep is the sole claimant for this scope.
+        # A model-only outbox wakes the EXISTING vision queue, never index-worker
+        # and never a fabricated photo job. Persist before attempting publication.
         import automatic_index_updates as automatic
         import index_work
         if jobs_table_client is None:
             return 'unavailable'
         try:
-            index_work.WorkStore(jobs_table_client, partition=automatic.TAG_PARTITION).request(key, scope,
-                advance=reason not in index_updates.READ_REASONS)
-            return 'queued'
+            store = index_work.WorkStore(jobs_table_client, partition=automatic.TAG_PARTITION)
+            delay = 2 if coalesce and reason not in index_updates.READ_REASONS else 0
+            if delay_override is not None:
+                delay = max(1, int(delay_override))
+            token = store.request(key, scope, advance=reason not in index_updates.READ_REASONS, delay=delay)
+            sent = store.notify(token, lambda library, kind, revision, wait: _send_tag_index_wakeup(
+                library, kind, revision, wait, reason=reason, capture=capture))
+            if not sent:
+                current = store._get(token)
+                if ipwork_queue_client is None or (current and current.get('failed')):
+                    return 'unavailable'
+            return 'queued' if sent else 'already_active'
         except Exception:
             worker_logger.exception('Tag maintenance intent unavailable for %s', key)
             return 'unavailable'
@@ -11098,15 +11107,46 @@ def _send_index_wakeup(library, scope, revision, delay=0, *, reason='pending-rec
 _INDEX_ARTIFACT_RECOVERY = threading.local()
 
 
+TAG_INDEX_MAINTENANCE_TYPE = 'tag_index_maintenance'
+
+
+def _tag_index_payload(library, revision):
+    import automatic_index_updates as automatic
+    import index_work
+    return {
+        'type': TAG_INDEX_MAINTENANCE_TYPE, 'protocolVersion': 1,
+        'userId': library, 'scope': 'tag_embedding',
+        'jobId': _index_build_job_id(library) + '-tag_embedding',
+        'maintenancePartition': automatic.TAG_PARTITION,
+        'maintenanceKey': index_work.WorkStore.key(library, 'tag_embedding'),
+        'intentRevision': revision,
+    }
+
+
+def _send_tag_index_wakeup(library, scope, revision, delay=0, *, reason='pending-recovery', capture=None):
+    if scope != 'tag_embedding':
+        raise ValueError('Vision maintenance only accepts tag_embedding')
+    queue = ipwork_queue_client
+    if queue is None:
+        raise RuntimeError('Vision queue unavailable')
+    payload = _tag_index_payload(library, revision)
+    payload['reason'] = reason
+    _upsert_job_status(payload['jobId'], library, INDEX_BUILD_JOB_TYPE, 'queued', indexScope=scope)
+    sent = queue.send_message(json.dumps(payload), visibility_timeout=delay or None)
+    if capture is not None:
+        capture.append((queue, sent))
+
+
 def recover_pending_index_work(library=None, *, retry_failed=False):
     from bisect import insort
     import index_work
-    if jobs_table_client is None or index_maintenance_queue_client is None:
+    if jobs_table_client is None or (index_maintenance_queue_client is None and ipwork_queue_client is None):
         return 0
     # Only the worker's unscoped periodic sweep may discover GC work. Reuse
     # the existing controls scan, not a metadata scan or another WorkStore scope.
     gc_limit = 0
-    if library is None and os.getenv('APP_ROLE', 'core').strip().lower() == 'index-worker':
+    gc_enabled = library is None and index_maintenance_queue_client is not None
+    if gc_enabled and os.getenv('APP_ROLE', 'core').strip().lower() == 'index-worker':
         try:
             gc_limit = max(0, min(1000, int(os.getenv('INDEX_ARTIFACT_CLEANUP_LIBRARIES_PER_RECOVERY', '25'))))
         except ValueError:
@@ -11115,15 +11155,17 @@ def recover_pending_index_work(library=None, *, retry_failed=False):
     cursor = getattr(_INDEX_ARTIFACT_RECOVERY, 'cursor', '')
     after, before = [], []
     store = index_work.WorkStore(jobs_table_client)
+    import automatic_index_updates as automatic
+    tags = index_work.WorkStore(jobs_table_client, partition=automatic.TAG_PARTITION)
     if retry_failed:
         # Explicit user repair only; poison jobs never restart on a polling read.
-        query = f"PartitionKey eq '{index_work.PARTITION}' and libraryId eq '{_escape_odata(library)}'"
-        for row in jobs_table_client.query_entities(query):
-            if row.get('failed'):
-                store.request(row['libraryId'], row['scope'])
+        for target in (store, tags):
+            query = f"PartitionKey eq '{target.partition}' and libraryId eq '{_escape_odata(library)}'"
+            for row in jobs_table_client.query_entities(query):
+                if row.get('failed') and (target is store or row.get('scope') == 'tag_embedding'):
+                    target.request(row['libraryId'], row['scope'])
     # Source coverage survives a failed post-write scheduler call. Do not
     # restart poison work automatically: request(advance=False) preserves it.
-    import automatic_index_updates as automatic
     if search_index_dirty_table_client is not None:
         query = "RowKey eq '!coverage'"
         if library:
@@ -11140,25 +11182,27 @@ def recover_pending_index_work(library=None, *, retry_failed=False):
                     or type(row.get('coverageVersion')) is not int
                     or row['coverageVersion'] != automatic.VERSION):
                 continue
-            if row.get('coveredRevision') == row.get('revision'):
-                if (gc_limit and kind == 'hash' and row.get('revision')
-                        and type(row.get('active')) is int and row['active'] == 0
-                        and row.get('fullRequired') is False and row.get('base')):
-                    # Two bounded sorted windows allow wraparound in one scan,
-                    # independent of page order. No all-library IDs set survives
-                    # the scan; one exact hash control exists per library.
-                    item = (row['PartitionKey'], user)
-                    window = after if item[0] > cursor else before
+            if gc_limit:
+                # Any canonical family control can nominate its library. GC
+                # independently certifies each output under the shared lock;
+                # missing/unready hash coverage must not hide other families.
+                # Stable library key + bounded-window dedup keeps one slot per
+                # library without an unbounded all-library identity set.
+                item = (automatic.partition(user, 'hash'), user)
+                window = after if item[0] > cursor else before
+                if item not in window:
                     insort(window, item)
                     if len(window) > gc_limit:
                         window.pop()
+            if row.get('coveredRevision') == row.get('revision'):
                 continue
             if automatic.wave_pending(user):
                 continue
-            target = (index_work.WorkStore(jobs_table_client, partition=automatic.TAG_PARTITION)
-                      if kind == 'tag_embedding' else store)
+            target = tags if kind == 'tag_embedding' else store
             target.request(user, automatic.SCOPES.get(kind, kind), advance=False)
-    recovered = store.recover(_send_index_wakeup, library=library)
+    recovered = store.recover(_send_index_wakeup, library=library) if index_maintenance_queue_client is not None else 0
+    # Recovery publishes only: index-worker must never claim/model-load tag jobs.
+    recovered += tags.recover(_send_tag_index_wakeup, library=library)
     # Publish pending wakeups first. Even a failing/deferred cleanup consumes
     # its rotation slot so busy/broken first libraries cannot starve later ones.
     for key, user in (after + before)[:gc_limit]:
@@ -11168,6 +11212,93 @@ def recover_pending_index_work(library=None, *, retry_failed=False):
         except Exception:
             worker_logger.warning('Periodic index artifact cleanup failed for %s', user, exc_info=True)
     return recovered
+
+
+def _run_tag_index_maintenance_payload(payload):
+    """One exact-library vision job. Queue delivery counts aren't failure counts."""
+    import automatic_index_updates as automatic
+    import index_work
+    import index_publication
+    library = payload.get('userId')
+    revision = payload.get('intentRevision')
+    if (not isinstance(library, str) or not library or library != library.strip()
+            or not isinstance(revision, str) or not revision
+            or type(payload.get('protocolVersion')) is not int or payload['protocolVersion'] != 1
+            or any(payload.get(field) != value for field, value in _tag_index_payload(library, revision).items())
+            or any(field in payload for field in ('filename', 'steps', 'user_id', 'correlationId'))):
+        return 'tag_index_invalid'
+    # Wrong-role consumption must not erase valid model work or alter job status.
+    if (os.getenv('APP_ROLE', '').strip().lower() != 'vision'
+            or jobs_table_client is None or not INDEX_MAINTENANCE_QUEUE_NAME
+            or not vision_utils.image_encoder_available()):
+        return 'tag_index_retry'
+    store = index_work.WorkStore(jobs_table_client, partition=automatic.TAG_PARTITION)
+    key = payload['maintenanceKey']
+    claim = None
+    try:
+        current = store._get(key)
+        if current is None:
+            return 'tag_index_noop'
+        if current.get('libraryId') != library or current.get('scope') != 'tag_embedding':
+            return 'tag_index_invalid'
+        if current.get('failed'):
+            return 'tag_index_failed'
+        if float(current.get('notBefore') or 0) > store.clock():
+            return 'tag_index_retry'
+        # An old wake intentionally claims the latest revision of this SAME job.
+        claim = store.claim(key)
+        if claim is None:
+            return 'tag_index_noop'
+        exhausted = False
+        with index_publication.publication(store, claim):
+            with index_publication.catalog_serialization(None, library,
+                    storage_utils_module._CTX.get('blob_service_client'),
+                    storage_utils_module._lexical_index_container_name(), require_real=True):
+                # Check source barriers BEFORE the poison ceiling. A pre-write
+                # wake may spend arbitrarily many queue deliveries waiting here.
+                automatic.check_source_admission(library)
+                if automatic.wave_pending(library):
+                    raise automatic.SourceBusy('Active upload wave')
+                control = automatic.configured_store().control(library, 'tag_embedding')
+                if control and control.get('active'):
+                    raise automatic.SourceBusy('Active tag source reservation')
+                if claim.attempt > INDEX_BUILD_MAX_RETRIES:
+                    if queue_service_client is None or not INDEX_MAINTENANCE_DEADLETTER_QUEUE_NAME:
+                        raise RuntimeError('Tag maintenance deadletter queue unavailable')
+                    queue_service_client.get_queue_client(INDEX_MAINTENANCE_DEADLETTER_QUEUE_NAME).send_message(
+                        json.dumps({'originalPayload': payload, 'reason': 'Tag maintenance attempts exhausted',
+                                    'intentRevision': claim.revision, 'attempts': claim.attempt - 1}))
+                    exhausted = True
+                else:
+                    _run_index_build_job(library, payload['jobId'], 'tag_embedding')
+        # Stop renewers/check ownership before releasing or deleting the intent.
+        newer = store.finish(claim, failed=exhausted)
+        claim = None
+        if newer:
+            store.notify(key, _send_tag_index_wakeup)
+        if exhausted:
+            if not newer:
+                _upsert_job_status(payload['jobId'], library, INDEX_BUILD_JOB_TYPE, 'failed',
+                    indexScope='tag_embedding', error='Tag maintenance attempts exhausted')
+            return 'tag_index_failed'
+        _notify_index_ready(library, payload['jobId'], 'tag_embedding')
+        return 'tag_index_done'
+    except automatic.SourceBusy:
+        if claim is not None:
+            store.release(claim, deferred=True, retry_delay=10, retry_reason='barrier_wait')
+        # This delivery remains the wake: run_ipworker re-delays its visibility.
+        # Sending a replacement AND retaining every busy delivery would multiply
+        # queue messages at each barrier wait. The durable retry timing above
+        # lets bounded recovery resend if this replica/receipt is lost instead.
+        return 'tag_index_retry'
+    except Exception:
+        if claim is not None:
+            try:
+                store.release(claim, retry_delay=30)
+            except Exception:
+                worker_logger.warning('Tag maintenance release failed', exc_info=True)
+        worker_logger.exception('Tag maintenance failed; durable intent and queue receipt retained')
+        return 'tag_index_retry'
 
 
 def _run_index_maintenance_payload(payload):
@@ -17240,6 +17371,10 @@ def _process_ipwork_message_impl(message) -> str:
         if isinstance(payload, dict):
             job_id = str(payload.get('jobId') or payload.get('correlationId') or '').strip()
             user_id = str(payload.get('user_id') or payload.get('userId') or '').strip()
+            if payload.get('type') == TAG_INDEX_MAINTENANCE_TYPE:
+                import index_progress
+                with index_progress.reporting_to(getattr(_ipwork_metrics_context, 'wave_progress', None)):
+                    return _run_tag_index_maintenance_payload(payload)
             if payload.get('type') == 'upload_wave_stage':
                 from wave_runtime import consume
                 # Same budget the ipwork watchdog below uses to decide when to
@@ -17273,6 +17408,9 @@ def _process_ipwork_message_impl(message) -> str:
                 return 'retry_exhausted'  # terminal ACK, not a productive completion/milestone
             outcome = _handle_ipwork_queue_payload(payload, job_id, user_id)
     except Exception as exc:
+        if isinstance(payload, dict) and payload.get('type') == TAG_INDEX_MAINTENANCE_TYPE:
+            worker_logger.exception('Tag maintenance dispatch failed; retaining queue receipt')
+            return 'tag_index_retry'
         if job_id and user_id:
             try:
                 _upsert_job_status(job_id, user_id, 'ipwork', 'failed', error='Photo processing failed')
@@ -17475,6 +17613,8 @@ def _prepare_ipwork_face_indexes(messages, cancelled) -> None:
             payload = json.loads(message.content or '{}')
         except (TypeError, ValueError):
             continue
+        if isinstance(payload, dict) and payload.get('type') == TAG_INDEX_MAINTENANCE_TYPE:
+            continue  # Model maintenance is never photo/face preparation.
         if not isinstance(payload, dict) or not isinstance(payload.get('steps'), list) or 'face' not in payload['steps']:
             continue
         user_id = str(payload.get('user_id') or payload.get('userId') or '').strip()
@@ -17730,7 +17870,8 @@ def run_ipworker() -> None:
                         in_flight[future] = message
                         task_started[future] = submitted_at
                         try:
-                            if json.loads(message.content).get('type')=='upload_wave_stage':wave_receipts[future]=submitted_at
+                            if json.loads(message.content).get('type') in ('upload_wave_stage', TAG_INDEX_MAINTENANCE_TYPE):
+                                wave_receipts[future]=submitted_at
                         except (ValueError,TypeError,AttributeError):pass
                         task_receipts[future] = wave_receipt_at
 
@@ -17801,7 +17942,8 @@ def run_ipworker() -> None:
                             in_flight[future] = message
                             task_started[future] = submitted_at
                             try:
-                                if json.loads(message.content).get('type')=='upload_wave_stage':wave_receipts[future]=submitted_at
+                                if json.loads(message.content).get('type') in ('upload_wave_stage', TAG_INDEX_MAINTENANCE_TYPE):
+                                    wave_receipts[future]=submitted_at
                             except (ValueError,TypeError,AttributeError):pass
                             task_receipts[future] = received_at
 
@@ -17877,6 +18019,12 @@ def run_ipworker() -> None:
                     if outcome == 'lease_busy' and int(getattr(message, 'dequeue_count', 0) or 0) < IPWORK_LEASE_RETRY_LIMIT:
                         continue
                     if outcome == 'error':
+                        continue
+                    if outcome == 'tag_index_retry':
+                        try:
+                            queue_client.update_message(message, visibility_timeout=10)
+                        except Exception:
+                            worker_logger.exception('Tag maintenance queue retry visibility update failed')
                         continue
                     # A real processing completion ('done', vs a noop/not_found
                     # that changed nothing) counts toward this user's rebuild
