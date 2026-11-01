@@ -776,12 +776,12 @@ const waitForOnline = () => new Promise<void>((resolve) => {
 
 const isRetriableUploadError = (err: unknown): boolean => {
     const anyErr = err as any;
-    const status = anyErr?.response?.status;
+    const status = anyErr?.response?.status ?? anyErr?.statusCode ?? anyErr?.status;
     const code = anyErr?.code;
     if (status === 408 || status === 425 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504) {
         return true;
     }
-    return code === 'ECONNABORTED' || code === 'ERR_NETWORK' || !navigator.onLine;
+    return code === 'ECONNABORTED' || code === 'ERR_NETWORK' || code === 'REQUEST_SEND_ERROR' || !navigator.onLine;
 };
 
 const isAbortUploadError = (err: unknown): boolean => {
@@ -2252,27 +2252,19 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // unchanged server-side; this only cuts how many separate HTTP
     // requests/gunicorn threads are spent invoking it.
     //
-    // Wider window than init-batch's on purpose: a live HAR during a real
-    // upload measured a 5.35s MEDIAN gap between consecutive files becoming
-    // finalize-ready (init's arrivals cluster at session start; finalize's
-    // don't -- each file's readiness is staggered by however long its own
-    // staging took). A short window mostly catches nothing under that
-    // arrival pattern. This can afford to be generous specifically because
-    // "Upload complete" no longer waits on finalize settling (see
-    // runUploadSession) -- the wait is now invisible background latency, not
-    // time the user watches a spinner for, so trading a few seconds of
-    // additional background delay for meaningfully larger batches is free.
+    // Collect for a fixed window from the first ready file. The previous
+    // resettable 200ms debounce flushed on small gaps between arrivals: a
+    // small-file HAR averaged only 2.02 files/request despite the cap of 24.
+    // Arrivals neither shorten nor extend this window. Transfers continue
+    // independently; even an isolated final file flushes after at most 1s
+    // when the dispatch gate has capacity.
     //
     // Same `force` split as flushInitBatch above, same reasoning.
     //
-    // 2026-10-31: raised 12->24 alongside backend's MAX_INIT_BATCH_FILES
-    // (20->40, see backend/app.py -- shared cap with init-batch). Safe on the
-    // latency math: measured finalize-batch latency today is 1-3s per batch
-    // of up to 12 (dominated by sequential per-file Table Storage writes, not
-    // CPU-bound work), so 24 lands around 2-6s -- nowhere near gunicorn's
-    // 600s --timeout or Container Apps' request ceiling.
+    // Stay below the backend's shared init/finalize request cap. Larger
+    // batches still perform sequential per-file work on the server.
     const FINALIZE_BATCH_MAX_SIZE = 24;
-    const FINALIZE_BATCH_DEBOUNCE_MS = 200;
+    const FINALIZE_BATCH_COLLECTION_MS = 1000;
     const FINALIZE_BATCH_MAX_WAIT_MS = 2500;
 
     const flushFinalizeBatch = (force: boolean) => {
@@ -2346,10 +2338,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 flushFinalizeBatch(true);
                 return;
             }
-            if (batchFinalizeDebounceTimerRef.current) {
-                clearTimeout(batchFinalizeDebounceTimerRef.current);
+            if (!batchFinalizeDebounceTimerRef.current) {
+                batchFinalizeDebounceTimerRef.current = setTimeout(() => { flushFinalizeBatch(false); }, FINALIZE_BATCH_COLLECTION_MS);
             }
-            batchFinalizeDebounceTimerRef.current = setTimeout(() => { flushFinalizeBatch(false); }, FINALIZE_BATCH_DEBOUNCE_MS);
             if (!batchFinalizeMaxWaitTimerRef.current) {
                 batchFinalizeMaxWaitTimerRef.current = setTimeout(() => { flushFinalizeBatch(false); }, FINALIZE_BATCH_MAX_WAIT_MS);
             }
@@ -3079,6 +3070,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             const chunkSize = file.size <= stagingBlockSize ? file.size : stagingBlockSize;
             const BlockBlobClient = await loadBlockBlobClient();
             const blockBlobClient = new BlockBlobClient(initResponse.blobUrl);
+            // Fresh small originals need one atomic PUT, not a block PUT plus
+            // a block-list commit. Keep retries bounded to 1MiB and retain the
+            // existing block checkpoint path for every resumed upload.
+            const singlePut = file.size > 0 && file.size <= Math.min(stagingBlockSize, MB)
+                && !options?.existingUploadId && !options?.existingBlockIds?.length;
 
             // Enumerate every block up front. Block IDs are derived from the block
             // index, so blocks can be staged out of order and in parallel — the final
@@ -3180,23 +3176,45 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 void postUpload('/upload/transfer-heartbeat', {}).catch(() => undefined);
             }, UPLOAD_TRANSFER_HEARTBEAT_MS);
             try {
-                await Promise.all(Array.from({ length: stageConcurrency }, () => stageWorker()));
+                if (!singlePut) {
+                    await Promise.all(Array.from({ length: stageConcurrency }, () => stageWorker()));
+                }
             } finally {
                 clearInterval(transferHeartbeat);
             }
 
             const finalBlockIds = blockIds.filter(Boolean);
-            if (finalBlockIds.length === 0) {
+            if (!singlePut && finalBlockIds.length === 0) {
                 throw new Error('No upload blocks were staged.');
             }
             options?.onFinalizeStarted?.();
+            const singlePutHeartbeat = singlePut ? setInterval(() => {
+                void postUpload('/upload/transfer-heartbeat', {}).catch(() => undefined);
+            }, UPLOAD_TRANSFER_HEARTBEAT_MS) : null;
             try {
-                await blockBlobClient.commitBlockList(finalBlockIds, {
+                const commitOptions = {
                     abortSignal: options?.signal,
                     blobHTTPHeaders: {
                         blobContentType: file.type || 'application/octet-stream',
                     },
-                });
+                };
+                if (singlePut) {
+                    for (let attempt = 0; ; attempt++) {
+                        if (uploadStopRequestedRef.current || options?.signal?.aborted) {
+                            throw new Error(UPLOAD_STOPPED_ERROR);
+                        }
+                        try {
+                            await blockBlobClient.upload(file, file.size, commitOptions);
+                            break;
+                        } catch (error) {
+                            if (isAbortUploadError(error) || !isRetriableUploadError(error) || attempt >= 2) throw error;
+                            await waitForUploadRetry(100 * 2 ** attempt,
+                                options?.signal || uploadRetryStopRef.current.signal);
+                        }
+                    }
+                } else {
+                    await blockBlobClient.commitBlockList(finalBlockIds, commitOptions);
+                }
             } catch (commitErr) {
                 // abortSignal only tears down the client's view of the request --
                 // once Azure has received the commit, it finishes server-side
@@ -3220,7 +3238,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 if (committedSize !== file.size) {
                     throw commitErr;
                 }
+            } finally {
+                if (singlePutHeartbeat !== null) clearInterval(singlePutHeartbeat);
             }
+            if (singlePut) options?.onChunkCommitted?.(file.size);
             // The bytes are now durably committed to blob storage -- everything
             // left (register/dedup/queue this upload via /upload/finalize) is
             // backend bookkeeping, not data transfer, and measured at 20-90s+

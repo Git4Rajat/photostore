@@ -2,6 +2,7 @@ import {UploadAssetPreparer} from './uploadAssetPreparation';
 import type {UploadMetadataDescriptor, UploadMetadataPacket} from '../utils/uploadMetadata';
 import {isVideoFilename} from '../utils/photoDisplay';
 import {extractBrowserExif} from '../utils/browserExifTool';
+import {UploadWorkerReuse, discardUploadWorker, type UploadWorker} from './uploadWorkerReuse';
 import {PREPARATION_ASSETS, type AssetPreparationDiagnostic, type PreparationAsset, type UploadPreparationReport} from '../utils/uploadPreparationDiagnostics';
 
 export interface PreparedUpload {
@@ -59,6 +60,7 @@ export class UploadPreparationPipeline {
     private admission = new PreparationGate(5);
     private puts = new PreparationGate(2);
     private disposed = false;
+    private metadataWorkers = new UploadWorkerReuse();
 
     start(file: File, sha256: string, targets: UploadAssetTargets, signal: AbortSignal): Promise<PreparedUpload> {
         const started = performance.now();
@@ -110,12 +112,13 @@ export class UploadPreparationPipeline {
         this.disposed = true;
         for (const controller of Array.from(this.jobs)) controller.abort();
         this.preparer.dispose();
+        this.metadataWorkers.dispose();
     }
 
     private metadata(file: File, sha256: string, signal: AbortSignal, diagnostic: AssetPreparationDiagnostic): Promise<UploadMetadataPacket | null> {
         const started = performance.now();
         return new Promise(resolve => {
-            let worker: Worker | undefined;
+            let worker: UploadWorker | undefined;
             let settled = false;
             const timer = setTimeout(() => { diagnostic.generationReason = 'generation_timeout'; finish(null); }, 30_000);
             const finish = (packet: UploadMetadataPacket | null) => {
@@ -126,7 +129,10 @@ export class UploadPreparationPipeline {
                 diagnostic.generation = packet ? 'generated' : 'failed';
                 if (!packet) diagnostic.generationReason ??= 'generation_failed';
                 if (packet) diagnostic.bytes = packet.blob.size;
-                worker?.terminate();
+                if (worker) {
+                    if (packet && !this.disposed && !isVideoFilename(file.name)) this.metadataWorkers.release(worker);
+                    else discardUploadWorker(worker);
+                }
                 signal.removeEventListener('abort', abort);
                 resolve(packet);
             };
@@ -135,7 +141,7 @@ export class UploadPreparationPipeline {
             try {
                 worker = isVideoFilename(file.name)
                     ? new Worker(new URL('../workers/videoMetadata.worker.ts', import.meta.url), {type: 'module'})
-                    : new Worker(new URL('../workers/uploadMetadata.worker.ts', import.meta.url), {type: 'module'});
+                    : this.metadataWorkers.take(() => new Worker(new URL('../workers/uploadMetadata.worker.ts', import.meta.url), {type: 'module'}));
                 signal.addEventListener('abort', abort, {once: true});
                 worker.onmessage = ({data}) => {
                     if (settled) return;
@@ -151,7 +157,7 @@ export class UploadPreparationPipeline {
                         finish(null);
                     }
                 };
-                worker.onerror = () => { diagnostic.generationReason = 'worker_error'; finish(null); };
+                worker.onerror = () => { if (settled) return; diagnostic.generationReason = 'worker_error'; finish(null); };
                 worker.postMessage({file, sha256});
             } catch { diagnostic.generationReason = 'worker_start_failed'; finish(null); }
         });

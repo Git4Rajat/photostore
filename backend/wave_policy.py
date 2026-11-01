@@ -1,5 +1,6 @@
 """One-way wave ownership; explicit paused upgrades may change the release binding."""
 from contextvars import ContextVar
+from contextlib import contextmanager
 from functools import wraps
 import os
 import re
@@ -22,6 +23,7 @@ def _supported_certificate_roles(builds):
 
 _SOURCE = ContextVar('wave_source_change', default=False)
 _FINALIZE = ContextVar('wave_finalization_check', default=None)
+_FINALIZE_ITEM = ContextVar('wave_finalization_item', default=None)
 
 
 def source_change(function):
@@ -44,7 +46,27 @@ def finalization_check():
     check();return True
 
 
+@contextmanager
+def finalization_item(session, item):
+    """Limit repeated write fences to the source currently being finalized.
+
+    Admission still validates the complete batch. Batch-wide mutations (init)
+    retain complete write fences; only a single-source write opts into this
+    scope. Never cache policy or reservation rows across write boundaries.
+    """
+    token = _FINALIZE_ITEM.set((session, item))
+    try:
+        yield
+    finally:
+        _FINALIZE_ITEM.reset(token)
+
+
 def check_finalization(store,bindings):
+    current = _FINALIZE_ITEM.get()
+    if current is not None:
+        if current not in bindings:
+            raise Conflict('Upload source is outside admitted finalization bindings')
+        bindings = (current,)
     policy=store._required('policy')
     if policy.get('cleanupState') or policy.get('gcUntil',0)>store.clock():
         raise Conflict('Cleanup fenced upload source writes')

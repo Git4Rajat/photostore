@@ -577,3 +577,63 @@ def test_gunicorn_hooks_only_report_for_upload_role(monkeypatch, role):
     config.post_worker_init(worker)
     config.worker_exit(None, worker)
     assert calls == ([('start', {'workers_per_replica': 1}), ('stop', {})] if role == 'upload' else [])
+
+
+def test_finalize_batch_scopes_write_checks_to_each_admitted_source(upload_env, monkeypatch):
+    import wave_policy
+    _, client = upload_env
+    bindings = [('session', str(index)) for index in range(3)]
+    reads = []
+    def required(key):
+        reads.append(key)
+        return {} if key == 'policy' else {'outcome': 'reserved', 'finalizeLeaseUntil': 600}
+    store = SimpleNamespace(_required=required, clock=lambda: 0,
+                            item_key=lambda session, item: f'{session}/{item}')
+    def finalize(user, filename, content_type, **kwargs):
+        wave_policy.finalization_check()
+        wave_policy.finalization_check()
+        return [], filename
+    monkeypatch.setattr(app, 'finalize_uploaded_file', finalize)
+    token = wave_policy.begin_finalization(lambda: wave_policy.check_finalization(store, bindings))
+    try:
+        files = [file_data(filename=f'{index}.jpg', waveSessionId=session, waveItemId=item)
+                 for index, (session, item) in enumerate(bindings)]
+        response = client.post('/upload/finalize-batch', json={'files': files})
+        assert response.status_code == 200
+        assert all(result.get('complete') for result in response.json['results'])
+        assert reads == [key for _, item in bindings for key in ('policy', f'session/{item}') * 2]
+        reads.clear()
+        wave_policy.finalization_check()
+        assert reads == ['policy', 'session/0', 'session/1', 'session/2']
+    finally:
+        wave_policy.end_finalization(token)
+
+
+@pytest.mark.parametrize('batch', [False, True])
+@pytest.mark.parametrize('stamp', ['entity', 'none', 'exception', 'hash_mismatch'])
+def test_finalize_reuses_stamped_metadata_with_fallback_and_hash_validation(upload_env, monkeypatch, batch, stamp):
+    from unittest.mock import Mock
+    _, client = upload_env
+    entity = {'fileHash': 'a' * 64, 'upload_sha256_expected': 'a' * 64,
+              'upload_sha256_match': stamp != 'hash_mismatch'}
+    update = Mock(return_value=entity if stamp in ('entity', 'hash_mismatch') else None)
+    if stamp == 'exception': update.side_effect = RuntimeError('stamp unavailable')
+    read = Mock(return_value=entity)
+    monkeypatch.setattr(app, '_update_metadata_entity_fields', update)
+    monkeypatch.setattr(app, 'metadata_table_client', SimpleNamespace(get_entity=read))
+    item = file_data()
+    response = client.post('/upload/finalize-batch' if batch else '/upload/finalize',
+                           json={'files': [item]} if batch else item)
+    if stamp in ('none', 'exception'):
+        read.assert_called_once_with(partition_key='library', row_key='private.jpg')
+    else:
+        read.assert_not_called()
+    if stamp == 'hash_mismatch':
+        if batch:
+            assert response.status_code == 200
+            assert response.json['results'][0]['error'] == 'Upload hash mismatch'
+        else:
+            assert response.status_code == 422
+    else:
+        assert response.status_code == 200
+        assert (response.json['results'][0] if batch else response.json)['complete'] is True

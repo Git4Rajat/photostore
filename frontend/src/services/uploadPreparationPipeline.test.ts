@@ -442,3 +442,59 @@ test('metadata takes the next PUT slot ahead of queued derivatives', async () =>
     expect(mocks.fetch.mock.calls[2][0]).toBe('https://storage/metadata');
     pipeline.dispose(); await Promise.all([first, second]);
 });
+
+test('reuses photo metadata workers with independent packets and releases them on dispose', async () => {
+    const instances: Array<{terminate: ReturnType<typeof vi.fn>; postMessage: ReturnType<typeof vi.fn>}> = [];
+    vi.stubGlobal('Worker', class {
+        onmessage?: (event: {data: unknown}) => void;
+        onerror?: () => void;
+        terminate = vi.fn();
+        constructor() { instances.push(this); }
+        postMessage = vi.fn(({sha256}) => queueMicrotask(() => this.onmessage?.({data: {
+            status: 'generated', packet: {blob: new Blob(['packet']), descriptor: {
+                version: 1, bytes: 6, sha256: 'c'.repeat(64), sourceSha256: sha256}},
+        }})));
+    });
+    const pipeline = new UploadPreparationPipeline();
+    for (const hash of ['a'.repeat(64), 'b'.repeat(64)]) {
+        const result = await pipeline.start(source(), hash, {metadataBlobUrl: 'https://storage/metadata', uploadPreparationEnabled: true}, new AbortController().signal);
+        expect(result.clientMetadata?.sourceSha256).toBe(hash);
+    }
+    expect(instances).toHaveLength(1);
+    expect(instances[0].postMessage).toHaveBeenCalledTimes(2);
+    expect(instances[0].terminate).not.toHaveBeenCalled();
+    pipeline.dispose();
+    expect(instances[0].terminate).toHaveBeenCalledOnce();
+});
+
+test.each(['abort', 'timeout', 'error'])('discards metadata workers after %s before processing another photo', async (failure) => {
+    const instances: Array<{onmessage?: (event: {data: unknown}) => void; onerror?: () => void; terminate: ReturnType<typeof vi.fn>}> = [];
+    vi.stubGlobal('Worker', class {
+        onmessage?: (event: {data: unknown}) => void;
+        onerror?: () => void;
+        terminate = vi.fn();
+        constructor() { instances.push(this); }
+        postMessage() {
+            if (instances.length > 1) queueMicrotask(() => this.onmessage?.({data: {
+                status: 'generated', packet: {blob: new Blob(['packet']), descriptor: {version: 1}},
+            }}));
+        }
+    });
+    const pipeline = new UploadPreparationPipeline();
+    const target = {metadataBlobUrl: 'https://storage/metadata', uploadPreparationEnabled: true};
+    const controller = new AbortController();
+    const first = pipeline.start(source(), 'a'.repeat(64), target, controller.signal);
+    await vi.advanceTimersByTimeAsync(0);
+    const stale = instances[0].onmessage!;
+    if (failure === 'abort') controller.abort();
+    if (failure === 'timeout') await vi.advanceTimersByTimeAsync(30_000);
+    if (failure === 'error') instances[0].onerror?.();
+    await first;
+    expect(instances[0].terminate).toHaveBeenCalledOnce();
+    const next = pipeline.start(source(), 'b'.repeat(64), target, new AbortController().signal);
+    stale({data: {status: 'generated', packet: {blob: new Blob(['stale']), descriptor: {version: 1}}}});
+    const result = await next;
+    expect(instances).toHaveLength(2);
+    expect(result.preparationReport?.assets.metadata.generation).toBe('generated');
+    pipeline.dispose();
+});

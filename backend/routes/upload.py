@@ -16,6 +16,7 @@ import app
 from benchmark_upload import authorize_entry, validate_finalization, isolated
 from upload_metadata import uploads_enabled, qualified_family, packet_blob_name, stamp_candidate
 from upload_preparation_diagnostics import record_receipt, rejection_reason, metadata_offer_reason
+from wave_policy import finalization_item
 
 upload_bp = Blueprint('upload', __name__)
 upload_bp.teardown_request(upload_teardown)
@@ -539,6 +540,7 @@ def finalize_direct_upload():
     # Persist the blob size (validated above) and the adding account in one write:
     # the size lets the gallery listing skip a per-photo blob HEAD, and uploadedBy
     # attributes the photo to the library member who added it.
+    metadata = None
     try:
         finalize_updates: app.Dict[str, object] = {'size': total_size}
         finalize_updates.update(processing_diagnostics.upload_fields(data))
@@ -547,12 +549,12 @@ def finalize_direct_upload():
         client_last_modified_iso = app.epoch_millis_to_iso(data.get('clientLastModified'))
         if client_last_modified_iso:
             finalize_updates['clientLastModified'] = client_last_modified_iso
-        timed_call('metadata_stamp', app._update_metadata_entity_fields, user_id, final_name, finalize_updates)
+        metadata = timed_call('metadata_stamp', app._update_metadata_entity_fields, user_id, final_name, finalize_updates)
     except Exception:
         app.app.logger.debug('Could not stamp finalize metadata for %s', final_name)
-    metadata = None
     try:
-        metadata = timed_call('metadata_read', app.metadata_table_client.get_entity, partition_key=user_id, row_key=final_name)
+        if metadata is None:
+            metadata = timed_call('metadata_read', app.metadata_table_client.get_entity, partition_key=user_id, row_key=final_name)
         if metadata.get('upload_sha256_expected') and metadata.get('upload_sha256_match') is False:
             return app.jsonify({
                 'error': 'Upload hash mismatch',
@@ -722,16 +724,19 @@ def finalize_upload_batch():
             continue
 
         try:
-            duplicates, final_name = timed_call('finalize_metadata', app.finalize_uploaded_file,
-                user_id,
-                filename,
-                content_type,
-                client_processing=item.get('clientProcessing'),
-                client_processing_report=item.get('clientProcessingReport'),
-                client_asset_id=str(item.get('clientAssetId') or item.get('uploadId') or ''),
-                client_sha256=str(item.get('sha256') or ''),
-                anonymous_blob_name=anonymous_blob_name,
-            )
+            # This call writes one source. Checking every other reservation on
+            # each internal write fence made a batch's storage reads quadratic.
+            with finalization_item(item.get('waveSessionId'), item.get('waveItemId')):
+                duplicates, final_name = timed_call('finalize_metadata', app.finalize_uploaded_file,
+                    user_id,
+                    filename,
+                    content_type,
+                    client_processing=item.get('clientProcessing'),
+                    client_processing_report=item.get('clientProcessingReport'),
+                    client_asset_id=str(item.get('clientAssetId') or item.get('uploadId') or ''),
+                    client_sha256=str(item.get('sha256') or ''),
+                    anonymous_blob_name=anonymous_blob_name,
+                )
         except Exception as exc:
             app.app.logger.exception('Batch finalize failed for %s', filename)
             results.append({'index': idx, 'filename': filename, 'error': 'Upload finalization failed'})
@@ -740,6 +745,7 @@ def finalize_upload_batch():
         # Same per-file follow-up as single-file finalize above, just inline
         # in this loop instead of a separate request.
         app._invalidate_metadata_scan_cache(user_id)
+        metadata = None
         try:
             finalize_updates: app.Dict[str, object] = {'size': total_size}
             finalize_updates.update(processing_diagnostics.upload_fields(item))
@@ -748,14 +754,14 @@ def finalize_upload_batch():
             client_last_modified_iso = app.epoch_millis_to_iso(item.get('clientLastModified'))
             if client_last_modified_iso:
                 finalize_updates['clientLastModified'] = client_last_modified_iso
-            timed_call('metadata_stamp', app._update_metadata_entity_fields, user_id, final_name, finalize_updates)
+            metadata = timed_call('metadata_stamp', app._update_metadata_entity_fields, user_id, final_name, finalize_updates)
         except Exception:
             app.app.logger.debug('Could not stamp finalize metadata for %s', final_name)
 
-        metadata = None
         hash_mismatch = False
         try:
-            metadata = timed_call('metadata_read', app.metadata_table_client.get_entity, partition_key=user_id, row_key=final_name)
+            if metadata is None:
+                metadata = timed_call('metadata_read', app.metadata_table_client.get_entity, partition_key=user_id, row_key=final_name)
             if metadata.get('upload_sha256_expected') and metadata.get('upload_sha256_match') is False:
                 hash_mismatch = True
         except Exception:

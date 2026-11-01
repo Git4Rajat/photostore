@@ -63,3 +63,70 @@ def test_live_init_cannot_overwrite_a_concurrent_deletion(finalize_ctx,monkeypat
                 storage_utils.reset_upload_tracking_and_reserve_blob('lib-A','photo.cr3',10,'a'*64)
         assert table.get_entity('lib-A','photo.cr3')['processing_state']=='deleted'
     finally:wave_policy.end_finalization(token)
+
+
+@pytest.mark.parametrize('count', [1, 3, 24])
+def test_single_source_fences_have_linear_reads_and_do_not_cache(count):
+    from types import SimpleNamespace
+    bindings = [('session', str(index)) for index in range(count)]
+    reads = []
+    rows = {'policy': {}}
+    rows.update({f'item!session!{index}': {'outcome': 'reserved', 'finalizeLeaseUntil': 600}
+                 for index in range(count)})
+    def required(key):
+        reads.append(key)
+        return rows[key]
+    store = SimpleNamespace(_required=required, clock=lambda: 0,
+                            item_key=lambda session, item: f'item!{session}!{item}')
+    token = wave_policy.begin_finalization(lambda: wave_policy.check_finalization(store, bindings))
+    try:
+        for binding in bindings:
+            with wave_policy.finalization_item(*binding):
+                assert wave_policy.finalization_check()
+                assert wave_policy.finalization_check()
+        # Two fresh checks per source, each reading policy and that source only.
+        assert len(reads) == 4 * count
+        assert reads.count('policy') == 2 * count
+        # Leaving the scope restores batch-wide fencing (used by batch init).
+        reads.clear()
+        wave_policy.finalization_check()
+        assert len(reads) == count + 1
+        with wave_policy.finalization_item(*bindings[0]):
+            rows['policy']['cleanupState'] = 'deleting'
+            with pytest.raises(wave_policy.Conflict, match='Cleanup fenced'):
+                wave_policy.finalization_check()
+    finally:
+        wave_policy.end_finalization(token)
+    assert wave_policy.finalization_check() is False
+
+
+@pytest.mark.parametrize('mutation', ['cancelled', 'expired', 'cleanup', 'gc'])
+def test_scoped_fence_observes_mutation_between_writes_and_restores_on_error(mutation):
+    from types import SimpleNamespace
+    bindings = [('session', 'one'), ('session', 'two')]
+    rows = {'policy': {}, 'one': {'outcome': 'reserved', 'finalizeLeaseUntil': 600},
+            'two': {'outcome': 'reserved', 'finalizeLeaseUntil': 600}}
+    store = SimpleNamespace(_required=rows.__getitem__, clock=lambda: 0,
+                            item_key=lambda session, item: item)
+    token = wave_policy.begin_finalization(lambda: wave_policy.check_finalization(store, bindings))
+    try:
+        with pytest.raises(wave_policy.Conflict):
+            with wave_policy.finalization_item('session', 'one'):
+                wave_policy.finalization_check()
+                if mutation == 'cancelled': rows['one']['outcome'] = 'cancelled'
+                if mutation == 'expired': rows['one']['finalizeLeaseUntil'] = 59
+                if mutation == 'cleanup': rows['policy']['cleanupState'] = 'deleting'
+                if mutation == 'gc': rows['policy']['gcUntil'] = 1
+                wave_policy.finalization_check()
+        # An exception must not leave the second source's writes scoped to one.
+        with wave_policy.finalization_item('session', 'two'):
+            if mutation in ('cleanup', 'gc'):
+                with pytest.raises(wave_policy.Conflict): wave_policy.finalization_check()
+            else:
+                assert wave_policy.finalization_check()
+        with wave_policy.finalization_item('other', 'one'):
+            with pytest.raises(wave_policy.Conflict, match='outside admitted'):
+                wave_policy.finalization_check()
+        with pytest.raises(wave_policy.Conflict): wave_policy.finalization_check()
+    finally:
+        wave_policy.end_finalization(token)

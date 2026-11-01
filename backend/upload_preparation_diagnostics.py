@@ -93,28 +93,35 @@ def record_receipt(app, user_id, filename, payload, *, packet_accepted=False, pa
     if report is None:
         return
     try:
-        row = app.metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
-        processing = json.loads(row.get('processing_metadata') or '{}')
-        claims = payload.get('clientProcessing') or {}
-        client_asset_id = str(payload.get('clientAssetId') or payload.get('uploadId') or '')
-        receipts = {}
-        for asset in ('preview', 'thumbnail'):
-            submitted = isinstance(claims.get(asset), dict) and claims[asset].get('alreadyUploaded') is True
-            source = (processing.get('client_' + asset) or {}).get('source')
-            rejection = processing.get('client_' + asset + '_rejected')
-            rejected_this_upload = isinstance(rejection, dict) and rejection.get('clientAssetId') == client_asset_id
-            receipts[asset] = ('duplicate' if duplicate else 'accepted' if submitted
-                               and not rejected_this_upload and row.get(asset + '_status') == 'done' and source == 'browser'
-                               else 'rejected' if submitted else 'not_submitted')
-            if receipts[asset] == 'rejected' and rejected_this_upload:
-                receipts[asset + 'Reason'] = str(rejection.get('reason') or 'invalid_derivative')[:64]
-        receipts['metadata'] = ('duplicate' if duplicate else 'accepted' if packet_accepted
-                                else 'rejected' if payload.get('clientMetadata') else 'not_submitted')
-        if packet_rejection and payload.get('clientMetadata'):
-            receipts['metadataReason'] = packet_rejection
-        if processing_rejection and any(receipts[asset] == 'rejected' for asset in ('preview', 'thumbnail')):
-            receipts['processingReason'] = processing_rejection
-        record = {'browserClaim': report, 'backendReceipt': receipts}
+        record = None
+        def derive(row):
+            nonlocal record
+            processing = json.loads(row.get('processing_metadata') or '{}')
+            claims = payload.get('clientProcessing') or {}
+            client_asset_id = str(payload.get('clientAssetId') or payload.get('uploadId') or '')
+            receipts = {}
+            for asset in ('preview', 'thumbnail'):
+                submitted = isinstance(claims.get(asset), dict) and claims[asset].get('alreadyUploaded') is True
+                source = (processing.get('client_' + asset) or {}).get('source')
+                rejection = processing.get('client_' + asset + '_rejected')
+                rejected_this_upload = isinstance(rejection, dict) and rejection.get('clientAssetId') == client_asset_id
+                receipts[asset] = ('duplicate' if duplicate else 'accepted' if submitted
+                                   and not rejected_this_upload and row.get(asset + '_status') == 'done' and source == 'browser'
+                                   else 'rejected' if submitted else 'not_submitted')
+                if receipts[asset] == 'rejected' and rejected_this_upload:
+                    receipts[asset + 'Reason'] = str(rejection.get('reason') or 'invalid_derivative')[:64]
+            receipts['metadata'] = ('duplicate' if duplicate else 'accepted' if packet_accepted
+                                    else 'rejected' if payload.get('clientMetadata') else 'not_submitted')
+            if packet_rejection and payload.get('clientMetadata'):
+                receipts['metadataReason'] = packet_rejection
+            if processing_rejection and any(receipts[asset] == 'rejected' for asset in ('preview', 'thumbnail')):
+                receipts['processingReason'] = processing_rejection
+            record = {'browserClaim': report, 'backendReceipt': receipts}
+            return {'uploadPreparationReport': json.dumps(record, separators=(',', ':'))}
+        updated = app._update_metadata_entity_fields(user_id, filename, {}, derive_updates=derive)
+        if updated is None or record is None:
+            raise RuntimeError('Receipt metadata unavailable')
+        receipts = record['backendReceipt']
         from processing_diagnostics import file_event, batch_id
         for asset in ('preview', 'thumbnail', 'metadata'):
             claim = report.get('assets', {}).get(asset, {})
@@ -124,7 +131,6 @@ def record_receipt(app, user_id, filename, payload, *, packet_accepted=False, pa
                        upload_ms=claim.get('uploadMs'), queue_ms=claim.get('queueMs'),
                        bytes=claim.get('bytes'), passthrough=claim.get('passthrough'),
                        reason=claim.get('generationReason') or receipts.get(asset + 'Reason'))
-        app._update_metadata_entity_fields(user_id, filename, {'uploadPreparationReport': json.dumps(record, separators=(',', ':'))})
         app.app.logger.info('upload preparation receipt %s', json.dumps({
             'user': user_id, 'file': filename, 'uploadId': str(payload.get('uploadId') or '')[:100], **record}, separators=(',', ':')))
     except Exception:

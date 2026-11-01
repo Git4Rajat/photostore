@@ -8,7 +8,10 @@ const mocks = vi.hoisted(() => ({
     postUpload: vi.fn(),
     postTools: vi.fn(),
     requestJobPoll: vi.fn(),
+    transferred: vi.fn(),
     staged: vi.fn(),
+    uploaded: vi.fn(),
+    properties: vi.fn(),
     committed: vi.fn(),
     idbDelete: vi.fn(),
     idbGet: vi.fn(),
@@ -62,7 +65,15 @@ vi.mock('./PhotoGallery', () => ({
 }));
 vi.mock('@azure/storage-blob', () => ({
     BlockBlobClient: class {
-        stageBlock = mocks.staged;
+        stageBlock = (...args: unknown[]) => {
+            mocks.staged(...args);
+            return mocks.transferred(...args);
+        };
+        upload = (body: Blob, length: number, options: unknown) => {
+            mocks.uploaded(body, length, options);
+            return mocks.transferred('single-put', body, length, options);
+        };
+        getProperties = mocks.properties;
         commitBlockList = mocks.committed;
     },
 }));
@@ -126,8 +137,9 @@ beforeEach(() => {
     localStorage.clear();
     sessionStorage.clear();
     mocks.getUpload.mockImplementation(async () => ({ hashes: {} }));
-    mocks.staged.mockResolvedValue(undefined);
+    mocks.transferred.mockResolvedValue(undefined);
     mocks.committed.mockResolvedValue(undefined);
+    mocks.properties.mockRejectedValue(new Error('Blob not found'));
     mocks.idbDelete.mockResolvedValue(undefined);
     mocks.idbGet.mockResolvedValue(null);
     mocks.postUpload.mockImplementation(async (url: string, payload: { filename: string; files: Array<{ filename: string }> }) => {
@@ -342,7 +354,7 @@ describe('browser upload selection and startup', () => {
     it('starts the next queued upload without waiting for an index response', async () => {
         mocks.postTools.mockImplementation(() => new Promise(() => {}));
         let releaseTransfer!: () => void;
-        mocks.staged.mockImplementationOnce(() => new Promise<void>(resolve => { releaseTransfer = resolve; }));
+        mocks.transferred.mockImplementationOnce(() => new Promise<void>(resolve => { releaseTransfer = resolve; }));
         const files = filesFor(2);
         const input = select([files[0]]);
         await advance(1000);
@@ -350,7 +362,7 @@ describe('browser upload selection and startup', () => {
         await advance(1000);
         expect(services.queuedUploadFileCount).toBe(1);
         await act(async () => { releaseTransfer(); });
-        for (let tick = 0; tick < 6; tick += 1) await advance(1000);
+        for (let tick = 0; tick < 8; tick += 1) await advance(1000);
         expect(finalizedFiles()).toHaveLength(2);
         expect(endSummaries()).toHaveLength(2);
         expect(services.queuedUploadFileCount).toBe(0);
@@ -456,8 +468,9 @@ describe('browser upload selection and startup', () => {
         mocks.prepared.mockImplementation(() => new Promise(resolve => { resolvePreparation = resolve; }));
         select(filesFor(1));
         await advance(1000);
-        expect(mocks.staged).toHaveBeenCalledTimes(1);
-        expect(mocks.committed).toHaveBeenCalledTimes(1);
+        expect(mocks.transferred).toHaveBeenCalledTimes(1);
+        expect(mocks.committed).not.toHaveBeenCalled();
+        expect(mocks.uploaded).toHaveBeenCalledTimes(1);
         expect(finalizedFiles()).toHaveLength(0);
         expect(initFiles()[0]).toMatchObject({includePreview: true, includeMetadata: true});
         const prepared = {clientProcessing: {preview: {alreadyUploaded: true}},
@@ -474,6 +487,85 @@ describe('browser upload selection and startup', () => {
             expect.objectContaining({batchId, phase: 'end', uploaded: 1, failed: 0, duplicates: 0}),
         ]));
         expect(services.pendingUploadSummary).toBeNull();
+    });
+
+    it('coalesces staggered prepared files without extending the first file collection deadline', async () => {
+        mocks.preparationEnabled = true;
+        const ready: Array<(value: unknown) => void> = [];
+        mocks.prepared.mockImplementation(() => new Promise(resolve => { ready.push(resolve); }));
+        select(filesFor(3));
+        await advance(1000);
+        expect(ready).toHaveLength(3);
+        await act(async () => { ready[0]({}); });
+        await advance(350);
+        await act(async () => { ready[1]({}); });
+        await advance(350);
+        await act(async () => { ready[2]({}); });
+        expect(finalizedFiles()).toHaveLength(0);
+        await advance(301);
+        const requests = mocks.postUpload.mock.calls.filter(([url]) => url === '/upload/finalize-batch');
+        expect(requests).toHaveLength(1);
+        expect(requests[0][1].files).toHaveLength(3);
+        await advance(3000);
+        expect(services.pendingUploadSummary).toBeNull();
+    });
+
+    it.each([1, 1024 * 1024])('uploads a fresh %i-byte original with one PUT and no block commit', async (size) => {
+        const file = new File([new Uint8Array(size)], 'small.jpg', {type: 'image/jpeg'});
+        select([file]);
+        await advance(4000);
+        expect(mocks.uploaded).toHaveBeenCalledExactlyOnceWith(file, size,
+            expect.objectContaining({blobHTTPHeaders: {blobContentType: 'image/jpeg'}}));
+        expect(mocks.staged).not.toHaveBeenCalled();
+        expect(mocks.committed).not.toHaveBeenCalled();
+        expect(finalizedFiles()).toHaveLength(1);
+        expect(services.pendingUploadSummary).toBeNull();
+    });
+
+    it('keeps the block upload path above the single-PUT limit', async () => {
+        select([new File([new Uint8Array(1024 * 1024 + 1)], 'larger.jpg', {type: 'image/jpeg'})]);
+        await advance(4000);
+        expect(mocks.uploaded).not.toHaveBeenCalled();
+        expect(mocks.staged).toHaveBeenCalled();
+        expect(mocks.committed).toHaveBeenCalledTimes(1);
+        expect(finalizedFiles()).toHaveLength(1);
+    });
+
+    it('retries a transient single-PUT failure without staging blocks', async () => {
+        mocks.transferred.mockRejectedValueOnce(Object.assign(new Error('network error'), {statusCode: 503}));
+        select(filesFor(1));
+        await advance(4000);
+        expect(mocks.uploaded).toHaveBeenCalledTimes(2);
+        expect(mocks.staged).not.toHaveBeenCalled();
+        expect(mocks.committed).not.toHaveBeenCalled();
+        expect(finalizedFiles()).toHaveLength(1);
+    });
+
+    it.each([2, 0])('verifies an aborted single PUT against committed size %i before finalizing', async (size) => {
+        const error = Object.assign(new Error('Aborted'), {name: 'AbortError'});
+        if (size === 2) mocks.transferred.mockRejectedValueOnce(error);
+        else mocks.transferred.mockRejectedValue(error);
+        mocks.properties.mockResolvedValue({contentLength: size});
+        select(filesFor(1));
+        await advance(4000);
+        expect(mocks.uploaded).toHaveBeenCalledTimes(1);
+        expect(mocks.properties).toHaveBeenCalledTimes(1);
+        expect(finalizedFiles()).toHaveLength(size === 2 ? 1 : 0);
+    });
+
+    it('keeps transfer heartbeats active for a slow single PUT and stops them on Stop', async () => {
+        mocks.transferred.mockImplementation((_id, _body, _length, options) => new Promise((_resolve, reject) => {
+            options.abortSignal.addEventListener('abort', () => reject(new Error('upload_stopped_by_user')), {once: true});
+        }));
+        select(filesFor(1));
+        await advance(91_000);
+        const heartbeats = () => mocks.postUpload.mock.calls.filter(([url, body]) => url === '/upload/transfer-heartbeat'
+            && Object.keys(body).length === 0);
+        expect(heartbeats()).toHaveLength(1);
+        act(() => services.stopActiveUpload());
+        await advance(95_000);
+        expect(heartbeats()).toHaveLength(1);
+        expect(finalizedFiles()).toHaveLength(0);
     });
 
     it('does not request or run preparation when the feature is off', async () => {
@@ -496,7 +588,7 @@ describe('browser upload selection and startup', () => {
         expect(finalizedFiles()).toHaveLength(count);
         expect(new Set(finalizedFiles().map((file) => file.filename)).size).toBe(count);
         expect(finalizedFiles().every((file) => file.totalSize === 2 && file.contentType === 'image/heic')).toBe(true);
-        expect(mocks.staged).toHaveBeenCalledTimes(count);
+        expect(mocks.transferred).toHaveBeenCalledTimes(count);
         expect(refreshRequests()).toHaveLength(1);
         expect(refreshRequests()[0][1]).toEqual({ reason: 'completed' });
         expect(services.pendingUploadSummary).toBeNull();
@@ -519,7 +611,7 @@ describe('browser upload selection and startup', () => {
         await advance(330000);
         expect(initFiles()).toHaveLength(3);
         expect(finalizedFiles()).toHaveLength(3);
-        expect(mocks.staged).toHaveBeenCalledTimes(3);
+        expect(mocks.transferred).toHaveBeenCalledTimes(3);
     });
 
     it('blocks upload start until the known-hash download settles, then skips every already-known duplicate', async () => {
@@ -530,14 +622,14 @@ describe('browser upload selection and startup', () => {
         select(files);
         await advance(1000);
         // Nothing starts while the blocking wake-up/hash call is still pending.
-        expect(mocks.staged).not.toHaveBeenCalled();
+        expect(mocks.transferred).not.toHaveBeenCalled();
         await act(async () => {
             resolveHashes({ hashes: Object.fromEntries(files.slice(0, 20).map((file) => [
                 Array.from(new TextEncoder().encode(file.name)).join('-'), `stored-${file.name}`,
             ])) });
         });
         await advance(10000);
-        expect(mocks.staged.mock.calls.length).toBeGreaterThan(0);
+        expect(mocks.transferred.mock.calls.length).toBeGreaterThan(0);
         expect(initFiles()).toHaveLength(30);
         expect(services.notifications.some((notification) =>
             notification.progress?.skippedDuplicateCount === 20)).toBe(true);
@@ -545,7 +637,7 @@ describe('browser upload selection and startup', () => {
     });
 
     it('refreshes after a run ends with failed files', async () => {
-        mocks.staged.mockRejectedValue(new Error('Test transfer failure'));
+        mocks.transferred.mockRejectedValue(new Error('Test transfer failure'));
         select(filesFor(2));
         await advance(20000);
         expect(services.pendingUploadSummary?.fileCount).toBe(2);
@@ -554,7 +646,7 @@ describe('browser upload selection and startup', () => {
     });
 
     it('refreshes after stopping an active upload', async () => {
-        mocks.staged.mockImplementation((_id, _data, _size, options) => new Promise((_resolve, reject) => {
+        mocks.transferred.mockImplementation((_id, _data, _size, options) => new Promise((_resolve, reject) => {
             const abort = () => reject(new Error('upload_stopped_by_user'));
             if (options.abortSignal.aborted) abort();
             else options.abortSignal.addEventListener('abort', abort, { once: true });
@@ -571,7 +663,7 @@ describe('browser upload selection and startup', () => {
     });
 
     it('keeps upload progress and Stop available after notifications are cleared', async () => {
-        mocks.staged.mockImplementation((_id, _data, _size, options) => new Promise((_resolve, reject) => {
+        mocks.transferred.mockImplementation((_id, _data, _size, options) => new Promise((_resolve, reject) => {
             const abort = () => reject(new Error('upload_stopped_by_user'));
             if (options.abortSignal.aborted) abort();
             else options.abortSignal.addEventListener('abort', abort, { once: true });
@@ -592,7 +684,7 @@ describe('browser upload selection and startup', () => {
     });
 
     it('can stop an automatic retry after notification dismissal with no finalization pending', async () => {
-        mocks.staged.mockRejectedValue(new Error('Test transfer failure'));
+        mocks.transferred.mockRejectedValue(new Error('Test transfer failure'));
         select(filesFor(1));
         for (let tick = 0; tick < 200 && !services.notifications.some(n => n.title === 'Retrying failed files'); tick += 1) {
             await advance(100);
@@ -601,11 +693,11 @@ describe('browser upload selection and startup', () => {
         expect(services.uploading).toBe(false);
         expect(services.uploadActive).toBe(true);
         expect(finalizedFiles()).toHaveLength(0);
-        const attempts = mocks.staged.mock.calls.length;
+        const attempts = mocks.transferred.mock.calls.length;
         act(() => services.clearNotifications());
         fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
         await advance(10000);
-        expect(mocks.staged).toHaveBeenCalledTimes(attempts);
+        expect(mocks.transferred).toHaveBeenCalledTimes(attempts);
         expect(services.uploadActive).toBe(false);
         expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull();
     });
@@ -620,7 +712,7 @@ describe('browser upload selection and startup', () => {
             return original(url,payload);
         });
         select(filesFor(1));
-        await advance(1000);
+        await advance(2000);
         expect(finalizedFiles()).toHaveLength(1);
         expect(services.uploadActive).toBe(true);
         act(() => services.stopActiveUpload());
@@ -635,7 +727,7 @@ describe('browser upload selection and startup', () => {
 
     it('keeps the recovery checkpoint when Stop cannot acknowledge server closure', async () => {
         vi.spyOn(uploadWaveSync,'stopWaveShadowSession').mockRejectedValue(new Error('Server closure unavailable'));
-        mocks.staged.mockImplementation((_id,_data,_size,options) => new Promise((_resolve,reject) => {
+        mocks.transferred.mockImplementation((_id,_data,_size,options) => new Promise((_resolve,reject) => {
             const abort=() => reject(new Error('upload_stopped_by_user'));
             if (options.abortSignal.aborted) abort();
             else options.abortSignal.addEventListener('abort',abort,{once:true});
@@ -659,7 +751,7 @@ describe('browser upload selection and startup', () => {
             return originalPost(url, payload);
         });
         select(filesFor(3));
-        await advance(1000);
+        await advance(2000);
         expect(finalizedFiles()).toHaveLength(3);
         expect(services.uploading).toBe(false);
         expect(services.uploadActive).toBe(true);
@@ -685,14 +777,14 @@ describe('browser upload selection and startup', () => {
             if (url === '/upload/finalize-batch') await finalizeGate;
             return originalPost(url, payload);
         });
-        mocks.staged.mockResolvedValueOnce(undefined).mockImplementation((_id, _data, _size, options) =>
+        mocks.transferred.mockResolvedValueOnce(undefined).mockImplementation((_id, _data, _size, options) =>
             new Promise((_resolve, reject) => {
                 const abort = () => reject(new Error('upload_stopped_by_user'));
                 if (options.abortSignal.aborted) abort();
                 else options.abortSignal.addEventListener('abort', abort, { once: true });
             }));
         select(filesFor(50));
-        await advance(1000);
+        await advance(2000);
         expect(finalizedFiles()).toHaveLength(1);
         act(() => { services.stopActiveUpload(); });
         await advance(3000);
@@ -714,7 +806,7 @@ describe('browser upload selection and startup', () => {
             return originalPost(url, payload);
         });
         select(filesFor(3));
-        await advance(1000);
+        await advance(2000);
         expect(finalizedFiles()).toHaveLength(3);
         expect(refreshRequests()).toHaveLength(0);
         await act(async () => { releaseFinalize(); });
@@ -749,7 +841,7 @@ describe('browser upload selection and startup', () => {
     });
 
     it('flushes active upload progress when the page is hidden or unloaded', async () => {
-        mocks.staged.mockImplementation((_id, _data, _size, options) => new Promise((_resolve, reject) => {
+        mocks.transferred.mockImplementation((_id, _data, _size, options) => new Promise((_resolve, reject) => {
             const abort = () => reject(new Error('upload_stopped_by_user'));
             if (options.abortSignal.aborted) abort();
             else options.abortSignal.addEventListener('abort', abort, { once: true });
@@ -786,7 +878,7 @@ describe('browser upload selection and startup', () => {
         ])) });
         select(files);
         await advance(1000);
-        expect(mocks.staged).not.toHaveBeenCalled();
+        expect(mocks.transferred).not.toHaveBeenCalled();
         expect(refreshRequests()[0][1]).toEqual({ reason: 'completed' });
         expect(skippedKeys.size).toBe(3000);
         expect(services.queuedUploadFileCount).toBe(0);
@@ -807,8 +899,9 @@ describe('browser upload selection and startup', () => {
         }));
         render(<AppServicesProvider><Probe /></AppServicesProvider>);
         await advance(4000);
-        expect(mocks.staged).not.toHaveBeenCalled();
+        expect(mocks.transferred).not.toHaveBeenCalled();
         expect(mocks.committed).toHaveBeenCalledWith([blockId], expect.anything());
+        expect(mocks.uploaded).not.toHaveBeenCalled();
         expect(finalizedFiles()).toHaveLength(1);
         expect(mocks.postUpload.mock.calls.find(([url]) => url === '/upload/init')![1]).toMatchObject({ uploadId: file.name });
         expect(services.pendingUploadSummary).toBeNull();
@@ -817,11 +910,11 @@ describe('browser upload selection and startup', () => {
 
     it('resumes 100 paused files and also uploads the other 200 from a broader reselection', async () => {
         const files = filesFor(300);
-        mocks.staged.mockRejectedValue(new Error('Test transfer failure'));
+        mocks.transferred.mockRejectedValue(new Error('Test transfer failure'));
         const input = select(files.slice(0, 100));
         await advance(20000);
         expect(services.pendingUploadSummary?.fileCount).toBe(100);
-        mocks.staged.mockResolvedValue(undefined);
+        mocks.transferred.mockResolvedValue(undefined);
         mocks.postUpload.mockClear();
         fireEvent.change(input, { target: { files } });
         for (let tick = 0; tick < 40 && finalizedFiles().length < 300; tick += 1) {
@@ -880,7 +973,7 @@ describe('browser upload selection and startup', () => {
                 .map((file) => [Array.from(new TextEncoder().encode(file.name)).join('-'), `stored-${file.name}`]),
         ) });
         failingNames.clear();
-        mocks.staged.mockClear();
+        mocks.transferred.mockClear();
         mocks.postUpload.mockClear();
         // fetchKnownHashes caches for 60s -- advance past it so the reselect
         // below queries the updated hashes above instead of the stale (empty)
@@ -903,7 +996,7 @@ describe('browser upload selection and startup', () => {
         // The 3 already-done files are caught by the hash-dedup check before
         // any bytes transfer -- not silently skipped via a stale local match,
         // and not re-uploaded/duplicated either.
-        expect(mocks.staged).not.toHaveBeenCalled();
+        expect(mocks.transferred).not.toHaveBeenCalled();
         expect(services.notifications.some((notification) => notification.progress?.skippedDuplicateCount === 3)).toBe(true);
     });
 
@@ -958,7 +1051,7 @@ describe('browser upload selection and startup', () => {
         select([file]);
         await advance(1000);
         expect(initFiles()).toHaveLength(0);
-        expect(mocks.staged).not.toHaveBeenCalled();
+        expect(mocks.transferred).not.toHaveBeenCalled();
         expect(services.pendingUploadSummary).toBeNull();
         expect(services.notifications.some((notification) => notification.progress?.skippedDuplicateCount === 1)).toBe(true);
     });
@@ -973,7 +1066,7 @@ describe('browser upload selection and startup', () => {
         fireEvent.change(view.container.querySelector('input[type="file"]')!, { target: { files: [file] } });
         await advance(1000);
         expect(mocks.getUpload.mock.calls.filter(([url]) => url === '/upload/known-hashes')).toHaveLength(1);
-        expect(mocks.staged).not.toHaveBeenCalled();
+        expect(mocks.transferred).not.toHaveBeenCalled();
         expect(services.notifications.some((notification) => notification.progress?.skippedDuplicateCount === 1)).toBe(true);
     });
 
@@ -988,8 +1081,8 @@ describe('browser upload selection and startup', () => {
         fireEvent(input, new Event('cancel'));
         mocks.getUpload.mockResolvedValue({ hashes: {} });
         fireEvent.change(input, { target: { files: [file] } });
-        await advance(1000);
-        expect(mocks.staged).toHaveBeenCalledTimes(1);
+        await advance(2000);
+        expect(mocks.transferred).toHaveBeenCalledTimes(1);
         expect(finalizedFiles()).toHaveLength(1);
     });
 
@@ -1008,8 +1101,8 @@ describe('browser upload selection and startup', () => {
         await advance(100);
         await act(async () => { resolveOld({ hashes: { [hash]: 'deleted.heic' } }); });
         fireEvent.change(input, { target: { files: [file] } });
-        await advance(1000);
-        expect(mocks.staged).toHaveBeenCalledTimes(1);
+        await advance(2000);
+        expect(mocks.transferred).toHaveBeenCalledTimes(1);
         expect(finalizedFiles()).toHaveLength(1);
     });
 
@@ -1025,8 +1118,8 @@ describe('browser upload selection and startup', () => {
         mocks.getUpload.mockResolvedValue({ hashes: {} });
         await act(async () => { resolveOld({ hashes: { [hash]: 'deleted.heic' } }); });
         fireEvent.change(view.container.querySelector('input[type="file"]')!, { target: { files: [file] } });
-        await advance(1000);
-        expect(mocks.staged).toHaveBeenCalledTimes(1);
+        await advance(2000);
+        expect(mocks.transferred).toHaveBeenCalledTimes(1);
         expect(finalizedFiles()).toHaveLength(1);
     });
 
@@ -1041,7 +1134,7 @@ describe('browser upload selection and startup', () => {
         await advance(1000);
         expect(initFiles()).toHaveLength(1);
         expect(finalizedFiles()).toHaveLength(1);
-        expect(mocks.staged).toHaveBeenCalledTimes(1);
+        expect(mocks.transferred).toHaveBeenCalledTimes(1);
         expect(mocks.span.mock.calls.filter(([name]) => name === 'upload.known_hashes.timeout')).toHaveLength(0);
         expect(services.notifications.some((notification) => notification.progress?.skippedDuplicateCount === 1)).toBe(true);
     });
@@ -1060,7 +1153,7 @@ describe('browser upload selection and startup', () => {
         await advance(4000);
         expect(initFiles()).toHaveLength(1);
         expect(finalizedFiles()).toHaveLength(1);
-        expect(mocks.staged).toHaveBeenCalledTimes(1);
+        expect(mocks.transferred).toHaveBeenCalledTimes(1);
         expect(services.notifications.some((notification) => notification.progress?.skippedDuplicateCount === 1)).toBe(true);
     });
 
@@ -1202,7 +1295,7 @@ describe('upload wave shadow protocol wiring', () => {
         expect(services.uploading).toBe(false);
         expect(services.notifications.some(notification => notification.details?.includes('Library cleanup is in progress'))).toBe(true);
         expect(services.pendingUploadSummary).toMatchObject({ fileCount: 50, failedCount: 0 });
-        expect(mocks.staged).not.toHaveBeenCalled();
+        expect(mocks.transferred).not.toHaveBeenCalled();
         expect(resolutionCalls()).toHaveLength(0);
         expect(shadowCalls('/close')).toHaveLength(0);
         blocked = false;
@@ -1234,7 +1327,7 @@ describe('upload wave shadow protocol wiring', () => {
         // /items call is still blocked, not the exact sizes involved.
         expect(shadowCalls('/items').length).toBeGreaterThanOrEqual(1);
         expect(initFiles().length).toBeGreaterThan(0);
-        expect(mocks.staged).toHaveBeenCalled();
+        expect(mocks.transferred).toHaveBeenCalled();
         expect(finalizedFiles().length).toBeGreaterThan(0);
         expect(shadowCalls('/close')).toHaveLength(0);
         await act(async () => {release();});
@@ -1255,14 +1348,14 @@ describe('upload wave shadow protocol wiring', () => {
             if (url === '/upload/transfer-heartbeat') return {leaseActive:false};
             return original(url,payload);
         });
-        mocks.staged.mockImplementation((_id,_data,_size,options) => new Promise((_resolve,reject) => {
+        mocks.transferred.mockImplementation((_id,_data,_size,options) => new Promise((_resolve,reject) => {
             const abort=() => reject(new Error('upload_stopped_by_user'));
             if (options.abortSignal.aborted) abort();
             else options.abortSignal.addEventListener('abort',abort,{once:true});
         }));
         select(filesFor(50));
         await advance(1000);
-        expect(mocks.staged).toHaveBeenCalled();
+        expect(mocks.transferred).toHaveBeenCalled();
         const admitted=opens()[0][1].sessionId;
         await advance(95000);
         expect(services.uploading).toBe(false);
@@ -1340,14 +1433,14 @@ describe('upload wave shadow protocol wiring', () => {
             vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
             mocks.getUpload.mockImplementation(async (url) => url === '/upload/waves/protocol' ? { protocol: 'live' } : { hashes: {} });
         }
-        mocks.staged.mockResolvedValueOnce(undefined).mockImplementation((_id, _data, _size, options) =>
+        mocks.transferred.mockResolvedValueOnce(undefined).mockImplementation((_id, _data, _size, options) =>
             new Promise((_resolve, reject) => {
                 const abort = () => reject(new Error('upload_stopped_by_user'));
                 if (options.abortSignal.aborted) abort();
                 else options.abortSignal.addEventListener('abort', abort, { once: true });
             }));
         select(filesFor(count));
-        await advance(1000);
+        await advance(2000);
         expect(finalizedFiles()).toHaveLength(1);
         act(() => services.stopActiveUpload());
         await advance(4000);
@@ -1384,14 +1477,14 @@ describe('upload wave shadow protocol wiring', () => {
             if (url === '/upload/finalize-batch') await gate;
             return original(url, payload);
         });
-        mocks.staged.mockResolvedValueOnce(undefined).mockImplementation((_id, _data, _size, options) =>
+        mocks.transferred.mockResolvedValueOnce(undefined).mockImplementation((_id, _data, _size, options) =>
             new Promise((_resolve, reject) => {
                 const abort = () => reject(new Error('upload_stopped_by_user'));
                 if (options.abortSignal.aborted) abort();
                 else options.abortSignal.addEventListener('abort', abort, { once: true });
             }));
         select(filesFor(50));
-        await advance(1000);
+        await advance(2000);
         const committedFilename = finalizedFiles()[0].filename;
         act(() => services.stopActiveUpload());
         await advance(3000);
@@ -1423,7 +1516,7 @@ describe('upload wave shadow protocol wiring', () => {
             return original(url, payload);
         });
         select(filesFor(1));
-        for (let tick = 0; tick < 6; tick += 1) await advance(1000);
+        for (let tick = 0; tick < 8; tick += 1) await advance(1000);
         const resolveCalls = resolutionCalls();
         expect(resolveCalls.some(([, body]) => body.outcome === 'failed')).toBe(true);
     });

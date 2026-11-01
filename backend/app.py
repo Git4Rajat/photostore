@@ -3403,7 +3403,10 @@ def _humanize_job(row: Dict) -> Dict:
     }
 
 
-def _update_metadata_entity_fields(user_id: str, filename: str, updates: Dict) -> Optional[Dict]:
+def _update_metadata_entity_fields(
+    user_id: str, filename: str, updates: Dict, *,
+    derive_updates: Optional[Callable[[Dict], Dict]] = None,
+) -> Optional[Dict]:
     if metadata_table_client is None:
         return None
     last_exc = None
@@ -3414,12 +3417,14 @@ def _update_metadata_entity_fields(user_id: str, filename: str, updates: Dict) -
             return None
         if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
             return None
-        if (storage_utils_module.DURABLE_INDEX_UPDATES and all(entity.get(k) == v for k, v in (updates or {}).items())
+        # Recompute derived fields after every fresh read/ETag retry.
+        current_updates = derive_updates(entity) if derive_updates is not None else updates
+        if (storage_utils_module.DURABLE_INDEX_UPDATES and all(entity.get(k) == v for k, v in (current_updates or {}).items())
                 and entity.get('processing_complete') == _photo_processing_complete(entity)):
             storage_utils_module.publish_metadata_index_intent(user_id, filename, entity)
             return entity
-        changed = {k: v for k, v in (updates or {}).items() if entity.get(k) != v}
-        entity.update(updates or {})
+        changed = {k: v for k, v in (current_updates or {}).items() if entity.get(k) != v}
+        entity.update(current_updates or {})
         complete = _photo_processing_complete(entity)
         if entity.get('processing_complete') != complete:
             changed['processing_complete'] = complete
@@ -3433,12 +3438,12 @@ def _update_metadata_entity_fields(user_id: str, filename: str, updates: Dict) -
             _invalidate_metadata_scan_cache(user_id)
             if storage_utils_module.DURABLE_INDEX_UPDATES:
                 storage_utils_module.publish_metadata_index_intent(user_id, filename, entity)
-            elif metadata_updates_affect_search_indexes(updates or {}):
+            elif metadata_updates_affect_search_indexes(current_updates or {}):
                 touch_user_search_indexes_state(
                     user_id, filenames=filename,
-                    touch_albums=storage_utils_module.metadata_updates_affect_album_covers(updates or {}),
+                    touch_albums=storage_utils_module.metadata_updates_affect_album_covers(current_updates or {}),
                 )
-            elif metadata_updates_affect_sort_index(updates or {}):
+            elif metadata_updates_affect_sort_index(current_updates or {}):
                 touch_user_sort_index_dirty(user_id, [filename])
             return entity
         except ResourceNotFoundError:
