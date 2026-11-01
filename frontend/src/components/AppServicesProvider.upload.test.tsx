@@ -907,6 +907,50 @@ describe('browser upload selection and startup', () => {
         expect(services.notifications.some((notification) => notification.progress?.skippedDuplicateCount === 3)).toBe(true);
     });
 
+    it('does not skip identical content while its first finalize is pending', async () => {
+        vi.spyOn(largeFileHash, 'hashLargeFile').mockResolvedValue('a'.repeat(64));
+        const files = filesFor(2);
+        files.forEach(file => Object.defineProperty(file, 'size', { value: 256 * 1024 * 1024 }));
+        const postUpload = mocks.postUpload.getMockImplementation()!;
+        const pending: Array<() => void> = [];
+        mocks.postUpload.mockImplementation((url, payload) => {
+            if (url === '/upload/finalize-batch') {
+                return new Promise(resolve => pending.push(() => resolve({
+                    results: payload.files.map((file: { filename: string }) => ({
+                        filename: file.filename, complete: true, duplicates: [],
+                    })),
+                })));
+            }
+            return postUpload(url, payload);
+        });
+        select(files);
+        await advance(4000);
+        expect(initFiles()).toHaveLength(2);
+        expect(finalizedFiles()).toHaveLength(2);
+        expect(services.notifications.some(notification => notification.progress?.skippedDuplicateCount)).toBe(false);
+        await act(async () => { pending.forEach(resolve => resolve()); });
+        await advance(4000);
+        expect(services.pendingUploadSummary).toBeNull();
+    });
+
+    it('caches the finalized filename for later copies after the backend renames a source', async () => {
+        const resolve = vi.spyOn(uploadWaveSync, 'resolveWaveShadowFile').mockResolvedValue(undefined);
+        const postUpload = mocks.postUpload.getMockImplementation()!;
+        mocks.postUpload.mockImplementation((url, payload) => url === '/upload/finalize-batch'
+            ? Promise.resolve({ results: payload.files.map(() => ({ filename: 'renamed.heic', complete: true, duplicates: [] })) })
+            : postUpload(url, payload));
+        const file = filesFor(1)[0];
+        const input = select([file]);
+        await advance(4000);
+        expect(finalizedFiles()).toHaveLength(1);
+        fireEvent.change(input, { target: { files: [file] } });
+        await advance(4000);
+        expect(initFiles()).toHaveLength(1);
+        expect(resolve).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({
+            skippedDuplicate: true, waveAcceptedFilename: 'renamed.heic',
+        }));
+    });
+
     it('still skips a confirmed duplicate without transferring bytes', async () => {
         const file = filesFor(1)[0];
         const hash = Array.from(new TextEncoder().encode(file.name)).join('-');

@@ -3039,13 +3039,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // this for real; this is purely an earlier, cheaper exit.
             return { skippedDuplicate: true, filename: knownHashesRef.current.get(sha256) || libraryHashesRef.current.get(sha256) || file.name };
         }
-        // Claim this hash immediately, synchronously with the check above (no
-        // await in between) -- otherwise two concurrent lanes uploading
-        // byte-identical NEW files would both pass the .has() check before
-        // either finishes, and neither would see the other's claim. Rolled
-        // back in the catch below if this upload doesn't end up succeeding,
-        // so a failed upload can't leave its content permanently unclaimed.
-        knownHashesRef.current.set(sha256, file.name);
+        // Only finalized sources may enter knownHashesRef. Concurrent copies
+        // can transfer together; backend finalize deduplication arbitrates
+        // them. A staging claim is not proof that a duplicate can be skipped.
         try {
             // Resumes carry an existing uploadId and must go straight to
             // single-file /upload/init (it needs to reuse the SAME reserved
@@ -3237,12 +3233,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // transfers fast.
             return { skippedDuplicate: false, sha256, uploadId: initResponse.uploadId };
         } catch (err) {
-            // This upload didn't finish, so nothing was actually stored under
-            // this hash -- release the claim (only if it's still ours; a
-            // concurrent lane can't have taken over the same hash, since the
-            // synchronous check-then-claim above means at most one lane ever
-            // holds a given hash's claim within a batch) so a later file with
-            // the same content is retried instead of silently skipped.
+            // Evict a matching cached identity on failure so a later attempt
+            // revalidates it through the backend.
             if (knownHashesRef.current.get(sha256) === file.name) {
                 knownHashesRef.current.delete(sha256);
             }
@@ -3703,6 +3695,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         error: undefined,
                     });
                     const waveAcceptedFilename = completeResponse?.filename || fileMeta.name;
+                    knownHashesRef.current.set(staged.sha256, waveAcceptedFilename);
                     waveShadowFileOutcomes.set(fileMeta.key, { status: 'done', skippedDuplicate, waveAcceptedFilename });
                     updatePersistedFile(fileMeta.key, { waveAcceptedFilename });
                     const settledFile = { ...fileMeta, status: 'done' as const, skippedDuplicate, waveAcceptedFilename };
@@ -3733,11 +3726,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         },
                     });
                 } catch (err) {
-                    // This upload didn't finish, so nothing was actually stored
-                    // under this hash -- release the claim so a later file with
-                    // the same content is retried instead of silently skipped
-                    // (mirrors uploadFileInChunks's own rollback for a
-                    // staging-phase failure).
+                    // Retry a failed identity through the backend rather than
+                    // treating a matching local cache entry as authoritative.
                     if (knownHashesRef.current.get(staged.sha256) === file.name) {
                         knownHashesRef.current.delete(staged.sha256);
                     }
