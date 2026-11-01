@@ -105,8 +105,9 @@ export interface WaveShadowItem {
 
 export type WaveShadowOutcome = 'accepted' | 'duplicate' | 'cancelled' | 'failed';
 
-// HTTP limits are independent of the smaller transactional storage pages.
-export const WAVE_SHADOW_MAX_PAGE = 2000;
+// Registration is folded into each init-batch request now (see
+// registerWaveItemsBatch in uploadWaveSync.ts) -- no separate page size of
+// its own; a batch's size is whatever INIT_BATCH_MAX_SIZE already is.
 export const WAVE_RESOLVE_MAX_BATCH = 100;
 
 export const openWaveShadowSession = (sessionId: string, declaredCount: number, resumedFromSessionId?: string) =>

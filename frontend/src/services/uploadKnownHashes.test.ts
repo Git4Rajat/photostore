@@ -38,7 +38,9 @@ describe('background upload hash download', () => {
     it('bounds each hung attempt and stops after a few retries', async () => {
         mocks.get.mockImplementation(() => new Promise(() => {}));
         const promise = fetchKnownUploadHashes();
-        await vi.advanceTimersByTimeAsync(UPLOAD_HASH_DOWNLOAD_TIMEOUT_MS * UPLOAD_HASH_DOWNLOAD_ATTEMPTS + 7000);
+        // +25000 covers the retry-backoff delays between attempts
+        // ([2000, 5000, 8000, 8000]), not just the per-attempt timeouts.
+        await vi.advanceTimersByTimeAsync(UPLOAD_HASH_DOWNLOAD_TIMEOUT_MS * UPLOAD_HASH_DOWNLOAD_ATTEMPTS + 25000);
         expect(await promise).toEqual({});
         expect(mocks.get).toHaveBeenCalledTimes(UPLOAD_HASH_DOWNLOAD_ATTEMPTS);
         expect(mocks.get.mock.calls.every(([, config]) => config.signal.aborted)).toBe(true);
@@ -62,7 +64,8 @@ describe('background upload hash download', () => {
     it('stops after bounded retries on network failure', async () => {
         mocks.get.mockRejectedValue(new Error('offline'));
         const promise = fetchKnownUploadHashes();
-        await vi.advanceTimersByTimeAsync(7000);
+        // Sum of the retry-backoff delays between attempts ([2000, 5000, 8000, 8000]).
+        await vi.advanceTimersByTimeAsync(25000);
         expect(await promise).toEqual({});
         expect(mocks.get).toHaveBeenCalledTimes(UPLOAD_HASH_DOWNLOAD_ATTEMPTS);
         expect(vi.getTimerCount()).toBe(0);

@@ -159,3 +159,51 @@ def test_expiry_polls_while_main_clustering_thread_is_busy():
     finally:
         shutdown.set();thread.join(1)
     assert calls and not thread.is_alive()
+
+
+@pytest.mark.parametrize('stop',['discard','browser_loss'])
+def test_partial_accepted_manifest_seals_only_finalized_subset_and_fences_late_writes(stop):
+    from wave_settlement import fence_discard, abandon
+    from wave_policy import validate_admission, check_finalization
+    store,table,now=world()
+    table.submit_transaction([('create',store._row('policy',protocol='library-wave-v1',cleanupState=''))])
+    opened=store.open_session('partial',10000,lease_seconds=300)
+    for offset in range(0,45,20):
+        store.register('partial',[dict(itemId=f'{i:04}',filename=f'{i}.jpg')
+            for i in range(offset,min(offset+20,45))])
+    # Browser lost these successful finalize responses; server evidence remains
+    # authoritative. Unregistered declarations never become Vision members.
+    for i in (0,21,44):
+        store.resolve('partial',f'{i:04}',outcome='accepted',filename=f'{i}.jpg',
+                      photo_id=f'p{i}',processing_revision='r',required_steps=['face'])
+    wave=store._required(store.wave_key(opened['waveId']))
+    assert wave['state']=='collecting' and wave['memberCount']==3
+    assert not wave.get('visionPendingKey')
+    if stop=='browser_loss':
+        now[0]+=301
+        driven=[]
+        expire(store,'partial',lambda *args:pytest.fail('No extra wake needed'),
+               lambda current,wave:driven.append(wave))
+        assert driven==[opened['waveId']]
+    else:
+        parent=fence_discard(store,'partial',reason='User stopped')
+        while parent['state']=='open':
+            parent=abandon(store,'partial',parent['manifestRevision'],reason='User stopped')
+    parent=store._required(store.session_key('partial'))
+    assert parent['state']=='abandoned'
+    assert parent['registeredCount']==parent['resolvedCount']==45
+    assert parent['declaredCount']==10000 and parent['abandonCancelledCount']==42
+    wave=store._required(store.wave_key(opened['waveId']))
+    assert wave['state']=='processing_pending' and wave['memberCount']==3
+    assert store.outbox_eligible(wave,store._required(wave['visionPendingKey']))
+    assert {row['photoId'] for row in store._page(f'e!{wave["waveId"]}!m!')}=={'p0','p21','p44'}
+    with pytest.raises(Conflict,match='closed'):
+        store.register('partial',[dict(itemId='late',filename='late.jpg')])
+    with pytest.raises(Conflict,match='closed'):
+        validate_admission(store,dict(waveSessionId='partial',waveItemId='0001',
+                                     filename='1.jpg',sha256='a'*64),finalizing=True)
+    with pytest.raises(Conflict,match='finalization lease expired|reservation was cancelled'):
+        check_finalization(store,[('partial','0001')])
+    with pytest.raises(Conflict,match='cannot be rebound'):
+        store.resolve('partial','0001',outcome='accepted',filename='1.jpg',photo_id='late',
+                      processing_revision='r',required_steps=['face'])

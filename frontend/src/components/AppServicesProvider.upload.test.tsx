@@ -507,45 +507,40 @@ describe('browser upload selection and startup', () => {
         });
     });
 
-    it('starts transfers when the optional known-hash request never settles', async () => {
+    it('starts transfers after exhausting known-hash retries, even if the app never responds', async () => {
+        // Upload click now blocks on waking the app / fetching known hashes
+        // (up to UPLOAD_HASH_DOWNLOAD_ATTEMPTS=5 retries) before anything
+        // else starts -- this simulates the app never answering at all, and
+        // confirms the upload still proceeds once retries are exhausted
+        // rather than hanging forever.
         mocks.getUpload.mockImplementation((url: string) => url === '/upload/known-hashes'
             ? new Promise(() => {}) : Promise.resolve({}));
         select(filesFor(3));
-        await advance(4000);
+        await advance(330000);
         expect(initFiles()).toHaveLength(3);
         expect(finalizedFiles()).toHaveLength(3);
         expect(mocks.staged).toHaveBeenCalledTimes(3);
     });
 
-    it('starts immediately and uses a slow hash download to skip remaining files in the same upload', async () => {
+    it('blocks upload start until the known-hash download settles, then skips every already-known duplicate', async () => {
         const files = filesFor(50);
         let resolveHashes!: (value: unknown) => void;
-        let releaseTransfers!: () => void;
         mocks.getUpload.mockImplementation((url: string) => url === '/upload/known-hashes'
             ? new Promise((resolve) => { resolveHashes = resolve; }) : Promise.resolve({}));
-        const transferGate = new Promise<void>((resolve) => { releaseTransfers = resolve; });
-        mocks.staged.mockImplementation(() => transferGate);
-        const input = select(files);
+        select(files);
         await advance(1000);
-        const transfersStarted = mocks.staged.mock.calls.length;
-        expect(transfersStarted).toBeGreaterThan(0);
-        expect(transfersStarted).toBeLessThan(files.length);
-        await advance(9000);
-        const hashConfig = mocks.getUpload.mock.calls.find(([url]) => url === '/upload/known-hashes')![1];
-        fireEvent(input, new Event('cancel'));
-        expect(hashConfig.signal.aborted).toBe(false);
+        // Nothing starts while the blocking wake-up/hash call is still pending.
+        expect(mocks.staged).not.toHaveBeenCalled();
         await act(async () => {
-            resolveHashes({ hashes: Object.fromEntries(files.map((file) => [
+            resolveHashes({ hashes: Object.fromEntries(files.slice(0, 20).map((file) => [
                 Array.from(new TextEncoder().encode(file.name)).join('-'), `stored-${file.name}`,
             ])) });
         });
-        await act(async () => { releaseTransfers(); });
-        await advance(3000);
-        expect(mocks.staged).toHaveBeenCalledTimes(transfersStarted);
-        expect(finalizedFiles()).toHaveLength(transfersStarted);
-        expect(services.pendingUploadSummary).toBeNull();
+        await advance(10000);
+        expect(mocks.staged.mock.calls.length).toBeGreaterThan(0);
+        expect(initFiles()).toHaveLength(30);
         expect(services.notifications.some((notification) =>
-            notification.progress?.skippedDuplicateCount === files.length - transfersStarted)).toBe(true);
+            notification.progress?.skippedDuplicateCount === 20)).toBe(true);
         expect(mocks.getUpload.mock.calls.filter(([url]) => url === '/upload/known-hashes')).toHaveLength(1);
     });
 
@@ -991,9 +986,7 @@ describe('browser upload selection and startup', () => {
         expect(finalizedFiles()).toHaveLength(1);
     });
 
-    it('skips a file already uploaded in this tab while the shared library lookup is still pending', async () => {
-        mocks.getUpload.mockImplementation((url: string) => url === '/upload/known-hashes'
-            ? new Promise(() => {}) : Promise.resolve({}));
+    it('skips a file already uploaded in this tab on a later selection', async () => {
         const files = filesFor(1);
         const input = select(files);
         await advance(3000);
@@ -1005,14 +998,11 @@ describe('browser upload selection and startup', () => {
         expect(initFiles()).toHaveLength(1);
         expect(finalizedFiles()).toHaveLength(1);
         expect(mocks.staged).toHaveBeenCalledTimes(1);
-        expect(mocks.getUpload.mock.calls.filter(([url]) => url === '/upload/known-hashes')).toHaveLength(1);
         expect(mocks.span.mock.calls.filter(([name]) => name === 'upload.known_hashes.timeout')).toHaveLength(0);
         expect(services.notifications.some((notification) => notification.progress?.skippedDuplicateCount === 1)).toBe(true);
     });
 
     it('also reports a backend duplicate in the same skipped-duplicate counter after transferring bytes', async () => {
-        mocks.getUpload.mockImplementation((url: string) => url === '/upload/known-hashes'
-            ? new Promise(() => {}) : Promise.resolve({}));
         const postUpload = mocks.postUpload.getMockImplementation()!;
         mocks.postUpload.mockImplementation(async (url, payload) => {
             if (url === '/upload/finalize-batch') {
@@ -1108,6 +1098,7 @@ describe('upload wave shadow protocol wiring', () => {
             if (/^\/upload\/waves\/(shadow|live)\//.test(url)) {
                 if (url.endsWith('/items')) return { manifestRevision: 'rev-items', registeredCount: payload.items.length };
                 if (url.endsWith('/resolve-batch')) return { manifestRevision: 'rev-resolve' };
+                if (url.endsWith('/discard')) return { state: 'abandoned', manifestRevision: 'server-preserved' };
                 if (url.endsWith('/close')) return { state: 'closed' };
                 return { waveId: 'wave-1', manifestRevision: 'rev-open' };
             }
@@ -1131,14 +1122,19 @@ describe('upload wave shadow protocol wiring', () => {
         expect(shadowCalls('/close')).toHaveLength(1);
     });
 
-    it('declares one 901-file selection across both transport chunks before the first init', async () => {
+    it('declares one 901-file selection, registered batch by batch alongside init, before the first init', async () => {
         select(filesFor(901));
         for (let tick = 0; tick < 20 && finalizedFiles().length < 901; tick += 1) await advance(1000);
         await advance(2000);
         expect(finalizedFiles()).toHaveLength(901);
         expect(opens()).toHaveLength(1);
         expect(opens()[0][1]).toMatchObject({ declaredCount: 901 });
-        expect(shadowCalls('/items')).toHaveLength(1);
+        // No separate bulk pass anymore -- each /items call registers exactly
+        // one init-batch's worth of files (<= INIT_BATCH_MAX_SIZE), piggybacked
+        // on that same batch instead of a fixed page size of its own.
+        const registerSizes = shadowCalls('/items').map(([, body]) => body.items.length);
+        expect(registerSizes.every((size) => size > 0 && size <= 24)).toBe(true);
+        expect(registerSizes.reduce((sum, size) => sum + size, 0)).toBe(901);
         expect(shadowCalls('/close')).toHaveLength(1);
         const calls = mocks.postUpload.mock.calls;
         expect(calls.findIndex(([url]) => url.endsWith('/items')))
@@ -1170,6 +1166,67 @@ describe('upload wave shadow protocol wiring', () => {
         await advance(5000);
         expect(finalizedFiles()).toHaveLength(50);
         expect(services.pendingUploadSummary).toBeNull();
+    });
+
+    it('starts live init and byte transfers for one batch while a second items call is blocked', async () => {
+        vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
+        mocks.getUpload.mockImplementation(async url => url === '/upload/waves/protocol' ? {protocol:'live'} : {hashes:{}});
+        const original=mocks.postUpload.getMockImplementation()!;
+        let pages=0;
+        let release!: () => void;
+        const gate=new Promise<void>(resolve => {release=resolve;});
+        mocks.postUpload.mockImplementation(async (url,payload) => {
+            // Call #1 is the upfront single-file admission probe (see
+            // runUploadSession) -- block the second *real* batch (#3) so the
+            // first real batch (#2) is free to start bytes.
+            if (url.endsWith('/items') && ++pages===3) await gate;
+            return original(url,payload);
+        });
+        select(filesFor(450));
+        await advance(4000);
+        // No fixed page sizes anymore -- registration rides along with each
+        // init-batch flush (<= INIT_BATCH_MAX_SIZE each). What matters: one
+        // batch's bytes can start transferring while a later batch's own
+        // /items call is still blocked, not the exact sizes involved.
+        expect(shadowCalls('/items').length).toBeGreaterThanOrEqual(1);
+        expect(initFiles().length).toBeGreaterThan(0);
+        expect(mocks.staged).toHaveBeenCalled();
+        expect(finalizedFiles().length).toBeGreaterThan(0);
+        expect(shadowCalls('/close')).toHaveLength(0);
+        await act(async () => {release();});
+        for (let tick=0;tick<40 && finalizedFiles().length<450;tick++) await advance(1000);
+        await advance(2000);
+        const registered=shadowCalls('/items').flatMap(([,body]) => body.items);
+        expect(registered.map(item => item.filename)).toEqual(filesFor(450).map(file => file.name));
+        expect(new Set(registered.map(item => item.itemId)).size).toBe(450);
+        expect(finalizedFiles()).toHaveLength(450);
+        expect(opens()).toHaveLength(1);
+    });
+
+    it('heartbeat expiry aborts active live transfer intake and retains an explicit retry checkpoint without opening a successor', async () => {
+        vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
+        mocks.getUpload.mockImplementation(async url => url === '/upload/waves/protocol' ? {protocol:'live'} : {hashes:{}});
+        const original=mocks.postUpload.getMockImplementation()!;
+        mocks.postUpload.mockImplementation(async (url,payload) => {
+            if (url === '/upload/transfer-heartbeat') return {leaseActive:false};
+            return original(url,payload);
+        });
+        mocks.staged.mockImplementation((_id,_data,_size,options) => new Promise((_resolve,reject) => {
+            const abort=() => reject(new Error('upload_stopped_by_user'));
+            if (options.abortSignal.aborted) abort();
+            else options.abortSignal.addEventListener('abort',abort,{once:true});
+        }));
+        select(filesFor(50));
+        await advance(1000);
+        expect(mocks.staged).toHaveBeenCalled();
+        const admitted=opens()[0][1].sessionId;
+        await advance(95000);
+        expect(services.uploading).toBe(false);
+        expect(services.pendingUploadSummary).not.toBeNull();
+        expect(services.notifications.some(notification => notification.title === 'Upload expired')).toBe(true);
+        expect(opens()).toHaveLength(1);
+        expect(shadowCalls('/discard')[0][0]).toContain(admitted);
+        expect(finalizedFiles()).toHaveLength(0);
     });
 
     it('stops retrying (auto or manual) once a session hits the attempt cap, instead of retrying forever', async () => {
@@ -1224,7 +1281,11 @@ describe('upload wave shadow protocol wiring', () => {
         select(filesFor(2));
         await advance(4000);
         expect(finalizedFiles()).toHaveLength(2);
-        expect(shadowCalls('/items')).toHaveLength(1);
+        // Registration now rides along with each init-batch flush rather
+        // than a single upfront bulk call -- 2 small files may land in one
+        // batch or two depending on debounce timing; what matters is both
+        // got registered, not the exact call count.
+        expect(shadowCalls('/items').flatMap(([, body]) => body.items)).toHaveLength(2);
         expect(shadowCalls('/resolve-batch')).toHaveLength(0);
         expect(shadowCalls('/close')).toHaveLength(0);
     });
@@ -1247,10 +1308,23 @@ describe('upload wave shadow protocol wiring', () => {
         act(() => services.stopActiveUpload());
         await advance(4000);
         const outcomes = new Map(resolutionCalls().map(([, body]) => [body.itemId, body.outcome]));
-        expect(outcomes.size).toBe(count);
-        expect(Array.from(outcomes.values()).filter(outcome => outcome === 'accepted')).toHaveLength(1);
-        expect(Array.from(outcomes.values()).filter(outcome => outcome === 'cancelled')).toHaveLength(count - 1);
-        expect(shadowCalls('/close')).toHaveLength(1);
+        if (protocol === 'live') {
+            expect(shadowCalls('/discard')).toHaveLength(1);
+            expect(Array.from(outcomes.values())).not.toContain('cancelled');
+            expect(shadowCalls('/close')).toHaveLength(0);
+            expect(finalizedFiles()).toHaveLength(1);
+        } else {
+            // Shadow (advisory) registration now happens lazily per
+            // init-batch rather than a single upfront bulk call -- by the
+            // time Stop runs, only whatever batches already flushed are
+            // registered (<= count), and only those get resolved. Files
+            // whose batch never ran are simply never declared, consistent
+            // with "unregistered declarations are excluded."
+            expect(outcomes.size).toBeGreaterThan(0);
+            expect(outcomes.size).toBeLessThanOrEqual(count);
+            expect(Array.from(outcomes.values()).filter(outcome => outcome === 'accepted')).toHaveLength(1);
+            expect(Array.from(outcomes.values()).filter(outcome => outcome === 'cancelled')).toHaveLength(outcomes.size - 1);
+        }
         expect(services.uploading).toBe(false);
     });
 
@@ -1285,8 +1359,17 @@ describe('upload wave shadow protocol wiring', () => {
         await advance(4000);
         expect(cancelledFiles().length).toBeGreaterThan(0);
         expect(cancelledFiles().some(file => file.filename === committedFilename)).toBe(false);
-        expect(resolutionCalls().some(([, body]) => body.outcome === 'accepted')).toBe(true);
-        expect(shadowCalls('/close')).toHaveLength(1);
+        if (protocol === 'live') {
+            expect(shadowCalls('/discard')).toHaveLength(1);
+            expect(shadowCalls('/close')).toHaveLength(0);
+        } else {
+            // Shadow close() requires every declared item resolved
+            // (waveParentResolved), which a stopped selection with most
+            // batches never registered can no longer satisfy -- the
+            // meaningful guarantee here is that the committed file still
+            // resolves as accepted, not a shadow-mode close.
+            expect(resolutionCalls().some(([, body]) => body.outcome === 'accepted')).toBe(true);
+        }
     });
 
     it('resolves a finalize failure as failed, not accepted', async () => {

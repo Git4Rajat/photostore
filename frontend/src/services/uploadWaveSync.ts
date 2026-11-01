@@ -1,4 +1,4 @@
-import { waveParentFor, recordWaveItemResolved, waveParentResolved, waveSelectionSession, waveFileBelongs, loadWaveOperation, retireWaveOperation, retryWaveOperation, type Operation } from './uploadWaveOperations';
+import { waveParentFor, recordWaveItemResolved, waveParentResolved, waveSelectionSession, waveFileBelongs, loadWaveOperation, retireWaveOperation, type Operation } from './uploadWaveOperations';
 import { sessionScope } from './sessionScope';
 import type { PersistedUploadFile, PersistedUploadSession } from '../types/browserProcessing';
 import {
@@ -9,7 +9,6 @@ import {
     wireItemId,
     waveLiveEnabled,
     waveProtocol,
-    WAVE_SHADOW_MAX_PAGE,
     WAVE_RESOLVE_MAX_BATCH,
     type WaveShadowOutcome,
     closeWaveShadowSession,
@@ -18,9 +17,9 @@ import {
     resolveWaveShadowItems,
 } from './uploadWaveClient';
 
-// Optional shadow protocol for full-selection parents and their transport children.
-// Legacy checkpoints remain readable. Requests are serialized per parent; errors
-// hold diagnostic intake open and never fail the underlying byte upload.
+// Full-selection intake shared by transport children. Advisory shadow errors
+// remain best effort; live admission and cancellation fail closed. Registration,
+// outcome reporting and close are ordered per parent.
 
 // waveParentFor can return either a real Operation (declaredCount present)
 // or, for a session with no waveOperationId yet, the plain checkpoint itself
@@ -32,8 +31,11 @@ const declaredCountFor = (parent: PersistedUploadSession): number =>
 interface WaveShadowSessionState {
     manifestRevision: string | null;
     opened: boolean;
-    registered: boolean;
-    registeredCount: number;
+    opening?: Promise<void>;
+    // Populated per item as each batch actually registers it (see
+    // registerWaveItemsBatch below) -- identity-based, not a count/offset,
+    // so there is nothing here that can drift from the server's truth.
+    registeredItems: Set<string>;
     queued: Map<string, PersistedUploadFile>;
     resolutionScheduled: boolean;
     closed: boolean;
@@ -44,7 +46,6 @@ interface WaveShadowSessionState {
     leaseCheckAt?: number;
     expired?: boolean;
     renewal?: Promise<void>;
-    registrationWaiters: Array<{ through: number; resolve: () => void }>;
 }
 
 const sessionState = new Map<string, WaveShadowSessionState>();
@@ -52,35 +53,10 @@ const sessionState = new Map<string, WaveShadowSessionState>();
 const stateFor = (sessionId: string): WaveShadowSessionState => {
     let state = sessionState.get(sessionId);
     if (!state) {
-        state = { manifestRevision: null, opened: false, registered: false, registeredCount: 0, queued: new Map(), resolutionScheduled: false, closed: false, resolved: new Set(), pending: Promise.resolve(), registrationWaiters: [] };
+        state = { manifestRevision: null, opened: false, registeredItems: new Set(), queued: new Map(), resolutionScheduled: false, closed: false, resolved: new Set(), pending: Promise.resolve() };
         sessionState.set(sessionId, state);
     }
     return state;
-};
-
-// Lets an admission call for file N proceed as soon as the page containing
-// item N has registered, without waiting for the rest of the manifest.
-const waitForRegisteredThrough = (state: WaveShadowSessionState, through: number): Promise<void> => {
-    if (state.registered || state.registeredCount >= through) return Promise.resolve();
-    return new Promise<void>((resolve) => { state.registrationWaiters.push({ through, resolve }); });
-};
-
-const notifyRegistrationWaiters = (state: WaveShadowSessionState): void => {
-    const remaining: WaveShadowSessionState['registrationWaiters'] = [];
-    for (const waiter of state.registrationWaiters) {
-        if (state.registered || state.registeredCount >= waiter.through) waiter.resolve();
-        else remaining.push(waiter);
-    }
-    state.registrationWaiters = remaining;
-};
-
-// waveItemKey is always `${operationId}-${index}` (declareWaveSelection/
-// retryWaveOperation). Recovering the index lets admission wait only for
-// this file's own registration page instead of the whole manifest.
-const itemIndex = (operationId: string, key: string): number => {
-    if (!key.startsWith(operationId + '-')) return -1;
-    const index = Number(key.slice(operationId.length + 1));
-    return Number.isInteger(index) && index >= 0 ? index : -1;
 };
 
 const liveOutcomeForFile = (file: PersistedUploadFile): WaveShadowOutcome | null => {
@@ -92,17 +68,14 @@ const liveOutcomeForFile = (file: PersistedUploadFile): WaveShadowOutcome | null
 // Opens the shadow session (if not already). Safe to call more than once for
 // the same session.id (e.g. at creation and again on mount-restore) -- the
 // state.opened guard makes every repeat call after the first a near-instant
-// no-op.
-// Exported for callers that need to confirm a session is admitted before
-// starting byte uploads, without blocking on the whole manifest -- see
-// liveWaveAdmission below for the same pattern (open, then kick the full
-// registration loop in the background via ensureWaveShadowSessionOpened).
-export const ensureOpened = async (child: PersistedUploadSession): Promise<void> => {
+// no-op. Registration itself has no separate "ensure" of its own anymore --
+// see registerWaveItemsBatch below, called per init-batch, not ahead of time.
+const openSessionOnce = async (child: PersistedUploadSession): Promise<void> => {
     const parent = waveParentFor(child);
     if (!parent) return;
     const state = stateFor(parent.id);
     if ('closed' in parent && parent.closed === true) {
-        state.opened = state.registered = state.closed = true;
+        state.opened = state.closed = true;
         return;
     }
     // declaredCount, not parent.files.length/child.files.length: the
@@ -132,56 +105,14 @@ export const ensureOpened = async (child: PersistedUploadSession): Promise<void>
     }
 };
 
-// Registers every declared item, paged by WAVE_SHADOW_MAX_PAGE. Safe to call
-// more than once for the same session.id -- backend registration is
-// idempotent per itemId, and this module also tracks what it already
-// believes is done so a healthy tab doesn't re-send on every call. Runs in
-// the background relative to byte uploads -- liveWaveAdmission only waits
-// for each file's own page via waitForRegisteredThrough, not this whole loop.
-const ensureRegistered = async (child: PersistedUploadSession): Promise<void> => {
+export const ensureOpened = (child: PersistedUploadSession): Promise<void> => {
     const parent = waveParentFor(child);
-    if (!parent) return;
+    if (!parent) return Promise.resolve();
     const state = stateFor(parent.id);
-    try {
-        await ensureOpened(child);
-        if (state.closed || state.expired || state.discarding || !state.opened || state.registered) return;
-        // child.files (the checkpoint), not parent.files: always a safe,
-        // idempotent subset of what's already registered -- a file can't reach
-        // `done` (and be dropped from the checkpoint) before its whole
-        // registration round has already completed, so re-registering only
-        // what's left in the checkpoint never skips anything that still needs it.
-        for (let i = state.registeredCount; i < child.files.length; i += WAVE_SHADOW_MAX_PAGE) {
-            if (state.discarding || !waveParentFor(child)) return;
-            // waveItemKey (not the bare checkpoint key) is what every other
-            // reference to this file's item -- resolve, admission, finalize
-            // -- hashes into the wire itemId (see wireItemId call sites
-            // below). Registering under file.key instead would register a
-            // different identity than anything ever looks up again.
-            const page = child.files.slice(i, i + WAVE_SHADOW_MAX_PAGE)
-                .map((file) => ({ itemId: file.waveItemKey || file.key, filename: file.name }));
-            const result = await registerWaveShadowItems(parent.id, page);
-            if (!result) return; // Replay only the unacknowledged HTTP batch on retry.
-            state.manifestRevision = result.manifestRevision;
-            state.registeredCount = i + page.length;
-            notifyRegistrationWaiters(state);
-        }
-        if (!state.discarding) state.registered = true;
-    } catch (error) {
-        // Set synchronously here (not left to serialized()'s own .catch,
-        // which runs a tick later) so admissionError is already visible by
-        // the time the finally below wakes any waiter -- otherwise
-        // liveWaveAdmission can resume and check admissionError before it's
-        // actually set.
-        state.admissionError = error instanceof Error ? error : new Error('Upload admission failed.');
-        throw error;
-    } finally {
-        // Unconditional: on early return/throw, release every waiter even if
-        // unsatisfied -- liveWaveAdmission re-checks progress and throws its
-        // own "admission unavailable" rather than hanging forever. A later
-        // retry re-kicks registration and sets up a fresh, satisfiable wait.
-        for (const waiter of state.registrationWaiters) waiter.resolve();
-        state.registrationWaiters = [];
+    if (!state.opening) {
+        state.opening = openSessionOnce(child).finally(() => { state.opening = undefined; });
     }
+    return state.opening;
 };
 
 // Registration, resolutions and close share one ordered chain. The upload
@@ -197,12 +128,73 @@ const serialized = (session: PersistedUploadSession, action: () => Promise<void>
     return state.pending;
 };
 
-export const ensureWaveShadowSessionOpened = (session: PersistedUploadSession): Promise<void> => {
+const expiredAdmission = () => Object.assign(new Error('Upload session expired. Retry explicitly to start a new upload intake.'),
+    { code: 'upload_session_expired' });
+
+// Registers exactly these files under session's parent in one /items call --
+// no paging, since callers only ever pass a batch already bounded by
+// INIT_BATCH_MAX_SIZE (see flushInitBatch in AppServicesProvider.tsx). This
+// is the only registration primitive: there is no separate bulk pass to run
+// ahead of time and nothing for a background loop to drift from, because a
+// batch's own admission IS its registration, resolved synchronously right
+// before that same batch's init.
+export const registerWaveItemsBatch = async (
+    session: PersistedUploadSession, files: PersistedUploadFile[],
+): Promise<Map<string, {waveSessionId: string; waveItemId: string}>> => {
+    await ensureOpened(session);
     const parent = waveParentFor(session);
-    // Admission is immutable once the complete manifest is acknowledged. Do not
-    // put hashing/init/finalize behind the queue draining earlier file outcomes.
-    if (!parent || stateFor(parent.id).registered) return Promise.resolve();
-    return serialized(session, () => ensureRegistered(session));
+    const state = parent ? stateFor(parent.id) : null;
+    if (state?.expired) throw expiredAdmission();
+    if (!parent || !state || state.discarding || state.closed) {
+        throw new Error('Upload wave admission is unavailable. Retry before uploading files.');
+    }
+    const items = files.filter(file => waveFileBelongs(session, file))
+        .map(file => ({ itemId: file.waveItemKey || file.key, filename: file.name }))
+        .filter(item => !state.registeredItems.has(item.itemId));
+    if (items.length) {
+        let result;
+        try {
+            result = await registerWaveShadowItems(parent.id, items);
+        } catch (error) {
+            // Set synchronously (not left to serialized()'s own .catch, which
+            // runs a tick later) so a caller rejecting this same batch sees
+            // the real reason, not the generic fallback message below.
+            state.admissionError = error instanceof Error ? error : new Error('Upload admission failed.');
+            throw error;
+        }
+        if (!result) throw new Error('Upload wave admission is unavailable. Retry before uploading files.');
+        state.manifestRevision = result.manifestRevision;
+        for (const item of items) state.registeredItems.add(item.itemId);
+    }
+    // Re-check after the network round trip -- an independent heartbeat
+    // renewal can flip this mid-call. Never hand back a binding for a
+    // session that's since expired/closed/discarding.
+    if (state.expired) throw expiredAdmission();
+    if (state.discarding || state.closed) {
+        throw new Error('Upload wave admission is unavailable. Retry before uploading files.');
+    }
+    const out = new Map<string, {waveSessionId: string; waveItemId: string}>();
+    for (const file of files) {
+        if (!waveFileBelongs(session, file)) continue;
+        out.set(file.key, { waveSessionId: parent.id, waveItemId: await wireItemId(file.waveItemKey || file.key) });
+    }
+    // Hashing the transport identity yields to the event loop. Cancellation
+    // or expiry while it was in flight must not hand back a late binding.
+    if (state.expired) throw expiredAdmission();
+    if (state.discarding || state.closed || waveParentFor(session)?.id !== parent.id) {
+        throw new Error('Upload wave admission is unavailable. Retry before uploading files.');
+    }
+    return out;
+};
+
+// Recomputes the wire identity for a file whose batch already registered it
+// at init time (see registerWaveItemsBatch) -- no new registration call,
+// just the same deterministic hash finalize needs to reference the item.
+export const waveIdentityFor = async (session: PersistedUploadSession, file: PersistedUploadFile)
+    : Promise<Record<string,string>> => {
+    const parent = waveParentFor(session);
+    if (!parent || !waveFileBelongs(session, file)) return {};
+    return { waveSessionId: parent.id, waveItemId: await wireItemId(file.waveItemKey || file.key) };
 };
 
 // Called only from the parent's ordered chain. Failed batches remain unresolved
@@ -211,9 +203,9 @@ const resolveFiles = async (session: PersistedUploadSession, files: PersistedUpl
     const parent = waveParentFor(session);
     if (!parent) return;
     const state = stateFor(parent.id);
-    await ensureRegistered(session);
-    if (state.expired || state.discarding || !state.registered || !waveParentFor(session)) return;
+    if (state.expired || state.discarding || !waveParentFor(session)) return;
     const outstanding = files.filter(file => waveFileBelongs(session, file)
+        && state.registeredItems.has(file.waveItemKey || file.key)
         && !state.resolved.has(file.waveItemKey || file.key));
     for (let i = 0; i < outstanding.length; i += WAVE_RESOLVE_MAX_BATCH) {
         if (state.discarding || !waveParentFor(session)) return;
@@ -273,11 +265,11 @@ export const acknowledgeWaveFinalizedFile = (session: PersistedUploadSession, fi
     }
 });
 
-// Called once, from runUploadSession's `finally`, regardless of how the
-// session ended (completed, stopped, discarded, or errored). Defensively
+// Called from runUploadSession's healthy/error tail; live Stop/Discard uses
+// server-authoritative abandonment instead. Defensively
 // resolves every file this module hasn't confirmed as settled -- anything
 // not accepted/duplicate/failed is a cancellation (never started, or stopped
-// mid-transfer) -- then closes the shadow session. A session with items that
+// mid-transfer) -- then closes intake. A session with items that
 // still can't resolve (e.g. the shadow API was never reachable) simply never
 // closes; that's an observational gap, not a failure this surfaces.
 export const finalizeWaveShadowSession = (session: PersistedUploadSession): Promise<void> => serialized(session, async () => {
@@ -285,15 +277,18 @@ export const finalizeWaveShadowSession = (session: PersistedUploadSession): Prom
     if (!parent) return;
     const state = stateFor(parent.id);
     if (state.closed || state.discarding) return;
-    await ensureRegistered(session);
-    if (state.expired || state.discarding || !state.registered || !waveParentFor(session)) return;
+    if (state.expired || state.discarding || !waveParentFor(session)) return;
     await resolveFiles(session, session.files);
     // Retry local checkpoint writes without repeating acknowledged HTTP calls.
     for (const file of session.files) {
         if (state.resolved.has(file.waveItemKey || file.key)) recordWaveItemResolved(session, file);
     }
     if (state.closed) return;
+    // Only files actually registered gate completeness -- a file whose batch
+    // never ran (session stopped before its turn) was never declared to the
+    // server at all, so it can't block closing on "not yet resolved."
     if (session.files.some(file => waveFileBelongs(session, file)
+        && state.registeredItems.has(file.waveItemKey || file.key)
         && !state.resolved.has(file.waveItemKey || file.key))) return;
     if (!waveParentResolved(session)) return;
     if (!state.manifestRevision) return;
@@ -307,6 +302,13 @@ export const finalizeWaveShadowSession = (session: PersistedUploadSession): Prom
 // Discard needs a durable server acknowledgment, not a best-effort outcome flush.
 // Stop restored registration after its in-flight HTTP page and preserve server-
 // resolved uploads even if this browser lost their local completion checkpoint.
+export const quiesceWaveShadowSession = (session: PersistedUploadSession): void => {
+    if (!waveLiveEnabled()) return;
+    const parent = waveParentFor(session);
+    if (!parent) return;
+    stateFor(parent.id).discarding = true;
+};
+
 export const discardWaveShadowSession = async (session: PersistedUploadSession): Promise<void> => {
     const parent = waveParentFor(session);
     if (!parent) {
@@ -314,6 +316,7 @@ export const discardWaveShadowSession = async (session: PersistedUploadSession):
         return;
     }
     if (!waveLiveEnabled() || await waveProtocol() === 'legacy') {
+        stateFor(parent.id).discarding = false;
         await finalizeWaveShadowSession(session);
         return;
     }
@@ -379,6 +382,11 @@ export const discardWaveShadowSession = async (session: PersistedUploadSession):
                     if ([403].includes(failure.status || 0) || failure.message?.includes('Only the library owner may abandon intake')) {
                         const child=currentId===parent.id ? session : candidate;
                         if (!child) throw error;
+                        // Older services restrict abandonment to owners. The
+                        // resolve/close fallback below only ever resolves
+                        // items already in registeredItems (see resolveFiles)
+                        // and the server's own close() rejects an incomplete
+                        // wave -- no separate pre-check needed here.
                         state.discarding=false;
                         await finalizeWaveShadowSession(child);
                         state.discarding=true;
@@ -407,23 +415,29 @@ export const discardWaveShadowSession = async (session: PersistedUploadSession):
             retireWaveOperation({...session,waveOperationId:session.waveOperationId ? id : undefined});
         }
     } finally {
-        for (const state of Array.from(held)) state.discarding=false;
+        // Cancellation is terminal locally even if the server acknowledgment
+        // was lost. Retry Discard may finish cleanup, never restart intake.
+        for (const state of Array.from(held)) state.discarding=true;
     }
 };
 
 // A lost finalize response may leave server-accepted files locally unresolved.
 // Never rebind those results to cancelled just to stop the remaining upload.
 export const stopWaveShadowSession = async (session: PersistedUploadSession): Promise<void> => {
-    await finalizeWaveShadowSession(session);
     const parent=waveParentFor(session);
-    if (!waveLiveEnabled() || await waveProtocol()==='legacy') return;
+    quiesceWaveShadowSession(session);
+    if (!waveLiveEnabled() || await waveProtocol()==='legacy') {
+        if (parent) stateFor(parent.id).discarding = false;
+        await finalizeWaveShadowSession(session);
+        return;
+    }
     if (parent && stateFor(parent.id).closed) return;
     await discardWaveShadowSession(session);
 };
 
 export const cancelQueuedWaveSelection = (files: File[]): Promise<void> => {
     const child = waveSelectionSession(files);
-    return child ? finalizeWaveShadowSession(child) : Promise.resolve();
+    return child ? stopWaveShadowSession(child) : Promise.resolve();
 };
 
 // Test-only: clear in-memory state between cases so one test's session ids
@@ -449,86 +463,21 @@ export const heartbeatWaveSession = async (session: PersistedUploadSession): Pro
     const parent = waveParentFor(session);
     if (!parent) return;
     const state = stateFor(parent.id);
-    if (!state.opened || state.expired || state.closed || state.discarding) return;
+    if (state.expired) throw expiredAdmission();
+    if (!state.opened || state.closed || state.discarding) return;
     if (!state.renewal) {
         state.renewal = renewUploadWaveLease(parent.id).then(result => observeLease(state,result))
+            .catch(error => {
+                if (state.leaseCheckAt !== undefined && Date.now() >= state.leaseCheckAt) {
+                    state.expired = true;
+                    throw expiredAdmission();
+                }
+                throw error;
+            })
             .finally(() => { state.renewal = undefined; });
     }
     await state.renewal;
+    if (state.expired) throw expiredAdmission();
 };
+// Lease expiry is terminal for this intake; only explicit retry creates a successor.
 
-const admissions = new WeakMap<PersistedUploadSession, Promise<void>>();
-
-// A returning browser cannot resurrect a timed-out parent. Preserve transport
-// keys/bytes and move unfinished files to a linked admission, repeatedly.
-export const liveWaveAdmission = async (session: PersistedUploadSession, file: PersistedUploadFile,
-    onRebind?: () => void, onBeforeRebind?: () => void): Promise<Record<string,string>> => {
-    if (!waveLiveEnabled() || await waveProtocol()==='legacy') return {};
-    let pending=admissions.get(session);
-    if (!pending) {
-        pending=(async () => {
-            // Open eagerly (fast, single call). The registration loop is
-            // kicked off later, synchronously adjacent to this file's own
-            // wait (see below) -- not here, so there's exactly one kickoff
-            // per admission attempt instead of two racing/duplicating calls.
-            await ensureOpened(session);
-            let parent=waveParentFor(session);
-            if (parent) {
-                let state=stateFor(parent.id);
-                if (!state.expired && state.leaseCheckAt !== undefined && Date.now()>=state.leaseCheckAt) {
-                    await heartbeatWaveSession(session);
-                }
-                if (state.expired) {
-                    onBeforeRebind?.();
-                    const next=retryWaveOperation(session);
-                    if (next.waveOperationId===session.waveOperationId) throw new Error('Upload resume could not be saved.');
-                    // Keep references held by hashing/transfer lanes valid.
-                    session.waveOperationId=next.waveOperationId;
-                    session.waveScope=next.waveScope;
-                    session.files.forEach((entry,index) => { entry.waveItemKey=next.files[index].waveItemKey; });
-                    onRebind?.();
-                    await ensureOpened(session);
-                    parent=waveParentFor(session);
-                    state=stateFor(parent!.id);
-                }
-            }
-        })().finally(() => { admissions.delete(session); });
-        admissions.set(session,pending);
-    }
-    await pending;
-    // Automatic retry lanes can hold a progress-store copy of this record.
-    if (!waveFileBelongs(session,file)) {
-        const current=session.files.find(entry => entry.key===file.key);
-        if (current) file.waveItemKey=current.waveItemKey;
-    }
-    const parent=waveParentFor(session);
-    if (session.waveAdmissionFailed) {
-        throw new Error('Upload admission could not be saved in browser storage. Free space for this site, then retry.');
-    }
-    if (!parent || !session.waveOperationId || !waveFileBelongs(session,file)) {
-        throw new Error('Upload wave admission is unavailable. Retry before uploading files.');
-    }
-    const state=stateFor(parent.id);
-    // Wait only for THIS file's own registration page, not the whole
-    // manifest -- the background loop keeps advancing registeredCount
-    // independently of which file is currently waiting. The re-kick here is
-    // synchronous and immediately followed by the wait (no await between
-    // them) so a kickoff that fails/flushes fast can never race ahead of
-    // this waiter being registered -- it's also what retries a registration
-    // attempt that failed before this call ever reached state.registered.
-    const requiredIndex=itemIndex(parent.id, file.waveItemKey || file.key);
-    if (!state.registered) {
-        if (requiredIndex>=0) {
-            void ensureWaveShadowSessionOpened(session);
-            await waitForRegisteredThrough(state, requiredIndex+1);
-        } else {
-            await ensureWaveShadowSessionOpened(session); // can't determine this file's page; fall back to the full wait
-        }
-    }
-    const admitted=state.registered || (requiredIndex>=0 && state.registeredCount>requiredIndex);
-    if (!admitted || state.expired) {
-        if (state.admissionError) throw state.admissionError;
-        throw new Error('Upload wave admission is unavailable. Retry before uploading files.');
-    }
-    return {waveSessionId:parent.id,waveItemId:await wireItemId(file.waveItemKey || file.key)};
-};
