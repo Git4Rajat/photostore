@@ -133,6 +133,40 @@ def test_resolve_many_advances_shared_control_once_for_a_page(world):
     assert store._required(store.wave_key(row['waveId']))['memberCount'] == 10
 
 
+def test_known_duplicates_reduce_declaration_before_admission_idempotently(world):
+    store, table, _ = world
+    store.open_session('duplicates', 3)
+    first = store.exclude_duplicates('duplicates', [
+        dict(itemId='a', filename='stored-a.jpg'),
+        dict(itemId='b', filename='stored-b.jpg'),
+    ])
+    assert first['selectionCount'] == 3
+    assert first['declaredCount'] == 1
+    assert first['excludedDuplicateCount'] == 2
+    transactions = len(table.transactions)
+    replay = store.exclude_duplicates('duplicates', [
+        dict(itemId='b', filename='stored-b.jpg'),
+        dict(itemId='a', filename='stored-a.jpg'),
+    ])
+    assert replay['declaredCount'] == 1
+    assert len(table.transactions) == transactions
+    # Reopening after a reload still validates against the immutable original
+    # selection count rather than the reduced admission count.
+    assert store.open_session('duplicates', 3)['declaredCount'] == 1
+    registered = store.register('duplicates', [dict(itemId='candidate', filename='new.jpg')])
+    assert registered['registeredCount'] == 1
+    resolved = store.resolve('duplicates', 'candidate', outcome='cancelled')
+    assert store.close('duplicates', resolved['manifestRevision'], 'close-duplicates')['state'] == 'closed'
+
+
+def test_duplicate_exclusion_cannot_remove_an_already_admitted_identity(world):
+    store, _, _ = world
+    store.open_session('overlap', 1)
+    store.register('overlap', [dict(itemId='same', filename='new.jpg')])
+    with pytest.raises(Conflict, match='overlaps admitted'):
+        store.exclude_duplicates('overlap', [dict(itemId='same', filename='stored.jpg')])
+
+
 def test_resolve_many_coalesces_same_revision_and_preserves_projection(world):
     store, _, _ = world
     parent = store.open_session('same', 2)

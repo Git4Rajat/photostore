@@ -37,7 +37,8 @@ def endpoint(function):
         # Large manifests are a single browser request; storage transactions
         # remain bounded independently inside the registration handler.
         operation = app.request.path.rsplit('/', 1)[-1]
-        limit = {'items': 16 * 1024 * 1024, 'resolve-batch': 1024 * 1024}.get(operation, 65536)
+        limit = {'items': 16 * 1024 * 1024, 'resolve-batch': 1024 * 1024,
+                 'duplicate-exclusions': 1024 * 1024}.get(operation, 65536)
         if app.request.content_length and app.request.content_length > limit:
             return app.jsonify({'error': 'Shadow request too large'}), 413
         if app.jobs_table_client is None:
@@ -132,6 +133,22 @@ def register_routes(blueprint):
         for offset in range(0, len(items), REGISTER_MAX_PAGE):
             result = store.register(session, items[offset:offset + REGISTER_MAX_PAGE])
         return result
+
+    @blueprint.route('/upload/waves/live/sessions/<session>/duplicate-exclusions', methods=['POST'])
+    @endpoint
+    def wave_live_exclude_duplicates(store, data, session):
+        from upload_waves import REGISTER_MAX_PAGE, identifier
+        items = data['items']
+        if not isinstance(items, list) or not 0 < len(items) <= REGISTER_MAX_PAGE:
+            raise ValueError('Invalid duplicate exclusion size')
+        ids = []
+        for item in items:
+            ids.append(identifier(item['itemId']))
+            if not isinstance(item.get('filename'), str) or not 0 < len(item['filename']) <= 1024:
+                raise ValueError('Invalid duplicate filename')
+        if len(set(ids)) != len(ids):
+            raise ValueError('Duplicate itemId')
+        return store.exclude_duplicates(session, items)
 
     @blueprint.route('/upload/waves/live/sessions/<session>/resolve-batch', methods=['POST'])
     @blueprint.route('/upload/waves/shadow/sessions/<session>/resolve-batch', methods=['POST'])

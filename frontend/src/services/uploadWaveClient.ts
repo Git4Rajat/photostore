@@ -106,10 +106,11 @@ export interface WaveShadowItem {
 export type WaveShadowOutcome = 'accepted' | 'duplicate' | 'cancelled' | 'failed';
 
 // Keep admission comfortably below the backend's 2,000-item request limit.
-// A live upload registers its pending manifest in these pages before starting
-// workers; per-init registration remains an idempotent fallback for resumes
-// and files added after that pass.
+// Fresh uploads normally admit only the candidates in each init batch after
+// hashing and known-duplicate rejection; the larger bound also supports
+// recovery and protocol maintenance callers.
 export const WAVE_REGISTER_MAX_BATCH = 1000;
+export const WAVE_DUPLICATE_EXCLUSION_MAX_BATCH = 90;
 export const WAVE_RESOLVE_MAX_BATCH = 100;
 
 export const openWaveShadowSession = (sessionId: string, declaredCount: number, resumedFromSessionId?: string) =>
@@ -122,6 +123,16 @@ export const openWaveShadowSession = (sessionId: string, declaredCount: number, 
 export const registerWaveShadowItems = (sessionId: string, items: WaveShadowItem[]) =>
     callShadow<{ manifestRevision: string; registeredCount: number }>(
         `${base()}/sessions/${encodeURIComponent(sessionId)}/items`,
+        async () => ({ items: await Promise.all(items.map(async item => ({
+            ...item, itemId: await wireItemId(item.itemId),
+        }))) }),
+        BATCH_REQUEST_CONFIG,
+        true,
+    );
+
+export const excludeWaveShadowDuplicates = (sessionId: string, items: WaveShadowItem[]) =>
+    callShadow<{ manifestRevision: string; declaredCount: number; excludedDuplicateCount?: number }>(
+        `${base()}/sessions/${encodeURIComponent(sessionId)}/duplicate-exclusions`,
         async () => ({ items: await Promise.all(items.map(async item => ({
             ...item, itemId: await wireItemId(item.itemId),
         }))) }),

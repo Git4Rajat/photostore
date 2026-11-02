@@ -226,7 +226,7 @@ class ShadowWaves:
             existing = self._get(key)
             if existing:
                 if existing.get('discardAbsent'):return dict(existing)
-                if existing['declaredCount'] != declared_count or existing.get('resumedFromSessionId', '') != resumed_from:
+                if existing.get('selectionCount', existing['declaredCount']) != declared_count or existing.get('resumedFromSessionId', '') != resumed_from:
                     raise Conflict('A session declaration is immutable')
                 return dict(existing)
             if resumed_from:
@@ -250,7 +250,7 @@ class ShadowWaves:
                         evaluation='', updatedAt=self.clock(), lastProgressAt=self.clock(),
                         visionPendingKey='', waitReason='intake_open')
             wave.update(noWorkProbe='',noWorkImpossible=False)
-            row = self._row(key, sessionId=session, waveId=wave_id, declaredCount=declared_count,
+            row = self._row(key, sessionId=session, waveId=wave_id, selectionCount=declared_count, declaredCount=declared_count,
                 registeredCount=0, resolvedCount=0, state='open', resumedFromSessionId=resumed_from, manifestRevision=uuid.uuid4().hex,
                 createdAt=self.clock(), **(dict(heartbeatAt=self.clock(),
                     leaseExpiresAt=self.clock()+lease_seconds) if lease_seconds else {}))
@@ -301,6 +301,64 @@ class ShadowWaves:
             if old['registeredCount'] + len(changes) > old['declaredCount']:
                 raise Conflict('Registration exceeds declared parent selection')
             row = dict(old, registeredCount=old['registeredCount'] + len(changes),
+                       manifestRevision=uuid.uuid4().hex)
+            wave = self._required(self.wave_key(old['waveId']))
+            control = self._required('control')
+            self._commit(control, [self._change(old, row), *changes,
+                self._change(wave, dict(wave, lastProgressAt=self.clock(), updatedAt=self.clock()))])
+            return row
+        return self._retry(run)
+
+    def exclude_duplicates(self, session, items):
+        """Durably remove known duplicates before manifest admission.
+
+        Each excluded identity gets its own receipt so regrouped retries after
+        a lost response cannot decrement declaredCount twice. The receipts and
+        session count change share the same optimistic-concurrency transaction.
+        """
+        if not isinstance(items, list) or not 0 < len(items) <= REGISTER_MAX_PAGE:
+            raise ValueError(f'Expected 1-{REGISTER_MAX_PAGE} duplicate exclusions per page')
+        if any(not isinstance(item, dict) for item in items):
+            raise ValueError('Each duplicate exclusion must be an object')
+        keys = [identifier(item['itemId']) for item in items]
+        if len(set(keys)) != len(keys):
+            raise ValueError('Duplicate itemId in exclusion page')
+        for item in items:
+            if not isinstance(item.get('filename'), str) or not 0 < len(item['filename']) <= 1024:
+                raise ValueError('Each duplicate exclusion requires its stored filename')
+
+        def exclusion_key(item_id):
+            return f'x!{session}!{identifier(item_id)}'
+
+        def run():
+            old = self._required(self.session_key(session))
+            from table_reads import read_entities
+            existing = read_entities(self.table, self.partition,
+                [key for item in items for key in (
+                    exclusion_key(item['itemId']), self.item_key(session, item['itemId']))])
+            changes = []
+            for item in items:
+                key = exclusion_key(item['itemId'])
+                previous = existing[key]
+                if previous:
+                    if previous.get('filename') != item['filename']:
+                        raise Conflict('Duplicate exclusion identity cannot be rebound')
+                    continue
+                if existing[self.item_key(session, item['itemId'])]:
+                    raise Conflict('Duplicate exclusion overlaps admitted manifest')
+                changes.append(('create', self._row(key, kind='duplicate-exclusion',
+                    itemId=item['itemId'], sessionId=session, waveId=old['waveId'],
+                    filename=item['filename'], outcome='duplicate', excludedAt=self.clock())))
+            if not changes:
+                return dict(old)
+            if old['state'] != 'open' or old.get('abandoning') or (
+                    old.get('leaseExpiresAt') and old['leaseExpiresAt'] <= self.clock()):
+                raise Conflict('Session is closed')
+            declared_count = old['declaredCount'] - len(changes)
+            if declared_count < old['registeredCount']:
+                raise Conflict('Duplicate exclusion overlaps admitted manifest')
+            row = dict(old, declaredCount=declared_count,
+                       excludedDuplicateCount=old.get('excludedDuplicateCount', 0) + len(changes),
                        manifestRevision=uuid.uuid4().hex)
             wave = self._required(self.wave_key(old['waveId']))
             control = self._required('control')

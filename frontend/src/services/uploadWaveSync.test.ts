@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
     legacyAbandon: vi.fn(),
     live: false,
     register: vi.fn(),
+    exclude: vi.fn(),
     resolve: vi.fn(),
     batch: vi.fn(),
     close: vi.fn(),
@@ -18,10 +19,12 @@ vi.mock('./uploadWaveClient', () => ({
     discardWaveSession: mocks.abandon,
     abandonWaveShadowSession: mocks.legacyAbandon,
     WAVE_REGISTER_MAX_BATCH: 1000,
+    WAVE_DUPLICATE_EXCLUSION_MAX_BATCH: 90,
     WAVE_RESOLVE_MAX_BATCH: 100,
     wireItemId: async (key: string) => `wire:${key}`,
     openWaveShadowSession: mocks.open,
     registerWaveShadowItems: mocks.register,
+    excludeWaveShadowDuplicates: mocks.exclude,
     resolveWaveShadowItems: async (id: string, items: any[]) => {
         mocks.batch(id, items);
         const results = await Promise.all(items.map(item => mocks.resolve(id, item.itemId, item.outcome, item.filename)));
@@ -35,6 +38,7 @@ import {
     ensureOpened,
     registerWaveItemsBatch,
     finalizeWaveShadowSession,
+    excludeWaveDuplicate,
     discardWaveShadowSession,
     stopWaveShadowSession,
     resolveWaveShadowFile,
@@ -60,6 +64,8 @@ beforeEach(() => {
     mocks.open.mockReset().mockResolvedValue({ waveId: 'wave-1', manifestRevision: 'rev-0' });
     mocks.register.mockImplementation(async (_sessionId: string, items: unknown[]) =>
         ({ manifestRevision: `rev-register-${items.length}`, registeredCount: items.length }));
+    mocks.exclude.mockImplementation(async (_sessionId: string, items: unknown[]) =>
+        ({ manifestRevision: `rev-exclude-${items.length}`, declaredCount: 0, excludedDuplicateCount: items.length }));
     mocks.resolve.mockResolvedValue({ manifestRevision: 'rev-resolve' });
     mocks.close.mockResolvedValue({ state: 'closed' });
 });
@@ -168,6 +174,26 @@ describe('registerWaveItemsBatch', () => {
         mocks.open.mockClear();
         await expect(registerWaveItemsBatch(s, s.files)).rejects.toThrow('admission is unavailable');
         expect(mocks.open).not.toHaveBeenCalled();
+    });
+});
+
+describe('excludeWaveDuplicate', () => {
+    it('coalesces concurrent known duplicates before manifest admission', async () => {
+        mocks.live = true;
+        const s = session(3, 'sess-known-duplicates');
+        const exclusions = s.files.map((file, index) => excludeWaveDuplicate(s, file, `stored-${index}.jpg`));
+        await Promise.all(exclusions);
+        expect(mocks.register).not.toHaveBeenCalled();
+        expect(mocks.exclude).toHaveBeenCalledTimes(1);
+        expect(mocks.exclude.mock.calls[0][1]).toHaveLength(3);
+    });
+
+    it('rejects excluding an identity that was already admitted', async () => {
+        mocks.live = true;
+        const s = session(1, 'sess-admitted-duplicate');
+        await registerWaveItemsBatch(s, s.files);
+        await expect(excludeWaveDuplicate(s, s.files[0], 'stored.jpg'))
+            .rejects.toThrow('already admitted');
     });
 });
 

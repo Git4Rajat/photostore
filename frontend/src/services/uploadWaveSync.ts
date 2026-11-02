@@ -10,11 +10,13 @@ import {
     waveLiveEnabled,
     waveProtocol,
     WAVE_REGISTER_MAX_BATCH,
+    WAVE_DUPLICATE_EXCLUSION_MAX_BATCH,
     WAVE_RESOLVE_MAX_BATCH,
     type WaveShadowOutcome,
     closeWaveShadowSession,
     openWaveShadowSession,
     registerWaveShadowItems,
+    excludeWaveShadowDuplicates,
     resolveWaveShadowItems,
 } from './uploadWaveClient';
 
@@ -43,11 +45,14 @@ interface WaveShadowSessionState {
     discarding?: boolean;
     resolved: Set<string>;
     pending: Promise<void>;
-    // Registration has a separate chain from outcome/close ordering. Init
-    // batches and the rolling look-ahead can arrive concurrently, but Azure
+    // Admission/exclusion has a separate chain from outcome/close ordering.
+    // Concurrent init batches can arrive together, but Azure
     // Table session/wave rows are optimistic-concurrency hot spots. Serialize
     // admission locally so this browser never races itself on those rows.
     registrationPending: Promise<void>;
+    excludedItems: Set<string>;
+    duplicateQueue: Map<string, { file: PersistedUploadFile; waiters: Array<{ resolve: () => void; reject: (error: unknown) => void }> }>;
+    duplicateFlushScheduled: boolean;
     admissionError?: Error;
     leaseCheckAt?: number;
     expired?: boolean;
@@ -59,7 +64,7 @@ const sessionState = new Map<string, WaveShadowSessionState>();
 const stateFor = (sessionId: string): WaveShadowSessionState => {
     let state = sessionState.get(sessionId);
     if (!state) {
-        state = { manifestRevision: null, opened: false, registeredItems: new Set(), queued: new Map(), resolutionScheduled: false, closed: false, resolved: new Set(), pending: Promise.resolve(), registrationPending: Promise.resolve() };
+        state = { manifestRevision: null, opened: false, registeredItems: new Set(), queued: new Map(), resolutionScheduled: false, closed: false, resolved: new Set(), pending: Promise.resolve(), registrationPending: Promise.resolve(), excludedItems: new Set(), duplicateQueue: new Map(), duplicateFlushScheduled: false };
         sessionState.set(sessionId, state);
     }
     return state;
@@ -149,13 +154,12 @@ export const registerWaveItemsBatch = async (
     if (!parent || !state || state.discarding || state.closed) {
         throw new Error('Upload wave admission is unavailable. Retry before uploading files.');
     }
-    // The common init path asks for identities inside the already-admitted
-    // rolling window. Do not queue that local lookup behind a slower network
-    // refill for future files.
+    // A repeated init path may ask for identities already admitted by an
+    // overlapping batch. Do not queue that local lookup behind another call.
     const needsRegistration = files.some(file => waveFileBelongs(session, file)
         && !state.registeredItems.has(file.waveItemKey || file.key));
     const registration = needsRegistration ? state.registrationPending.then(async () => {
-        // Compute this inside the chain. A preceding look-ahead or init batch
+        // Compute this inside the chain. A preceding init batch
         // may have admitted some of the same files while this caller waited.
         const items = files.filter(file => waveFileBelongs(session, file))
             .map(file => ({ itemId: file.waveItemKey || file.key, filename: file.name }))
@@ -186,9 +190,8 @@ export const registerWaveItemsBatch = async (
         throw new Error('Upload wave admission is unavailable. Retry before uploading files.');
     }
     const out = new Map<string, {waveSessionId: string; waveItemId: string}>();
-    // The upfront manifest pass needs only the acknowledgement. Avoid hashing
-    // every item again for a return value its caller discards; init batches
-    // derive their own small set of transport identities as they start.
+    // Maintenance callers can request acknowledgement without deriving return
+    // identities; init batches normally need the small identity map.
     if (!includeIdentities) return out;
     for (const file of files) {
         if (!waveFileBelongs(session, file)) continue;
@@ -211,6 +214,59 @@ export const waveIdentityFor = async (session: PersistedUploadSession, file: Per
     const parent = waveParentFor(session);
     if (!parent || !waveFileBelongs(session, file)) return {};
     return { waveSessionId: parent.id, waveItemId: await wireItemId(file.waveItemKey || file.key) };
+};
+
+// Known-hash duplicates never enter /items. Coalesce discoveries from upload
+// lanes, then durably reduce the session declaration before reporting them as
+// complete locally. The shared mutation chain prevents exclusion and admission
+// from racing on the same session row.
+export const excludeWaveDuplicate = async (
+    session: PersistedUploadSession, file: PersistedUploadFile, storedFilename: string,
+): Promise<void> => {
+    await ensureOpened(session);
+    const parent = waveParentFor(session);
+    const state = parent ? stateFor(parent.id) : null;
+    const itemId = file.waveItemKey || file.key;
+    // A deployment may enable the client feature while this library still
+    // negotiates the legacy protocol. No live session exists in that case.
+    if (state && !state.opened) return;
+    if (!parent || !state || state.expired || state.discarding || state.closed) throw expiredAdmission();
+    if (state.registeredItems.has(itemId)) {
+        throw new Error('Duplicate was already admitted to the upload manifest.');
+    }
+    if (state.excludedItems.has(itemId)) return;
+    await new Promise<void>((resolve, reject) => {
+        const queued = state.duplicateQueue.get(itemId);
+        if (queued) queued.waiters.push({ resolve, reject });
+        else state.duplicateQueue.set(itemId, { file: { ...file, waveAcceptedFilename: storedFilename },
+            waiters: [{ resolve, reject }] });
+        if (state.duplicateFlushScheduled) return;
+        state.duplicateFlushScheduled = true;
+        setTimeout(() => {
+            state.duplicateFlushScheduled = false;
+            const entries = Array.from(state.duplicateQueue.entries());
+            state.duplicateQueue.clear();
+            const mutation = state.registrationPending.then(async () => {
+                for (let offset = 0; offset < entries.length; offset += WAVE_DUPLICATE_EXCLUSION_MAX_BATCH) {
+                    const page = entries.slice(offset, offset + WAVE_DUPLICATE_EXCLUSION_MAX_BATCH);
+                    const result = await excludeWaveShadowDuplicates(parent.id, page.map(([, value]) => ({
+                        itemId: value.file.waveItemKey || value.file.key,
+                        filename: value.file.waveAcceptedFilename || value.file.name,
+                    })));
+                    if (!result) throw new Error('Duplicate exclusion is unavailable. Retry before uploading files.');
+                    state.manifestRevision = result.manifestRevision;
+                    page.forEach(([key, value]) => {
+                        state.excludedItems.add(key);
+                        state.resolved.add(key);
+                        recordWaveItemResolved(session, value.file);
+                    });
+                }
+            });
+            state.registrationPending = mutation.catch(() => undefined);
+            mutation.then(() => entries.forEach(([, value]) => value.waiters.forEach(waiter => waiter.resolve())),
+                error => entries.forEach(([, value]) => value.waiters.forEach(waiter => waiter.reject(error))));
+        }, 25);
+    });
 };
 
 // Called only from the parent's ordered chain. Failed batches remain unresolved

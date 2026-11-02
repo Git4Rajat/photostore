@@ -8,7 +8,7 @@ import { preloadLocalIndexes } from '../services/preloadLocalIndexes';
 import { startMediaTokenAutoRefresh } from '../services/mediaToken';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { get, getUpload, post, postTools, postUpload, resolveApiUrl } from '../services/apiClient';
-import { heartbeatWaveSession, quiesceWaveShadowSession, discardWaveShadowSession, stopWaveShadowSession, registerWaveItemsBatch, waveIdentityFor, ensureOpened as ensureWaveShadowSessionAdmitted, finalizeWaveShadowSession, resolveWaveShadowFile, acknowledgeWaveFinalizedFile, cancelQueuedWaveSelection } from '../services/uploadWaveSync';
+import { heartbeatWaveSession, quiesceWaveShadowSession, discardWaveShadowSession, stopWaveShadowSession, registerWaveItemsBatch, excludeWaveDuplicate, waveIdentityFor, ensureOpened as ensureWaveShadowSessionAdmitted, finalizeWaveShadowSession, resolveWaveShadowFile, acknowledgeWaveFinalizedFile, cancelQueuedWaveSelection } from '../services/uploadWaveSync';
 import { hashLargeFile, LARGE_FILE_HASH_THRESHOLD } from '../utils/largeFileHash';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
 import { getRuntimeConfig } from '../config/appConfig';
@@ -2160,12 +2160,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const INIT_BATCH_MAX_SIZE = 24;
     const INIT_BATCH_DEBOUNCE_MS = 50;
     const INIT_BATCH_MAX_WAIT_MS = 250;
-    // Keep manifest admission close to the transfer cursor. Full-selection
-    // registration made startup proportional to file count and an unbounded
-    // background pass competed with finalization on the same Table rows.
-    const WAVE_STARTUP_ADMISSION_SIZE = 48;
-    const WAVE_ADMISSION_LOW_WATER = 48;
-    const WAVE_ADMISSION_HIGH_WATER = 192;
 
     const flushInitBatch = (force: boolean) => {
         if (batchInitDebounceTimerRef.current) {
@@ -2190,11 +2184,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const batch = pendingBatchInitRef.current;
         pendingBatchInitRef.current = [];
         void (async () => {
-            // Resolve this batch's wave identities. Live sessions normally
-            // registered their full pending manifest before workers started,
-            // making this local; missing items are registered here as an
-            // idempotent fallback. Group by session in case more than one
-            // lands in the same debounce window.
+            // Resolve this hash-qualified batch's wave identities immediately
+            // before init. Known duplicates exit before reaching this queue.
+            // Group by session in case more than one lands in the same window.
             const admissionByKey = new Map<string, Record<string,string>>();
             if (waveShadowEnabled()) {
                 const bySession = new Map<PersistedUploadSession, PersistedUploadFile[]>();
@@ -3483,17 +3475,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             const pendingFiles = normalized.files.filter((file) => (
                 file.status !== 'done' && (!options.fileKeys || options.fileKeys.has(file.key))
             ));
-            // Put only a small startup window on the critical path. A rolling
-            // producer below admits a bounded look-ahead as workers consume it;
-            // init-batch remains the exact, fail-closed admission path.
-            let admittedFileCount = 0;
-            let requestedAdmissionCount = 0;
-            let rollingWaveAdmission: Promise<void> = Promise.resolve();
-            if (waveLiveEnabled() && pendingFiles.length) {
-                const startupFiles=pendingFiles.slice(0,WAVE_STARTUP_ADMISSION_SIZE);
-                await registerWaveItemsBatch(normalized,startupFiles,false);
-                admittedFileCount = requestedAdmissionCount = startupFiles.length;
-            }
             if (uploadRunGenerationRef.current !== uploadRunGeneration) return;
             admissionReady = true;
 
@@ -3514,29 +3495,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             const currentBlockConcurrency = () => Math.max(1, Math.round(TARGET_CONCURRENT_UPLOAD_BLOCKS / laneBudget));
 
             const parallelThumbnailTasks = new Set<Promise<void>>();
-
-            const refillWaveAdmission = (consumedThrough: number) => {
-                if (!waveLiveEnabled() || requestedAdmissionCount >= pendingFiles.length
-                    || admittedFileCount - consumedThrough > WAVE_ADMISSION_LOW_WATER
-                    // Once Blob commits start completing, reserve Table capacity
-                    // for authoritative finalization. Init batches will admit
-                    // their exact files if the rolling window runs dry.
-                    || pendingFinalizeTasks.size > 0) return;
-                const target = Math.min(pendingFiles.length, consumedThrough + WAVE_ADMISSION_HIGH_WATER);
-                if (target <= requestedAdmissionCount) return;
-                const start = requestedAdmissionCount;
-                requestedAdmissionCount = target;
-                rollingWaveAdmission = rollingWaveAdmission.then(async () => {
-                    try {
-                        await registerWaveItemsBatch(normalized, pendingFiles.slice(start, target), false);
-                        admittedFileCount = Math.max(admittedFileCount, target);
-                    } catch {
-                        // Do not reserve the failed range. Exact init admission
-                        // remains fail-closed and retries only files workers use.
-                        requestedAdmissionCount = Math.min(requestedAdmissionCount, start);
-                    }
-                });
-            };
 
             const kickOffThumbnailForFile = (file: File, filename: string, blobName?: string) => {
                 if (isVideoFilename(filename)) return;
@@ -3837,7 +3795,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     }
 
                     const fileMeta = pendingFiles[currentIndex];
-                    refillWaveAdmission(currentIndex + 1);
                     updatePersistedFile(fileMeta.key, { status: 'uploading', error: undefined });
                     let resolvedFileForFailurePreview: File | null = null;
 
@@ -3980,6 +3937,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         }
 
                         if (staged.skippedDuplicate) {
+                            if (waveLiveEnabled()) {
+                                await excludeWaveDuplicate(normalized, fileMeta, staged.filename);
+                            }
                             // No network work left for this file at all (the
                             // client-side known-hash check short-circuited
                             // before init/stage/finalize) -- mark it done inline,
@@ -3989,7 +3949,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                             totalSkippedDuplicates += 1;
                             const waveAcceptedFilename = staged.filename;
                             waveShadowFileOutcomes.set(fileMeta.key, { status: 'done', skippedDuplicate: true, waveAcceptedFilename });
-                            void resolveWaveShadowFile(session, { ...fileMeta, status: 'done', skippedDuplicate: true, waveAcceptedFilename });
                             updatePersistedFile(fileMeta.key, {
                                 waveAcceptedFilename,
                                 status: 'done',
@@ -4031,6 +3990,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         if (uploadStopRequestedRef.current || isUploadStoppedError(err)) {
                             throw new Error(UPLOAD_STOPPED_ERROR, { cause: err });
                         }
+                        // Live admission is a session-wide gate. Turning a
+                        // cleanup/contention outage into one failure per file
+                        // creates a storm and loses the existing Retry UX.
+                        if (err instanceof Error && err.message.startsWith('Upload admission failed:')) {
+                            throw err;
+                        }
                         await markFileFailed(fileMeta, resolvedFileForFailurePreview, err);
                     }
                 }
@@ -4069,10 +4034,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             if (firstWorkerError !== undefined) {
                 throw firstWorkerError;
             }
-            // Fence the last bounded look-ahead before close/cleanup. Failures
-            // were already recovered per file by fail-closed init admission.
-            await rollingWaveAdmission;
-
             // Every lane has finished transferring bytes (whether by running out
             // of files or a Stop request) -- what's left below (backend finalize
             // confirmation, possible auto-retries) is bookkeeping that can take
@@ -4876,8 +4837,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         let uploadRunStarted = false;
         try {
             persistSession(session);
-            // Open only (fast, single call). Live registration follows in
-            // runUploadSession once the exact pending manifest is known.
+            // Open only (fast, single call). Candidate admission follows after
+            // each file's hash and known-duplicate check.
             // Shadow failures are contained by the sync client.
             await ensureWaveShadowSessionAdmitted(session);
             uploadSourceFilesRef.current = new Map(session.files.map((meta, index) => [meta.key, filesToUpload[index]]));
