@@ -1330,32 +1330,34 @@ describe('upload wave shadow protocol wiring', () => {
         expect(services.pendingUploadSummary).toBeNull();
     });
 
-    it('registers the live manifest once before starting init and byte transfers', async () => {
+    it('starts transfers after a bounded live admission window while the remaining manifest registers', async () => {
         vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
         mocks.getUpload.mockImplementation(async url => url === '/upload/waves/protocol' ? {protocol:'live'} : {hashes:{}});
         const original=mocks.postUpload.getMockImplementation()!;
+        let itemCalls=0;
         let release!: () => void;
         const gate=new Promise<void>(resolve => {release=resolve;});
         mocks.postUpload.mockImplementation(async (url,payload) => {
-            if (url.endsWith('/items')) await gate;
+            if (url.endsWith('/items') && ++itemCalls===2) await gate;
             return original(url,payload);
         });
         select(filesFor(450));
         await advance(4000);
-        expect(shadowCalls('/items')).toHaveLength(1);
-        expect(shadowCalls('/items')[0][1].items).toHaveLength(450);
-        expect(initFiles()).toHaveLength(0);
-        expect(mocks.transferred).not.toHaveBeenCalled();
+        expect(shadowCalls('/items').length).toBeGreaterThanOrEqual(2);
+        expect(shadowCalls('/items')[0][1].items).toHaveLength(48);
+        expect(shadowCalls('/items')[1][1].items.length).toBeLessThanOrEqual(192);
+        expect(initFiles().length).toBeGreaterThan(0);
+        expect(mocks.transferred).toHaveBeenCalled();
         expect(shadowCalls('/close')).toHaveLength(0);
         await act(async () => {release();});
         for (let tick=0;tick<40 && finalizedFiles().length<450;tick++) await advance(1000);
         await advance(2000);
         const registered=shadowCalls('/items').flatMap(([,body]) => body.items);
-        expect(registered.map(item => item.filename)).toEqual(filesFor(450).map(file => file.name));
+        expect(new Set(registered.map(item => item.filename))).toEqual(new Set(filesFor(450).map(file => file.name)));
         expect(new Set(registered.map(item => item.itemId)).size).toBe(450);
         expect(finalizedFiles()).toHaveLength(450);
         expect(opens()).toHaveLength(1);
-        expect(shadowCalls('/items')).toHaveLength(1);
+        expect(shadowCalls('/items').length).toBeGreaterThanOrEqual(2);
     });
 
     it('heartbeat expiry aborts active live transfer intake and retains an explicit retry checkpoint without opening a successor', async () => {

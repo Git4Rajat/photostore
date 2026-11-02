@@ -2160,6 +2160,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const INIT_BATCH_MAX_SIZE = 24;
     const INIT_BATCH_DEBOUNCE_MS = 50;
     const INIT_BATCH_MAX_WAIT_MS = 250;
+    // Keep manifest admission close to the transfer cursor. Full-selection
+    // registration made startup proportional to file count and an unbounded
+    // background pass competed with finalization on the same Table rows.
+    const WAVE_STARTUP_ADMISSION_SIZE = 48;
+    const WAVE_ADMISSION_LOW_WATER = 48;
+    const WAVE_ADMISSION_HIGH_WATER = 192;
 
     const flushInitBatch = (force: boolean) => {
         if (batchInitDebounceTimerRef.current) {
@@ -3477,12 +3483,16 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             const pendingFiles = normalized.files.filter((file) => (
                 file.status !== 'done' && (!options.fileKeys || options.fileKeys.has(file.key))
             ));
-            // Register the pending live manifest before workers start. The
-            // sync layer pages large selections and records each acknowledged
-            // page, so retry resumes at the first still-missing item. Later
-            // init batches only derive identities locally in the common case.
+            // Put only a small startup window on the critical path. A rolling
+            // producer below admits a bounded look-ahead as workers consume it;
+            // init-batch remains the exact, fail-closed admission path.
+            let admittedFileCount = 0;
+            let requestedAdmissionCount = 0;
+            let rollingWaveAdmission: Promise<void> = Promise.resolve();
             if (waveLiveEnabled() && pendingFiles.length) {
-                await registerWaveItemsBatch(normalized, pendingFiles, false);
+                const startupFiles=pendingFiles.slice(0,WAVE_STARTUP_ADMISSION_SIZE);
+                await registerWaveItemsBatch(normalized,startupFiles,false);
+                admittedFileCount = requestedAdmissionCount = startupFiles.length;
             }
             if (uploadRunGenerationRef.current !== uploadRunGeneration) return;
             admissionReady = true;
@@ -3504,6 +3514,29 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             const currentBlockConcurrency = () => Math.max(1, Math.round(TARGET_CONCURRENT_UPLOAD_BLOCKS / laneBudget));
 
             const parallelThumbnailTasks = new Set<Promise<void>>();
+
+            const refillWaveAdmission = (consumedThrough: number) => {
+                if (!waveLiveEnabled() || requestedAdmissionCount >= pendingFiles.length
+                    || admittedFileCount - consumedThrough > WAVE_ADMISSION_LOW_WATER
+                    // Once Blob commits start completing, reserve Table capacity
+                    // for authoritative finalization. Init batches will admit
+                    // their exact files if the rolling window runs dry.
+                    || pendingFinalizeTasks.size > 0) return;
+                const target = Math.min(pendingFiles.length, consumedThrough + WAVE_ADMISSION_HIGH_WATER);
+                if (target <= requestedAdmissionCount) return;
+                const start = requestedAdmissionCount;
+                requestedAdmissionCount = target;
+                rollingWaveAdmission = rollingWaveAdmission.then(async () => {
+                    try {
+                        await registerWaveItemsBatch(normalized, pendingFiles.slice(start, target), false);
+                        admittedFileCount = Math.max(admittedFileCount, target);
+                    } catch {
+                        // Do not reserve the failed range. Exact init admission
+                        // remains fail-closed and retries only files workers use.
+                        requestedAdmissionCount = Math.min(requestedAdmissionCount, start);
+                    }
+                });
+            };
 
             const kickOffThumbnailForFile = (file: File, filename: string, blobName?: string) => {
                 if (isVideoFilename(filename)) return;
@@ -3804,6 +3837,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     }
 
                     const fileMeta = pendingFiles[currentIndex];
+                    refillWaveAdmission(currentIndex + 1);
                     updatePersistedFile(fileMeta.key, { status: 'uploading', error: undefined });
                     let resolvedFileForFailurePreview: File | null = null;
 
@@ -4035,6 +4069,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             if (firstWorkerError !== undefined) {
                 throw firstWorkerError;
             }
+            // Fence the last bounded look-ahead before close/cleanup. Failures
+            // were already recovered per file by fail-closed init admission.
+            await rollingWaveAdmission;
 
             // Every lane has finished transferring bytes (whether by running out
             // of files or a Stop request) -- what's left below (backend finalize

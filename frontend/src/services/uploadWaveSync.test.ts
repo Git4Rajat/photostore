@@ -105,6 +105,28 @@ describe('registerWaveItemsBatch', () => {
         expect(mocks.register.mock.calls[1][1]).toHaveLength(5); // files 5..9 -- 3..4 already registered, filtered out
     });
 
+    it('serializes concurrent overlapping admission and filters after the first acknowledgement', async () => {
+        const s = session(5, 'sess-concurrent-overlap');
+        let release!: () => void;
+        const gate = new Promise<void>(resolve => { release = resolve; });
+        let active = 0;
+        let maxActive = 0;
+        mocks.register.mockImplementation(async (_sessionId: string, items: unknown[]) => {
+            active += 1;
+            maxActive = Math.max(maxActive, active);
+            if (mocks.register.mock.calls.length === 1) await gate;
+            active -= 1;
+            return { manifestRevision: `rev-register-${items.length}`, registeredCount: items.length };
+        });
+        const first = registerWaveItemsBatch(s, s.files.slice(0, 3));
+        const second = registerWaveItemsBatch(s, s.files.slice(2, 5));
+        await vi.waitFor(() => expect(mocks.register).toHaveBeenCalledTimes(1));
+        release();
+        await Promise.all([first, second]);
+        expect(maxActive).toBe(1);
+        expect(mocks.register.mock.calls.map(([, items]) => items.length)).toEqual([3, 2]);
+    });
+
     it('registers a large manifest in bounded pages', async () => {
         const s = session(2005, 'sess-paged');
         const result = await registerWaveItemsBatch(s, s.files);

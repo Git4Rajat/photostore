@@ -43,6 +43,11 @@ interface WaveShadowSessionState {
     discarding?: boolean;
     resolved: Set<string>;
     pending: Promise<void>;
+    // Registration has a separate chain from outcome/close ordering. Init
+    // batches and the rolling look-ahead can arrive concurrently, but Azure
+    // Table session/wave rows are optimistic-concurrency hot spots. Serialize
+    // admission locally so this browser never races itself on those rows.
+    registrationPending: Promise<void>;
     admissionError?: Error;
     leaseCheckAt?: number;
     expired?: boolean;
@@ -54,7 +59,7 @@ const sessionState = new Map<string, WaveShadowSessionState>();
 const stateFor = (sessionId: string): WaveShadowSessionState => {
     let state = sessionState.get(sessionId);
     if (!state) {
-        state = { manifestRevision: null, opened: false, registeredItems: new Set(), queued: new Map(), resolutionScheduled: false, closed: false, resolved: new Set(), pending: Promise.resolve() };
+        state = { manifestRevision: null, opened: false, registeredItems: new Set(), queued: new Map(), resolutionScheduled: false, closed: false, resolved: new Set(), pending: Promise.resolve(), registrationPending: Promise.resolve() };
         sessionState.set(sessionId, state);
     }
     return state;
@@ -144,22 +149,35 @@ export const registerWaveItemsBatch = async (
     if (!parent || !state || state.discarding || state.closed) {
         throw new Error('Upload wave admission is unavailable. Retry before uploading files.');
     }
-    const items = files.filter(file => waveFileBelongs(session, file))
-        .map(file => ({ itemId: file.waveItemKey || file.key, filename: file.name }))
-        .filter(item => !state.registeredItems.has(item.itemId));
-    for (let offset = 0; offset < items.length; offset += WAVE_REGISTER_MAX_BATCH) {
-        const page = items.slice(offset, offset + WAVE_REGISTER_MAX_BATCH);
-        let result;
-        try {
-            result = await registerWaveShadowItems(parent.id, page);
-        } catch (error) {
-            state.admissionError = error instanceof Error ? error : new Error('Upload admission failed.');
-            throw error;
+    // The common init path asks for identities inside the already-admitted
+    // rolling window. Do not queue that local lookup behind a slower network
+    // refill for future files.
+    const needsRegistration = files.some(file => waveFileBelongs(session, file)
+        && !state.registeredItems.has(file.waveItemKey || file.key));
+    const registration = needsRegistration ? state.registrationPending.then(async () => {
+        // Compute this inside the chain. A preceding look-ahead or init batch
+        // may have admitted some of the same files while this caller waited.
+        const items = files.filter(file => waveFileBelongs(session, file))
+            .map(file => ({ itemId: file.waveItemKey || file.key, filename: file.name }))
+            .filter(item => !state.registeredItems.has(item.itemId));
+        for (let offset = 0; offset < items.length; offset += WAVE_REGISTER_MAX_BATCH) {
+            const page = items.slice(offset, offset + WAVE_REGISTER_MAX_BATCH);
+            let result;
+            try {
+                result = await registerWaveShadowItems(parent.id, page);
+            } catch (error) {
+                state.admissionError = error instanceof Error ? error : new Error('Upload admission failed.');
+                throw error;
+            }
+            if (!result) throw new Error('Upload wave admission is unavailable. Retry before uploading files.');
+            state.manifestRevision = result.manifestRevision;
+            for (const item of page) state.registeredItems.add(item.itemId);
         }
-        if (!result) throw new Error('Upload wave admission is unavailable. Retry before uploading files.');
-        state.manifestRevision = result.manifestRevision;
-        for (const item of page) state.registeredItems.add(item.itemId);
-    }
+    }) : Promise.resolve();
+    // A transient failure rejects this caller without permanently poisoning
+    // later admission attempts for the session.
+    state.registrationPending = registration.catch(() => undefined);
+    await registration;
     // Re-check after the network round trip -- an independent heartbeat
     // renewal can flip this mid-call. Never hand back a binding for a
     // session that's since expired/closed/discarding.

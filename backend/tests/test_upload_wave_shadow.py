@@ -395,20 +395,21 @@ def test_two_thousand_manifest_items_use_one_request_with_bounded_transactions(a
 
 def test_manifest_failure_replays_partial_server_pages_safely(api, monkeypatch):
     client, table, library = api
-    client.post(ROOT + '/sessions', json=dict(sessionId='partial', declaredCount=25))
-    items = [dict(itemId=f'i{i}', filename=f'{i}.jpg') for i in range(25)]
+    from upload_waves import REGISTER_MAX_PAGE
+    client.post(ROOT + '/sessions', json=dict(sessionId='partial', declaredCount=REGISTER_MAX_PAGE + 5))
+    items = [dict(itemId=f'i{i}', filename=f'{i}.jpg') for i in range(REGISTER_MAX_PAGE + 5)]
     original = ShadowWaves.register
     failed = [False]
     def register(store, session, page):
-        if page[0]['itemId'] == 'i20' and not failed[0]:
+        if page[0]['itemId'] == f'i{REGISTER_MAX_PAGE}' and not failed[0]:
             failed[0] = True
             raise AzureError('storage unavailable')
         return original(store, session, page)
     monkeypatch.setattr(ShadowWaves, 'register', register)
     assert client.post(ROOT + '/sessions/partial/items', json=dict(items=items)).status_code == 503
-    assert ShadowWaves(table, library[0])._required('session!partial')['registeredCount'] == 20
+    assert ShadowWaves(table, library[0])._required('session!partial')['registeredCount'] == REGISTER_MAX_PAGE
     response = client.post(ROOT + '/sessions/partial/items', json=dict(items=items))
-    assert response.status_code == 200 and response.json['registeredCount'] == 25
+    assert response.status_code == 200 and response.json['registeredCount'] == REGISTER_MAX_PAGE + 5
 
 
 def test_manifest_validates_last_item_before_any_page_is_written(api):

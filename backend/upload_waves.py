@@ -20,6 +20,12 @@ from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, Re
 from azure.data.tables import TableTransactionError, UpdateMode
 
 MAX_PAGE = 20
+# Registration creates one entity per item plus shared session, wave, control,
+# policy and execution-guard operations. Keep enough headroom below Azure
+# Table's 100-operation transaction limit while avoiding five tiny commits for
+# every 100 manifest items. Other wave paths retain MAX_PAGE because their
+# per-item transaction fan-out is larger.
+REGISTER_MAX_PAGE = 90
 MAX_RETRIES = 16
 EMPTY_DIGEST = hashlib.sha256(b'upload-wave-shadow-v1').hexdigest()
 
@@ -261,8 +267,8 @@ class ShadowWaves:
         return self._retry(run)
 
     def register(self, session, items):
-        if not isinstance(items, list) or not 0 < len(items) <= MAX_PAGE:
-            raise ValueError('Expected 1-20 manifest items per page')
+        if not isinstance(items, list) or not 0 < len(items) <= REGISTER_MAX_PAGE:
+            raise ValueError(f'Expected 1-{REGISTER_MAX_PAGE} manifest items per page')
         if any(not isinstance(item, dict) for item in items):
             raise ValueError('Each manifest item must be an object')
         keys = [identifier(item['itemId']) for item in items]

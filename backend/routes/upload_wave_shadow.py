@@ -117,7 +117,7 @@ def register_routes(blueprint):
     @blueprint.route('/upload/waves/shadow/sessions/<session>/items', methods=['POST'])
     @endpoint
     def wave_shadow_register(store, data, session):
-        from upload_waves import MAX_PAGE, identifier
+        from upload_waves import REGISTER_MAX_PAGE, identifier
         items = data['items']
         if not isinstance(items, list) or not 0 < len(items) <= MAX_MANIFEST_REQUEST:
             raise ValueError('Invalid manifest size')
@@ -129,8 +129,8 @@ def register_routes(blueprint):
                 raise ValueError('Invalid filename')
         if len(set(ids)) != len(ids):
             raise ValueError('Duplicate itemId')
-        for offset in range(0, len(items), MAX_PAGE):
-            result = store.register(session, items[offset:offset + MAX_PAGE])
+        for offset in range(0, len(items), REGISTER_MAX_PAGE):
+            result = store.register(session, items[offset:offset + REGISTER_MAX_PAGE])
         return result
 
     @blueprint.route('/upload/waves/live/sessions/<session>/resolve-batch', methods=['POST'])
