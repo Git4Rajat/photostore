@@ -3,6 +3,17 @@ import json
 from pathlib import Path
 
 
+def test_core_can_negotiate_index_push_without_waking_indexer():
+    template = json.loads((Path(__file__).parents[2] / 'deploy' / 'azuredeploy.json').read_text())
+    module = next(r for r in template['resources']
+                  if r['type'] == 'Microsoft.Resources/deployments')['properties']['template']
+    grant = next(r for r in module['resources']
+                 if r.get('copy', {}).get('name') == 'indexPushRoles')
+    assert "createArray('indexer', 'cluster', 'core')" in grant['copy']['count']
+    assert "variables('coreAppName')" in grant['properties']['principalId']
+    assert "[resourceId('Microsoft.App/containerApps', variables('coreAppName'))]" in grant['dependsOn']
+
+
 def test_compiled_worker_scales_to_zero_by_default():
     template = json.loads((Path(__file__).parents[2] / 'deploy' / 'azuredeploy.json').read_text())
     parameter = template['parameters']['clusterMinReplicas']

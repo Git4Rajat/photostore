@@ -1,6 +1,6 @@
 import { hasForegroundDemand, onForegroundReturn } from './foregroundDemand';
 import { hasIndexDemand, onIndexDemandReturn } from './indexDemand';
-import { postTools } from './apiClient';
+import { post } from './apiClient';
 import { getActiveLibraryFromToken } from './passwordAuthClient';
 import { isLikelyAuthenticated } from './jobNotifications';
 import { pendingEditScope } from './pendingEdits';
@@ -21,8 +21,10 @@ export const startIndexReadyPush = (ready: () => void): (() => void) => {
         try {
             if (isGated()) { timer = setTimeout(() => void connect(), 30000); return; }
             if (!isLikelyAuthenticated() || !navigator.onLine) { timer = setTimeout(() => void connect(), 30000); return; }
-            const result = await postTools<{ available: boolean; url?: string; libraryId?: string }>(
-                '/api/tools/index-events/negotiate', {},
+            // Subscription authorization is core work. Sending renewals to
+            // the indexer would wake its maintenance sidecar without any work.
+            const result = await post<{ available: boolean; url?: string; libraryId?: string }>(
+                '/api/index-events/negotiate', {},
             );
             if (stopped || isGated() || attempt !== generation || requestedScope !== pendingEditScope()) return;
             if (!result.available || !result.url) {
@@ -37,6 +39,8 @@ export const startIndexReadyPush = (ready: () => void): (() => void) => {
                 clearTimeout(timer);
                 retry = 1000;
                 ready(); // Recover publications missed while disconnected.
+                // Bound subscription authorization by periodically checking
+                // library access again. This renewal uses core, not indexer.
                 timer = setTimeout(() => connection.close(), 4 * 60000);
             };
             connection.onmessage = event => {

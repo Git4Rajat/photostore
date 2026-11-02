@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { noteForegroundActivity } from './foregroundDemand';
 import { __resetIndexDemandForTests, noteIndexActivity, setIndexDemandTab } from './indexDemand';
-const mocks = vi.hoisted(() => ({ post: vi.fn(), library: 'A', user: 'u1', authenticated: true }));
-vi.mock('./apiClient', () => ({ postTools: mocks.post }));
+const mocks = vi.hoisted(() => ({ post: vi.fn(), postTools: vi.fn(), library: 'A', user: 'u1', authenticated: true }));
+vi.mock('./apiClient', () => ({ post: mocks.post, postTools: mocks.postTools }));
 vi.mock('./passwordAuthClient', () => ({ getActiveLibraryFromToken: () => mocks.library }));
 vi.mock('./pendingEdits', () => ({ pendingEditScope: () => `${mocks.user}/${mocks.library}` }));
 vi.mock('./jobNotifications', () => ({ isLikelyAuthenticated: () => mocks.authenticated }));
@@ -23,11 +23,24 @@ beforeEach(() => {
     // window. The index-demand gate itself is covered separately below.
     setIndexDemandTab('tools');
     mocks.post.mockReset().mockResolvedValue({ available: true, url: 'wss://service/client', libraryId: 'A' });
+    mocks.postTools.mockReset();
     vi.stubGlobal('WebSocket', FakeSocket);
 });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); __resetIndexDemandForTests(); });
 
 describe('index publication push', () => {
+    it('negotiates initial and renewed subscriptions on core without waking indexer', async () => {
+        const { startIndexReadyPush } = await import('./indexReadyPush');
+        const stop = startIndexReadyPush(vi.fn()); await flush();
+        expect(mocks.post).toHaveBeenCalledWith('/api/index-events/negotiate', {});
+        sockets[0].onopen?.();
+        await vi.advanceTimersByTimeAsync(4 * 60000 + 1000);
+        expect(mocks.post).toHaveBeenCalledTimes(2);
+        expect(mocks.post.mock.calls.every(([path]) => path === '/api/index-events/negotiate')).toBe(true);
+        expect(mocks.postTools).not.toHaveBeenCalled();
+        stop();
+    });
+
     it('refreshes on connection and library-ready messages without user navigation', async () => {
         const { startIndexReadyPush } = await import('./indexReadyPush');
         const refresh = vi.fn(); const stop = startIndexReadyPush(refresh); await flush();

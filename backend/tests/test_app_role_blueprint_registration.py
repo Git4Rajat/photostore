@@ -39,6 +39,15 @@ def test_core_role_does_not_serve_tools_routes():
     assert '/api/photos' in paths  # sanity: other groups still registered
 
 
+def test_subscription_negotiation_is_core_with_legacy_indexer_compatibility():
+    core = _rule_paths_for_role('core')
+    indexer = _rule_paths_for_role('indexer')
+    assert '/api/index-events/negotiate' in core
+    assert '/api/tools/index-events/negotiate' not in core
+    assert '/api/index-events/negotiate' not in indexer
+    assert '/api/tools/index-events/negotiate' in indexer
+
+
 def test_core_role_does_not_serve_upload_routes():
     paths = _rule_paths_for_role(None)
     assert '/api/upload/init' not in paths

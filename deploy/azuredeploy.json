@@ -1585,20 +1585,21 @@
             {
               "copy": {
                 "name": "indexPushRoles",
-                "count": "[length(createArray('indexer', 'cluster'))]"
+                "count": "[length(createArray('indexer', 'cluster', 'core'))]"
               },
               "condition": "[parameters('enableIndexPush')]",
               "type": "Microsoft.Authorization/roleAssignments",
               "apiVersion": "2022-04-01",
               "scope": "[format('Microsoft.SignalRService/webPubSub/{0}', format('{0}-index-events', parameters('appName')))]",
-              "name": "[guid(resourceId('Microsoft.SignalRService/webPubSub', format('{0}-index-events', parameters('appName'))), createArray('indexer', 'cluster')[copyIndex()], 'index-events-owner')]",
+              "name": "[guid(resourceId('Microsoft.SignalRService/webPubSub', format('{0}-index-events', parameters('appName'))), createArray('indexer', 'cluster', 'core')[copyIndex()], 'index-events-owner')]",
               "properties": {
                 "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '12cf5a90-567b-43ae-8102-96cf46c7d9b4')]",
-                "principalId": "[if(equals(createArray('indexer', 'cluster')[copyIndex()], 'indexer'), reference(resourceId('Microsoft.App/containerApps', variables('indexerAppName')), '2025-01-01', 'full').identity.principalId, reference(resourceId('Microsoft.App/containerApps', variables('clusterAppName')), '2025-01-01', 'full').identity.principalId)]",
+                "principalId": "[if(equals(createArray('indexer', 'cluster', 'core')[copyIndex()], 'indexer'), reference(resourceId('Microsoft.App/containerApps', variables('indexerAppName')), '2025-01-01', 'full').identity.principalId, if(equals(createArray('indexer', 'cluster', 'core')[copyIndex()], 'core'), reference(resourceId('Microsoft.App/containerApps', variables('coreAppName')), '2025-01-01', 'full').identity.principalId, reference(resourceId('Microsoft.App/containerApps', variables('clusterAppName')), '2025-01-01', 'full').identity.principalId))]",
                 "principalType": "ServicePrincipal"
               },
               "dependsOn": [
                 "[resourceId('Microsoft.App/containerApps', variables('clusterAppName'))]",
+                "[resourceId('Microsoft.App/containerApps', variables('coreAppName'))]",
                 "[resourceId('Microsoft.App/containerApps', variables('indexerAppName'))]",
                 "[resourceId('Microsoft.SignalRService/webPubSub', format('{0}-index-events', parameters('appName')))]"
               ]

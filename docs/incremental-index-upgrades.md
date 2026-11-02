@@ -340,3 +340,22 @@ Out-of-order responses are covered both with another completion signal and with
 only the latest delayed fallback available to recover unfinished work.
 Concurrent tests also cover an older response returning during the newer send,
 before the newer response records the replacement receipt.
+
+### Subscription negotiation no longer wakes the indexer
+
+The push client reconnects every four minutes to recheck library authorization.
+It previously used `postTools('/api/tools/index-events/negotiate')`, so these
+lightweight renewals woke the indexer API and its co-located maintenance sidecar
+without any pending indexing work. Index-demand and foreground gates limit the
+requests, but do not prevent them during an active session.
+
+New browser bundles use core's `POST /api/index-events/negotiate` through the
+core API client. The authenticated library binding, no-store response, short
+subscription token, reconnect reconciliation, and demand gates are retained.
+The legacy tools route delegates to the same handler for older bundles.
+Deployment code adds core's managed identity to the existing Web PubSub grants;
+core already receives `INDEX_EVENTS_ENDPOINT` through the shared backend env.
+
+This is code-only. A future rollout must include the backend route, Web PubSub
+grant, and frontend bundle. Older browser bundles still negotiate on indexer
+until refreshed; no live routing or role assignments were changed here.

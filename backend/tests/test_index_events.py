@@ -3,24 +3,38 @@ from unittest.mock import Mock
 import pytest
 import app
 import index_events
-from routes import tools
+from routes import tools, index_events as event_routes
 
 
-def test_negotiate_binds_to_authenticated_library_without_send_or_join_permissions(monkeypatch):
+@pytest.mark.parametrize('handler,path', [
+    (event_routes.negotiate_index_events, '/api/index-events/negotiate'),
+    (tools.negotiate_index_events, '/api/tools/index-events/negotiate'),
+])
+def test_negotiate_binds_to_authenticated_library_without_send_or_join_permissions(monkeypatch, handler, path):
     client=SimpleNamespace(get_client_access_token=Mock(return_value={'url':'wss://service/client?token=private'}))
     monkeypatch.setenv('INDEX_EVENTS_ENDPOINT','https://service')
     monkeypatch.setattr(index_events,'_client',lambda:client)
     monkeypatch.setattr(app,'_require_user_id',lambda:('library-A',None))
-    with app.app.test_request_context('/api/tools/index-events/negotiate', method='POST',json={'libraryId':'library-B'}):
-        response=tools.negotiate_index_events()
+    with app.app.test_request_context(path, method='POST',json={'libraryId':'library-B'}):
+        response=handler()
     assert response.headers['Cache-Control']=='no-store'
     assert response.get_json()['libraryId']=='library-A'
     client.get_client_access_token.assert_called_once_with(groups=[index_events.group('library-A')],roles=[],minutes_to_expire=5)
 
 
-def test_negotiation_requires_authentication(monkeypatch):
+@pytest.mark.parametrize('handler', [event_routes.negotiate_index_events, tools.negotiate_index_events])
+def test_negotiation_requires_authentication(monkeypatch, handler):
     monkeypatch.setattr(app,'_require_user_id',lambda:(None,('unauthorized',401)))
-    assert tools.negotiate_index_events()==('unauthorized',401)
+    assert handler()==('unauthorized',401)
+
+
+def test_core_negotiation_handles_service_failure_without_indexer_fallback(monkeypatch):
+    monkeypatch.setattr(app, '_require_user_id', lambda: ('library-A', None))
+    monkeypatch.setattr(index_events, 'negotiate', Mock(side_effect=OSError('offline')))
+    with app.app.test_client() as client:
+        response = client.post('/api/index-events/negotiate', json={})
+    assert response.status_code == 503
+    assert response.get_json() == {'available': False}
 
 
 @pytest.mark.parametrize('status,result,expected',[

@@ -2054,13 +2054,14 @@ resource archiveStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01
   }
 ]
 
-// The API negotiates subscriptions; dedicated and legacy index consumers publish.
-resource indexPushRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for appRole in ['indexer', 'cluster']: if (enableIndexPush) {
+// Core negotiates subscriptions without waking indexer. Retain indexer's grant
+// for publishing and negotiation by older browser bundles; cluster also publishes.
+resource indexPushRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for appRole in ['indexer', 'cluster', 'core']: if (enableIndexPush) {
   name: guid(indexPush!.id, appRole, 'index-events-owner')
   scope: indexPush
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '12cf5a90-567b-43ae-8102-96cf46c7d9b4')
-    principalId: appRole == 'indexer' ? indexer.identity.principalId : cluster.identity.principalId
+    principalId: appRole == 'indexer' ? indexer.identity.principalId : appRole == 'core' ? core.identity.principalId : cluster.identity.principalId
     principalType: 'ServicePrincipal'
   }
 }]
