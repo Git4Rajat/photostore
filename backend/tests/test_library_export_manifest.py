@@ -10,7 +10,7 @@ import re
 import pytest
 
 import app
-from routes.library import library_export_manifest_page
+from routes.library_operations import library_export_manifest_page
 
 
 class _FakePager:

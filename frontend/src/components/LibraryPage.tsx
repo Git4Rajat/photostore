@@ -3,6 +3,7 @@ import * as library from '../services/libraryClient';
 import { startLibraryExport, ExportController, ExportProgress } from '../services/libraryExportDownloader';
 import { verifyOpfsUsable } from '../services/opfsDownloadStaging';
 import { getRuntimeConfig } from '../config/appConfig';
+import { useLibraryCleanupStatus } from '../services/useLibraryCleanupStatus';
 import { Loading } from './shared/Loading';
 import { confirmDialog } from './shared/dialogs';
 
@@ -26,8 +27,6 @@ const LibraryPage: React.FC = () => {
     const [error, setError] = useState('');
     const [notice, setNotice] = useState('');
     const [cleanupNotice, setCleanupNotice] = useState('');
-    const cleanupPollTimer = useRef<number | null>(null);
-    const lastSeenCleanupTime = useRef<number>(0);
     // Belt-and-suspenders against double submission: `disabled={busy}` covers
     // mouse clicks once React re-renders, but a ref flips synchronously so a
     // second Enter/submit landing before that re-render can't slip through.
@@ -83,53 +82,19 @@ const LibraryPage: React.FC = () => {
         load();
     }, [load]);
 
-    // Poll for cleanup completion. A clean is a rare, deliberate action that
-    // also requires an emailed confirmation link (see requestLibraryClean
-    // below), so it can start or finish from an entirely different tab than
-    // this one -- this page can't just wait for a local trigger to know when
-    // to check. It used to poll every 3s unconditionally for as long as this
-    // page was open, regardless of whether a clean was actually running.
-    // Instead: check every 3s while a clean is actually in progress (so a
-    // completion is caught quickly), but back off to a 30s idle cadence the
-    // rest of the time -- the common case for this page.
-    useEffect(() => {
-        const ACTIVE_DELAY_MS = 3000;
-        const IDLE_DELAY_MS = 30000;
-        let cancelled = false;
-        const schedule = (delayMs: number) => {
-            cleanupPollTimer.current = window.setTimeout(tick, delayMs);
-        };
-        const tick = async () => {
-            let nextDelay = IDLE_DELAY_MS;
-            try {
-                const info = await library.getLibraryCleanupInfo();
-                if (info.lastCleanupStatus === 'in_progress') {
-                    nextDelay = ACTIVE_DELAY_MS;
-                } else if (info.lastCleanupStatus === 'completed' && info.lastCleanupTime > lastSeenCleanupTime.current) {
-                    lastSeenCleanupTime.current = info.lastCleanupTime;
-                    const photosStr = info.lastCleanupPhotosDeleted > 0
-                        ? `${info.lastCleanupPhotosDeleted} photo(s)/video(s) removed`
-                        : 'all photos and videos removed';
-                    setCleanupNotice(`Cleanup complete — ${photosStr}. You can now upload new photos.`);
-                    // Reload the gallery after cleanup
-                    await load();
-                    // Auto-dismiss the notification after 10 seconds
-                    setTimeout(() => setCleanupNotice(''), 10000);
-                }
-            } catch {
-                // Silently ignore cleanup status check failures
-            }
-            if (!cancelled) {
-                schedule(nextDelay);
-            }
-        };
-
-        schedule(ACTIVE_DELAY_MS);
-        return () => {
-            cancelled = true;
-            if (cleanupPollTimer.current) window.clearTimeout(cleanupPollTimer.current);
-        };
+    const onCleanupCompleted = useCallback((info: library.CleanupInfo) => {
+        const photos = info.lastCleanupPhotosDeleted > 0
+            ? `${info.lastCleanupPhotosDeleted} photo(s)/video(s) removed`
+            : 'all photos and videos removed';
+        setCleanupNotice(`Cleanup complete — ${photos}. You can now upload new photos.`);
+        void load();
     }, [load]);
+    useLibraryCleanupStatus(mine?.activeLibraryId, mine?.cleanupInfo, onCleanupCompleted);
+    useEffect(() => {
+        if (!cleanupNotice) return;
+        const timer = window.setTimeout(() => setCleanupNotice(''), 10000);
+        return () => window.clearTimeout(timer);
+    }, [cleanupNotice]);
 
     // Starts (or transparently resumes -- startLibraryExport figures out
     // what's already done via its own IndexedDB records, see

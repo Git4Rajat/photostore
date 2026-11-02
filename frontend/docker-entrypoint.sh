@@ -11,7 +11,7 @@ INDEXER_API_BASE_URL="${APP_CONFIG_INDEXER_API_BASE_URL:-$API_BASE_URL}"
 # `recovery` containerApp resource.
 RECOVERY_API_BASE_URL="${APP_CONFIG_RECOVERY_API_BASE_URL:-$API_BASE_URL}"
 # Same fallback pattern as INDEXER_API_BASE_URL -- see deploy/resources.bicep's
-# `archive` containerApp resource (people/faces, library, public share links).
+# `archive` containerApp resource (whole-library operations and public share links).
 ARCHIVE_API_BASE_URL="${APP_CONFIG_ARCHIVE_API_BASE_URL:-$API_BASE_URL}"
 SPA_BASE_URL="${APP_CONFIG_SPA_BASE_URL:-}"
 AZURE_AD_TENANT_ID="${APP_CONFIG_AZURE_AD_TENANT_ID:-}"

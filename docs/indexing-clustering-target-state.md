@@ -64,7 +64,8 @@ wave revision.
 | Indexer maintenance worker | Search, Sort, Access, People, Albums, published photo-vector and people-embedding artifacts, upload-hash snapshots, bootstrap/compaction/recovery | Consume clustering work or run face assignment |
 | Cluster worker | One wave's face-to-person assignment/discovery, authoritative assignment/person writes, internal FAISS runtime and checkpoints | Build/publish Search, Sort, Access, People/Albums snapshots, hash snapshots or published vector artifacts |
 | Recovery app (`recovery`) | Existing manual repair API (`admin_bp`); target authenticated wave inspection and audited retry/cancel/repair requests | Become a permanently polling coordinator or automatically run destructive repairs |
-| Archive app (`archive`) | Library management/export/clean orchestration and public-share endpoints (`library_bp`, `public_bp`) | Be treated as idle when export/share/library requests actually need it |
+| Core management (`core`) | Library listing/switching, membership, invitations and rename (`library_bp`) | Scan invitation history or run whole-library operations on requests |
+| Archive app (`archive`) | Whole-library deletion/export/clean orchestration (`library_operations_bp`) and public-share endpoints (`public_bp`); temporary management compatibility for old clients | Be treated as idle when export/share/library operations actually need it |
 | Serving APIs and browser | Read published views, submit mutations, request maintenance, show stage progress | Repair an index synchronously on a read |
 
 ### Complete app-role inventory and recovery terminology

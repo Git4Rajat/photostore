@@ -1243,6 +1243,9 @@ resource recovery 'Microsoft.App/containerApps@2025-01-01' = {
 // outright rather than carried along, since they were the only genuinely
 // unbounded-by-design reads in this blueprint. 'archive' now carries only
 // library/public.
+// 2026-11-02: library management now runs on core. Archive retains whole-library
+// deletion/export/cleanup and public traffic, plus temporary management routes
+// for old frontend bundles. No sizing/scaling change accompanies the split.
 resource archive 'Microsoft.App/containerApps@2025-01-01' = {
   name: archiveAppName
   location: location

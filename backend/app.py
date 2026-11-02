@@ -1661,6 +1661,7 @@ def _init_storage_clients():
         invites_table=invites_table_client,
         audit_table=audit_table_client,
         clean_requests_table=clean_requests_table_client,
+        require_invite_index=os.getenv('APP_ROLE', 'core').strip().lower() in ('', 'core'),
         before_create=lambda library: __import__('wave_policy').enroll_new(jobs_table_client, library, metadata_table_client),
     )
 
@@ -18117,6 +18118,7 @@ from routes.people import people_bp
 from routes.albums import albums_bp
 from routes.public import public_bp
 from routes.library import library_bp
+from routes.library_operations import library_operations_bp
 from routes.tools import tools_bp
 from routes.admin import admin_bp
 from routes.system import system_bp
@@ -18154,29 +18156,18 @@ elif _app_role == 'recovery':
     # auth were ever bypassed there.
     app.register_blueprint(admin_bp)
 elif _app_role == 'archive':
-    # 2026-09-17: library/public split off the core role so core
-    # itself can shrink to a 0.5vCPU/1Gi tier sized for just the everyday
-    # gallery loop. These two carry the heavier secondary features (library
-    # export/clean orchestration and public share-link media streaming) that
-    # day-to-day browsing doesn't touch. people_bp moved back to 'core'
-    # (2026-10-08) once its one request-path full-account scan (get_person's
-    # old call into _load_user_face_summary_by_id) was replaced with a
-    # bounded fetch scoped to each person's own faceIds (_load_face_rows_by_ids)
-    # -- the remaining unbounded scan (merge's personId-ownership resolution)
-    # is accepted as a low-frequency, explicit, user-initiated cost, not a
-    # scroll/list-shaped one. See the removed list_persons/list_faces/
-    # suggestions routes' history for the two endpoints that were deleted
-    # outright rather than brought along (zero callers in the live frontend).
-    for _bp in (library_bp, public_bp):
+    # Compatibility window: older frontend bundles still send management here.
+    # Whole-library operations and public traffic remain archive-only.
+    for _bp in (library_bp, library_operations_bp, public_bp):
         app.register_blueprint(_bp)
 else:
     # system_bp stays here rather than moving to 'archive' -- it's negligible
     # weight (a handful of point lookups, including /health) and Container
     # Apps' default TCP probe doesn't need it, but losing a friendly
     # same-origin /health on core specifically wasn't worth it for zero
-    # real memory/CPU savings. people_bp joined this role 2026-10-08 (see the
-    # 'archive' branch's comment above).
-    for _bp in (auth_bp, photos_bp, albums_bp, system_bp, explore_bp, suggestions_bp, people_bp):
+    # real memory/CPU savings. people_bp joined this role 2026-10-08; library
+    # management joined 2026-11-02, leaving operations/public on archive.
+    for _bp in (auth_bp, photos_bp, albums_bp, system_bp, explore_bp, suggestions_bp, people_bp, library_bp):
         app.register_blueprint(_bp)
 
 # Every role answers /health (system_bp only exists on the core role; upload has its own), so the

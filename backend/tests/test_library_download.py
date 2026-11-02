@@ -17,7 +17,7 @@ import pytest
 from azure.core.exceptions import ResourceNotFoundError
 
 import app
-from routes.library import library_download_request, library_download_status
+from routes.library_operations import library_download_request, library_download_status
 
 
 class _FakeTable:

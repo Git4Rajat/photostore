@@ -32,6 +32,7 @@ RUN pip install -r requirements.txt -r requirements-clustering.txt
 # Copy runtime Python modules used by app.py
 COPY *.py ./
 COPY routes/ ./routes/
+COPY scripts/backfill_invitation_index.py ./scripts/backfill_invitation_index.py
 COPY data/ ./data/
 COPY entrypoint.sh ./
 RUN chmod +x /app/entrypoint.sh
