@@ -889,7 +889,7 @@ describe('browser upload selection and startup', () => {
         expect(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)).toBeNull();
     });
 
-    it('does not slow duplicate-only selections by waiting for a checkpoint in each lane', async () => {
+    it('finishes duplicate-only selections without creating upload checkpoints', async () => {
         const files = filesFor(3000);
         const skippedKeys = new Set<string>();
         mocks.idbDelete.mockImplementation(async (key) => {
@@ -905,7 +905,7 @@ describe('browser upload selection and startup', () => {
         await advance(1000);
         expect(mocks.transferred).not.toHaveBeenCalled();
         expect(refreshRequests()[0][1]).toEqual({ reason: 'completed' });
-        expect(skippedKeys.size).toBe(3000);
+        expect(skippedKeys.size).toBe(0);
         expect(services.queuedUploadFileCount).toBe(0);
         expect(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)).toBeNull();
     });
@@ -1064,7 +1064,7 @@ describe('browser upload selection and startup', () => {
         await advance(4000);
         expect(initFiles()).toHaveLength(1);
         expect(services.notifications.some(notification =>
-            notification.progress?.skippedDuplicateCount===1)).toBe(true);
+            notification.progress?.skippedDuplicateCount === 1)).toBe(true);
     });
 
     it('still skips a confirmed duplicate without transferring bytes', async () => {
@@ -1257,8 +1257,6 @@ describe('upload wave shadow protocol wiring', () => {
         mocks.postUpload.mockImplementation(async (url: string, payload: any) => {
             if (/^\/upload\/waves\/(shadow|live)\//.test(url)) {
                 if (url.endsWith('/items')) return { manifestRevision: 'rev-items', registeredCount: payload.items.length };
-                if (url.endsWith('/duplicate-exclusions')) return { manifestRevision: 'rev-exclusions', declaredCount: 0,
-                    excludedDuplicateCount: payload.items.length };
                 if (url.endsWith('/resolve-batch')) return { manifestRevision: 'rev-resolve' };
                 if (url.endsWith('/discard')) return { state: 'abandoned', manifestRevision: 'server-preserved' };
                 if (url.endsWith('/close')) return { state: 'closed' };
@@ -1330,16 +1328,26 @@ describe('upload wave shadow protocol wiring', () => {
         expect(services.pendingUploadSummary).toBeNull();
     });
 
-    it('admits live upload candidates just in time through bounded init batches', async () => {
+    it('starts transfers after a bounded live admission window while the remaining manifest registers', async () => {
         vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
         mocks.getUpload.mockImplementation(async url => url === '/upload/waves/protocol' ? {protocol:'live'} : {hashes:{}});
+        const original=mocks.postUpload.getMockImplementation()!;
+        let itemCalls=0;
+        let release!: () => void;
+        const gate=new Promise<void>(resolve => {release=resolve;});
+        mocks.postUpload.mockImplementation(async (url,payload) => {
+            if (url.endsWith('/items') && ++itemCalls===2) await gate;
+            return original(url,payload);
+        });
         select(filesFor(450));
         await advance(4000);
-        expect(shadowCalls('/items').length).toBeGreaterThan(0);
-        expect(Math.max(...shadowCalls('/items').map(([,body]) => body.items.length))).toBeLessThanOrEqual(24);
+        expect(shadowCalls('/items').length).toBeGreaterThanOrEqual(2);
+        expect(shadowCalls('/items')[0][1].items).toHaveLength(48);
+        expect(shadowCalls('/items')[1][1].items.length).toBeLessThanOrEqual(192);
         expect(initFiles().length).toBeGreaterThan(0);
         expect(mocks.transferred).toHaveBeenCalled();
         expect(shadowCalls('/close')).toHaveLength(0);
+        await act(async () => {release();});
         for (let tick=0;tick<40 && finalizedFiles().length<450;tick++) await advance(1000);
         await advance(2000);
         const registered=shadowCalls('/items').flatMap(([,body]) => body.items);
@@ -1347,27 +1355,32 @@ describe('upload wave shadow protocol wiring', () => {
         expect(new Set(registered.map(item => item.itemId)).size).toBe(450);
         expect(finalizedFiles()).toHaveLength(450);
         expect(opens()).toHaveLength(1);
+        expect(shadowCalls('/items').length).toBeGreaterThanOrEqual(2);
     });
 
-    it('excludes known duplicates before sending upload candidates to live items', async () => {
+    it('deduplicates before declaring the live count or registering upload items', async () => {
         vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
-        const files=filesFor(50);
+        const files = filesFor(50);
+        const duplicateHashes = Object.fromEntries(files.slice(0, 20).map(file => [
+            Array.from(new TextEncoder().encode(file.name)).join('-'),
+            `stored-${file.name}`,
+        ]));
         mocks.getUpload.mockImplementation(async url => url === '/upload/waves/protocol'
-            ? {protocol:'live'}
-            : {hashes:Object.fromEntries(files.slice(0,20).map(file => [
-                Array.from(new TextEncoder().encode(file.name)).join('-'),`stored-${file.name}`,
-            ]))});
+            ? { protocol: 'live' }
+            : { hashes: duplicateHashes });
+
         select(files);
-        for (let tick=0;tick<40 && finalizedFiles().length<30;tick++) await advance(1000);
+        for (let tick = 0; tick < 40 && finalizedFiles().length < 30; tick += 1) await advance(1000);
         await advance(2000);
-        const admitted=shadowCalls('/items').flatMap(([,body]) => body.items);
-        const excluded=shadowCalls('/duplicate-exclusions').flatMap(([,body]) => body.items);
-        expect(admitted).toHaveLength(30);
-        expect(excluded).toHaveLength(20);
-        expect(new Set(admitted.map(item => item.itemId)))
-            .not.toEqual(new Set(excluded.map(item => item.itemId)));
+
+        const registered = shadowCalls('/items').flatMap(([, body]) => body.items);
+        expect(opens()).toHaveLength(1);
+        expect(opens()[0][1]).toMatchObject({ declaredCount: 30 });
+        expect(registered).toHaveLength(30);
         expect(initFiles()).toHaveLength(30);
-        expect(services.notifications.some(notification => notification.progress?.skippedDuplicateCount===20)).toBe(true);
+        expect(mocks.postUpload.mock.calls.some(([url]) => url.endsWith('/duplicate-exclusions'))).toBe(false);
+        expect(services.notifications.some(notification =>
+            notification.progress?.skippedDuplicateCount === 20)).toBe(true);
     });
 
     it('heartbeat expiry aborts active live transfer intake and retains an explicit retry checkpoint without opening a successor', async () => {

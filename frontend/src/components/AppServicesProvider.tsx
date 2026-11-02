@@ -1,6 +1,6 @@
 import { hasForegroundDemand, onForegroundReturn } from '../services/foregroundDemand';
 import { waveLiveEnabled, waveShadowEnabled } from '../services/uploadWaveClient';
-import { bindWaveChild, declareWaveSelection, retryWaveOperation, sliceWaveSelection } from '../services/uploadWaveOperations';
+import { bindWaveChild, declareWaveSelection, retryWaveOperation } from '../services/uploadWaveOperations';
 import { hasPendingEdits } from '../services/pendingEdits';
 import { startIndexReadyPush } from '../services/indexReadyPush';
 import { reportIndexBuilding } from '../services/indexBuilding';
@@ -8,7 +8,7 @@ import { preloadLocalIndexes } from '../services/preloadLocalIndexes';
 import { startMediaTokenAutoRefresh } from '../services/mediaToken';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { get, getUpload, post, postTools, postUpload, resolveApiUrl } from '../services/apiClient';
-import { heartbeatWaveSession, quiesceWaveShadowSession, discardWaveShadowSession, stopWaveShadowSession, registerWaveItemsBatch, excludeWaveDuplicate, waveIdentityFor, ensureOpened as ensureWaveShadowSessionAdmitted, finalizeWaveShadowSession, resolveWaveShadowFile, acknowledgeWaveFinalizedFile, cancelQueuedWaveSelection } from '../services/uploadWaveSync';
+import { heartbeatWaveSession, quiesceWaveShadowSession, discardWaveShadowSession, stopWaveShadowSession, registerWaveItemsBatch, waveIdentityFor, ensureOpened as ensureWaveShadowSessionAdmitted, finalizeWaveShadowSession, resolveWaveShadowFile, acknowledgeWaveFinalizedFile, cancelQueuedWaveSelection } from '../services/uploadWaveSync';
 import { hashLargeFile, LARGE_FILE_HASH_THRESHOLD } from '../utils/largeFileHash';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
 import { getRuntimeConfig } from '../config/appConfig';
@@ -1155,6 +1155,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const uploadRunGenerationRef = useRef<number>(0);
     const uploadStartInProgressRef = useRef<boolean>(false);
     const uploadSourceFilesRef = useRef<Map<string, File>>(new Map());
+    // Selection preflight hashes only need to survive this tab's active run.
+    // Keeping them out of PersistedUploadSession avoids inflating localStorage
+    // for large selections; resumed uploads simply hash the file again.
+    const uploadPrecomputedHashesRef = useRef<Map<string, string>>(new Map());
     // Mirrors uploadSourceFilesRef but for FileSystemFileHandle-backed
     // selections (Chrome/Edge desktop only, see fileSystemAccess.ts) --
     // cleared alongside it once a session concludes, since the durable
@@ -1908,6 +1912,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
     const releaseCachedUploadFile = useCallback(async (fileKey: string) => {
         uploadSourceFilesRef.current.delete(fileKey);
+        uploadPrecomputedHashesRef.current.delete(fileKey);
         if (await uploadSessionStoreRef.current!.checkpoint()) {
             await idbDelete(fileKey);
         }
@@ -2160,6 +2165,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const INIT_BATCH_MAX_SIZE = 24;
     const INIT_BATCH_DEBOUNCE_MS = 50;
     const INIT_BATCH_MAX_WAIT_MS = 250;
+    // Keep manifest admission close to the transfer cursor. Full-selection
+    // registration made startup proportional to file count and an unbounded
+    // background pass competed with finalization on the same Table rows.
+    const WAVE_STARTUP_ADMISSION_SIZE = 48;
+    const WAVE_ADMISSION_LOW_WATER = 48;
+    const WAVE_ADMISSION_HIGH_WATER = 192;
 
     const flushInitBatch = (force: boolean) => {
         if (batchInitDebounceTimerRef.current) {
@@ -2184,9 +2195,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const batch = pendingBatchInitRef.current;
         pendingBatchInitRef.current = [];
         void (async () => {
-            // Resolve this hash-qualified batch's wave identities immediately
-            // before init. Known duplicates exit before reaching this queue.
-            // Group by session in case more than one lands in the same window.
+            // Resolve this batch's wave identities. Live sessions normally
+            // registered their full pending manifest before workers started,
+            // making this local; missing items are registered here as an
+            // idempotent fallback. Group by session in case more than one
+            // lands in the same debounce window.
             const admissionByKey = new Map<string, Record<string,string>>();
             if (waveShadowEnabled()) {
                 const bySession = new Map<PersistedUploadSession, PersistedUploadFile[]>();
@@ -3037,12 +3050,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             signal?: AbortSignal;
             chunkSizeBytes?: number;
             blockConcurrency?: number;
+            precomputedSha256?: string;
         },
     ): Promise<{ skippedDuplicate: true; filename: string } | { skippedDuplicate: false; sha256: string; uploadId: string }> => {
         if (uploadStopRequestedRef.current || options?.signal?.aborted) {
             throw new Error(UPLOAD_STOPPED_ERROR);
         }
-        const sha256 = await computeSha256(file, options?.signal);
+        const sha256 = options?.precomputedSha256 || await computeSha256(file, options?.signal);
         if (uploadStopRequestedRef.current || options?.signal?.aborted) {
             throw new Error(UPLOAD_STOPPED_ERROR);
         }
@@ -3302,7 +3316,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
     const runUploadSession = useCallback(async (
         session: PersistedUploadSession,
-        options: { resumed?: boolean; notificationId?: string; uploadProfile?: UploadProfile; fileKeys?: Set<string> } = {},
+        options: { resumed?: boolean; notificationId?: string; uploadProfile?: UploadProfile; fileKeys?: Set<string>;
+            preflightSkippedDuplicateCount?: number } = {},
     ) => {
         if (isResumingUploadRef.current || uploadDiscardInProgressRef.current) {
             return;
@@ -3345,7 +3360,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const totalCount = session.files.length;
         let totalUploaded = session.files.filter((file) => file.status === 'done').length;
         let totalFailed = 0;
-        let totalSkippedDuplicates = session.files.filter((file) => file.skippedDuplicate).length;
+        let totalSkippedDuplicates = session.files.filter((file) => file.skippedDuplicate).length
+            + (options.preflightSkippedDuplicateCount || 0);
         const previouslyUploaded = totalUploaded;
         const previouslySkipped = totalSkippedDuplicates;
         const uploadProfile = options.uploadProfile || getAdaptiveUploadProfile(session.files);
@@ -3475,6 +3491,17 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             const pendingFiles = normalized.files.filter((file) => (
                 file.status !== 'done' && (!options.fileKeys || options.fileKeys.has(file.key))
             ));
+            // Put only a small startup window on the critical path. A rolling
+            // producer below admits a bounded look-ahead as workers consume it;
+            // init-batch remains the exact, fail-closed admission path.
+            let admittedFileCount = 0;
+            let requestedAdmissionCount = 0;
+            let rollingWaveAdmission: Promise<void> = Promise.resolve();
+            if (waveLiveEnabled() && pendingFiles.length) {
+                const startupFiles=pendingFiles.slice(0,WAVE_STARTUP_ADMISSION_SIZE);
+                await registerWaveItemsBatch(normalized,startupFiles,false);
+                admittedFileCount = requestedAdmissionCount = startupFiles.length;
+            }
             if (uploadRunGenerationRef.current !== uploadRunGeneration) return;
             admissionReady = true;
 
@@ -3495,6 +3522,29 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             const currentBlockConcurrency = () => Math.max(1, Math.round(TARGET_CONCURRENT_UPLOAD_BLOCKS / laneBudget));
 
             const parallelThumbnailTasks = new Set<Promise<void>>();
+
+            const refillWaveAdmission = (consumedThrough: number) => {
+                if (!waveLiveEnabled() || requestedAdmissionCount >= pendingFiles.length
+                    || admittedFileCount - consumedThrough > WAVE_ADMISSION_LOW_WATER
+                    // Once Blob commits start completing, reserve Table capacity
+                    // for authoritative finalization. Init batches will admit
+                    // their exact files if the rolling window runs dry.
+                    || pendingFinalizeTasks.size > 0) return;
+                const target = Math.min(pendingFiles.length, consumedThrough + WAVE_ADMISSION_HIGH_WATER);
+                if (target <= requestedAdmissionCount) return;
+                const start = requestedAdmissionCount;
+                requestedAdmissionCount = target;
+                rollingWaveAdmission = rollingWaveAdmission.then(async () => {
+                    try {
+                        await registerWaveItemsBatch(normalized, pendingFiles.slice(start, target), false);
+                        admittedFileCount = Math.max(admittedFileCount, target);
+                    } catch {
+                        // Do not reserve the failed range. Exact init admission
+                        // remains fail-closed and retries only files workers use.
+                        requestedAdmissionCount = Math.min(requestedAdmissionCount, start);
+                    }
+                });
+            };
 
             const kickOffThumbnailForFile = (file: File, filename: string, blobName?: string) => {
                 if (isVideoFilename(filename)) return;
@@ -3795,6 +3845,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     }
 
                     const fileMeta = pendingFiles[currentIndex];
+                    refillWaveAdmission(currentIndex + 1);
                     updatePersistedFile(fileMeta.key, { status: 'uploading', error: undefined });
                     let resolvedFileForFailurePreview: File | null = null;
 
@@ -3923,6 +3974,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                                 signal: controller.signal,
                                 chunkSizeBytes,
                                 blockConcurrency: currentBlockConcurrency(),
+                                precomputedSha256: uploadPrecomputedHashesRef.current.get(fileMeta.key),
                             });
                         } catch (err) {
                             controller.abort();
@@ -3937,9 +3989,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         }
 
                         if (staged.skippedDuplicate) {
-                            if (waveLiveEnabled()) {
-                                await excludeWaveDuplicate(normalized, fileMeta, staged.filename);
-                            }
                             // No network work left for this file at all (the
                             // client-side known-hash check short-circuited
                             // before init/stage/finalize) -- mark it done inline,
@@ -3949,6 +3998,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                             totalSkippedDuplicates += 1;
                             const waveAcceptedFilename = staged.filename;
                             waveShadowFileOutcomes.set(fileMeta.key, { status: 'done', skippedDuplicate: true, waveAcceptedFilename });
+                            void resolveWaveShadowFile(session, { ...fileMeta, status: 'done', skippedDuplicate: true, waveAcceptedFilename });
                             updatePersistedFile(fileMeta.key, {
                                 waveAcceptedFilename,
                                 status: 'done',
@@ -3990,12 +4040,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         if (uploadStopRequestedRef.current || isUploadStoppedError(err)) {
                             throw new Error(UPLOAD_STOPPED_ERROR, { cause: err });
                         }
-                        // Live admission is a session-wide gate. Turning a
-                        // cleanup/contention outage into one failure per file
-                        // creates a storm and loses the existing Retry UX.
-                        if (err instanceof Error && err.message.startsWith('Upload admission failed:')) {
-                            throw err;
-                        }
                         await markFileFailed(fileMeta, resolvedFileForFailurePreview, err);
                     }
                 }
@@ -4034,6 +4078,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             if (firstWorkerError !== undefined) {
                 throw firstWorkerError;
             }
+            // Fence the last bounded look-ahead before close/cleanup. Failures
+            // were already recovered per file by fail-closed init admission.
+            await rollingWaveAdmission;
+
             // Every lane has finished transferring bytes (whether by running out
             // of files or a Stop request) -- what's left below (backend finalize
             // confirmation, possible auto-retries) is bookkeeping that can take
@@ -4299,6 +4347,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 // IndexedDB resume cache is best effort and may be unavailable.
                 if (!uploadSessionRef.current) {
                     uploadSourceFilesRef.current.clear();
+                    uploadPrecomputedHashesRef.current.clear();
                     uploadHandlesRef.current.clear();
                 }
                 uploadAbortControllersRef.current.clear();
@@ -4555,6 +4604,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 await discardWaveShadowSession(session);
             }
             uploadSourceFilesRef.current.clear();
+            uploadPrecomputedHashesRef.current.clear();
             uploadHandlesRef.current.clear();
             await clearPersistedSession();
             setPendingUploadSessionLive(null);
@@ -4692,13 +4742,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             showToast(message, { variant: 'error' });
             return;
         }
-        // Wakes a scaled-to-zero upload replica and prefetches known hashes
-        // for dedup, blocking (retried up to UPLOAD_HASH_DOWNLOAD_ATTEMPTS
-        // times) so registration/init below don't land on a cold app. Not
-        // forced: a recent successful fetch (60s cache) already proves the
-        // app is awake, so this is a no-op then rather than a redundant call.
-        await fetchKnownHashes();
-        declareWaveSelection(filesToUpload);
         // isResumingUploadRef, not just `uploading` -- see the comment on the
         // same check in retryPersistedUploadSession. Without it, a selection
         // made while a previous session's finalize/retry tail is still
@@ -4719,10 +4762,93 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         uploadStartInProgressRef.current = true;
         uploadStopRequestedRef.current = false;
         setUploading(true);
-        setUploadProgress({ uploadedCount: 0, totalCount: filesToUpload.length,
-            failedCount: 0, skippedDuplicateCount: 0 });
+        setUploadProgress({
+            uploadedCount: 0,
+            totalCount: filesToUpload.length,
+            failedCount: 0,
+            skippedDuplicateCount: 0,
+        });
         uploadingRef.current = true;
         setUploadError(null);
+        const selectedCount = filesToUpload.length;
+        const dedupNotificationId = addNotification(
+            'Checking duplicates',
+            `Hashing ${plural(selectedCount, 'selected file')} before creating the upload manifest.`,
+            { uploadedCount: 0, totalCount: selectedCount, failedCount: 0, skippedDuplicateCount: 0 },
+        );
+        const precomputedHashes = new Map<File, string>();
+        let preflightSkippedDuplicateCount = 0;
+        const dedupController = new AbortController();
+        uploadAbortControllersRef.current.add(dedupController);
+        try {
+            // Fetch the library snapshot first, then hash the complete
+            // selection. Only candidates survive into the wave declaration,
+            // so skipped duplicates never need /items or server bookkeeping.
+            await fetchKnownHashes();
+            const results: Array<{ file: File; sha256: string; duplicate: boolean } | undefined>
+                = new Array(filesToUpload.length);
+            let cursor = 0;
+            let completed = 0;
+            const hashWorker = async () => {
+                for (;;) {
+                    const index = cursor++;
+                    if (index >= filesToUpload.length) return;
+                    const file = filesToUpload[index];
+                    const sha256 = await computeSha256(file, dedupController.signal);
+                    results[index] = {
+                        file,
+                        sha256,
+                        duplicate: knownHashesRef.current.has(sha256) || libraryHashesRef.current.has(sha256),
+                    };
+                    completed += 1;
+                    if (completed === filesToUpload.length || completed % 25 === 0) {
+                        updateNotification(dedupNotificationId, {
+                            details: `Checked ${completed}/${selectedCount} files for duplicates.`,
+                        });
+                    }
+                }
+            };
+            await Promise.all(Array.from({ length: Math.min(4, filesToUpload.length) }, () => hashWorker()));
+            const candidates: File[] = [];
+            for (const result of results) {
+                if (!result) continue;
+                if (result.duplicate) preflightSkippedDuplicateCount += 1;
+                else {
+                    candidates.push(result.file);
+                    precomputedHashes.set(result.file, result.sha256);
+                }
+            }
+            filesToUpload = candidates;
+        } catch (error) {
+            const message = getUploadErrorMessage(error, 'Could not check selected files for duplicates.');
+            setUploadError(message);
+            setUploading(false);
+            uploadingRef.current = false;
+            uploadStartInProgressRef.current = false;
+            updateNotification(dedupNotificationId, { title: 'Duplicate check failed', details: message });
+            return;
+        } finally {
+            uploadAbortControllersRef.current.delete(dedupController);
+        }
+        if (filesToUpload.length === 0) {
+            setUploadProgress({ uploadedCount: 0, totalCount: 0, failedCount: 0,
+                skippedDuplicateCount: preflightSkippedDuplicateCount, mbPerSecond: 0 });
+            updateNotification(dedupNotificationId, {
+                title: 'No files to upload',
+                details: `Skipped ${plural(preflightSkippedDuplicateCount, 'known duplicate')}.`,
+                progress: { uploadedCount: 0, totalCount: 0, failedCount: 0,
+                    skippedDuplicateCount: preflightSkippedDuplicateCount, mbPerSecond: 0 },
+            });
+            setUploading(false);
+            uploadingRef.current = false;
+            uploadStartInProgressRef.current = false;
+            void requestUploadHashRefresh('completed');
+            return;
+        }
+        // Count and declare only the post-deduplication candidates.
+        declareWaveSelection(filesToUpload);
+        setUploadProgress({ uploadedCount: 0, totalCount: filesToUpload.length, failedCount: 0,
+            skippedDuplicateCount: preflightSkippedDuplicateCount });
         // requestUpload already probes this same backend before the native
         // picker even opens (pollUntilWarm(warmUpload, ...)), and on iOS the
         // gap between that and this point is however long the user spent
@@ -4797,16 +4923,17 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
         const totalBytes = filesToUpload.reduce((sum, file) => sum + file.size, 0);
         const uploadProfile = getAdaptiveUploadProfile(filesToUpload, { measuredRttMs });
-        const preparingNotificationId = addNotification(
-            'Preparing upload',
-            `Preparing ${plural(filesToUpload.length, 'file')}, ${formatBytes(totalBytes)}. ${plural(uploadProfile.fileParallelism, 'upload lane')}, ${formatBytes(uploadProfile.chunkSizeBytes)} chunks: ${uploadProfile.reason}.`,
-            {
+        const preparingNotificationId = dedupNotificationId;
+        updateNotification(preparingNotificationId, {
+            title: 'Preparing upload',
+            details: `Preparing ${plural(filesToUpload.length, 'file')}, ${formatBytes(totalBytes)}. ${plural(uploadProfile.fileParallelism, 'upload lane')}, ${formatBytes(uploadProfile.chunkSizeBytes)} chunks: ${uploadProfile.reason}.`,
+            progress: {
                 uploadedCount: 0,
                 totalCount: filesToUpload.length,
                 failedCount: 0,
-                skippedDuplicateCount: 0,
+                skippedDuplicateCount: preflightSkippedDuplicateCount,
             },
-        );
+        });
 
         const sessionId = `${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
         const session: PersistedUploadSession = {
@@ -4837,11 +4964,15 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         let uploadRunStarted = false;
         try {
             persistSession(session);
-            // Open only (fast, single call). Candidate admission follows after
-            // each file's hash and known-duplicate check.
+            // Open only (fast, single call). Live registration follows in
+            // runUploadSession once the exact pending manifest is known.
             // Shadow failures are contained by the sync client.
             await ensureWaveShadowSessionAdmitted(session);
             uploadSourceFilesRef.current = new Map(session.files.map((meta, index) => [meta.key, filesToUpload[index]]));
+            uploadPrecomputedHashesRef.current = new Map(session.files.map((meta, index) => [
+                meta.key,
+                precomputedHashes.get(filesToUpload[index])!,
+            ]));
             uploadHandlesRef.current = keyedHandles;
             // Not awaited: the actual upload only needs uploadSourceFilesRef
             // (already set above), so there's no reason to block starting on
@@ -4866,7 +4997,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // can let the picker open again to queue files from another folder.
             uploadStartInProgressRef.current = false;
             uploadRunStarted = true;
-            await runUploadSession(session, { notificationId: preparingNotificationId, uploadProfile });
+            await runUploadSession(session, { notificationId: preparingNotificationId, uploadProfile,
+                preflightSkippedDuplicateCount });
         } catch (err) {
             const message = getUploadErrorMessage(err, 'Upload could not start.');
             setUploadError(message);
@@ -4987,13 +5119,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (files.length === 0) {
             return;
         }
-        // declareWaveSelection only -- registration/opening now happens once
-        // inside startUpload itself when each queued batch actually runs,
-        // not pre-warmed here (see registerWaveItemsBatch/flushInitBatch).
-        declareWaveSelection(files);
         const maxBatchSize = getMaxFreshUploadBatchSize();
         for (let i = 0; i < files.length; i += maxBatchSize) {
-            queuedUploadBatchesRef.current.push(sliceWaveSelection(files, i, i + maxBatchSize));
+            queuedUploadBatchesRef.current.push(files.slice(i, i + maxBatchSize));
         }
         setQueuedUploadFileCount((count) => count + files.length);
     }, []);
@@ -5003,14 +5131,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             void startUpload(files);
             return;
         }
-        declareWaveSelection(files);
         const maxBatchSize = getMaxFreshUploadBatchSize();
         if (files.length <= maxBatchSize) {
             void startUpload(files);
             return;
         }
-        const firstBatch = sliceWaveSelection(files, 0, maxBatchSize);
-        const remainder = sliceWaveSelection(files, maxBatchSize);
+        const firstBatch = files.slice(0, maxBatchSize);
+        const remainder = files.slice(maxBatchSize);
         enqueueUploadFilesInBatches(remainder);
         addNotification(
             'Large selection split into batches',
