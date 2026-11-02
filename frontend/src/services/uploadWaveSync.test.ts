@@ -17,6 +17,7 @@ vi.mock('./uploadWaveClient', () => ({
     waveProtocol: async () => 'live',
     discardWaveSession: mocks.abandon,
     abandonWaveShadowSession: mocks.legacyAbandon,
+    WAVE_REGISTER_MAX_BATCH: 1000,
     WAVE_RESOLVE_MAX_BATCH: 100,
     wireItemId: async (key: string) => `wire:${key}`,
     openWaveShadowSession: mocks.open,
@@ -102,6 +103,29 @@ describe('registerWaveItemsBatch', () => {
         await registerWaveItemsBatch(s, s.files.slice(3, 10));
         expect(mocks.register).toHaveBeenCalledTimes(2);
         expect(mocks.register.mock.calls[1][1]).toHaveLength(5); // files 5..9 -- 3..4 already registered, filtered out
+    });
+
+    it('registers a large manifest in bounded pages', async () => {
+        const s = session(2005, 'sess-paged');
+        const result = await registerWaveItemsBatch(s, s.files);
+        expect(mocks.register.mock.calls.map(([, items]) => items.length)).toEqual([1000, 1000, 5]);
+        expect(result.size).toBe(2005);
+    });
+
+    it('can admit a manifest without deriving unused return identities', async () => {
+        const s = session(5, 'sess-admit-only');
+        const result = await registerWaveItemsBatch(s, s.files, false);
+        expect(mocks.register).toHaveBeenCalledTimes(1);
+        expect(result.size).toBe(0);
+    });
+
+    it('resumes after the last acknowledged page when a later page fails', async () => {
+        const s = session(1500, 'sess-page-retry');
+        mocks.register.mockResolvedValueOnce({ manifestRevision: 'rev-first', registeredCount: 1000 })
+            .mockResolvedValueOnce(null);
+        await expect(registerWaveItemsBatch(s, s.files)).rejects.toThrow('admission is unavailable');
+        await registerWaveItemsBatch(s, s.files);
+        expect(mocks.register.mock.calls.map(([, items]) => items.length)).toEqual([1000, 500, 500]);
     });
 
     it('a failed registration call rejects the whole batch and registers nothing', async () => {

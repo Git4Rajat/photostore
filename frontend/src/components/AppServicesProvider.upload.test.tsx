@@ -1289,30 +1289,22 @@ describe('upload wave shadow protocol wiring', () => {
         expect(services.pendingUploadSummary).toBeNull();
     });
 
-    it('starts live init and byte transfers for one batch while a second items call is blocked', async () => {
+    it('registers the live manifest once before starting init and byte transfers', async () => {
         vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
         mocks.getUpload.mockImplementation(async url => url === '/upload/waves/protocol' ? {protocol:'live'} : {hashes:{}});
         const original=mocks.postUpload.getMockImplementation()!;
-        let pages=0;
         let release!: () => void;
         const gate=new Promise<void>(resolve => {release=resolve;});
         mocks.postUpload.mockImplementation(async (url,payload) => {
-            // Call #1 is the upfront single-file admission probe (see
-            // runUploadSession) -- block the second *real* batch (#3) so the
-            // first real batch (#2) is free to start bytes.
-            if (url.endsWith('/items') && ++pages===3) await gate;
+            if (url.endsWith('/items')) await gate;
             return original(url,payload);
         });
         select(filesFor(450));
         await advance(4000);
-        // No fixed page sizes anymore -- registration rides along with each
-        // init-batch flush (<= INIT_BATCH_MAX_SIZE each). What matters: one
-        // batch's bytes can start transferring while a later batch's own
-        // /items call is still blocked, not the exact sizes involved.
-        expect(shadowCalls('/items').length).toBeGreaterThanOrEqual(1);
-        expect(initFiles().length).toBeGreaterThan(0);
-        expect(mocks.transferred).toHaveBeenCalled();
-        expect(finalizedFiles().length).toBeGreaterThan(0);
+        expect(shadowCalls('/items')).toHaveLength(1);
+        expect(shadowCalls('/items')[0][1].items).toHaveLength(450);
+        expect(initFiles()).toHaveLength(0);
+        expect(mocks.transferred).not.toHaveBeenCalled();
         expect(shadowCalls('/close')).toHaveLength(0);
         await act(async () => {release();});
         for (let tick=0;tick<40 && finalizedFiles().length<450;tick++) await advance(1000);
@@ -1322,6 +1314,7 @@ describe('upload wave shadow protocol wiring', () => {
         expect(new Set(registered.map(item => item.itemId)).size).toBe(450);
         expect(finalizedFiles()).toHaveLength(450);
         expect(opens()).toHaveLength(1);
+        expect(shadowCalls('/items')).toHaveLength(1);
     });
 
     it('heartbeat expiry aborts active live transfer intake and retains an explicit retry checkpoint without opening a successor', async () => {

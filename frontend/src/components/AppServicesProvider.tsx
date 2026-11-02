@@ -2166,11 +2166,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const batch = pendingBatchInitRef.current;
         pendingBatchInitRef.current = [];
         void (async () => {
-            // Registers this batch's items in the same request-cycle as
-            // admitting them -- no separate bulk pass, no cross-batch
-            // waiting (see registerWaveItemsBatch). Grouped by session in
-            // case entries from more than one session land in the same
-            // debounce window (practically always exactly one).
+            // Resolve this batch's wave identities. Live sessions normally
+            // registered their full pending manifest before workers started,
+            // making this local; missing items are registered here as an
+            // idempotent fallback. Group by session in case more than one
+            // lands in the same debounce window.
             const admissionByKey = new Map<string, Record<string,string>>();
             if (waveShadowEnabled()) {
                 const bySession = new Map<PersistedUploadSession, PersistedUploadFile[]>();
@@ -3459,13 +3459,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             const pendingFiles = normalized.files.filter((file) => (
                 file.status !== 'done' && (!options.fileKeys || options.fileKeys.has(file.key))
             ));
-            // Admission is shared by the selection. Probe it once (via the
-            // first pending file -- idempotent, so its own later batch just
-            // sees it already registered) before any worker starts, rather
-            // than letting every file's own batch fail and count against it
-            // when the service or wave intake itself is unavailable.
+            // Register the pending live manifest before workers start. The
+            // sync layer pages large selections and records each acknowledged
+            // page, so retry resumes at the first still-missing item. Later
+            // init batches only derive identities locally in the common case.
             if (waveLiveEnabled() && pendingFiles.length) {
-                await registerWaveItemsBatch(normalized, [pendingFiles[0]]);
+                await registerWaveItemsBatch(normalized, pendingFiles, false);
             }
             if (uploadRunGenerationRef.current !== uploadRunGeneration) return;
             admissionReady = true;
@@ -3845,11 +3844,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         let preparation: Promise<PreparedUpload> = Promise.resolve({});
                         try {
                             staged = await uploadFileInChunks(resolvedFile, {
-                                // Resumed files bypass requestBatchedInit's own
-                                // per-batch registration entirely (postInitWithRetry
-                                // is called directly) -- register this one file on
-                                // its own here instead. Fresh files pass undefined;
-                                // flushInitBatch resolves their admission per batch.
+                                // Resumed files bypass requestBatchedInit's identity
+                                // lookup (postInitWithRetry is called directly), so
+                                // derive their already-registered binding here. This
+                                // also admits the file if it was added after the bulk
+                                // pass. Fresh files resolve through flushInitBatch.
                                 waveAdmission: waveLiveEnabled() && fileMeta.uploadId
                                     ? (await registerWaveItemsBatch(normalized, [fileMeta])).get(fileMeta.key)
                                     : undefined,
@@ -4501,8 +4500,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const retryableKeys = new Set(retryableFiles.map((file) => file.key));
         session = retryWaveOperation(session);
         persistSession(session);
-        // Open only -- registration now happens per init-batch, not ahead of
-        // time (see registerWaveItemsBatch/flushInitBatch).
+        // Open now; runUploadSession bulk-registers the retryable manifest
+        // immediately before starting its workers.
         await ensureWaveShadowSessionAdmitted(session);
         await runUploadSession(session, { resumed: true, fileKeys: retryableKeys });
     }, [addNotification, loadPersistedSession, pendingUploadSession, persistSession, runUploadSession, setUploadError, uploading]);
@@ -4822,8 +4821,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         let uploadRunStarted = false;
         try {
             persistSession(session);
-            // Open only (fast, single call) -- registration happens per
-            // init-batch, not ahead of time (see registerWaveItemsBatch).
+            // Open only (fast, single call). Live registration follows in
+            // runUploadSession once the exact pending manifest is known.
             // Shadow failures are contained by the sync client.
             await ensureWaveShadowSessionAdmitted(session);
             uploadSourceFilesRef.current = new Map(session.files.map((meta, index) => [meta.key, filesToUpload[index]]));

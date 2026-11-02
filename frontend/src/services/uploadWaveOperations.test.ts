@@ -5,7 +5,7 @@ vi.mock('./sessionScope', () => ({ sessionScope: () => mocks.scope }));
 vi.mock('./uploadWaveClient', () => ({ waveShadowEnabled: () => true, waveLiveEnabled: () => true,
     discardWaveSession:mocks.discard,
     waveProtocol: async () => 'live', renewUploadWaveLease: mocks.renew,
-    wireItemId: mocks.wire, WAVE_RESOLVE_MAX_BATCH: 100,
+    wireItemId: mocks.wire, WAVE_REGISTER_MAX_BATCH: 1000, WAVE_RESOLVE_MAX_BATCH: 100,
     openWaveShadowSession: mocks.open, registerWaveShadowItems: mocks.register,
     resolveWaveShadowItems: async (id: string, items: any[]) => {
         const results = await Promise.all(items.map(item => mocks.resolve(id, item.itemId, item.outcome, item.filename)));

@@ -105,9 +105,11 @@ export interface WaveShadowItem {
 
 export type WaveShadowOutcome = 'accepted' | 'duplicate' | 'cancelled' | 'failed';
 
-// Registration is folded into each init-batch request now (see
-// registerWaveItemsBatch in uploadWaveSync.ts) -- no separate page size of
-// its own; a batch's size is whatever INIT_BATCH_MAX_SIZE already is.
+// Keep admission comfortably below the backend's 2,000-item request limit.
+// A live upload registers its pending manifest in these pages before starting
+// workers; per-init registration remains an idempotent fallback for resumes
+// and files added after that pass.
+export const WAVE_REGISTER_MAX_BATCH = 1000;
 export const WAVE_RESOLVE_MAX_BATCH = 100;
 
 export const openWaveShadowSession = (sessionId: string, declaredCount: number, resumedFromSessionId?: string) =>
