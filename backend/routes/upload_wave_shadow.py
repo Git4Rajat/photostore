@@ -327,7 +327,7 @@ def _drive(store,wave_id):
     key=(wave.get('visionPendingKey') if destination=='vision' else
          'shadow-cluster!'+wave_id if destination=='cluster' else wave.get('indexPendingKey'))
     if destination and key:release_and_relay(work,store,store.library,key,destination,send_stage)
-    if state=='complete':
+    if state in ('complete', 'cancelled'):
         from wave_runtime import relay_successor, resume_completed_wave_maintenance
         relay_successor(work,store,wave_id,send_stage)
         resume_completed_wave_maintenance(store.library)

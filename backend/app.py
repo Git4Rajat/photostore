@@ -11407,7 +11407,10 @@ def _run_index_maintenance_payload(payload):
     except automatic.SourceBusy:
         # A healthy source barrier wait does not consume the poison budget.
         waiting_wave = automatic.wave_pending(library)
-        store.release(claim, deferred=True, retry_delay=INDEX_BARRIER_RECOVERY_SECONDS,
+        delay = INDEX_BARRIER_RECOVERY_SECONDS
+        if waiting_wave and claim.schedule_reason == 'wave_wait' and claim.scheduled_delay > 0:
+            delay = min(3600, max(INDEX_BARRIER_RECOVERY_SECONDS, int(claim.scheduled_delay * 2)))
+        store.release(claim, deferred=True, retry_delay=delay,
             retry_reason='wave_wait' if waiting_wave else 'barrier_wait')
         _upsert_job_status(str(payload['jobId']), library, INDEX_BUILD_JOB_TYPE, 'queued', indexScope=scope,
             error='', result={'status': 'deferred', 'reason': 'barrier_wait', 'ready': False})

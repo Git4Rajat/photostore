@@ -303,11 +303,12 @@ def consume(payload,*,deadline=None,progress=None):
             work.finish(claim)
         current=store._required(store.wave_key(wave_id))
         relay_current(work,store,current,send_stage)
-        if current['state']=='complete':
+        if current['state'] in ('complete', 'cancelled'):
             resume_completed_wave_maintenance(library)
-            import index_events
-            index_events.publish(library,'wave',current['completionReceiptId'])
-        if current['state'] in ('ready','indexing','complete'):
+            if current['state']=='complete':
+                import index_events
+                index_events.publish(library,'wave',current['completionReceiptId'])
+        if current['state'] in ('ready','indexing','complete','cancelled'):
             relay_successor(work,store,wave_id,send_stage)
         return 'done'
     except ArtifactCleanupBusy:

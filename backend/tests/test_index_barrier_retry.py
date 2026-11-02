@@ -323,3 +323,94 @@ def test_index_worker_reports_processing_and_deferred_outcome(monkeypatch, caplo
               for r in caplog.records if 'processing telemetry ' in r.message]
     assert any(e['event'] == 'index_message_outcome' and e['outcome'] == 'deferred' for e in events)
     assert all(e.get('role') == 'indexer' for e in events)
+
+
+def test_wave_wait_exponential_backoff_and_wave_completion_resume(clocked, monkeypatch):
+    env = clocked
+    active = [True]
+    monkeypatch.setattr(automatic, 'wave_pending', lambda _: active[0])
+    key = env.store.request('A', 'vector')
+    payload = dict(type=app.INDEX_BUILD_JOB_TYPE, userId='A', scope='vector', jobId='job',
+                   maintenanceKey=key)
+
+    # 1st attempt: initial deferral is 300s (INDEX_BARRIER_RECOVERY_SECONDS)
+    app._run_index_maintenance_payload(payload)
+    row = env.store._get(key)
+    assert row['retryReason'] == 'wave_wait'
+    assert row['retryDelaySeconds'] == 300
+    assert row['notBefore'] == 1300
+    assert env.sent[-1][-1] == 300
+
+    # 2nd attempt: wave still active, backs off to 600s
+    env.now[0] = 1300
+    app._run_index_maintenance_payload(payload)
+    row = env.store._get(key)
+    assert row['retryReason'] == 'wave_wait'
+    assert row['retryDelaySeconds'] == 600
+    assert row['notBefore'] == 1900
+    assert env.sent[-1][-1] == 600
+
+    # 3rd attempt: backs off to 1200s
+    env.now[0] = 1900
+    app._run_index_maintenance_payload(payload)
+    row = env.store._get(key)
+    assert row['retryReason'] == 'wave_wait'
+    assert row['retryDelaySeconds'] == 1200
+    assert row['notBefore'] == 3100
+    assert env.sent[-1][-1] == 1200
+
+    # 4th attempt: backs off to 2400s
+    env.now[0] = 3100
+    app._run_index_maintenance_payload(payload)
+    row = env.store._get(key)
+    assert row['retryReason'] == 'wave_wait'
+    assert row['retryDelaySeconds'] == 2400
+    assert row['notBefore'] == 5500
+    assert env.sent[-1][-1] == 2400
+
+    # 5th attempt: caps at 3600s (1 hour)
+    env.now[0] = 5500
+    app._run_index_maintenance_payload(payload)
+    row = env.store._get(key)
+    assert row['retryReason'] == 'wave_wait'
+    assert row['retryDelaySeconds'] == 3600
+    assert row['notBefore'] == 9100
+    assert env.sent[-1][-1] == 3600
+
+    # 6th attempt: remains capped at 3600s
+    env.now[0] = 9100
+    app._run_index_maintenance_payload(payload)
+    row = env.store._get(key)
+    assert row['retryReason'] == 'wave_wait'
+    assert row['retryDelaySeconds'] == 3600
+    assert row['notBefore'] == 12700
+    assert env.sent[-1][-1] == 3600
+
+    # Now wave completes: resume_completed_wave_maintenance immediately clears backoff and signals delay=0
+    active[0] = False
+    import wave_runtime
+    resumed = wave_runtime.resume_completed_wave_maintenance('A')
+    assert resumed == 1
+    row = env.store._get(key)
+    assert row['notBefore'] == 0
+    assert row['retryReason'] == ''
+    assert env.sent[-1][-1] == 0
+
+
+def test_wave_runtime_resumes_maintenance_on_cancelled_wave(clocked, monkeypatch):
+    env = clocked
+    active = [True]
+    monkeypatch.setattr(automatic, 'wave_pending', lambda _: active[0])
+    key = env.store.request('A', 'vector')
+    payload = dict(type=app.INDEX_BUILD_JOB_TYPE, userId='A', scope='vector', jobId='job',
+                   maintenanceKey=key)
+    app._run_index_maintenance_payload(payload)
+    assert env.store._get(key)['retryReason'] == 'wave_wait'
+
+    # When wave is cancelled (and no more waves pending), maintenance wakes immediately
+    active[0] = False
+    import wave_runtime
+    resumed = wave_runtime.resume_completed_wave_maintenance('A')
+    assert resumed == 1
+    assert env.store._get(key)['notBefore'] == 0
+    assert env.sent[-1][-1] == 0

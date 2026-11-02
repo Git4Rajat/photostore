@@ -350,3 +350,16 @@ def test_prepare_deadline_uses_healthy_continuation_only_for_stage_expiry(monkey
         assert json.loads(lease['progressCheckpoint'][7:])==dict(phase='sources',after='')
     assert not store._page('source-attempt!')
     assert store._page(f"e!{wave['waveId']}!m!")[0]['outcome']=='pending'
+
+
+def test_consume_on_cancelled_wave_resumes_maintenance_and_relays_successor(monkeypatch, vision_dispatch):
+    store, work, wave, token, payload, sent = vision_dispatch
+    resumed = []
+    monkeypatch.setattr(runtime, 'resume_completed_wave_maintenance', lambda lib: resumed.append(lib))
+    def cancel_wave(*a, **kw):
+        existing = store._required(store.wave_key(wave['waveId']))
+        store.table.rows[(store.partition, store.wave_key(wave['waveId']))] = dict(existing, state='cancelled')
+        return dict(existing, state='cancelled')
+    monkeypatch.setattr(runtime, 'run_vision_release', cancel_wave)
+    assert runtime.consume(payload) == 'done'
+    assert resumed == [store.library]
