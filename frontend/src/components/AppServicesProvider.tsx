@@ -284,10 +284,10 @@ interface AppServicesContextValue {
     releaseKnownHashesForFilenames: (filenames: string[]) => void;
     startBrowserProcessing: (options?: BrowserProcessingStartOptions) => Promise<number>;
     browserProcessingActive: boolean;
-    // In-flight background jobs from the last /api/jobs/status poll, so views can
-    // show live progress (e.g. a "Grouping people…" indicator) rather than only a
-    // toast on completion.
+    // In-flight background jobs observed while Tools is open. Cleared on leaving
+    // Tools so other views do not retain stale activity indicators.
     activeJobs: JobStatusRecord[];
+    registerToolsPageJobPolling: () => () => void;
     clusteringActive: boolean;
     clusteringStatusLabel: string;
     ipworkActive: boolean;
@@ -1318,9 +1318,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
     // --- Background job completion notifier ---------------------------------
     // Long-running worker jobs (reclustering, "find more faces", library
-    // cleanup, preview generation) record their lifecycle server-side. We poll
-    // for finished ones and surface each exactly once in the bell (+ a toast for
+    // cleanup, preview generation) record their lifecycle server-side. While Tools
+    // is mounted, we poll for finished ones and surface each exactly once in the bell (+ a toast for
     // the higher-signal kinds). See services/jobNotifications for the contract.
+    const toolsPageMountedRef = useRef(false);
     const jobPollTimerRef = useRef<number | null>(null);
     const jobPollInFlightRef = useRef<boolean>(false);
     // Guards startJobPolling itself against a second caller racing in before the
@@ -1432,7 +1433,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }, [flushClusterCompletions]);
 
     const pollJobStatusesOnce = useCallback(async (): Promise<boolean> => {
-        if (!hasForegroundDemand()) return false;
+        if (!toolsPageMountedRef.current || !hasForegroundDemand()) return false;
         // Resolves to whether any jobs are still in flight (so the caller knows
         // whether to keep polling).
         if (jobPollInFlightRef.current) {
@@ -1444,6 +1445,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         jobPollInFlightRef.current = true;
         try {
             const jobs = await fetchJobStatuses();
+            if (!toolsPageMountedRef.current) return false;
             const seen = notifiedJobIdsRef.current;
             const inFlight: JobStatusRecord[] = [];
             let active = false;
@@ -1587,7 +1589,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }, []);
 
     const startJobPolling = useCallback(() => {
-        if (!isLikelyAuthenticated()) {
+        if (!toolsPageMountedRef.current || !isLikelyAuthenticated()) {
             return;
         }
         // Already polling, or another caller is mid-startup (between kicking off
@@ -1600,7 +1602,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         // Poll immediately, then keep polling while jobs remain in flight and go
         // idle once none are left (a nudge or refocus restarts the loop).
         void pollJobStatusesOnce().then((active) => {
-            if (!active) {
+            if (!active || !toolsPageMountedRef.current) {
                 stopJobPolling();
                 return;
             }
@@ -1624,8 +1626,24 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         });
     }, [pollJobStatusesOnce, stopJobPolling]);
 
+    // Only the mounted Tools page may wake the indexer for job status. Focus,
+    // uploads and mutation nudges elsewhere must not keep its replica alive.
+    const registerToolsPageJobPolling = useCallback(() => {
+        toolsPageMountedRef.current = true;
+        startJobPolling();
+        return () => {
+            toolsPageMountedRef.current = false;
+            stopJobPolling();
+            jobPollRequestedUntilRef.current = 0;
+            jobPollHadActiveRef.current = false;
+            ipworkJobsInFlightRef.current = false;
+            setActiveJobs([]);
+        };
+    }, [startJobPolling, stopJobPolling]);
+
     useEffect(() => {
         const unsubscribe = onJobPollRequested(() => {
+            if (!toolsPageMountedRef.current) return;
             // A mutation can precede visibility of its queued job. Allow a
             // bounded grace period, without polling idle sessions forever.
             jobPollRequestedUntilRef.current = Date.now() + 30000;
@@ -5418,6 +5436,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         startBrowserProcessing,
         browserProcessingActive,
         activeJobs,
+        registerToolsPageJobPolling,
         clusteringActive,
         clusteringStatusLabel,
         ipworkActive,
@@ -5455,6 +5474,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         startBrowserProcessing,
         browserProcessingActive,
         activeJobs,
+        registerToolsPageJobPolling,
         clusteringActive,
         clusteringStatusLabel,
         ipworkActive,

@@ -300,7 +300,18 @@ const getToolsPageKey = (pathname: string): ToolsPageKey => {
 const PAGE_SIZE = 50;
 
 const ToolsPage: React.FC = () => {
-    const { browserAiModelState, loadBrowserAiModel, startBrowserProcessing } = useAppServices();
+    const { browserAiModelState, loadBrowserAiModel, startBrowserProcessing, registerToolsPageJobPolling } = useAppServices();
+    useEffect(() => registerToolsPageJobPolling(), [registerToolsPageJobPolling]);
+    const mountedRef = useRef(false);
+    const snapshotPollTimersRef = useRef<Set<number>>(new Set());
+    useEffect(() => {
+        mountedRef.current = true;
+        return () => {
+            mountedRef.current = false;
+            snapshotPollTimersRef.current.forEach(timer => window.clearTimeout(timer));
+            snapshotPollTimersRef.current.clear();
+        };
+    }, []);
     const location = useLocation();
     const navigate = useNavigate();
     const [photos, setPhotos] = useState<Photo[]>([]);
@@ -1054,9 +1065,11 @@ const ToolsPage: React.FC = () => {
         let attempts = 0;
         const maxAttempts = 12;
         const tick = async () => {
+            if (!mountedRef.current) return;
             attempts += 1;
             try {
                 const response = await getTools('/api/jobs/status') as { jobs?: Array<Record<string, unknown>> };
+                if (!mountedRef.current) return;
                 const job = (response?.jobs || []).find((j) => j.jobId === jobId);
                 if (job && (job.status === 'done' || job.status === 'failed')) {
                     const snapshotId = String(job.snapshotId || '');
@@ -1069,7 +1082,11 @@ const ToolsPage: React.FC = () => {
                 return;
             }
             if (attempts < maxAttempts) {
-                window.setTimeout(() => void tick(), 3000);
+                const timer = window.setTimeout(() => {
+                    snapshotPollTimersRef.current.delete(timer);
+                    void tick();
+                }, 3000);
+                snapshotPollTimersRef.current.add(timer);
             }
         };
         void tick();

@@ -53,7 +53,7 @@ vi.mock('../services/backgroundKeepAlive', () => ({
     },
 }));
 vi.mock('../services/toast', () => ({ showToast: mocks.toast }));
-vi.mock('../services/perf', () => ({ perf: { recordSpan: mocks.span } }));
+vi.mock('../services/perf', () => ({ perf: { recordSpan: mocks.span, span: (_name: string, run: () => unknown) => run() } }));
 vi.mock('./PhotoGallery', () => ({
     idbPut: vi.fn().mockResolvedValue(undefined),
     idbGet: mocks.idbGet,
@@ -85,8 +85,12 @@ import * as largeFileHash from '../utils/largeFileHash';
 import * as uploadWaveSync from '../services/uploadWaveSync';
 
 let services: ReturnType<typeof useAppServices>;
-function Probe() {
+function Probe({ toolsPage = true }: { toolsPage?: boolean }) {
     services = useAppServices();
+    const { registerToolsPageJobPolling } = services;
+    React.useEffect(() => {
+        if (toolsPage) return registerToolsPageJobPolling();
+    }, [toolsPage, registerToolsPageJobPolling]);
     return <><button onClick={services.requestUpload}>Upload</button><UploadDock /></>;
 }
 
@@ -179,6 +183,43 @@ function select(files: File[]) {
     fireEvent.change(input, { target: { files } });
     return input;
 }
+
+describe('Tools-only job polling', () => {
+    it('ignores mount, focus, visibility and mutation nudges outside Tools', async () => {
+        mocks.pollAuthenticated = true;
+        render(<AppServicesProvider><Probe toolsPage={false} /></AppServicesProvider>);
+        const { requestJobPoll } = await vi.importActual<typeof import('../services/jobNotifications')>('../services/jobNotifications');
+        await act(async () => {
+            window.dispatchEvent(new Event('focus'));
+            document.dispatchEvent(new Event('visibilitychange'));
+            requestJobPoll();
+        });
+        await advance(60000);
+        expect(mocks.jobs).not.toHaveBeenCalled();
+    });
+
+    it('starts on entering Tools and stops on leaving, including an in-flight response', async () => {
+        mocks.pollAuthenticated = true;
+        let resolveJobs!: (jobs: unknown[]) => void;
+        mocks.jobs.mockImplementationOnce(() => new Promise(resolve => { resolveJobs = resolve; }));
+        const view = render(<AppServicesProvider><Probe toolsPage={false} /></AppServicesProvider>);
+        view.rerender(<AppServicesProvider><Probe /></AppServicesProvider>);
+        expect(mocks.jobs).toHaveBeenCalledTimes(1);
+        view.rerender(<AppServicesProvider><Probe toolsPage={false} /></AppServicesProvider>);
+        await act(async () => resolveJobs([{jobId: 'running', kind: 'ipwork', status: 'running'}]));
+        await advance(12000);
+        expect(mocks.jobs).toHaveBeenCalledTimes(1);
+        expect(services.activeJobs).toEqual([]);
+        mocks.jobs.mockResolvedValue([{jobId: 'running', kind: 'ipwork', status: 'running'}]);
+        view.rerender(<AppServicesProvider><Probe /></AppServicesProvider>);
+        await advance(6000);
+        expect(mocks.jobs).toHaveBeenCalledTimes(3);
+        view.rerender(<AppServicesProvider><Probe toolsPage={false} /></AppServicesProvider>);
+        await advance(12000);
+        expect(mocks.jobs).toHaveBeenCalledTimes(3);
+        expect(services.activeJobs).toEqual([]);
+    });
+});
 
 describe('index completion notifications', () => {
     const indexJob = (scope: string, message: string, millisecondsAgo = 0) => ({
