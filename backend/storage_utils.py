@@ -9650,6 +9650,8 @@ def _reusable_semantic_vector(row, text_digest, version, dimension):
 def _refresh_semantic_fields(filename: str, metadata: Dict) -> None:
     import processing_metrics as metrics
     semantic_text = _build_client_semantic_text(filename, metadata)
+    metadata['semanticText'] = semantic_text
+    metadata['semanticLayers'] = _json_compact(build_semantic_layers(filename, metadata))
     text_digest = hashlib.sha256(semantic_text.encode('utf-8')).hexdigest()
     version = vision_utils.get_text_embedding_version()
     dimension = vision_utils.get_text_embedding_dimension()
@@ -9667,8 +9669,6 @@ def _refresh_semantic_fields(filename: str, metadata: Dict) -> None:
             except Exception:
                 metrics.add(semantic_embedding_reuse_read_errors=1)
         vector = _reusable_semantic_vector(prior, text_digest, version, dimension)
-    metadata['semanticText'] = semantic_text
-    metadata['semanticLayers'] = _json_compact(build_semantic_layers(filename, metadata))
     if vector is None:
         metrics.add(semantic_embedding_encodes=1)
         vector = vision_utils.encode_text_embedding(semantic_text)
@@ -10056,6 +10056,7 @@ def _apply_client_processing_results(
     origin: str = 'browser',
     claimed_steps: Optional[List[str]] = None,
     persist_result: bool = True,
+    include_semantic_embedding: bool = True,
 ) -> None:
     metadata_table_client = _CTX['metadata_table_client']
     payload = client_processing if isinstance(client_processing, dict) else {}
@@ -10928,6 +10929,14 @@ def _apply_client_processing_results(
     if not derivatives_only:
         with processing_diagnostics.apply_phase(user_id, filename, 'semantic_refresh'):
             _refresh_semantic_fields(filename, metadata)
+            if not include_semantic_embedding:
+                # Browser uploads already supply a real CLIP image vector when
+                # vision succeeds. EXIF/derivative-only reports do not persist
+                # a redundant text vector; search computes it on demand when
+                # no image vector exists. Keep the refresh call itself stable
+                # for instrumentation and existing extension hooks.
+                for field in ('semanticEmbedding', 'semanticEmbeddingVersion', 'semanticTextDigest'):
+                    metadata.pop(field, None)
 
     if status_updates:
         metadata.update(status_updates)
@@ -11057,6 +11066,7 @@ def apply_client_processing_results_for_file(
             str(metadata.get('anonymousImageId') or ''),
             generation=str(metadata.get('processingGeneration') or ''))
     consolidated = origin == 'ipworker' or expected_processing_revision is not None
+    browser_consolidated = origin.startswith('browser') and not consolidated
     baseline = metadata
     if consolidated:
         if lease_owner is None:
@@ -11096,10 +11106,14 @@ def apply_client_processing_results_for_file(
     if artifact_fence:
         metadata['artifactReceipt'] = ''
     try:
-        # Workers own the final status flush; browser callers retain the
-        # separate on-exit flush, including partial progress on exceptions.
-        with result_fence(artifact_fence), batched_processing_status_updates(user_id, filename, flush=not consolidated) as batch:
-            options = {'persist_result': False} if consolidated else {}
+        # Worker and browser aggregate commits own the final status flush.
+        # Other legacy callers retain the separate on-exit flush; browser
+        # exceptions explicitly preserve partial statuses below.
+        with result_fence(artifact_fence), batched_processing_status_updates(
+                user_id, filename, flush=not (consolidated or browser_consolidated)) as batch:
+            options = {'persist_result': False} if (consolidated or browser_consolidated) else {}
+            if browser_consolidated:
+                options['include_semantic_embedding'] = False
             _apply_client_processing_results(
                 user_id,
                 filename,
@@ -11145,6 +11159,13 @@ def apply_client_processing_results_for_file(
                            require_unexpired=expected_processing_revision is not None)
             except Exception:
                 _LOGGER.warning('Worker partial-status commit failed')
+        elif browser_consolidated:
+            if batch:
+                # Preserve terminal statuses already produced before a later
+                # browser step failed, matching the former on-exit batch flush.
+                timed_call('persistence', _flush_processing_status_batch,
+                           user_id, filename, batch)
+            _unstick_claimed_steps_still_running(user_id, filename, claimed_steps, str(exc))
         else:
             _unstick_claimed_steps_still_running(user_id, filename, claimed_steps, str(exc))
         raise
@@ -11152,6 +11173,9 @@ def apply_client_processing_results_for_file(
         return timed_call('persistence', _commit_worker_processing_results,
                           user_id, filename, baseline, metadata, batch, lease_owner,
                           require_unexpired=expected_processing_revision is not None)
+    if browser_consolidated:
+        return timed_call('persistence', _commit_browser_processing_results,
+                          user_id, filename, baseline, metadata, batch)
     exif_updates = {key: metadata.get(key) for key in _EXIF_RESULT_FIELDS
                     if metadata.get(key) != exif_baseline[key]}
     timed_call('persistence', refresh_metadata_entity, user_id, filename, {
@@ -11200,6 +11224,63 @@ def _check_result_lease(entity: Dict, owner: str) -> None:
         raise StaleProcessingResult('Photo is isolated from processing.')
     if _metadata_lease_owner(entity) != owner:
         raise StaleProcessingResult('Processing result lease owner changed.')
+
+
+@processing_metrics.purpose('browser_metadata_commit')
+def _commit_browser_processing_results(user_id, filename, baseline, result, updates):
+    """Merge one browser attempt with a generation-aware conditional write.
+
+    Browser result application historically performed an aggregate upsert, a
+    status-batch update, and a lease-release refresh. Besides extra I/O, every
+    write independently entered automatic index coverage. Rebuild the attempt's
+    delta against a fresh row on CAS conflicts and publish all metadata/status/
+    lease changes through one source mutation instead.
+    """
+    table = _CTX['metadata_table_client']
+    fields = {key: value for key, value in result.items()
+              if key not in {'PartitionKey', 'RowKey', 'processing_metadata'}
+              and (key not in baseline or value != baseline[key])}
+    before = _safe_json_load(baseline.get('processing_metadata'))
+    after = _safe_json_load(result.get('processing_metadata'))
+    changed_keys = {key for key in before.keys() | after.keys()
+                    if key not in before or key not in after or before[key] != after[key]}
+    current = baseline
+    for attempt in range(_METADATA_UPDATE_MAX_RETRIES):
+        from processing_completion import StaleProcessingResult
+        if str(current.get('processing_state') or '').strip().lower() == 'deleted':
+            raise StaleProcessingResult('Photo has been deleted.')
+        if any(current.get(key) != baseline.get(key)
+               for key in ('anonymousImageId', 'fileHash', 'processingRevision',
+                           'processingFence', 'processingGeneration')):
+            raise StaleProcessingResult('Processing source changed during result application.')
+        touched_steps = {key[:-7] for key in fields if key.endswith('_status')}
+        touched_steps.update(update['step'] for update in updates)
+        if any(_step_locked_done(current, step) and not _step_locked_done(baseline, step)
+               for step in touched_steps):
+            raise RuntimeError('Processing step completed during result application.')
+        processing = _safe_json_load(current.get('processing_metadata'))
+        for key in changed_keys:
+            if key in after:
+                processing[key] = after[key]
+            else:
+                processing.pop(key, None)
+        entity = copy.copy(current)
+        entity.update(fields)
+        entity['processing_metadata'] = json.dumps(processing, ensure_ascii=False, separators=(',', ':'))
+        _apply_processing_status_updates(entity, updates)
+        entity.update(processing_lease_owner='', processing_lease='', processing_lease_expires_at='')
+        entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
+        entity['processing_complete'] = _photo_processing_complete(entity)
+        try:
+            table.update_entity(entity, mode=UpdateMode.MERGE,
+                                match_condition=MatchConditions.IfNotModified)
+            touch_user_search_indexes_state(user_id, filenames=filename)
+            return entity
+        except ResourceModifiedError:
+            if attempt + 1 == _METADATA_UPDATE_MAX_RETRIES:
+                raise
+            time.sleep(_METADATA_UPDATE_RETRY_BASE_SECONDS * (2 ** attempt))
+            current = table.get_entity(partition_key=user_id, row_key=filename)
 
 
 @processing_metrics.purpose('metadata_commit')

@@ -117,6 +117,38 @@ def test_overlapping_sessions_join_one_wave_and_both_must_close(world):
     assert finish_scan(store, wave)['state'] == 'ready'
 
 
+def test_resolve_many_advances_shared_control_once_for_a_page(world):
+    store, table, _ = world
+    store.open_session('batch', 10)
+    store.register('batch', [dict(itemId=str(index), filename=f'{index}.jpg')
+                             for index in range(10)])
+    table.transactions.clear()
+    row = store.resolve_many('batch', [dict(item=str(index), outcome='accepted',
+        photo_id=f'photo-{index}', processing_revision=f'revision-{index}',
+        filename=f'{index}.jpg', required_steps=['face']) for index in range(10)])
+    assert row['resolvedCount'] == 10
+    assert len(table.transactions) == 1
+    assert sum(operation[1]['RowKey'] == 'control'
+               for operation in table.transactions[0]) == 1
+    assert store._required(store.wave_key(row['waveId']))['memberCount'] == 10
+
+
+def test_resolve_many_coalesces_same_revision_and_preserves_projection(world):
+    store, _, _ = world
+    parent = store.open_session('same', 2)
+    store.register('same', [dict(itemId='duplicate', filename='copy.jpg'),
+                            dict(itemId='accepted', filename='original.jpg')])
+    store.resolve_many('same', [
+        dict(item='duplicate', outcome='duplicate', photo_id='photo',
+             processing_revision='revision', filename='copy.jpg', required_steps=['face']),
+        dict(item='accepted', outcome='accepted', photo_id='photo',
+             processing_revision='revision', filename='original.jpg', required_steps=['face']),
+    ])
+    members = store._page(f"e!{parent['waveId']}!m!")
+    assert len(members) == 1
+    assert members[0]['needsProjection'] is True
+
+
 def test_whole_parent_selection_spans_900_file_transport_boundary(world):
     store, _, _ = world
     session = store.open_session('parent', 901)

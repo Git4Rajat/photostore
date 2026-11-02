@@ -298,7 +298,7 @@ def worker_commit_ctx(racy_ctx, monkeypatch):
           processing_lease_owner='worker-A', processing_lease='worker-A',
           processing_lease_expires_at='2099-01-01T00:00:00+00:00', rating=1)
     monkeypatch.setitem(storage_utils._CTX, 'source_completion_delivery', None)
-    monkeypatch.setattr(storage_utils, '_refresh_semantic_fields', lambda *a: None)
+    monkeypatch.setattr(storage_utils, '_refresh_semantic_fields', lambda *a, **k: None)
     monkeypatch.setattr(storage_utils, 'touch_user_search_indexes_state', lambda *a, **k: None)
     monkeypatch.setattr(storage_utils, 'touch_user_sort_index_dirty', lambda *a, **k: None)
     monkeypatch.setattr(storage_utils, 'download_media_bytes', lambda *a: pytest.fail('Unexpected download'))
@@ -336,6 +336,18 @@ def test_worker_results_statuses_and_release_use_one_read_one_conditional_write(
     assert event['write_attempts'] == 1 and event['retry_reads'] == 0
     assert event['status_updates'] == 1 and event['outcome'] == 'success'
     assert 'a.jpg' not in json.dumps(event) and 'hello' not in json.dumps(event)
+
+
+def test_unfenced_browser_results_use_one_conditional_metadata_commit(worker_commit_ctx):
+    table = worker_commit_ctx
+    result = storage_utils.apply_client_processing_results_for_file(
+        'u1', 'a.jpg', origin='browser', claimed_steps=['ocr'],
+        client_processing={'ocr': {'hasData': True, 'text': 'browser text'}})
+    assert result['ocrText'] == 'browser text'
+    assert result['ocr_status'] == 'done'
+    assert result['processing_lease_owner'] == ''
+    assert table.get_calls == table.update_calls == 1
+    assert table.etags[('u1', 'a.jpg')] == 2
 
 
 def test_worker_commit_retries_only_merge_preserving_concurrent_edits(worker_commit_ctx, monkeypatch):

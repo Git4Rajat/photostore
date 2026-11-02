@@ -106,22 +106,30 @@ def install(blueprint):
         result=response.get_json(silent=True) or {}
         results=result.get('results',[]) if context[2].endswith('-batch') else [result]
         try:
-            from upload_wave_shadow import resolve_source
+            from upload_wave_shadow import resolve_sources
             from routes.upload_wave_shadow import close_resolved_intake
-            for binding,entry in zip(bindings,results):
+            grouped={}
+            for index,(binding,entry) in enumerate(zip(bindings,results)):
                 if entry.get('error') or not entry.get('complete'):continue
-                # Finalization wrote this source's metadata, so it requires
-                # publication even if dedup finds identical bytes (including
-                # itself on a retry). No-write duplicate selections use the
-                # explicit resolve endpoint instead.
-                if binding in getattr(g,'wave_finalize_replays',{}):
-                    session=store._required(store.session_key(binding[0]))
-                else:
-                    session=resolve_source(store,app.metadata_table_client,*binding,
-                        'accepted',entry['filename'])
+                grouped.setdefault(binding[0],[]).append((index,binding,entry))
+            replays=getattr(g,'wave_finalize_replays',{})
+            for session_id,group in grouped.items():
+                pending=[value for value in group if value[1] not in replays]
+                # Azure Table transactions allow 100 operations. resolve_many
+                # bounds a page to 20 so even all-new member/source bindings
+                # plus the shared control/session/wave rows fit atomically.
+                session=None
+                for offset in range(0,len(pending),20):
+                    page=pending[offset:offset+20]
+                    session=resolve_sources(store,app.metadata_table_client,session_id,
+                        [(binding[1],'accepted',entry['filename'])
+                         for _index,binding,entry in page])
+                if session is None:
+                    session=store._required(store.session_key(session_id))
                 session=close_resolved_intake(store,session)
-                entry['waveResolution']=dict(sessionId=binding[0],itemId=binding[1],
-                    manifestRevision=session['manifestRevision'],state=session['state'])
+                for _index,binding,entry in group:
+                    entry['waveResolution']=dict(sessionId=binding[0],itemId=binding[1],
+                        manifestRevision=session['manifestRevision'],state=session['state'])
             response.set_data(app.jsonify(result).get_data())
         except IntakeBindingConflict as error:
             body,status=_binding_conflict_response(app,error)

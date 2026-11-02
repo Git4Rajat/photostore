@@ -427,6 +427,12 @@ const TARGET_CONCURRENT_UPLOAD_BLOCKS = 6;
 // than this, so the cap only ever lowers the large desktop sizes.
 const PARALLEL_UPLOAD_BLOCK_BYTES = 8 * MB;
 
+// A fresh original that fits in one normal browser request does not benefit
+// from stageBlock + commitBlockList: those two operations add a second Blob
+// request and a block-list round trip for every small photo. Keep resumed
+// uploads on the block path so their persisted checkpoints remain valid.
+const SINGLE_PUT_UPLOAD_MAX_BYTES = 8 * MB;
+
 // A single file's block-staging loop (stageBlock/commitBlockList) goes straight
 // to Blob Storage and never otherwise touches the backend between /upload/init
 // and /upload/finalize. On a slow link a large file alone can run longer than
@@ -2196,7 +2202,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             runGatedRequestWithRetry(gate, '/upload/init-batch', {
                 files: admitted.map(({ fileMeta, totalSize, sha256 }) => ({ filename: fileMeta.name, totalSize, sha256,
                     ...admissionByKey.get(fileMeta.key),
-                    ...(isVideoFilename(fileMeta.name) ? {includeMetadata: true} : getRuntimeConfig().browserUploadPreparation ? {includePreview: true, includeMetadata: true} : {}),
+                    ...(isVideoFilename(fileMeta.name) ? {includeMetadata: true} : {}),
                 })),
             })
                 .then((response) => {
@@ -2256,16 +2262,17 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // resettable 200ms debounce flushed on small gaps between arrivals: a
     // small-file HAR averaged only 2.02 files/request despite the cap of 24.
     // Arrivals neither shorten nor extend this window. Transfers continue
-    // independently; even an isolated final file flushes after at most 1s
-    // when the dispatch gate has capacity.
+    // independently; an isolated final file flushes promptly when the
+    // dispatch gate has capacity. A one-second window improved batch fullness
+    // but made the common small upload visibly wait after Blob commit.
     //
     // Same `force` split as flushInitBatch above, same reasoning.
     //
     // Stay below the backend's shared init/finalize request cap. Larger
     // batches still perform sequential per-file work on the server.
     const FINALIZE_BATCH_MAX_SIZE = 24;
-    const FINALIZE_BATCH_COLLECTION_MS = 1000;
-    const FINALIZE_BATCH_MAX_WAIT_MS = 2500;
+    const FINALIZE_BATCH_COLLECTION_MS = 100;
+    const FINALIZE_BATCH_MAX_WAIT_MS = 500;
 
     const flushFinalizeBatch = (force: boolean) => {
         if (batchFinalizeDebounceTimerRef.current) {
@@ -3047,7 +3054,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     directToBlob: true,
                     uploadId: options.existingUploadId,
                     ...options.waveAdmission,
-                    ...(isVideoFilename(file.name) ? {includeMetadata: true} : getRuntimeConfig().browserUploadPreparation ? {includePreview: true, includeMetadata: true} : {}),
+                    ...(isVideoFilename(file.name) ? {includeMetadata: true} : {}),
                 }, options?.signal)
                 : await requestBatchedInit(options!.fileMeta!, options!.session!, file.size, sha256);
             options?.onInitLatencyMs?.(performance.now() - initStartedAt);
@@ -3071,9 +3078,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             const BlockBlobClient = await loadBlockBlobClient();
             const blockBlobClient = new BlockBlobClient(initResponse.blobUrl);
             // Fresh small originals need one atomic PUT, not a block PUT plus
-            // a block-list commit. Keep retries bounded to 1MiB and retain the
-            // existing block checkpoint path for every resumed upload.
-            const singlePut = file.size > 0 && file.size <= Math.min(stagingBlockSize, MB)
+            // a block-list commit. Keep retries bounded to the explicit limit
+            // above and retain the block checkpoint path for every resume.
+            const singlePut = file.size > 0 && file.size <= Math.min(stagingBlockSize, SINGLE_PUT_UPLOAD_MAX_BYTES)
                 && !options?.existingUploadId && !options?.existingBlockIds?.length;
 
             // Enumerate every block up front. Block IDs are derived from the block
@@ -3854,9 +3861,18 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                                 onUploadInitialized: (uploadId, blobName, sha256, targets) => {
                                     resolvedBlobName = blobName;
                                     updatePersistedFile(fileMeta.key, { uploadId, blobName });
-                                    preparation = getRuntimeConfig().browserUploadPreparation || isVideoFilename(resolvedFile.name)
+                                    // Image preparation (decode, preview, thumbnail,
+                                    // metadata packet and EXIF extraction) can cost
+                                    // more CPU time than transferring a small file.
+                                    // It is already recoverable through the normal
+                                    // post-finalize browser/backend processing path,
+                                    // including kickOffThumbnailForFile below. Keep
+                                    // only video preparation inline because videos
+                                    // require browser-owned assets and metadata.
+                                    preparation = isVideoFilename(resolvedFile.name)
                                         ? uploadPreparation.start(resolvedFile, sha256,
-                                            {...targets, uploadPreparationEnabled: !!targets.uploadPreparationEnabled}, controller.signal) : Promise.resolve({});
+                                            {...targets, uploadPreparationEnabled: !!targets.uploadPreparationEnabled}, controller.signal)
+                                        : Promise.resolve({});
                                 },
                                 onChunkCommitted: (bytesReceived) => {
                                     const previousBytes = lastCommittedBytesByFile.get(fileMeta.key) || 0;

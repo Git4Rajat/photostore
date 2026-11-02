@@ -305,58 +305,118 @@ class ShadowWaves:
 
     def resolve(self, session, item, *, outcome, photo_id='', processing_revision='',
                 filename='', required_steps=()):
-        if outcome not in ('accepted', 'duplicate', 'cancelled', 'failed'):
-            raise ValueError('Invalid intake outcome')
-        if outcome in ('accepted', 'duplicate'):
-            if (not all(isinstance(value, str) and 0 < len(value) <= 1024
-                        for value in (photo_id, processing_revision, filename))):
-                raise ValueError('Accepted items require immutable photo/revision identity')
-            from image_utils import is_video_file
-            if (not isinstance(required_steps, (list, tuple)) or not 0 <= len(required_steps) <= 16
-                    or (not required_steps and not is_video_file(filename))
-                    or any(not isinstance(step, str) or not re.fullmatch(r'[a-z_]{1,32}', step)
-                           for step in required_steps)):
-                raise ValueError('Accepted items require a processing step policy')
-        binding = dict(outcome=outcome, photoId=photo_id, processingRevision=processing_revision,
-                       acceptedFilename=filename, requiredSteps=json.dumps(sorted(set(required_steps))))
+        return self.resolve_many(session, [dict(item=item, outcome=outcome,
+            photo_id=photo_id, processing_revision=processing_revision,
+            filename=filename, required_steps=required_steps)])
+
+    def resolve_many(self, session, resolutions):
+        """Resolve up to one manifest page in one control/session transaction.
+
+        Finalize batches used to advance the shared library control row once per
+        file.  Concurrent requests then spent most of their retries colliding on
+        that row.  All bindings below are validated before the atomic commit;
+        exact replays remain no-ops and mixed replay/new pages only advance the
+        session by the number of newly resolved items.
+        """
+        if not isinstance(resolutions, list) or not 0 < len(resolutions) <= MAX_PAGE:
+            raise ValueError('Expected 1-20 intake resolutions per page')
+        item_ids = [identifier(value.get('item', '')) for value in resolutions]
+        if len(set(item_ids)) != len(item_ids):
+            raise ValueError('Duplicate itemId in resolution page')
+        normalized = []
+        from image_utils import is_video_file
+        for value, item in zip(resolutions, item_ids):
+            outcome = value.get('outcome')
+            photo_id = value.get('photo_id', '')
+            processing_revision = value.get('processing_revision', '')
+            filename = value.get('filename', '')
+            required_steps = value.get('required_steps', ())
+            if outcome not in ('accepted', 'duplicate', 'cancelled', 'failed'):
+                raise ValueError('Invalid intake outcome')
+            if outcome in ('accepted', 'duplicate'):
+                if (not all(isinstance(candidate, str) and 0 < len(candidate) <= 1024
+                            for candidate in (photo_id, processing_revision, filename))):
+                    raise ValueError('Accepted items require immutable photo/revision identity')
+                if (not isinstance(required_steps, (list, tuple)) or not 0 <= len(required_steps) <= 16
+                        or (not required_steps and not is_video_file(filename))
+                        or any(not isinstance(step, str) or not re.fullmatch(r'[a-z_]{1,32}', step)
+                               for step in required_steps)):
+                    raise ValueError('Accepted items require a processing step policy')
+            normalized.append((item, dict(outcome=outcome, photoId=photo_id,
+                processingRevision=processing_revision, acceptedFilename=filename,
+                requiredSteps=json.dumps(sorted(set(required_steps))))))
 
         def run():
+            from table_reads import read_entities
             control = self._required('control')
             old_session = self._required(self.session_key(session))
-            old_item = self._required(self.item_key(session, item))
-            if old_item['outcome'] != 'reserved':
-                differing = [k for k, v in binding.items() if old_item.get(k) != v]
-                if differing:
-                    raise IntakeBindingConflict(differing)
+            items = read_entities(self.table, self.partition,
+                [self.item_key(session, item) for item, _ in normalized], workers=2)
+            pending = []
+            for item, binding in normalized:
+                old_item = items[self.item_key(session, item)]
+                if old_item is None:
+                    raise Conflict('Unknown session, member or wave')
+                if old_item['outcome'] != 'reserved':
+                    differing = [key for key, value in binding.items() if old_item.get(key) != value]
+                    if differing:
+                        raise IntakeBindingConflict(differing)
+                else:
+                    pending.append((old_item, binding))
+            if not pending:
                 return dict(old_session)
             if old_session['state'] != 'open':
                 raise Conflict('Session is closed')
             wave_id = old_session['waveId']
             wave = self._required(self.wave_key(wave_id))
+            accepted = [(item, binding) for item, binding in pending
+                        if binding['outcome'] in ('accepted', 'duplicate')]
+            member_keys = [f'e!{wave_id}!m!' + digest([
+                binding['photoId'], binding['processingRevision']]) for _, binding in accepted]
+            source_keys = ['admitted-source!' + digest([
+                binding['photoId'], binding['processingRevision']]) for _, binding in accepted]
+            existing = read_entities(self.table, self.partition, member_keys + source_keys,
+                workers=4, group_namespaces=True)
+            changes = []
             next_wave = dict(wave, lastProgressAt=self.clock(), updatedAt=self.clock())
-            changes = [self._change(old_item, dict(old_item, **binding))]
-            if outcome in ('accepted', 'duplicate'):
-                member_key = f'e!{wave_id}!m!' + digest([photo_id, processing_revision])
-                existing = self._get(member_key)
-                if existing and existing['requiredSteps'] != binding['requiredSteps']:
+            created_members = set()
+            for old_item, binding in pending:
+                changes.append(self._change(old_item, dict(old_item, **binding)))
+                if binding['outcome'] not in ('accepted', 'duplicate'):
+                    continue
+                identity = [binding['photoId'], binding['processingRevision']]
+                member_key = f'e!{wave_id}!m!' + digest(identity)
+                member = existing.get(member_key)
+                if member and member['requiredSteps'] != binding['requiredSteps']:
                     raise Conflict('Processing policy differs for the same revision')
-                if existing is None:
+                if member is None:
                     member = self._row(member_key, kind='member', waveId=wave_id,
-                        photoId=photo_id, processingRevision=processing_revision, filename=filename,
-                        requiredSteps=binding['requiredSteps'], outcome='pending', evidenceId='',
-                        needsProjection=outcome=='accepted',
+                        photoId=binding['photoId'], processingRevision=binding['processingRevision'],
+                        filename=binding['acceptedFilename'], requiredSteps=binding['requiredSteps'],
+                        outcome='pending', evidenceId='', needsProjection=binding['outcome']=='accepted',
                         outstandingLeases=0, evidenceQualified=False, observedAt=0.0)
-                    next_wave['memberCount'] += 1
                     changes.append(('create', member))
-                elif outcome=='accepted' and not existing.get('needsProjection',True):
-                    changes.append(self._change(existing,dict(existing,needsProjection=True)))
-                source_key='admitted-source!'+digest([photo_id,processing_revision])
-                if self._get(source_key) is None:
-                    changes.append(('create',self._row(source_key,waveId=wave_id,
-                        photoId=photo_id,processingRevision=processing_revision,filename=filename)))
-            row = dict(old_session, resolvedCount=old_session['resolvedCount'] + 1,
+                    existing[member_key] = member
+                    created_members.add(member_key)
+                    next_wave['memberCount'] += 1
+                elif binding['outcome']=='accepted' and not member.get('needsProjection', True):
+                    if member_key in created_members:
+                        member['needsProjection'] = True
+                    else:
+                        next_member = dict(member, needsProjection=True)
+                        changes.append(self._change(member, next_member))
+                        existing[member_key] = next_member
+                source_key = 'admitted-source!' + digest(identity)
+                if existing.get(source_key) is None:
+                    source = self._row(source_key, waveId=wave_id,
+                        photoId=binding['photoId'], processingRevision=binding['processingRevision'],
+                        filename=binding['acceptedFilename'])
+                    changes.append(('create', source))
+                    existing[source_key] = source
+            row = dict(old_session, resolvedCount=old_session['resolvedCount'] + len(pending),
                        manifestRevision=uuid.uuid4().hex)
-            self._commit(control, [*changes, self._change(old_session, row), self._change(wave, next_wave)])
+            self._commit(control, [*changes, self._change(old_session, row),
+                self._change(wave, next_wave)])
             return row
         return self._retry(run)
 

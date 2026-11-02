@@ -38,6 +38,7 @@ from contextvars import ContextVar
 from functools import wraps
 import hashlib
 import logging
+import random
 import time
 import uuid
 
@@ -290,6 +291,11 @@ class CoverageStore:
                     # Azure reports an ETag conflict inside a batch this way.
                     if getattr(error, 'status_code', None) != 412 or attempt == 19:
                         raise
+                # Immediate CAS retries repeatedly lose to the same hot
+                # coverage control row during upload fanout. Keep the durable
+                # reservation and bounded retry policy, but yield long enough
+                # for the winning transaction to publish its next ETag.
+                time.sleep(random.uniform(0.001, min(0.25, 0.002 * (2 ** attempt))))
         return result
 
     def begin(self, user, kind, ids, *, uncertain=False, deleted=False):

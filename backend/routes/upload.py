@@ -846,15 +846,22 @@ def finalize_upload_batch():
         sc = app.perf_instrumentation.current_scope()
         if sc is not None and results:
             queue_sends = sum(int(row[0]) for label, row in sc.ops.items() if label.startswith('queue:'))
-            job_table_writes = sum(
+            job_table_operations = sum(
                 int(row[0]) for label, row in sc.ops.items()
                 if label.startswith('table:') and label.split(':', 2)[-1].split('(')[0] == app.JOBS_TABLE
             )
+            job_table_writes = sum(
+                int(row[0]) for label, row in sc.ops.items()
+                if label.startswith(('table:POST:', 'table:PUT:', 'table:PATCH:', 'table:DELETE:'))
+                and label.split(':', 2)[-1].split('(')[0] == app.JOBS_TABLE
+            )
             app.perf_instrumentation.log_event(
                 'finalize_batch_fanout', files=len(results),
-                queue_sends=queue_sends, job_table_writes=job_table_writes,
+                queue_sends=queue_sends, job_table_operations=job_table_operations,
+                job_table_writes=job_table_writes,
                 queue_sends_per_file=round(queue_sends / len(results), 2),
-                job_rows_per_file=round(job_table_writes / len(results), 2),
+                job_table_operations_per_file=round(job_table_operations / len(results), 2),
+                job_table_writes_per_file=round(job_table_writes / len(results), 2),
             )
     except Exception:
         pass

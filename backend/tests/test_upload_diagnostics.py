@@ -417,14 +417,13 @@ def test_storage_client_processing_persistence_subphases(monkeypatch):
     def apply(*args, **kwargs):
         storage_utils.update_processing_status('library', 'private.jpg', 'ocr', 'done')
     monkeypatch.setattr(storage_utils, '_apply_client_processing_results', apply)
-    monkeypatch.setattr(storage_utils, '_flush_processing_status_batch', clock.action(11))
-    monkeypatch.setattr(storage_utils, 'refresh_metadata_entity', clock.action(13))
+    monkeypatch.setattr(storage_utils, '_commit_browser_processing_results', clock.action(13, {}))
     token = diagnostics._CURRENT.set(timing)
     try:
         assert storage_utils.apply_client_processing_results_for_file('library', 'private.jpg') == {}
     finally:
         diagnostics._CURRENT.reset(token)
-    assert timing.phase_ms == {'metadata_read': pytest.approx(7), 'persistence': pytest.approx(24)}
+    assert timing.phase_ms == {'metadata_read': pytest.approx(7), 'persistence': pytest.approx(13)}
 
 
 def throughput_records(caplog):

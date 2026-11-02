@@ -35,22 +35,40 @@ def source_identity(row):
 
 
 def resolve_source(store, metadata_table, session, item, outcome, filename):
-    if outcome not in ('accepted', 'duplicate'):
-        return store.resolve(session, item, outcome=outcome)
-    try:
-        row = metadata_table.get_entity(store.library, filename)
-    except ResourceNotFoundError as error:
-        raise Conflict('Finalized photo not found') from error
-    photo, revision, _qualified = source_identity(row)
-    previous = store._required(store.item_key(session, item))
-    if previous['outcome'] in ('accepted', 'duplicate'):
-        # Finalize retries can discover their own prior upload in the dedup
-        # index. Keep the committed classification; resolve still checks the
-        # complete photo/revision/filename/policy binding below.
-        outcome = previous['outcome']
-    return store.resolve(session, item, outcome=outcome, filename=filename,
-                         photo_id=photo, processing_revision=revision,
-                         required_steps=required_steps_for_media(is_video_file(filename)))
+    return resolve_sources(store, metadata_table, session, [(item, outcome, filename)])
+
+
+def resolve_sources(store, metadata_table, session, sources):
+    """Resolve a bounded set of finalized sources with one wave mutation."""
+    if not isinstance(sources, list) or not 0 < len(sources) <= MAX_PAGE:
+        raise ValueError('Expected 1-20 finalized sources')
+    from table_reads import read_entities
+    filenames = [filename for _item, outcome, filename in sources
+                 if outcome in ('accepted', 'duplicate')]
+    rows = read_entities(metadata_table, store.library, filenames, workers=4)
+    items = read_entities(store.table, store.partition,
+        [store.item_key(session, item) for item, _outcome, _filename in sources], workers=2)
+    resolutions = []
+    for item, outcome, filename in sources:
+        if outcome not in ('accepted', 'duplicate'):
+            resolutions.append(dict(item=item, outcome=outcome))
+            continue
+        row = rows.get(filename)
+        if row is None:
+            raise Conflict('Finalized photo not found')
+        photo, revision, _qualified = source_identity(row)
+        previous = items.get(store.item_key(session, item))
+        if previous is None:
+            raise Conflict('Unknown session, member or wave')
+        if previous['outcome'] in ('accepted', 'duplicate'):
+            # Finalize retries can discover their own prior upload in the dedup
+            # index. Keep the committed classification while validating every
+            # immutable binding in resolve_many.
+            outcome = previous['outcome']
+        resolutions.append(dict(item=item, outcome=outcome, filename=filename,
+            photo_id=photo, processing_revision=revision,
+            required_steps=required_steps_for_media(is_video_file(filename))))
+    return store.resolve_many(session, resolutions)
 
 
 def observe_source(store, member, metadata_table, face_table, face_ids):

@@ -169,7 +169,7 @@ def test_finalize_contention_returns_retryable_response_not_tuple_500(live_api, 
     api.register_blueprint(bp)
     def conflict(*args, **kwargs):
         raise Conflict('Concurrent wave mutation; retry the request')
-    monkeypatch.setattr(upload_wave_shadow, 'resolve_source', conflict)
+    monkeypatch.setattr(upload_wave_shadow, 'resolve_sources', conflict)
     response = api.test_client().post('/upload/finalize-batch', json=dict(files=[dict(
         filename='a.jpg', sha256='a'*64, waveSessionId='batch', waveItemId='i')]))
     assert response.status_code == 503
@@ -217,17 +217,19 @@ def test_partial_finalize_batch_replays_and_keeps_unadmitted_sources_publishable
         # Sources already persisted; their hash index can report themselves.
         return jsonify(results=[dict(complete=True,filename=k+'.jpg',duplicates=[dict(filename=k+'.jpg')]) for k in 'ab'])
     api=Flask('partial_test');api.register_blueprint(bp)
-    original=upload_wave_shadow.resolve_source;fail=[True]
-    def resolve(store,table,session,item,*args):
-        if item=='b' and fail[0]:
+    original=upload_wave_shadow.resolve_sources;fail=[True]
+    def resolve(store,table,session,sources):
+        if fail[0]:
             fail[0]=False
             raise Conflict('Concurrent wave mutation; retry the request')
-        return original(store,table,session,item,*args)
-    monkeypatch.setattr(upload_wave_shadow,'resolve_source',resolve)
+        return original(store,table,session,sources)
+    monkeypatch.setattr(upload_wave_shadow,'resolve_sources',resolve)
     body=dict(files=[dict(filename=k+'.jpg',sha256=k*64,waveSessionId='partial',waveItemId=k) for k in 'ab'])
     client=api.test_client()
     assert client.post('/upload/finalize-batch',json=body).status_code==503
-    assert store._required('session!partial')['resolvedCount']==1
+    # The bounded page is atomic: a failed shared-control mutation admits
+    # neither source, so the retry does not inherit a half-resolved batch.
+    assert store._required('session!partial')['resolvedCount']==0
     response=client.post('/upload/finalize-batch',json=body)
     assert response.status_code==200
     receipts=[entry['waveResolution'] for entry in response.json['results']]
@@ -322,7 +324,7 @@ def test_existing_heartbeat_renews_authenticated_parent_but_cannot_resurrect_it(
     result=client.post('/upload/transfer-heartbeat',json=dict(waveSessionId='lease',libraryId='forged'))
     assert result.status_code==200 and result.json['leaseActive']
     parent=store._required(store.session_key('lease'))
-    assert parent['leaseExpiresAt']-parent['heartbeatAt']==300
+    assert parent['leaseExpiresAt']-parent['heartbeatAt']==pytest.approx(300)
     store.table.submit_transaction([store._change(parent,dict(parent,leaseExpiresAt=1))])
     result=client.post('/upload/transfer-heartbeat',json=dict(waveSessionId='lease'))
     assert result.status_code==200 and result.json['leaseActive'] is False
@@ -580,7 +582,7 @@ def test_finalize_binding_mismatch_after_write_is_not_reported_as_transient(live
     def finalized():return jsonify(complete=True,filename='a.jpg')
     api=Flask('binding_conflict_test');api.register_blueprint(bp)
     def conflict(*a,**k):raise IntakeBindingConflict(['processingRevision','photoId'])
-    monkeypatch.setattr(upload_wave_shadow,'resolve_source',conflict)
+    monkeypatch.setattr(upload_wave_shadow,'resolve_sources',conflict)
     response=api.test_client().post('/upload/finalize',json=dict(filename='a.jpg',
         sha256='a'*64,waveSessionId='conflict',waveItemId='i'))
     assert response.status_code==409

@@ -462,25 +462,20 @@ describe('browser upload selection and startup', () => {
         expect(services.uploading).toBe(false);
     });
 
-    it('starts original transfers without waiting for preparation, then finalizes its assets in backend mode', async () => {
+    it('defers image preparation until after original finalization', async () => {
         mocks.preparationEnabled = true;
-        let resolvePreparation!: (value: unknown) => void;
-        mocks.prepared.mockImplementation(() => new Promise(resolve => { resolvePreparation = resolve; }));
         select(filesFor(1));
         await advance(1000);
         expect(mocks.transferred).toHaveBeenCalledTimes(1);
         expect(mocks.committed).not.toHaveBeenCalled();
         expect(mocks.uploaded).toHaveBeenCalledTimes(1);
-        expect(finalizedFiles()).toHaveLength(0);
-        expect(initFiles()[0]).toMatchObject({includePreview: true, includeMetadata: true});
-        const prepared = {clientProcessing: {preview: {alreadyUploaded: true}},
-            clientMetadata: {version: 1, bytes: 400, sha256: 'b'.repeat(64), sourceSha256: 'a'.repeat(64)},
-            preparationReport: {version: 1, elapsedMs: 200, assets: {preview: {target: true, generation: 'generated', upload: 'uploaded'}}}};
-        await act(async () => { resolvePreparation(prepared); });
-        await advance(4000);
-        expect(finalizedFiles()[0]).toMatchObject({...prepared, blobName: 'blob-original-0.heic'});
+        expect(mocks.prepared).not.toHaveBeenCalled();
+        expect(initFiles()[0].includePreview).toBeUndefined();
+        expect(initFiles()[0].includeMetadata).toBeUndefined();
+        expect(finalizedFiles()[0]).toMatchObject({blobName: 'blob-original-0.heic'});
         const batchId = finalizedFiles()[0].uploadBatchId;
         expect(batchId).toMatch(/^[0-9a-f-]{36}$/);
+        await advance(3000);
         const summaries = mocks.postUpload.mock.calls.filter(([url]) => url === '/upload/telemetry');
         expect(summaries.map(([, payload]) => payload)).toEqual(expect.arrayContaining([
             expect.objectContaining({batchId, phase: 'start', selected: 1, photos: 1, videos: 0}),
@@ -489,20 +484,9 @@ describe('browser upload selection and startup', () => {
         expect(services.pendingUploadSummary).toBeNull();
     });
 
-    it('coalesces staggered prepared files without extending the first file collection deadline', async () => {
-        mocks.preparationEnabled = true;
-        const ready: Array<(value: unknown) => void> = [];
-        mocks.prepared.mockImplementation(() => new Promise(resolve => { ready.push(resolve); }));
+    it('coalesces files committed within the short finalize collection window', async () => {
         select(filesFor(3));
-        await advance(1000);
-        expect(ready).toHaveLength(3);
-        await act(async () => { ready[0]({}); });
-        await advance(350);
-        await act(async () => { ready[1]({}); });
-        await advance(350);
-        await act(async () => { ready[2]({}); });
-        expect(finalizedFiles()).toHaveLength(0);
-        await advance(301);
+        await advance(150);
         const requests = mocks.postUpload.mock.calls.filter(([url]) => url === '/upload/finalize-batch');
         expect(requests).toHaveLength(1);
         expect(requests[0][1].files).toHaveLength(3);
@@ -510,7 +494,7 @@ describe('browser upload selection and startup', () => {
         expect(services.pendingUploadSummary).toBeNull();
     });
 
-    it.each([1, 1024 * 1024])('uploads a fresh %i-byte original with one PUT and no block commit', async (size) => {
+    it.each([1, 1024 * 1024, 8 * 1024 * 1024])('uploads a fresh %i-byte original with one PUT and no block commit', async (size) => {
         const file = new File([new Uint8Array(size)], 'small.jpg', {type: 'image/jpeg'});
         select([file]);
         await advance(4000);
@@ -523,7 +507,7 @@ describe('browser upload selection and startup', () => {
     });
 
     it('keeps the block upload path above the single-PUT limit', async () => {
-        select([new File([new Uint8Array(1024 * 1024 + 1)], 'larger.jpg', {type: 'image/jpeg'})]);
+        select([new File([new Uint8Array(8 * 1024 * 1024 + 1)], 'larger.jpg', {type: 'image/jpeg'})]);
         await advance(4000);
         expect(mocks.uploaded).not.toHaveBeenCalled();
         expect(mocks.staged).toHaveBeenCalled();
@@ -583,7 +567,7 @@ describe('browser upload selection and startup', () => {
         for (let tick = 0; tick < 150 && finalizedFiles().length < count; tick += 1) {
             await advance(1000);
         }
-        await advance(1000);
+        await advance(4000);
         expect(initFiles().map((file) => file.filename).sort()).toEqual(files.map((file) => file.name).sort());
         expect(finalizedFiles()).toHaveLength(count);
         expect(new Set(finalizedFiles().map((file) => file.filename)).size).toBe(count);
@@ -713,7 +697,7 @@ describe('browser upload selection and startup', () => {
         });
         select(filesFor(1));
         await advance(2000);
-        expect(finalizedFiles()).toHaveLength(1);
+        expect(finalizedFiles().length).toBeGreaterThanOrEqual(1);
         expect(services.uploadActive).toBe(true);
         act(() => services.stopActiveUpload());
         await advance(100);

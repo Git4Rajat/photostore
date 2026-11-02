@@ -77,6 +77,18 @@ def test_mixed_results_build_semantic_inputs_once_with_identical_final_values(ap
     assert metadata.rows[('private-user', 'private.jpg')]['processing_lease_owner'] == ''
 
 
+def test_unfenced_browser_result_defers_redundant_text_embedding_write(apply_context):
+    metadata, embeddings, encoded = apply_context
+    result = storage_utils.apply_client_processing_results_for_file(
+        'private-user', 'private.jpg', origin='browser', claimed_steps=['ocr'],
+        client_processing={'ocr': {'hasData': True, 'text': 'browser text'}})
+    assert result['ocrText'] == 'browser text'
+    assert result['ocr_status'] == 'done'
+    assert len(encoded) == 1
+    assert ('private-user', 'private.jpg') not in embeddings.rows
+    assert metadata.rows[('private-user', 'private.jpg')]['semanticText']
+
+
 def test_apply_phases_separate_cpu_storage_and_index_work(apply_context, monkeypatch, caplog):
     caplog.set_level(logging.INFO, logger='processing_diagnostics')
     table = apply_context[0]
