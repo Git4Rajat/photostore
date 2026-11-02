@@ -87,6 +87,24 @@ The additive lookup rows do not require deleting or rewriting canonical records.
 Remove archive's temporary `library_bp` registration in a separate release
 after the compatibility window, updating isolated role tests accordingly.
 
+## Refreshing cleanup confirmation links
+
+The confirmation page first reads archive's
+`GET /api/library/clean/confirmation-status?token=...`. This does not approve or
+enqueue cleanup. The endpoint requires the authenticated recipient and matching
+active library. Only an unconfirmed, unexpired request shows the confirm button.
+
+Once approved, the token lookup is retained for status reads, while the recorded
+approval prevents replay. Once cleanup starts, its request retains the original
+job ID. Reloading or reopening the link resumes that job's queued/running/final
+status, including after the approval deadline. Waiting approvers can also resume
+the waiting screen and follow the job once the remaining approval is recorded.
+An older link does not report or overwrite a subsequent cleanup's status.
+
+Release the backend before this frontend change. Requests whose consumed token
+lookups were already deleted by the old backend cannot be reconstructed from the
+link; these show status unavailable rather than another confirmation prompt.
+
 ## Local verification
 
 Run backend management/index/membership/role tests and existing library

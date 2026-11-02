@@ -227,9 +227,37 @@ def library_clean_confirm():
         return app.jsonify({'status': 'awaiting_more_approvals'})
 
     queued = app._enqueue_library_clean_job(library_id, account_id, request_id)
-    app.library_store.cancel_clean_request(library_id, request_id)
+    app.library_store.mark_clean_request_started(library_id, request_id, queued)
     app.library_store.audit(library_id, actor=account_id, action='clean-executed', target=queued.get('jobId', ''))
     return app.jsonify(app._clustering_queue_response(queued, activeLibraryId=library_id))
+
+@library_operations_bp.route('/api/library/clean/confirmation-status', methods=['GET'])
+def library_clean_confirmation_status():
+    account_id, library_id, error = app._require_library_context(require_auth=True)
+    if error:
+        return error
+    status, clean_request = app.library_store.get_clean_confirmation(
+        str(app.request.args.get('token') or ''), account_id=account_id, library_id=library_id,
+    )
+    if status == 'mismatch':
+        return app.jsonify({'error': 'This confirmation link does not belong to your account.'}), 403
+    if status in {'invalid', 'expired'} or not clean_request:
+        return app.jsonify({'error': 'This confirmation link is invalid, expired, or no longer has a saved cleanup status.'}), 410
+    if status == 'pending':
+        body = {'status': 'pending'}
+    elif status == 'confirmed':
+        body = {'status': 'awaiting_start' if app.library_store.is_clean_request_fully_confirmed(clean_request)
+                else 'awaiting_more_approvals'}
+    else:
+        job_id = str(clean_request.get('jobId') or '')
+        meta = app.library_store.get_library(library_id) or {}
+        body = _library_clean_job_status(library_id, job_id, reconcile=meta.get('lastCleanupJobId') == job_id)
+        if body['status'] == 'unknown' and clean_request.get('jobStatus') in {'failed', 'done'}:
+            body = {'status': clean_request['jobStatus']}
+        body['jobId'] = job_id
+    response = app.jsonify(body)
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 @library_operations_bp.route('/api/library/clean/status', methods=['GET'])
 def library_clean_status():
@@ -237,14 +265,18 @@ def library_clean_status():
     if error:
         return error
     job_id = str(app.request.args.get('jobId', '') or '')
+    return app.jsonify(_library_clean_job_status(_library_id, job_id))
+
+
+def _library_clean_job_status(_library_id, job_id, *, reconcile=True):
     if not job_id:
-        return app.jsonify({'status': 'unknown'})
+        return {'status': 'unknown'}
     row = app._get_job_row(_library_id, job_id)
     if row is None:
-        stale_reason = app._reconcile_stale_library_cleanup(_library_id, job_id=job_id)
+        stale_reason = app._reconcile_stale_library_cleanup(_library_id, job_id=job_id) if reconcile else None
         if stale_reason:
-            return app.jsonify({'status': 'failed', 'error': stale_reason})
-        return app.jsonify({'status': 'unknown'})
+            return {'status': 'failed', 'error': stale_reason}
+        return {'status': 'unknown'}
     result = row.get('result')
     if isinstance(result, str):
         try:
@@ -253,11 +285,11 @@ def library_clean_status():
             pass
     status = str(row.get('status') or 'unknown')
     stale_reason = None
-    if status in {'queued', 'running'}:
+    if reconcile and status in {'queued', 'running'}:
         stale_reason = app._reconcile_stale_library_cleanup(_library_id, job_id=job_id, job_row=row)
         if stale_reason:
             status = 'failed'
-    if app.library_store is not None and status in {'done', 'failed'}:
+    if reconcile and app.library_store is not None and status in {'done', 'failed'}:
         try:
             if status == 'done':
                 summary = result if isinstance(result, dict) else {}
@@ -270,7 +302,7 @@ def library_clean_status():
                 app.library_store.set_cleanup_failed(_library_id, stale_reason or str(row.get('error') or 'cleanup failed'))
         except Exception:
             app.app.logger.debug('Could not reconcile cleanup status for %s from job %s', _library_id, job_id)
-    return app.jsonify({'status': status, 'result': result, 'error': stale_reason or row.get('error')})
+    return {'status': status, 'result': result, 'error': stale_reason or row.get('error')}
 
 @library_operations_bp.route('/api/library/cleanup-info', methods=['GET'])
 @library_operations_bp.route('/api/library/cleanup-info/', methods=['GET'])

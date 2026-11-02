@@ -68,6 +68,7 @@ def test_core_role_serves_management_but_not_archive_operations():
         '/api/library/download/request', '/api/library/download/status',
         '/api/library/clean/request', '/api/library/clean/confirm',
         '/api/library/clean/status', '/api/library/cleanup-info',
+        '/api/library/clean/confirmation-status',
         '/api/library/cleanup-info/',
     } & paths
     assert '/public/albums/<token>' not in paths
@@ -164,6 +165,7 @@ def test_archive_role_serves_only_library_and_public_routes():
         '/api/library/download/request', '/api/library/download/status',
         '/api/library/clean/request', '/api/library/clean/confirm',
         '/api/library/clean/status', '/api/library/cleanup-info',
+        '/api/library/clean/confirmation-status',
         '/api/library/cleanup-info/',
     } <= non_static
     assert '/public/albums/<token>' in non_static

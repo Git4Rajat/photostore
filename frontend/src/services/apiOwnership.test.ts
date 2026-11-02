@@ -16,6 +16,7 @@ it.each([
 it.each([
     ['/api/library', 'DELETE'], ['/api/library/', 'delete'],
     ['/api/library/clean/request', 'POST'], ['/api/library/clean/confirm', 'POST'],
+    ['/api/library/clean/confirmation-status?token=x', 'GET'],
     ['/api/library/clean/status?jobId=x', 'GET'], ['/api/library/cleanup-info/', 'GET'],
     ['/api/library/download/request', 'POST'], ['/api/library/download/status', 'GET'],
     ['/api/library/export/manifest?cursor=x', 'GET'],

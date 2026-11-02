@@ -264,6 +264,18 @@ export interface CleanStatusResult {
     error?: string;
 }
 
+export interface CleanConfirmationStatus extends CleanStatusResult {
+    jobId?: string;
+}
+
+export const getLibraryCleanConfirmationStatus = async (token: string): Promise<CleanConfirmationStatus> => {
+    const response = await authedFetch(`/api/library/clean/confirmation-status?token=${encodeURIComponent(token)}`, { cache: 'no-store' });
+    if (!response.ok) {
+        throw new Error(await parseError(response, 'Could not load cleanup status.'));
+    }
+    return response.json();
+};
+
 export const getLibraryCleanStatus = async (jobId: string): Promise<CleanStatusResult> => {
     const response = await authedFetch(`/api/library/clean/status?jobId=${encodeURIComponent(jobId)}`);
     if (!response.ok) {

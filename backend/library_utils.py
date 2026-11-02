@@ -822,9 +822,11 @@ class LibraryStore:
         request_id = new_clean_request_id()
         expires_at = _now() + int(ttl_seconds)
         tokens_by_user: Dict[str, str] = {}
+        token_hashes = []
         for user_id in required_user_ids:
             raw = generate_invite_token()
             token_hash = hash_invite_token(raw)
+            token_hashes.append(token_hash)
             tokens_by_user[str(user_id)] = raw
             self.clean_requests.upsert_entity({
                 'PartitionKey': _TOKEN_PK,
@@ -839,6 +841,7 @@ class LibraryStore:
             'requestedBy': str(requested_by),
             'requiredUserIds': ','.join(str(u) for u in required_user_ids),
             'confirmedUserIds': '',
+            'tokenHashes': ','.join(token_hashes),
             'status': 'pending',
             'createdAt': _now(),
             'expiresAt': expires_at,
@@ -846,25 +849,28 @@ class LibraryStore:
         return request_id, tokens_by_user
 
     def confirm_clean_token(self, raw_token: str, *, account_id: str, library_id: str) -> tuple:
-        """Validate a single approver's clean-confirmation token against the
-        caller's authenticated account/library context, and record the
-        approval.
+        """Record one approval; retain its lookup for authenticated status reads.
 
-        Returns ``(status, request)``:
-          - ``'ok'``: the approval was recorded; ``request`` is the updated row.
-          - ``'mismatch'``: the token is real but wasn't issued to this caller
-            (wrong account or wrong active library). Left completely untouched
-            so the real approver can still use it — the caller must never be
-            able to record someone else's approval just by holding their link.
-          - ``'invalid'``: the token is unknown, or its request is gone,
-            already used, or expired. The token (if found) is deleted since
-            it's no longer useful.
-        Every branch other than 'mismatch' consumes the token so it can't be
-        replayed."""
+        Confirmation stays single-use: a recorded approver cannot approve or
+        enqueue again, even though reopening their link can still read status.
+        """
+        status, request = self.get_clean_confirmation(raw_token, account_id=account_id, library_id=library_id)
+        if status == 'mismatch':
+            return status, None
+        if status != 'pending':
+            return 'invalid', None
+        confirmed = [u for u in str(request.get('confirmedUserIds') or '').split(',') if u]
+        confirmed.append(str(account_id))
+        request['confirmedUserIds'] = ','.join(confirmed)
+        self.clean_requests.upsert_entity(request)
+        return 'ok', request
+
+    def get_clean_confirmation(self, raw_token: str, *, account_id: str, library_id: str) -> tuple:
+        """Point-read a link's own request, without approving or starting work."""
         if not raw_token or self.clean_requests is None:
             return 'invalid', None
         token_hash = hash_invite_token(raw_token)
-        lookup = self._get(self.clean_requests, _TOKEN_PK, token_hash)
+        lookup = self._get_checked(self.clean_requests, _TOKEN_PK, token_hash)
         if not lookup:
             return 'invalid', None
         token_library_id = str(lookup.get('libraryId') or '')
@@ -873,18 +879,27 @@ class LibraryStore:
         if token_library_id != str(library_id) or token_user_id != str(account_id):
             return 'mismatch', None
 
-        self._delete(self.clean_requests, _TOKEN_PK, token_hash)
-        request = self._get(self.clean_requests, token_library_id, request_id)
-        if not request or str(request.get('status') or '') != 'pending':
+        request = self._get_checked(self.clean_requests, token_library_id, request_id)
+        if not request:
+            return 'invalid', None
+        if request.get('status') == 'started':
+            return 'started', request
+        if request.get('status') != 'pending':
             return 'invalid', None
         if int(request.get('expiresAt', 0) or 0) <= _now():
-            return 'invalid', None
-        confirmed = [u for u in str(request.get('confirmedUserIds') or '').split(',') if u]
-        if token_user_id not in confirmed:
-            confirmed.append(token_user_id)
-        request['confirmedUserIds'] = ','.join(confirmed)
+            return 'expired', None
+        confirmed = str(request.get('confirmedUserIds') or '').split(',')
+        return ('confirmed' if token_user_id in confirmed else 'pending'), request
+
+    def mark_clean_request_started(self, library_id: str, request_id: str, job: Dict) -> None:
+        """Keep the link-to-job association after approvals have been consumed."""
+        request = self._get_checked(self.clean_requests, str(library_id), str(request_id))
+        if not request:
+            raise RuntimeError('Cleanup confirmation request is unavailable')
+        request['status'] = 'started'
+        request['jobId'] = str(job.get('jobId') or '')
+        request['jobStatus'] = str(job.get('status') or 'unknown')
         self.clean_requests.upsert_entity(request)
-        return 'ok', request
 
     @staticmethod
     def is_clean_request_fully_confirmed(request: Dict) -> bool:
@@ -901,12 +916,14 @@ class LibraryStore:
         request = self._get(self.clean_requests, library_id, request_id) if request_id else self.get_active_clean_request(library_id)
         if not request:
             return
-        # Token rows are keyed by hash, which we no longer have; sweep the
-        # library's token partition instead. Clean requests are rare and this
-        # partition only ever holds a couple of rows at a time.
-        for row in self._query(self.clean_requests, f"PartitionKey eq '{_TOKEN_PK}'"):
-            if str(row.get('requestId') or '') == str(request.get('RowKey') or ''):
-                self._delete(self.clean_requests, _TOKEN_PK, str(row.get('RowKey') or ''))
+        if request.get('tokenHashes'):
+            for token_hash in str(request['tokenHashes']).split(','):
+                self._delete(self.clean_requests, _TOKEN_PK, token_hash)
+        else:
+            # Legacy pending requests did not retain their token hashes.
+            for row in self._query(self.clean_requests, f"PartitionKey eq '{_TOKEN_PK}'"):
+                if str(row.get('requestId') or '') == str(request.get('RowKey') or ''):
+                    self._delete(self.clean_requests, _TOKEN_PK, str(row.get('RowKey') or ''))
         self._delete(self.clean_requests, str(library_id), str(request.get('RowKey') or ''))
 
     def clean_request_send_allowed(self, library_id: str) -> bool:

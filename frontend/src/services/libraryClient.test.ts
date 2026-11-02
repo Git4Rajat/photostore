@@ -44,11 +44,12 @@ it('routes deletion, cleanup and both download mechanisms to archive', async () 
     await library.requestLibraryClean('password');
     await library.confirmLibraryClean('token');
     await library.getLibraryCleanStatus('job');
+    await library.getLibraryCleanConfirmationStatus('token');
     await library.getLibraryCleanupInfo();
     await library.requestLibraryDownload();
     await library.getLibraryDownloadStatus('job');
     await library.getLibraryExportManifestPage('cursor');
-    expect(fetchMock).toHaveBeenCalledTimes(8);
+    expect(fetchMock).toHaveBeenCalledTimes(9);
     for (const [url] of fetchMock.mock.calls) expect(url).toMatch(/^https:\/\/archive\/api\/library/);
     expect(fetchMock.mock.calls[0][1].method).toBe('DELETE');
     expect(mocks.publish).toHaveBeenCalledWith('library-cleanup', expect.any(Array), expect.objectContaining({ jobId: 'job', notifyCurrentTab: true }));
