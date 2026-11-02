@@ -7,10 +7,13 @@ The pending partition is also the recovery index for failed queue publication.
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 import math
 import time
 import uuid
 from dataclasses import dataclass
+from typing import Callable
 
 from azure.core import MatchConditions
 from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
@@ -118,6 +121,38 @@ class WorkLeased(RuntimeError):
 
 
 @dataclass(frozen=True)
+class QueueWakeup:
+    """Accepted queue delivery and its best-effort cancellation adapter."""
+    queue_name: str
+    message_id: str
+    pop_receipt: str
+    cancel: Callable[[dict], None]
+
+    @property
+    def receipt(self):
+        return dict(queueName=self.queue_name, messageId=self.message_id, popReceipt=self.pop_receipt)
+
+    def cancel_receipt(self, receipt):
+        if receipt:
+            try:
+                self.cancel(receipt)
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    'Superseded index wake cancellation failed; receipt remains safe to consume')
+
+
+def _wake_receipt(row):
+    try:
+        receipt = json.loads(row.get('wakeReceipt') or '{}')
+        if isinstance(receipt, dict) and all(isinstance(receipt.get(k), str) and receipt[k]
+                for k in ('queueName', 'messageId', 'popReceipt')):
+            return receipt
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+@dataclass(frozen=True)
 class Claim:
     key: str
     library: str
@@ -145,7 +180,7 @@ def _retry_timing(row):
             return (0, 0, '', '')
         reason = row.get('retryReason')
         return (scheduled, delay, identity, reason if reason in {
-            'progress', 'barrier_wait', 'coordination_conflict', 'continuation'} else 'other')
+            'progress', 'barrier_wait', 'wave_wait', 'coordination_conflict', 'continuation'} else 'other')
     except (ValueError, TypeError):
         return (0, 0, '', '')
 
@@ -195,7 +230,7 @@ class WorkStore:
             target = self.clock() + max(0, delay)
             if current and float(current.get('leaseUntil') or 0) <= self.clock():
                 target = min(float(current.get('notBefore') or target), target)
-            if current and not current.get('failed') and current.get('retryReason') == 'barrier_wait':
+            if current and not current.get('failed') and current.get('retryReason') in ('barrier_wait', 'wave_wait'):
                 # Source/job revisions do not prove the guarded wave is clear.
                 # Keep its embargo even when a writer advances the revision.
                 target = max(float(current.get('notBefore') or 0), target)
@@ -220,15 +255,60 @@ class WorkStore:
                 return False
             delay = max(0, math.ceil(float(current.get('notBefore') or 0) - now),
                         math.ceil(minimum_delay))
-            row = dict(current, wakeUntil=now + delay + self.wake_seconds)
+            reservation = uuid.uuid4().hex
+            previous_receipt = _wake_receipt(current)
+            row = dict(current, wakeUntil=now + delay + self.wake_seconds,
+                       wakeReservationId=reservation)
             try:
                 self._replace(current, row)
             except ResourceModifiedError:
                 continue
             # On failure the durable reservation expires; do not delete intent.
-            send(row['libraryId'], row['scope'], row['revision'], delay)
+            published = send(row['libraryId'], row['scope'], row['revision'], delay)
+            if isinstance(published, QueueWakeup):
+                self._record_wakeup(key, reservation, published, delayed=delay > 0,
+                                    previous_receipt=previous_receipt)
             return True
         raise WakeupContention('Maintenance wakeup contention')
+
+    def _record_wakeup(self, key, reservation, published, *, delayed, previous_receipt):
+        try:
+            for _ in range(12):
+                current = self._get(key)
+                if current is None:
+                    # A fast replacement already finished before this send returned.
+                    published.cancel_receipt(published.receipt)
+                    return
+                if current.get('wakeReservationId') != reservation:
+                    # A racing owner may be an inline builder without another
+                    # receipt. Attach its fallback without changing ownership,
+                    # but never overwrite a newer recorded queue delivery.
+                    if not delayed:
+                        return
+                    if _wake_receipt(current) not in (None, previous_receipt):
+                        # A newer delayed send already supplied the recovery
+                        # receipt. This late response must cancel its own
+                        # delivery instead of leaving an untracked wake behind.
+                        published.cancel_receipt(published.receipt)
+                        return
+                try:
+                    if delayed:
+                        displaced_receipt = _wake_receipt(current)
+                        self._replace(current, dict(current, wakeReceipt=json.dumps(published.receipt)))
+                        # The ETag certifies which receipt this write displaced.
+                        # Another response may have attached it during send(),
+                        # so the pre-send snapshot is insufficient for cleanup.
+                        if displaced_receipt != published.receipt:
+                            published.cancel_receipt(displaced_receipt)
+                    # Immediate deliveries can be deferred/ACKed early; retain
+                    # their delayed fallback until finish certifies completion.
+                    return
+                except (ResourceModifiedError, ResourceNotFoundError):
+                    continue
+        except Exception:
+            # An accepted delivery remains valid even if recording its handle
+            # fails. Never turn a bookkeeping outage into another queue send.
+            logging.getLogger(__name__).warning('Index wake receipt could not be retained')
 
     def claim(self, key):
         for _ in range(12):
@@ -246,7 +326,8 @@ class WorkStore:
             attempt = (int(current.get('attempts') or 0) + 1
                        if current.get('attemptRevision') == current['revision'] else 1)
             row = dict(current, owner=owner, leaseUntil=now + self.lease_seconds, wakeUntil=0,
-                       attempts=attempt, attemptRevision=current['revision'])
+                       attempts=attempt, attemptRevision=current['revision'],
+                       wakeReservationId='')
             timing = _retry_timing(current)
             row.update(retryScheduleId='', retryScheduledAt=0)
             try:
@@ -317,7 +398,7 @@ class WorkStore:
                 continue
         raise RuntimeError('Maintenance failure contention')
 
-    def finish(self, claim, *, failed=False):
+    def finish(self, claim, *, failed=False, cancel_wakeup=None):
         """Return True when a newer revision must be scheduled after this run."""
         for _ in range(12):
             current = self._get(claim.key)
@@ -329,6 +410,15 @@ class WorkStore:
                 if not failed and not newer:
                     self.table.delete_entity(self.partition, claim.key, etag=etag(current),
                                              match_condition=MatchConditions.IfNotModified)
+                    receipt = _wake_receipt(current)
+                    if receipt and cancel_wakeup is not None:
+                        # Commit first. Cancellation failure must never resurrect
+                        # completed work or discard a newer revision's recovery.
+                        try:
+                            cancel_wakeup(receipt)
+                        except Exception:
+                            logging.getLogger(__name__).warning(
+                                'Completed index wake cancellation failed; receipt remains safe to consume')
                 else:
                     self._replace(current, dict(current, owner='', leaseUntil=0, wakeUntil=0,
                                                 failed=bool(failed and not newer), failedAt=self.clock() if failed and not newer else 0))
@@ -364,3 +454,30 @@ class WorkStore:
             except Exception:
                 continue
         return sent
+
+    def resume_wave_waits(self, library, send, *, scopes):
+        """A terminal wave can release its own embargo, never a live claim.
+
+        The old delayed receipt stays available until finish certifies the intent.
+        Failed sends retain that receipt and an expiring reservation.
+        """
+        query = (f"PartitionKey eq '{self.partition}' and libraryId eq '"
+                 + library.replace("'", "''") + "'")
+        resumed = 0
+        for candidate in self.table.query_entities(query):
+            if candidate.get('scope') not in scopes:
+                continue
+            for _ in range(12):
+                row = self._get(candidate['RowKey'])
+                if (not row or row.get('libraryId') != library or row.get('scope') not in scopes
+                        or row.get('failed') or row.get('retryReason') != 'wave_wait'
+                        or float(row.get('leaseUntil') or 0) > self.clock()):
+                    break
+                try:
+                    self._replace(row, dict(row, notBefore=0, wakeUntil=0,
+                        retryReason='', retryScheduleId='', retryScheduledAt=0))
+                except ResourceModifiedError:
+                    continue
+                resumed += int(self.notify(row['RowKey'], send))
+                break
+        return resumed

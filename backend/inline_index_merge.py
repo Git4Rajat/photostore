@@ -256,7 +256,7 @@ def _attempt_serialized(user_id, scope, capture):
         if not completed:
             store.release(claim, deferred=True)
             return
-        newer = store.finish(claim)
+        newer = store.finish(claim, cancel_wakeup=app._cancel_index_wakeup)
     except Exception:
         try:
             store.release(claim)

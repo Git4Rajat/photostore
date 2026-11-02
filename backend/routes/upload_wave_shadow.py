@@ -328,8 +328,9 @@ def _drive(store,wave_id):
          'shadow-cluster!'+wave_id if destination=='cluster' else wave.get('indexPendingKey'))
     if destination and key:release_and_relay(work,store,store.library,key,destination,send_stage)
     if state=='complete':
-        from wave_runtime import relay_successor
+        from wave_runtime import relay_successor, resume_completed_wave_maintenance
         relay_successor(work,store,wave_id,send_stage)
+        resume_completed_wave_maintenance(store.library)
     # Piggyback recovery of any OTHER stage this library left stuck (e.g. a
     # prior wave whose wake got lost to a worker scale-down race) on this
     # genuine event; independent recovery covers browser and worker loss.

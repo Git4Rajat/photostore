@@ -157,7 +157,7 @@ def test_uncertified_hash_control_does_not_prevent_family_discovery(recovery, mo
 
 
 @pytest.mark.parametrize('problem', ['source', 'lease', 'model-lease', 'quiescence', 'wave'])
-def test_periodic_recovery_never_deletes_active_or_quiesced_library(recovery, monkeypatch, problem):
+def test_periodic_recovery_never_deletes_active_or_quiesced_library(recovery, monkeypatch, problem, caplog):
     prepare_all(recovery)
     if problem == 'source':
         recovery.dirty.rows[automatic.partition(USER, 'vector'), automatic.CONTROL]['active'] = 1
@@ -181,6 +181,7 @@ def test_periodic_recovery_never_deletes_active_or_quiesced_library(recovery, mo
     assert not recovery.service.deleted
     if problem in ('quiescence', 'wave'):
         assert not recovery.reports and not recovery.service.queries
+        assert 'Index artifact cleanup failed' not in caplog.text
     else:
         assert recovery.reports[-1][1]['status'] == 'deferred'
 

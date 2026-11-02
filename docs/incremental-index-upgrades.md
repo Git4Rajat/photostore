@@ -271,3 +271,72 @@ results do not certify a live rollout or production-scale sizing.
 
 See [incremental-summaries.md](incremental-summaries.md) for the summary
 adapters' separate reference contracts and operational limitations.
+
+## Indexer idle-cost cleanup (2026-11-02)
+
+Automatic maintenance blocked by an unfinished wave now stores a `wave_wait`
+intent and schedules a recovery receipt after five minutes (configurable with
+`INDEX_BARRIER_RECOVERY_SECONDS`, minimum 300). This replaces ten-second retries
+that could sustain a running replica despite no eligible artifact work. Source
+barriers without a pending wave use the same recovery interval. Durable intent,
+dirty coverage, real failure limits and early-delivery embargoes are preserved.
+
+A terminal wave signals the indexer to resume its library's wave-waiting intents
+immediately. A completed predecessor cannot unblock an unfinished tail, steal a
+live claim, revive a failed intent, or release a non-wave source barrier. Normal
+wave consumption and the route-driven completion path both issue this signal.
+Lost completion signals and failed sends retain the delayed recovery path. A
+late old receipt is acknowledged as obsolete rather than rebuilding an artifact.
+Recovery-only resume can take up to the configured delay plus queue/startup time;
+this trades frequent empty checks for scale-to-zero opportunities.
+
+Index-worker telemetry now charges message processing and periodic recovery to
+its own reporter. Queue handling emits `index_message_outcome` values such as
+`deferred`, `obsolete`, `intent_completed`, or `handled`; acknowledgement/normal
+return alone is not an index-publication receipt. Routine GC wave/quiescence
+barriers return deferred quietly, while unexpected failures retain tracebacks.
+
+The existing Tools-only browser job-polling change is retained and its polling,
+foreground-demand and index-ready push tests were rerun. No infrastructure change,
+queue purge, image publication or live rollout is part of this code-only cleanup.
+
+Cleanup verification: full backend suite **5,434 passed, 14 skipped** (the private
+TIFF-corpus cases), and **98 frontend tests passed** across Tools-only job polling,
+index demand and index-ready push. The deterministic regression covers immediate
+wave-completion resume, unfinished-tail protection, stale-receipt deduplication,
+live-claim isolation, lost completion/send recovery, and correct worker telemetry.
+
+### Audit follow-up: cancel obsolete delayed recovery wakes
+
+Delayed index wake receipts are now retained in the durable intent. An immediate
+completion signal keeps that fallback until the latest maintenance revision has
+actually finished; merely accepting an immediate queue message is insufficient,
+because a concurrent edit can make that delivery early again. After successful
+intent deletion, the worker (or inline builder) cancels the delayed receipt.
+Failed sends and unfinished/newer revisions keep their recovery path.
+
+Replacement delayed deliveries supersede older receipts only after the new send
+succeeds. A send response arriving after intent completion cancels its own stale
+delivery. If delayed send responses arrive out of order, the late response also
+cancels its own delivery when a newer recovery receipt is already recorded.
+When a response records a replacement, it cancels the receipt displaced by that
+successful conditional write, including one attached while its send was pending.
+Rotated receipts are left to their active consumer, while cancellation
+failures leave an obsolete message safe to acknowledge later. Receipt-bookkeeping
+failures do not reinterpret an accepted send as a failed send or discard work.
+Legacy messages without a stored receipt can still cause one obsolete wake;
+normal cancellation applies to newly tracked messages. No live queues are purged.
+
+This follow-up fixes audit issue 2 only. The five-minute delay for ordinary
+non-wave source barriers (audit issue 1) is unchanged. Changes remain code-only.
+
+Receipt-cleanup verification before the overlapping-send follow-up: full backend
+suite **5,444 passed, 14 skipped**. The overlapping-send follow-ups passed **119**
+targeted receipt, work-store, barrier, recovery and wave-liveness tests.
+Fourteen receipt test cases exercise real sender/worker integration, cancellation after final
+completion, retained fallbacks on failed/early sends, newer revisions, rotated
+consumer receipts, deletion outages, delayed send responses and inline races.
+Out-of-order responses are covered both with another completion signal and with
+only the latest delayed fallback available to recover unfinished work.
+Concurrent tests also cover an older response returning during the newer send,
+before the newer response records the replacement receipt.

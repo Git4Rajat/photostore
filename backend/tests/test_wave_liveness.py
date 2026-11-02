@@ -37,6 +37,7 @@ def live(monkeypatch):
         IPWORKER_CONCURRENCY=2,_ipwork_metrics_context=threading.local(),
         reconcile_face_filename_indexes_batch=lambda *a,**kw:None,
         _live_faiss_metadata_update=lambda *a:None,
+        resume_index_maintenance_after_wave=lambda library:0,
         _get_live_faiss_assigner=lambda:pytest.fail('zero-face work loaded FAISS'))
     monkeypatch.setitem(sys.modules,'app',app)
     monkeypatch.setattr(wave_runtime,'send_stage',lambda *a:sent.append(a))
@@ -229,6 +230,9 @@ def test_source_with_no_required_steps_exhausts_without_blocking_its_wave_mate(l
 
 def test_index_completion_wakes_a_waiting_successor(live,monkeypatch):
     store,metadata,sent,_=live;first=admit(store,metadata,1)
+    maintenance_wakes = []
+    monkeypatch.setattr(sys.modules['app'], 'resume_index_maintenance_after_wave',
+                        lambda library: maintenance_wakes.append(library))
     intent=complete_source(store,metadata,'s-0.jpg')
     store.observe(first,'s-p0','s-r0',outcome='settled',evidence_id=intent['id'],evidence_qualified=True)
     frozen=finish_scan(store,first)
@@ -243,6 +247,7 @@ def test_index_completion_wakes_a_waiting_successor(live,monkeypatch):
     monkeypatch.setattr(index_events,'publish',lambda *a:None)
     monkeypatch.setenv('APP_ROLE','index-worker');wave_runtime.consume(wake(store,first,'index'))
     assert store.status(first)['state']=='complete'
+    assert maintenance_wakes == [store.library]
     assert store.status(second)['state']=='processing_pending'
     assert any(f'wave-vision:{second}:' in message[1] for message in sent)
 

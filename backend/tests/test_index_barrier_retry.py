@@ -24,6 +24,7 @@ def clocked(runtime, monkeypatch):
             super().__init__(table, clock=lambda: now[0], **kw)
     monkeypatch.setattr(index_work, 'WorkStore', ClockStore)
     monkeypatch.setenv('APP_ROLE', 'index-worker')
+    monkeypatch.setattr(app, 'index_maintenance_queue_client', object())
     statuses, sent, events = [], [], []
     def status(*args, **kwargs):
         statuses.append((args, kwargs))
@@ -51,8 +52,8 @@ def test_actual_barrier_wait_duplicate_storm_then_recovery_completes(clocked, mo
     app._run_index_maintenance_payload(payload)
     row = env.store._get(key)
     assert row['attempts'] == 0 and not row['failed'] and not row['owner']
-    assert row['notBefore'] == 1010 and row['retryReason'] == 'barrier_wait'
-    assert len(env.sent) == 1 and env.sent[0][-1] == 10
+    assert row['notBefore'] == 1300 and row['retryReason'] == 'wave_wait'
+    assert len(env.sent) == 1 and env.sent[0][-1] == 300
     status = env.runtime.jobs.get_entity('A', 'job')
     assert status['status'] == 'queued'
     assert json.loads(status['result']) == dict(status='deferred', reason='barrier_wait', ready=False)
@@ -75,7 +76,7 @@ def test_actual_barrier_wait_duplicate_storm_then_recovery_completes(clocked, mo
     env.runtime.store.begin('A', kind, ['two'])
     env.runtime.store.finish('A', kind)
     env.store.request('A', scope)
-    assert env.store._get(key)['notBefore'] == 1010
+    assert env.store._get(key)['notBefore'] == 1300
     assert env.store.claim(key) is None
     active[0] = False
     # Simulate lost queue receipt. The pending ledger recovers it after the
@@ -150,6 +151,7 @@ def test_barrier_at_failure_ceiling_waits_without_poison_then_real_budget_applie
         env.now[0] += 10
     assert not deadletters and not env.events
     active[0] = False
+    env.now[0] = env.store._get(key)['notBefore']
     app._run_index_maintenance_payload(payload)
     assert env.store._get(key)['failed'] and deadletters[0]['attempts'] == 1
 
@@ -231,3 +233,93 @@ def test_tag_dispatch_keeps_early_duplicates_nonterminal_and_does_not_send(clock
     assert tags._get(key) == before
     assert not env.statuses and not env.runtime.calls and not env.events
     send.assert_not_called()
+
+
+def test_wave_completion_resumes_maintenance_before_recovery_deadline(clocked, monkeypatch):
+    env = clocked
+    env.runtime.store.begin('A', 'vector', ['one'])
+    env.runtime.store.finish('A', 'vector')
+    pending = [True]
+    monkeypatch.setattr(automatic, 'wave_pending', lambda _: pending[0])
+    key = env.store.request('A', 'vector')
+    payload = dict(userId='A', scope='vector', jobId='job', maintenanceKey=key)
+    assert app._run_index_maintenance_payload(payload) == 'deferred'
+    assert env.store._get(key)['notBefore'] == env.now[0] + 300
+    # A completed predecessor must not release the still-pending tail.
+    assert app.resume_index_maintenance_after_wave('A') == 0
+    assert len(env.sent) == 1
+    pending[0] = False
+    assert app.resume_index_maintenance_after_wave('A') == 1
+    assert env.sent[-1][-1] == 0
+    assert app.resume_index_maintenance_after_wave('A') == 0
+    assert app._run_index_maintenance_payload(payload) == 'intent_completed'
+    assert env.store._get(key) is None
+    assert len(env.runtime.calls) == 1
+    # The old delayed receipt is an obsolete advisory wake, never a rebuild.
+    assert app._run_index_maintenance_payload(payload) == 'obsolete'
+    assert len(env.runtime.calls) == 1
+
+
+def test_completion_does_not_release_unrelated_barriers_or_live_work():
+    # Use real ledger CAS rules without importing an application runtime.
+    now = [1000.0]
+    store = index_work.WorkStore(EtagTable(), clock=lambda: now[0])
+    keys = {}
+    for library, scope, reason in [('A', 'vector', 'wave_wait'),
+                                   ('A', 'people_embedding', 'barrier_wait'),
+                                   ('B', 'vector', 'wave_wait'),
+                                   ('A', 'search', 'wave_wait')]:
+        key = store.request(library, scope)
+        claim = store.claim(key)
+        store.release(claim, deferred=True, retry_delay=300, retry_reason=reason)
+        keys[library, scope] = key
+    # A recovered owner may be working; the completion signal cannot steal it.
+    current = store._get(keys['A', 'search'])
+    store._replace(current, dict(current, leaseUntil=2000, owner='live'))
+    sent = []
+    assert store.resume_wave_waits('A', lambda *args: sent.append(args),
+        scopes={'vector', 'people_embedding', 'search'}) == 1
+    assert sent[0][1] == 'vector' and sent[0][-1] == 0
+    assert store._get(keys['A', 'people_embedding'])['notBefore'] == 1300
+    assert store._get(keys['B', 'vector'])['notBefore'] == 1300
+    assert store._get(keys['A', 'search'])['owner'] == 'live'
+
+
+def test_completion_send_failure_keeps_intent_recoverable(clocked, monkeypatch):
+    env = clocked
+    monkeypatch.setattr(automatic, 'wave_pending', lambda _: False)
+    key = env.store.request('A', 'vector')
+    claim = env.store.claim(key)
+    env.store.release(claim, deferred=True, retry_delay=300, retry_reason='wave_wait')
+    monkeypatch.setattr(app, '_send_index_wakeup', Mock(side_effect=OSError('queue down')))
+    import wave_runtime
+    assert wave_runtime.resume_completed_wave_maintenance('A') == 0
+    row = env.store._get(key)
+    assert not row['failed'] and row['notBefore'] == 0
+    env.now[0] = row['wakeUntil']
+    assert env.store.recover(lambda *args: env.sent.append(args)) == 1
+    assert env.sent[-1][-1] == 0
+
+
+def test_index_worker_reports_processing_and_deferred_outcome(monkeypatch, caplog):
+    import processing_diagnostics as diagnostics
+    now = [0.0]
+    reporter = diagnostics.Worker('indexer', clock=lambda: now[0])
+    reporter.state('idle')
+    monkeypatch.setenv('APP_ROLE', 'index-worker')
+    monkeypatch.setitem(diagnostics._WORKERS, 'indexer', reporter)
+    message = SimpleNamespace(content=json.dumps(dict(type='index_build', userId='A', scope='vector')),
+                              dequeue_count=1)
+    def dispatch(*args):
+        assert reporter.current == 'processing'
+        now[0] += 2
+        return 'deferred'
+    queue = SimpleNamespace(delete_message=lambda _: None)
+    assert app._process_clustering_queue_message(message, queue, 'index', 5, dispatch=dispatch)
+    reporter.report()
+    assert reporter.seconds['processing'] == 2
+    assert reporter.counts['acknowledged_messages'] == 1
+    events = [json.loads(r.message.split('processing telemetry ', 1)[1])
+              for r in caplog.records if 'processing telemetry ' in r.message]
+    assert any(e['event'] == 'index_message_outcome' and e['outcome'] == 'deferred' for e in events)
+    assert all(e.get('role') == 'indexer' for e in events)

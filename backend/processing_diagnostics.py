@@ -505,7 +505,7 @@ def measured(role, name, *, state=None):
     def decorate(function):
         @wraps(function)
         def wrapped(*args, **kwargs):
-            with phase(role, name, state=state):
+            with phase(role() if callable(role) else role, name, state=state):
                 return function(*args, **kwargs)
         return wrapped
     return decorate

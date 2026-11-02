@@ -10912,6 +10912,8 @@ INDEX_BUILD_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_MIN_INTERVAL_SEC
 INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS', '180'))
 # Index bugs must not inherit the destructive library-clean retry budget.
 INDEX_BUILD_MAX_RETRIES = max(1, int(os.getenv('INDEX_BUILD_MAX_RETRIES', '5')))
+# Longer than scale-down cooldown; completion signals resume wave waits early.
+INDEX_BARRIER_RECOVERY_SECONDS = max(300, int(os.getenv('INDEX_BARRIER_RECOVERY_SECONDS', '300')))
 # Safety ceiling for progressive search-database maintenance. Each pass must
 # either publish dirty rows or compact a non-empty delta log; reaching this
 # limit means forward progress is not converging and should be queue-retried.
@@ -11118,6 +11120,30 @@ def _send_index_wakeup(library, scope, revision, delay=0, *, reason='pending-rec
     }), visibility_timeout=delay or None)
     if capture is not None:
         capture.append((queue, sent))
+    if isinstance(getattr(sent, 'id', None), str) and isinstance(getattr(sent, 'pop_receipt', None), str):
+        return index_work.QueueWakeup(
+            INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME if delay else INDEX_MAINTENANCE_QUEUE_NAME,
+            sent.id, sent.pop_receipt, _cancel_index_wakeup)
+
+
+def _cancel_index_wakeup(receipt):
+    from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
+    queues = {
+        INDEX_MAINTENANCE_QUEUE_NAME: index_maintenance_queue_client,
+        INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME: index_maintenance_deferred_queue_client,
+    }
+    queue = queues.get(receipt.get('queueName'))
+    if queue is None:
+        raise ValueError('Index wake cancellation requires its configured queue')
+    try:
+        queue.delete_message(receipt['messageId'], receipt['popReceipt'])
+    except ResourceNotFoundError:
+        pass
+    except HttpResponseError as error:
+        # A consumer rotates the pop receipt on receive/renewal. Its in-flight
+        # message must remain untouched; it no longer represents a future wake.
+        if getattr(error, 'error_code', None) != 'PopReceiptMismatch':
+            raise
 
 
 _INDEX_ARTIFACT_RECOVERY = threading.local()
@@ -11317,6 +11343,20 @@ def _run_tag_index_maintenance_payload(payload):
         return 'tag_index_retry'
 
 
+def resume_index_maintenance_after_wave(library):
+    """Wake durable maintenance after the tail finishes; delayed recovery backs it up."""
+    import automatic_index_updates as automatic
+    import index_work
+    import index_updates
+    if (jobs_table_client is None or index_maintenance_queue_client is None
+            or automatic.wave_pending(library)):
+        return 0
+    store = index_work.WorkStore(jobs_table_client)
+    resumed = store.resume_wave_waits(library, _send_index_wakeup,
+        scopes=set(index_updates.SCOPE_KINDS) - {'tag_embedding'})
+    return resumed + recover_pending_index_work(library)
+
+
 def _run_index_maintenance_payload(payload):
     import index_work
     import index_publication
@@ -11329,7 +11369,7 @@ def _run_index_maintenance_payload(payload):
     try:
         claim = store.claim(key)
     except index_work.WorkLeased:
-        return  # The live owner (or expired-lease recovery) covers this wake.
+        return 'obsolete'  # The live owner or lease recovery covers this wake.
     if claim is None:
         # An early/stale receipt can be ACKed. Reserve at most one delayed
         # replacement; failed sends remain durable for periodic recovery.
@@ -11337,7 +11377,7 @@ def _run_index_maintenance_payload(payload):
             store.notify(key, _send_index_wakeup)
         except Exception:
             worker_logger.warning('Maintenance wakeup retained for recovery', exc_info=True)
-        return
+        return 'obsolete'
     try:
         if claim.attempt > INDEX_BUILD_MAX_RETRIES:
             if scope in ('vector', 'lexical_artifact', 'people_embedding', 'dedup', 'dedup-idle'):
@@ -11363,17 +11403,19 @@ def _run_index_maintenance_payload(payload):
             return
         with index_publication.publication(store, claim):
             _run_index_build_job(library, str(payload['jobId']), scope)
-        newer = store.finish(claim)
+        newer = store.finish(claim, cancel_wakeup=_cancel_index_wakeup)
     except automatic.SourceBusy:
         # A healthy source barrier wait does not consume the poison budget.
-        store.release(claim, deferred=True, retry_delay=10, retry_reason='barrier_wait')
+        waiting_wave = automatic.wave_pending(library)
+        store.release(claim, deferred=True, retry_delay=INDEX_BARRIER_RECOVERY_SECONDS,
+            retry_reason='wave_wait' if waiting_wave else 'barrier_wait')
         _upsert_job_status(str(payload['jobId']), library, INDEX_BUILD_JOB_TYPE, 'queued', indexScope=scope,
             error='', result={'status': 'deferred', 'reason': 'barrier_wait', 'ready': False})
         try:
             store.notify(key, _send_index_wakeup)
         except Exception:
             worker_logger.warning('Barrier wakeup retained for recovery', exc_info=True)
-        return
+        return 'deferred'
     except Exception:
         try:
             store.release(claim)
@@ -11384,6 +11426,7 @@ def _run_index_maintenance_payload(payload):
         store.notify(key, _send_index_wakeup)
     _cleanup_completed_index_artifacts(library)
     _notify_index_ready(library, str(payload['jobId']), scope)
+    return 'intent_completed'
 
 
 def _cleanup_completed_index_artifacts(library):
@@ -11411,6 +11454,9 @@ def _cleanup_completed_index_artifacts(library):
         check_quiet(library)
         report = cleanup_user_index_artifacts(library, storage=storage_utils_module,
             jobs=jobs_table_client, serialization=serialization)
+    except automatic.SourceBusy as error:
+        # Normal source/wave fencing is a quiet deferral, not a GC failure.
+        return dict(status='deferred', deleted=0, examined=0, reason=str(error))
     except Exception as error:
         worker_logger.warning('Index artifact cleanup failed for %s', library, exc_info=True)
         report = dict(status='deferred', deleted=0, examined=0, reason=f'{type(error).__name__}: {error}')
@@ -15582,7 +15628,7 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
                 _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done',
                                    indexScope=scope, forwardedTo=target)
         else:
-            _run_index_maintenance_payload(payload)
+            return _run_index_maintenance_payload(payload)
         return
 
     if job_type == 'photo_soft_delete':
@@ -15890,17 +15936,24 @@ def _poll_clustering_queue_once(
         visibility_timeout=CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS,
     ))
     if not messages:
+        processing_diagnostics.count(_queue_worker_role(), 'empty_receives')
         return False
+    processing_diagnostics.count(_queue_worker_role(), 'received_messages', len(messages))
     return _process_clustering_queue_message(
         messages[0], queue_client, queue_name, max_retries, deadletter_queue_client, dispatch=dispatch)
 
 
-@processing_diagnostics.measured('cluster', 'message', state='processing')
+def _queue_worker_role():
+    return 'indexer' if os.getenv('APP_ROLE', '').strip().lower() == 'index-worker' else 'cluster'
+
+
+@processing_diagnostics.measured(_queue_worker_role, 'message', state='processing')
 def _process_clustering_queue_message(message, queue_client, queue_name, max_retries,
                                       deadletter_queue_client=None, *, dispatch=None):
     """Instrumented entry: one `scope_summary` line per queue message (wall time,
     storage round trips, duplicates, peak RSS) tagged with the job type."""
-    processing_diagnostics.message_event('cluster_started', message, role='cluster')
+    role = _queue_worker_role()
+    processing_diagnostics.message_event('cluster_started', message, role=role)
     job_type, user_id = '?', ''
     try:
         body = json.loads(getattr(message, 'content', '') or '{}')
@@ -15911,7 +15964,7 @@ def _process_clustering_queue_message(message, queue_client, queue_name, max_ret
         pass
     if job_type == INDEX_BUILD_JOB_TYPE:
         max_retries = min(max_retries, INDEX_BUILD_MAX_RETRIES)
-    processing_diagnostics.emit('cluster_job_started', role='cluster', job_type=job_type)
+    processing_diagnostics.emit('cluster_job_started', role=role, job_type=job_type)
     with perf_instrumentation.scope(f'queue.{queue_name}.{job_type}', user=user_id,
                                     dequeue=getattr(message, 'dequeue_count', None)):
         return _process_clustering_queue_message_impl(
@@ -16081,7 +16134,10 @@ def _process_clustering_queue_message_impl(message, queue_client, queue_name, ma
                 job_type or 'people_incremental_assign', _clustering_log_filename_summary(payload), user_id, dequeue_count,
                 backlog_age_s,
             )
-            (dispatch or _handle_clustering_queue_payload)(payload, job_id, user_id, job_type)
+            outcome = (dispatch or _handle_clustering_queue_payload)(payload, job_id, user_id, job_type)
+            if _queue_worker_role() == 'indexer':
+                processing_diagnostics.emit('index_message_outcome', role='indexer', job_type=job_type,
+                    outcome=outcome or 'handled')
             worker_logger.info(
                 'clustering message done job_type=%s filename=%s user=%s elapsed_ms=%d',
                 job_type or 'people_incremental_assign', _clustering_log_filename_summary(payload), user_id,
@@ -16125,16 +16181,18 @@ def _process_clustering_queue_message_impl(message, queue_client, queue_name, ma
             delete_started = time.monotonic()
             try:
                 queue_client.delete_message(final_message)
-                processing_diagnostics.message_event('cluster_acknowledged', message, role='cluster')
-                processing_diagnostics.count('cluster', 'acknowledged_messages')
-                processing_diagnostics.emit('cluster_job_acknowledged', role='cluster', job_type=job_type)
+                role = _queue_worker_role()
+                processing_diagnostics.message_event('cluster_acknowledged', message, role=role)
+                processing_diagnostics.count(role, 'acknowledged_messages')
+                processing_diagnostics.emit('cluster_job_acknowledged', role=role, job_type=job_type)
                 worker_logger.info('clustering message delete queue=%s delete_ms=%d',
                                    queue_name, int((time.monotonic() - delete_started) * 1000))
             except Exception:
                 worker_logger.exception('Failed to delete %s queue message', queue_name)
         else:
-            processing_diagnostics.message_event('cluster_retry', message, role='cluster')
-            processing_diagnostics.count('cluster', 'errors')
+            role = _queue_worker_role()
+            processing_diagnostics.message_event('cluster_retry', message, role=role)
+            processing_diagnostics.count(role, 'errors')
             worker_logger.info(
                 'Leaving %s queue message visible for retry (dequeue_count=%s, max_retries=%s)',
                 queue_name, dequeue_count, max_retries,
@@ -16540,12 +16598,13 @@ def run_index_worker() -> None:
     def dispatch(payload, job_id, user_id, job_type):
         if job_type not in (INDEX_BUILD_JOB_TYPE, 'upload_wave_stage'):
             raise ValueError('Index queue cannot dispatch other job types')
-        _handle_clustering_queue_payload(payload, job_id, user_id, job_type)
+        return _handle_clustering_queue_payload(payload, job_id, user_id, job_type)
     while not stop.is_set():
         try:
             now = time.monotonic()
             if now - last_recovery >= 60:
-                recover_pending_index_work()
+                with processing_diagnostics.phase('indexer', 'recovery', state='processing'):
+                    recover_pending_index_work()
                 last_recovery = now
             processed = _poll_clustering_queue_once(
                 queue, INDEX_MAINTENANCE_QUEUE_NAME, INDEX_BUILD_MAX_RETRIES, deadletter, dispatch=dispatch)

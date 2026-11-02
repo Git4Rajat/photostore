@@ -4,6 +4,7 @@ No worker executes another role's stage and no API request builds a catalog.
 The release record remains authoritative; queue messages are advisory wakes.
 """
 import json
+import logging
 import os
 import threading
 import uuid
@@ -64,6 +65,16 @@ def send_stage(library,scope,revision,delay=0):
     if queue is None: raise RuntimeError('Wave stage queue unavailable')
     queue.send_message(json.dumps(dict(type=TYPE,userId=library,waveId=parts[1],
         stage=stage,scope=scope,intentRevision=revision)),visibility_timeout=delay or None)
+
+
+def resume_completed_wave_maintenance(library):
+    """Best effort completion signal; durable delayed receipts survive failure."""
+    import app
+    try:
+        return app.resume_index_maintenance_after_wave(library)
+    except Exception:
+        logging.getLogger(__name__).warning('Index maintenance completion wake retained for recovery', exc_info=True)
+        return 0
 
 
 @contextmanager
@@ -293,6 +304,7 @@ def consume(payload,*,deadline=None,progress=None):
         current=store._required(store.wave_key(wave_id))
         relay_current(work,store,current,send_stage)
         if current['state']=='complete':
+            resume_completed_wave_maintenance(library)
             import index_events
             index_events.publish(library,'wave',current['completionReceiptId'])
         if current['state'] in ('ready','indexing','complete'):
