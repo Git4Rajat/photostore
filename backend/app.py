@@ -3299,6 +3299,7 @@ def _humanize_job(row: Dict) -> Dict:
             'sort': ('Photo ordering index', 'Photo ordering and gallery fields refreshed.'),
             'access': ('Photo access index', 'Photo media availability refreshed.'),
             'search': ('Search index', 'Pending photo search changes refreshed.'),
+            'lexical_artifact': ('Search text index', 'Photo text search refreshed.'),
             'compact': ('Search database compaction', 'Search database maintenance completed.'),
             'reconcile': ('Library reconciliation', 'Missing catalog records checked and queued for repair.'),
             'vector': ('Photo vector index', 'Photo embedding lookup refreshed.'),

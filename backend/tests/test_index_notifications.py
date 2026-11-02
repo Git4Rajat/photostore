@@ -9,6 +9,7 @@ import app
     ('full', 'Full library indexes'), ('light', 'Photo browsing index'),
     ('people', 'People index'), ('dedup', 'Duplicate-check index'),
     ('dedup-idle', 'Duplicate-check index'),
+    ('lexical_artifact', 'Search text index'),
 ])
 @pytest.mark.parametrize('status', ['queued', 'running', 'done', 'failed'])
 def test_index_notification_identifies_scope(scope, label, status):
