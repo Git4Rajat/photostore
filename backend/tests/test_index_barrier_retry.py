@@ -1,0 +1,233 @@
+"""Deterministic durable-state replay of Nov 2 SourceBusy/duplicate wakeups."""
+import json
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+
+import app
+import automatic_index_updates as automatic
+import index_work
+from tests.test_automatic_index_updates import runtime
+from tests.test_index_work import EtagTable
+
+
+write_status = app._upsert_job_status
+
+
+@pytest.fixture
+def clocked(runtime, monkeypatch):
+    now = [1000.0]
+    real_store = index_work.WorkStore
+    class ClockStore(real_store):
+        def __init__(self, table, **kw):
+            super().__init__(table, clock=lambda: now[0], **kw)
+    monkeypatch.setattr(index_work, 'WorkStore', ClockStore)
+    monkeypatch.setenv('APP_ROLE', 'index-worker')
+    statuses, sent, events = [], [], []
+    def status(*args, **kwargs):
+        statuses.append((args, kwargs))
+        write_status(*args, **kwargs)
+    monkeypatch.setattr(app, '_upsert_job_status', status)
+    monkeypatch.setattr(app, '_send_index_wakeup', lambda *args: sent.append(args))
+    monkeypatch.setattr(app, '_notify_index_ready', lambda *args: events.append(args))
+    monkeypatch.setattr(app, '_cleanup_completed_index_artifacts', lambda _: None)
+    return SimpleNamespace(runtime=runtime, now=now, store=real_store(runtime.jobs, clock=lambda: now[0]),
+        statuses=statuses, sent=sent, events=events)
+
+
+@pytest.mark.parametrize('kind', ['vector', 'lexical_artifact', 'people_embedding'])
+def test_actual_barrier_wait_duplicate_storm_then_recovery_completes(clocked, monkeypatch, kind):
+    env = clocked
+    env.runtime.store.begin('A', kind, ['one'])
+    env.runtime.store.finish('A', kind)
+    active = [True]
+    monkeypatch.setattr(automatic, 'wave_pending', lambda _: active[0])
+    scope = automatic.SCOPES.get(kind, kind)
+    key = env.store.request('A', scope)
+    revision = env.store._get(key)['revision']
+    payload = dict(type=app.INDEX_BUILD_JOB_TYPE, userId='A', scope=scope, jobId='job',
+        maintenanceKey=key, intentRevision=revision)
+    app._run_index_maintenance_payload(payload)
+    row = env.store._get(key)
+    assert row['attempts'] == 0 and not row['failed'] and not row['owner']
+    assert row['notBefore'] == 1010 and row['retryReason'] == 'barrier_wait'
+    assert len(env.sent) == 1 and env.sent[0][-1] == 10
+    status = env.runtime.jobs.get_entity('A', 'job')
+    assert status['status'] == 'queued'
+    assert json.loads(status['result']) == dict(status='deferred', reason='barrier_wait', ready=False)
+    assert not env.runtime.calls and env.runtime.store.capture('A', kind).ids == ['one']
+
+    # A hundred stale deliveries, even beyond queue's poison ceiling, cannot
+    # run, increment attempts, extend the delay, or multiply scheduled wakes.
+    deleted, deadletters = [], []
+    for i in range(100):
+        message = SimpleNamespace(content=json.dumps(payload), dequeue_count=100 + i)
+        app._process_clustering_queue_message_impl(message,
+            SimpleNamespace(delete_message=lambda msg: deleted.append(msg)), 'index', 3,
+            SimpleNamespace(send_message=lambda body: deadletters.append(body)))
+    assert len(deleted) == 100 and not deadletters
+    assert env.store._get(key) == row
+    assert len(env.sent) == 1 and not env.runtime.calls and not env.events
+    assert all(args[3] != 'failed' for args, _ in env.statuses)
+
+    # New source/job revision cannot silently cancel the barrier embargo.
+    env.runtime.store.begin('A', kind, ['two'])
+    env.runtime.store.finish('A', kind)
+    env.store.request('A', scope)
+    assert env.store._get(key)['notBefore'] == 1010
+    assert env.store.claim(key) is None
+    active[0] = False
+    # Simulate lost queue receipt. The pending ledger recovers it after the
+    # reservation expires, and an obsolete payload claims the latest revision.
+    env.now[0] = row['wakeUntil']
+    assert app.recover_pending_index_work('A') == 1
+    app._run_index_maintenance_payload(payload)
+    assert env.store._get(key) is None
+    assert len(env.runtime.calls) == 1 and env.runtime.calls[0][0] == kind
+    assert not env.runtime.store.capture('A', kind).ids
+    assert env.runtime.jobs.get_entity('A', 'job')['status'] == 'done'
+    assert len(env.events) == 1
+
+
+def test_failed_barrier_wakeup_send_is_nonterminal_and_recovers(clocked, monkeypatch):
+    env = clocked
+    monkeypatch.setattr(automatic, 'wave_pending', lambda _: True)
+    monkeypatch.setattr(app, '_send_index_wakeup', Mock(side_effect=OSError('queue down')))
+    key = env.store.request('A', 'vector')
+    payload = dict(userId='A', scope='vector', jobId='job', maintenanceKey=key)
+    app._run_index_maintenance_payload(payload)
+    row = env.store._get(key)
+    assert not row['failed'] and row['attempts'] == 0
+    assert env.runtime.jobs.get_entity('A', 'job')['status'] == 'queued'
+    assert env.store.recover(lambda *args: pytest.fail('reservation ignored')) == 0
+    env.now[0] = row['wakeUntil']
+    assert env.store.recover(lambda *args: env.sent.append(args)) == 1
+    assert len(env.sent) == 1
+
+
+def test_early_unreserved_delivery_schedules_only_one_replacement(clocked):
+    env = clocked
+    key = env.store.request('A', 'vector', delay=10)
+    payload = dict(userId='A', scope='vector', jobId='job', maintenanceKey=key)
+    for _ in range(100):
+        app._run_index_maintenance_payload(payload)
+    assert len(env.sent) == 1 and env.sent[0][-1] == 10
+    assert 'attempts' not in env.store._get(key)
+    assert not env.statuses and not env.events
+
+
+def test_live_owner_duplicates_are_acked_without_failure_or_more_wakeups(clocked):
+    env = clocked
+    key = env.store.request('A', 'vector')
+    claim = env.store.claim(key)
+    before = env.store._get(key)
+    payload = dict(userId='A', scope='vector', jobId='job', maintenanceKey=key)
+    for _ in range(100):
+        app._run_index_maintenance_payload(payload)
+    assert env.store._get(key) == before
+    assert not env.sent and not env.statuses and not env.events
+    env.store.finish(claim)
+
+
+def test_barrier_at_failure_ceiling_waits_without_poison_then_real_budget_applies(clocked, monkeypatch):
+    env = clocked
+    key = env.store.request('A', 'vector')
+    first = env.store.claim(key)
+    env.store.release(first)
+    monkeypatch.setattr(app, 'INDEX_BUILD_MAX_RETRIES', 1)
+    active = [True]
+    monkeypatch.setattr(automatic, 'wave_pending', lambda _: active[0])
+    deadletters = []
+    monkeypatch.setattr(app, 'queue_service_client', SimpleNamespace(get_queue_client=lambda _:
+        SimpleNamespace(send_message=lambda body: deadletters.append(json.loads(body)))))
+    monkeypatch.setattr(app, 'INDEX_MAINTENANCE_DEADLETTER_QUEUE_NAME', 'dead')
+    payload = dict(userId='A', scope='vector', jobId='job', maintenanceKey=key)
+    for _ in range(10):
+        app._run_index_maintenance_payload(payload)
+        assert env.store._get(key)['attempts'] == 1
+        assert env.runtime.jobs.get_entity('A', 'job')['status'] == 'queued'
+        env.now[0] += 10
+    assert not deadletters and not env.events
+    active[0] = False
+    app._run_index_maintenance_payload(payload)
+    assert env.store._get(key)['failed'] and deadletters[0]['attempts'] == 1
+
+
+def test_real_failures_still_exhaust_ledger_budget_not_queue_deliveries(clocked, monkeypatch):
+    env = clocked
+    key = env.store.request('A', 'vector')
+    payload = dict(type=app.INDEX_BUILD_JOB_TYPE, userId='A', scope='vector', jobId='job',
+        maintenanceKey=key, intentRevision=env.store._get(key)['revision'])
+    monkeypatch.setattr(app, 'INDEX_BUILD_MAX_RETRIES', 2)
+    monkeypatch.setattr(automatic, 'run', Mock(side_effect=OSError('actual build failure')))
+    deadletters = []
+    monkeypatch.setattr(app, 'queue_service_client', SimpleNamespace(get_queue_client=lambda _:
+        SimpleNamespace(send_message=lambda body: deadletters.append(json.loads(body)))))
+    monkeypatch.setattr(app, 'INDEX_MAINTENANCE_DEADLETTER_QUEUE_NAME', 'dead')
+    deleted = []
+    queue = SimpleNamespace(delete_message=lambda msg: deleted.append(msg))
+    for delivery in range(3):
+        # Already far past the queue delivery ceiling on the FIRST build.
+        msg = SimpleNamespace(content=json.dumps(payload), dequeue_count=100 + delivery)
+        app._process_clustering_queue_message_impl(msg, queue, 'index', 2)
+        assert len(deleted) == (1 if delivery == 2 else 0)
+    assert env.store._get(key)['failed']
+    assert deadletters[0]['attempts'] == 2
+    assert env.runtime.jobs.get_entity('A', 'job')['status'] == 'failed'
+    assert not env.events
+
+
+def test_deadletter_failure_cannot_discard_or_poison_the_durable_intent(clocked, monkeypatch):
+    env = clocked
+    key = env.store.request('A', 'vector')
+    first = env.store.claim(key)
+    env.store.release(first)
+    monkeypatch.setattr(app, 'INDEX_BUILD_MAX_RETRIES', 1)
+    send = Mock(side_effect=OSError('deadletter down'))
+    monkeypatch.setattr(app, 'queue_service_client', SimpleNamespace(get_queue_client=lambda _:
+        SimpleNamespace(send_message=send)))
+    monkeypatch.setattr(app, 'INDEX_MAINTENANCE_DEADLETTER_QUEUE_NAME', 'dead')
+    payload = dict(userId='A', scope='vector', jobId='job', maintenanceKey=key)
+    with pytest.raises(OSError, match='deadletter down'):
+        app._run_index_maintenance_payload(payload)
+    assert not env.store._get(key)['failed'] and not env.store._get(key)['owner']
+    send.side_effect = None
+    app._run_index_maintenance_payload(payload)
+    assert env.store._get(key)['failed']
+
+
+@pytest.mark.parametrize('partition', [index_work.PARTITION, automatic.TAG_PARTITION])
+def test_claim_embargo_is_cas_rechecked_and_preserves_attempts(partition, monkeypatch):
+    table, now = EtagTable(), [1000.0]
+    store = index_work.WorkStore(table, clock=lambda: now[0], partition=partition)
+    key = store.request('A', 'tag_embedding' if partition == automatic.TAG_PARTITION else 'vector')
+    get = store._get
+    stale = get(key)
+    first = store.claim(key)
+    store.release(first, deferred=True, retry_delay=10, retry_reason='barrier_wait')
+    latest = get(key)
+    # First read is stale; failed ETag CAS must reread the embargo, not claim.
+    reads = iter([stale, latest])
+    monkeypatch.setattr(store, '_get', lambda _: next(reads))
+    assert store.claim(key) is None
+    assert table.get_entity(partition, key) == latest
+
+
+def test_tag_dispatch_keeps_early_duplicates_nonterminal_and_does_not_send(clocked, monkeypatch):
+    env = clocked
+    monkeypatch.setenv('APP_ROLE', 'vision')
+    monkeypatch.setattr(app.vision_utils, 'image_encoder_available', lambda: True)
+    tags = index_work.WorkStore(env.runtime.jobs, partition=automatic.TAG_PARTITION)
+    key = tags.request('A', 'tag_embedding')
+    first = tags.claim(key)
+    tags.release(first, deferred=True, retry_delay=10, retry_reason='barrier_wait')
+    before = tags._get(key)
+    payload = app._tag_index_payload('A', before['revision'])
+    send = Mock(side_effect=AssertionError('duplicate replacement'))
+    monkeypatch.setattr(app, '_send_tag_index_wakeup', send)
+    for _ in range(100):
+        assert app._run_tag_index_maintenance_payload(payload) == 'tag_index_retry'
+    assert tags._get(key) == before
+    assert not env.statuses and not env.runtime.calls and not env.events
+    send.assert_not_called()

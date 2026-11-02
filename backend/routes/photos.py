@@ -1119,6 +1119,12 @@ def photos_sort_index():
     try:
         container_name, blob_name = app.get_sort_index_blob_location(user_id)
         index_url, expires_at = app._create_stable_read_sas_url(container_name, blob_name)
+        delta_urls = []
+        delta_seq = int(sort_summary.get('delta_seq') or 0)
+        if delta_seq:
+            for seq in range(1, delta_seq + 1):
+                delta_name = storage_utils._sort_index_delta_blob_name(user_id, seq)
+                delta_urls.append(app._create_stable_read_sas_url(container_name, delta_name)[0])
     except Exception:
         app.app.logger.exception('Failed to mint sort index SAS URL for %s', user_id)
         return app.jsonify({'available': False})
@@ -1128,6 +1134,8 @@ def photos_sort_index():
         'expiresAt': expires_at,
         'sourceVersion': sort_summary.get('source_version'),
         'updatedAt': sort_summary.get('updated_at'),
+        'deltaSeq': int(sort_summary.get('delta_seq') or 0),
+        'deltaUrls': delta_urls,
     })
 
 @photos_bp.route('/api/photos/index-status', methods=['GET'])

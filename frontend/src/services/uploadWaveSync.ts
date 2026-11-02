@@ -342,6 +342,7 @@ export const discardWaveShadowSession = async (session: PersistedUploadSession):
             await state.pending;
             let revision: string | undefined;
             let staleRefreshes=0;
+            let waitedForFinalizationDrain=false;
             let result: WaveDiscardResult | null=null;
             for (;;) {
                 try {
@@ -374,6 +375,16 @@ export const discardWaveShadowSession = async (session: PersistedUploadSession):
                     }
                 } catch (error) {
                     const failure=error as Error & {status?: number};
+                    if (!legacyApi && !waitedForFinalizationDrain
+                        && failure.message?.includes('A finalization is still in flight')) {
+                        // Modern discard durably fences new finalizations, then
+                        // gives already-admitted requests a 30-second drain
+                        // window. Keep this Discard action alive through that
+                        // window instead of asking the user to click again.
+                        waitedForFinalizationDrain=true;
+                        await new Promise(resolve => setTimeout(resolve,31_000));
+                        continue;
+                    }
                     if (!legacyApi && [404,405].includes(failure.status || 0)) {
                         legacyApi=true; continue;
                     }

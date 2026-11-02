@@ -1,7 +1,7 @@
 """Cancellation/admission interleavings behind refresh -> Discard -> upload."""
 import pytest
 from upload_waves import ShadowWaves, Conflict
-from wave_settlement import abandon
+from wave_settlement import abandon, fence_discard, FINALIZE_DISCARD_GRACE_SECONDS
 from test_upload_waves import AtomicTable
 
 
@@ -37,6 +37,21 @@ def test_live_finalize_lease_refuses_entire_page_without_partial_cancellation():
         abandon(store,'old',parent['manifestRevision'],reason='discard')
     assert len(table.transactions)==initial
     assert store._required(store.session_key('old'))['resolvedCount']==0
+
+
+def test_discard_fence_stops_waiting_after_inflight_finalize_grace():
+    now=[1000]
+    store,table,_=setup()
+    store.clock=lambda:now[0]
+    old=store._required(store.item_key('old','019'))
+    table.submit_transaction([store._change(old,dict(old,finalizeLeaseUntil=1600))])
+    parent=fence_discard(store,'old',reason='discard')
+    with pytest.raises(Conflict,match='still in flight'):
+        abandon(store,'old',parent['manifestRevision'],reason='discard')
+    now[0]+=FINALIZE_DISCARD_GRACE_SECONDS+1
+    result=abandon(store,'old',parent['manifestRevision'],reason='discard')
+    assert result['resolvedCount']==20
+    assert result['abandonmentNeedsMore']
 
 
 def test_finalize_winning_the_race_is_preserved_on_explicit_revision_refresh():

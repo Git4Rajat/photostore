@@ -1,11 +1,11 @@
 """Bounded, best-effort inline merge of small CRUD-triggered index rebuilds.
 
-CRUD edits to people/albums/sort(ratings)/access(likes) already enqueue a
+CRUD edits to people/albums/sort(ratings)/access(likes)/search already enqueue a
 durable Azure Queue wakeup for the dedicated `index-worker` role -- that
 path is untouched and always runs regardless of anything in this module.
 `core` is already warm handling the CRUD request itself, so when the
 triggering change is small enough to be confident it'll take the existing
-bounded merge path (not a full/embedding-heavy rebuild), this module ALSO
+bounded merge or Search correction-slip path (not a full/embedding-heavy rebuild), this module ALSO
 tries to finish the work right there, through a small bounded local queue
 (never unbounded -- `core` is a 0.5 vCPU/1Gi container and must not OOM or
 have its HTTP-serving threads starved by this). On success it cancels the
@@ -19,8 +19,9 @@ only the fresh read is what keeps this safe (see
 storage_utils._people_merge_eligible and friends).
 
 Correctness note: `index_ownership.allow_inline_merge` is a narrow, explicit
-exception to the index-worker-only catalog gate -- restricted to exactly the
-four bounded lexical scopes below. The WorkStore claim is renewed under the
+exception to the index-worker-only catalog gate -- restricted to the bounded
+People/Albums/Sort/Access merge scopes and the Search correction-slip scope
+below. The WorkStore claim is renewed under the
 same publication guard as the durable worker. A real library catalog lease
 also serializes overlapping scopes; legacy libraries where that lease is a
 no-op defer to durable maintenance. Strict publishers capture artifact and
@@ -49,6 +50,9 @@ _WORKERS = int(os.getenv('INLINE_INDEX_MERGE_WORKERS', '2'))
 # falsely-eligible attempt must not be allowed to run an unbounded-memory
 # rebuild on a 1Gi container.
 _MAX_PREV_ROWS = int(os.getenv('INLINE_INDEX_MERGE_MAX_ROWS', '5000'))
+# Core performs only one small Search correction-slip pass. Larger dirty sets
+# remain with the durable index-worker path.
+_SEARCH_MAX_NAMES = int(os.getenv('INLINE_SEARCH_MAX_NAMES', '5000'))
 # Only used by callers that also attempt inline -- see enqueue_index_build's
 # delay_override. Gives the inline attempt a real window to finish and
 # cancel before the durable backstop message would even become visible,
@@ -142,6 +146,14 @@ def _serialized_library(user_id):
 def _conflicting_work(store, user_id, scope):
     kinds = set(index_updates.SCOPE_KINDS[scope])
     for other, other_kinds in index_updates.SCOPE_KINDS.items():
+        if scope == 'search' and other != 'search':
+            # Search deltas share the catalog lineage and the source rows with
+            # every catalog publication.  Do not race a full/light or targeted
+            # artifact publisher even though the search scope has no entries in
+            # SCOPE_KINDS itself.
+            row = store._get(store.key(user_id, other))
+            if row is not None and float(row.get('leaseUntil') or 0) > store.clock():
+                return True
         if other != scope and (kinds.intersection(other_kinds)
                 or scope == 'albums' and other in index_updates.SEARCH_SCOPES):
             row = store._get(store.key(user_id, other))
@@ -157,7 +169,7 @@ def _eligible(user_id: str, scope: str):
     _run_index_build_job (app.py) already runs, so the inline path and the
     real worker path can never disagree about what counts as eligible."""
     import app
-    if not storage_utils._inline_artifact_within_limit(user_id, scope, _MAX_PREV_ROWS):
+    if scope != 'search' and not storage_utils._inline_artifact_within_limit(user_id, scope, _MAX_PREV_ROWS):
         return False, None, None
     if scope == 'people':
         table = app.people_dirty_set_table_client
@@ -188,6 +200,25 @@ def _eligible(user_id: str, scope: str):
         return True, None, dirty_albums
     if scope in ('sort', 'access'):
         if not storage_utils._rows_merge_eligible(user_id, scope):
+            return False, None, None
+        return True, None, None
+    if scope == 'search':
+        # Search already has a reader-compatible base+delta format.  Core may
+        # publish only a bounded delta against an existing compatible base;
+        # missing bases and exhausted delta capacity stay with the index app.
+        import search_db
+        manifest = search_db.load_manifest(user_id)
+        if (not manifest.get('sourceVersion')
+                or manifest.get('schemaVersion') != search_db.SCHEMA_VERSION
+                or search_db.available_delta_row_capacity(
+                    manifest, storage_utils.SEARCH_DB_DELTA_CHUNK) <= 0):
+            return False, None, None
+        dirty = index_work.read_bounded_dirty(
+            storage_utils._get_dirty_search_index_filenames, user_id, 'lexical',
+            max_rows=_SEARCH_MAX_NAMES)
+        if (dirty is None or not dirty or getattr(dirty, 'has_more', False)
+                or getattr(dirty, 'truncated', False)
+                or len(dirty) > _SEARCH_MAX_NAMES):
             return False, None, None
         return True, None, None
     return False, None, None
@@ -243,6 +274,28 @@ def _merge_claimed(store, claim, guard, user_id, scope):
     ok, dirty_people, dirty_albums = _eligible(user_id, scope)
     if not ok or _conflicting_work(store, user_id, scope):
         return
+    if scope == 'search':
+        # The Search SQLite path is already a correction-slip publisher.  It
+        # acknowledges dirty rows itself only after the delta CAS succeeds.
+        # A deferred/no-base/capacity result deliberately keeps the durable
+        # backstop alive for the index worker.
+        with index_ownership.allow_inline_merge(scope):
+            outcome = app._drain_incremental_search_db(
+                user_id, scope, max_names=_SEARCH_MAX_NAMES, max_passes=1)
+        if str(outcome.get('status') or '') not in ('noop', 'delta'):
+            return False
+        guard.check()
+        return True
+    if scope == 'sort':
+        # Sort now has the same reader-compatible base-plus-delta contract as
+        # Search. A missing base, large dirty capture, or exhausted delta log
+        # stays with the durable worker, which can compact or rebuild.
+        with index_ownership.allow_inline_merge(scope):
+            outcome = storage_utils.refresh_user_sort_index_incremental(user_id)
+        if str(outcome.get('status') or '') != 'delta':
+            return False
+        guard.check()
+        return True
     kinds = index_updates.SCOPE_KINDS[scope]
     with index_ownership.allow_inline_merge(scope):
         bad = storage_utils.prime_all_user_indexes_sequentially(

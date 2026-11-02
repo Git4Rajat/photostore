@@ -113,6 +113,10 @@ class WakeupContention(RuntimeError):
     correct either way, since every step here is idempotent."""
 
 
+class WorkLeased(RuntimeError):
+    """Another worker owns this intent; a duplicate delivery is not a failure."""
+
+
 @dataclass(frozen=True)
 class Claim:
     key: str
@@ -191,6 +195,10 @@ class WorkStore:
             target = self.clock() + max(0, delay)
             if current and float(current.get('leaseUntil') or 0) <= self.clock():
                 target = min(float(current.get('notBefore') or target), target)
+            if current and not current.get('failed') and current.get('retryReason') == 'barrier_wait':
+                # Source/job revisions do not prove the guarded wave is clear.
+                # Keep its embargo even when a writer advances the revision.
+                target = max(float(current.get('notBefore') or 0), target)
             row['notBefore'] = target
             if current and current.get('failed'):
                 row.update(owner='', leaseUntil=0, wakeUntil=0)
@@ -201,7 +209,7 @@ class WorkStore:
                 continue
         raise RuntimeError('Maintenance request contention')
 
-    def notify(self, key, send):
+    def notify(self, key, send, *, minimum_delay=0):
         """Reserve a wakeup before sending; recovery retries expired reservations."""
         for _ in range(12):
             current = self._get(key)
@@ -210,7 +218,8 @@ class WorkStore:
             now = self.clock()
             if float(current.get('leaseUntil') or 0) > now or float(current.get('wakeUntil') or 0) > now:
                 return False
-            delay = max(0, math.ceil(float(current.get('notBefore') or 0) - now))
+            delay = max(0, math.ceil(float(current.get('notBefore') or 0) - now),
+                        math.ceil(minimum_delay))
             row = dict(current, wakeUntil=now + delay + self.wake_seconds)
             try:
                 self._replace(current, row)
@@ -228,7 +237,11 @@ class WorkStore:
                 return None
             now = self.clock()
             if float(current.get('leaseUntil') or 0) > now:
-                raise RuntimeError('Maintenance work is already leased')
+                raise WorkLeased('Maintenance work is already leased')
+            if float(current.get('notBefore') or 0) > now:
+                # Queue messages are advisory, including stale duplicates.
+                # Do not consume attempts or clear the reserved delayed wake.
+                return None
             owner = str(uuid.uuid4())
             attempt = (int(current.get('attempts') or 0) + 1
                        if current.get('attemptRevision') == current['revision'] else 1)

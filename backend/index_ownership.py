@@ -24,7 +24,7 @@ def configured_build_roles():
 
 # A narrow, explicit exception to the index-worker-only rule above -- NOT a
 # change to configured_build_roles()/index_build_allowed(). Lets `core`
-# publish ONLY the bounded, already-cheap merge scopes (see
+# publish ONLY the bounded merge scopes and Search correction slips (see
 # inline_index_merge.py) when an eligibility check it already passed proves
 # this call will take the targeted merge path, never a full/embedding-heavy
 # rebuild. The allowed-scope list here is the only thing standing between

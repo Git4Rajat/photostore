@@ -165,7 +165,7 @@ def test_submit_rejects_wrong_role(monkeypatch, role):
     assert inline_index_merge.submit('lib', 'people') is False
 
 
-@pytest.mark.parametrize('scope', ['full', 'vector', 'compact', 'light', 'search', 'tag_embedding'])
+@pytest.mark.parametrize('scope', ['full', 'vector', 'compact', 'light', 'tag_embedding'])
 def test_submit_rejects_scopes_outside_the_bounded_set(scope):
     assert inline_index_merge.submit('lib', scope) is False
 
@@ -258,6 +258,32 @@ def test_eligible_sort_access_defer_to_the_shared_predicate(monkeypatch):
     assert inline_index_merge._eligible('lib', 'access')[0] is False
 
 
+def test_eligible_search_requires_existing_base_and_bounded_dirty_set(monkeypatch):
+    import search_db
+    monkeypatch.setattr(search_db, 'load_manifest', lambda uid: {
+        'sourceVersion': 'v1', 'schemaVersion': search_db.SCHEMA_VERSION,
+        'deltaSeq': 0, 'deltaRows': 0, 'lineage': 'v1',
+    })
+    monkeypatch.setattr(search_db, 'available_delta_row_capacity', lambda manifest, chunk: 10)
+    monkeypatch.setattr(su, '_get_dirty_search_index_filenames', lambda *a, **k: {'a.jpg'})
+    ok, people, albums = inline_index_merge._eligible('lib', 'search')
+    assert ok is True and people is None and albums is None
+
+
+def test_eligible_search_defers_without_base_or_when_dirty_capture_is_truncated(monkeypatch):
+    import search_db
+    monkeypatch.setattr(search_db, 'load_manifest', lambda uid: {})
+    assert inline_index_merge._eligible('lib', 'search')[0] is False
+    monkeypatch.setattr(search_db, 'load_manifest', lambda uid: {
+        'sourceVersion': 'v1', 'schemaVersion': search_db.SCHEMA_VERSION,
+        'deltaSeq': 0, 'deltaRows': 0,
+    })
+    monkeypatch.setattr(search_db, 'available_delta_row_capacity', lambda manifest, chunk: 10)
+    monkeypatch.setattr(su, '_get_dirty_search_index_filenames', lambda *a, **k: SimpleNamespace(
+        rows={'a.jpg'}, has_more=True, truncated=False))
+    assert inline_index_merge._eligible('lib', 'search')[0] is False
+
+
 @pytest.fixture
 def attempt_ctx(monkeypatch):
     from contextlib import nullcontext
@@ -301,6 +327,52 @@ def test_attempt_claims_merges_clears_and_cancels_on_success(attempt_ctx, monkey
     assert deleted == [('m1', 'r1')]
     # WorkStore row for this key is gone -- finish() succeeded.
     assert table.rows == {} if (table := attempt_ctx.table) else True
+
+
+def test_search_inline_publishes_delta_and_cancels_backstop(attempt_ctx):
+    store = index_work.WorkStore(attempt_ctx.table)
+    attempt_ctx.table.rows.pop((index_work.PARTITION, store.key('lib', 'people')))
+    store.request('lib', 'search')
+    attempt_ctx.drain.return_value = {'status': 'delta', 'published': 1}
+    deleted = []
+    capture = [(SimpleNamespace(delete_message=lambda mid, pr: deleted.append((mid, pr))),
+                SimpleNamespace(id='m1', pop_receipt='r1'))]
+    inline_index_merge._attempt('lib', 'search', capture)
+    attempt_ctx.drain.assert_called_once_with(
+        'lib', 'search', max_names=inline_index_merge._SEARCH_MAX_NAMES, max_passes=1)
+    attempt_ctx.prime.assert_not_called()
+    assert deleted == [('m1', 'r1')]
+    assert not attempt_ctx.table.rows
+
+
+def test_search_inline_enters_catalog_ownership_escape_hatch(attempt_ctx, monkeypatch):
+    store = index_work.WorkStore(attempt_ctx.table)
+    attempt_ctx.table.rows.pop((index_work.PARTITION, store.key('lib', 'people')))
+    store.request('lib', 'search')
+    entered = []
+    from contextlib import nullcontext
+    monkeypatch.setattr(index_ownership, 'allow_inline_merge',
+                        lambda scope: (entered.append(scope) or nullcontext()))
+    attempt_ctx.drain.return_value = {'status': 'delta'}
+    inline_index_merge._attempt('lib', 'search', [])
+    assert entered == ['search']
+
+
+def test_search_inline_defers_compaction_to_index_worker(attempt_ctx):
+    store = index_work.WorkStore(attempt_ctx.table)
+    attempt_ctx.table.rows.pop((index_work.PARTITION, store.key('lib', 'people')))
+    store.request('lib', 'search')
+    attempt_ctx.drain.return_value = {'status': 'deferred', 'nextScope': 'compact'}
+    deleted = []
+    inline_index_merge._attempt(
+        'lib', 'search',
+        [(SimpleNamespace(delete_message=lambda *args: deleted.append(args)),
+          SimpleNamespace(id='m1', pop_receipt='r1'))],
+    )
+    attempt_ctx.drain.assert_called_once_with(
+        'lib', 'search', max_names=inline_index_merge._SEARCH_MAX_NAMES, max_passes=1)
+    assert deleted == []
+    assert attempt_ctx.table.rows
 
 
 def test_attempt_leaves_backstop_message_when_a_newer_revision_arrived_mid_merge(attempt_ctx, monkeypatch):
@@ -390,6 +462,10 @@ def test_dispatch_scoped_rebuild_attempts_inline_only_for_bounded_scopes(monkeyp
     monkeypatch.setattr('inline_index_merge.submit', lambda uid, scope, **k: submitted.append((uid, scope)) or True)
     app.dispatch_scoped_rebuild('lib', 'rating-change', 'sort')
     assert submitted == [('lib', 'sort')]
+
+    submitted.clear()
+    app.dispatch_scoped_rebuild('lib', 'metadata-change', 'search')
+    assert submitted == [('lib', 'search')]
 
     submitted.clear()
     app.dispatch_scoped_rebuild('lib', 'bulk-upload', 'full')

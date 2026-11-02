@@ -275,6 +275,17 @@ def test_sort_tile_updates_coalesce_dirty_marks(sort_ctx, monkeypatch):
     storage_utils._get_dirty_search_index_filenames('lib-coalesce', 'lexical')
 
 
+def test_processing_sort_touch_wakes_search_delta_scope_when_durable(monkeypatch):
+    calls = []
+    monkeypatch.setattr(storage_utils, 'DURABLE_INDEX_UPDATES', True)
+    monkeypatch.setattr(storage_utils, 'METADATA_INDEX_REQUEST_HOOK',
+                        lambda user, scope: calls.append((user, scope)) or 'queued')
+    monkeypatch.setattr(storage_utils, 'sort_index_skipped', lambda user: True)
+    monkeypatch.setattr(storage_utils, '_mark_search_index_dirty_filenames', lambda *args, **kwargs: None)
+    storage_utils.touch_user_sort_index_dirty('lib-status', ['a.jpg'])
+    assert calls == [('lib-status', 'search')]
+
+
 @pytest.mark.parametrize('batched', [False, True])
 def test_processing_status_write_dirties_gallery_index(sort_ctx, monkeypatch, batched):
     table, _, _ = sort_ctx

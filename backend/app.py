@@ -11043,9 +11043,18 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, 
                      else (2 if coalesce and reason not in index_updates.READ_REASONS else 0))
             if delay_override is not None:
                 delay = max(1, int(delay_override))
-            token = store.request(key, scope, advance=reason not in index_updates.READ_REASONS, delay=delay)
+            # Search dirty rows are the source of truth for repeated metadata
+            # changes. Do not rewrite the same maintenance revision for every
+            # processing-status callback; an existing wakeup already covers it.
+            advance = reason not in index_updates.READ_REASONS
+            if scope == 'search' and reason == 'metadata-change':
+                advance = False
+            # Inline's backstop visibility is not a work embargo: core may
+            # claim immediately. An existing barrier retry still wins in request.
+            inline_delay = delay if capture is not None else 0
+            token = store.request(key, scope, advance=advance, delay=0 if inline_delay else delay)
             sent = store.notify(token, lambda library, kind, revision, wait: _send_index_wakeup(
-                library, kind, revision, wait, reason=reason, capture=capture))
+                library, kind, revision, wait, reason=reason, capture=capture), minimum_delay=inline_delay)
             if not sent and reason in index_updates.READ_REASONS:
                 current = store._get(token)
                 if current and current.get('failed'):
@@ -11317,11 +11326,30 @@ def _run_index_maintenance_payload(payload):
     key = index_work.WorkStore.key(library, scope)
     if payload.get('maintenanceKey') != key:
         raise ValueError('Maintenance identity mismatch')
-    claim = store.claim(key)
+    try:
+        claim = store.claim(key)
+    except index_work.WorkLeased:
+        return  # The live owner (or expired-lease recovery) covers this wake.
     if claim is None:
+        # An early/stale receipt can be ACKed. Reserve at most one delayed
+        # replacement; failed sends remain durable for periodic recovery.
+        try:
+            store.notify(key, _send_index_wakeup)
+        except Exception:
+            worker_logger.warning('Maintenance wakeup retained for recovery', exc_info=True)
         return
     try:
         if claim.attempt > INDEX_BUILD_MAX_RETRIES:
+            if scope in ('vector', 'lexical_artifact', 'people_embedding', 'dedup', 'dedup-idle'):
+                # Like Vision's tag dispatcher, never poison a source barrier
+                # even if earlier real failures used the entire retry budget.
+                automatic.check_source_admission(library)
+                if automatic.wave_pending(library):
+                    raise automatic.SourceBusy('Active upload wave')
+                kind = 'hash' if scope in ('dedup', 'dedup-idle') else scope
+                control = automatic.configured_store().control(library, kind)
+                if control and control.get('active'):
+                    raise automatic.SourceBusy('Active source reservation')
             deadletter = queue_service_client.get_queue_client(INDEX_MAINTENANCE_DEADLETTER_QUEUE_NAME)
             deadletter.send_message(json.dumps({
                 'originalPayload': payload, 'reason': 'Index maintenance attempts exhausted',
@@ -11339,7 +11367,12 @@ def _run_index_maintenance_payload(payload):
     except automatic.SourceBusy:
         # A healthy source barrier wait does not consume the poison budget.
         store.release(claim, deferred=True, retry_delay=10, retry_reason='barrier_wait')
-        store.notify(key, _send_index_wakeup)
+        _upsert_job_status(str(payload['jobId']), library, INDEX_BUILD_JOB_TYPE, 'queued', indexScope=scope,
+            error='', result={'status': 'deferred', 'reason': 'barrier_wait', 'ready': False})
+        try:
+            store.notify(key, _send_index_wakeup)
+        except Exception:
+            worker_logger.warning('Barrier wakeup retained for recovery', exc_info=True)
         return
     except Exception:
         try:
@@ -11624,12 +11657,17 @@ def reconcile_dirty_albums(user_id: str) -> bool:
     return True
 
 
-def _drain_incremental_search_db(user_id: str, scope: str) -> Dict[str, object]:
+def _drain_incremental_search_db(user_id: str, scope: str, *, max_names: Optional[int] = None,
+                                 max_passes: Optional[int] = None) -> Dict[str, object]:
     """Consume all currently dirty search rows using bounded delta periods."""
     import search_db
 
-    for pass_number in range(1, INDEX_BUILD_INCREMENTAL_MAX_PASSES + 1):
-        outcome = refresh_user_search_db_incremental(user_id)
+    pass_limit = INDEX_BUILD_INCREMENTAL_MAX_PASSES if max_passes is None else max(1, int(max_passes))
+    for pass_number in range(1, pass_limit + 1):
+        if max_names is None:
+            outcome = refresh_user_search_db_incremental(user_id)
+        else:
+            outcome = refresh_user_search_db_incremental(user_id, max_names=max_names)
         perf_instrumentation.log_event('search_db_incremental', user=user_id, scope=scope, pass_number=pass_number, **{
             k: v for k, v in outcome.items() if isinstance(v, (int, str))})
         status = str(outcome.get('status') or '')
@@ -11679,6 +11717,8 @@ def _drain_incremental_search_db(user_id: str, scope: str) -> Dict[str, object]:
             # not a reason to mark this job failed.
             return outcome
         raise RuntimeError(f'incremental search database refresh returned {status or "an empty status"}')
+    if max_passes is not None:
+        return {'status': 'deferred', 'nextScope': 'search'}
     raise RuntimeError(
         f'incremental search database refresh did not converge after {INDEX_BUILD_INCREMENTAL_MAX_PASSES} passes')
 
@@ -11693,6 +11733,7 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
     from index_ownership import require_catalog_owner
     require_catalog_owner(model_owned_tag=scope == 'tag_embedding')
     import index_updates
+    from automatic_index_updates import SourceBusy
     scope = index_updates.validate_scope(scope)
     started = time.monotonic()
     stop = threading.Event()
@@ -11870,6 +11911,14 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
                     if enqueue_index_build(user_id, reason='post-bootstrap', scope='search') == 'unavailable':
                         raise RuntimeError('Could not schedule post-bootstrap catalog updates')
                 _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done')
+    except SourceBusy:
+        # Stop any in-flight heartbeat before publishing the waiting state.
+        # The outer owner releases/debits the claim and schedules recovery.
+        stop.set()
+        heartbeat.join(timeout=5)
+        _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'queued', indexScope=scope,
+            error='', result={'status': 'deferred', 'reason': 'barrier_wait', 'ready': False})
+        raise
     except Exception:
         worker_logger.exception('Index build failed for %s', user_id)
         _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'failed', error='Index build failed')
@@ -15878,7 +15927,23 @@ def _process_clustering_queue_message_impl(message, queue_client, queue_name, ma
     job_type = ''
 
     dequeue_count = int(getattr(message, 'dequeue_count', 0) or 0)
-    if dequeue_count > max_retries:
+    # Durable maintenance charges actual ledger claims, not duplicate queue
+    # deliveries. Otherwise a healthy barrier wait can poison its intent here
+    # before the worker gets a chance to consult notBefore/attempts.
+    durable_index = False
+    try:
+        candidate = json.loads(message.content or '{}')
+        if (isinstance(candidate, dict) and candidate.get('type') == INDEX_BUILD_JOB_TYPE
+                and jobs_table_client is not None
+                and os.getenv('APP_ROLE', 'core').strip().lower() == 'index-worker'
+                and isinstance(candidate.get('userId'), str) and candidate['userId']
+                and isinstance(candidate.get('scope'), str)):
+            import index_work
+            durable_index = candidate.get('maintenanceKey') == index_work.WorkStore.key(
+                candidate['userId'], candidate['scope'])
+    except (ValueError, TypeError):
+        pass
+    if dequeue_count > max_retries and not durable_index:
         try:
             payload = json.loads(message.content or '{}')
             if isinstance(payload, dict):

@@ -1071,12 +1071,13 @@ def _normalize_face_bbox(face: Dict) -> Dict[str, int]:
             return int(round(float(bbox.get(key, 0) or 0)))
         except Exception:
             return 0
-    return {
+    summary = {
         'left': max(0, px('left')),
         'top': max(0, px('top')),
         'width': max(0, px('width')),
         'height': max(0, px('height')),
     }
+    return summary
 
 
 def _face_identity_key(user_id: str, filename: str, face: Dict) -> str:
@@ -4747,7 +4748,7 @@ def _fetch_rows_by_names(user_id: str, names: List[str], select: List[str]) -> D
 
 
 @catalog_publisher
-def refresh_user_search_db_incremental(user_id: str) -> Dict[str, object]:
+def refresh_user_search_db_incremental(user_id: str, *, max_names: Optional[int] = None) -> Dict[str, object]:
     """Bring the library's search database up to date by publishing small DELTAS for the photos
     whose rows changed, instead of re-scanning and rebuilding the whole library.
 
@@ -4773,7 +4774,8 @@ def refresh_user_search_db_incremental(user_id: str) -> Dict[str, object]:
     if not manifest.get('sourceVersion') or manifest.get('schemaVersion') != search_db.SCHEMA_VERSION:
         return {'status': 'no_base'}
     capacity = search_db.available_delta_row_capacity(manifest, SEARCH_DB_DELTA_CHUNK)
-    pass_limit = min(max(1, capacity), max(1, SEARCH_DB_DELTA_MAX_NAMES))
+    configured_limit = SEARCH_DB_DELTA_MAX_NAMES if max_names is None else max_names
+    pass_limit = min(max(1, capacity), max(1, int(configured_limit)))
     from index_work import read_bounded_dirty
     dirty = read_bounded_dirty(_get_dirty_search_index_filenames, key, 'lexical', max_rows=pass_limit)
     if dirty is None:
@@ -5728,6 +5730,10 @@ def _sort_index_manifest_blob_name(user_id: str) -> str:
     return f'{_vector_index_blob_key(user_id)}-sort.json'
 
 
+def _sort_index_delta_blob_name(user_id: str, seq: int) -> str:
+    return f'{_vector_index_blob_key(user_id)}-sortdelta-{int(seq):06d}.json.gz'
+
+
 def get_sort_index_blob_location(user_id: str) -> Tuple[str, str]:
     """(container_name, blob_name) for user_id's sort index data blob -- the
     pair a caller needs to mint its own SAS URL (see
@@ -5765,6 +5771,18 @@ def delete_user_sort_index_data(user_id: str) -> None:
             blob_client.delete_blob()
         except Exception:
             pass
+    # Correction slips are separate immutable blobs; remove them with the base
+    # artifact so a deleted library cannot leave an orphaned delta chain.
+    try:
+        service = _CTX.get('blob_service_client')
+        container_name = _lexical_index_container_name()
+        if service is not None and container_name:
+            container = service.get_container_client(container_name)
+            prefix = f'{_vector_index_blob_key(key)}-sortdelta-'
+            for item in container.list_blobs(name_starts_with=prefix):
+                container.delete_blob(item.name)
+    except Exception:
+        pass
     invalidate_user_sort_index_cache(key)
 
 
@@ -5777,13 +5795,18 @@ def touch_user_sort_index_state(user_id: str, *, touch_albums: bool = True) -> s
         return ''
     if _manifest_already_marked_dirty(key, 'sort'):
         return ''
-    source_version = datetime.now(timezone.utc).isoformat()
+    current = _load_sort_index_manifest(key)
+    # A dirty mark describes pending rows; it must not move the base lineage.
+    # Delta readers continue using the existing base while the worker drains
+    # the dirty set. Full builds still publish a new sourceVersion.
+    source_version = str(current.get('sourceVersion') or datetime.now(timezone.utc).isoformat())
     manifest = {
         'userId': key,
         'sourceVersion': source_version,
         'schemaVersion': _SORT_INDEX_SCHEMA_VERSION,
         'dirty': True,
-        'updatedAt': source_version,
+        'updatedAt': datetime.now(timezone.utc).isoformat(),
+        **({k: current[k] for k in ('deltaSeq', 'deltaRows') if k in current}),
     }
     blob_client = _sort_index_blob_client(_sort_index_manifest_blob_name(key))
     if blob_client is not None:
@@ -5816,9 +5839,25 @@ def touch_user_sort_index_dirty(user_id: str, filenames) -> None:
     key = str(user_id or '').strip()
     if not key or not filenames:
         return
+    from wave_policy import source_change_active
+    if source_change_active() and _CTX.get('wave_owned') and _CTX['wave_owned'](key):
+        # Upload waves publish the complete source-derived catalog after their
+        # processing stages. Do not create legacy Search/Sort dirty work or
+        # inline wakeups while a wave owns this library.
+        return
     # The search database stores rating/likes too (filter and gallery order), so the change must
     # reach it as a delta even though no search *text* changed.
     _mark_search_index_dirty_filenames(key, [str(f) for f in filenames], kinds=('lexical', 'sort'))
+    # Processing-status writes use this narrow helper directly rather than the
+    # metadata-intent outbox. Wake the Search correction-slip scope separately
+    # so core can drain the cheap delta path without waiting for the broader
+    # light (sort/access) maintenance job. Sort itself remains on its existing
+    # durable path until it has a reader-compatible correction format.
+    if DURABLE_INDEX_UPDATES and METADATA_INDEX_REQUEST_HOOK is not None:
+        try:
+            METADATA_INDEX_REQUEST_HOOK(key, 'search')
+        except Exception:
+            _LOGGER.warning('Search delta scheduling failed for %s', key, exc_info=True)
     if sort_index_skipped(key):
         return
     touch_user_sort_index_state(key)
@@ -5923,6 +5962,95 @@ def _sort_index_row(entity: Dict) -> Optional[Dict[str, object]]:
             },
         },
     }
+
+
+SORT_INDEX_DELTA_CHUNK = int(os.getenv('SORT_INDEX_DELTA_CHUNK', '5000'))
+SORT_INDEX_DELTA_MAX_NAMES = int(os.getenv('SORT_INDEX_DELTA_MAX_NAMES', '5000'))
+
+
+def _sort_delta_capacity(manifest: Dict[str, object]) -> int:
+    base_rows = max(1, int(manifest.get('rowCount') or 0))
+    remaining = max(0, 200 - int(manifest.get('deltaSeq') or 0))
+    row_limit = max(5000, int(0.25 * base_rows))
+    return max(0, min(row_limit - int(manifest.get('deltaRows') or 0), remaining * SORT_INDEX_DELTA_CHUNK))
+
+
+def _sort_publish_delta(user_id: str, upserts: List[Dict], deletes: List[str]) -> Optional[int]:
+    key = str(user_id or '').strip()
+    manifest = _load_sort_index_manifest(key)
+    lineage = str(manifest.get('sourceVersion') or '')
+    if not lineage or manifest.get('schemaVersion') != _SORT_INDEX_SCHEMA_VERSION:
+        return None
+    seq = int(manifest.get('deltaSeq') or 0) + 1
+    client = _sort_index_blob_client(_sort_index_delta_blob_name(key, seq))
+    manifest_client = _sort_index_blob_client(_sort_index_manifest_blob_name(key))
+    if client is None or manifest_client is None:
+        return None
+    payload = gzip.compress(json.dumps(
+        {'lineage': lineage, 'seq': seq, 'upserts': upserts, 'deletes': deletes},
+        ensure_ascii=False, separators=(',', ':')).encode('utf-8'), compresslevel=5)
+    try:
+        client.upload_blob(payload, overwrite=True, content_settings=BlobContentSettings(content_type='application/gzip'))
+        props = manifest_client.get_blob_properties()
+        current = json.loads(manifest_client.download_blob().readall().decode('utf-8'))
+        if (str(current.get('sourceVersion') or '') != lineage
+                or int(current.get('deltaSeq') or 0) != seq - 1):
+            return None
+        current.update(deltaSeq=seq, deltaRows=int(current.get('deltaRows') or 0) + len(upserts) + len(deletes),
+                       updatedAt=datetime.now(timezone.utc).isoformat())
+        manifest_client.upload_blob(json.dumps(current, separators=(',', ':')).encode('utf-8'), overwrite=True,
+                                    content_settings=BlobContentSettings(content_type='application/json'),
+                                    etag=props.etag, match_condition=MatchConditions.IfNotModified)
+        return seq
+    except Exception:
+        _LOGGER.warning('Sort delta publication failed for %s', key, exc_info=True)
+        return None
+
+
+@catalog_publisher
+def refresh_user_sort_index_incremental(user_id: str) -> Dict[str, object]:
+    key = str(user_id or '').strip()
+    manifest = _load_sort_index_manifest(key)
+    if (not manifest.get('sourceVersion') or manifest.get('schemaVersion') != _SORT_INDEX_SCHEMA_VERSION):
+        return {'status': 'no_base'}
+    capacity = _sort_delta_capacity(manifest)
+    if capacity <= 0:
+        return {'status': 'needs_full'}
+    from index_work import read_bounded_dirty
+    dirty = read_bounded_dirty(_get_dirty_search_index_filenames, key, 'sort', max_rows=min(capacity, SORT_INDEX_DELTA_MAX_NAMES))
+    if dirty is None:
+        return {'status': 'unavailable'}
+    if not dirty:
+        return {'status': 'noop'}
+    if getattr(dirty, 'has_more', False) or getattr(dirty, 'truncated', False):
+        return {'status': 'more'}
+    names = sorted(dirty)
+    rows = _fetch_rows_by_names(key, names, _SORT_INDEX_SOURCE_FIELDS)
+    upserts, deletes = [], []
+    for name in names:
+        entity = rows.get(name)
+        if entity is None or str(entity.get('processing_state') or '').lower() == 'deleted':
+            deletes.append(name)
+        else:
+            row = _sort_index_row(entity)
+            (upserts if row is not None else deletes).append(row if row is not None else name)
+    for start in range(0, len(upserts) + len(deletes), SORT_INDEX_DELTA_CHUNK):
+        part_upserts = upserts[start:start + SORT_INDEX_DELTA_CHUNK]
+        part_deletes = deletes[start:start + SORT_INDEX_DELTA_CHUNK]
+        if _sort_publish_delta(key, part_upserts, part_deletes) is None:
+            return {'status': 'conflict'}
+    _clear_dirty_search_index_filenames(key, 'sort', dirty)
+    try:
+        manifest_client = _sort_index_blob_client(_sort_index_manifest_blob_name(key))
+        props = manifest_client.get_blob_properties()
+        current = json.loads(manifest_client.download_blob().readall().decode('utf-8'))
+        current['dirty'] = False
+        manifest_client.upload_blob(json.dumps(current, separators=(',', ':')).encode('utf-8'), overwrite=True,
+                                    content_settings=BlobContentSettings(content_type='application/json'),
+                                    etag=props.etag, match_condition=MatchConditions.IfNotModified)
+    except Exception:
+        return {'status': 'conflict'}
+    return {'status': 'delta', 'published': len(upserts) + len(deletes)}
 
 
 def _build_user_sort_index_snapshot(user_id: str, source_version: str) -> Optional[LexicalIndexSnapshot]:
@@ -6317,7 +6445,8 @@ def refresh_user_sort_index(
         _publish_skipped_sort_manifest(key, version, _library_row_count(key))
         return LexicalIndexSnapshot(user_id=key, source_version=version, schema_version=_SORT_INDEX_SCHEMA_VERSION,
                                     updated_at=version, rows=[])
-    return _refresh_rows_index_on_disk(
+    previous_delta_seq = int(_load_sort_index_manifest(key).get('deltaSeq') or 0)
+    result = _refresh_rows_index_on_disk(
         'sort', key, str(source_version or datetime.now(timezone.utc).isoformat()),
         schema_version=_SORT_INDEX_SCHEMA_VERSION,
         blob_name=_sort_index_json_blob_name(key),
@@ -6329,6 +6458,15 @@ def refresh_user_sort_index(
         incremental_only=incremental_only,
         cache_lock=_SORT_INDEX_CACHE_LOCK, cache=_SORT_INDEX_CACHE,
     )
+    if result is not None and not incremental_only and previous_delta_seq:
+        for seq in range(1, previous_delta_seq + 1):
+            client = _sort_index_blob_client(_sort_index_delta_blob_name(key, seq))
+            if client is not None:
+                try:
+                    client.delete_blob()
+                except Exception:
+                    pass
+    return result
 
 
 def ensure_user_sort_index_current(user_id: str) -> bool:
@@ -8616,6 +8754,9 @@ def get_index_manifest_summary(user_id: str, kind: str) -> Optional[Dict[str, ob
         'row_count': row_count,
         'schema_version': str(manifest.get('schemaVersion') or ''),
     }
+    if 'deltaSeq' in manifest:
+        summary['delta_seq'] = int(manifest.get('deltaSeq') or 0)
+    return summary
 
 
 def get_user_index_build_state(user_id: str) -> Dict[str, object]:

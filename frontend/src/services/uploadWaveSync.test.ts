@@ -300,6 +300,19 @@ it('discard surfaces server failure and can retry from the existing parent', asy
     expect(mocks.register).not.toHaveBeenCalled();
 });
 
+it('waits through the server finalization drain and retries discard automatically', async () => {
+    vi.useFakeTimers();
+    mocks.live = true;
+    const s = session(1, 'draining-discard');
+    mocks.abandon.mockRejectedValueOnce(new Error('Upload admission failed: A finalization is still in flight; retry abandonment later'))
+        .mockResolvedValueOnce({manifestRevision: 'closed', state: 'abandoned'});
+    const pending=discardWaveShadowSession(s);
+    await vi.advanceTimersByTimeAsync(31_000);
+    await expect(pending).resolves.toBeUndefined();
+    expect(mocks.abandon).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+});
+
 it('library members retain resolve/close discard when owner abandonment is forbidden', async () => {
     mocks.live = true;
     const s = session(1, 'member-discard');
@@ -373,6 +386,19 @@ it('Stop falls back to server closure when a lost finalize response conflicts wi
     await expect(stopWaveShadowSession(s)).resolves.toBeUndefined();
     expect(mocks.abandon).toHaveBeenCalledWith('stop-lost-response',undefined);
     expect(mocks.close).not.toHaveBeenCalled();
+});
+
+it('Stop waits through an in-flight finalization lease and closes automatically', async () => {
+    vi.useFakeTimers();
+    mocks.live=true;
+    const s=session(1,'stop-finalize-drain');
+    mocks.abandon.mockRejectedValueOnce(new Error('Upload admission failed: A finalization is still in flight; retry abandonment later'))
+        .mockResolvedValueOnce({state:'abandoned',manifestRevision:'stopped'});
+    const pending=stopWaveShadowSession(s);
+    await vi.advanceTimersByTimeAsync(31_000);
+    await expect(pending).resolves.toBeUndefined();
+    expect(mocks.abandon).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
 });
 
 it('Stop surfaces failed server closure so the caller keeps its recovery checkpoint', async () => {

@@ -166,6 +166,7 @@ def vision_dispatch(monkeypatch):
     wave = store.status(wave_id)
     key = wave['visionPendingKey']
     work = stage_work_store(EtagTable())
+    work.clock = lambda: 1000.0
     monkeypatch.setattr(runtime, 'stage_work_store', lambda table: work)
     assert dispatch_outbox(work, store, store.library, key, 'vision')
     scope = f'wave-vision:{wave_id}:{digest(key)}'
@@ -274,6 +275,9 @@ def test_real_vision_retry_replays_durable_completion_without_another_model_atte
     assert calls == ['original.jpg'] and sent[-1][3] == 2
     monkeypatch.setattr(wave_source_batch, 'commit_observations', original)
     # The normal short wake drives the real coordinator and receipt validation.
+    due = work._get(token)['notBefore']
+    assert runtime.consume(payload) == 'noop'  # An early duplicate cannot bypass it.
+    work.clock = lambda: due
     assert runtime.consume(payload) == 'done'
     assert calls == ['original.jpg']
     assert store._page(f"e!{wave['waveId']}!m!")[0]['outcome'] == 'settled'

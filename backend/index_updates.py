@@ -30,7 +30,7 @@ SEARCH_SCOPES = frozenset(('light', 'people', 'search'))
 # set; inline_index_merge.py, index_ownership.py, and app.py's
 # dispatch_scoped_rebuild all reference this constant instead of their own
 # copies, so there is nowhere left for the three to drift apart.
-INLINE_MERGE_SCOPES = ('people', 'albums', 'sort', 'access')
+INLINE_MERGE_SCOPES = ('people', 'albums', 'sort', 'access', 'search')
 
 # Ensuring an existing projection does not constitute another source change.
 READ_REASONS = frozenset((

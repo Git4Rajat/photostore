@@ -61,8 +61,9 @@ retain evidence/retry work or fail the source operation, not silently certify it
 
 | Index | Added or strengthened facility | Current activation |
 | --- | --- | --- |
-| Search SQLite | Bounded dirty captures, continuation, original-version acknowledgement | Existing search maintenance |
-| Sort/access | Strict incremental-only merges: defer instead of full-scan fallback | Existing inline path, subject to ownership/base/budget checks |
+| Search SQLite | Bounded dirty captures, continuation, original-version acknowledgement, base-plus-delta publication | Core attempts bounded slips; index worker remains the durable backstop and compactor |
+| Sort | Base-plus-delta correction slips with bounded dirty captures and browser delta application | Core attempts small slips; index worker remains the durable backstop and compactor |
+| Access | Strict incremental-only merges: defer instead of full-scan fallback | Existing inline path, subject to ownership/base/budget checks |
 | People/albums | Strict incremental-only merges, membership budgets, artifact CAS; album search dependency checks | Existing inline path, subject to real catalog serialization |
 | Lexical JSON | Streamed gzip merge with bounded changed rows and disk uniqueness table | Automatic certified filenames through existing maintenance work |
 | Photo vector | Streamed NPZ merge, SQLite row mappings, immutable data/manifest CAS | Automatic certified filenames through existing maintenance work |

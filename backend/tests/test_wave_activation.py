@@ -91,6 +91,17 @@ def test_wave_source_commit_defers_legacy_dirty_manifests_but_crud_does_not(monk
         assert 'tag_embedding' in touched and 'dirty_files' in touched
 
 
+def test_wave_owned_processing_status_does_not_schedule_search_or_sort_slips(monkeypatch):
+    import storage_utils as storage
+    touched = []
+    monkeypatch.setitem(storage._CTX, 'wave_owned', lambda library: True)
+    monkeypatch.setattr(storage, '_mark_search_index_dirty_filenames', lambda *a, **k: touched.append('dirty'))
+    monkeypatch.setattr(storage, 'touch_user_sort_index_state', lambda *a, **k: touched.append('sort'))
+    monkeypatch.setattr(storage, 'METADATA_INDEX_REQUEST_HOOK', lambda *a, **k: touched.append('wake'))
+    policy.source_change(lambda: storage.touch_user_sort_index_dirty('u', ['photo.jpg']))()
+    assert touched == []
+
+
 def test_reservation_cannot_change_source_or_accept_an_old_client():
     table=RuntimeTable();store=active(table)
     store.open_session('s',1);store.register('s',[dict(itemId='i',filename='a.jpg')])

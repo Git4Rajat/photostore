@@ -278,6 +278,9 @@ def fence_discard(store,session,*,reason,resumed_from=''):
     return store._retry(commit)
 
 
+FINALIZE_DISCARD_GRACE_SECONDS = 30
+
+
 def abandon(store,session,manifest_revision,*,reason):
     """Operator-confirmed stop, one bounded reservation page per call.
     Resolved sources remain members; unknown/missing reservations are cancelled,
@@ -294,7 +297,16 @@ def abandon(store,session,manifest_revision,*,reason):
         cursor=old.get('abandonCursor','')
         items=store._page('item!'+session+'!',cursor)
         reserved=[item for item in items if item['outcome']=='reserved']
-        if any(item.get('finalizeLeaseUntil',0)>store.clock() for item in reserved):
+        # fence_discard marks the parent abandoning before this scan. That
+        # prevents any new finalize request from passing admission. Keep a
+        # short drain window for requests that passed admission just before
+        # the fence, then let the normal per-write finalization checks reject
+        # any late writer. Waiting for each item's full ten-minute reservation
+        # lease made repeated retries look permanently undiscardable.
+        discard_at=old.get('discardRequestedAt',0)
+        blocks=lambda item: item.get('finalizeLeaseUntil',0)>store.clock() and (
+            not discard_at or discard_at+FINALIZE_DISCARD_GRACE_SECONDS>store.clock())
+        if any(blocks(item) for item in reserved):
             raise Conflict('A finalization is still in flight; retry abandonment later')
         # Cancel the bounded page atomically. One transaction per item used to
         # monopolize the shared wave/control rows while another tab registered.

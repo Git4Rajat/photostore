@@ -79,7 +79,7 @@ def wake(store,wave,stage):
     return dict(userId=store.library,waveId=wave,stage=stage,scope=scope,intentRevision=pending['revision'])
 
 
-def test_expired_vision_budget_releases_ownership_and_sends_continuation(live):
+def test_expired_vision_budget_releases_ownership_and_sends_continuation(live,monkeypatch):
     store,metadata,sent,_=live;wave=admit(store,metadata,1);payload=wake(store,wave,'vision')
     assert wave_runtime.consume(payload,deadline=time.monotonic()-1)=='done'
     lease=store._get(ExecutionLeases.key(store.library,wave,'vision'))
@@ -87,6 +87,9 @@ def test_expired_vision_budget_releases_ownership_and_sends_continuation(live):
     pending=stage_work_store(store.table)._get(stage_work_store(store.table).key(store.library,payload['scope']))
     assert pending['attempts']==0 and len(sent)==1 and sent[0][3]>0
     complete_source(store,metadata,'s-0.jpg')
+    assert wave_runtime.consume(payload)=='noop'
+    work=stage_work_store(store.table);work.clock=lambda:pending['notBefore']
+    monkeypatch.setattr(wave_runtime,'stage_work_store',lambda table:work)
     wave_runtime.consume(payload)
     assert store.status(wave)['state']=='indexing'
 

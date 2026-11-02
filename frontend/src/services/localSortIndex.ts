@@ -47,6 +47,8 @@ interface SortIndexResponse {
     indexUrl?: string;
     sourceVersion?: string;
     updatedAt?: string;
+    deltaSeq?: number;
+    deltaUrls?: string[];
 }
 
 interface StoredSortIndex {
@@ -54,6 +56,7 @@ interface StoredSortIndex {
     sourceVersion: string;
     updatedAt: string;
     rows: SortIndexRow[];
+    deltaSeq?: number;
     removedRows?: Record<string, string>;
 }
 
@@ -208,6 +211,28 @@ const downloadSortIndexBlob = async (indexUrl: string, scope: string, current: (
     return rows;
 };
 
+const downloadSortDelta = async (url: string): Promise<{ upserts?: Record<string, unknown>[]; deletes?: string[] }> => {
+    const buffer = await fetchWithTimeout(url, BLOB_FETCH_TIMEOUT_MS);
+    let text: string;
+    try { text = new TextDecoder().decode(buffer); } catch { text = ''; }
+    if (!text.trim().startsWith('{')) text = await decompressGzip(buffer);
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+};
+
+const applySortDeltas = async (rows: SortIndexRow[], urls: string[]): Promise<SortIndexRow[]> => {
+    const byName = new Map(rows.map((row) => [row.filename, row]));
+    for (const url of urls) {
+        const delta = await downloadSortDelta(url);
+        for (const name of delta.deletes ?? []) byName.delete(String(name));
+        for (const raw of delta.upserts ?? []) {
+            const normalized = normalizeRows([raw])[0];
+            if (normalized) byName.set(normalized.filename, normalized);
+        }
+    }
+    return Array.from(byName.values());
+};
+
 // Keyed by active library, same reasoning as the former browser search index's indexKey/
 // photoCache.ts's photoCacheKey -- switching libraries can't serve one
 // library's rows while browsing another.
@@ -275,10 +300,12 @@ const fetchLocalSortIndex = async (key: string, requestGeneration: number, editS
         return null;
     }
     const sourceVersion = response.sourceVersion || '';
+    const deltaSeq = Number(response.deltaSeq || 0);
     const idbStarted = perfNow();
     const stored = await idbGetStored(key).catch(() => null);
     readStoredRemovals(key, stored);
     const storedMatches = stored && sourceVersion && stored.sourceVersion === sourceVersion
+        && Number(stored.deltaSeq || 0) === deltaSeq
         && (!stored.payloadVersion || stored.payloadVersion === sourceVersion);
     perf.recordSpan('index.sort.idb_read', perfNow() - idbStarted, { cached: Boolean(storedMatches) });
     if (storedMatches) {
@@ -292,7 +319,14 @@ const fetchLocalSortIndex = async (key: string, requestGeneration: number, editS
         if (stored.payloadVersion) snapshotVersions.set(visible, stored.payloadVersion);
         return visible;
     }
-    const rows = await downloadSortIndexBlob(response.indexUrl, editScope, () => generation === requestGeneration, readTokens);
+    let rows: SortIndexRow[];
+    if (stored && sourceVersion && stored.sourceVersion === sourceVersion
+        && Number(stored.deltaSeq || 0) < deltaSeq && response.deltaUrls?.length) {
+        const pending = response.deltaUrls.slice(Number(stored.deltaSeq || 0));
+        rows = await applySortDeltas(stored.rows, pending);
+    } else {
+        rows = await downloadSortIndexBlob(response.indexUrl, editScope, () => generation === requestGeneration, readTokens);
+    }
     filterRemovedRows(key, rows, generation === requestGeneration);
     // An invalidation (bumping `generation`) during this download can let a
     // newer request's write land in IndexedDB first, then have this now-stale
@@ -304,7 +338,7 @@ const fetchLocalSortIndex = async (key: string, requestGeneration: number, editS
     // write regressing this one (or vice versa).
     if (generation === requestGeneration) {
         const writeStarted = perfNow();
-        await idbPutStoredIfNewer(key, { sourceVersion, payloadVersion: snapshotVersions.get(rows), updatedAt: response.updatedAt || '', rows,
+        await idbPutStoredIfNewer(key, { sourceVersion, payloadVersion: snapshotVersions.get(rows), updatedAt: response.updatedAt || '', rows, deltaSeq,
             removedRows: Object.fromEntries(removalsFor(key)) }).catch(() => {
             // Best-effort persistence -- an in-memory-only session still works,
             // it just re-downloads next reload instead of skipping the fetch.

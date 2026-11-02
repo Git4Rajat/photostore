@@ -77,7 +77,7 @@ def test_tools_status_detects_a_scoped_job_without_a_full_job(worker, monkeypatc
 
 
 def test_read_poll_during_build_does_not_create_a_followup_loop(worker, monkeypatch):
-    app.enqueue_index_build('A', reason='person-label', scope='people')
+    app.enqueue_index_build('A', reason='person-label', scope='people', coalesce=False)
     def run(*args):
         assert app.enqueue_index_build('A', reason='serving-process', scope='people') == 'already_active'
     monkeypatch.setattr(app, '_run_index_build_job', run)
@@ -97,13 +97,13 @@ def test_read_poll_does_not_report_poison_revision_as_active(worker):
 
 
 def test_edit_during_build_gets_one_durable_followup(worker, monkeypatch):
-    app.enqueue_index_build('A', reason='person-label', scope='people')
+    app.enqueue_index_build('A', reason='person-label', scope='people', coalesce=False)
     runs = []
     def run(*args):
         runs.append(args)
         if len(runs) == 1:
-            assert app.enqueue_index_build('A', reason='person-label', scope='people') == 'already_active'
-            assert app.enqueue_index_build('A', reason='person-label', scope='people') == 'already_active'
+            assert app.enqueue_index_build('A', reason='person-label', scope='people', coalesce=False) == 'already_active'
+            assert app.enqueue_index_build('A', reason='person-label', scope='people', coalesce=False) == 'already_active'
     monkeypatch.setattr(app, '_run_index_build_job', run)
     app._run_index_maintenance_payload(worker.sent[0])
     assert len(worker.sent) == 2
