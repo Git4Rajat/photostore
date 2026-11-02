@@ -32,11 +32,11 @@ export const waveProtocol = async (): Promise<'live' | 'legacy'> => {
 // requestJson throws ApiError; direct Axios shapes remain supported for
 // callers/tests that bypass it. Preserve structured application failures.
 const waveFailure = (error: unknown) => {
-    const failure=error as {status?:number;responseData?:unknown;rawMessage?:string;message?:string;
+    const failure=error as {status?:number;responseData?:unknown;rawMessage?:string;message?:string;retriable?:boolean;
         response?:{status?:number;data?:unknown}};
     const raw=failure?.response?.data ?? failure?.responseData;
     const body=raw && typeof raw==='object' ? raw as {code?:string;error?:unknown} : undefined;
-    return {status:failure?.response?.status ?? failure?.status,body,
+    return {status:failure?.response?.status ?? failure?.status,body,retriable:failure?.retriable===true,
         message:typeof body?.error==='string' ? body.error : failure?.message};
 };
 
@@ -53,6 +53,7 @@ const callShadow = async <T = unknown>(
         const cleanupDeadline=Date.now()+90_000;
         let contentionRetries=0;
         let cleanupRetries=0;
+        let transientRetries=0;
         for (;;) {
             if (sessionScope() !== scope) return null;
             try { return await postUpload<T>(path, payload, config); }
@@ -65,6 +66,18 @@ const callShadow = async <T = unknown>(
                     const remaining=cleanupDeadline-Date.now();
                     if (remaining<=0) throw error;
                     const delay=Math.min(remaining,5000,1000*2**Math.min(++cleanupRetries,3));
+                    await new Promise(resolve => setTimeout(resolve,delay));
+                    continue;
+                }
+                // Live session open and item registration are idempotent by
+                // stable session/item identity. A timeout may mean the server
+                // committed but its response was lost, so replay the exact
+                // payload rather than forcing the user to restart admission.
+                const transientAdmission=admission && (failure.retriable
+                    || failure.body?.code==='wave_admission_retry'
+                    || [502,503,504].includes(failure.status || 0));
+                if (transientAdmission && transientRetries<3) {
+                    const delay=750*2**transientRetries++ + Math.random()*250;
                     await new Promise(resolve => setTimeout(resolve,delay));
                     continue;
                 }

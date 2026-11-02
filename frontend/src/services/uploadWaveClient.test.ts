@@ -122,6 +122,35 @@ it('does not retry a permanent admission conflict', async () => {
     expect(mocks.post).toHaveBeenCalledTimes(1);
 });
 
+it('automatically retries a timed-out live admission with the identical payload', async () => {
+    vi.useFakeTimers();
+    try {
+        vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
+        mocks.post.mockRejectedValueOnce(new ApiError({kind:'timeout',retriable:true,requestId:'timeout',
+            message:'The server took too long to respond. Please try again in a moment.',rawMessage:'timeout'}))
+            .mockResolvedValueOnce({waveId:'wave-1',manifestRevision:'opened'});
+        const pending=openWaveShadowSession('slow-start',30);
+        await vi.runAllTimersAsync();
+        await expect(pending).resolves.toMatchObject({manifestRevision:'opened'});
+        expect(mocks.post).toHaveBeenCalledTimes(2);
+        expect(mocks.post.mock.calls[0][1]).toEqual(mocks.post.mock.calls[1][1]);
+    } finally { vi.useRealTimers(); }
+});
+
+it('bounds automatic retries for unavailable live admission', async () => {
+    vi.useFakeTimers();
+    try {
+        vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
+        mocks.post.mockRejectedValue(new ApiError({kind:'unreachable',status:503,retriable:true,requestId:'unavailable',
+            message:"Can't reach the server right now",rawMessage:'Service unavailable'}));
+        const pending=openWaveShadowSession('unavailable',30);
+        const checked=expect(pending).rejects.toThrow("Can't reach the server right now");
+        await vi.runAllTimersAsync();
+        await checked;
+        expect(mocks.post).toHaveBeenCalledTimes(4);
+    } finally { vi.useRealTimers(); }
+});
+
 it('bounds contention retries and stops replay if the authenticated scope changes', async () => {
     vi.useFakeTimers();
     try {
