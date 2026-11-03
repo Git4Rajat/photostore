@@ -61,6 +61,7 @@ class EtagTable:
         pk = query.split("'")[1]
         with self.lock:
             rows = [Entity(row, self.versions[key]) for key, row in self.rows.items() if key[0] == pk]
+        rows.sort(key=lambda r: str(r.get('RowKey', '')))
         if ' and libraryId eq ' in query:
             library = query.split(' and libraryId eq ')[1].split("'")[1]
             rows = [row for row in rows if row.get('libraryId') == library]
@@ -68,6 +69,12 @@ class EtagTable:
             rows = [row for row in rows if not row.get('failed')]
         if 'failed eq true' in query:
             rows = [row for row in rows if row.get('failed')]
+        m_gt = re.search(r"RowKey gt '([^']*)'", query)
+        if m_gt:
+            rows = [row for row in rows if str(row.get('RowKey', '')) > m_gt.group(1)]
+        m_le = re.search(r"RowKey le '([^']*)'", query)
+        if m_le:
+            rows = [row for row in rows if str(row.get('RowKey', '')) <= m_le.group(1)]
         for field in ('leaseUntil', 'wakeUntil', 'requestedAt', 'failedAt'):
             match = re.search(rf'{field} le ([0-9.]+)', query)
             if match:
@@ -77,6 +84,8 @@ class EtagTable:
 
 @pytest.fixture
 def work():
+    from index_work import _RECOVERY_CURSORS
+    _RECOVERY_CURSORS.clear()
     table = EtagTable()
     now = [1000.0]
     return WorkStore(table, clock=lambda: now[0]), table, now
@@ -91,6 +100,24 @@ def test_reserved_work_cannot_starve_later_libraries(work):
     sent = []
     assert store.recover(lambda *args: sent.append(args), limit=1) == 1
     assert sent[0][0] == 'ready'
+
+
+def test_wave_waiting_work_cannot_starve_later_libraries(work, monkeypatch):
+    import automatic_index_updates as automatic
+    monkeypatch.setattr(automatic, 'wave_pending', lambda lib: lib.startswith('wave-'))
+    store, _, now = work
+    # 105 rows waiting for active upload waves with expired wakeUntil
+    for i in range(105):
+        key = store.request(f'wave-{i}', 'vector')
+        claim = store.claim(key)
+        store.release(claim, deferred=True, retry_delay=0, retry_reason='wave_wait')
+        # Simulate elapsed backup wake timer
+        row = store._get(key)
+        store._replace(row, dict(row, wakeUntil=now[0]))
+    store.request('unrelated-ready', 'search')
+    sent = []
+    assert store.recover(lambda *args: sent.append(args), limit=1) == 1
+    assert sent[0][0] == 'unrelated-ready'
 
 
 def test_dirty_ack_keeps_conditional_deletes_batched():
@@ -361,3 +388,69 @@ def test_malformed_optional_retry_telemetry_cannot_block_a_claim(work):
         retryScheduleRevision=current['revision'], retryScheduleId='invalid'), etag=current.metadata['etag'])
     claim = store.claim(key)
     assert claim and not claim.schedule_id
+
+
+def test_wave_handoff_lost_send_response_replays_same_operation_without_timer(work):
+    store, table, now = work
+    key = store.request('A', 'vector')
+    claim = store.claim(key)
+    store.release(claim, deferred=True, retry_reason='wave_wait')
+    accepted = []
+    def lost_response(*args):
+        accepted.append(args)  # Queue accepted, but the client cannot prove it.
+        raise OSError('send response lost')
+    with pytest.raises(OSError, match='response lost'):
+        store.resume_wave_waits('A', lost_response, scopes={'vector'})
+    assert store._get(key)['retryReason'] == 'wave_wait'
+    assert store.resume_wave_waits('A', lambda *args: accepted.append(args), scopes={'vector'}) == 1
+    assert accepted[0] == accepted[1]
+    assert now[0] == 1000.0
+    assert store.resume_wave_waits('A', lambda *args: pytest.fail('handoff already accepted'),
+        scopes={'vector'}) == 0
+
+
+def test_recovery_cursor_advances_past_large_waiting_backlog(work, monkeypatch):
+    import automatic_index_updates as automatic
+    monkeypatch.setattr(automatic, 'wave_pending', lambda lib: lib.startswith('waiting-'))
+    store, table, now = work
+
+    # Insert 1050 waiting rows with row keys sorted 'w-0000' ... 'w-1049'
+    for i in range(1050):
+        key = f'w-{i:04d}'
+        table.create_entity({
+            'PartitionKey': store.partition,
+            'RowKey': key,
+            'libraryId': f'waiting-{i}',
+            'scope': 'vector',
+            'revision': 'rev',
+            'failed': False,
+            'leaseUntil': 0.0,
+            'wakeUntil': 0.0,
+            'notBefore': 0.0,
+            'retryReason': 'wave_wait',
+        })
+
+    # Insert 1 runnable row with row key 'z-runnable' (after all waiting rows)
+    table.create_entity({
+        'PartitionKey': store.partition,
+        'RowKey': 'z-runnable',
+        'libraryId': 'runnable',
+        'scope': 'search',
+        'revision': 'rev',
+        'failed': False,
+        'leaseUntil': 0.0,
+        'wakeUntil': 0.0,
+        'notBefore': 0.0,
+        'retryReason': '',
+    })
+
+    sent = []
+    # Pass 1: max_scan is 1000. It scans first 1000 waiting rows and stops.
+    assert store.recover(lambda *args: sent.append(args), limit=1) == 0
+    assert not sent
+
+    # Pass 2: With cursor tracking, it resumes from cursor ('w-0999')
+    # scans remaining 50 waiting rows and finds 'z-runnable'!
+    assert store.recover(lambda *args: sent.append(args), limit=1) == 1
+    assert len(sent) == 1
+    assert sent[0][0] == 'runnable'

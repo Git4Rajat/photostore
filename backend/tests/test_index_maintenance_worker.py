@@ -111,6 +111,20 @@ def test_edit_during_build_gets_one_durable_followup(worker, monkeypatch):
     assert len(runs) == 2 and worker.table.rows == {}
 
 
+def test_metadata_edit_during_search_build_gets_durable_followup(worker, monkeypatch):
+    app.enqueue_index_build('A', reason='metadata-change', scope='search', coalesce=False)
+    runs = []
+    def run(*args):
+        runs.append(args)
+        if len(runs) == 1:
+            assert app.enqueue_index_build('A', reason='metadata-change', scope='search', coalesce=False) == 'already_active'
+    monkeypatch.setattr(app, '_run_index_build_job', run)
+    app._run_index_maintenance_payload(worker.sent[0])
+    assert len(worker.sent) == 2
+    app._run_index_maintenance_payload(worker.sent[1])
+    assert len(runs) == 2 and worker.table.rows == {}
+
+
 def test_duplicate_wakeup_after_completion_is_a_noop(worker, monkeypatch):
     app.enqueue_index_build('A', scope='people')
     run = Mock()

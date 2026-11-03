@@ -115,6 +115,25 @@ def face_row(filename, revision='rev-1'):
 
 # --- Part 2/7: durable release -> real queue delivery, crash/duplicate tolerance ---
 
+def test_required_handoff_retries_an_unsent_queue_reservation(world):
+    store, work, leases, table, work_table = world
+    row = store.open_session('p', 0)
+    close(store, 'p', row)
+    key = store.status(row['waveId'])['visionPendingKey']
+    calls = []
+    def unavailable(*args):
+        calls.append(args)
+        raise OSError('send failed before queue acceptance')
+    with pytest.raises(OSError):
+        release_and_relay(work, store, store.library, key, 'vision', unavailable)
+    intent = next(iter(work_table.rows.values()))
+    assert intent['wakeUntil'] > work.clock()
+    accepted = []
+    assert release_and_relay(work, store, store.library, key, 'vision',
+        lambda *args: accepted.append(args), require_delivery=True)
+    assert accepted == calls  # Same operation identity, without waiting for expiry.
+
+
 def test_crash_after_outbox_commit_before_send_is_retried_by_recover(world, monkeypatch):
     store, _unused_work, leases, table, work_table = world
     now = [1000.0]

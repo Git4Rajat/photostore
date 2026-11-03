@@ -390,3 +390,84 @@ def test_consume_on_cancelled_wave_resumes_maintenance_and_relays_successor(monk
     monkeypatch.setattr(runtime, 'run_vision_release', cancel_wave)
     assert runtime.consume(payload) == 'done'
     assert resumed == [store.library]
+
+
+def test_completed_wave_redelivery_executes_pending_handoffs_without_early_noop(monkeypatch, vision_dispatch):
+    store, work, wave, token, payload, sent = vision_dispatch
+    # Mark wave complete with pending handoffs
+    existing = store._required(store.wave_key(wave['waveId']))
+    store.table.rows[(store.partition, store.wave_key(wave['waveId']))] = dict(
+        existing, state='complete', completionReceiptId='rcpt-1',
+        pendingHandoffs=json.dumps(['index_maintenance', 'successor']),
+    )
+    resumed = []
+    relayed = []
+    monkeypatch.setattr(runtime, 'resume_completed_wave_maintenance', lambda lib: resumed.append(lib))
+    monkeypatch.setattr(runtime, 'relay_successor', lambda w, s, wid, snd, **kw: relayed.append(wid))
+
+    # Redelivered message must NOT return 'noop'; it must execute pending handoffs and return 'done'
+    assert runtime.consume(payload) == 'done'
+    assert resumed == [store.library]
+    assert relayed == [wave['waveId']]
+
+    # Handoffs are now durably marked complete
+    updated = store._required(store.wave_key(wave['waveId']))
+    assert store.pending_handoffs(updated) == []
+
+    # Subsequent redelivery sees all handoffs finished, returns 'done' without repeating work
+    resumed.clear()
+    relayed.clear()
+    assert runtime.consume(payload) == 'done'
+    assert resumed == []
+    assert relayed == []
+
+
+def test_failed_handoff_retains_wave_message_and_retries_only_unfinished(monkeypatch, vision_dispatch):
+    store, work, wave, token, payload, sent = vision_dispatch
+    existing = store._required(store.wave_key(wave['waveId']))
+    store.table.rows[(store.partition, store.wave_key(wave['waveId']))] = dict(
+        existing, state='complete', completionReceiptId='rcpt-1',
+        pendingHandoffs=json.dumps(['index_maintenance', 'successor']),
+    )
+    resumed = []
+    relayed = []
+
+    # Step 1: Maintenance handoff fails
+    def fail_maintenance(lib):
+        resumed.append(lib)
+        raise RuntimeError('maintenance queue down')
+    monkeypatch.setattr(runtime, 'resume_completed_wave_maintenance', fail_maintenance)
+    monkeypatch.setattr(runtime, 'relay_successor', lambda w, s, wid, snd, **kw: relayed.append(wid))
+
+    assert runtime.consume(payload) == 'retry'
+    assert resumed == [store.library]
+    assert relayed == []
+    # Both handoffs still pending
+    assert store.pending_handoffs(store._required(store.wave_key(wave['waveId']))) == ['index_maintenance', 'successor']
+
+    # Step 2: Maintenance succeeds, but successor relay fails
+    resumed.clear()
+    monkeypatch.setattr(runtime, 'resume_completed_wave_maintenance', lambda lib: resumed.append(lib))
+    def fail_successor(w, s, wid, snd, **kw):
+        relayed.append(wid)
+        raise RuntimeError('successor relay failed')
+    monkeypatch.setattr(runtime, 'relay_successor', fail_successor)
+
+    assert runtime.consume(payload) == 'retry'
+    assert resumed == [store.library]
+    assert relayed == [wave['waveId']]
+    # Maintenance was completed, only successor is pending
+    assert store.pending_handoffs(store._required(store.wave_key(wave['waveId']))) == ['successor']
+
+    # Step 3: Redelivery retries ONLY the unfinished handoff (successor)
+    resumed.clear()
+    relayed.clear()
+    monkeypatch.setattr(runtime, 'relay_successor', lambda w, s, wid, snd, **kw: relayed.append(wid))
+
+    assert runtime.consume(payload) == 'done'
+    # Maintenance was NOT re-run!
+    assert resumed == []
+    # Successor was retried and succeeded
+    assert relayed == [wave['waveId']]
+    # All handoffs completed durably
+    assert store.pending_handoffs(store._required(store.wave_key(wave['waveId']))) == []

@@ -306,7 +306,7 @@ def test_wave_blocked_tag_job_does_not_acquire_catalog_lease(env, monkeypatch):
     assert len(env.queue.sent) == 0
     for _ in range(20):
         assert app._process_ipwork_message(msg) == 'tag_index_noop'
-    assert len(env.queue.sent) == 0  # No wakeups while wave is pending.
+    assert len(env.queue.sent) == 0  # No extra wakeups while wave is pending.
 
 
 def test_terminal_wave_signal_resumes_tag_recovery_wake(env, monkeypatch):

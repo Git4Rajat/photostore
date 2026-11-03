@@ -356,7 +356,8 @@ def begin_library_cleanup(table,metadata,library):
         def cancel():
             current=store._required(wave['RowKey']);control=store._required('control')
             store._commit(control,[store._change(current,dict(current,state='cancelled',
-                cancellationReason='library_cleanup',lastProgressAt=store.clock(),stateEnteredAt=store.clock()))],maintenance=True)
+                cancellationReason='library_cleanup',lastProgressAt=store.clock(),stateEnteredAt=store.clock(),
+                pendingHandoffs=json.dumps(['index_maintenance', 'successor'])))],maintenance=True)
         store._retry(cancel)
     def detach():
         control=store._get('control')

@@ -253,6 +253,7 @@ def test_wave_completion_resumes_maintenance_before_recovery_deadline(clocked, m
     pending[0] = False
     assert app.resume_index_maintenance_after_wave('A') == 1
     assert env.sent[-1][-1] == 0
+    assert len(env.sent) == 1
     assert app.resume_index_maintenance_after_wave('A') == 0
     assert app._run_index_maintenance_payload(payload) == 'intent_completed'
     assert env.store._get(key) is None
@@ -295,12 +296,70 @@ def test_completion_send_failure_keeps_intent_recoverable(clocked, monkeypatch):
     env.store.release(claim, deferred=True, retry_delay=300, retry_reason='wave_wait')
     monkeypatch.setattr(app, '_send_index_wakeup', Mock(side_effect=OSError('queue down')))
     import wave_runtime
-    assert wave_runtime.resume_completed_wave_maintenance('A') == 0
+    monkeypatch.setattr(wave_runtime.time, 'sleep', lambda _: None)
+    with pytest.raises(OSError, match='queue down'):
+        wave_runtime.resume_completed_wave_maintenance('A')
     row = env.store._get(key)
     assert not row['failed'] and row['notBefore'] == 0
-    env.now[0] = row['wakeUntil']
-    assert env.store.recover(lambda *args: env.sent.append(args)) == 1
+    assert row['retryReason'] == 'wave_wait'
+    # The retained wave receipt retries delivery, without waiting for a sweep.
+    monkeypatch.setattr(app, '_send_index_wakeup', lambda *args: env.sent.append(args))
+    assert wave_runtime.resume_completed_wave_maintenance('A') == 1
     assert env.sent[-1][-1] == 0
+
+
+def test_wave_receipt_is_retained_until_real_maintenance_send_succeeds(clocked, monkeypatch):
+    from tests.test_upload_waves import AtomicTable, close
+    from upload_waves import ShadowWaves
+    import wave_runtime
+
+    env = clocked
+    pending = [True]
+    monkeypatch.setattr(automatic, 'wave_pending', lambda _: pending[0])
+    monkeypatch.setattr(app, '_run_index_build_job', Mock(side_effect=automatic.SourceBusy('active wave')))
+    key = env.store.request('A', 'vector')
+    maintenance = dict(userId='A', scope='vector', jobId='job', maintenanceKey=key)
+    assert app._run_index_maintenance_payload(maintenance) == 'deferred'
+    revision = env.store._get(key)['revision']
+
+    waves = ShadowWaves(AtomicTable(), 'A')
+    session = waves.open_session('session', 0)
+    close(waves, 'session', session)
+    wave_id = session['waveId']
+    row = waves._required(waves.wave_key(wave_id))
+    waves.table.submit_transaction([waves._change(row, dict(row, state='complete',
+        pendingHandoffs=json.dumps(['index_maintenance', 'successor'])))])
+    pending[0] = False
+    monkeypatch.setattr(wave_runtime.time, 'sleep', lambda _: None)
+    successor = Mock()
+    monkeypatch.setattr(wave_runtime, 'relay_successor', successor)
+    send = Mock(side_effect=OSError('queue unavailable'))
+    monkeypatch.setattr(app, '_send_index_wakeup', send)
+
+    deleted, updated = [], []
+    queue = SimpleNamespace(delete_message=lambda message: deleted.append(message),
+        update_message=lambda message, **kwargs: updated.append(kwargs))
+    message = SimpleNamespace(content=json.dumps(dict(type='upload_wave_stage', userId='A', waveId=wave_id)),
+        dequeue_count=1)
+    def dispatch(*args):
+        return wave_runtime.execute_wave_handoffs(env.store, waves, 'A', wave_id, lambda *args: None)
+
+    app._process_clustering_queue_message_impl(message, queue, 'index', 5, dispatch=dispatch)
+    assert not deleted and updated == [dict(visibility_timeout=10)]
+    assert send.call_count == 3
+    assert waves.pending_handoffs(waves._required(waves.wave_key(wave_id))) == ['index_maintenance', 'successor']
+    assert env.store._get(key)['retryReason'] == 'wave_wait'
+    successor.assert_not_called()
+
+    # Queue recovery alone suffices; no clock advance or recovery sweep.
+    send.side_effect = None
+    app._process_clustering_queue_message_impl(message, queue, 'index', 5, dispatch=dispatch)
+    assert deleted == [message]
+    assert waves.pending_handoffs(waves._required(waves.wave_key(wave_id))) == []
+    assert env.store._get(key)['retryReason'] == ''
+    assert all(call.args == ('A', 'vector', revision, 0) for call in send.call_args_list)
+    successor.assert_called_once()
+    app._run_index_build_job.assert_called_once()  # Redelivery only repaired handoffs.
 
 
 def test_index_worker_reports_processing_and_deferred_outcome(monkeypatch, caplog):
@@ -335,20 +394,16 @@ def test_wave_wait_eliminates_unnecessary_wakeups_and_resumes_on_completion(cloc
     payload = dict(type=app.INDEX_BUILD_JOB_TYPE, userId='A', scope='vector', jobId='job',
                    maintenanceKey=key)
 
-    # 1st attempt: defers with wave_wait, sends ZERO queue wakeups
-    app._run_index_maintenance_payload(payload)
+    # 1st attempt: defers with wave_wait, zero queue messages scheduled
+    assert app._run_index_maintenance_payload(payload) == 'deferred'
     row = env.store._get(key)
     assert row['retryReason'] == 'wave_wait'
     assert row['notBefore'] == 0
     assert len(env.sent) == 0
 
-    # Repeated calls while wave is active: all defer with 0 queue sends
+    # Redeliveries / duplicate wakes while wave is active: claim is refused, 0 wakeups sent
     for _ in range(5):
-        env.now[0] += 3600
-        app._run_index_maintenance_payload(payload)
-        row = env.store._get(key)
-        assert row['retryReason'] == 'wave_wait'
-        assert row['notBefore'] == 0
+        assert app._run_index_maintenance_payload(payload) == 'obsolete'
         assert len(env.sent) == 0
 
     # Wave is still active: periodic recover() skips wave_wait and sends 0 wakeups
@@ -384,3 +439,44 @@ def test_wave_runtime_resumes_maintenance_on_cancelled_wave(clocked, monkeypatch
     assert resumed == 1
     assert env.store._get(key)['notBefore'] == 0
     assert env.sent[-1][-1] == 0
+
+
+def test_failed_retry_message_keeps_current_queue_message(clocked, monkeypatch):
+    env = clocked
+    monkeypatch.setattr(automatic, 'wave_pending', lambda _: False)
+    monkeypatch.setattr(automatic, 'run', Mock(side_effect=automatic.SourceBusy('source busy')))
+    monkeypatch.setattr(app, '_send_index_wakeup', Mock(side_effect=OSError('queue down')))
+
+    key = env.store.request('A', 'vector')
+    revision = env.store._get(key)['revision']
+    payload = dict(type=app.INDEX_BUILD_JOB_TYPE, userId='A', scope='vector', jobId='job',
+                   maintenanceKey=key, intentRevision=revision)
+
+    deleted = []
+    updated = []
+    msg = SimpleNamespace(content=json.dumps(payload), dequeue_count=1, id='msg-1', pop_receipt='pr-1')
+    queue_mock = SimpleNamespace(
+        delete_message=lambda m: deleted.append(m),
+        update_message=lambda m, visibility_timeout: updated.append((m, visibility_timeout)),
+    )
+
+    app._process_clustering_queue_message_impl(
+        msg, queue_mock, 'photostore-index-maintenance', 3,
+        dispatch=lambda *a: app._run_index_maintenance_payload(payload),
+    )
+
+    # Message was NOT deleted because replacement send failed
+    assert len(deleted) == 0
+    # Visibility was updated to 10s to allow redelivery
+    assert len(updated) == 1
+    assert updated[0][1] == 10
+
+    # Now queue recovers and reservation expires, replacement send succeeds:
+    env.now[0] = env.store._get(key)['wakeUntil']
+    monkeypatch.setattr(app, '_send_index_wakeup', Mock(return_value=True))
+    app._process_clustering_queue_message_impl(
+        msg, queue_mock, 'photostore-index-maintenance', 3,
+        dispatch=lambda *a: app._run_index_maintenance_payload(payload),
+    )
+    # Message IS deleted now because replacement was durably sent
+    assert len(deleted) == 1

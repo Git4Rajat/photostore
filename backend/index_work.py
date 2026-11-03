@@ -20,6 +20,7 @@ from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, Re
 from azure.data.tables import TableTransactionError, UpdateMode
 
 PARTITION = 'index-maintenance-pending'
+_RECOVERY_CURSORS = {}
 
 
 def etag(row):
@@ -255,7 +256,7 @@ class WorkStore:
                 return False
             if current.get('retryReason') == 'wave_wait':
                 import automatic_index_updates as automatic
-                if automatic.wave_pending(current.get('libraryId')):
+                if automatic.wave_pending(current['libraryId']):
                     return False
             delay = max(0, math.ceil(float(current.get('notBefore') or 0) - now),
                         math.ceil(minimum_delay))
@@ -322,14 +323,14 @@ class WorkStore:
             now = self.clock()
             if float(current.get('leaseUntil') or 0) > now:
                 raise WorkLeased('Maintenance work is already leased')
+            if current.get('retryReason') == 'wave_wait':
+                import automatic_index_updates as automatic
+                if automatic.wave_pending(current['libraryId']):
+                    return None
             if float(current.get('notBefore') or 0) > now:
                 # Queue messages are advisory, including stale duplicates.
                 # Do not consume attempts or clear the reserved delayed wake.
                 return None
-            if current.get('retryReason') == 'wave_wait':
-                import automatic_index_updates as automatic
-                if automatic.wave_pending(current.get('libraryId')):
-                    return None
             owner = str(uuid.uuid4())
             attempt = (int(current.get('attempts') or 0) + 1
                        if current.get('attemptRevision') == current['revision'] else 1)
@@ -445,42 +446,72 @@ class WorkStore:
         raise RuntimeError('Maintenance completion contention')
 
     def recover(self, send, *, limit=100, library=None):
-        query = f"PartitionKey eq '{self.partition}' and failed eq false"
+        base_query = f"PartitionKey eq '{self.partition}' and failed eq false"
         if library is not None:
-            query += " and libraryId eq '" + library.replace("'", "''") + "'"
+            base_query += " and libraryId eq '" + library.replace("'", "''") + "'"
         # Exclude reserved work server-side before applying the bounded page.
         # Otherwise the same first 100 leased rows starve every later library.
         now = float(self.clock())
-        query += f' and leaseUntil le {now} and wakeUntil le {now}'
-        import itertools
+        base_query += f' and leaseUntil le {now} and wakeUntil le {now}'
+
+        cursor = _RECOVERY_CURSORS.get((self.partition, library))
+        if cursor:
+            safe_cursor = cursor.replace("'", "''")
+            query_chain = [
+                f"{base_query} and RowKey gt '{safe_cursor}'",
+                f"{base_query} and RowKey le '{safe_cursor}'",
+            ]
+        else:
+            query_chain = [base_query]
+
         sent = 0
-        for row in itertools.islice(self.table.query_entities(query), limit):
-            if row.get('retryReason') == 'wave_wait':
-                import automatic_index_updates as automatic
-                if automatic.wave_pending(row.get('libraryId')):
+        scanned = 0
+        max_scan = max(limit * 10, 1000)
+        last_row_key = None
+        for query in query_chain:
+            for row in self.table.query_entities(query):
+                last_row_key = row.get('RowKey')
+                scanned += 1
+                if row.get('retryReason') == 'wave_wait':
+                    import automatic_index_updates as automatic
+                    if automatic.wave_pending(row.get('libraryId')):
+                        try:
+                            self._replace(row, dict(row, wakeUntil=now + self.lease_seconds))
+                        except Exception:
+                            pass
+                        if scanned >= max_scan:
+                            break
+                        continue
+                # One row's send() failing (e.g. a stage's queue client
+                # unavailable) must not abort the whole batch -- the untouched
+                # row stays eligible and a later recover() call retries it,
+                # same as any other advisory wake in this module. Contention on
+                # the reservation write itself (WakeupContention) is handled the
+                # same way -- skip and let a later pass retry -- but kept as a
+                # distinct, nameable type rather than conflated with a generic
+                # send() failure, so a caller that wants to tell them apart (e.g.
+                # for metrics on a hot row) can.
+                try:
+                    sent += int(self.notify(row['RowKey'], send))
+                except WakeupContention:
                     continue
-            # One row's send() failing (e.g. a stage's queue client
-            # unavailable) must not abort the whole batch -- the untouched
-            # row stays eligible and a later recover() call retries it,
-            # same as any other advisory wake in this module. Contention on
-            # the reservation write itself (WakeupContention) is handled the
-            # same way -- skip and let a later pass retry -- but kept as a
-            # distinct, nameable type rather than conflated with a generic
-            # send() failure, so a caller that wants to tell them apart (e.g.
-            # for metrics on a hot row) can.
-            try:
-                sent += int(self.notify(row['RowKey'], send))
-            except WakeupContention:
-                continue
-            except Exception:
-                continue
+                except Exception:
+                    continue
+                if sent >= limit or scanned >= max_scan:
+                    break
+            if sent >= limit or scanned >= max_scan:
+                break
+        if last_row_key is not None:
+            _RECOVERY_CURSORS[(self.partition, library)] = last_row_key
         return sent
 
     def resume_wave_waits(self, library, send, *, scopes):
-        """A terminal wave can release its own embargo, never a live claim.
+        """Keep the wave handoff pending until its queue send is accepted.
 
-        The old delayed receipt stays available until finish certifies the intent.
-        Failed sends retain that receipt and an expiring reservation.
+        The caller retains the wave message on failure. Do not use notify's
+        temporary send reservation as proof of delivery: after a crash or lost
+        response, resending the same operation is safe, while skipping it can
+        strand work. Existing backup receipts remain until work finishes.
         """
         query = (f"PartitionKey eq '{self.partition}' and libraryId eq '"
                  + library.replace("'", "''") + "'")
@@ -496,9 +527,31 @@ class WorkStore:
                     break
                 try:
                     self._replace(row, dict(row, notBefore=0, wakeUntil=0,
-                        retryReason='', retryScheduleId='', retryScheduledAt=0))
+                        retryReason='wave_wait'))
                 except ResourceModifiedError:
                     continue
-                resumed += int(self.notify(row['RowKey'], send))
+                # A normal return from the queue adapter certifies acceptance.
+                # Leave wave_wait intact on failure, including process death.
+                send(row['libraryId'], row['scope'], row['revision'], 0)
+                resumed += 1
+                for _ in range(12):
+                    current = self._get(row['RowKey'])
+                    if (current is None or current.get('revision') != row['revision']
+                            or current.get('retryReason') != 'wave_wait'
+                            or current.get('retryScheduleId') != row.get('retryScheduleId')
+                            or float(current.get('leaseUntil') or 0) > self.clock()):
+                        # A fast consumer, newer edit or newer wave owns this row.
+                        break
+                    try:
+                        self._replace(current, dict(current, retryReason='',
+                            retryScheduleId='', retryScheduledAt=0,
+                            wakeUntil=self.clock() + self.wake_seconds))
+                        break
+                    except ResourceModifiedError:
+                        continue
+                else:
+                    raise WakeupContention('Maintenance handoff completion contention')
                 break
+            else:
+                raise WakeupContention('Maintenance handoff preparation contention')
         return resumed

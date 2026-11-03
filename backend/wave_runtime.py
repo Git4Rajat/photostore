@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import threading
+import time
 import uuid
 import processing_metrics
 import processing_diagnostics
@@ -68,13 +69,47 @@ def send_stage(library,scope,revision,delay=0):
 
 
 def resume_completed_wave_maintenance(library):
-    """Best effort completion signal; durable delayed receipts survive failure."""
+    """Completion signal; raises on failure so wave queue message is retained for redelivery."""
     import app
-    try:
-        return app.resume_index_maintenance_after_wave(library)
-    except Exception:
-        logging.getLogger(__name__).warning('Index maintenance completion wake retained for recovery', exc_info=True)
-        return 0
+    for attempt in range(3):
+        try:
+            return app.resume_index_maintenance_after_wave(library)
+        except Exception:
+            if attempt == 2:
+                logging.getLogger(__name__).warning('Index maintenance completion wake failed after retries', exc_info=True)
+                raise
+            time.sleep(0.5)
+
+
+def execute_wave_handoffs(work, store, library, wave_id, send):
+    """Execute and record pending maintenance handoffs durably. Retries unfinished only."""
+    wave = store._required(store.wave_key(wave_id))
+    pending = store.pending_handoffs(wave)
+    if not pending:
+        return 'done'
+    if 'index_maintenance' in pending:
+        try:
+            resume_completed_wave_maintenance(library)
+            wave = store.complete_handoff(wave_id, 'index_maintenance')
+            pending = store.pending_handoffs(wave)
+        except Exception:
+            logging.getLogger(__name__).warning('Index maintenance handoff failed for wave %s; retaining message', wave_id, exc_info=True)
+            return 'retry'
+    if 'successor' in pending:
+        try:
+            relay_successor(work, store, wave_id, send, require_delivery=True)
+            wave = store.complete_handoff(wave_id, 'successor')
+            pending = store.pending_handoffs(wave)
+        except Exception:
+            logging.getLogger(__name__).warning('Successor relay handoff failed for wave %s; retaining message', wave_id, exc_info=True)
+            return 'retry'
+    if wave.get('state') == 'complete' and wave.get('completionReceiptId'):
+        try:
+            import index_events
+            index_events.publish(library, 'wave', wave['completionReceiptId'])
+        except Exception:
+            pass
+    return 'done'
 
 
 @contextmanager
@@ -149,23 +184,24 @@ def invalidate_wave_tags(storage,library):
             raise RuntimeError('Wave tag invalidation was not durably published')
 
 
-def relay_successor(work,store,wave_id,send):
+def relay_successor(work,store,wave_id,send,*,require_delivery=False):
     """Wake the direct successor; scheduled recovery also covers lost sends."""
     from itertools import islice
     query=(f"PartitionKey eq '{store.partition}' and RowKey ge 'wave!' and RowKey lt 'wave!~' "
            f"and predecessorWaveId eq '{wave_id}'")
     for successor in islice(store.table.query_entities(query,results_per_page=1),1):
         wave,_=advance_wave(work,store,store.library,successor['waveId'])
-        relay_current(work,store,wave,send)
+        relay_current(work,store,wave,send,require_delivery=require_delivery)
 
 
-def relay_current(work,store,wave,send):
+def relay_current(work,store,wave,send,*,require_delivery=False):
     state=wave['state'];wave_id=wave['waveId']
     stage=('vision' if state in ('processing_pending','processing') else
            'cluster' if state=='ready' else 'index' if state=='indexing' else None)
     key=(wave.get('visionPendingKey') if stage=='vision' else
          'shadow-cluster!'+wave_id if stage=='cluster' else wave.get('indexPendingKey'))
-    if stage and key:release_and_relay(work,store,store.library,key,stage,send)
+    if stage and key:
+        release_and_relay(work,store,store.library,key,stage,send,require_delivery=require_delivery)
 
 
 def consume(payload,*,deadline=None,progress=None):
@@ -186,9 +222,13 @@ def consume(payload,*,deadline=None,progress=None):
          'shadow-cluster!'+wave_id if stage=='cluster' else wave.get('indexPendingKey'))
     outbox=store._get(key) if key else None
     expected=f'wave-{stage}:{wave_id}:{digest(key)}' if key else ''
-    if payload.get('scope')!=expected or not outbox or not store.outbox_eligible(wave,outbox):
+    if payload.get('scope')!=expected or not outbox:
         return 'noop'
     work=stage_work_store(store.table)
+    if wave['state'] in ('complete', 'cancelled'):
+        return execute_wave_handoffs(work, store, library, wave_id, send_stage)
+    if not store.outbox_eligible(wave,outbox):
+        return 'noop'
     token=work.key(library,expected)
     claim=work.claim(token)
     if claim is None: return 'noop'
@@ -305,11 +345,8 @@ def consume(payload,*,deadline=None,progress=None):
         current=store._required(store.wave_key(wave_id))
         relay_current(work,store,current,send_stage)
         if current['state'] in ('complete', 'cancelled'):
-            resume_completed_wave_maintenance(library)
-            if current['state']=='complete':
-                import index_events
-                index_events.publish(library,'wave',current['completionReceiptId'])
-        if current['state'] in ('ready','indexing','complete','cancelled'):
+            return execute_wave_handoffs(work, store, library, wave_id, send_stage)
+        if current['state'] in ('ready','indexing'):
             relay_successor(work,store,wave_id,send_stage)
         return 'done'
     except ArtifactCleanupBusy:

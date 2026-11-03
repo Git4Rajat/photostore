@@ -266,6 +266,7 @@ def test_publication_completion_and_receipt_are_atomic_and_replayable(world):
     assert store._get('completion!' + wave['waveId']) is None
     result = store.complete_indexing(wave['waveId'], ledger)
     assert result['state'] == 'complete'
+    assert store.pending_handoffs(result) == ['index_maintenance', 'successor']
     assert store.complete_indexing(wave['waveId'], ledger)['completionReceiptId'] == result['completionReceiptId']
 
 

@@ -84,7 +84,7 @@ def queued(clocked, monkeypatch):
     reservation = uuid.uuid4().hex
     row = dict(env.store._get(env.key), wakeReceipt=json.dumps(sent.receipt),
                wakeReceiptReservation=reservation, wakeUntil=env.now[0] + 300)
-    env.store.table.update_entity(row)
+    env.store.table.update_entity(row, etag=row.get('metadata', {}).get('etag') or '1')
     assert len(env.deferred.rows) == 1
     return env
 
@@ -106,19 +106,19 @@ def test_completion_cancels_backup_and_no_message_wakes_after_work_finishes(queu
     assert env.main.take() is None and env.deferred.take() is None
 
 
-def test_failed_immediate_send_retains_original_backup_then_recovery_supersedes_it(queued):
+def test_failed_immediate_send_retains_backup_until_parent_redelivery_succeeds(queued):
     env = queued
     original = dict(env.deferred.rows)
     env.pending[0] = False
     env.main.fail_send = True
-    assert wave_runtime.resume_completed_wave_maintenance('A') == 0
+    with pytest.raises(OSError, match='queue unavailable'):
+        wave_runtime.resume_completed_wave_maintenance('A')
     assert env.deferred.rows == original and not env.deferred.deleted
     row = env.store._get(env.key)
     assert json.loads(row['wakeReceipt'])['messageId'] in original
     assert not row['failed']
     env.main.fail_send = False
-    env.now[0] = row['wakeUntil']
-    assert app.recover_pending_index_work('A') == 1
+    assert wave_runtime.resume_completed_wave_maintenance('A') == 1
     assert len(env.main.rows) == 1 and env.deferred.rows
     assert app._process_clustering_queue_message(env.main.take(), env.main, env.main.name, 5)
     assert not env.deferred.rows

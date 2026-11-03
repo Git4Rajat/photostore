@@ -120,6 +120,7 @@ def test_cancelled_wave_completes_with_control_proof_without_any_stage(monkeypat
     resolved=store.resolve('s','i',outcome='cancelled');close(store,'s',resolved)
     result=advance_empty(store,opened['waveId'])
     assert result['state']=='complete' and result['completionOutcome']=='no_work'
+    assert store.pending_handoffs(result)==['index_maintenance','successor']
     assert not store._page('assignment!') and not store._page('publication!')
     assert advance_empty(store,opened['waveId'])['completionReceiptId']==result['completionReceiptId']
 

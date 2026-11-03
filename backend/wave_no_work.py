@@ -61,6 +61,7 @@ def advance_empty(store,wave_id):
         identity=digest(payload)
         row=dict(wave,state='complete',completionReceiptId=identity,completionOutcome='no_work',
             frozenRevision=revision,requiredPublicationId='',manifestDigest=probe['digest'],noWorkProbe='',
+            pendingHandoffs=json.dumps(['index_maintenance', 'successor']),
             stateEnteredAt=store.clock(),lastProgressAt=store.clock(),updatedAt=store.clock())
         new_control=dict(control,revision=identity,updatedAt=store.clock())
         if new_control.get('collectingWaveId')==wave_id:new_control['collectingWaveId']=''

@@ -11048,9 +11048,12 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, 
             # Search dirty rows are the source of truth for repeated metadata
             # changes. Do not rewrite the same maintenance revision for every
             # processing-status callback; an existing wakeup already covers it.
+            # However, while actively leased by a running worker, newer edits must
+            # advance the revision so the worker's finish() does not delete the row.
             advance = reason not in index_updates.READ_REASONS
             if scope == 'search' and reason == 'metadata-change':
-                advance = False
+                current = store._get(store.key(key, scope))
+                advance = bool(current and float(current.get('leaseUntil') or 0) > store.clock())
             # Inline's backstop visibility is not a work embargo: core may
             # claim immediately. An existing barrier retry still wins in request.
             inline_delay = delay if capture is not None else 0
@@ -11117,6 +11120,7 @@ def _send_index_wakeup(library, scope, revision, delay=0, *, reason='pending-rec
         'type': INDEX_BUILD_JOB_TYPE, 'userId': library, 'jobId': job,
         'scope': scope, 'reason': reason,
         'maintenanceKey': index_work.WorkStore.key(library, scope), 'intentRevision': revision,
+        'operationId': f'{library}:{scope}:{revision}',
     }), visibility_timeout=delay or None)
     if capture is not None:
         capture.append((queue, sent))
@@ -11162,6 +11166,7 @@ def _tag_index_payload(library, revision):
         'maintenancePartition': automatic.TAG_PARTITION,
         'maintenanceKey': index_work.WorkStore.key(library, 'tag_embedding'),
         'intentRevision': revision,
+        'operationId': f'{library}:tag_embedding:{revision}',
     }
 
 
@@ -11347,7 +11352,9 @@ def _run_tag_index_maintenance_payload(payload):
             delay = 10
             store.release(claim, deferred=True, retry_delay=delay, retry_reason='barrier_wait')
         try:
-            store.notify(key, _send_tag_index_wakeup)
+            sent = store.notify(key, _send_tag_index_wakeup)
+            if not sent:
+                return 'tag_index_retry'
         except Exception:
             worker_logger.warning('Tag barrier wakeup retained for recovery', exc_info=True)
             return 'tag_index_retry'  # Keep this receipt if replacement failed.
@@ -11363,12 +11370,14 @@ def _run_tag_index_maintenance_payload(payload):
 
 
 def resume_index_maintenance_after_wave(library):
-    """Wake durable maintenance after the tail finishes; delayed recovery backs it up."""
+    """Deliver wave-waiting maintenance; failures retain the parent wave message."""
     import automatic_index_updates as automatic
     import index_work
     import index_updates
-    if (jobs_table_client is None or index_maintenance_queue_client is None
-            or automatic.wave_pending(library)):
+    if jobs_table_client is None or index_maintenance_queue_client is None:
+        raise RuntimeError('Wave maintenance handoff storage/queue unavailable')
+    if automatic.wave_pending(library):
+        # The unfinished tail wave owns the eventual maintenance handoff.
         return 0
     store = index_work.WorkStore(jobs_table_client)
     resumed = store.resume_wave_waits(library, _send_index_wakeup,
@@ -11394,10 +11403,17 @@ def _run_index_maintenance_payload(payload):
     if claim is None:
         # An early/stale receipt can be ACKed. Reserve at most one delayed
         # replacement; failed sends remain durable for periodic recovery.
+        current = store._get(key)
+        if current and current.get('retryReason') == 'wave_wait':
+            return 'obsolete'
         try:
-            store.notify(key, _send_index_wakeup)
+            sent = store.notify(key, _send_index_wakeup)
+            if not sent:
+                if current and not current.get('failed') and float(current.get('notBefore') or 0) > store.clock():
+                    return 'retry'
         except Exception:
             worker_logger.warning('Maintenance wakeup retained for recovery', exc_info=True)
+            return 'retry'
         return 'obsolete'
     try:
         if claim.attempt > INDEX_BUILD_MAX_RETRIES:
@@ -11429,13 +11445,10 @@ def _run_index_maintenance_payload(payload):
         # A healthy source barrier wait does not consume the poison budget.
         waiting_wave = automatic.wave_pending(library)
         if waiting_wave:
-            # Active upload waves gate index maintenance until terminal (complete/cancelled).
-            # Do not schedule periodic queue wakeups; wave completion/cancellation resumes immediately.
             store.release(claim, deferred=True, retry_reason='wave_wait')
             _upsert_job_status(str(payload['jobId']), library, INDEX_BUILD_JOB_TYPE, 'queued', indexScope=scope,
                 error='', result={'status': 'deferred', 'reason': 'barrier_wait', 'ready': False})
             if not automatic.wave_pending(library):
-                # The wave completed while we were releasing the claim; resume immediately.
                 resume_index_maintenance_after_wave(library)
             return 'deferred'
         delay = INDEX_BARRIER_RECOVERY_SECONDS
@@ -11443,9 +11456,12 @@ def _run_index_maintenance_payload(payload):
         _upsert_job_status(str(payload['jobId']), library, INDEX_BUILD_JOB_TYPE, 'queued', indexScope=scope,
             error='', result={'status': 'deferred', 'reason': 'barrier_wait', 'ready': False})
         try:
-            store.notify(key, _send_index_wakeup)
+            sent = store.notify(key, _send_index_wakeup)
+            if not sent:
+                return 'retry'
         except Exception:
             worker_logger.warning('Barrier wakeup retained for recovery', exc_info=True)
+            return 'retry'
         return 'deferred'
     except Exception:
         try:
@@ -16174,7 +16190,12 @@ def _process_clustering_queue_message_impl(message, queue_client, queue_name, ma
                 job_type or 'people_incremental_assign', _clustering_log_filename_summary(payload), user_id,
                 int((time.monotonic() - start_time) * 1000),
             )
-        succeeded = True
+        succeeded = (outcome not in ('retry', 'wave_retry', 'index_retry', 'tag_index_retry'))
+        if not succeeded:
+            try:
+                queue_client.update_message(message_holder[0], visibility_timeout=10)
+            except Exception:
+                worker_logger.exception('Queue retry visibility update failed')
     except Exception as exc:
         worker_logger.info(
             'clustering message failed job_type=%s filename=%s user=%s elapsed_ms=%d',
@@ -18182,11 +18203,11 @@ def run_ipworker() -> None:
                         continue
                     if outcome == 'error':
                         continue
-                    if outcome == 'tag_index_retry':
+                    if outcome in ('tag_index_retry', 'retry', 'wave_retry'):
                         try:
                             queue_client.update_message(message, visibility_timeout=10)
                         except Exception:
-                            worker_logger.exception('Tag maintenance queue retry visibility update failed')
+                            worker_logger.exception('Queue retry visibility update failed')
                         continue
                     # A real processing completion ('done', vs a noop/not_found
                     # that changed nothing) counts toward this user's rebuild

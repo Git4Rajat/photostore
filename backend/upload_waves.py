@@ -624,8 +624,41 @@ class ShadowWaves:
                 **{key: value for key, value in proof.items() if key != 'libraryId'}, receiptId=receipt_id)
             next_wave = dict(wave, state='complete', completionReceiptId=receipt_id,
                 completionOutcome='applied_with_failures' if wave.get('failedMembers',0) else 'applied',
+                pendingHandoffs=json.dumps(['index_maintenance', 'successor']),
                 stateEnteredAt=self.clock(), lastProgressAt=self.clock(), updatedAt=self.clock())
             self._commit(control, [self._change(wave, next_wave), ('create', receipt)])
+            return next_wave
+        return self._retry(run)
+
+    def pending_handoffs(self, wave):
+        raw = wave.get('pendingHandoffs')
+        if raw is not None:
+            try:
+                return json.loads(raw)
+            except Exception:
+                return []
+        if wave.get('completionHandoffsDone'):
+            return []
+        if wave.get('state') in ('complete', 'cancelled'):
+            return ['index_maintenance', 'successor']
+        return []
+
+    def complete_handoff(self, wave_id, handoff):
+        def run():
+            wave = self._required(self.wave_key(wave_id))
+            pending = self.pending_handoffs(wave)
+            if handoff not in pending:
+                return wave
+            remaining = [h for h in pending if h != handoff]
+            updates = {
+                'pendingHandoffs': json.dumps(remaining),
+                'updatedAt': self.clock(),
+            }
+            if not remaining:
+                updates['completionHandoffsDone'] = True
+            next_wave = dict(wave, **updates)
+            control = self._get('control')
+            self._commit(control, [self._change(wave, next_wave)], advance=False, maintenance=True)
             return next_wave
         return self._retry(run)
 

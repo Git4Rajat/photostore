@@ -123,7 +123,7 @@ def sweep_library(work_store, store, library, *, limit=MAX_SWEEP_PAGES):
     return touched
 
 
-def release_and_relay(work_store, store, library, outbox_key, destination, send):
+def release_and_relay(work_store, store, library, outbox_key, destination, send, *, require_delivery=False):
     """Combines dispatch_outbox's durable WorkStore request with the actual
     relay send, covering all three handoffs via one generic path (intake
     closed -> Vision, frozen wave -> cluster, assignment committed ->
@@ -135,6 +135,10 @@ def release_and_relay(work_store, store, library, outbox_key, destination, send)
     reservation itself expires, retries a genuinely lost send. Returns
     False when execution is disabled, the outbox doesn't exist, or nothing
     new needed sending (already relayed and still within its reservation).
+
+    require_delivery is for a retained parent receipt: it bypasses ambiguous
+    send reservations and returns only after queue acceptance or live ownership.
+    A lost send response may duplicate the same idempotent release.
     """
     if not execution_enabled():
         return False
@@ -149,6 +153,22 @@ def release_and_relay(work_store, store, library, outbox_key, destination, send)
     from upload_waves import digest
     scope = f'wave-{destination}:{outbox["waveId"]}:{digest(outbox_key)}'
     key = work_store.key(library, scope)
+    if require_delivery:
+        # A retained parent message is the retry mechanism for this handoff.
+        # A prior notify reservation might have crashed before sending. Bypass
+        # that reservation, retaining the same durable operation identity.
+        import math
+        work_store.request(library, scope, advance=False)
+        current = work_store._get(key)
+        if current is None:
+            return False  # A fast consumer already completed the release.
+        if current.get('failed'):
+            raise RuntimeError('Successor stage dispatch requires operator retry')
+        if float(current.get('leaseUntil') or 0) > work_store.clock():
+            return False  # A consumer has already accepted ownership.
+        delay = max(0, math.ceil(float(current.get('notBefore') or 0) - work_store.clock()))
+        send(library, scope, current['revision'], delay)
+        return True
     return work_store.notify(key, send)
 
 

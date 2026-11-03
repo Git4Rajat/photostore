@@ -61,3 +61,13 @@ The user subsequently rolled out and started vision. Read-only checks confirmed:
 - The 10,207-member wave is actively processing (its durable lifecycle label remains `processing_pending` during bounded passes); the four successors remain `waiting_predecessor`.
 
 Exact post-rollout query results are saved in the same ignored evidence directory under `post-rollout-*`. Temporary CLI credential copies were removed after these checks.
+
+## Progress verified — approximately 12:51 Stockholm
+
+- Wave `6d61cb0` finished vision at 11:48:36 Stockholm. Since restart it logged 57 successful measured passes, 6,379 source attempts and zero source exceptions. Its cluster execution is live, with checkpoint `faces-applied:6272` and recent durable progress.
+- Successor `88397a60` (9,980 members) is now actively processing in vision. Completed measured passes recorded 3,614 source attempts and 4,233 qualification completions; these counters are not a deduplicated whole-wave completion percentage.
+- The remaining three waves, totaling 21,202 members, are still waiting for their predecessors.
+- Across inspected vision logs since rollout: zero mutation-contention events, exhausted-dispatch exceptions, duplicate-claim/tag failure records or watchdog timeouts.
+- The first wave's final vision barrier records **11 failed members**. Their verified settlement reason is `source_retries_exhausted`. Three settlements predate the restart and eight were recorded afterward; zero source exceptions in measured passes does not imply zero terminal failed members. These are separate source-level outcomes and were not retried or changed by this read-only status check.
+
+Evidence: `current-wave-performance*`, `current-vision-errors*`, `current-direct-state.json`, and `current-first-wave-failed-members.json` in the ignored evidence directory. No cloud changes were made during this status check.
