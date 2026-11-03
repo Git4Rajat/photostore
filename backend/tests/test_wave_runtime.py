@@ -184,17 +184,16 @@ def vision_dispatch(monkeypatch):
     return store, work, wave, token, payload, sent
 
 
-@pytest.mark.parametrize('errors,progressed,expected_attempts', [(1, False, 1), (0, False, 0), (1, True, 0)])
+@pytest.mark.parametrize('errors,progressed,expected_attempts', [(1, False, 1), (0, False, 1), (1, True, 0)])
 def test_continuation_refunds_only_healthy_or_progressing_passes(monkeypatch, vision_dispatch, errors, progressed, expected_attempts):
     store, work, wave, token, payload, sent = vision_dispatch
     def run(*args, inspection_failures, **kwargs):
         inspection_failures[0] = errors
         return dict(wave, state='processing', lastProgressAt=float(wave.get('lastProgressAt') or 0) + int(progressed))
     monkeypatch.setattr(runtime, 'run_vision_release', run)
-    assert runtime.consume(payload) == 'done'
+    assert runtime.consume(payload) == ('done' if progressed else 'retry')
     assert work._get(token)['attempts'] == expected_attempts
-
-    assert sent[0][3] == (0 if progressed else 5)
+    assert (sent[0][3] == 0) if progressed else not sent
 
 
 def test_coordination_contention_queues_short_retry_and_exhausts_existing_budget(monkeypatch, vision_dispatch):
@@ -246,24 +245,19 @@ def test_progress_resets_vision_dispatch_failures_between_pages(monkeypatch, vis
         now[0] += 1
 
 
-def test_artifact_cleanup_wait_preserves_budget_and_durable_wakeup(monkeypatch, vision_dispatch):
+def test_artifact_cleanup_stall_is_bounded_without_scheduling_wakeups(monkeypatch, vision_dispatch):
     from upload_waves import ArtifactCleanupBusy
-    _, work, wave, token, payload, sent = vision_dispatch
+    _, work, _, token, payload, sent = vision_dispatch
     def busy(*args, **kwargs):
         raise ArtifactCleanupBusy('temporary GC')
     monkeypatch.setattr(runtime, 'run_vision_release', busy)
-    now = [1000.0]
-    work.clock = lambda: now[0]
-    for _ in range(8):
-        assert runtime.consume(payload) == 'done'
-        row = work._get(token)
-        assert row['attempts'] == 0 and not row.get('failed')
-        assert row['notBefore'] == now[0] + 30
-        assert sent[-1][3] == 30
-        now[0] += 31
-    monkeypatch.setattr(runtime, 'run_vision_release', lambda *a, **k: dict(wave, state='processing'))
-    assert runtime.consume(payload) == 'done'
-    assert work._get(token)['attempts'] == 0
+    for attempt in range(1, 6):
+        assert runtime.consume(payload) == 'retry'
+        assert work._get(token)['attempts'] == attempt
+        assert not sent
+    with pytest.raises(RuntimeError, match='attempts exhausted'):
+        runtime.consume(payload)
+    assert work._get(token)['failed']
 
 
 @pytest.mark.parametrize('failure', [ValueError('invalid evidence'), RuntimeError('lost lease')])
@@ -335,7 +329,7 @@ def test_actual_retry_delay_is_measured_at_stage_start(monkeypatch, vision_dispa
     assert runtime.consume(payload) == 'done'
     now[0] += 7
     monkeypatch.setattr(runtime, 'run_vision_release', lambda *a, **kw: dict(wave, state='processing'))
-    assert runtime.consume(payload) == 'done'
+    assert runtime.consume(payload) == 'retry'
     rows = records(caplog)
     scheduled = [r for r in rows if r['event'] == 'wave_retry_scheduled'][0]
     resumed = [r for r in rows if r['event'] == 'wave_stage_started'][-1]
@@ -366,7 +360,7 @@ def test_prepare_deadline_uses_healthy_continuation_only_for_stage_expiry(monkey
         assert work._get(token)['attempts']==1 and not sent
     else:
         assert runtime.consume(payload,deadline=now[0]+100)=='done'
-        assert work._get(token)['attempts']==0 and sent[-1][3]==5
+        assert work._get(token)['attempts']==0 and sent[-1][3]==0
         events=records(caplog)
         assert any(r['event']=='vision_deadline_yield' for r in events)
         config=next(r for r in events if r['event']=='vision_runtime_config')
@@ -477,9 +471,9 @@ def test_busy_wave_defers_without_charging_attempt_or_releasing_owner(vision_dis
     _, work, _, token, payload, sent = vision_dispatch
     claim = work.claim(token)
     before = dict(work._get(token))
-    assert runtime.consume(payload) == 'done'
+    assert runtime.consume(payload) == 'retry'
     assert work._get(token) == before
-    assert sent == [(payload['userId'], payload['scope'], claim.revision, 180)]
+    assert not sent
 
 
 def test_busy_wave_failed_replacement_send_preserves_owner(monkeypatch, vision_dispatch):
@@ -489,8 +483,7 @@ def test_busy_wave_failed_replacement_send_preserves_owner(monkeypatch, vision_d
     def unavailable(*args, **kwargs):
         raise OSError('queue unavailable')
     monkeypatch.setattr(runtime, 'send_stage', unavailable)
-    with pytest.raises(OSError, match='queue unavailable'):
-        runtime.consume(payload)
+    assert runtime.consume(payload) == 'retry'
     assert work._get(token) == before
 
 

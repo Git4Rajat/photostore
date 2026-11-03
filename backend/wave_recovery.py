@@ -11,7 +11,7 @@ import time
 
 from upload_waves import ShadowWaves, digest
 from upload_wave_execution import (stage_work_store, advance_wave, release_and_relay,
-    recover_releases, revive_stale_failed_dispatches)
+    recover_releases)
 
 # A session with no real activity for this long (a browser tab closed mid
 # upload, a dropped connection) is abandoned, not just slow. Measured against
@@ -177,8 +177,8 @@ def recover_library(table,library,send,*,after='',wave_pages=2,release_limit=100
     try:
         policy=store._get('policy')
         if clock()<deadline and not (policy and policy.get('cleanupState')):
-            revived=revive_stale_failed_dispatches(work,store,clock=clock)
-            if revived:emit(event='wave_dispatch_revived',library_id=digest(library),count=revived)
+            # Failed releases require an explicit operator retry. An unrelated
+            # upload/read event must not restart an exhausted job every hour.
             recover_releases(work,store,send,limit=release_limit)
             _reap_stale_sessions(store,library,clock,emit,deadline=deadline,work=work,send=send)
         if cleanup_send is not None and clock()<deadline:

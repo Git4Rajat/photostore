@@ -116,6 +116,21 @@ class CatalogPublisher:
                     or props.metadata.get('sha256') != output['sha256']):
                 raise RuntimeError('Publication generation missing or changed')
 
+    def verify(self, scope, obligation):
+        """Verify a recorded immutable output without rebuilding missing proof."""
+        if scope not in SCOPES:
+            raise ValueError('Unknown wave publication scope')
+        self.check()
+        key = f'publication!{self.wave_id}!{obligation}'
+        previous = self.store._get(key)
+        if not previous:
+            raise ValueError('Recorded publication proof is missing')
+        proof = json.loads(previous['payload'])
+        if digest(proof) != previous.get('generation') or proof.get('obligationId') != obligation or proof.get('scope') != scope:
+            raise ValueError('Publication generation identity mismatch')
+        self._verify(proof)
+        return previous['generation']
+
     @serialize_catalog
     def publish(self, scope, obligation):
         from index_ownership import require_catalog_owner
@@ -124,13 +139,8 @@ class CatalogPublisher:
             raise ValueError('Unknown wave publication scope')
         self.check()
         key = f'publication!{self.wave_id}!{obligation}'
-        previous = self.store._get(key)
-        if previous:
-            proof = json.loads(previous['payload'])
-            if digest(proof) != previous.get('generation') or proof.get('obligationId') != obligation or proof.get('scope') != scope:
-                raise ValueError('Publication generation identity mismatch')
-            self._verify(proof)
-            return previous['generation']
+        if self.store._get(key):
+            return self.verify(scope, obligation)
         su, library = self.su, self.store.library
         if scope == 'dedup':
             # Its real publisher has a create-only blob and delete-epoch CAS.

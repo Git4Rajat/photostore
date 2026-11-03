@@ -6,8 +6,13 @@ from upload_waves import digest,Conflict,MAX_PAGE
 def publication_key(member):return 'published-source!'+digest([member['photoId'],member['processingRevision']])
 
 
-def record_publication_members(store,wave,check):
-    after=''
+def record_publication_members(store,wave,check,*,after='',checkpoint=lambda after:None,
+                               should_yield=lambda:False):
+    """Record immutable source markers in replayable pages.
+
+    Save the cursor only after every marker in a page commits. A crash can
+    replay that page, but cannot skip an uncommitted marker.
+    """
     while True:
         page=store._page(f'e!{wave["waveId"]}!m!',after)
         for member in page:
@@ -20,8 +25,11 @@ def record_publication_members(store,wave,check):
                 if old and all(old.get(k)==v for k,v in row.items()):return
                 store._commit(control,[store._change(old,row)],advance=False)
             store._retry(commit)
-        if len(page)<MAX_PAGE:return
-        after=page[-1]['RowKey']
+        if page:
+            after=page[-1]['RowKey']
+            checkpoint(after)
+        if len(page)<MAX_PAGE:return True
+        if should_yield():return False
 
 
 def advance_empty(store,wave_id):

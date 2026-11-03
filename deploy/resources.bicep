@@ -1868,14 +1868,8 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
             // Backend/worker keep the 20s default; only ipworker's per-photo
             // cadence outlasts it.
             { name: 'PEOPLE_SCAN_CACHE_TTL_SECONDS', value: '120' }
-            // How often the background maintenance sweep (tag-embedding
-            // index check, trash purge) runs per replica
-            // (backend/app.py, _ipwork_sweep_loop). It no longer re-offers
-            // stuck photos: that safety net was removed in favor of the
-            // upload-end release plus the Tools "Process now" button. Kept in sync
-            // with the 'ipwork-sweep-wake' cron rule's ~5-day period below --
-            // a replica only stays up for that rule's 5-minute window, so
-            // this only needs to fire once per wake.
+            // Maintenance may run only while queue-triggered work has this
+            // replica active. Never add a periodic scale-up trigger.
             { name: 'IPWORK_SWEEP_INTERVAL_SECONDS', value: '432000' }
             // Lets vision trigger a derived-index rebuild on the indexer
             // role (2vCPU/4Gi) when it drains the queue -- and every
@@ -1927,37 +1921,6 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
                 queueLengthStrategy: 'all'
               }
               identity: 'system'
-            }
-          }
-          {
-            // The queue-length rule above only wakes ipworker when there's
-            // already a message on the queue -- but a photo that never got
-            // enqueued in the first place (uploaded while ipworker was
-            // stopped, or during a 'browser'-only PROCESSING_MODE window)
-            // leaves the queue empty forever, so with only that rule
-            // ipworker would never come up to run its own background
-            // orphaned-photo sweep (_ipwork_sweep_loop in backend/app.py).
-            // This cron rule wakes one replica for a 5-minute window roughly
-            // every 5 days purely so that sweep gets a chance to run,
-            // independent of current queue depth; it scales back to 0
-            // afterward same as the queue rule. Keep this in sync with
-            // IPWORK_SWEEP_INTERVAL_SECONDS below (also 5 days) -- a wider
-            // gap here would leave a wake cycle with nothing to do, and a
-            // narrower one would waste replica time re-sweeping mid-cycle.
-            // Standard cron has no native "every N days" step that survives
-            // month boundaries -- day-of-month '*/5' fires on 1,6,11,...,26,31
-            // and simply skips a date that doesn't exist in a shorter month
-            // (e.g. Feb), so real gaps land at 5 days +/- a few, not exactly
-            // 5.00 days. Fine for a background safety-net sweep.
-            name: 'ipwork-sweep-wake'
-            custom: {
-              type: 'cron'
-              metadata: {
-                timezone: 'Etc/UTC'
-                start: '0 0 */5 * *'
-                end: '5 0 */5 * *'
-                desiredReplicas: '1'
-              }
             }
           }
         ]

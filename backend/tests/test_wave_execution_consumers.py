@@ -360,6 +360,8 @@ def test_nonempty_cluster_does_not_call_unsafe_legacy_assigner(world):
         run_cluster_release(leases, store, store.library, wave_id, 'shadow-cluster!' + wave_id,
             assigner=assigner, journal=None, obligations_table=EtagTable(), face_table=None, face_ids=None)
     assert not assigner.calls and store.status(wave_id)['state'] == 'ready'
+    row = leases._get(leases.key(store.library, wave_id, 'cluster'))
+    assert not row['owner'] and row['leaseUntil'] == 0
 
 
 def test_zero_face_cluster_commits_index_handoff_but_index_requires_publication(world):

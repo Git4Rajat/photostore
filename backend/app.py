@@ -16059,6 +16059,33 @@ def _process_clustering_queue_message_impl(message, queue_client, queue_name, ma
                 candidate['userId'], candidate['scope'])
     except (ValueError, TypeError):
         pass
+    if (durable_wave or durable_index) and queue_name in (CLUSTERING_DEFERRED_QUEUE_NAME, INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME):
+        # A deferred queue is visible-only so future work does not keep a
+        # replica alive. Once due, transfer the delivery to its main queue
+        # BEFORE ACKing. The main scaler counts invisible in-flight messages;
+        # processing here would otherwise hide active work and scale it to zero.
+        target = (clustering_queue_client if candidate.get('stage') == 'cluster'
+                  else index_maintenance_queue_client)
+        try:
+            if target is None:
+                raise RuntimeError('Main stage queue unavailable')
+            target.send_message(message.content)
+        except Exception:
+            worker_logger.exception('Stage queue transfer retained for retry: %s', queue_name)
+            if dequeue_count >= max_retries and deadletter_queue_client is not None:
+                # A permanently unavailable target must not create an endless
+                # sequence of cold starts. Preserve the release and a replayable
+                # dead letter; never invalidate a different live stage owner.
+                deadletter_queue_client.send_message(json.dumps(dict(sourceQueue=queue_name,
+                    reason='Main queue transfer attempts exhausted', originalPayload=candidate,
+                    dequeueCount=dequeue_count)))
+                queue_client.delete_message(message)
+            return True
+        try:
+            queue_client.delete_message(message)
+        except Exception:
+            worker_logger.exception('Transferred stage delivery could not be acknowledged: %s',queue_name)
+        return True
     if dequeue_count > max_retries and not (durable_index or durable_wave):
         try:
             payload = json.loads(message.content or '{}')

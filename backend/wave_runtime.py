@@ -9,14 +9,13 @@ import os
 import threading
 import time
 import uuid
-import math
 import processing_metrics
 import processing_diagnostics
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 
 from upload_waves import ShadowWaves, digest, MutationContention, ArtifactCleanupBusy
-from execution_lease import ExecutionLeases
+from execution_lease import ExecutionLeases, OwnershipLost
 from wave_policy import source_change
 from upload_wave_execution import (execution_enabled,stage_work_store,run_vision_release,
     run_cluster_release,run_index_release,release_and_relay,advance_wave)
@@ -186,7 +185,7 @@ def invalidate_wave_tags(storage,library):
 
 
 def relay_successor(work,store,wave_id,send,*,require_delivery=False):
-    """Wake the direct successor; scheduled recovery also covers lost sends."""
+    """Dependency completion wakes the direct successor; no polling timer."""
     from itertools import islice
     query=(f"PartitionKey eq '{store.partition}' and RowKey ge 'wave!' and RowKey lt 'wave!~' "
            f"and predecessorWaveId eq '{wave_id}'")
@@ -247,8 +246,23 @@ def consume(payload,*,deadline=None,progress=None):
     if wave['state'] in ('complete', 'cancelled'):
         return execute_wave_handoffs(work, store, library, wave_id, send_stage)
     if not store.outbox_eligible(wave,outbox):
+        # In particular, a ready successor waits for predecessor publication.
+        # The predecessor's durable completion handoff wakes it; do not poll.
+        # A retained old-stage message also repairs a transition whose queue
+        # send failed AFTER the wave committed its new stage.
+        relay_current(work,store,wave,send_stage,require_delivery=True)
         return 'noop'
     token=work.key(library,expected)
+    leases=ExecutionLeases(store.table,partition=store.partition)
+    execution_key=leases.key(library,wave_id,stage)
+    before=leases._get(execution_key) or {}
+    current=work._get(token)
+    if current is None or current.get('failed') or current['revision']!=payload.get('intentRevision'):
+        return 'noop'
+    if float(before.get('leaseUntil') or 0)>leases.clock():
+        # Retain this queue receipt. Main queues count in-flight work, so this
+        # neither consumes a failure nor manufactures a recurring cold wake.
+        return 'retry'
     from index_work import WorkLeased
     try:
         claim=work.claim(token)
@@ -256,20 +270,15 @@ def consume(payload,*,deadline=None,progress=None):
         current = work._get(token)
         if current is None or current.get('failed') or current['revision'] != payload.get('intentRevision'):
             return 'noop'
-        delay = max(1, min(180, math.ceil(float(current.get('leaseUntil') or 0) - work.clock()) + 1))
-        # Publish the replacement before ACKing this delivery. A failed send
-        # must propagate so the source message remains available for recovery.
-        send_stage(library, expected, current['revision'], delay)
         processing_diagnostics.emit('wave_lease_deferred', wave_id=wave_id, stage=stage,
-                                    delay_seconds=delay)
-        return 'done'
+                                    reason='dispatcher_owned', retained_receipt=True)
+        return 'retry'
     if claim is None: return 'noop'
     if claim.revision!=payload.get('intentRevision'):
         work.release(claim,deferred=True);return 'noop'
     if claim.attempt>5:
         work.finish(claim,failed=True)
         raise RuntimeError('Wave dispatch attempts exhausted; operator retry required')
-    leases=ExecutionLeases(store.table,partition=store.partition)
     healthy_continuation = True
     try:
         # Dispatcher bookkeeping is renewed separately from stage ownership.
@@ -353,43 +362,65 @@ def consume(payload,*,deadline=None,progress=None):
                     frozen_revision=wave['frozenRevision'],assignment_revision=wave.get('assignmentReceiptId',''))
                 def publish(scope,obligation,check):
                     return CatalogPublisher(store,wave_id,storage,check).publish(scope,obligation)
+                def verify(scope,obligation,check):
+                    return CatalogPublisher(store,wave_id,storage,check).verify(scope,obligation)
                 @source_change
-                def prepare(check):
-                    after=''
-                    while True:
-                        members=store._page(f'e!{wave_id}!m!',after)
-                        for member in members:
-                            if member['outcome'] not in ('settled','failed_exhausted'):continue
-                            check();app._live_faiss_metadata_update(library,member['filename']);check()
-                        if len(members)<20:break
-                        after=members[-1]['RowKey']
+                def prepare_page(check,after):
+                    from upload_waves import MAX_PAGE
+                    members=store._page(f'e!{wave_id}!m!',after)
+                    for member in members:
+                        if member['outcome'] not in ('settled','failed_exhausted'):continue
+                        check();app._live_faiss_metadata_update(library,member['filename']);check()
+                    return (members[-1]['RowKey'] if members else after),len(members)<MAX_PAGE
                 from index_publication import catalog_serialization
                 with catalog_serialization(store.table,library,app.blob_service_client,app.BLOB_LEXICAL_INDEX_CONTAINER):
-                    result=run_index_release(leases,store,library,wave_id,key,ledger,publisher=publish,prepare=prepare)
-        if result and result['state'] in ('processing_pending','processing','ready'):
-            progressing = float(result.get('lastProgressAt') or 0) > float(wave.get('lastProgressAt') or 0)
-            delay = 0 if stage == 'vision' and healthy_continuation and progressing else 5
-            work.release(claim,deferred=healthy_continuation,retry_delay=delay,
-                         retry_reason='progress' if progressing else 'barrier_wait',
-                         reset_attempts=stage == 'vision' and healthy_continuation and progressing)
+                    result=run_index_release(leases,store,library,wave_id,key,ledger,
+                        publisher=publish,prepare_page=prepare_page,verify=verify)
+        same_stage=result and result['state'] in {
+            'vision':('processing_pending','processing'),'cluster':('ready',),'index':('indexing',)}[stage]
+        if same_stage:
+            after=leases._get(execution_key) or {}
+            progressing=(after.get('progressCheckpoint','')!=before.get('progressCheckpoint','')
+                or float(result.get('lastProgressAt') or 0)>float(wave.get('lastProgressAt') or 0)
+                or any(result.get(k)!=wave.get(k) for k in ('evaluation','zeroFaceAfter','zeroFaceProbePending')))
+            if not progressing:
+                # No progress is not a healthy slice. Keep the original message
+                # and bound consecutive stalls with the existing failure budget.
+                # No delayed self-wakeup or unlimited refunded barrier loop.
+                work.release(claim)
+                processing_diagnostics.emit('wave_no_progress',wave_id=wave_id,stage=stage,
+                    dispatch_attempt=claim.attempt,retained_receipt=True)
+                return 'retry'
+            work.release(claim,deferred=healthy_continuation,retry_delay=0,
+                         retry_reason='progress',reset_attempts=healthy_continuation)
         else:
             work.finish(claim)
         current=store._required(store.wave_key(wave_id))
-        relay_current(work,store,current,send_stage)
+        # Vision's release function already sends its downstream handoff. Do
+        # not duplicate an accepted delivery; a retained old-stage message
+        # uses the explicit repair path above if that send failed.
+        relay_current(work,store,current,send_stage,require_delivery=stage!='vision' or bool(same_stage))
         if current['state'] in ('complete', 'cancelled'):
             return execute_wave_handoffs(work, store, library, wave_id, send_stage)
         if current['state'] in ('ready','indexing'):
             relay_successor(work,store,wave_id,send_stage)
         return 'done'
     except ArtifactCleanupBusy:
-        # Temporary artifact GC is not a failed model/dispatch attempt. Keep a
-        # durable delayed wake so scale-to-zero cannot strand this release.
-        current = store._required(store.wave_key(wave_id))
-        work.release(claim, deferred=True, retry_delay=30, retry_reason='artifact_cleanup')
-        relay_current(work, store, current, send_stage)
+        # Keep queued work rather than spawning unbounded maintenance timers.
+        # A persistent fence is an actionable stall after the bounded budget.
+        work.release(claim)
         processing_diagnostics.emit('wave_cleanup_wait', wave_id=wave_id, stage=stage,
-                                    delay_seconds=30)
-        return 'done'
+                                    retained_receipt=True,dispatch_attempt=claim.attempt)
+        return 'retry'
+    except OwnershipLost:
+        current=leases._get(execution_key) or {}
+        if float(current.get('leaseUntil') or 0)>leases.clock() and current.get('owner'):
+            # The stage claim can race the preflight check. A live owner is
+            # contention, not a failed model/assignment/publication attempt.
+            work.release(claim,deferred=True)
+            return 'retry'
+        work.release(claim)
+        raise
     except MutationContention:
         current = store._required(store.wave_key(wave_id))
         intent = work._get(claim.key)

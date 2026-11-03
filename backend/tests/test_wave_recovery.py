@@ -96,24 +96,21 @@ def test_recent_open_session_is_left_alone(monkeypatch):
     assert session['state']=='open'
 
 
-def test_stale_failed_dispatch_gets_one_more_attempt(monkeypatch):
-    """A stage dispatch that gave up after 5 attempts (failed=True) must not
-    be abandoned forever -- after enough time for an operator to plausibly
-    have noticed and fixed the underlying cause, recovery gives it exactly
-    one more try instead of requiring a manual /repair call indefinitely."""
+def test_old_failed_dispatch_requires_explicit_operator_retry(monkeypatch):
     from upload_wave_execution import stage_work_store
     monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED','true')
-    table=RuntimeTable()
-    now=[1000.0]
+    table=RuntimeTable();now=[1000.0]
     work=stage_work_store(table,clock=lambda:now[0])
     key=work.request('a','wave-vision:w1:deadbeef')
-    claim=work.claim(key)
-    work.finish(claim,failed=True)
-    assert table.get_entity(work.partition,key)['failed']
-    now[0]+=4000  # past STALE_FAILED_DISPATCH_SECONDS
-    store=ShadowWaves(table,'a',clock=lambda:now[0])
-    recover_library(table,'a',lambda *a:None,clock=lambda:now[0])
-    assert table.get_entity(work.partition,key)['failed'] is False
+    work.finish(work.claim(key),failed=True)
+    revision=work._get(key)['revision'];sent=[]
+    for _ in range(3):
+        now[0]+=4000
+        recover_library(table,'a',lambda *args:sent.append(args),clock=lambda:now[0])
+        assert work._get(key)['failed'] and work._get(key)['revision']==revision
+    assert not sent
+    work.request('a','wave-vision:w1:deadbeef',advance=True)
+    assert not work._get(key)['failed'] and work._get(key)['revision']!=revision
 
 
 def test_recently_failed_dispatch_is_not_retried_yet(monkeypatch):
@@ -125,7 +122,7 @@ def test_recently_failed_dispatch_is_not_retried_yet(monkeypatch):
     key=work.request('a','wave-vision:w1:deadbeef')
     claim=work.claim(key)
     work.finish(claim,failed=True)
-    now[0]+=60  # well under STALE_FAILED_DISPATCH_SECONDS
+    now[0]+=60
     recover_library(table,'a',lambda *a:None,clock=lambda:now[0])
     assert table.get_entity(work.partition,key)['failed']
 
@@ -168,14 +165,3 @@ def test_session_survey_resumes_after_closed_history(monkeypatch):
     for _ in range(2):
         _reap_stale_sessions(store,'a',lambda:now[0],lambda **kw:None,deadline=now[0]+100)
     assert store._required(store.session_key('z'))['state']=='abandoned'
-
-
-def test_dispatch_cooldown_starts_when_it_failed_not_when_requested(monkeypatch):
-    from upload_wave_execution import stage_work_store,revive_stale_failed_dispatches
-    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED','true')
-    table=RuntimeTable();now=[1000.0];work=stage_work_store(table,clock=lambda:now[0])
-    key=work.request('a','wave-vision:w:key');now[0]+=4000
-    work.finish(work.claim(key),failed=True)
-    assert revive_stale_failed_dispatches(work,ShadowWaves(table,'a'),clock=lambda:now[0])==0
-    now[0]+=3601
-    assert revive_stale_failed_dispatches(work,ShadowWaves(table,'a'),clock=lambda:now[0])==1

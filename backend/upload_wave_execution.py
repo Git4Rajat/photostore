@@ -198,45 +198,6 @@ def recover_releases(work_store, store, send, *, limit=100):
     return work_store.recover(guarded_send, limit=limit, library=store.library)
 
 
-# A stage dispatch gives up after 5 delivery attempts (see wave_runtime.consume's
-# `claim.attempt>5` check) and is marked failed=True -- excluded from every
-# future recover_releases call, by design: a wave stuck mid-dispatch shouldn't
-# spin retrying something genuinely broken forever with no one ever finding
-# out. But "forever, with nothing short of an operator running the manual
-# /repair endpoint" is also too strong a failure mode for something that could
-# just as easily be a transient infra blip (a worker crash loop during a
-# deploy, a brief storage outage) that happened to coincide with all 5
-# attempts. This gives it exactly one more try after enough time has passed
-# for a human to plausibly have noticed and fixed the underlying cause, while
-# still emitting a distinct, visible event every time it happens so chronic
-# flapping isn't silent either.
-STALE_FAILED_DISPATCH_SECONDS = 3600
-
-
-def revive_stale_failed_dispatches(work_store, store, *, limit=20, clock=None):
-    """Give each stage dispatch that's been failed=True for a long time one
-    more chance: resets it to a fresh revision (failed=False, no lease/wake),
-    making it eligible for the very next recover_releases call in the same
-    pass. recover_releases' own outbox_eligible re-check still protects
-    against resending for a wave that's since moved past that stage.
-    """
-    if not execution_enabled():
-        return 0
-    if work_store.partition != STAGE_PARTITION:
-        raise ValueError('Invalid stage recovery partition')
-    now = (clock or work_store.clock)()
-    query = (f"PartitionKey eq '{work_store.partition}' and failed eq true"
-             f" and libraryId eq '{store.library.replace(chr(39), chr(39)*2)}'"
-             f" and requestedAt le {float(now - STALE_FAILED_DISPATCH_SECONDS)}")
-    import itertools
-    revived = 0
-    for row in itertools.islice(work_store.table.query_entities(query), limit):
-        if now - float(row.get('failedAt') or row.get('requestedAt') or 0) < STALE_FAILED_DISPATCH_SECONDS: continue
-        work_store.request(store.library, row['scope'], advance=True)
-        revived += 1
-    return revived
-
-
 def _release_input_revision(outbox, wave):
     if outbox['destination'] == 'vision':
         return f"{wave['waveId']}:{outbox.get('intakeEpoch')}"
@@ -802,103 +763,158 @@ def run_cluster_release(leases, store, library, wave_id, outbox_key, *,
         return None
     if ownership.status == 'succeeded':
         return wave
-    with execution_scope(leases, ownership, store, lambda: _execution_check(leases, ownership, store, outbox_key)):
-        _execution_check(leases, ownership, store, outbox_key)
-        outbox = store._required(outbox_key)
-        if wave.get('manifestDigest') != outbox.get('manifestDigest'):
-            raise ValueError('Cluster release input receipts no longer match the frozen wave')
-        def renew():
+    try:
+        with execution_scope(leases, ownership, store, lambda: _execution_check(leases, ownership, store, outbox_key)):
             _execution_check(leases, ownership, store, outbox_key)
-            leases.renew(ownership)
-        from wave_assignment import run_frozen_assignment, AssignmentYield
-        import time
-        slice_deadline = time.monotonic() + max(1, float(os.getenv('WAVE_CLUSTER_SLICE_SECONDS', '120')))
-        next_check = [0.0]
-        try:
-            with leases.keepalive(ownership, local_checks=True) as owned:
-                @processing_diagnostics.wave_phase('guard_check')
-                def check(force=False):
-                    with processing_diagnostics.wave_phase_scope('guard_keepalive_check'):
-                        owned()
-                    if force or time.monotonic() >= next_check[0]:
-                        _execution_check(leases, ownership, store, outbox_key)
-                        next_check[0] = time.monotonic() + 1.0
-                check.boundary = lambda: check(force=True)
-                assignment_receipt = run_frozen_assignment(store, wave, assigner,
-                    lambda: _iter_wave_faces(store, wave_id, renew=check), check,
-                    page_size=128 if chunk_size is None else chunk_size,
-                    progress=lambda count: leases.checkpoint(ownership, 'faces-applied:' + str(count)),
-                    local_journal=True, should_yield=lambda: time.monotonic() >= slice_deadline)
-        except AssignmentYield:
-            # Stop keepalive before releasing. The dispatcher then durably
-            # schedules the next slice; no assignment receipt is fabricated.
-            leases.release(ownership)
-            return store._required(store.wave_key(wave_id))
-        with processing_diagnostics.wave_phase_scope('publication_handoff'):
-            renew()
-            from wave_catalog import SCOPES, PREREQUISITES
-            scopes=tuple(SCOPES if required_scopes is None else required_scopes)
-            graph={scope:deps for scope,deps in PREREQUISITES.items() if scope in scopes}
-            ledger = ObligationLedger(obligations_table, wave_id, library=library,
-                frozen_revision=wave['frozenRevision'], assignment_revision=assignment_receipt)
-            obligations=compute_obligations(library,wave_id,wave['frozenRevision'],scopes,
-                prerequisite_scopes=graph,assignment_revision=assignment_receipt)
-            frontier=ledger.record_required(obligations,prerequisite_scopes=graph)
-            next_wave = store.commit_assignment(wave_id, frontier, manifest_digest=wave['manifestDigest'],
-                assignment_receipt=assignment_receipt)
-    with processing_diagnostics.wave_phase_scope('execution_complete'):
-        leases.complete(ownership, frontier)
-    return next_wave
+            outbox = store._required(outbox_key)
+            if wave.get('manifestDigest') != outbox.get('manifestDigest'):
+                raise ValueError('Cluster release input receipts no longer match the frozen wave')
+            def renew():
+                _execution_check(leases, ownership, store, outbox_key)
+                leases.renew(ownership)
+            from wave_assignment import run_frozen_assignment, AssignmentYield
+            import time
+            slice_deadline = time.monotonic() + max(1, float(os.getenv('WAVE_CLUSTER_SLICE_SECONDS', '120')))
+            next_check = [0.0]
+            try:
+                with leases.keepalive(ownership, local_checks=True) as owned:
+                    @processing_diagnostics.wave_phase('guard_check')
+                    def check(force=False):
+                        with processing_diagnostics.wave_phase_scope('guard_keepalive_check'):
+                            owned()
+                        if force or time.monotonic() >= next_check[0]:
+                            _execution_check(leases, ownership, store, outbox_key)
+                            next_check[0] = time.monotonic() + 1.0
+                    check.boundary = lambda: check(force=True)
+                    assignment_receipt = run_frozen_assignment(store, wave, assigner,
+                        lambda: _iter_wave_faces(store, wave_id, renew=check), check,
+                        page_size=128 if chunk_size is None else chunk_size,
+                        progress=lambda count: leases.checkpoint(ownership, 'faces-applied:' + str(count)),
+                        local_journal=True, should_yield=lambda: time.monotonic() >= slice_deadline)
+            except AssignmentYield:
+                # Stop keepalive before releasing. The dispatcher then durably
+                # schedules the next slice; no assignment receipt is fabricated.
+                leases.release(ownership)
+                return store._required(store.wave_key(wave_id))
+            with processing_diagnostics.wave_phase_scope('publication_handoff'):
+                renew()
+                from wave_catalog import SCOPES, PREREQUISITES
+                scopes=tuple(SCOPES if required_scopes is None else required_scopes)
+                graph={scope:deps for scope,deps in PREREQUISITES.items() if scope in scopes}
+                ledger = ObligationLedger(obligations_table, wave_id, library=library,
+                    frozen_revision=wave['frozenRevision'], assignment_revision=assignment_receipt)
+                obligations=compute_obligations(library,wave_id,wave['frozenRevision'],scopes,
+                    prerequisite_scopes=graph,assignment_revision=assignment_receipt)
+                frontier=ledger.record_required(obligations,prerequisite_scopes=graph)
+                next_wave = store.commit_assignment(wave_id, frontier, manifest_digest=wave['manifestDigest'],
+                    assignment_receipt=assignment_receipt)
+        with processing_diagnostics.wave_phase_scope('execution_complete'):
+            leases.complete(ownership, frontier)
+        return next_wave
+    finally:
+        from execution_lease import OwnershipLost
+        current = leases._get(ownership.key)
+        if current and current.get('owner') == ownership.owner:
+            try:leases.release(ownership)
+            except OwnershipLost:pass
 
 
 @processing_diagnostics.index_wave_summary
-def run_index_release(leases, store, library, wave_id, outbox_key, ledger, *, publisher=None, prepare=None):
-    from execution_lease import execution_scope
+def run_index_release(leases, store, library, wave_id, outbox_key, ledger, *, publisher=None,
+                      prepare=None, prepare_page=None, verify=None, should_yield=None):
+    """Resume metadata preparation, immutable publications and completion pages.
+
+    A bounded pass yields only after durable progress; its existing queued work
+    immediately continues on the main queue. No timer or recovery job is needed.
+    """
+    import time
+    from execution_lease import execution_scope, OwnershipLost
     ownership, wave = claim_release(leases, store, library, wave_id, 'index', outbox_key, 'index')
     if ownership is None:
         return None
     if ownership.status == 'succeeded':
         return wave
-    with execution_scope(leases, ownership, store, lambda: _execution_check(leases, ownership, store, outbox_key)):
-        if ledger.assignment_revision != (wave.get('assignmentReceiptId') or ''):
-            raise ValueError('Index obligations do not match the committed assignment receipt')
-        with leases.keepalive(ownership, local_checks=True) as owned:
-            from processing_checks import CoalescedCheck
-            stage_check = CoalescedCheck(
-                lambda: _execution_check(leases, ownership, store, outbox_key), local=owned)
-            def check(force=False):
-                stage_check(force=force)
-            check.boundary = lambda: check(force=True)
-            if publisher is not None:
-                if prepare is not None:
-                    with processing_diagnostics.wave_phase_scope('prepare'):
-                        prepare(check)
+    try:
+        deadline = time.monotonic() + max(1, float(os.getenv('WAVE_INDEX_SLICE_SECONDS', '120')))
+        expired = should_yield or (lambda: time.monotonic() >= deadline)
+        saved = leases.row(ownership).get('progressCheckpoint', '')
+        position = json.loads(saved[6:]) if saved.startswith('index:') else {}
+        # Older executions already prepared metadata before publishing any scope.
+        phase = position.get('phase', 'publish' if saved.startswith('published:') else 'prepare')
+        cursor = position.get('after', '')
+        def checkpoint(phase, after=''):
+            leases.checkpoint(ownership, 'index:' + json.dumps(dict(phase=phase, after=after)))
+        with execution_scope(leases, ownership, store, lambda: _execution_check(leases, ownership, store, outbox_key)):
+            if ledger.assignment_revision != (wave.get('assignmentReceiptId') or ''):
+                raise ValueError('Index obligations do not match the committed assignment receipt')
+            with leases.keepalive(ownership, local_checks=True) as owned:
+                from processing_checks import CoalescedCheck
+                stage_check = CoalescedCheck(
+                    lambda: _execution_check(leases, ownership, store, outbox_key), local=owned)
+                def check(force=False):
+                    stage_check(force=force)
+                check.boundary = lambda: check(force=True)
                 manifest,specs=ledger._specs()
                 if manifest is None or manifest['requiredSetId'] != wave.get('requiredPublicationId'):
                     raise ValueError('Index obligation set is not the committed wave frontier')
-                remaining=dict(specs)
-                while remaining:
-                    advanced=False
-                    for scope,spec in list(remaining.items()):
-                        check()
-                        if any(not ledger._valid_receipt(ledger._get(parent),manifest) for parent in spec['prerequisites']):
-                            continue
-                        check.boundary()
-                        with processing_diagnostics.wave_phase_scope('publish:'+scope):
-                            generation=publisher(scope,spec['id'],check)
-                        check()
-                        ledger.record_receipt(spec['id'],output_generation=generation)
-                        leases.checkpoint(ownership,'published:'+scope)
-                        del remaining[scope]; advanced=True
-                    if not advanced:
-                        raise RuntimeError('Publication prerequisites cannot advance')
-            incomplete=not ledger.is_complete()
-            if not incomplete:
+                if verify is not None:
+                    for scope,spec in specs.items():
+                        receipt = ledger._get(spec['id'])
+                        if ledger._valid_receipt(receipt,manifest):
+                            generation = verify(scope,spec['id'],check)
+                            if generation != json.loads(receipt['receipt']).get('outputGeneration'):
+                                raise ValueError('Recorded publication generation differs from its receipt')
+                # An interrupted legacy execution may already have every receipt.
+                # Never redo metadata scans or rebuild those outputs to finalize it.
+                complete = ledger.is_complete()
+                if not complete and publisher is not None:
+                    if phase == 'prepare':
+                        if prepare_page is not None:
+                            while True:
+                                check.boundary()
+                                with processing_diagnostics.wave_phase_scope('prepare'):
+                                    cursor, done = prepare_page(check, cursor)
+                                checkpoint('publish' if done else 'prepare', '' if done else cursor)
+                                if done:break
+                                if expired():return store._required(store.wave_key(wave_id))
+                        elif prepare is not None:
+                            with processing_diagnostics.wave_phase_scope('prepare'):
+                                prepare(check)
+                        checkpoint('publish')
+                        phase, cursor = 'publish', ''
+                    remaining={scope:spec for scope,spec in specs.items()
+                               if not ledger._valid_receipt(ledger._get(spec['id']),manifest)}
+                    while remaining:
+                        advanced=False
+                        for scope,spec in list(remaining.items()):
+                            check()
+                            if any(not ledger._valid_receipt(ledger._get(parent),manifest) for parent in spec['prerequisites']):
+                                continue
+                            check.boundary()
+                            with processing_diagnostics.wave_phase_scope('publish:'+scope):
+                                generation=publisher(scope,spec['id'],check)
+                            check()
+                            ledger.record_receipt(spec['id'],output_generation=generation)
+                            checkpoint('publish', scope)
+                            del remaining[scope]; advanced=True
+                            if remaining and expired():return store._required(store.wave_key(wave_id))
+                        if not advanced:
+                            raise RuntimeError('Publication prerequisites cannot advance')
+                if not ledger.is_complete():
+                    leases.fail(ownership,'publication_incomplete')
+                    return store._required(store.wave_key(wave_id))
+                if phase != 'members':
+                    cursor = ''
+                    checkpoint('members')
                 from wave_no_work import record_publication_members
-                record_publication_members(store,wave,check)
+                done = record_publication_members(store,wave,check,after=cursor,
+                    checkpoint=lambda after:checkpoint('members',after),should_yield=expired)
+                if not done:return store._required(store.wave_key(wave_id))
                 result = store.complete_indexing(wave_id, ledger)
-        if incomplete:
-            leases.fail(ownership,'publication_incomplete')
-            return wave
-    leases.complete(ownership, result.get('completionReceiptId', ''))
-    return result
+            leases.complete(ownership, result.get('completionReceiptId', ''))
+            return result
+    finally:
+        current = leases._get(ownership.key)
+        if current and current.get('owner') == ownership.owner:
+            try:leases.release(ownership)
+            except OwnershipLost:pass

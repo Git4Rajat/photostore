@@ -1424,18 +1424,6 @@
                           },
                           "identity": "system"
                         }
-                      },
-                      {
-                        "name": "ipwork-sweep-wake",
-                        "custom": {
-                          "type": "cron",
-                          "metadata": {
-                            "timezone": "Etc/UTC",
-                            "start": "0 0 */5 * *",
-                            "end": "5 0 */5 * *",
-                            "desiredReplicas": "1"
-                          }
-                        }
                       }
                     ]
                   }
