@@ -1168,6 +1168,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const uploadStopRequestedRef = useRef<boolean>(false);
     const uploadDiscardInProgressRef = useRef(false);
     const uploadAbortControllersRef = useRef<Set<AbortController>>(new Set());
+    // A hash is claimed until its leader reaches durable server finalization.
+    // Followers wait for that result: success lets them skip without staging
+    // bytes, while failure releases one of them to become the next leader.
+    const activeUploadHashClaimsRef = useRef<Map<string, {
+        result: Promise<{ finalized: boolean; filename?: string }>;
+        settle: (result: { finalized: boolean; filename?: string }) => void;
+    }>>(new Map());
     const uploadRetryStopRef = useRef(new AbortController());
     // Hashes learned in this tab survive batch boundaries; downloaded library
     // hashes live separately so each refresh replaces, rather than accumulates, them.
@@ -3052,7 +3059,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             blockConcurrency?: number;
             precomputedSha256?: string;
         },
-    ): Promise<{ skippedDuplicate: true; filename: string } | { skippedDuplicate: false; sha256: string; uploadId: string }> => {
+    ): Promise<{ skippedDuplicate: true; filename: string } | { skippedDuplicate: false; sha256: string; uploadId: string;
+        hashClaim: { result: Promise<{ finalized: boolean; filename?: string }>;
+            settle: (result: { finalized: boolean; filename?: string }) => void } }> => {
         if (uploadStopRequestedRef.current || options?.signal?.aborted) {
             throw new Error(UPLOAD_STOPPED_ERROR);
         }
@@ -3060,16 +3069,40 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (uploadStopRequestedRef.current || options?.signal?.aborted) {
             throw new Error(UPLOAD_STOPPED_ERROR);
         }
-        if (knownHashesRef.current.has(sha256) || libraryHashesRef.current.has(sha256)) {
-            // Already have this content under some filename -- skip the network
-            // transfer entirely (no /upload/init, no blob staging, no finalize).
-            // The backend's own finalize-time check is what actually enforces
-            // this for real; this is purely an earlier, cheaper exit.
-            return { skippedDuplicate: true, filename: knownHashesRef.current.get(sha256) || libraryHashesRef.current.get(sha256) || file.name };
+        let hashClaim: {
+            result: Promise<{ finalized: boolean; filename?: string }>;
+            settle: (result: { finalized: boolean; filename?: string }) => void;
+        } | null = null;
+        for (;;) {
+            if (knownHashesRef.current.has(sha256) || libraryHashesRef.current.has(sha256)) {
+                // Already have this content under some filename -- skip the network
+                // transfer entirely (no /upload/init, no blob staging, no finalize).
+                return { skippedDuplicate: true, filename: knownHashesRef.current.get(sha256) || libraryHashesRef.current.get(sha256) || file.name };
+            }
+            const activeClaim = activeUploadHashClaimsRef.current.get(sha256);
+            if (!activeClaim) {
+                let settle!: (result: { finalized: boolean; filename?: string }) => void;
+                const result = new Promise<{ finalized: boolean; filename?: string }>(resolve => { settle = resolve; });
+                hashClaim = { result, settle };
+                activeUploadHashClaimsRef.current.set(sha256, hashClaim);
+                break;
+            }
+            // Do not optimistically discard the follower. Wait until the leader
+            // is actually finalized; if it fails, loop and atomically compete to
+            // take ownership of the released hash.
+            const leaderResult = await new Promise<{ finalized: boolean; filename?: string }>((resolve, reject) => {
+                const abort = () => reject(new Error(UPLOAD_STOPPED_ERROR));
+                if (options?.signal?.aborted || uploadStopRequestedRef.current) {
+                    abort();
+                    return;
+                }
+                options?.signal?.addEventListener('abort', abort, { once: true });
+                activeClaim.result.then(resolve, reject).finally(() => options?.signal?.removeEventListener('abort', abort));
+            });
+            if (leaderResult.finalized) {
+                return { skippedDuplicate: true, filename: leaderResult.filename || file.name };
+            }
         }
-        // Only finalized sources may enter knownHashesRef. Concurrent copies
-        // can transfer together; backend finalize deduplication arbitrates
-        // them. A staging claim is not proof that a duplicate can be skipped.
         try {
             // Resumes carry an existing uploadId and must go straight to
             // single-file /upload/init (it needs to reuse the SAME reserved
@@ -3289,8 +3322,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // in runUploadSession) -- staying in this function to await it was
             // leaving lanes idle ~80% of the time even though each chunk itself
             // transfers fast.
-            return { skippedDuplicate: false, sha256, uploadId: initResponse.uploadId };
+            return { skippedDuplicate: false, sha256, uploadId: initResponse.uploadId, hashClaim };
         } catch (err) {
+            if (hashClaim && activeUploadHashClaimsRef.current.get(sha256) === hashClaim) {
+                activeUploadHashClaimsRef.current.delete(sha256);
+                hashClaim.settle({ finalized: false });
+            }
             // Evict a matching cached identity on failure so a later attempt
             // revalidates it through the backend.
             if (knownHashesRef.current.get(sha256) === file.name) {
@@ -3728,7 +3765,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 file: File,
                 fileMeta: PersistedUploadFile,
                 controller: AbortController,
-                staged: { sha256: string; uploadId: string },
+                staged: { sha256: string; uploadId: string; hashClaim: {
+                    result: Promise<{ finalized: boolean; filename?: string }>;
+                    settle: (result: { finalized: boolean; filename?: string }) => void;
+                } },
                 preparation: Promise<PreparedUpload>,
             ): Promise<void> => {
                 try {
@@ -3782,6 +3822,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     });
                     const waveAcceptedFilename = completeResponse?.filename || fileMeta.name;
                     knownHashesRef.current.set(staged.sha256, waveAcceptedFilename);
+                    if (activeUploadHashClaimsRef.current.get(staged.sha256) === staged.hashClaim) {
+                        activeUploadHashClaimsRef.current.delete(staged.sha256);
+                        staged.hashClaim.settle({ finalized: true, filename: waveAcceptedFilename });
+                    }
                     waveShadowFileOutcomes.set(fileMeta.key, { status: 'done', skippedDuplicate, waveAcceptedFilename });
                     updatePersistedFile(fileMeta.key, { waveAcceptedFilename });
                     const settledFile = { ...fileMeta, status: 'done' as const, skippedDuplicate, waveAcceptedFilename };
@@ -3812,6 +3856,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         },
                     });
                 } catch (err) {
+                    if (activeUploadHashClaimsRef.current.get(staged.sha256) === staged.hashClaim) {
+                        activeUploadHashClaimsRef.current.delete(staged.sha256);
+                        staged.hashClaim.settle({ finalized: false });
+                    }
                     // Retry a failed identity through the backend rather than
                     // treating a matching local cache entry as authoritative.
                     if (knownHashesRef.current.get(staged.sha256) === file.name) {
@@ -4810,10 +4858,18 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             };
             await Promise.all(Array.from({ length: Math.min(4, filesToUpload.length) }, () => hashWorker()));
             const candidates: File[] = [];
+            const selectedHashes = new Set<string>();
             for (const result of results) {
                 if (!result) continue;
-                if (result.duplicate) preflightSkippedDuplicateCount += 1;
+                // Collapse byte-identical files inside this selection before
+                // declareWaveSelection. The first occurrence is the upload
+                // candidate; later copies never become wave members or stage
+                // blobs. Existing-library matches are removed by the same pass.
+                if (result.duplicate || selectedHashes.has(result.sha256)) {
+                    preflightSkippedDuplicateCount += 1;
+                }
                 else {
+                    selectedHashes.add(result.sha256);
                     candidates.push(result.file);
                     precomputedHashes.set(result.file, result.sha256);
                 }

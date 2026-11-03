@@ -122,7 +122,7 @@ def install(blueprint):
                 for offset in range(0,len(pending),20):
                     page=pending[offset:offset+20]
                     session=resolve_sources(store,app.metadata_table_client,session_id,
-                        [(binding[1],'accepted',entry['filename'])
+                        [(binding[1],'duplicate' if entry.get('duplicates') else 'accepted',entry['filename'])
                          for _index,binding,entry in page])
                 if session is None:
                     session=store._required(store.session_key(session_id))

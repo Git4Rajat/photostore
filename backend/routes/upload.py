@@ -533,6 +533,12 @@ def finalize_direct_upload():
     except Exception as exc:
         app.app.logger.exception('Direct upload finalization failed for %s', filename)
         return app.jsonify({'error': 'Upload finalization failed'}), 500
+    if duplicates:
+        # finalize_uploaded_file intentionally leaves the canonical source
+        # untouched. Remove this request's staged blob/tracking row now that
+        # the duplicate is durably identified.
+        timed_call('cleanup', app._cleanup_failed_upload, user_id, filename,
+                   str(data.get('uploadId') or ''))
     # finalize_uploaded_file writes metadata via storage_utils (bypassing
     # _update_metadata_entity_fields), so drop the scan cache explicitly: the
     # gallery refetches right after an upload and must see the new photo.
@@ -542,14 +548,18 @@ def finalize_direct_upload():
     # attributes the photo to the library member who added it.
     metadata = None
     try:
-        finalize_updates: app.Dict[str, object] = {'size': total_size}
-        finalize_updates.update(processing_diagnostics.upload_fields(data))
-        if account_id:
-            finalize_updates['uploadedBy'] = account_id
-        client_last_modified_iso = app.epoch_millis_to_iso(data.get('clientLastModified'))
-        if client_last_modified_iso:
-            finalize_updates['clientLastModified'] = client_last_modified_iso
-        metadata = timed_call('metadata_stamp', app._update_metadata_entity_fields, user_id, final_name, finalize_updates)
+        if duplicates:
+            metadata = timed_call('metadata_read', app.metadata_table_client.get_entity,
+                                  partition_key=user_id, row_key=final_name)
+        else:
+            finalize_updates: app.Dict[str, object] = {'size': total_size}
+            finalize_updates.update(processing_diagnostics.upload_fields(data))
+            if account_id:
+                finalize_updates['uploadedBy'] = account_id
+            client_last_modified_iso = app.epoch_millis_to_iso(data.get('clientLastModified'))
+            if client_last_modified_iso:
+                finalize_updates['clientLastModified'] = client_last_modified_iso
+            metadata = timed_call('metadata_stamp', app._update_metadata_entity_fields, user_id, final_name, finalize_updates)
     except Exception:
         app.app.logger.debug('Could not stamp finalize metadata for %s', final_name)
     try:
@@ -564,7 +574,7 @@ def finalize_direct_upload():
     except Exception:
         pass
     processing_rejection = None
-    if data.get('clientProcessing') or data.get('clientProcessingReport'):
+    if not duplicates and (data.get('clientProcessing') or data.get('clientProcessingReport')):
         try:
             metadata = timed_call('client_processing', app.apply_client_processing_results_for_file,
                 user_id,
@@ -596,10 +606,11 @@ def finalize_direct_upload():
             app.app.logger.info('Metadata sidecar rejected for %s; original fallback=%s', final_name, not app.is_video_file(final_name))
     record_receipt(app, user_id, final_name, data, packet_accepted=packet_accepted,
                    packet_rejection=packet_rejection, processing_rejection=processing_rejection, duplicate=bool(duplicates))
-    try:
-        timed_call('enqueues', processing_diagnostics.queued_call, app._queue_upload_processing, user_id, final_name, data)
-    except Exception:
-        app.app.logger.exception('Failed to queue post-finalize processing for %s', final_name)
+    if not duplicates:
+        try:
+            timed_call('enqueues', processing_diagnostics.queued_call, app._queue_upload_processing, user_id, final_name, data)
+        except Exception:
+            app.app.logger.exception('Failed to queue post-finalize processing for %s', final_name)
     try:
         timed_call('enqueues', app._mark_fresh_upload_activity, user_id)
     except Exception:
@@ -608,10 +619,11 @@ def finalize_direct_upload():
         timed_call('enqueues', app._mark_upload_activity_heartbeat, user_id)
     except Exception:
         app.app.logger.exception('Failed to record upload activity heartbeat for %s', user_id)
-    try:
-        timed_call('enqueues', app._queue_people_clustering_after_face_processing, user_id, final_name, metadata)
-    except Exception:
-        app.app.logger.exception('Failed to auto-queue clustering for %s', final_name)
+    if not duplicates:
+        try:
+            timed_call('enqueues', app._queue_people_clustering_after_face_processing, user_id, final_name, metadata)
+        except Exception:
+            app.app.logger.exception('Failed to auto-queue clustering for %s', final_name)
     upload_finalized(total_size)
     processing_diagnostics.upload_event(user_id, final_name, data, size=total_size,
                                        duplicate=bool(duplicates), video=app.is_video_file(final_name))
@@ -741,20 +753,27 @@ def finalize_upload_batch():
             app.app.logger.exception('Batch finalize failed for %s', filename)
             results.append({'index': idx, 'filename': filename, 'error': 'Upload finalization failed'})
             continue
+        if duplicates:
+            timed_call('cleanup', app._cleanup_failed_upload, user_id, filename,
+                       str(item.get('uploadId') or ''))
 
         # Same per-file follow-up as single-file finalize above, just inline
         # in this loop instead of a separate request.
         app._invalidate_metadata_scan_cache(user_id)
         metadata = None
         try:
-            finalize_updates: app.Dict[str, object] = {'size': total_size}
-            finalize_updates.update(processing_diagnostics.upload_fields(item))
-            if account_id:
-                finalize_updates['uploadedBy'] = account_id
-            client_last_modified_iso = app.epoch_millis_to_iso(item.get('clientLastModified'))
-            if client_last_modified_iso:
-                finalize_updates['clientLastModified'] = client_last_modified_iso
-            metadata = timed_call('metadata_stamp', app._update_metadata_entity_fields, user_id, final_name, finalize_updates)
+            if duplicates:
+                metadata = timed_call('metadata_read', app.metadata_table_client.get_entity,
+                                      partition_key=user_id, row_key=final_name)
+            else:
+                finalize_updates: app.Dict[str, object] = {'size': total_size}
+                finalize_updates.update(processing_diagnostics.upload_fields(item))
+                if account_id:
+                    finalize_updates['uploadedBy'] = account_id
+                client_last_modified_iso = app.epoch_millis_to_iso(item.get('clientLastModified'))
+                if client_last_modified_iso:
+                    finalize_updates['clientLastModified'] = client_last_modified_iso
+                metadata = timed_call('metadata_stamp', app._update_metadata_entity_fields, user_id, final_name, finalize_updates)
         except Exception:
             app.app.logger.debug('Could not stamp finalize metadata for %s', final_name)
 
@@ -776,7 +795,7 @@ def finalize_upload_batch():
             continue
 
         processing_rejection = None
-        if item.get('clientProcessing') or item.get('clientProcessingReport'):
+        if not duplicates and (item.get('clientProcessing') or item.get('clientProcessingReport')):
             try:
                 metadata = timed_call('client_processing', app.apply_client_processing_results_for_file,
                     user_id,
@@ -808,14 +827,15 @@ def finalize_upload_batch():
                 app.app.logger.info('Metadata sidecar rejected for %s; original fallback=%s', final_name, not app.is_video_file(final_name))
         record_receipt(app, user_id, final_name, item, packet_accepted=packet_accepted,
                        packet_rejection=packet_rejection, processing_rejection=processing_rejection, duplicate=bool(duplicates))
-        try:
-            timed_call('enqueues', processing_diagnostics.queued_call, app._queue_upload_processing, user_id, final_name, item)
-        except Exception:
-            app.app.logger.exception('Failed to queue post-finalize processing for %s', final_name)
-        try:
-            timed_call('enqueues', app._queue_people_clustering_after_face_processing, user_id, final_name, metadata)
-        except Exception:
-            app.app.logger.exception('Failed to auto-queue clustering for %s', final_name)
+        if not duplicates:
+            try:
+                timed_call('enqueues', processing_diagnostics.queued_call, app._queue_upload_processing, user_id, final_name, item)
+            except Exception:
+                app.app.logger.exception('Failed to queue post-finalize processing for %s', final_name)
+            try:
+                timed_call('enqueues', app._queue_people_clustering_after_face_processing, user_id, final_name, metadata)
+            except Exception:
+                app.app.logger.exception('Failed to auto-queue clustering for %s', final_name)
 
         results.append({
             'index': idx,

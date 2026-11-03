@@ -9193,8 +9193,12 @@ def detect_duplicates(user_id: str, file_hash: str, perceptual_hash: Optional[st
                 # by a delete path that hasn't caught up) can never cause a real
                 # upload to be wrongly skipped as "already have it".
                 try:
-                    metadata_table_client.get_entity(partition_key=user_id, row_key=candidate)
-                    matched_filename = candidate
+                    existing = metadata_table_client.get_entity(partition_key=user_id, row_key=candidate)
+                    if (existing.get('fileHash') == file_hash
+                            and existing.get('processing_state') != 'deleted'):
+                        matched_filename = candidate
+                    else:
+                        delete_hash_index_entry(user_id, file_hash)
                 except Exception:
                     try:
                         delete_hash_index_entry(user_id, file_hash)
@@ -11652,6 +11656,15 @@ def finalize_uploaded_file(
         file_hash = client_hash
 
     duplicates = timed_call('dedup', detect_duplicates, user_id, file_hash, perceptual_hash=None)
+    exact_duplicate = next((duplicate for duplicate in duplicates
+                            if duplicate.get('type') == 'exact' and duplicate.get('filename')), None)
+    if exact_duplicate:
+        # The hash index points at the canonical, already-finalized source.
+        # Do not create a filename alias, allocate a new processing revision,
+        # reset completed steps, or enqueue the same bytes for Vision again.
+        # The route returns this canonical filename and records the intake item
+        # as a duplicate while leaving its source metadata completely intact.
+        return duplicates, str(exact_duplicate['filename'])
     final_filename = timed_call('name_resolution', _resolve_filename_for_upload, user_id, filename, file_hash)
 
     if final_filename != filename and not anonymous_blob_name:

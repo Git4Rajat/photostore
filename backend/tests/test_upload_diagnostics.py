@@ -70,6 +70,29 @@ def file_data(**extra):
 
 
 @pytest.mark.parametrize('route', ['finalize', 'finalize-batch'])
+def test_duplicate_finalize_does_not_mutate_or_enqueue_canonical_source(upload_env, monkeypatch, route):
+    _, client = upload_env
+    duplicate = [{'filename': 'canonical.jpg', 'type': 'exact', 'hash': 'a' * 64}]
+    monkeypatch.setattr(app, 'finalize_uploaded_file', lambda *a, **k: (duplicate, 'canonical.jpg'))
+    cleaned=[]
+    monkeypatch.setattr(app, '_cleanup_failed_upload', lambda *a, **k: cleaned.append(a))
+    monkeypatch.setattr(app, '_update_metadata_entity_fields',
+                        lambda *a, **k: pytest.fail('Duplicate must not stamp canonical metadata'))
+    monkeypatch.setattr(app, 'apply_client_processing_results_for_file',
+                        lambda *a, **k: pytest.fail('Duplicate must not apply client processing'))
+    monkeypatch.setattr(app, '_queue_upload_processing',
+                        lambda *a, **k: pytest.fail('Duplicate must not enter processing queue'))
+    monkeypatch.setattr(app, '_queue_people_clustering_after_face_processing',
+                        lambda *a, **k: pytest.fail('Duplicate must not enter clustering queue'))
+    data=file_data(clientProcessing={'thumbnail': 'ignored'}, clientProcessingReport=[{'step':'face'}])
+    response=client.post('/upload/'+route,json={'files':[data]} if route.endswith('batch') else data)
+    assert response.status_code==200
+    result=response.json['results'][0] if route.endswith('batch') else response.json
+    assert result['filename']=='canonical.jpg' and result['duplicates']==duplicate
+    assert cleaned and cleaned[0][1:3]==('private.jpg','')
+
+
+@pytest.mark.parametrize('route', ['finalize', 'finalize-batch'])
 def test_processing_batch_id_is_stamped_and_passed_to_queue_without_extra_reads(upload_env, monkeypatch, route):
     import processing_diagnostics as processing
     _, client = upload_env

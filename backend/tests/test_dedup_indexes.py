@@ -168,6 +168,29 @@ def test_detect_duplicates_hit_is_point_lookup_not_a_scan(dedup_ctx):
     assert duplicates == [{'filename': 'vacation.jpg', 'type': 'exact', 'hash': file_hash}]
 
 
+def test_duplicate_finalize_reuses_canonical_source_without_resetting_processing(dedup_ctx):
+    metadata, _, filename_owners = dedup_ctx
+    file_hash = 'u' * 64
+    storage_utils.finalize_uploaded_file('lib-A', 'vacation.jpg', 'image/jpeg', client_sha256=file_hash)
+    canonical = metadata.rows[('lib-A', 'vacation.jpg')]
+    canonical.update({
+        'thumbnail_status': 'done', 'face_status': 'done', 'ocr_status': 'done',
+        'processing_complete': True, 'processing_lease_owner': '', 'retry_count': 4,
+    })
+    before = dict(canonical)
+
+    duplicates, final_name = storage_utils.finalize_uploaded_file(
+        'lib-A', 'exported-copy.jpg', 'image/jpeg', client_sha256=file_hash,
+        anonymous_blob_name='new-staging-blob',
+    )
+
+    assert duplicates == [{'filename': 'vacation.jpg', 'type': 'exact', 'hash': file_hash}]
+    assert final_name == 'vacation.jpg'
+    assert metadata.rows[('lib-A', 'vacation.jpg')] == before
+    assert ('lib-A', 'exported-copy.jpg') not in metadata.rows
+    assert ('exported-copy.jpg', 'lib-A') not in filename_owners.rows
+
+
 def test_detect_duplicates_no_hit_is_point_lookup_not_a_scan(dedup_ctx):
     # The overwhelming common case (no duplicate) must also never scan.
     duplicates = storage_utils.detect_duplicates('lib-A', 'c' * 64)

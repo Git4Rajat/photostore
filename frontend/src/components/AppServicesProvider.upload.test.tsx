@@ -410,6 +410,28 @@ describe('browser upload selection and startup', () => {
         expect(services.pendingUploadSummary).toBeNull();
     });
 
+    it('skips a repeated selection queued while its first upload is active', async () => {
+        let releaseTransfer!: () => void;
+        mocks.transferred.mockImplementationOnce(() => new Promise<void>(resolve => { releaseTransfer = resolve; }));
+        const file = filesFor(1)[0];
+        const input = select([file]);
+        await advance(1000);
+
+        fireEvent.change(input, { target: { files: [file] } });
+        await advance(1000);
+        expect(services.queuedUploadFileCount).toBe(1);
+
+        await act(async () => { releaseTransfer(); });
+        for (let tick = 0; tick < 12; tick += 1) await advance(1000);
+
+        expect(initFiles()).toHaveLength(1);
+        expect(finalizedFiles()).toHaveLength(1);
+        expect(mocks.transferred).toHaveBeenCalledTimes(1);
+        expect(services.queuedUploadFileCount).toBe(0);
+        expect(services.notifications.some(notification =>
+            notification.progress?.skippedDuplicateCount === 1)).toBe(true);
+    });
+
     it('wakes job polling again after a delayed enqueue response', async () => {
         let resolveIndex!: (value: unknown) => void;
         mocks.postTools.mockImplementation(() => new Promise(resolve => { resolveIndex = resolve; }));
@@ -1025,7 +1047,7 @@ describe('browser upload selection and startup', () => {
         expect(services.notifications.some((notification) => notification.progress?.skippedDuplicateCount === 3)).toBe(true);
     });
 
-    it('does not skip identical content while its first finalize is pending', async () => {
+    it('collapses identical files before declaring or transferring the upload selection', async () => {
         vi.spyOn(largeFileHash, 'hashLargeFile').mockResolvedValue('a'.repeat(64));
         const files = filesFor(2);
         files.forEach(file => Object.defineProperty(file, 'size', { value: 256 * 1024 * 1024 }));
@@ -1043,11 +1065,16 @@ describe('browser upload selection and startup', () => {
         });
         select(files);
         await advance(4000);
-        expect(initFiles()).toHaveLength(2);
-        expect(finalizedFiles()).toHaveLength(2);
-        expect(services.notifications.some(notification => notification.progress?.skippedDuplicateCount)).toBe(false);
+        expect(initFiles()).toHaveLength(1);
+        expect(finalizedFiles()).toHaveLength(1);
+        expect(services.notifications.some(notification =>
+            notification.progress?.skippedDuplicateCount === 1)).toBe(true);
         await act(async () => { pending.forEach(resolve => resolve()); });
         await advance(4000);
+        expect(initFiles()).toHaveLength(1);
+        expect(finalizedFiles()).toHaveLength(1);
+        expect(services.notifications.some(notification =>
+            notification.progress?.skippedDuplicateCount === 1)).toBe(true);
         expect(services.pendingUploadSummary).toBeNull();
     });
 
@@ -1075,6 +1102,7 @@ describe('browser upload selection and startup', () => {
         await advance(1000);
         expect(initFiles()).toHaveLength(0);
         expect(mocks.transferred).not.toHaveBeenCalled();
+        expect(mocks.postUpload.mock.calls.some(([url]) => String(url).startsWith('/upload/waves/'))).toBe(false);
         expect(services.pendingUploadSummary).toBeNull();
         expect(services.notifications.some((notification) => notification.progress?.skippedDuplicateCount === 1)).toBe(true);
     });

@@ -14870,6 +14870,17 @@ def _cleanup_failed_upload(user_id: str, filename: str, upload_id: str = '') -> 
 
     if metadata and has_upload_tracking:
         if has_completed_metadata:
+            # A completed canonical row can also carry a fresh pending blob
+            # from a later upload that deduplicated back to this same photo.
+            # Clearing only the tracking columns orphaned that staged blob.
+            pending_blob = str(metadata.get('pendingAnonymousBlob') or '').strip()
+            permanent_blob = str(metadata.get('anonymousImageId') or '').strip()
+            if pending_blob and pending_blob != permanent_blob:
+                cleanup['errors'].extend(_delete_photo_blobs_if_present(pending_blob))
+                try:
+                    delete_image_name_mapping(user_id, pending_blob)
+                except Exception:
+                    pass
             for field in UPLOAD_TRACKING_FIELDS:
                 metadata.pop(field, None)
             try:

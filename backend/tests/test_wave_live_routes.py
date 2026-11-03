@@ -241,8 +241,8 @@ def test_partial_finalize_batch_replays_and_keeps_unadmitted_sources_publishable
     assert receipts[-1]['state']=='closed'
     parent=store._required('session!partial')
     assert parent['resolvedCount']==2 and parent['state']=='closed'
-    assert all(store._required(store.item_key('partial',k))['outcome']=='accepted' for k in 'ab')
-    assert all(member['needsProjection'] for member in store._page('e!'+parent['waveId']+'!m!'))
+    assert all(store._required(store.item_key('partial',k))['outcome']=='duplicate' for k in 'ab')
+    assert all(not member['needsProjection'] for member in store._page('e!'+parent['waveId']+'!m!'))
 
 
 @pytest.mark.parametrize('path',['/upload/waves/protocol','/upload/init','/upload/finalize-batch'])
