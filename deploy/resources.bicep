@@ -1902,18 +1902,10 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
               metadata: {
                 accountName: storageAccountName
                 queueName: 'photostore-ipwork'
-                // 2026-09-21: raised 1->2 to match IPWORKER_CONCURRENCY=2 --
-                // a real 986-file forenkla2-qa upload showed KEDA scaling to
-                // all 4 replicas while average CPU never exceeded 35% (max
-                // 88%), meaning replicas were under-utilized even at the
-                // scale ceiling. Targeting one replica's actual concurrent
-                // capacity (2 messages) before adding another consolidates
-                // the same work onto fewer, better-utilized replicas instead
-                // of one replica per single queued message. Re-verify replica
-                // count/CPU on the next real upload; revert to '1' if backlog
-                // drain latency regresses under a much bigger burst than this
-                // one.
-                queueLength: '2'
+                // Each wave message can keep a replica's source pool busy.
+                // Request one replica per message so independent libraries
+                // can scale out without waiting for a third queued wave.
+                queueLength: '1'
                 // A wave message can own hundreds of images. It remains
                 // invisible while its receipt is renewed, so count it until
                 // ACK; otherwise KEDA scales down during healthy processing.

@@ -1419,7 +1419,7 @@
                           "metadata": {
                             "accountName": "[variables('storageAccountName')]",
                             "queueName": "photostore-ipwork",
-                            "queueLength": "2",
+                            "queueLength": "1",
                             "queueLengthStrategy": "all"
                           },
                           "identity": "system"
