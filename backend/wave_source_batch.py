@@ -210,13 +210,20 @@ def reserve_attempts(store, members):
             if admitted:
                 changes.append(store._change(old, store._row(key, count=count, updatedAt=store.clock())))
         if changes:
-            store.table.submit_transaction([*changes, *store._policy_guard(), *guard_operations(store)])
+            guards = guard_operations(store)
+            store.table.submit_transaction([*changes, *guards, *store._policy_guard()])
         return counts
     return store._retry(commit)
 
 
 def commit_observations(store, wave_id, observations):
-    """One control/wave/ownership transaction for the page's qualified results."""
+    """Atomically commit page evidence with its wave, policy and ownership.
+
+    Evidence does not change intake ordering or the library's tail. Including
+    control here makes unrelated successor intake invalidate completed work.
+    The wave CAS still serializes evidence with freeze/cancel/intake changes.
+    """
+    from execution_lease import guard_operations
     from wave_settlement import verified
     if len(observations) > MAX_PAGE:
         raise ValueError('Observation batch exceeds member page')
@@ -226,8 +233,6 @@ def commit_observations(store, wave_id, observations):
     def commit():
         read_current = not first[0]
         first[0] = False
-        control = store._required('control')
-        wave = store._required(store.wave_key(wave_id))
         changes = []
         for member, completion, leased in observations:
             # The member page already supplied an ETag. Reuse it on the first
@@ -240,10 +245,18 @@ def commit_observations(store, wave_id, observations):
                 evidenceQualified=bool(completion), outstandingLeases=int(leased and completion is None))
             if all(old.get(key) == value for key, value in fields.items()):
                 continue
-            if wave['state'] in ('ready', 'indexing', 'complete'):
-                raise Conflict('Frozen wave evidence cannot change')
             changes.append(store._change(old, dict(old, **fields, observedAt=store.clock())))
         if changes:
-            changes.append(store._change(wave, dict(wave, lastProgressAt=store.clock(), updatedAt=store.clock())))
-            store._commit(control, changes)
+            # Capture shared fences after the per-member reads, keeping their
+            # read-to-CAS window short even when replaying a full page.
+            wave = store._required(store.wave_key(wave_id))
+            if wave['state'] in ('ready', 'indexing', 'complete', 'cancelled'):
+                raise Conflict('Frozen wave evidence cannot change')
+            # A partially scanned manifest must restart when its evidence
+            # changes. Previously the control revision provided that signal;
+            # the wave CAS and scan reset now provide it without global writes.
+            changes.append(store._change(wave, dict(wave, evaluation='',
+                lastProgressAt=store.clock(), updatedAt=store.clock())))
+            guards = guard_operations(store)
+            store.table.submit_transaction([*changes, *guards, *store._policy_guard()])
     store._retry(commit)

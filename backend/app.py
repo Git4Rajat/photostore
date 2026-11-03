@@ -11286,24 +11286,35 @@ def _run_tag_index_maintenance_payload(payload):
         if current.get('failed'):
             return 'tag_index_failed'
         if float(current.get('notBefore') or 0) > store.clock():
-            return 'tag_index_retry'
+            # Coalesce early duplicates into one reserved delayed wake before
+            # ACKing them. A failed send falls through to receipt retention.
+            store.notify(key, _send_tag_index_wakeup)
+            return 'tag_index_noop'
         # An old wake intentionally claims the latest revision of this SAME job.
-        claim = store.claim(key)
+        try:
+            claim = store.claim(key)
+        except index_work.WorkLeased:
+            # The live owner or lease-expiry recovery covers this duplicate.
+            return 'tag_index_noop'
         if claim is None:
             return 'tag_index_noop'
         exhausted = False
+        def check_sources():
+            automatic.check_source_admission(library)
+            if automatic.wave_pending(library):
+                raise automatic.SourceBusy('Active upload wave')
+            control = automatic.configured_store().control(library, 'tag_embedding')
+            if control and control.get('active'):
+                raise automatic.SourceBusy('Active tag source reservation')
         with index_publication.publication(store, claim):
+            # A known wave barrier must not acquire/wait for the catalog lease.
+            check_sources()
             with index_publication.catalog_serialization(None, library,
                     storage_utils_module._CTX.get('blob_service_client'),
                     storage_utils_module._lexical_index_container_name(), require_real=True):
                 # Check source barriers BEFORE the poison ceiling. A pre-write
                 # wake may spend arbitrarily many queue deliveries waiting here.
-                automatic.check_source_admission(library)
-                if automatic.wave_pending(library):
-                    raise automatic.SourceBusy('Active upload wave')
-                control = automatic.configured_store().control(library, 'tag_embedding')
-                if control and control.get('active'):
-                    raise automatic.SourceBusy('Active tag source reservation')
+                check_sources()  # Recheck after acquiring the real write fence.
                 if claim.attempt > INDEX_BUILD_MAX_RETRIES:
                     if queue_service_client is None or not INDEX_MAINTENANCE_DEADLETTER_QUEUE_NAME:
                         raise RuntimeError('Tag maintenance deadletter queue unavailable')
@@ -11327,12 +11338,18 @@ def _run_tag_index_maintenance_payload(payload):
         return 'tag_index_done'
     except automatic.SourceBusy:
         if claim is not None:
-            store.release(claim, deferred=True, retry_delay=10, retry_reason='barrier_wait')
-        # This delivery remains the wake: run_ipworker re-delays its visibility.
-        # Sending a replacement AND retaining every busy delivery would multiply
-        # queue messages at each barrier wait. The durable retry timing above
-        # lets bounded recovery resend if this replica/receipt is lost instead.
-        return 'tag_index_retry'
+            waiting_wave = automatic.wave_pending(library)
+            delay = INDEX_BARRIER_RECOVERY_SECONDS if waiting_wave else 10
+            if waiting_wave and claim.schedule_reason == 'wave_wait' and claim.scheduled_delay > 0:
+                delay = min(3600, max(delay, int(claim.scheduled_delay * 2)))
+            store.release(claim, deferred=True, retry_delay=delay,
+                          retry_reason='wave_wait' if waiting_wave else 'barrier_wait')
+        try:
+            store.notify(key, _send_tag_index_wakeup)
+        except Exception:
+            worker_logger.warning('Tag barrier wakeup retained for recovery', exc_info=True)
+            return 'tag_index_retry'  # Keep this receipt if replacement failed.
+        return 'tag_index_deferred'  # ACK only after the delayed wake is durable.
     except Exception:
         if claim is not None:
             try:
@@ -11354,6 +11371,8 @@ def resume_index_maintenance_after_wave(library):
     store = index_work.WorkStore(jobs_table_client)
     resumed = store.resume_wave_waits(library, _send_index_wakeup,
         scopes=set(index_updates.SCOPE_KINDS) - {'tag_embedding'})
+    tags = index_work.WorkStore(jobs_table_client, partition=automatic.TAG_PARTITION)
+    resumed += tags.resume_wave_waits(library, _send_tag_index_wakeup, scopes={'tag_embedding'})
     return resumed + recover_pending_index_work(library)
 
 

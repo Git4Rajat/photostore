@@ -219,6 +219,33 @@ def test_coordination_contention_queues_short_retry_and_exhausts_existing_budget
     assert len(sent) == 5
 
 
+def test_progress_resets_vision_dispatch_failures_between_pages(monkeypatch, vision_dispatch):
+    store, work, wave, token, payload, sent = vision_dispatch
+    now = [1000.0]
+    work.clock = lambda: now[0]
+    current = [wave]
+
+    def conflict(*args, **kwargs):
+        raise runtime.MutationContention('Concurrent wave mutation')
+
+    def progress(*args, **kwargs):
+        old = store._required(store.wave_key(wave['waveId']))
+        updated = dict(old, lastProgressAt=float(old.get('lastProgressAt') or 0) + 1)
+        store.table.submit_transaction([store._change(old, updated)])
+        current[0] = updated
+        return updated
+
+    for _ in range(7):
+        monkeypatch.setattr(runtime, 'run_vision_release', conflict)
+        assert runtime.consume(payload) == 'done'
+        assert work._get(token)['attempts'] == 1
+        now[0] += 31
+        monkeypatch.setattr(runtime, 'run_vision_release', progress)
+        assert runtime.consume(payload) == 'done'
+        assert work._get(token)['attempts'] == 0
+        now[0] += 1
+
+
 def test_artifact_cleanup_wait_preserves_budget_and_durable_wakeup(monkeypatch, vision_dispatch):
     from upload_waves import ArtifactCleanupBusy
     _, work, wave, token, payload, sent = vision_dispatch

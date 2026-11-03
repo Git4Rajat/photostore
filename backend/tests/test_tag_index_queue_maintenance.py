@@ -261,17 +261,69 @@ def test_source_busy_is_durable_visibility_retry_without_exhausting_budget(env):
     env.runtime.store.begin('A', 'tag_embedding', ['one'])
     msg = message(env)
     key = json.loads(msg.content)['maintenanceKey']
-    for _ in range(app.INDEX_BUILD_MAX_RETRIES + 4):
-        assert app._process_ipwork_message(msg) == 'tag_index_retry'
+    for attempt in range(app.INDEX_BUILD_MAX_RETRIES + 4):
+        assert app._process_ipwork_message(msg) == 'tag_index_deferred'
         row = env.store._get(key)
         assert not row['failed'] and row['attempts'] == 0 and row['notBefore'] == env.now[0] + 10
+        assert len(env.queue.sent) == attempt + 1
+        assert env.queue.sent[-1][1]['visibility_timeout'] == 10
         env.now[0] += 11
-    assert not env.deadletter.sent and not env.runtime.calls and not env.queue.sent
+    assert not env.deadletter.sent and not env.runtime.calls
     env.runtime.store.finish('A', 'tag_embedding')
-    # Post-write schedule revises and publishes one wake; further writes coalesce.
-    assert enqueue(env) == 'queued'
+    # The reserved recovery wake also covers a later source revision.
+    assert enqueue(env) == 'already_active'
     assert enqueue(env) == 'already_active'
     assert app._process_ipwork_message(msg) == 'tag_index_done'
+    assert env.store._get(key) is None
+
+
+def test_duplicate_tag_wakes_are_acked_without_failure_or_renewing_live_owner(env, monkeypatch):
+    msg = message(env)
+    key = json.loads(msg.content)['maintenanceKey']
+    owner = env.store.claim(key)
+    before = dict(env.store._get(key))
+    monkeypatch.setattr(app.worker_logger, 'exception', lambda *a, **k: pytest.fail('Duplicate logged as failure'))
+    for _ in range(20):
+        assert app._process_ipwork_message(msg) == 'tag_index_noop'
+    assert dict(env.store._get(key)) == before
+    assert not env.runtime.calls and not env.queue.sent
+    # The durable intent remains recoverable if the real owner crashes.
+    env.now[0] += env.store.lease_seconds + env.store.wake_seconds + 1
+    assert env.store.recover(REAL_SEND) == 1
+    assert env.store._get(key)['owner'] == owner.owner
+
+
+def test_wave_blocked_tag_job_does_not_acquire_catalog_lease(env, monkeypatch):
+    msg = message(env)
+    monkeypatch.setattr(automatic, 'wave_pending', lambda _: True)
+    assert app._process_ipwork_message(msg) == 'tag_index_deferred'
+    assert env.blobs.acquired == 0
+    assert not env.runtime.calls
+    key = json.loads(msg.content)['maintenanceKey']
+    row = env.store._get(key)
+    assert row['retryReason'] == 'wave_wait'
+    assert row['notBefore'] == env.now[0] + app.INDEX_BARRIER_RECOVERY_SECONDS
+    assert len(env.queue.sent) == 1
+    for _ in range(20):
+        assert app._process_ipwork_message(msg) == 'tag_index_noop'
+    assert len(env.queue.sent) == 1  # Early receipts do not multiply recovery wakes.
+
+
+def test_terminal_wave_signal_resumes_tag_recovery_wake(env, monkeypatch):
+    msg = message(env)
+    key = json.loads(msg.content)['maintenanceKey']
+    pending = [True]
+    monkeypatch.setattr(automatic, 'wave_pending', lambda _: pending[0])
+    monkeypatch.setattr(app, 'index_maintenance_queue_client', Queue())
+    monkeypatch.setattr(app, 'recover_pending_index_work', lambda _: 0)
+    assert app._process_ipwork_message(msg) == 'tag_index_deferred'
+    assert len(env.queue.sent) == 1
+    assert app.resume_index_maintenance_after_wave('A') == 0
+    pending[0] = False
+    assert app.resume_index_maintenance_after_wave('A') == 1
+    assert env.store._get(key)['notBefore'] == 0
+    assert len(env.queue.sent) == 2
+    assert app._process_ipwork_message(env.queue.sent[-1][2]) == 'tag_index_done'
     assert env.store._get(key) is None
 
 
@@ -353,12 +405,14 @@ def test_real_poll_loop_acks_only_after_exact_job_and_never_triggers_photo_miles
     assert len(env.runtime.calls) == 1
 
 
-def test_real_poll_loop_source_busy_updates_visibility_and_never_acks(env, monkeypatch):
+def test_real_poll_loop_source_busy_acks_only_after_replacement_wake(env, monkeypatch):
     env.runtime.store.begin('A', 'tag_embedding', ['one'])
     msg = message(env)
     run_queue(env, monkeypatch, msg)
-    assert not env.queue.deleted
-    assert env.queue.updated == [(msg, {'visibility_timeout': 10})]
+    assert env.queue.deleted == [msg]
+    assert not env.queue.updated
+    assert len(env.queue.sent) == 1
+    assert env.queue.sent[0][1]['visibility_timeout'] == 10
     assert env.store._get(json.loads(msg.content)['maintenanceKey'])['attempts'] == 0
 
 
@@ -412,7 +466,7 @@ def test_real_source_write_busy_wake_coalesces_post_request_and_retries(env, mon
     monkeypatch.setattr(env.runtime.source, 'upsert_entity', write)
     source = automatic.SourceTable(env.runtime.source, 'metadata')
     source.upsert_entity({'PartitionKey': 'A', 'RowKey': 'one', 'tags': '["cat"]'})
-    assert observed == ['tag_index_retry']
+    assert observed == ['tag_index_deferred']
     key = env.store.key('A', 'tag_embedding')
     assert env.store._get(key)['attempts'] == 0
     assert len(env.queue.sent) == 2  # pre-wake + coalesced post-commit wake
@@ -453,16 +507,16 @@ def test_source_barrier_is_checked_even_after_prior_failure_budget_exhausted(env
     row = env.store._get(key)
     env.runtime.jobs.upsert_entity(dict(row, attempts=10, attemptRevision=row['revision']))
     monkeypatch.setattr(app, 'INDEX_BUILD_MAX_RETRIES', 2)
-    assert app._process_ipwork_message(msg) == 'tag_index_retry'
+    assert app._process_ipwork_message(msg) == 'tag_index_deferred'
     assert env.store._get(key)['attempts'] == 10 and not env.store._get(key)['failed']
     assert not env.deadletter.sent
 
 
-def test_concurrent_claim_is_retry_not_poison_or_photo_failure(env):
+def test_concurrent_claim_is_obsolete_not_poison_or_photo_failure(env):
     msg = message(env)
     key = json.loads(msg.content)['maintenanceKey']
     claim = env.store.claim(key)
-    assert app._process_ipwork_message(msg) == 'tag_index_retry'
+    assert app._process_ipwork_message(msg) == 'tag_index_noop'
     assert env.store._get(key)['owner'] == claim.owner and not env.statuses
 
 

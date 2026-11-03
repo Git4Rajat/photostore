@@ -304,6 +304,32 @@ def test_healthy_deferred_barrier_waits_do_not_exhaust_work_attempts(work):
     assert store.claim(key).attempt==2
 
 
+def test_verified_progress_resets_failures_only_for_the_claimed_revision(work):
+    store, _, _ = work
+    key = store.request('A', 'wave-vision:w:key')
+    first = store.claim(key)
+    store.release(first)
+    second = store.claim(key)
+    assert second.attempt == 2
+    store.release(second, deferred=True, reset_attempts=True)
+    third = store.claim(key)
+    assert third.attempt == 1
+    store.request('A', 'wave-vision:w:key')
+    newer = store._get(key)
+    store.release(third, deferred=True, reset_attempts=True)
+    assert store._get(key)['attemptRevision'] == newer['attemptRevision']
+    assert store._get(key)['attempts'] == newer['attempts']
+
+
+def test_failure_cannot_reset_its_own_attempt_budget(work):
+    store, _, _ = work
+    key = store.request('A', 'wave-vision:w:key')
+    claim = store.claim(key)
+    with pytest.raises(ValueError, match='verified progress'):
+        store.release(claim, reset_attempts=True)
+    assert store._get(key)['owner'] == claim.owner
+
+
 def test_retry_timing_is_piggybacked_consumed_once_and_invalidated_by_new_revision(work):
     store, table, now = work
     key = store.request('A', 'wave-vision:wave:outbox')

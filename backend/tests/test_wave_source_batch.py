@@ -220,6 +220,76 @@ def test_crash_before_batch_observation_replays_receipts_without_models(world, m
     assert [row['count'] for row in store._page('source-attempt!')] == [1] * 4
 
 
+def test_page_commit_survives_successor_intake_changing_library_control(world, monkeypatch):
+    """A later upload must not starve already qualified source evidence."""
+    from wave_source_batch import commit_observations
+    store, _, _, table, _ = world
+    table.submit_transaction([('create', store._row('policy', protocol='library-wave-v1', cleanupState=''))])
+    _, wave, _ = admit(world, 1)
+    member = store._page(f'e!{wave}!m!')[0]
+    original = store._policy_guard
+    collisions = []
+    mutating = [False]
+    monkeypatch.setattr(time, 'sleep', lambda _: None)
+
+    def guard(*args, **kwargs):
+        if not mutating[0]:
+            collisions.append(1)
+            # Real intake mutates control plus its successor wave/session.
+            # It races the long member-read phase, before the fresh policy CAS.
+            mutating[0] = True
+            store.open_session('successor-' + str(len(collisions)), 0)
+            mutating[0] = False
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, '_policy_guard', guard)
+    commit_observations(store, wave, [(member, ({'id': 'qualified'}, {}), False)])
+    assert store._required(member['RowKey'])['outcome'] == 'settled'
+    assert len(collisions) == 1
+    assert store._required('control')['collectingWaveId'] != wave
+
+
+@pytest.mark.parametrize('fence', ['cleanup', 'freeze'])
+def test_page_commit_still_rejects_concurrent_cleanup_or_freeze(world, monkeypatch, fence):
+    from upload_waves import Conflict
+    from wave_source_batch import commit_observations
+    _, wave, _ = admit(world, 1)
+    store, _, _, table, _ = world
+    member = store._page(f'e!{wave}!m!')[0]
+    table.submit_transaction([('create', store._row('policy', cleanupState=''))])
+
+    def mutate():
+        key = 'policy' if fence == 'cleanup' else store.wave_key(wave)
+        old = store._required(key)
+        fields = {'cleanupState': 'deleting'} if fence == 'cleanup' else {'state': 'ready'}
+        table.submit_transaction([store._change(old, dict(old, **fields))])
+
+    table.before_commit = mutate
+    with pytest.raises(Conflict):
+        commit_observations(store, wave, [(member, ({'id': 'qualified'}, {}), False)])
+    assert store._required(member['RowKey'])['outcome'] == 'pending'
+
+
+def test_page_evidence_change_restarts_partial_manifest_evaluation(world):
+    from wave_source_batch import commit_observations
+    _, wave, _ = admit(world, 21)
+    store = world[0]
+    members = store._page(f'e!{wave}!m!', size=21)
+    for member in members:
+        commit_observations(store, wave, [(member, ({'id': 'qualified'}, {}), False)])
+    first_page = store.evaluate(wave)
+    assert json.loads(first_page['evaluation'])['members'] == 20
+    scanned = store._required(members[0]['RowKey'])
+    commit_observations(store, wave, [(scanned, None, False)])
+    assert store._required(store.wave_key(wave))['evaluation'] == ''
+    for _ in range(3):
+        result = store.evaluate(wave)
+        if not result.get('evaluation'):
+            break
+    assert result['state'] == 'processing'
+    assert result['outstandingMembers'] == 1
+
+
 def test_deadline_checkpoints_only_the_processed_prefix(world, monkeypatch):
     metadata, wave, key = admit(world, 4)
     store, _, leases, *_ = world

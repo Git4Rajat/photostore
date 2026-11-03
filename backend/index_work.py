@@ -351,7 +351,9 @@ class WorkStore:
                 continue
         raise RuntimeError('Maintenance lease renewal contention')
 
-    def release(self, claim, *, deferred=False, retry_delay=None, retry_reason='continuation'):
+    def release(self, claim, *, deferred=False, retry_delay=None, retry_reason='continuation', reset_attempts=False):
+        if reset_attempts and not deferred:
+            raise ValueError('Only verified progress may reset deferred work attempts')
         for _ in range(12):
             current = self._get(claim.key)
             if current is None or current.get('owner') != claim.owner:
@@ -367,10 +369,11 @@ class WorkStore:
                         retryScheduledAt=scheduled_at, retryDelaySeconds=max(0, retry_delay),
                         retryScheduleId=uuid.uuid4().hex, retryScheduleRevision=claim.revision,
                         retryReason=retry_reason)
-                # A healthy barrier wait (or obsolete wake) did not fail work.
-                # Preserve earlier failures without charging this claim again.
+                # Barrier waits refund this claim; verified durable progress
+                # additionally clears failures accumulated on earlier pages.
                 if deferred and current['revision'] == claim.revision:
-                    row['attempts'] = max(0, int(current.get('attempts') or 0) - 1)
+                    row['attempts'] = (0 if reset_attempts else
+                                       max(0, int(current.get('attempts') or 0) - 1))
                 self._replace(current, row)
                 if retry_delay is not None:
                     import processing_diagnostics

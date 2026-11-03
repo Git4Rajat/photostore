@@ -298,7 +298,8 @@ def consume(payload,*,deadline=None,progress=None):
             progressing = float(result.get('lastProgressAt') or 0) > float(wave.get('lastProgressAt') or 0)
             delay = 0 if stage == 'vision' and healthy_continuation and progressing else 5
             work.release(claim,deferred=healthy_continuation,retry_delay=delay,
-                         retry_reason='progress' if progressing else 'barrier_wait')
+                         retry_reason='progress' if progressing else 'barrier_wait',
+                         reset_attempts=stage == 'vision' and healthy_continuation and progressing)
         else:
             work.finish(claim)
         current=store._required(store.wave_key(wave_id))
@@ -331,10 +332,13 @@ def consume(payload,*,deadline=None,progress=None):
         # Source results precede coordination/checkpoint writes. Retry those
         # through the normal durable release, without waiting out the queue's
         # five-minute visibility timeout or admitting another model attempt.
-        # Keep this failure charged to the dispatch budget: contention cannot
-        # create an unbounded healthy-continuation loop.
+        # Bound consecutive failures, not all conflicts over a large wave's
+        # lifetime. Earlier committed pages are real progress even if this
+        # page lost a race. Persistent no-progress contention still exhausts.
+        progressing = float(current.get('lastProgressAt') or 0) > float(wave.get('lastProgressAt') or 0)
         delay = min(30, 2 ** min(claim.attempt, 5))
-        work.release(claim, retry_delay=delay, retry_reason='coordination_conflict')
+        work.release(claim, deferred=progressing, reset_attempts=progressing,
+                     retry_delay=delay, retry_reason='coordination_conflict')
         relay_current(work, store, current, send_stage)
         processing_diagnostics.emit('vision_coordination_retry', wave_id=wave_id,
             attempt=claim.attempt, delay_seconds=delay)

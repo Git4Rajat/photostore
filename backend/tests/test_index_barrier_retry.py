@@ -216,7 +216,7 @@ def test_claim_embargo_is_cas_rechecked_and_preserves_attempts(partition, monkey
     assert table.get_entity(partition, key) == latest
 
 
-def test_tag_dispatch_keeps_early_duplicates_nonterminal_and_does_not_send(clocked, monkeypatch):
+def test_tag_dispatch_coalesces_early_duplicates_into_one_delayed_wake(clocked, monkeypatch):
     env = clocked
     monkeypatch.setenv('APP_ROLE', 'vision')
     monkeypatch.setattr(app.vision_utils, 'image_encoder_available', lambda: True)
@@ -226,13 +226,15 @@ def test_tag_dispatch_keeps_early_duplicates_nonterminal_and_does_not_send(clock
     tags.release(first, deferred=True, retry_delay=10, retry_reason='barrier_wait')
     before = tags._get(key)
     payload = app._tag_index_payload('A', before['revision'])
-    send = Mock(side_effect=AssertionError('duplicate replacement'))
+    send = Mock(return_value=None)
     monkeypatch.setattr(app, '_send_tag_index_wakeup', send)
     for _ in range(100):
-        assert app._run_tag_index_maintenance_payload(payload) == 'tag_index_retry'
-    assert tags._get(key) == before
+        assert app._run_tag_index_maintenance_payload(payload) == 'tag_index_noop'
+    after = tags._get(key)
+    for field in ('attempts', 'revision', 'notBefore', 'owner', 'failed'):
+        assert after[field] == before[field]
     assert not env.statuses and not env.runtime.calls and not env.events
-    send.assert_not_called()
+    send.assert_called_once_with('A', 'tag_embedding', before['revision'], 10)
 
 
 def test_wave_completion_resumes_maintenance_before_recovery_deadline(clocked, monkeypatch):
