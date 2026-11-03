@@ -27,6 +27,10 @@ def live_api(monkeypatch):
     import wave_runtime
     monkeypatch.setattr(wave_runtime,'send_stage',lambda *args:None)
     monkeypatch.setattr(app,'jobs_table_client',table)
+    # Terminal upload events also deliver pending maintenance handoffs. Keep
+    # the real handoff path enabled with its queue dependency configured.
+    monkeypatch.setattr(app,'index_maintenance_queue_client',
+        SimpleNamespace(send_message=lambda *args,**kwargs:None))
     monkeypatch.setattr(app,'metadata_table_client',metadata)
     monkeypatch.setattr(app,'_require_library_context',lambda **kw:('owner',library[0],None))
     monkeypatch.setattr(app,'library_store',SimpleNamespace(is_owner=lambda account,lib:account=='owner' and lib=='u'))
