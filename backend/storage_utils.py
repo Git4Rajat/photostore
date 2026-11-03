@@ -59,6 +59,7 @@ import table_scan
 import maps_utils
 import perf_instrumentation
 import processing_diagnostics
+import index_merge_diagnostics
 import processing_metrics
 import vision_utils
 
@@ -6180,9 +6181,11 @@ def _strict_capture_publication(user_id, kind):
     try:
         versions = [client.get_blob_properties().etag for client in clients]
         if not all(versions):
-            return None
-    except Exception:
-        return None
+            return index_merge_diagnostics.record(kind, 'publication_etag_unavailable')
+    except ResourceNotFoundError:
+        return index_merge_diagnostics.record(kind, 'publication_base_missing')
+    except Exception as error:
+        return index_merge_diagnostics.record(kind, 'publication_base_read_failed', error=error)
     return [(client, {'etag': version, 'match_condition': MatchConditions.IfNotModified})
             for client, version in zip(clients, versions)]
 
@@ -7138,27 +7141,37 @@ def touch_user_albums_index_state(user_id: str) -> str:
 def _load_albums_index_manifest(user_id: str) -> Dict[str, str]:
     blob_client = _albums_index_blob_client(_albums_index_manifest_blob_name(user_id))
     if blob_client is None:
+        index_merge_diagnostics.record('albums', 'albums_manifest_storage_unavailable')
         return {}
     try:
         payload = blob_client.download_blob().readall()
-    except Exception:
+    except ResourceNotFoundError:
+        index_merge_diagnostics.record('albums', 'albums_manifest_missing')
+        return {}
+    except Exception as error:
+        index_merge_diagnostics.record('albums', 'albums_manifest_read_failed', error=error)
         return {}
     try:
         parsed = json.loads(payload.decode('utf-8'))
-        return parsed if isinstance(parsed, dict) else {}
-    except Exception:
+        if not isinstance(parsed, dict):
+            raise ValueError('Albums manifest must be an object')
+        return parsed
+    except Exception as error:
+        index_merge_diagnostics.record('albums', 'albums_manifest_decode_failed', error=error)
         return {}
 
 
 def _load_albums_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
     blob_client = _albums_index_blob_client(_albums_index_json_blob_name(user_id))
     if blob_client is None:
-        return None
+        return index_merge_diagnostics.record('albums', 'albums_data_storage_unavailable')
     try:
         payload = blob_client.download_blob().readall()
-    except Exception:
+    except ResourceNotFoundError:
+        return index_merge_diagnostics.record('albums', 'albums_data_missing')
+    except Exception as error:
         _LOGGER.warning('Albums index data download failed user=%s', user_id, exc_info=True)
-        return None
+        return index_merge_diagnostics.record('albums', 'albums_data_read_failed', error=error)
     try:
         # Blob SDK reads may already decode Content-Encoding:gzip, whereas
         # shared write-through files can still contain the original gzip bytes.
@@ -7174,9 +7187,9 @@ def _load_albums_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
             updated_at=str(parsed.get('updatedAt') or ''),
             rows=rows,
         )
-    except Exception:
+    except Exception as error:
         _LOGGER.warning('Albums index data decode failed user=%s', user_id, exc_info=True)
-        return None
+        return index_merge_diagnostics.record('albums', 'albums_data_decode_failed', error=error)
 
 
 def _serialize_albums_index(snapshot: LexicalIndexSnapshot) -> bytes:
@@ -7337,7 +7350,7 @@ def _incremental_albums_index_snapshot(
     Much faster than full rebuild for bulk operations (e.g., moving 100 photos to one album)."""
     albums_table_client = _CTX.get('albums_table_client')
     if albums_table_client is None:
-        return None
+        return index_merge_diagnostics.record('albums', 'albums_table_unavailable')
 
     import search_db
     try:
@@ -7347,7 +7360,9 @@ def _incremental_albums_index_snapshot(
             raise
         library_db = None
     if incremental_only and (library_db is None or not _strict_album_search_ready(user_id, library_db, ())):
-        return None
+        if library_db is None:
+            return index_merge_diagnostics.record('albums', 'search_database_unavailable')
+        return None  # Readiness check recorded the precise reason.
 
     def _cover(names: List[str]) -> str:
         if not names:
@@ -7375,8 +7390,8 @@ def _incremental_albums_index_snapshot(
             except ResourceNotFoundError:
                 # Album deleted, will be filtered out below
                 pass
-    except Exception:
-        return None
+    except Exception as error:
+        return index_merge_diagnostics.record('albums', 'album_source_read_failed', error=error)
 
     # Build updated rows for affected albums
     updated_rows: Dict[str, Dict[str, object]] = {}
@@ -7386,11 +7401,11 @@ def _incremental_albums_index_snapshot(
             # Album was deleted, skip it
             continue
         if incremental_only and album_store.is_table_backed(row) and not album_store.members_available():
-            return None
+            return index_merge_diagnostics.record('albums', 'album_members_unavailable')
         filenames = album_store.sample(row) if album_store.is_table_backed(row) else album_store.read_filenames(row)
         member_count += len(filenames)
         if incremental_only and member_count > _STRICT_INCREMENTAL_MAX_MEMBERS:
-            return None
+            return index_merge_diagnostics.record('albums', 'album_member_limit')
         if incremental_only and not _strict_album_search_ready(user_id, library_db, filenames):
             return None
         updated_rows[album_id] = {
@@ -7434,26 +7449,42 @@ def _strict_album_search_ready(user_id, db, filenames):
     try:
         manifest = search_db.load_manifest(user_id)
         lexical = _load_lexical_index_manifest(user_id)
-        if (not manifest.get('sourceVersion') or manifest.get('schemaVersion') != search_db.SCHEMA_VERSION
-                or manifest.get('building') or lexical.get('dirty')
-                or not lexical.get('sourceVersion')
-                or search_db._lineage(manifest) != str(lexical['sourceVersion'])
-                or db.path != search_db._local_path(user_id, str(manifest['sourceVersion']))
-                or db.applied_seq() != int(manifest.get('deltaSeq') or manifest.get('baseSeq') or 0)):
+        reason = None
+        if not manifest.get('sourceVersion'):
+            reason = 'search_manifest_missing'
+        elif manifest.get('schemaVersion') != search_db.SCHEMA_VERSION:
+            reason = 'search_schema_mismatch'
+        elif manifest.get('building'):
+            reason = 'search_building'
+        elif lexical.get('dirty'):
+            reason = 'search_source_dirty'
+        elif not lexical.get('sourceVersion'):
+            reason = 'search_source_missing'
+        elif search_db._lineage(manifest) != str(lexical['sourceVersion']):
+            reason = 'search_lineage_mismatch'
+        elif db.path != search_db._local_path(user_id, str(manifest['sourceVersion'])):
+            reason = 'search_database_stale'
+        elif db.applied_seq() != int(manifest.get('deltaSeq') or manifest.get('baseSeq') or 0):
+            reason = 'search_delta_not_applied'
+        if reason:
+            index_merge_diagnostics.record('albums', reason)
             return False
         _flush_dirty_filename_buffer(user_id, 'lexical')
         table = _CTX.get('search_index_dirty_table_client')
         if table is None:
+            index_merge_diagnostics.record('albums', 'search_dirty_tracking_unavailable')
             return False
         partition = _search_index_dirty_partition_key(user_id, 'lexical')
         for filename in filenames:
             try:
                 table.get_entity(partition_key=partition, row_key=filename)
+                index_merge_diagnostics.record('albums', 'album_member_metadata_pending')
                 return False
             except ResourceNotFoundError:
                 pass
         return True
-    except Exception:
+    except Exception as error:
+        index_merge_diagnostics.record('albums', 'album_search_read_failed', error=error)
         return False
 
 
@@ -7471,16 +7502,20 @@ def _albums_merge_eligible(user_id: str, affected_album_ids: Optional[set], *, m
     publishes to the same blob guarded only by an in-process lock)."""
     key = str(user_id or '').strip()
     if not key or not affected_album_ids or len(affected_album_ids) > _STRICT_INCREMENTAL_MAX_IDS or getattr(affected_album_ids, 'has_more', False) or getattr(affected_album_ids, 'truncated', False):
-        return None
+        return index_merge_diagnostics.record('albums', 'album_id_capture_ineligible')
     prev_manifest = _load_albums_index_manifest(key)
+    if not prev_manifest:
+        return None  # Loader recorded missing storage, data or a read failure.
     if max_rows is not None and not _incremental_manifest_within_limit(prev_manifest, _ALBUMS_INDEX_SCHEMA_VERSION, max_rows):
-        return None
+        return index_merge_diagnostics.record('albums', 'albums_manifest_ineligible')
     prev_snapshot = _load_albums_index_blob(key) if prev_manifest else None
     if (prev_snapshot and prev_snapshot.schema_version == _ALBUMS_INDEX_SCHEMA_VERSION
             and prev_snapshot.source_version == str(prev_manifest.get('sourceVersion') or '')
             and (max_rows is None or len(prev_snapshot.rows) == prev_manifest['rowCount'] <= max_rows)):
         return prev_snapshot
-    return None
+    if prev_snapshot is None:
+        return None  # Loader recorded the reason.
+    return index_merge_diagnostics.record('albums', 'albums_snapshot_mismatch')
 
 
 @catalog_publisher
@@ -7502,7 +7537,7 @@ def refresh_user_albums_index(user_id: str, *, source_version: Optional[str] = N
     if incremental_only:
         prev_snapshot = _albums_merge_eligible(key, affected_album_ids, max_rows=_STRICT_INCREMENTAL_MAX_ROWS)
         if prev_snapshot is None:
-            return None
+            return None  # Eligibility/loader recorded the precise reason.
         snapshot = _incremental_albums_index_snapshot(key, source_version, affected_album_ids, prev_snapshot.rows,
                                                      incremental_only=True)
     # Try incremental if affected IDs provided
@@ -7521,7 +7556,7 @@ def refresh_user_albums_index(user_id: str, *, source_version: Optional[str] = N
     if snapshot is None:
         return None
     if incremental_only and len(snapshot.rows) > _STRICT_INCREMENTAL_MAX_ROWS:
-        return None
+        return index_merge_diagnostics.record('albums', 'album_row_limit')
     container_name = _lexical_index_container_name()
     if not container_name or _get_blob_client(container_name, _albums_index_json_blob_name(key)) is None or _get_blob_client(container_name, _albums_index_manifest_blob_name(key)) is None:
         raise RuntimeError('Albums index blob storage is unavailable')
@@ -8650,13 +8685,18 @@ def prime_all_user_indexes_sequentially(
                         result = refresh_fn(key, source_version=source_version, **extra_kwargs)
                     if result is None:
                         failed.append(kind)
-                        _LOGGER.error('Index priming produced no %s index user=%s', kind, key)
+                        if incremental_only and index_merge_diagnostics.was_deferred(kind):
+                            _LOGGER.info('Inline index deferred kind=%s user=%s; durable work retained', kind, key)
+                        else:
+                            _LOGGER.error('Index priming produced no %s index user=%s', kind, key)
                     else:
                         _mark_index_rebuild_completed(key, kind)
                         if kind in readiness:
                             readiness[kind] = True
-                except Exception:
+                except Exception as error:
                     failed.append(kind)
+                    if incremental_only:
+                        index_merge_diagnostics.record(kind, 'refresh_failed', error=error)
                     _LOGGER.exception('Sequential index priming failed kind=%s user=%s', kind, key)
                 finally:
                     kind_lock.release()

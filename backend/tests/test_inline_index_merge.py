@@ -654,6 +654,28 @@ def test_inline_failed_result_retains_intent_dirty_and_backstop(attempt_ctx):
     assert attempt_ctx.table.rows
 
 
+def test_real_read_failure_cannot_be_hidden_by_later_deferral(attempt_ctx, monkeypatch, caplog):
+    import index_merge_diagnostics
+    import logging
+    caplog.set_level(logging.INFO)
+    def fail_then_defer(*args, **kwargs):
+        index_merge_diagnostics.record('people', 'publication_base_read_failed',
+                                       error=OSError('private failure detail'))
+        index_merge_diagnostics.record('people', 'publication_etag_unavailable')
+        return ['people']
+    attempt_ctx.prime.side_effect = fail_then_defer
+    delete = Mock()
+    with pytest.raises(RuntimeError, match='produced no people'):
+        inline_index_merge._attempt('lib', 'people', [(SimpleNamespace(delete_message=delete),
+                                                      SimpleNamespace(id='m', pop_receipt='r'))])
+    delete.assert_not_called()
+    attempt_ctx.clear_people.assert_not_called()
+    assert 'private failure detail' not in caplog.text
+    assert 'publication_base_read_failed' in caplog.text
+    # Attempt-local diagnostics cannot leak into the next worker task.
+    assert not index_merge_diagnostics.was_deferred('people')
+
+
 @pytest.mark.parametrize('kind', ['sort', 'access'])
 @pytest.mark.parametrize('reason', ['cost', 'read', 'schema', 'source', 'dirty_cap', 'photo_cap'])
 def test_strict_rows_revalidation_never_falls_back_to_scan(rows_ctx, monkeypatch, kind, reason):
@@ -800,7 +822,11 @@ def _ready_album_search(monkeypatch, *, seq=0, applied=0, dirty=False):
 
 
 @pytest.mark.parametrize('reason', ['absent', 'stale', 'dirty', 'member_pending', 'lookup_error', 'empty_result', 'lineage', 'building'])
-def test_strict_album_search_not_ready_retains_artifacts_intent_and_backstop(albums_ctx, attempt_ctx, monkeypatch, reason):
+def test_strict_album_search_not_ready_retains_artifacts_intent_and_backstop(albums_ctx, attempt_ctx, monkeypatch, caplog, reason):
+    import logging
+    import json
+    import processing_diagnostics
+    caplog.set_level(logging.INFO)
     import search_db
     albums, _, blobs = albums_ctx
     _seed_album(albums, 'lib', 'a1', name='Trip', filenames='["a.jpg"]')
@@ -822,14 +848,28 @@ def test_strict_album_search_not_ready_retains_artifacts_intent_and_backstop(alb
     before = dict(blobs.blobs)
     store = index_work.WorkStore(attempt_ctx.table)
     store.request('lib', 'albums')
+    revision = store._get(store.key('lib', 'albums'))['revision']
     # Remove the unrelated people intent (albums conservatively conflicts
     # with people search work) and run the real strict primer.
     attempt_ctx.table.rows.pop((index_work.PARTITION, store.key('lib', 'people')))
     monkeypatch.setattr(inline_index_merge, '_eligible', lambda *a: (True, None, {'a1'}))
     monkeypatch.setattr(su, 'prime_all_user_indexes_sequentially', _REAL_PRIMER)
     delete = Mock()
-    with pytest.raises(RuntimeError, match='produced no albums'):
+    if reason in ('lookup_error', 'empty_result'):
+        with pytest.raises(RuntimeError, match='produced no albums'):
+            inline_index_merge._attempt('lib', 'albums', [(SimpleNamespace(delete_message=delete), SimpleNamespace(id='m', pop_receipt='r'))])
+    else:
         inline_index_merge._attempt('lib', 'albums', [(SimpleNamespace(delete_message=delete), SimpleNamespace(id='m', pop_receipt='r'))])
+        expected = {'absent': 'search_database_unavailable', 'stale': 'search_delta_not_applied',
+                    'dirty': 'search_source_dirty', 'member_pending': 'album_member_metadata_pending',
+                    'lineage': 'search_lineage_mismatch', 'building': 'search_building'}[reason]
+        events = [json.loads(r.message.split('processing telemetry ', 1)[1])
+                  for r in caplog.records if 'processing telemetry ' in r.message]
+        assert any(e.get('reason') == expected and e['outcome'] == 'deferred'
+                   and e['intent_revision'] == revision
+                   and e['operation_id'] == processing_diagnostics.operation_id(f'lib:albums:{revision}')
+                   for e in events)
+        assert not any(r.levelno >= logging.ERROR for r in caplog.records)
     assert blobs.blobs == before
     attempt_ctx.clear_albums.assert_not_called()
     delete.assert_not_called()

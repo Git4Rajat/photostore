@@ -76,15 +76,22 @@ def test_batch_context_is_thread_local_and_reset_on_error():
 
 
 def test_per_step_events_inherit_delivery_identity_and_trace_is_reset(caplog):
+    revision = '42fc715a-5932-49f5-8b30-16cac3ea4315'
+    operation = f'private-library-with-a-long-identifier:people_embedding:{revision}'
     message = SimpleNamespace(id='queue', dequeue_count=2, content=json.dumps({
-        'uploadBatchId': '01234567-89ab-4def-8123-456789abcdef'}))
+        'uploadBatchId': '01234567-89ab-4def-8123-456789abcdef',
+        'operationId': operation, 'intentRevision': revision}))
     with d.trace(message):
         d.file_event('vision_step', 'u', 'photo.jpg', step='ocr')
     d.file_event('vision_step', 'u', 'photo.jpg', step='face')
     first, second = records(caplog)
     assert first['attempt'] == 2 and first['message_id'] == d.message_fields(message)['message_id']
     assert first['batch_id'] == '0123456789ab4def8123456789abcdef'
+    assert first['operation_id'] == d.operation_id(operation)
+    assert first['intent_revision'] == revision.replace('-', '')
+    assert operation not in json.dumps(first)
     assert 'message_id' not in second and 'batch_id' not in second
+    assert 'operation_id' not in second and 'intent_revision' not in second
 
 
 def test_state_accounting_is_exclusive_and_forced_report_includes_partial_window(caplog):

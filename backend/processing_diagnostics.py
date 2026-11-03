@@ -165,6 +165,12 @@ def file_id(user, filename):
     return hashlib.sha256(json.dumps([str(user), str(filename)], separators=(',', ':')).encode()).hexdigest()[:32]
 
 
+def operation_id(value):
+    # Queue operation IDs can exceed the telemetry label limit and contain a
+    # library identity. Use the same bounded correlation key in every process.
+    return hashlib.sha256(str(value).encode()).hexdigest()[:32] if value else None
+
+
 def emit(event, **fields):
     try:
         record = {'event': event, 'schema': 1, 'process_instance': _INSTANCE,
@@ -374,9 +380,12 @@ def message_fields(message):
 
 @contextmanager
 def trace(message):
+    body = payload(message)
     fields = message_fields(message)
-    fields['batch_id'] = batch_id(payload(message).get('uploadBatchId'))
-    fields['wave_id'] = batch_id(payload(message).get('waveId'))
+    fields['batch_id'] = batch_id(body.get('uploadBatchId'))
+    fields['wave_id'] = batch_id(body.get('waveId'))
+    fields['operation_id'] = operation_id(body.get('operationId'))
+    fields['intent_revision'] = batch_id(body.get('intentRevision'))
     token = _TRACE.set(fields)
     try:
         yield

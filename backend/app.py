@@ -16184,7 +16184,9 @@ def _process_clustering_queue_message_impl(message, queue_client, queue_name, ma
             outcome = (dispatch or _handle_clustering_queue_payload)(payload, job_id, user_id, job_type)
             if _queue_worker_role() == 'indexer':
                 processing_diagnostics.emit('index_message_outcome', role='indexer', job_type=job_type,
-                    outcome=outcome or 'handled')
+                    outcome=outcome or 'handled', operation_id=processing_diagnostics.operation_id(payload.get('operationId')),
+                    intent_revision=payload.get('intentRevision'), scope=payload.get('scope'),
+                    wave_id=payload.get('waveId'))
             worker_logger.info(
                 'clustering message done job_type=%s filename=%s user=%s elapsed_ms=%d',
                 job_type or 'people_incremental_assign', _clustering_log_filename_summary(payload), user_id,

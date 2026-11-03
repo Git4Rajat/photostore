@@ -296,6 +296,29 @@ its own reporter. Queue handling emits `index_message_outcome` values such as
 return alone is not an index-publication receipt. Routine GC wave/quiescence
 barriers return deferred quietly, while unexpected failures retain tracebacks.
 
+The November 3 live-log follow-up distinguishes Vision coordination contention
+from photo inspection failures. `MutationContention` during inspection escapes
+to the existing bounded stage retry path (`vision_coordination_retry`), without
+incrementing a member's inspection counter or spending a source/model attempt.
+ETag checks, execution fencing and queue retry limits remain in force.
+
+Inline Albums readiness emits `index_merge_readiness` with `kind`, `reason`,
+`outcome` (`deferred` or `failed`) and, for failures, `error_type`. Reasons identify
+publication-base reads, missing/invalid Albums artifacts, stale Search lineage
+or delta state, building/dirty Search data, pending member metadata, unavailable
+tracking and bounded-work limits. An explicit safe deferral retains the dirty
+rows, intent and queue wakeup without raising the generic merge error. Storage,
+decode and refresh failures remain failures; a later readiness deferral cannot
+hide an earlier error in the same attempt.
+
+Claimed inline attempts attach the intent revision and an opaque `operation_id`.
+Queue traces and `index_message_outcome` use the same SHA-256-derived, 32-character
+key from the existing queue `operationId`; the original can exceed the telemetry
+label limit and includes a library identity. Queue outcome fields describe the
+delivered intent; a coalescing worker can claim a newer revision, so an outcome
+alone still does not prove publication of every edit. These diagnostics run on
+existing work/read paths and introduce no timers, wakeups or storage requests.
+
 The existing Tools-only browser job-polling change is retained and its polling,
 foreground-demand and index-ready push tests were rerun. No infrastructure change,
 queue purge, image publication or live rollout is part of this code-only cleanup.

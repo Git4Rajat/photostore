@@ -568,6 +568,33 @@ def test_transient_inspection_failure_can_recover_without_consuming_model_budget
     assert world[0].status(wave)['failedMembers'] == 0
 
 
+def test_coordination_conflicts_retry_stage_without_charging_photo_budget(world, monkeypatch):
+    import upload_wave_execution as execution
+    from upload_waves import MutationContention
+    metadata, wave, key = admit(world, 1)
+    store = world[0]
+    original = execution._inspect_vision_member
+    def conflict(*args):
+        raise MutationContention('Concurrent wave mutation')
+    monkeypatch.setattr(execution, '_inspect_vision_member', conflict)
+    for _ in range(4):  # More than the photo inspection failure budget.
+        failures = [0]
+        with pytest.raises(MutationContention):
+            run(world, metadata, wave, key,
+                lambda *a: pytest.fail('Model started during coordination conflict'),
+                inspection_failures=failures)
+        member = store._page(f'e!{wave}!m!')[0]
+        assert member['outcome'] == 'pending'
+        assert not member.get('inspectionFailures')
+        assert failures == [0]
+        assert not store._page('source-attempt!')
+    monkeypatch.setattr(execution, '_inspect_vision_member', original)
+    def process(library, filename, revision, renew):
+        publish_completion(store, metadata, filename=filename)
+    assert run(world, metadata, wave, key, process)['state'] == 'ready'
+    assert store.status(wave)['failedMembers'] == 0
+
+
 @pytest.mark.parametrize('blocked', ['missing', 'isolated', 'identity', 'contract'])
 def test_silent_skip_has_bounded_failure_and_releases_healthy_siblings(world, blocked):
     from wave_settlement import BLOCKED_GRACE_SECONDS, verified

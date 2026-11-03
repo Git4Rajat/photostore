@@ -386,6 +386,7 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
     import time
     import processing_metrics as metrics
     from execution_lease import OwnershipLost
+    from upload_waves import MutationContention
     from wave_settlement import exhausted, inspection_failed
     from wave_source_batch import reserve_attempts
     from storage_utils import _processing_is_expired
@@ -432,7 +433,10 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
                 with processing_diagnostics.image_scope(member['RowKey'], 'inspection'):
                     try:
                         item = _inspect_vision_member(store, wave_id, member, metadata, receipts)
-                    except (OwnershipLost, NotImplementedError):
+                    except (OwnershipLost, NotImplementedError, MutationContention):
+                        # A shared coordination row changed, not the photo.
+                        # Let the durable stage retry without charging this
+                        # member's bounded inspection-failure budget.
                         raise
                     except Exception as error:
                         settled = inspection_failed(store, wave_id, member, metadata, error)

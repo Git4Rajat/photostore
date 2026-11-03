@@ -369,7 +369,9 @@ def test_index_worker_reports_processing_and_deferred_outcome(monkeypatch, caplo
     reporter.state('idle')
     monkeypatch.setenv('APP_ROLE', 'index-worker')
     monkeypatch.setitem(diagnostics._WORKERS, 'indexer', reporter)
-    message = SimpleNamespace(content=json.dumps(dict(type='index_build', userId='A', scope='vector')),
+    operation = 'A:vector:42fc715a-5932-49f5-8b30-16cac3ea4315'
+    message = SimpleNamespace(content=json.dumps(dict(type='index_build', userId='A', scope='vector',
+                              operationId=operation, intentRevision='42fc715a-5932-49f5-8b30-16cac3ea4315')),
                               dequeue_count=1)
     def dispatch(*args):
         assert reporter.current == 'processing'
@@ -382,7 +384,10 @@ def test_index_worker_reports_processing_and_deferred_outcome(monkeypatch, caplo
     assert reporter.counts['acknowledged_messages'] == 1
     events = [json.loads(r.message.split('processing telemetry ', 1)[1])
               for r in caplog.records if 'processing telemetry ' in r.message]
-    assert any(e['event'] == 'index_message_outcome' and e['outcome'] == 'deferred' for e in events)
+    assert any(e['event'] == 'index_message_outcome' and e['outcome'] == 'deferred'
+               and e['operation_id'] == diagnostics.operation_id(operation)
+               and e['intent_revision'] == '42fc715a-5932-49f5-8b30-16cac3ea4315'
+               and e['scope'] == 'vector' for e in events)
     assert all(e.get('role') == 'indexer' for e in events)
 
 

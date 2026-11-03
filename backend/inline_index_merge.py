@@ -37,6 +37,7 @@ import index_ownership
 import index_publication
 import index_updates
 import index_work
+import index_merge_diagnostics
 import storage_utils
 
 _LOGGER = logging.getLogger(__name__)
@@ -251,8 +252,9 @@ def _attempt_serialized(user_id, scope, capture):
     if claim is None:
         return
     try:
-        with index_publication.publication(store, claim) as guard:
-            completed = _merge_claimed(store, claim, guard, user_id, scope)
+        with index_merge_diagnostics.capture(user_id, scope, claim.revision):
+            with index_publication.publication(store, claim) as guard:
+                completed = _merge_claimed(store, claim, guard, user_id, scope)
         if not completed:
             store.release(claim, deferred=True)
             return
@@ -305,6 +307,8 @@ def _merge_claimed(store, claim, guard, user_id, scope):
             incremental_only=True,
         )
     if bad:
+        if all(index_merge_diagnostics.was_deferred(kind) for kind in bad):
+            return False  # Keep the durable intent, dirty rows and wakeup.
         raise RuntimeError(f'inline index merge produced no {", ".join(bad)} index')
     if scope == 'people':
         # This is a backstop-retention probe, NOT dependency readiness.
