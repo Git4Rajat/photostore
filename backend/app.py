@@ -11339,11 +11339,13 @@ def _run_tag_index_maintenance_payload(payload):
     except automatic.SourceBusy:
         if claim is not None:
             waiting_wave = automatic.wave_pending(library)
-            delay = INDEX_BARRIER_RECOVERY_SECONDS if waiting_wave else 10
-            if waiting_wave and claim.schedule_reason == 'wave_wait' and claim.scheduled_delay > 0:
-                delay = min(3600, max(delay, int(claim.scheduled_delay * 2)))
-            store.release(claim, deferred=True, retry_delay=delay,
-                          retry_reason='wave_wait' if waiting_wave else 'barrier_wait')
+            if waiting_wave:
+                store.release(claim, deferred=True, retry_reason='wave_wait')
+                if not automatic.wave_pending(library):
+                    resume_index_maintenance_after_wave(library)
+                return 'tag_index_deferred'
+            delay = 10
+            store.release(claim, deferred=True, retry_delay=delay, retry_reason='barrier_wait')
         try:
             store.notify(key, _send_tag_index_wakeup)
         except Exception:
@@ -11426,11 +11428,18 @@ def _run_index_maintenance_payload(payload):
     except automatic.SourceBusy:
         # A healthy source barrier wait does not consume the poison budget.
         waiting_wave = automatic.wave_pending(library)
+        if waiting_wave:
+            # Active upload waves gate index maintenance until terminal (complete/cancelled).
+            # Do not schedule periodic queue wakeups; wave completion/cancellation resumes immediately.
+            store.release(claim, deferred=True, retry_reason='wave_wait')
+            _upsert_job_status(str(payload['jobId']), library, INDEX_BUILD_JOB_TYPE, 'queued', indexScope=scope,
+                error='', result={'status': 'deferred', 'reason': 'barrier_wait', 'ready': False})
+            if not automatic.wave_pending(library):
+                # The wave completed while we were releasing the claim; resume immediately.
+                resume_index_maintenance_after_wave(library)
+            return 'deferred'
         delay = INDEX_BARRIER_RECOVERY_SECONDS
-        if waiting_wave and claim.schedule_reason == 'wave_wait' and claim.scheduled_delay > 0:
-            delay = min(3600, max(INDEX_BARRIER_RECOVERY_SECONDS, int(claim.scheduled_delay * 2)))
-        store.release(claim, deferred=True, retry_delay=delay,
-            retry_reason='wave_wait' if waiting_wave else 'barrier_wait')
+        store.release(claim, deferred=True, retry_delay=delay, retry_reason='barrier_wait')
         _upsert_job_status(str(payload['jobId']), library, INDEX_BUILD_JOB_TYPE, 'queued', indexScope=scope,
             error='', result={'status': 'deferred', 'reason': 'barrier_wait', 'ready': False})
         try:

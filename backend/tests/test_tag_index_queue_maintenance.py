@@ -302,11 +302,11 @@ def test_wave_blocked_tag_job_does_not_acquire_catalog_lease(env, monkeypatch):
     key = json.loads(msg.content)['maintenanceKey']
     row = env.store._get(key)
     assert row['retryReason'] == 'wave_wait'
-    assert row['notBefore'] == env.now[0] + app.INDEX_BARRIER_RECOVERY_SECONDS
-    assert len(env.queue.sent) == 1
+    assert row['notBefore'] == 0
+    assert len(env.queue.sent) == 0
     for _ in range(20):
         assert app._process_ipwork_message(msg) == 'tag_index_noop'
-    assert len(env.queue.sent) == 1  # Early receipts do not multiply recovery wakes.
+    assert len(env.queue.sent) == 0  # No wakeups while wave is pending.
 
 
 def test_terminal_wave_signal_resumes_tag_recovery_wake(env, monkeypatch):
@@ -317,12 +317,12 @@ def test_terminal_wave_signal_resumes_tag_recovery_wake(env, monkeypatch):
     monkeypatch.setattr(app, 'index_maintenance_queue_client', Queue())
     monkeypatch.setattr(app, 'recover_pending_index_work', lambda _: 0)
     assert app._process_ipwork_message(msg) == 'tag_index_deferred'
-    assert len(env.queue.sent) == 1
+    assert len(env.queue.sent) == 0
     assert app.resume_index_maintenance_after_wave('A') == 0
     pending[0] = False
     assert app.resume_index_maintenance_after_wave('A') == 1
     assert env.store._get(key)['notBefore'] == 0
-    assert len(env.queue.sent) == 2
+    assert len(env.queue.sent) == 1
     assert app._process_ipwork_message(env.queue.sent[-1][2]) == 'tag_index_done'
     assert env.store._get(key) is None
 

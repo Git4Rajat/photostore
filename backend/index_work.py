@@ -253,6 +253,10 @@ class WorkStore:
             now = self.clock()
             if float(current.get('leaseUntil') or 0) > now or float(current.get('wakeUntil') or 0) > now:
                 return False
+            if current.get('retryReason') == 'wave_wait':
+                import automatic_index_updates as automatic
+                if automatic.wave_pending(current.get('libraryId')):
+                    return False
             delay = max(0, math.ceil(float(current.get('notBefore') or 0) - now),
                         math.ceil(minimum_delay))
             reservation = uuid.uuid4().hex
@@ -322,6 +326,10 @@ class WorkStore:
                 # Queue messages are advisory, including stale duplicates.
                 # Do not consume attempts or clear the reserved delayed wake.
                 return None
+            if current.get('retryReason') == 'wave_wait':
+                import automatic_index_updates as automatic
+                if automatic.wave_pending(current.get('libraryId')):
+                    return None
             owner = str(uuid.uuid4())
             attempt = (int(current.get('attempts') or 0) + 1
                        if current.get('attemptRevision') == current['revision'] else 1)
@@ -367,6 +375,12 @@ class WorkStore:
                     scheduled_at = self.clock()
                     row.update(wakeUntil=0, notBefore=scheduled_at + max(0, retry_delay),
                         retryScheduledAt=scheduled_at, retryDelaySeconds=max(0, retry_delay),
+                        retryScheduleId=uuid.uuid4().hex, retryScheduleRevision=claim.revision,
+                        retryReason=retry_reason)
+                elif retry_reason == 'wave_wait':
+                    scheduled_at = self.clock()
+                    row.update(wakeUntil=0, notBefore=0,
+                        retryScheduledAt=scheduled_at, retryDelaySeconds=0,
                         retryScheduleId=uuid.uuid4().hex, retryScheduleRevision=claim.revision,
                         retryReason=retry_reason)
                 # Barrier waits refund this claim; verified durable progress
@@ -441,6 +455,10 @@ class WorkStore:
         import itertools
         sent = 0
         for row in itertools.islice(self.table.query_entities(query), limit):
+            if row.get('retryReason') == 'wave_wait':
+                import automatic_index_updates as automatic
+                if automatic.wave_pending(row.get('libraryId')):
+                    continue
             # One row's send() failing (e.g. a stage's queue client
             # unavailable) must not abort the whole batch -- the untouched
             # row stays eligible and a later recover() call retries it,

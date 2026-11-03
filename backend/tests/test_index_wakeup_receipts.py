@@ -1,5 +1,6 @@
 """Queue receipt cancellation across completion, failed sends and fast consumers."""
 import json
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from types import SimpleNamespace
@@ -78,6 +79,12 @@ def queued(clocked, monkeypatch):
     env.key = env.store.request('A', 'vector')
     env.payload = dict(userId='A', scope='vector', jobId='job', maintenanceKey=env.key)
     assert app._run_index_maintenance_payload(env.payload) == 'deferred'
+    # Seed a deferred recovery receipt to test backup receipt cancellation/retention
+    sent = app._send_index_wakeup('A', 'vector', 1, 300)
+    reservation = uuid.uuid4().hex
+    row = dict(env.store._get(env.key), wakeReceipt=json.dumps(sent.receipt),
+               wakeReceiptReservation=reservation, wakeUntil=env.now[0] + 300)
+    env.store.table.update_entity(row)
     assert len(env.deferred.rows) == 1
     return env
 
