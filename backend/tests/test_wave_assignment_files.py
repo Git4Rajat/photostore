@@ -11,7 +11,7 @@ from test_wave_assignment_journal import setup, oracle, comparable
 from clustering_reference_oracle import assignment_snapshot
 
 
-def run(h, snapshots, store, frozen, leases, root, *, local=True, page_size=3):
+def run(h, snapshots, store, frozen, leases, root, *, local=True, page_size=3, should_yield=lambda: False):
     (root / 'work').mkdir(exist_ok=True)
     h.assigner.config = replace(h.assigner.config, checkpoint_dir=str(root / 'mount'), work_dir=str(root / 'work'))
     ownership = leases.claim('u', frozen['waveId'], 'cluster', frozen['frozenRevision'])
@@ -20,7 +20,7 @@ def run(h, snapshots, store, frozen, leases, root, *, local=True, page_size=3):
     try:
         with execution_scope(leases, ownership, store, lambda: leases.check(ownership)):
             return wave.run_frozen_assignment(store, frozen, h.assigner,
-                lambda: iter(deepcopy(snapshots)), check, local_journal=local, page_size=page_size)
+                lambda: iter(deepcopy(snapshots)), check, local_journal=local, page_size=page_size, should_yield=should_yield)
     finally:
         try:
             leases.release(ownership)
@@ -207,3 +207,35 @@ def test_flush_metrics_measure_mount_sync_separately_from_local_commit(monkeypat
     assert calls == ['flush', 'fsync', 'commit']
     assert values['journal_flushes'] == values['journal_fsyncs'] == 1
     assert values['journal_flush_ms'] >= values['journal_fsync_ms'] >= 0
+
+
+@pytest.mark.parametrize('local', [True, False])
+def test_bounded_slices_resume_without_reapplying_or_starving_on_replay(tmp_path, monkeypatch, local):
+    expected = oracle()
+    h, snapshots, store, frozen, leases = setup()
+    original = wave._apply
+    applied = []
+    def apply(*args, **kwargs):
+        face = args[2]
+        assert face['RowKey'] not in applied
+        result = original(*args, **kwargs)
+        applied.append(face['RowKey'])
+        return result
+    monkeypatch.setattr(wave, '_apply', apply)
+    # Even an already-expired budget must make new durable progress after
+    # replaying the previous prefix. The final slice completes normally.
+    for _ in range(len(snapshots) + 1):
+        before = len(applied)
+        try:
+            receipt = run(h, snapshots, store, frozen, leases, tmp_path,
+                local=local, page_size=1, should_yield=lambda: True)
+        except wave.AssignmentYield:
+            assert len(applied) == before + 1
+            assert store._get(f'assignment!{frozen["waveId"]}!complete') is None
+        else:
+            assert len(receipt) == 64
+            break
+    else:
+        pytest.fail('assignment did not finish across bounded slices')
+    assert len(applied) == len(snapshots)
+    assert comparable(assignment_snapshot(h)) == expected

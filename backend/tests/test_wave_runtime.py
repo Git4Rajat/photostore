@@ -471,3 +471,34 @@ def test_failed_handoff_retains_wave_message_and_retries_only_unfinished(monkeyp
     assert relayed == [wave['waveId']]
     # All handoffs completed durably
     assert store.pending_handoffs(store._required(store.wave_key(wave['waveId']))) == []
+
+
+def test_busy_wave_defers_without_charging_attempt_or_releasing_owner(vision_dispatch):
+    _, work, _, token, payload, sent = vision_dispatch
+    claim = work.claim(token)
+    before = dict(work._get(token))
+    assert runtime.consume(payload) == 'done'
+    assert work._get(token) == before
+    assert sent == [(payload['userId'], payload['scope'], claim.revision, 180)]
+
+
+def test_busy_wave_failed_replacement_send_preserves_owner(monkeypatch, vision_dispatch):
+    _, work, _, token, payload, _ = vision_dispatch
+    work.claim(token)
+    before = dict(work._get(token))
+    def unavailable(*args, **kwargs):
+        raise OSError('queue unavailable')
+    monkeypatch.setattr(runtime, 'send_stage', unavailable)
+    with pytest.raises(OSError, match='queue unavailable'):
+        runtime.consume(payload)
+    assert work._get(token) == before
+
+
+def test_wave_delivery_exemption_requires_matching_durable_intent(vision_dispatch):
+    store, _, _, _, payload, _ = vision_dispatch
+    valid = dict(payload, type=runtime.TYPE)
+    assert runtime.durable_stage_wake(valid, store.table, 'vision')
+    for changes in [dict(intentRevision='stale'), dict(userId='other'),
+                    dict(waveId='other'), dict(scope='forged'), dict(stage='cluster')]:
+        assert not runtime.durable_stage_wake(dict(valid, **changes), store.table, 'vision')
+    assert not runtime.durable_stage_wake(valid, store.table, 'cluster')

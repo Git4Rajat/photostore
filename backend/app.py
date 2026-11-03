@@ -16042,8 +16042,13 @@ def _process_clustering_queue_message_impl(message, queue_client, queue_name, ma
     # deliveries. Otherwise a healthy barrier wait can poison its intent here
     # before the worker gets a chance to consult notBefore/attempts.
     durable_index = False
+    durable_wave = False
     try:
         candidate = json.loads(message.content or '{}')
+        if isinstance(candidate, dict) and candidate.get('type') == 'upload_wave_stage':
+            from wave_runtime import durable_stage_wake
+            durable_wave = durable_stage_wake(candidate, jobs_table_client,
+                os.getenv('APP_ROLE', 'core').strip().lower())
         if (isinstance(candidate, dict) and candidate.get('type') == INDEX_BUILD_JOB_TYPE
                 and jobs_table_client is not None
                 and os.getenv('APP_ROLE', 'core').strip().lower() == 'index-worker'
@@ -16054,7 +16059,7 @@ def _process_clustering_queue_message_impl(message, queue_client, queue_name, ma
                 candidate['userId'], candidate['scope'])
     except (ValueError, TypeError):
         pass
-    if dequeue_count > max_retries and not durable_index:
+    if dequeue_count > max_retries and not (durable_index or durable_wave):
         try:
             payload = json.loads(message.content or '{}')
             if isinstance(payload, dict):

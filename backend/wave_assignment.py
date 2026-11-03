@@ -413,7 +413,11 @@ def _assignment_lock(assigner, library):
         yield guard
 
 
-def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128, progress=lambda count: None, local_journal=False):
+class AssignmentYield(RuntimeError):
+    """A journal-safe continuation after a bounded amount of new work."""
+
+
+def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128, progress=lambda count: None, local_journal=False, should_yield=lambda: False):
     """One logical pass; page_size changes neither decisions nor recovery IDs.
 
     inputs is a callable yielding frozen face dictionaries, used only while
@@ -463,6 +467,7 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
                 guard.check()
                 chain = digest(['wave-decisions-v1', digest(header)])
                 begun = False
+                materialized = False
                 for position, face in enumerate(workspace.inputs()):
                     guard.check()
                     if position % page_size == 0:
@@ -486,12 +491,19 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
                             begun = True
                         _apply(assigner, store.library, face, decision, identity, guard, wave['waveId'],observed)
                         journal.put(f'applied!{position:012d}', {'decisionId': identity})
+                        materialized = True
                     _replay(workspace, runtime, decision, guard)
                     chain = digest([chain, position, identity])
                     processing_diagnostics.wave_faces(processed=position + 1)
                     if (position + 1) % page_size == 0 or position + 1 == header['faceCount']:
                         with processing_diagnostics.wave_phase_scope('checkpoint'):
                             progress(position + 1)
+                        # Replaying an existing prefix must never use up the
+                        # slice before any new work is durable. Final pages
+                        # finish normally rather than scheduling another pass.
+                        if materialized and position + 1 < header['faceCount'] and should_yield():
+                            raise AssignmentYield('Cluster assignment checkpointed for continuation')
+                        materialized = False
                 guard.check()
                 return journal.finish(header, chain)
             finally:

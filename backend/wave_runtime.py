@@ -9,6 +9,7 @@ import os
 import threading
 import time
 import uuid
+import math
 import processing_metrics
 import processing_diagnostics
 from contextlib import contextmanager
@@ -204,6 +205,24 @@ def relay_current(work,store,wave,send,*,require_delivery=False):
         release_and_relay(work,store,store.library,key,stage,send,require_delivery=require_delivery)
 
 
+def durable_stage_wake(payload, table, role):
+    """Only a persisted, role-matching intent bypasses queue delivery limits."""
+    if not execution_enabled() or table is None or not isinstance(payload, dict):
+        return False
+    if payload.get('type') != TYPE or ROLES.get(payload.get('stage')) != role:
+        return False
+    fields = [payload.get(key) for key in ('userId', 'waveId', 'scope', 'intentRevision')]
+    if not all(isinstance(value, str) and value for value in fields):
+        return False
+    library, wave_id, scope, revision = fields
+    if not scope.startswith(f'wave-{payload["stage"]}:{wave_id}:'):
+        return False
+    work = stage_work_store(table)
+    row = work._get(work.key(library, scope))
+    return bool(row and row.get('libraryId') == library and row.get('scope') == scope
+                and row.get('revision') == revision)
+
+
 def consume(payload,*,deadline=None,progress=None):
     if not execution_enabled(): return 'noop'
     import app
@@ -230,7 +249,20 @@ def consume(payload,*,deadline=None,progress=None):
     if not store.outbox_eligible(wave,outbox):
         return 'noop'
     token=work.key(library,expected)
-    claim=work.claim(token)
+    from index_work import WorkLeased
+    try:
+        claim=work.claim(token)
+    except WorkLeased:
+        current = work._get(token)
+        if current is None or current.get('failed') or current['revision'] != payload.get('intentRevision'):
+            return 'noop'
+        delay = max(1, min(180, math.ceil(float(current.get('leaseUntil') or 0) - work.clock()) + 1))
+        # Publish the replacement before ACKing this delivery. A failed send
+        # must propagate so the source message remains available for recovery.
+        send_stage(library, expected, current['revision'], delay)
+        processing_diagnostics.emit('wave_lease_deferred', wave_id=wave_id, stage=stage,
+                                    delay_seconds=delay)
+        return 'done'
     if claim is None: return 'noop'
     if claim.revision!=payload.get('intentRevision'):
         work.release(claim,deferred=True);return 'noop'

@@ -547,3 +547,22 @@ def test_failed_publisher_never_completes_wave(world):
         run_index_release(leases, store, store.library, wave_id, wave['indexPendingKey'], ledger,publisher=failed)
     assert store.status(wave_id)['state'] == 'indexing'
     assert not ledger.is_complete()
+
+
+def test_cluster_slice_yield_releases_execution_without_publishing_assignment(world, monkeypatch):
+    import wave_assignment
+    store, _, leases, *_ = world
+    wave_id = ready_wave(world, with_face=True)
+    def checkpoint_then_yield(*args, progress, **kwargs):
+        progress(128)
+        raise wave_assignment.AssignmentYield('slice complete')
+    monkeypatch.setattr(wave_assignment, 'run_frozen_assignment', checkpoint_then_yield)
+    result = run_cluster_release(leases, store, store.library, wave_id, 'shadow-cluster!' + wave_id,
+        assigner=object(), journal=None, obligations_table=EtagTable(), face_table=None, face_ids=None)
+    assert result['state'] == 'ready' and not result.get('assignmentReceiptId')
+    row = leases._get(leases.key(store.library, wave_id, 'cluster'))
+    assert row['progressCheckpoint'] == 'faces-applied:128'
+    assert row['leaseUntil'] == 0 and not row['owner']
+    # A replacement can immediately reclaim the same frozen input.
+    next_owner = leases.claim(store.library, wave_id, 'cluster', result['frozenRevision'])
+    assert next_owner.epoch == row['epoch'] + 1

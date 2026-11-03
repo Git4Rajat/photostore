@@ -136,3 +136,28 @@ def test_incremental_assignment_exception_is_retried(monkeypatch):
     app._poll_clustering_queue_once(source, 'photostore-clustering', 5)
     assert source.deleted == []
     assert source.messages == [message]
+
+
+@pytest.mark.parametrize('persisted', [True, False])
+def test_wave_delivery_ceiling_uses_validated_durable_intent(monkeypatch, persisted):
+    import wave_runtime
+    from upload_wave_execution import stage_work_store
+    from test_index_work import EtagTable
+    table = EtagTable()
+    work = stage_work_store(table)
+    scope = 'wave-cluster:wave:' + 'a' * 64
+    key = work.request('library', scope)
+    revision = work._get(key)['revision']
+    payload = dict(type='upload_wave_stage', stage='cluster', waveId='wave',
+                   userId='library', scope=scope, intentRevision=revision if persisted else 'forged')
+    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED', 'true')
+    monkeypatch.setenv('APP_ROLE', 'cluster')
+    monkeypatch.setattr(app, 'jobs_table_client', table)
+    called = []
+    message = _FakeMessage(json.dumps(payload), dequeue_count=20)
+    source, deadletter = _FakeQueueClient([message]), _FakeQueueClient()
+    app._process_clustering_queue_message_impl(message, source, 'photostore-clustering', 5,
+        deadletter, dispatch=lambda *args: called.append(args) or 'done')
+    assert bool(called) == persisted
+    assert bool(deadletter.sent) != persisted
+    assert source.deleted == [message]

@@ -810,23 +810,30 @@ def run_cluster_release(leases, store, library, wave_id, outbox_key, *,
         def renew():
             _execution_check(leases, ownership, store, outbox_key)
             leases.renew(ownership)
-        from wave_assignment import run_frozen_assignment
+        from wave_assignment import run_frozen_assignment, AssignmentYield
         import time
+        slice_deadline = time.monotonic() + max(1, float(os.getenv('WAVE_CLUSTER_SLICE_SECONDS', '120')))
         next_check = [0.0]
-        with leases.keepalive(ownership, local_checks=True) as owned:
-            @processing_diagnostics.wave_phase('guard_check')
-            def check(force=False):
-                with processing_diagnostics.wave_phase_scope('guard_keepalive_check'):
-                    owned()
-                if force or time.monotonic() >= next_check[0]:
-                    _execution_check(leases, ownership, store, outbox_key)
-                    next_check[0] = time.monotonic() + 1.0
-            check.boundary = lambda: check(force=True)
-            assignment_receipt = run_frozen_assignment(store, wave, assigner,
-                lambda: _iter_wave_faces(store, wave_id, renew=check), check,
-                page_size=128 if chunk_size is None else chunk_size,
-                progress=lambda count: leases.checkpoint(ownership, 'faces-applied:' + str(count)),
-                local_journal=True)
+        try:
+            with leases.keepalive(ownership, local_checks=True) as owned:
+                @processing_diagnostics.wave_phase('guard_check')
+                def check(force=False):
+                    with processing_diagnostics.wave_phase_scope('guard_keepalive_check'):
+                        owned()
+                    if force or time.monotonic() >= next_check[0]:
+                        _execution_check(leases, ownership, store, outbox_key)
+                        next_check[0] = time.monotonic() + 1.0
+                check.boundary = lambda: check(force=True)
+                assignment_receipt = run_frozen_assignment(store, wave, assigner,
+                    lambda: _iter_wave_faces(store, wave_id, renew=check), check,
+                    page_size=128 if chunk_size is None else chunk_size,
+                    progress=lambda count: leases.checkpoint(ownership, 'faces-applied:' + str(count)),
+                    local_journal=True, should_yield=lambda: time.monotonic() >= slice_deadline)
+        except AssignmentYield:
+            # Stop keepalive before releasing. The dispatcher then durably
+            # schedules the next slice; no assignment receipt is fabricated.
+            leases.release(ownership)
+            return store._required(store.wave_key(wave_id))
         with processing_diagnostics.wave_phase_scope('publication_handoff'):
             renew()
             from wave_catalog import SCOPES, PREREQUISITES
