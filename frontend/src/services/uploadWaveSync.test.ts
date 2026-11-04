@@ -392,10 +392,10 @@ it('falls back to exact-revision abandonment when the previous API has no discar
 
 it('does not treat admission failure on an older API as successful discard', async () => {
     mocks.live=true;
-    const s=session(1,'old-api-no-queue');
+    const s=session(1,'old-api-admission-failure');
     mocks.abandon.mockReset().mockRejectedValue(Object.assign(new Error('Not found'),{status:404}));
-    mocks.open.mockReset().mockRejectedValue(new Error('Upload expiry unavailable'));
-    await expect(discardWaveShadowSession(s)).rejects.toThrow('Upload expiry unavailable');
+    mocks.open.mockReset().mockRejectedValue(new Error('Upload session storage unavailable'));
+    await expect(discardWaveShadowSession(s)).rejects.toThrow('Upload session storage unavailable');
     expect(mocks.legacyAbandon).not.toHaveBeenCalled();
 });
 

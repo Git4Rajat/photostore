@@ -15609,7 +15609,9 @@ def _maybe_enqueue_coalesced_rerun(job_id: Optional[str], user_id: str) -> None:
 def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, job_type: str,
                                      *, incremental_assign=None, prepared=None) -> None:
     if payload.get('type') == 'upload_session_expiry':
-        return  # Retired expiry messages: Core now reconciles on user traffic.
+        # Acknowledge legacy messages accidentally delivered to this queue.
+        # No expiry consumer remains; Core recovers sessions on user traffic.
+        return
     if payload.get('type') == 'upload_wave_stage':
         from wave_runtime import consume
         return consume(payload)

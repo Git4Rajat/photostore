@@ -8,7 +8,6 @@ from azure.core.exceptions import AzureError, ResourceNotFoundError
 import app
 from upload_waves import ArtifactCleanupBusy, Conflict, MutationContention, ShadowWaves
 import upload_wave_shadow as source
-from upload_session_lease import ExpiryUnavailable
 
 MAX_MANIFEST_REQUEST = 2000
 MAX_RESOLVE_REQUEST = 100
@@ -55,7 +54,7 @@ def endpoint(function):
                 require_capability(store,'upload')
                 policy=store._required('policy')
                 if policy.get('cleanupState'):raise Conflict('Library cleanup is in progress')
-                # Check before admission queues a wake. Atomic mutation guards
+                # Check before admission writes its directory row. Atomic mutation guards
                 # still catch GC starting after this inexpensive preflight.
                 if app.request.method=='POST' and policy.get('gcUntil',0)>store.clock():
                     raise ArtifactCleanupBusy('Upload is waiting for background cleanup to finish.')
@@ -63,10 +62,6 @@ def endpoint(function):
             response = app.jsonify(dict(_public(result), protocolMode='live' if live else 'shadow', dispatchable=False, evidenceQualified=False))
             response.headers['Cache-Control'] = 'no-store'
             return response
-        except ExpiryUnavailable:
-            app.app.logger.exception('Upload expiry wake unavailable')
-            return app.jsonify({'error':'Upload service is temporarily unavailable. Please retry.',
-                                'code':'upload_expiry_unavailable'}),503
         except ResourceNotFoundError:
             return app.jsonify({'error':'Upload session state not found',
                                 'code':'wave_state_not_found'}),409

@@ -20,6 +20,11 @@ Implemented source changes; these do not change a running Azure deployment.
 - Existing stage handoffs/outboxes remain in use. No new queue, worker or
   sidecar is introduced. The expiry producer, clustering expiry poller, queue
   resource and KEDA expiry rule have been retired in source/templates.
+  The old queue-style `expire` helper, `send_check`/`start_worker` compatibility
+  stubs and expiry-unavailable API errors are removed as well. Clustering opens
+  its clustering, library-operations, deferred and dead-letter queues. Its sole remaining
+  `upload_session_expiry` check discards legacy messages without running recovery
+  or clustering; it is not a consumer of the retired expiry queue.
 - Core atomically publishes the stale-closure notice and removes its session
   directory entry after handoff. Failure retains the directory. Notice/read
   receipts expire after 14 days; bounded retention cleanup runs on user visits.

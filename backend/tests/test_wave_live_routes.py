@@ -3,8 +3,6 @@ from types import SimpleNamespace
 import pytest
 import app
 import wave_policy
-import upload_session_lease
-_SEND_EXPIRY_CHECK=upload_session_lease.send_check
 from upload_waves import ShadowWaves, Conflict
 from test_wave_recovery import RuntimeTable
 
@@ -22,8 +20,6 @@ def live_api(monkeypatch):
     monkeypatch.setenv('UPLOAD_WAVE_DEPLOYMENT_ID','qualified-build')
     store=ShadowWaves(table,'u')
     table.create_entity(store._row('policy',protocol=wave_policy.PROTOCOL,capabilityId=certificate,cleanupState=''))
-    import upload_session_lease
-    monkeypatch.setattr(upload_session_lease,'send_check',lambda *args:None)
     import wave_runtime
     monkeypatch.setattr(wave_runtime,'send_stage',lambda *args:None)
     monkeypatch.setattr(app,'jobs_table_client',table)
@@ -312,7 +308,6 @@ def test_registration_contention_is_a_distinct_retryable_conflict(live_api,monke
 
 def test_open_never_admits_without_a_durable_session_directory(live_api,monkeypatch):
     from azure.core.exceptions import AzureError
-    import upload_session_lease
     client,store,_,_=live_api
     def unavailable(*args):raise AzureError('queue unavailable')
     monkeypatch.setattr(app.upload_sessions_table_client,'submit_transaction',unavailable)
@@ -322,7 +317,6 @@ def test_open_never_admits_without_a_durable_session_directory(live_api,monkeypa
 
 
 def test_existing_heartbeat_renews_authenticated_parent_but_cannot_resurrect_it(live_api,monkeypatch):
-    import upload_session_lease
     client,store,_,library=live_api
     monkeypatch.setattr(app,'_require_user_id',lambda **kw:('owner',None))
     monkeypatch.setattr(app,'_mark_upload_activity_heartbeat',lambda user:None)
@@ -343,9 +337,7 @@ def test_existing_heartbeat_renews_authenticated_parent_but_cannot_resurrect_it(
 
 
 def test_discard_absent_session_needs_no_admission_queue_or_resume_ancestor(live_api,monkeypatch):
-    import upload_session_lease
     client,store,_,_=live_api
-    monkeypatch.setattr(upload_session_lease,'send_check',lambda *args:pytest.fail('Discard must not enqueue expiry'))
     result=client.post('/upload/waves/live/sessions/never-admitted/abandon',json=dict(reason='User discarded'))
     assert result.status_code==200 and result.json['state']=='absent'
     assert store._required(store.session_key('never-admitted'))['discardAbsent']
@@ -353,12 +345,10 @@ def test_discard_absent_session_needs_no_admission_queue_or_resume_ancestor(live
 
 
 def test_discard_uses_current_revision_without_reopening_intake(live_api,monkeypatch):
-    import upload_session_lease
     client,store,_,_=live_api
     parent=store.open_session('discard',2)
     store.register('discard',[dict(itemId='one',filename='one.jpg')])
     store.resolve('discard','one',outcome='accepted',filename='one.jpg',photo_id='photo',processing_revision='revision',required_steps=['face'])
-    monkeypatch.setattr(upload_session_lease,'send_check',lambda *args:pytest.fail('Discard must not enqueue expiry'))
     result=client.post('/upload/waves/live/sessions/discard/abandon',json=dict(reason='User discarded'))
     assert result.status_code==200 and result.json['state']=='abandoned'
     assert store._required(store.item_key('discard','one'))['outcome']=='accepted'
@@ -394,8 +384,7 @@ def test_unleased_heartbeat_upgrades_without_queue(live_api,monkeypatch):
     assert store._required(store.session_key('old-unleased'))['leaseExpiresAt']>store.clock()
 
 
-def test_discard_tombstone_prevents_late_open_and_ignores_its_expiry_wake(live_api):
-    from upload_session_lease import expire
+def test_discard_tombstone_prevents_late_open_and_core_handoff(live_api):
     client,store,_,_=live_api
     result=client.post('/upload/waves/live/sessions/late-open/discard',json=dict(reason='Discard'))
     assert result.status_code==200 and result.json['state']=='absent'
@@ -404,7 +393,11 @@ def test_discard_tombstone_prevents_late_open_and_ignores_its_expiry_wake(live_a
     with pytest.raises(Conflict,match='closed'):
         store.register('late-open',[dict(itemId='one',filename='one.jpg')])
     assert store._get('control') is None
-    expire(store,'late-open',lambda *args:pytest.fail('No reschedule'),lambda *args:pytest.fail('No wave to drive'))
+    from upload_session_registry import Sessions
+    directory=Sessions(app.upload_sessions_table_client,store.library,clock=store.clock)
+    directory.track('late-open')
+    assert not directory.reconcile(store,lambda *args:pytest.fail('No wave to drive'))
+    assert directory.get('session!late-open') is None
 
 
 def test_open_committing_first_is_fenced_and_closed_by_discard_retry(live_api):
@@ -470,18 +463,18 @@ def test_modern_discard_preserves_live_finalization_then_closes_after_admission(
     assert store._required(store.wave_key(opened['waveId']))['memberCount']==1
 
 
-def test_artifact_gc_defers_admission_before_sending_wake_then_allows_same_session(live_api,monkeypatch):
+def test_artifact_gc_defers_admission_before_tracking_then_allows_same_session(live_api,monkeypatch):
     client,store,_,_=live_api
     policy=store._required('policy')
     store.table.submit_transaction([store._change(policy,dict(policy,gcOwner='gc',gcUntil=store.clock()+600))])
-    monkeypatch.setattr(upload_session_lease,'send_check',lambda *args:pytest.fail('No orphan wake while GC is known active'))
     result=client.post('/upload/waves/live/sessions',json=dict(sessionId='after-gc',declaredCount=1))
     assert result.status_code==409 and result.json['code']=='wave_artifact_cleanup_busy'
     assert result.headers['Retry-After']=='2'
     assert store._get(store.session_key('after-gc')) is None
+    from upload_session_registry import Sessions
+    assert Sessions(app.upload_sessions_table_client,store.library).get('session!after-gc') is None
     policy=store._required('policy')
     store.table.submit_transaction([store._change(policy,dict(policy,gcOwner='',gcUntil=0))])
-    monkeypatch.setattr(upload_session_lease,'send_check',lambda *args:None)
     result=client.post('/upload/waves/live/sessions',json=dict(sessionId='after-gc',declaredCount=1))
     assert result.status_code==200 and result.json['state']=='open'
 

@@ -203,8 +203,8 @@ it('keeps structured application 503 errors instead of the generic cold-start me
     vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED','true');
     mocks.post.mockRejectedValue(new ApiError({kind:'unreachable',status:503,retriable:true,requestId:'test',
         message:"Can't reach the server right now",rawMessage:'Upload service is temporarily unavailable. Please retry.',
-        responseData:{error:'Upload service is temporarily unavailable. Please retry.',code:'upload_expiry_unavailable'}}));
-    await expect(openWaveShadowSession('parent',1)).rejects.toMatchObject({status:503,code:'upload_expiry_unavailable',
+        responseData:{error:'Upload service is temporarily unavailable. Please retry.',code:'upload_session_directory_unavailable'}}));
+    await expect(openWaveShadowSession('parent',1)).rejects.toMatchObject({status:503,code:'upload_session_directory_unavailable',
         message:'Upload admission failed: Upload service is temporarily unavailable. Please retry.'});
 });
 

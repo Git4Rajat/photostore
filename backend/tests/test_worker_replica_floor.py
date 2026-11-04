@@ -97,4 +97,11 @@ def test_every_queue_scaler_counts_claimed_work_until_ack():
     assert seen == {'photostore-ipwork', 'photostore-clustering',
                     'photostore-library-ops', 'photostore-index-maintenance',
                     'photostore-ipwork-deferred'}
-    assert "queueName: 'photostore-upload-expiry'" not in (root / 'deploy' / 'resources.bicep').read_text()
+
+
+def test_upload_expiry_has_no_queue_resource_scaler_or_dependency():
+    root = Path(__file__).parents[2]
+    for filename in ('resources.bicep', 'azuredeploy.json'):
+        template = (root / 'deploy' / filename).read_text()
+        assert 'upload-expiry' not in template
+        assert 'uploadExpiry' not in template
