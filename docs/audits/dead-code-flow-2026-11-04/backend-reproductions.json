@@ -1,0 +1,47 @@
+{
+  "sort_manifest_delta_lost": {
+    "manifestDelta": 3,
+    "summaryDelta": null
+  },
+  "sort_route_hides_deltas": {
+    "available": true,
+    "deltaSeq": 0,
+    "deltaUrls": [],
+    "expiresAt": "later",
+    "indexUrl": "https://example.invalid/sort.json",
+    "sourceVersion": "base-v1",
+    "updatedAt": "base-v1"
+  },
+  "two_accounts_share_one_like_identity": [
+    {
+      "account": "alice",
+      "filename": "photo.jpg",
+      "liked": true,
+      "likes": 1,
+      "success": true
+    },
+    {
+      "account": "bob",
+      "filename": "photo.jpg",
+      "liked": false,
+      "likes": 0,
+      "success": true
+    }
+  ],
+  "rating_reports_success_without_write": {
+    "response": {
+      "filename": "photo.jpg",
+      "rating": 5,
+      "success": true
+    },
+    "storedRating": null
+  },
+  "trash_secondary_write_not_repaired_by_replay": {
+    "metadataState": "deleted",
+    "trashEntries": []
+  },
+  "delete_overwrites_concurrent_metadata_edit": {
+    "concurrentRating": 5,
+    "finalRating": 1
+  }
+}

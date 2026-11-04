@@ -1,0 +1,119 @@
+{
+  "method": "Conservative source-module graph; includes type imports, lazy imports, worker URLs, and Vite query imports.",
+  "entrypoints": [
+    "frontend/src/index.tsx",
+    "frontend/src/mockups/main.tsx",
+    "frontend/src/benchmark/main.js"
+  ],
+  "sourceFiles": 173,
+  "sourceLines": 50984,
+  "unreachableFiles": 26,
+  "unreachableLines": 10376,
+  "unreachable": [
+    {
+      "file": "frontend/src/components/ToolsPage.tsx",
+      "lines": 2299
+    },
+    {
+      "file": "frontend/src/components/AlbumsPage.tsx",
+      "lines": 1848
+    },
+    {
+      "file": "frontend/src/components/FaceClusters.tsx",
+      "lines": 1439
+    },
+    {
+      "file": "frontend/src/App.tsx",
+      "lines": 1216
+    },
+    {
+      "file": "frontend/src/components/PersonDetail.tsx",
+      "lines": 726
+    },
+    {
+      "file": "frontend/src/components/LibraryPage.tsx",
+      "lines": 579
+    },
+    {
+      "file": "frontend/src/services/libraryExportDownloader.ts",
+      "lines": 321
+    },
+    {
+      "file": "frontend/src/components/RecentlyDeletedPage.tsx",
+      "lines": 239
+    },
+    {
+      "file": "frontend/src/components/ActivityPage.tsx",
+      "lines": 231
+    },
+    {
+      "file": "frontend/src/services/faceMediaCache.ts",
+      "lines": 181
+    },
+    {
+      "file": "frontend/src/components/CorruptedUploadsPage.tsx",
+      "lines": 168
+    },
+    {
+      "file": "frontend/src/components/ExplorePage.tsx",
+      "lines": 167
+    },
+    {
+      "file": "frontend/src/services/opfsDownloadStaging.ts",
+      "lines": 158
+    },
+    {
+      "file": "frontend/src/services/serviceWorkerDownload.ts",
+      "lines": 150
+    },
+    {
+      "file": "frontend/src/services/screenWakeLock.ts",
+      "lines": 101
+    },
+    {
+      "file": "frontend/src/components/ChangePasswordPage.tsx",
+      "lines": 95
+    },
+    {
+      "file": "frontend/src/services/useMultiSelect.ts",
+      "lines": 83
+    },
+    {
+      "file": "frontend/src/services/useLibraryCleanupStatus.ts",
+      "lines": 75
+    },
+    {
+      "file": "frontend/src/components/LogoutPage.tsx",
+      "lines": 74
+    },
+    {
+      "file": "frontend/src/components/shared/BackendStatusBanner.tsx",
+      "lines": 59
+    },
+    {
+      "file": "frontend/src/services/photoBackfill.ts",
+      "lines": 52
+    },
+    {
+      "file": "frontend/src/services/useThumbnailAccessResolver.ts",
+      "lines": 43
+    },
+    {
+      "file": "frontend/src/services/pagedFetch.ts",
+      "lines": 25
+    },
+    {
+      "file": "frontend/src/components/NotFoundPage.tsx",
+      "lines": 20
+    },
+    {
+      "file": "frontend/src/components/shared/MetricCard.tsx",
+      "lines": 15
+    },
+    {
+      "file": "frontend/src/components/PeoplePage.tsx",
+      "lines": 12
+    }
+  ],
+  "unresolved": []
+}
