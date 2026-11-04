@@ -19,6 +19,28 @@ REAL_SEND = app._send_tag_index_wakeup
 REAL_WORK_STORE = index_work.WorkStore
 
 
+def test_catalog_contention_never_exhausts_tag_work(env, monkeypatch):
+    from contextlib import contextmanager
+    from clustering_lease import RetryableLibraryLeaseError
+    mark(env.runtime, 'tag_embedding', ['one'])
+    msg = message(env)
+    original = index_publication.catalog_serialization
+    @contextmanager
+    def busy(*args, **kwargs):
+        raise RetryableLibraryLeaseError('catalog held by another publisher')
+        yield
+    monkeypatch.setattr(index_publication, 'catalog_serialization', busy)
+    for _ in range(app.INDEX_BUILD_MAX_RETRIES + 2):
+        assert app._process_ipwork_message(msg) == 'tag_index_deferred'
+        row = env.store._get(env.store.key('A', 'tag_embedding'))
+        assert row['attempts'] == 0 and not row['failed'] and not row['owner']
+        assert not env.runtime.calls and not env.deadletter.sent
+        env.now[0] += app.INDEX_BARRIER_RECOVERY_SECONDS + 1
+    monkeypatch.setattr(index_publication, 'catalog_serialization', original)
+    assert app._process_ipwork_message(msg) == 'tag_index_done'
+    assert len(env.runtime.calls) == 1
+
+
 class Queue:
     def __init__(self):
         self.sent, self.deleted, self.updated = [], [], []
@@ -34,7 +56,7 @@ class Queue:
     def create_queue(self):
         pass
 
-    def delete_message(self, message):
+    def delete_message(self, message, pop_receipt=None):
         self.deleted.append(message)
 
     def update_message(self, message, **options):
@@ -95,6 +117,7 @@ def env(runtime, monkeypatch):
     queue, deadletter, blobs = Queue(), Queue(), LeaseBlobs()
     monkeypatch.setattr(app, '_send_tag_index_wakeup', REAL_SEND)
     monkeypatch.setattr(app, 'ipwork_queue_client', queue)
+    monkeypatch.setattr(app, 'ipwork_deferred_queue_client', queue)
     monkeypatch.setattr(app, 'queue_service_client', SimpleNamespace(get_queue_client=lambda _: deadletter))
     monkeypatch.setattr(app, 'INDEX_MAINTENANCE_DEADLETTER_QUEUE_NAME', 'existing-index-deadletter')
     monkeypatch.setattr(app, '_notify_index_ready', lambda *args: None)
@@ -131,6 +154,49 @@ def env(runtime, monkeypatch):
 
 def enqueue(env, library='A', **options):
     return app.enqueue_index_build(library, reason='metadata-change', scope='tag_embedding', **options)
+
+
+def test_delayed_tag_wake_uses_deferred_queue_and_completion_cancels_it(env, monkeypatch):
+    deferred = Queue()
+    monkeypatch.setattr(app, 'ipwork_deferred_queue_client', deferred)
+    mark(env.runtime, 'tag_embedding', ['one'])
+    assert enqueue(env) == 'queued'
+    assert not env.queue.sent and len(deferred.sent) == 1
+    payload, options, sent = deferred.sent[0]
+    assert options['visibility_timeout'] == 2
+    row = env.store._get(payload['maintenanceKey'])
+    assert json.loads(row['wakeReceipt'])['queueName'] == app.IPWORKER_DEFERRED_QUEUE_NAME
+    env.now[0] += 3
+    assert app._process_ipwork_message(sent) == 'tag_index_done'
+    assert deferred.deleted == [sent.id]
+    assert env.store._get(payload['maintenanceKey']) is None
+
+
+@pytest.mark.parametrize('failure', [None, 'send', 'ack'])
+def test_due_tag_transfer_sends_before_ack_and_retains_on_failure(env, monkeypatch, failure):
+    deferred = Queue()
+    msg = message(env)
+    events = []
+    deferred.receive_messages = lambda **kw: [msg]
+    def send(content):
+        events.append('send')
+        assert content == msg.content
+        if failure == 'send':
+            raise OSError('main queue unavailable')
+    def ack(message):
+        events.append('ack')
+        assert message is msg
+        if failure == 'ack':
+            raise OSError('ack unavailable')
+    deferred.delete_message = ack
+    monkeypatch.setattr(app, 'ipwork_deferred_queue_client', deferred)
+    target = SimpleNamespace(send_message=send)
+    if failure:
+        with pytest.raises(OSError):
+            app._promote_deferred_ipwork(target)
+    else:
+        assert app._promote_deferred_ipwork(target)
+    assert events == (['send'] if failure == 'send' else ['send', 'ack'])
 
 
 def message(env, library='A'):
@@ -264,10 +330,10 @@ def test_source_busy_is_durable_visibility_retry_without_exhausting_budget(env):
     for attempt in range(app.INDEX_BUILD_MAX_RETRIES + 4):
         assert app._process_ipwork_message(msg) == 'tag_index_deferred'
         row = env.store._get(key)
-        assert not row['failed'] and row['attempts'] == 0 and row['notBefore'] == env.now[0] + 10
+        assert not row['failed'] and row['attempts'] == 0 and row['notBefore'] == env.now[0] + app.INDEX_BARRIER_RECOVERY_SECONDS
         assert len(env.queue.sent) == attempt + 1
-        assert env.queue.sent[-1][1]['visibility_timeout'] == 10
-        env.now[0] += 11
+        assert env.queue.sent[-1][1]['visibility_timeout'] == app.INDEX_BARRIER_RECOVERY_SECONDS
+        env.now[0] += app.INDEX_BARRIER_RECOVERY_SECONDS + 1
     assert not env.deadletter.sent and not env.runtime.calls
     env.runtime.store.finish('A', 'tag_embedding')
     # The reserved recovery wake also covers a later source revision.
@@ -336,7 +402,7 @@ def test_source_busy_with_retry_send_failure_keeps_both_evidence_and_receipt(env
     assert row and row['attempts'] == 0 and not row['failed']
     assert not env.queue.sent  # Busy receipts are retried, not multiplied.
     env.runtime.store.finish('A', 'tag_embedding')
-    env.now[0] += 11
+    env.now[0] += app.INDEX_BARRIER_RECOVERY_SECONDS + 1
     assert app._process_ipwork_message(msg) == 'tag_index_done'
 
 
@@ -412,7 +478,7 @@ def test_real_poll_loop_source_busy_acks_only_after_replacement_wake(env, monkey
     assert env.queue.deleted == [msg]
     assert not env.queue.updated
     assert len(env.queue.sent) == 1
-    assert env.queue.sent[0][1]['visibility_timeout'] == 10
+    assert env.queue.sent[0][1]['visibility_timeout'] == app.INDEX_BARRIER_RECOVERY_SECONDS
     assert env.store._get(json.loads(msg.content)['maintenanceKey'])['attempts'] == 0
 
 
@@ -471,7 +537,7 @@ def test_real_source_write_busy_wake_coalesces_post_request_and_retries(env, mon
     assert env.store._get(key)['attempts'] == 0
     assert len(env.queue.sent) == 2  # pre-wake + coalesced post-commit wake
     assert env.runtime.store.control('A', 'tag_embedding')['active'] == 0
-    env.now[0] += 11
+    env.now[0] += app.INDEX_BARRIER_RECOVERY_SECONDS + 1
     assert app._process_ipwork_message(env.queue.sent[0][2]) == 'tag_index_done'
     assert env.store._get(key) is None
 

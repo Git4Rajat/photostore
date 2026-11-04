@@ -556,3 +556,24 @@ def test_media_admission_fence_still_applies_to_internal_looking_filename(runtim
     with pytest.raises(automatic.SourceBusy, match='fenced A'):
         table.upsert_entity({'PartitionKey': 'A', 'RowKey': 'ipwork_sweep_lock', 'caption': 'cat'})
     assert not runtime.source.rows and not runtime.dirty.rows
+
+
+def test_source_reservation_attribution_lifecycle(runtime):
+    res_id = runtime.store.begin('A', 'vector', ['photo1', 'photo2'], owner='worker-pod-1', operation='metadata.upsert')
+    assert res_id is not None
+    reservations = runtime.store.reservations('A', 'vector')
+    assert len(reservations) == 1
+    assert reservations[0]['reservationId'] == res_id
+    assert reservations[0]['owner'] == 'worker-pod-1'
+    assert reservations[0]['operation'] == 'metadata.upsert'
+    assert reservations[0]['idsCount'] == 2
+    assert reservations[0]['startedAt'] > 0
+
+    with pytest.raises(automatic.SourceBusy):
+        runtime.store.capture('A', 'vector')
+
+    runtime.store.finish('A', 'vector', reservation_id=res_id)
+    assert runtime.store.reservations('A', 'vector') == []
+
+    captured = runtime.store.capture('A', 'vector')
+    assert set(captured.ids) == {'photo1', 'photo2'}

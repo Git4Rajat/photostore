@@ -190,7 +190,7 @@ jobs:
             -v "$PWD/backend/tests:/app/tests:ro" \
             -v "$PWD/backend/scripts:/app/scripts:ro" \
             -v "$PWD/deploy:/deploy:ro" \
-            "$VISION_IMAGE" -c 'python -m pytest tests/test_ipworker*.py tests/test_ipwork_ocr.py tests/test_apply_client_processing_recovery.py tests/test_processing_failure_capsules.py -q'
+            "$VISION_IMAGE" -c 'python -m pytest tests/test_ipworker*.py tests/test_ipwork_ocr.py tests/test_tag_index_queue_maintenance.py tests/test_index_barrier_retry.py tests/test_automatic_runtime_integration.py tests/test_apply_client_processing_recovery.py tests/test_processing_failure_capsules.py -q'
       - name: Create tested release contract
         run: python3 deploy/wave_release.py --image-dir release-images --source "${{ github.sha }}" --output wave-release.json
       - uses: actions/upload-artifact@v4

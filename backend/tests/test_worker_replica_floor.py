@@ -91,9 +91,10 @@ def test_every_queue_scaler_counts_claimed_work_until_ack():
                 custom = rule.get('custom', {})
                 if custom.get('type') == 'azure-queue':
                     assert custom['metadata']['queueLengthStrategy'] == (
-                        'visibleonly' if custom['metadata']['queueName']=='photostore-upload-expiry' else 'all'), rule['name']
+                        'visibleonly' if custom['metadata']['queueName'] in ('photostore-upload-expiry', 'photostore-ipwork-deferred') else 'all'), rule['name']
                     assert custom['identity'] == 'system'
                     seen.add(custom['metadata']['queueName'])
     assert seen == {'photostore-ipwork', 'photostore-clustering',
-                    'photostore-library-ops', 'photostore-index-maintenance', 'photostore-upload-expiry'}
+                    'photostore-library-ops', 'photostore-index-maintenance', 'photostore-upload-expiry',
+                    'photostore-ipwork-deferred'}
     assert "queueName: 'photostore-upload-expiry'" in (root / 'deploy' / 'resources.bicep').read_text()

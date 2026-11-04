@@ -141,6 +141,8 @@ def test_quiesced_recovery_resets_orphan_without_losing_ids_and_persists_all_job
     with gc.artifact_catalog_serialization('A', storage=su) as guard:
         result = automatic.recover_quiesced_source_reservations('A', guard=guard, fence_id=fence)
     assert result['recovered'] == list(automatic.KINDS)
+    assert result['orphanedReservations']['vector'][0]['idsCount'] == 1
+    assert runtime.store.reservations('A', 'vector') == []
     assert runtime.store.capture('A', 'vector').ids == ['orphan']
     assert runtime.store.control('A', 'vector')['active'] == 0
     assert all(runtime.store.control('A', kind)['fullRequired'] for kind in automatic.KINDS)

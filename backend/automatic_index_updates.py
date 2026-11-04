@@ -38,6 +38,7 @@ from contextvars import ContextVar
 from functools import wraps
 import hashlib
 import logging
+import os
 import random
 import time
 import uuid
@@ -186,6 +187,7 @@ def recover_quiesced_source_reservations(user, *, guard, fence_id):
     check = quiescence_check(user, guard=guard, fence_id=fence_id)
     store = configured_store()
     recovered = []
+    orphaned_reservations = {}
     for kind in KINDS:
         check()
         # The durable wakeup ledger precedes coverage reset. Crash at any step
@@ -193,11 +195,36 @@ def recover_quiesced_source_reservations(user, *, guard, fence_id):
         work = WorkStore(app.jobs_table_client, partition=TAG_PARTITION if kind == 'tag_embedding'
                          else PARTITION)
         work.request(user, SCOPES.get(kind, kind))
+        pk = partition(user, kind)
+        cleaned = []
+        try:
+            raw_entities = store.table.query_entities(f"PartitionKey eq '{pk}' and RowKey ne '{CONTROL}'")
+            res_entities = [r for r in raw_entities if str(r.get('RowKey', '')).startswith('res-')]
+            for res in res_entities:
+                cleaned.append({
+                    'reservationId': res.get('reservationId'),
+                    'owner': res.get('owner'),
+                    'operation': res.get('operation'),
+                    'startedAt': res.get('startedAt'),
+                    'idsCount': res.get('idsCount'),
+                })
+                try:
+                    store.table.delete_entity(pk, res['RowKey'])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if cleaned:
+            orphaned_reservations[kind] = cleaned
+            LOG.info(f"Recovered orphaned reservations for library={user!r}, kind={kind}: {cleaned}")
         store._change(user, kind, lambda row: row.update(active=0, fullRequired=True,
                                                        base='', coveredRevision=''))
         recovered.append(kind)
     check()
-    return dict(recovered=recovered, fenceId=fence_id, writersFenced=True)
+    result = dict(recovered=recovered, fenceId=fence_id, writersFenced=True)
+    if orphaned_reservations:
+        result['orphanedReservations'] = orphaned_reservations
+    return result
 
 
 def resume_quiesced_sources(user, *, guard, fence_id):
@@ -265,10 +292,17 @@ class CoverageStore:
             pass
         return self.control(user, kind)
 
-    def _change(self, user, kind, change, ids=(), deleted=False):
+    def _change(self, user, kind, change, ids=(), deleted=False, extra_ops=()):
         # IDs and the revision advance commit in the SAME partition transaction.
         ids = list(dict.fromkeys(str(value) for value in ids if value))
-        pages = [ids[i:i + 99] for i in range(0, len(ids), 99)] or [[]]
+        limit_page_0 = max(1, 99 - len(extra_ops))
+        if ids:
+            pages = [ids[:limit_page_0]]
+            remaining = ids[limit_page_0:]
+            if remaining:
+                pages.extend([remaining[i:i + 99] for i in range(0, len(remaining), 99)])
+        else:
+            pages = [[]]
         result = None
         for page_index, page in enumerate(pages):
             for attempt in range(20):
@@ -280,6 +314,8 @@ class CoverageStore:
                 ops.extend(('upsert', dict(PartitionKey=row['PartitionKey'],
                     RowKey='id-' + hashlib.sha256(value.encode()).hexdigest(),
                     sourceId=value, tombstone=bool(deleted), revision=row['revision'])) for value in page)
+                if page_index == 0 and extra_ops:
+                    ops.extend(extra_ops)
                 try:
                     self.table.submit_transaction(ops)
                     result = row
@@ -298,28 +334,75 @@ class CoverageStore:
                 time.sleep(random.uniform(0.001, min(0.25, 0.002 * (2 ** attempt))))
         return result
 
-    def begin(self, user, kind, ids, *, uncertain=False, deleted=False):
+    def begin(self, user, kind, ids, *, uncertain=False, deleted=False,
+              reservation_id=None, owner=None, operation=None):
+        reservation_id = reservation_id or uuid.uuid4().hex
+        res_entity = dict(
+            PartitionKey=partition(user, kind),
+            RowKey=f'res-{reservation_id}',
+            reservationId=reservation_id,
+            libraryId=user,
+            kind=kind,
+            owner=str(owner or os.getenv('CONTAINER_APP_NAME') or os.getenv('HOSTNAME') or 'source_writer'),
+            operation=str(operation or 'source_write'),
+            startedAt=time.time(),
+            idsCount=len(ids),
+        )
         def reserve(row):
             row['active'] = int(row.get('active') or 0) + 1
             row['fullRequired'] = bool(row.get('fullRequired') or uncertain)
         # If page 2 fails, the durable active reservation intentionally remains.
-        self._change(user, kind, reserve, ids, deleted)
+        self._change(user, kind, reserve, ids, deleted, extra_ops=[('upsert', res_entity)])
+        return reservation_id
 
-    def finish(self, user, kind, *, failed=False):
+    def finish(self, user, kind, reservation_id=None, *, failed=False):
+        pk = partition(user, kind)
+        if reservation_id is None:
+            try:
+                raw_rows = self.table.query_entities(f"PartitionKey eq '{pk}' and RowKey ne '{CONTROL}'")
+                res_rows = [r for r in raw_rows if str(r.get('RowKey', '')).startswith('res-')]
+                if res_rows:
+                    reservation_id = res_rows[0].get('reservationId')
+            except Exception:
+                pass
+
+        extra_ops = []
+        if reservation_id:
+            res_key = f'res-{reservation_id}'
+            extra_ops = [('delete', dict(PartitionKey=pk, RowKey=res_key))]
+
         def complete(row):
             if int(row.get('active') or 0) <= 0:
                 raise RuntimeError('Unbalanced source reservation')
             row['active'] -= 1
             row['fullRequired'] = bool(row.get('fullRequired') or failed)
-        self._change(user, kind, complete)
+
+        try:
+            self._change(user, kind, complete, extra_ops=extra_ops)
+        except Exception as error:
+            is_not_found = isinstance(error, ResourceNotFoundError) or getattr(error, 'status_code', None) == 404
+            if is_not_found and extra_ops:
+                self._change(user, kind, complete)
+            else:
+                raise
+
+    def reservations(self, user, kind):
+        pk = partition(user, kind)
+        try:
+            raw_rows = self.table.query_entities(
+                f"PartitionKey eq '{pk}' and RowKey ne '{CONTROL}'")
+            return [dict(r) for r in raw_rows if str(r.get('RowKey', '')).startswith('res-')]
+        except Exception:
+            return []
 
     def capture(self, user, kind):
         row = self.ensure(user, kind)
         if row.get('active'):
             raise SourceBusy(f'Active {kind} source intent for {user}')
         pk = row['PartitionKey']
-        dirty = DirtySnapshot(self.table.query_entities(
-            f"PartitionKey eq '{pk}' and RowKey ne '{CONTROL}'"), max_rows=LIMIT)
+        raw_rows = self.table.query_entities(
+            f"PartitionKey eq '{pk}' and RowKey ne '{CONTROL}'")
+        dirty = DirtySnapshot((r for r in raw_rows if not str(r.get('RowKey', '')).startswith('res-')), max_rows=LIMIT)
         return Capture(row, dirty)
 
     def check(self, user, kind, captured):
@@ -353,8 +436,9 @@ class CoverageStore:
             # the bounded lookahead. Drain in bounded ETag batches. A new writer
             # gets a DIFFERENT revision; never acknowledge its rows.
             while True:
-                snapshot = DirtySnapshot(self.table.query_entities(
-                    f"PartitionKey eq '{row['PartitionKey']}' and RowKey ne '{CONTROL}'"), max_rows=LIMIT)
+                raw_rows = self.table.query_entities(
+                    f"PartitionKey eq '{row['PartitionKey']}' and RowKey ne '{CONTROL}'")
+                snapshot = DirtySnapshot((r for r in raw_rows if not str(r.get('RowKey', '')).startswith('res-')), max_rows=LIMIT)
                 # Filter against source revision via the control ETag first;
                 # if any writer started, leave all remaining rows for next job.
                 live = self.control(user, kind)
@@ -576,9 +660,12 @@ class SourceTable:
                     # failure cannot erase evidence, even if source write fails.
                     if not (source_change_active() and su._CTX.get('wave_owned') and su._CTX['wave_owned'](user)):
                         schedule(user, kind)
-                    store.begin(user, kind, ids, uncertain=uncertain[user, kind], deleted=deleted[user, kind])
-                    reserved.append((user, kind))
-                for user, kind in reserved:
+                    res_id = store.begin(user, kind, ids, uncertain=uncertain[user, kind],
+                                         deleted=deleted[user, kind],
+                                         owner=os.getenv('CONTAINER_APP_NAME') or os.getenv('HOSTNAME') or 'source_writer',
+                                         operation=f'{self.source}.{name}')
+                    reserved.append((user, kind, res_id))
+                for user, kind, _ in reserved:
                     check_source_admission(user)
                 result = method(*args, **kwargs)
                 success = True
@@ -588,13 +675,13 @@ class SourceTable:
                 raise
             finally:
                 failures = []
-                for user, kind in reserved:
+                for user, kind, res_id in reserved:
                     try:
-                        store.finish(user, kind, failed=not success)
+                        store.finish(user, kind, reservation_id=res_id, failed=not success)
                     except BaseException as error:
-                        error.add_note(f'Automatic source finish failed: library={user!r}, kind={kind}')
+                        error.add_note(f'Automatic source finish failed: library={user!r}, kind={kind}, reservation={res_id}')
                         failures.append(error)
-                for user, kind in reserved:
+                for user, kind, _ in reserved:
                     try:
                         if not (source_change_active() and su._CTX.get('wave_owned') and su._CTX['wave_owned'](user)):
                             # A very fast worker may consume the pre-write wakeup

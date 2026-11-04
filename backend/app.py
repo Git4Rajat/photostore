@@ -798,6 +798,7 @@ LIBRARY_CLEAN_MAX_RETRIES = int(os.getenv('LIBRARY_CLEAN_MAX_RETRIES', '30'))
 CLUSTERING_DEADLETTER_QUEUE_NAME = os.getenv('CLUSTERING_DEADLETTER_QUEUE_NAME', 'photostore-clustering-deadletter')
 LIBRARY_OPS_DEADLETTER_QUEUE_NAME = os.getenv('LIBRARY_OPS_DEADLETTER_QUEUE_NAME', 'photostore-library-ops-deadletter')
 IPWORKER_QUEUE_NAME = os.getenv('IPWORKER_QUEUE_NAME', 'photostore-ipwork')
+IPWORKER_DEFERRED_QUEUE_NAME = os.getenv('IPWORKER_DEFERRED_QUEUE_NAME', 'photostore-ipwork-deferred')
 # ipworker's job: thumbnail, exif, ocr, geo (map_detection), vision (ai_vision),
 # face -- the full set the browser can do client-side. Thumbnail used to be a
 # permanent browser-only exception (cheap canvas resize, no model needed, so
@@ -1150,6 +1151,7 @@ clustering_queue_client = None
 clustering_deferred_queue_client = None
 queue_service_client = None
 ipwork_queue_client = None
+ipwork_deferred_queue_client = None
 library_ops_queue_client = None
 index_maintenance_queue_client = None
 index_maintenance_deferred_queue_client = None
@@ -1451,7 +1453,7 @@ def _init_storage_clients():
     global users_table_client, libraries_table_client, memberships_table_client
     global invites_table_client, audit_table_client, clean_requests_table_client, library_store
     global clustering_queue_client, clustering_deferred_queue_client, queue_service_client
-    global ipwork_queue_client, library_ops_queue_client
+    global ipwork_queue_client, ipwork_deferred_queue_client, library_ops_queue_client
     global index_maintenance_queue_client, index_maintenance_deferred_queue_client
     global clustering_deadletter_queue_client, library_ops_deadletter_queue_client
 
@@ -1598,6 +1600,7 @@ def _init_storage_clients():
     clustering_queue_client = clustering_queue_client_local
     clustering_deferred_queue_client = clustering_deferred_queue_client_local
     ipwork_queue_client = ipwork_queue_client_local
+    ipwork_deferred_queue_client = queue_service_client_local.get_queue_client(IPWORKER_DEFERRED_QUEUE_NAME)
     library_ops_queue_client = library_ops_queue_client_local
     index_maintenance_queue_client = (
         queue_service_client_local.get_queue_client(INDEX_MAINTENANCE_QUEUE_NAME)
@@ -1638,6 +1641,7 @@ def _init_storage_clients():
     ] + [
         lambda q=clustering_queue_client: q.create_queue(),
         lambda q=ipwork_queue_client: q.create_queue(),
+        lambda q=ipwork_deferred_queue_client: q.create_queue(),
         lambda q=library_ops_queue_client: q.create_queue(),
         lambda q=clustering_deadletter_queue_client: q.create_queue(),
         lambda q=library_ops_deadletter_queue_client: q.create_queue(),
@@ -11186,9 +11190,10 @@ def _tag_index_payload(library, revision):
 
 
 def _send_tag_index_wakeup(library, scope, revision, delay=0, *, reason='pending-recovery', capture=None):
+    import index_work
     if scope != 'tag_embedding':
         raise ValueError('Vision maintenance only accepts tag_embedding')
-    queue = ipwork_queue_client
+    queue = ipwork_deferred_queue_client if delay else ipwork_queue_client
     if queue is None:
         raise RuntimeError('Vision queue unavailable')
     payload = _tag_index_payload(library, revision)
@@ -11197,6 +11202,43 @@ def _send_tag_index_wakeup(library, scope, revision, delay=0, *, reason='pending
     sent = queue.send_message(json.dumps(payload), visibility_timeout=delay or None)
     if capture is not None:
         capture.append((queue, sent))
+    if isinstance(getattr(sent, 'id', None), str) and isinstance(getattr(sent, 'pop_receipt', None), str):
+        return index_work.QueueWakeup(
+            IPWORKER_DEFERRED_QUEUE_NAME if delay else IPWORKER_QUEUE_NAME,
+            sent.id, sent.pop_receipt, _cancel_tag_index_wakeup)
+
+
+def _cancel_tag_index_wakeup(receipt):
+    from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
+    queues = {IPWORKER_QUEUE_NAME: ipwork_queue_client,
+              IPWORKER_DEFERRED_QUEUE_NAME: ipwork_deferred_queue_client}
+    queue = queues.get(receipt.get('queueName'))
+    if queue is None:
+        raise ValueError('Tag wake cancellation requires its configured queue')
+    try:
+        queue.delete_message(receipt['messageId'], receipt['popReceipt'])
+    except ResourceNotFoundError:
+        pass
+    except HttpResponseError as error:
+        if getattr(error, 'error_code', None) != 'PopReceiptMismatch':
+            raise
+
+
+def _promote_deferred_ipwork(queue):
+    """Move one due wake to the all-message queue before acknowledging it.
+
+    Processing on the visible-only deferred queue would hide active work from
+    its scaler. Transfer failure leaves the original delivery for retry.
+    """
+    deferred = ipwork_deferred_queue_client
+    if deferred is None:
+        return False
+    for message in deferred.receive_messages(messages_per_page=1, max_messages=1,
+            visibility_timeout=IPWORKER_VISIBILITY_TIMEOUT_SECONDS):
+        queue.send_message(message.content)
+        deferred.delete_message(message)
+        return True
+    return False
 
 
 def recover_pending_index_work(library=None, *, retry_failed=False):
@@ -11280,6 +11322,7 @@ def _run_tag_index_maintenance_payload(payload):
     """One exact-library vision job. Queue delivery counts aren't failure counts."""
     import automatic_index_updates as automatic
     import index_work
+    from clustering_lease import RetryableLibraryLeaseError
     import index_publication
     library = payload.get('userId')
     revision = payload.get('intentRevision')
@@ -11345,7 +11388,7 @@ def _run_tag_index_maintenance_payload(payload):
                 else:
                     _run_index_build_job(library, payload['jobId'], 'tag_embedding')
         # Stop renewers/check ownership before releasing or deleting the intent.
-        newer = store.finish(claim, failed=exhausted)
+        newer = store.finish(claim, failed=exhausted, cancel_wakeup=_cancel_tag_index_wakeup)
         claim = None
         if newer:
             store.notify(key, _send_tag_index_wakeup)
@@ -11356,7 +11399,7 @@ def _run_tag_index_maintenance_payload(payload):
             return 'tag_index_failed'
         _notify_index_ready(library, payload['jobId'], 'tag_embedding')
         return 'tag_index_done'
-    except automatic.SourceBusy:
+    except (automatic.SourceBusy, RetryableLibraryLeaseError):
         if claim is not None:
             waiting_wave = automatic.wave_pending(library)
             if waiting_wave:
@@ -11364,11 +11407,14 @@ def _run_tag_index_maintenance_payload(payload):
                 if not automatic.wave_pending(library):
                     resume_index_maintenance_after_wave(library)
                 return 'tag_index_deferred'
-            delay = 10
+            delay = INDEX_BARRIER_RECOVERY_SECONDS
             store.release(claim, deferred=True, retry_delay=delay, retry_reason='barrier_wait')
         try:
             sent = store.notify(key, _send_tag_index_wakeup)
             if not sent:
+                current = store._get(key)
+                if current and (float(current.get('wakeUntil') or 0) > store.clock() or current.get('wakeReceipt')):
+                    return 'tag_index_deferred'
                 return 'tag_index_retry'
         except Exception:
             worker_logger.warning('Tag barrier wakeup retained for recovery', exc_info=True)
@@ -11404,6 +11450,7 @@ def resume_index_maintenance_after_wave(library):
 
 def _run_index_maintenance_payload(payload):
     import index_work
+    from clustering_lease import RetryableLibraryLeaseError
     import index_publication
     import automatic_index_updates as automatic
     store = index_work.WorkStore(jobs_table_client)
@@ -11456,7 +11503,7 @@ def _run_index_maintenance_payload(payload):
         with index_publication.publication(store, claim):
             _run_index_build_job(library, str(payload['jobId']), scope)
         newer = store.finish(claim, cancel_wakeup=_cancel_index_wakeup)
-    except automatic.SourceBusy:
+    except (automatic.SourceBusy, RetryableLibraryLeaseError):
         # A healthy source barrier wait does not consume the poison budget.
         waiting_wave = automatic.wave_pending(library)
         if waiting_wave:
@@ -11841,6 +11888,7 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
     from index_ownership import require_catalog_owner
     require_catalog_owner(model_owned_tag=scope == 'tag_embedding')
     import index_updates
+    from clustering_lease import RetryableLibraryLeaseError
     from automatic_index_updates import SourceBusy
     scope = index_updates.validate_scope(scope)
     started = time.monotonic()
@@ -12019,7 +12067,7 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
                     if enqueue_index_build(user_id, reason='post-bootstrap', scope='search') == 'unavailable':
                         raise RuntimeError('Could not schedule post-bootstrap catalog updates')
                 _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done')
-    except SourceBusy:
+    except (SourceBusy, RetryableLibraryLeaseError):
         # Stop any in-flight heartbeat before publishing the waiting state.
         # The outer owner releases/debits the claim and schedules recovery.
         stop.set()
@@ -13907,7 +13955,12 @@ def _sweep_tag_embedding_indexes() -> Dict[str, int]:
                 stats['indexesAvailable'] += 1
             except automatic.SourceBusy:
                 if claim is not None:
-                    store.release(claim, deferred=True, retry_delay=10, retry_reason='barrier_wait')
+                    delay = INDEX_BARRIER_RECOVERY_SECONDS
+                    store.release(claim, deferred=True, retry_delay=delay, retry_reason='barrier_wait')
+                    try:
+                        store.notify(row['RowKey'], _send_tag_index_wakeup)
+                    except Exception:
+                        worker_logger.warning('Sweep tag barrier wakeup could not be reserved', exc_info=True)
             except Exception:
                 if claim is not None:
                     store.release(claim, retry_delay=30)
@@ -18178,6 +18231,10 @@ def run_ipworker() -> None:
                             max_messages=free_slots,
                             visibility_timeout=IPWORKER_VISIBILITY_TIMEOUT_SECONDS,
                         ))
+                        if not messages and _promote_deferred_ipwork(queue_client):
+                            messages = list(queue_client.receive_messages(
+                                messages_per_page=free_slots, max_messages=free_slots,
+                                visibility_timeout=IPWORKER_VISIBILITY_TIMEOUT_SECONDS))
                     except Exception:
                         throughput.record('receive_failed', (time.monotonic() - receive_started) * 1000)
                         raise

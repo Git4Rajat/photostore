@@ -15,6 +15,31 @@ from tests.test_index_work import EtagTable
 write_status = app._upsert_job_status
 
 
+@pytest.mark.parametrize('kind', ['vector', 'lexical_artifact', 'people_embedding'])
+def test_catalog_contention_refunds_attempt_and_keeps_dirty_work(clocked, monkeypatch, kind):
+    from clustering_lease import RetryableLibraryLeaseError
+    env = clocked
+    env.runtime.store.begin('A', kind, ['one'])
+    env.runtime.store.finish('A', kind)
+    key = env.store.request('A', kind)
+    payload = dict(type=app.INDEX_BUILD_JOB_TYPE, userId='A', scope=kind, jobId='job',
+        maintenanceKey=key, intentRevision=env.store._get(key)['revision'])
+    original = automatic.run
+    monkeypatch.setattr(automatic, 'run', Mock(side_effect=RetryableLibraryLeaseError('catalog busy')))
+    for _ in range(app.INDEX_BUILD_MAX_RETRIES + 2):
+        assert app._run_index_maintenance_payload(payload) == 'deferred'
+        row = env.store._get(key)
+        assert row['attempts'] == 0 and not row['failed'] and not row['owner']
+        assert row['notBefore'] == env.now[0] + app.INDEX_BARRIER_RECOVERY_SECONDS
+        assert env.runtime.store.capture('A', kind).ids == ['one']
+        assert all(args[3] != 'failed' for args, _ in env.statuses)
+        env.now[0] += app.INDEX_BARRIER_RECOVERY_SECONDS + 1
+    monkeypatch.setattr(automatic, 'run', original)
+    app._run_index_maintenance_payload(payload)
+    assert env.store._get(key) is None
+    assert len(env.runtime.calls) == 1
+
+
 @pytest.fixture
 def clocked(runtime, monkeypatch):
     now = [1000.0]

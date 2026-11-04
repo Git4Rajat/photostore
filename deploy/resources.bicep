@@ -431,6 +431,7 @@ var backendEnv = [
   { name: 'INDEX_EVENTS_ENDPOINT', value: enableIndexPush ? 'https://${indexPush!.properties.hostName}' : '' }
   { name: 'INDEX_MAINTENANCE_QUEUE_NAME', value: 'photostore-index-maintenance' }
   { name: 'INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME', value: 'photostore-index-maintenance-deferred' }
+  { name: 'IPWORKER_DEFERRED_QUEUE_NAME', value: 'photostore-ipwork-deferred' }
   { name: 'INDEX_BUILD_ROLES', value: 'index-worker' }
   // Inline merge (see backend/inline_index_merge.py): lets `core` finish a
   // small CRUD-triggered people/albums/sort/access rebuild itself, through a
@@ -1886,7 +1887,8 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
         { name: 'index-cache', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
       ]
       scale: {
-        cooldownPeriod: 300
+        // Shorter than the 300s barrier retry so idle retries can scale to zero.
+        cooldownPeriod: 60
         minReplicas: 0
         // 1: uploads release their vision work in one burst at upload end
         // (IPWORK_DEFER_UNTIL_UPLOAD_END), and a measured 1809-file run used
@@ -1909,8 +1911,21 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
                 // A wave message can own hundreds of images. It remains
                 // invisible while its receipt is renewed, so count it until
                 // ACK; otherwise KEDA scales down during healthy processing.
-                // Delayed retries also count until handled or expired.
+                // Delayed tag maintenance uses the visible-only sibling queue.
                 queueLengthStrategy: 'all'
+              }
+              identity: 'system'
+            }
+          }
+          {
+            name: 'ipwork-deferred-queue'
+            custom: {
+              type: 'azure-queue'
+              metadata: {
+                accountName: storageAccountName
+                queueName: 'photostore-ipwork-deferred'
+                queueLength: '1'
+                queueLengthStrategy: 'visibleonly'
               }
               identity: 'system'
             }

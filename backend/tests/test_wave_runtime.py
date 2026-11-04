@@ -94,22 +94,32 @@ def test_delayed_cluster_wake_uses_deferred_queue_undelayed_does_not(monkeypatch
     assert deferred_sent[0][1]['visibility_timeout']==30
 
 
-def test_delayed_vision_wake_still_uses_its_main_queue(monkeypatch):
-    # Only cluster and index have a deferred sibling queue wired up so far --
-    # vision keeps today's behavior (still subject to the same false-start
-    # pattern, tracked separately) rather than silently no-op-ing or raising.
+def test_delayed_vision_wake_uses_deferred_queue_undelayed_does_not(monkeypatch):
+    # Like cluster and index, vision's main queue uses queueLengthStrategy='all',
+    # so delayed continuations must route to the sibling visible-only deferred
+    # queue to prevent sustaining replica demand while waiting out delays.
     monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED','true')
-    sent=[]
+    main_sent=[];deferred_sent=[]
     app=SimpleNamespace(
-        ipwork_queue_client=SimpleNamespace(send_message=lambda body,**o:sent.append((json.loads(body),o))),
+        ipwork_queue_client=SimpleNamespace(
+            send_message=lambda body,**options:main_sent.append((json.loads(body),options))),
+        ipwork_deferred_queue_client=SimpleNamespace(
+            send_message=lambda body,**options:deferred_sent.append((json.loads(body),options))),
         index_maintenance_queue_client=SimpleNamespace(send_message=lambda *a,**k:None),
         index_maintenance_deferred_queue_client=SimpleNamespace(send_message=lambda *a,**k:None),
         clustering_queue_client=SimpleNamespace(send_message=lambda *a,**k:None),
         clustering_deferred_queue_client=SimpleNamespace(send_message=lambda *a,**k:(_ for _ in ()).throw(AssertionError('vision must not use the cluster deferred queue'))),
     )
     monkeypatch.setitem(sys.modules,'app',app)
+
+    runtime.send_stage('u','wave-vision:w:key','r',delay=0)
+    assert len(main_sent)==1 and not deferred_sent
+    assert main_sent[0][1].get('visibility_timeout') is None
+
     runtime.send_stage('u','wave-vision:w:key','r',delay=30)
-    assert len(sent)==1 and sent[0][1]['visibility_timeout']==30
+    assert len(deferred_sent)==1 and len(main_sent)==1
+    assert deferred_sent[0][0]['stage']=='vision' and deferred_sent[0][0]['intentRevision']=='r'
+    assert deferred_sent[0][1]['visibility_timeout']==30
 
 
 def test_delayed_index_wake_uses_deferred_queue_undelayed_does_not(monkeypatch):

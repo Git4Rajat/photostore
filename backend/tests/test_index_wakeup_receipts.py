@@ -130,6 +130,7 @@ def test_lost_completion_signal_original_backup_still_runs(queued):
     env.now[0] = 1300
     message = env.deferred.take()
     assert app._process_clustering_queue_message(message, env.deferred, env.deferred.name, 5)
+    assert app._process_clustering_queue_message(env.main.take(), env.main, env.main.name, 5)
     assert env.store._get(env.key) is None
     assert len(env.runtime.calls) == 1 and not env.deferred.rows
 
@@ -312,6 +313,7 @@ def test_early_immediate_delivery_cannot_remove_the_delayed_recovery_path(queued
     assert not env.runtime.calls and env.deferred.rows
     env.now[0] = 1300
     assert app._process_clustering_queue_message(env.deferred.take(), env.deferred, env.deferred.name, 5)
+    assert app._process_clustering_queue_message(env.main.take(), env.main, env.main.name, 5)
     assert len(env.runtime.calls) == 1 and env.store._get(env.key) is None
 
 
