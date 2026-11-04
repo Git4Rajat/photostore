@@ -191,8 +191,9 @@ def register_routes(blueprint):
     def wave_live_abandon(store,data,session):
         account,_,error=app._require_library_context(require_auth=True)
         if error:return error
-        if not app.library_store.is_owner(account,store.library):
-            raise Conflict('Only the library owner may abandon intake')
+        # Any authenticated library member may stop an intake session they hold
+        # the (unguessable) id of; abandonment only cancels that session's own
+        # unresolved reservations. Resolved sources remain library members.
         from wave_settlement import abandon, fence_discard
         reason=data['reason']
         if not isinstance(reason,str) or not reason.strip() or len(reason)>256:
