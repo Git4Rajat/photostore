@@ -15,7 +15,7 @@ from image_utils import is_video_file
 from upload_waves import MAX_PAGE, Conflict, digest
 
 
-def source_identity(row):
+def source_identity(row, allow_pending=False):
     """Returns (photo_id, processing_revision, qualified).
 
     qualified is True once the row carries a real source-allocated
@@ -26,7 +26,7 @@ def source_identity(row):
     comparisons; it is not a real reprocessing generation fence.
     """
     photo = str(row.get('anonymousImageId') or '')
-    if not photo or row.get('processing_state') == 'deleted' or row.get('pendingAnonymousBlob'):
+    if not photo or row.get('processing_state') == 'deleted' or (row.get('pendingAnonymousBlob') and not allow_pending):
         raise Conflict('A finalized, nondeleted photo is required')
     real_revision = str(row.get('processingRevision') or '')
     if real_revision:
@@ -56,7 +56,10 @@ def resolve_sources(store, metadata_table, session, sources):
         row = rows.get(filename)
         if row is None:
             raise Conflict('Finalized photo not found')
-        photo, revision, _qualified = source_identity(row)
+        # A duplicate resolves to an already-finalized canonical row; a pending
+        # reservation left on it by a concurrent upload of the same filename is
+        # irrelevant to that finalized source and must not block admission.
+        photo, revision, _qualified = source_identity(row, allow_pending=outcome == 'duplicate')
         previous = items.get(store.item_key(session, item))
         if previous is None:
             raise Conflict('Unknown session, member or wave')
