@@ -8787,7 +8787,7 @@ def get_index_manifest_summary(user_id: str, kind: str) -> Optional[Dict[str, ob
         row_count = int(manifest.get('rowCount') or 0)
     except (TypeError, ValueError):
         row_count = 0
-    return {
+    summary = {
         'source_version': source_version,
         'updated_at': manifest.get('updatedAt') or source_version,
         'dirty': bool(manifest.get('dirty')),

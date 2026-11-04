@@ -33,6 +33,7 @@ vi.mock('../services/uploadPreparationPipeline', () => ({UploadPreparationPipeli
 vi.mock('../services/apiClient', () => ({
     get: mocks.get,
     post: vi.fn().mockResolvedValue({}),
+    getTools: vi.fn().mockResolvedValue({ready: true, building: false}),
     postTools: mocks.postTools,
     getUpload: mocks.getUpload,
     postUpload: mocks.postUpload,

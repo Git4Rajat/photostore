@@ -678,6 +678,24 @@ def test_photos_sort_index_returns_available_true_with_sas_url(monkeypatch, sort
     assert payload['updatedAt'] == '2026-01-01'
 
 
+def test_manifest_delta_sequence_reaches_the_sort_index_response(monkeypatch, sort_index_route_ctx):
+    # Exercise the real summary/route boundary, not a pre-composed summary.
+    monkeypatch.setattr(storage_utils, '_load_sort_index_manifest', lambda _: {
+        'sourceVersion': 'base-v1', 'rowCount': 2, 'deltaSeq': 2,
+    })
+    monkeypatch.setattr(app, 'get_index_manifest_summary', storage_utils.get_index_manifest_summary)
+    monkeypatch.setattr(app, 'get_sort_index_blob_location', lambda _: ('catalog', 'sort-base'))
+    monkeypatch.setattr(app, '_create_stable_read_sas_url', lambda container, blob: (f'https://storage.test/{blob}', 'later'))
+    with app.app.test_request_context('/api/photos/sort-index'):
+        payload = photos_sort_index().get_json()
+    assert payload['available']
+    assert payload['sourceVersion'] == 'base-v1'
+    assert payload['deltaSeq'] == 2
+    assert payload['deltaUrls'] == [
+        f'https://storage.test/{storage_utils._sort_index_delta_blob_name("owner", seq)}' for seq in (1, 2)
+    ]
+
+
 def test_photos_sort_index_route_never_loads_the_data_blob(monkeypatch, sort_index_route_ctx):
     """Regression pin for the 2026-09-30 OOM: the gallery-load endpoint must
     mint the URL from the manifest only (get_index_manifest_summary), never

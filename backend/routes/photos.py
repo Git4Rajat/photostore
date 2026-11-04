@@ -1502,8 +1502,10 @@ def set_photo_rating(filename: str):
         metadata = app._get_metadata_entity(user_id, safe_name)
         if not metadata:
             return app.jsonify({'error': 'Not found'}), 404
-        app._update_metadata_entity_fields(user_id, safe_name, {'rating': rating})
-        return app.jsonify({'success': True, 'filename': filename, 'rating': rating})
+        saved = app._update_metadata_entity_fields(user_id, safe_name, {'rating': rating})
+        if saved is None:
+            return app.jsonify({'error': 'Could not save rating', 'code': 'metadata_write_failed'}), 503
+        return app.jsonify({'success': True, 'filename': filename, 'rating': saved['rating']})
     except Exception as e:
         app.app.logger.exception('set_photo_rating failed')
         return app.jsonify({'error': 'Internal server error'}), 500
@@ -1530,21 +1532,25 @@ def rate_multiple_photos():
     if not valid_names:
         return app.jsonify({'rated': rated, 'errors': errors, 'success': False})
 
-    def _rate_one(safe_name: str) -> app.Tuple[str, bool]:
-        metadata = app._get_metadata_entity(user_id, safe_name)
-        if not metadata:
-            return safe_name, False
-        app._update_metadata_entity_fields(user_id, safe_name, {'rating': rating})
-        return safe_name, True
+    def _rate_one(safe_name: str) -> app.Tuple[str, str]:
+        try:
+            metadata = app._get_metadata_entity(user_id, safe_name)
+            if not metadata:
+                return safe_name, 'Not found'
+            saved = app._update_metadata_entity_fields(user_id, safe_name, {'rating': rating})
+            return safe_name, '' if saved is not None else 'Could not save rating'
+        except Exception:
+            app.app.logger.exception('Could not save rating for %s', safe_name)
+            return safe_name, 'Could not save rating'
 
     with ThreadPoolExecutor(max_workers=app.DELETE_IO_CONCURRENCY) as executor:
         results = list(executor.map(_rate_one, valid_names))
 
-    for safe_name, ok in results:
-        if ok:
+    for safe_name, error in results:
+        if not error:
             rated.append(safe_name)
         else:
-            errors.append(f'{safe_name}: Not found')
+            errors.append(f'{safe_name}: {error}')
 
     return app.jsonify({'rated': rated, 'rating': rating, 'errors': errors, 'success': len(rated) > 0})
 
@@ -1564,23 +1570,30 @@ def toggle_like_photo(filename: str):
         metadata = app._get_metadata_entity(user_id, safe_name)
         if not metadata:
             return app.jsonify({'error': 'Not found'}), 404
-        liked_by = app.json.loads(metadata.get('likedBy', '[]'))
+        data = app.request.get_json(silent=True) or {}
+        desired = data.get('liked')
+        if 'liked' in data and not isinstance(desired, bool):
+            return app.jsonify({'error': 'liked must be a boolean'}), 400
+        if desired is None:
+            # Retain toggle compatibility for older clients. Hold the chosen
+            # target fixed across conditional-write retries.
+            desired = user_id not in app.json.loads(metadata.get('likedBy') or '[]')
 
-        if user_id in liked_by:
-            liked_by.remove(user_id)
-        else:
-            liked_by.append(user_id)
+        def like_updates(current):
+            liked_by = app.json.loads(current.get('likedBy') or '[]')
+            liked_by = [value for value in liked_by if value != user_id]
+            if desired:
+                liked_by.append(user_id)
+            return {'likes': len(liked_by), 'likedBy': app.json.dumps(liked_by)}
 
-        app._update_metadata_entity_fields(user_id, safe_name, {
-            'likes': len(liked_by),
-            'likedBy': app.json.dumps(liked_by),
-        })
+        saved = app._update_metadata_entity_fields(user_id, safe_name, {}, derive_updates=like_updates)
+        if saved is None:
+            return app.jsonify({'error': 'Could not save like', 'code': 'metadata_write_failed'}), 503
+        liked_by = app.json.loads(saved.get('likedBy') or '[]')
 
         return app.jsonify({
             'success': True,
             'filename': filename,
-            # len(liked_by) is the post-toggle count; metadata['likes'] held the
-            # pre-update value (and raised KeyError → 500 on rows without it).
             'likes': len(liked_by),
             'liked': user_id in liked_by,
         })
@@ -1610,10 +1623,12 @@ def set_photo_rotation(filename: str):
         updates = {'rotation': rotation}
         if rotation != previous_rotation:
             updates['thumbnail_status'] = 'pending'
-        app._update_metadata_entity_fields(user_id, safe_name, {
+        saved = app._update_metadata_entity_fields(user_id, safe_name, {
             **updates,
         })
-        return app.jsonify({'success': True, 'filename': filename, 'rotation': rotation})
+        if saved is None:
+            return app.jsonify({'error': 'Could not save rotation', 'code': 'metadata_write_failed'}), 503
+        return app.jsonify({'success': True, 'filename': filename, 'rotation': saved['rotation']})
     except Exception as e:
         app.app.logger.exception('set_photo_rotation failed')
         return app.jsonify({'error': 'Internal server error'}), 500

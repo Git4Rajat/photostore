@@ -211,21 +211,35 @@ const downloadSortIndexBlob = async (indexUrl: string, scope: string, current: (
     return rows;
 };
 
-const downloadSortDelta = async (url: string): Promise<{ upserts?: Record<string, unknown>[]; deletes?: string[] }> => {
+type SortDelta = { lineage: string; seq: number; upserts: Record<string, unknown>[]; deletes: string[] };
+const sortSnapshotVersion = (lineage: string, seq: number): string => (
+    seq ? `${lineage}:delta:${String(seq).padStart(6, '0')}` : lineage
+);
+
+const downloadSortDelta = async (url: string): Promise<SortDelta> => {
     const buffer = await fetchWithTimeout(url, BLOB_FETCH_TIMEOUT_MS);
     let text: string;
     try { text = new TextDecoder().decode(buffer); } catch { text = ''; }
     if (!text.trim().startsWith('{')) text = await decompressGzip(buffer);
     const parsed = JSON.parse(text);
-    return parsed && typeof parsed === 'object' ? parsed : {};
+    if (!parsed || typeof parsed.lineage !== 'string' || !Number.isInteger(parsed.seq)
+        || !Array.isArray(parsed.upserts) || !Array.isArray(parsed.deletes)) {
+        throw new Error('Invalid sort-index delta');
+    }
+    return parsed;
 };
 
-const applySortDeltas = async (rows: SortIndexRow[], urls: string[]): Promise<SortIndexRow[]> => {
+const applySortDeltas = async (rows: SortIndexRow[], urls: string[], lineage: string, firstSeq: number): Promise<SortIndexRow[]> => {
     const byName = new Map(rows.map((row) => [row.filename, row]));
-    for (const url of urls) {
-        const delta = await downloadSortDelta(url);
-        for (const name of delta.deletes ?? []) byName.delete(String(name));
-        for (const raw of delta.upserts ?? []) {
+    for (let offset = 0; offset < urls.length; offset++) {
+        const delta = await downloadSortDelta(urls[offset]);
+        // Stable blob names may be reused after compaction. Never combine a
+        // new base/delta lineage with an older manifest or cached base.
+        if (delta.lineage !== lineage || delta.seq !== firstSeq + offset) {
+            throw new Error('Sort index changed during delta download');
+        }
+        for (const name of delta.deletes) byName.delete(String(name));
+        for (const raw of delta.upserts) {
             const normalized = normalizeRows([raw])[0];
             if (normalized) byName.set(normalized.filename, normalized);
         }
@@ -301,12 +315,17 @@ const fetchLocalSortIndex = async (key: string, requestGeneration: number, editS
     }
     const sourceVersion = response.sourceVersion || '';
     const deltaSeq = Number(response.deltaSeq || 0);
+    if (!Number.isInteger(deltaSeq) || deltaSeq < 0
+        || (deltaSeq > 0 && (!sourceVersion || response.deltaUrls?.length !== deltaSeq))) {
+        throw new Error('Incomplete sort-index delta manifest');
+    }
+    const version = sortSnapshotVersion(sourceVersion, deltaSeq);
     const idbStarted = perfNow();
     const stored = await idbGetStored(key).catch(() => null);
     readStoredRemovals(key, stored);
     const storedMatches = stored && sourceVersion && stored.sourceVersion === sourceVersion
         && Number(stored.deltaSeq || 0) === deltaSeq
-        && (!stored.payloadVersion || stored.payloadVersion === sourceVersion);
+        && (stored.payloadVersion === version || (!stored.payloadVersion && deltaSeq === 0));
     perf.recordSpan('index.sort.idb_read', perfNow() - idbStarted, { cached: Boolean(storedMatches) });
     if (storedMatches) {
         // Unchanged since the last download for this library -- skip the
@@ -320,12 +339,28 @@ const fetchLocalSortIndex = async (key: string, requestGeneration: number, editS
         return visible;
     }
     let rows: SortIndexRow[];
+    const storedSeq = Number(stored?.deltaSeq || 0);
     if (stored && sourceVersion && stored.sourceVersion === sourceVersion
-        && Number(stored.deltaSeq || 0) < deltaSeq && response.deltaUrls?.length) {
-        const pending = response.deltaUrls.slice(Number(stored.deltaSeq || 0));
-        rows = await applySortDeltas(stored.rows, pending);
+        && storedSeq < deltaSeq && response.deltaUrls?.length
+        && (stored.payloadVersion === sortSnapshotVersion(sourceVersion, storedSeq)
+            || (!stored.payloadVersion && storedSeq === 0))) {
+        const pending = response.deltaUrls.slice(storedSeq);
+        rows = await applySortDeltas(stored.rows, pending, sourceVersion, storedSeq + 1);
     } else {
         rows = await downloadSortIndexBlob(response.indexUrl, editScope, () => generation === requestGeneration, readTokens);
+        if (deltaSeq) {
+            if (snapshotVersions.get(rows) !== sourceVersion) {
+                throw new Error('Sort index changed during base download');
+            }
+            rows = await applySortDeltas(rows, response.deltaUrls!, sourceVersion, 1);
+        }
+    }
+    if (deltaSeq) {
+        // Delta sequence is part of the projection revision. Preserve it in
+        // IndexedDB and when observing replacement upload generations/edits.
+        snapshotVersions.set(rows, version);
+        if (generation === requestGeneration) rows.forEach(row =>
+            observePhotoGeneration(row.filename, row.thumb, editScope, version));
     }
     filterRemovedRows(key, rows, generation === requestGeneration);
     // An invalidation (bumping `generation`) during this download can let a
@@ -347,8 +382,8 @@ const fetchLocalSortIndex = async (key: string, requestGeneration: number, editS
     }
     perf.recordSpan('index.sort.total', perfNow() - totalStarted, { cached: false, rows: rows.length });
     const visible = filterRemovedRows(key, rows);
-    const version = snapshotVersions.get(rows);
-    if (version) snapshotVersions.set(visible, version);
+    const payloadVersion = snapshotVersions.get(rows);
+    if (payloadVersion) snapshotVersions.set(visible, payloadVersion);
     return visible;
 };
 

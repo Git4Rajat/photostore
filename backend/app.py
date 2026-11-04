@@ -3423,7 +3423,10 @@ def _update_metadata_entity_fields(
         current_updates = derive_updates(entity) if derive_updates is not None else updates
         if (storage_utils_module.DURABLE_INDEX_UPDATES and all(entity.get(k) == v for k, v in (current_updates or {}).items())
                 and entity.get('processing_complete') == _photo_processing_complete(entity)):
-            storage_utils_module.publish_metadata_index_intent(user_id, filename, entity)
+            try:
+                storage_utils_module.publish_metadata_index_intent(user_id, filename, entity)
+            except Exception:
+                app.logger.warning('Metadata saved; index intent delivery pending for %s/%s', user_id, filename, exc_info=True)
             return entity
         changed = {k: v for k, v in (current_updates or {}).items() if entity.get(k) != v}
         entity.update(current_updates or {})
@@ -3437,23 +3440,35 @@ def _update_metadata_entity_fields(
             # Conditional on the etag just read -- see _update_metadata_fields's
             # identical comment in storage_utils.py.
             metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
-            _invalidate_metadata_scan_cache(user_id)
-            if storage_utils_module.DURABLE_INDEX_UPDATES:
-                storage_utils_module.publish_metadata_index_intent(user_id, filename, entity)
-            elif metadata_updates_affect_search_indexes(current_updates or {}):
-                touch_user_search_indexes_state(
-                    user_id, filenames=filename,
-                    touch_albums=storage_utils_module.metadata_updates_affect_album_covers(current_updates or {}),
-                )
-            elif metadata_updates_affect_sort_index(current_updates or {}):
-                touch_user_sort_index_dirty(user_id, [filename])
-            return entity
         except ResourceNotFoundError:
             # Deleted between our read and this write -- nothing left to retry.
             return None
         except Exception as exc:
             last_exc = exc
             time.sleep(0.05 * (2 ** attempt))
+            continue
+        # The source commit succeeded. Projection delivery must not replay the
+        # mutation or turn its acknowledgement into a failed source write.
+        # Durable mode retains the publication intent on the metadata row.
+        for delivery_attempt in range(3):
+            try:
+                _invalidate_metadata_scan_cache(user_id)
+                if storage_utils_module.DURABLE_INDEX_UPDATES:
+                    storage_utils_module.publish_metadata_index_intent(user_id, filename, entity)
+                elif metadata_updates_affect_search_indexes(current_updates or {}):
+                    touch_user_search_indexes_state(
+                        user_id, filenames=filename,
+                        touch_albums=storage_utils_module.metadata_updates_affect_album_covers(current_updates or {}),
+                    )
+                elif metadata_updates_affect_sort_index(current_updates or {}):
+                    touch_user_sort_index_dirty(user_id, [filename])
+                break
+            except Exception:
+                if delivery_attempt == 2:
+                    app.logger.warning('Metadata saved; index refresh pending for %s/%s', user_id, filename, exc_info=True)
+                else:
+                    time.sleep(0.05 * (2 ** delivery_attempt))
+        return entity
     if last_exc:
         app.logger.warning('Failed to update metadata entity %s/%s: %s', user_id, filename, last_exc)
     return None
@@ -14181,6 +14196,9 @@ def _trash_index_add(user_id: str, filename: str, deleted_at: str) -> None:
         trash_index_table_client.upsert_entity({'PartitionKey': user_id, 'RowKey': filename, 'deletedAt': deleted_at})
     except Exception:
         app.logger.warning('Trash index add failed for %s', filename, exc_info=True)
+        # The caller must retain its request/job for replay; the metadata row
+        # is already deleted and carries its original timestamp/statuses.
+        raise
 
 
 def _trash_index_remove(user_id: str, filenames: List[str]) -> None:
@@ -14249,32 +14267,40 @@ def _mark_processing_deleted_for_file(user_id: str, filename: str) -> Optional[D
     the whole request themselves, the same way the hard-delete route already
     does, instead of paying for it per file.
     """
-    try:
-        entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
-    except Exception:
-        return None
-    # Queue redelivery may replay a chunk after the worker was interrupted.
-    # Preserve the original pre-delete statuses and timestamp in that case so
-    # a later restore remains lossless.
-    if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
+    for _ in range(5):
+        try:
+            entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+        except ResourceNotFoundError:
+            return None
+        # Replays repair a secondary write that failed after the source commit.
+        # Never overwrite the original deletion time or pre-delete statuses.
+        if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
+            _trash_index_add(user_id, filename, str(entity.get('deletedAt') or ''))
+            return entity
+        version = getattr(entity, 'metadata', {}).get('etag')
+        if not version or version == '*':
+            raise RuntimeError('Photo deletion requires a metadata ETag')
+        now_iso = datetime.now(timezone.utc).isoformat()
+        pre_delete_statuses = {field: entity.get(field, 'pending') for field, _ in BROWSER_PROCESSING_STATUS_FIELDS}
+        entity['preDeleteStatuses'] = json.dumps(pre_delete_statuses, separators=(',', ':'))
+        entity['processing_state'] = 'deleted'
+        entity['deletedAt'] = now_iso
+        for status_field, _ in BROWSER_PROCESSING_STATUS_FIELDS:
+            entity[status_field] = 'deleted'
+        entity['processing_lease_owner'] = ''
+        entity['processing_lease'] = ''
+        entity['processing_lease_expires_at'] = ''
+        entity['last_processing_update'] = now_iso
+        try:
+            metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE,
+                etag=version, match_condition=MatchConditions.IfNotModified)
+        except ResourceModifiedError:
+            continue
+        except ResourceNotFoundError:
+            return None
+        _trash_index_add(user_id, filename, now_iso)
         return entity
-    now_iso = datetime.now(timezone.utc).isoformat()
-    # Snapshot the real per-step statuses before overwriting them, so restore
-    # can put them back exactly instead of forcing a wasteful full re-run of
-    # steps (thumbnail/OCR/etc.) whose output blobs are still sitting there.
-    pre_delete_statuses = {field: entity.get(field, 'pending') for field, _ in BROWSER_PROCESSING_STATUS_FIELDS}
-    entity['preDeleteStatuses'] = json.dumps(pre_delete_statuses, separators=(',', ':'))
-    entity['processing_state'] = 'deleted'
-    entity['deletedAt'] = now_iso
-    for status_field, _ in BROWSER_PROCESSING_STATUS_FIELDS:
-        entity[status_field] = 'deleted'
-    entity['processing_lease_owner'] = ''
-    entity['processing_lease'] = ''
-    entity['processing_lease_expires_at'] = ''
-    entity['last_processing_update'] = now_iso
-    metadata_table_client.upsert_entity(entity)
-    _trash_index_add(user_id, filename, now_iso)
-    return entity
+    raise RuntimeError('Concurrent photo deletion requires retry')
 
 
 def _soft_delete_photos_now(
@@ -14580,25 +14606,37 @@ def _restore_deleted_file(user_id: str, filename: str) -> Optional[Dict[str, Any
     steps whose output blobs are still sitting in storage untouched. Same
     "pure mutation, caller batches index/cache touches" contract as the mark
     function above."""
-    try:
-        entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
-    except Exception:
-        return None
-    if entity.get('processing_state') != 'deleted':
+    for _ in range(5):
+        try:
+            entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+        except ResourceNotFoundError:
+            return None
+        if entity.get('processing_state') != 'deleted':
+            _trash_index_remove(user_id, [filename])
+            return entity
+        version = getattr(entity, 'metadata', {}).get('etag')
+        if not version or version == '*':
+            raise RuntimeError('Photo restoration requires a metadata ETag')
+        try:
+            pre_delete_statuses = json.loads(entity.get('preDeleteStatuses') or '{}')
+        except (TypeError, ValueError):
+            pre_delete_statuses = {}
+        entity['processing_state'] = 'active'
+        entity['deletedAt'] = ''
+        entity['preDeleteStatuses'] = ''
+        for status_field, _ in BROWSER_PROCESSING_STATUS_FIELDS:
+            entity[status_field] = pre_delete_statuses.get(status_field, 'pending')
+        entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
+        try:
+            metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE,
+                etag=version, match_condition=MatchConditions.IfNotModified)
+        except ResourceModifiedError:
+            continue
+        except ResourceNotFoundError:
+            return None
+        _trash_index_remove(user_id, [filename])
         return entity
-    try:
-        pre_delete_statuses = json.loads(entity.get('preDeleteStatuses') or '{}')
-    except (TypeError, ValueError):
-        pre_delete_statuses = {}
-    entity['processing_state'] = 'active'
-    entity['deletedAt'] = ''
-    entity['preDeleteStatuses'] = ''
-    for status_field, _ in BROWSER_PROCESSING_STATUS_FIELDS:
-        entity[status_field] = pre_delete_statuses.get(status_field, 'pending')
-    entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
-    metadata_table_client.upsert_entity(entity)
-    _trash_index_remove(user_id, [filename])
-    return entity
+    raise RuntimeError('Concurrent photo restoration requires retry')
 
 
 def _strip_deleted_people_from_photos(user_id: str, person_ids: set, skip_names: set) -> None:

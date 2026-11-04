@@ -21,7 +21,7 @@ def _patch_common(monkeypatch, known_filenames):
 def test_rates_every_valid_photo(monkeypatch):
     _patch_common(monkeypatch, {'a.jpg', 'b.jpg'})
     updated = []
-    monkeypatch.setattr(app, '_update_metadata_entity_fields', lambda uid, name, fields: updated.append((name, fields)))
+    monkeypatch.setattr(app, '_update_metadata_entity_fields', lambda uid, name, fields: updated.append((name, fields)) or fields)
 
     with app.app.test_request_context('/photos/rate-multiple', method='POST', json={'filenames': ['a.jpg', 'b.jpg'], 'rating': 4}):
         response = rate_multiple_photos()
@@ -36,7 +36,7 @@ def test_rates_every_valid_photo(monkeypatch):
 
 def test_reports_errors_for_missing_photos(monkeypatch):
     _patch_common(monkeypatch, {'a.jpg'})
-    monkeypatch.setattr(app, '_update_metadata_entity_fields', lambda *a, **k: None)
+    monkeypatch.setattr(app, '_update_metadata_entity_fields', lambda uid, name, fields: fields)
 
     with app.app.test_request_context('/photos/rate-multiple', method='POST', json={'filenames': ['a.jpg', 'missing.jpg'], 'rating': 5}):
         response = rate_multiple_photos()

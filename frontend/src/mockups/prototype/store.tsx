@@ -1291,10 +1291,22 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             // session reflects the new rating immediately, without waiting on
             // the backend's independent sort-index manifest to catch up.
             const edits = ids.map(id => beginPendingEdit('photo', id, { rating }));
-            void savePendingEdits(edits, () => post('/photos/rate-multiple', { filenames: ids, rating }))
-                .then(() => {
-                    edits.forEach(edit => confirmPendingEdit(edit));
+            void savePendingEdits(edits, () => post<{ rated: string[] }>('/photos/rate-multiple', { filenames: ids, rating }))
+                .then((result) => {
+                    const saved = new Set(result.rated || []);
+                    edits.forEach((edit, index) => {
+                        if (saved.has(ids[index])) confirmPendingEdit(edit);
+                        else rollbackPendingEdit(edit);
+                    });
                     if (edits[0]?.scope !== pendingEditScope()) return;
+                    const failed = new Set(ids.filter(id => !saved.has(id)));
+                    if (failed.size) {
+                        setPhotos(prev => prev.map(photo => failed.has(photo.id)
+                            ? applyPendingEdits('photo', photo.id, { ...photo, rating: prevRatings.get(photo.id) ?? photo.rating })
+                            : photo));
+                        invalidateLocalSortIndex();
+                        toast('Some ratings could not be saved', undefined, undefined, 'error');
+                    }
                     requestJobPoll();
                     invalidateLocalAlbumsIndex();
                     reloadAlbums();
@@ -1318,7 +1330,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             const optimisticLikes = Math.max(0, prevLikes + (nextLiked ? 1 : -1));
             setPhotos((prev) => prev.map((p) => (p.id === id ? { ...p, liked: nextLiked, likes: optimisticLikes } : p)));
             const edit = beginPendingEdit('photo', id, { likes: optimisticLikes, liked: nextLiked });
-            void savePendingEdits([edit], () => post<{ liked?: boolean; likes?: number }>(`/photos/${encodeURIComponent(id)}/like`, {}))
+            void savePendingEdits([edit], () => post<{ liked?: boolean; likes?: number }>(`/photos/${encodeURIComponent(id)}/like`, { liked: nextLiked }))
                 .then((res) => {
                     requestJobPoll();
                     const likes = res.likes ?? optimisticLikes;

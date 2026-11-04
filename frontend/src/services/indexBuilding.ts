@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from 'react';
-import { get } from './apiClient';
+import { getTools } from './apiClient';
 
 /**
  * Index building status service. Tracks whether indexes are being built and provides
@@ -31,7 +31,7 @@ const listeners = new Set<Listener>();
 const readyListeners = new Set<() => void>();
 let isBuilding = false;
 let indexStatus: IndexStatus = { sort: { ready: false, dirty: false }, lexical: { ready: false, dirty: false }, albums: { ready: false, dirty: false }, people: { ready: false, dirty: false } };
-let statusListeners = new Set<Listener>();
+const statusListeners = new Set<Listener>();
 let timer: ReturnType<typeof setTimeout> | null = null;
 let polling = false;
 let tries = 0;
@@ -58,7 +58,7 @@ const poll = async () => {
     if (polling) return;
     polling = true;
     try {
-        const status = await get<{ ready?: boolean; building?: boolean; indexes?: IndexStatus }>('/api/tools/indexes/status').catch(() => null);
+        const status = await getTools<{ ready?: boolean; building?: boolean; indexes?: IndexStatus }>('/api/tools/indexes/status').catch(() => null);
         if (status) {
             // Update detailed index status
             if (status.indexes) {

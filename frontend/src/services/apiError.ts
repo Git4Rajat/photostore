@@ -11,8 +11,7 @@ import axios from 'axios';
 // logging and for call sites that still want the specifics.
 
 export type ApiErrorKind =
-    // No HTTP response reached us (connection failure, or a gateway
-    // 502/503/504 before a warm replica) — the request never ran server-side.
+    // No healthy HTTP reply reached us. A mutation may still have committed.
     | 'unreachable'
     // The request timed out client-side (axios ECONNABORTED).
     | 'timeout'
@@ -28,7 +27,7 @@ export type ApiErrorKind =
 // Copy shown to the user, keyed by kind. 4xx uses the backend's own message
 // when present (it is usually specific and actionable), falling back here.
 const FRIENDLY_MESSAGE: Record<ApiErrorKind, string> = {
-    unreachable: "Can't reach the server right now — it may be waking up. We'll keep trying.",
+    unreachable: "Can't reach the server right now — it may be waking up. Check whether your change saved before trying again.",
     timeout: 'The server took too long to respond. Please try again in a moment.',
     server: 'Something went wrong on our end. This is usually temporary — please try again.',
     client: "That didn't work. Please check your input and try again.",
@@ -128,8 +127,8 @@ export const classifyApiError = (error: unknown, requestId: string = newRequestI
         }
         const status = error.response?.status;
         if (status === undefined) {
-            // A timeout surfaces as ECONNABORTED with no response; otherwise it's
-            // a connection failure that never reached the app.
+            // A timeout surfaces as ECONNABORTED with no response. Neither
+            // case establishes whether a mutation reached the app.
             const kind: ApiErrorKind = error.code === 'ECONNABORTED' ? 'timeout' : 'unreachable';
             return new ApiError({ kind, message: FRIENDLY_MESSAGE[kind], rawMessage, retriable: true, requestId });
         }

@@ -3,7 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
     library: 'library-A',
     postTools: vi.fn(),
-    get: vi.fn(async () => ({ available: true, indexUrl: 'https://storage.test/sort', sourceVersion: '2026-02-01' })),
+    get: vi.fn(async (): Promise<{available: boolean; indexUrl: string; sourceVersion: string; deltaSeq?: number; deltaUrls?: string[]}> => (
+        { available: true, indexUrl: 'https://storage.test/sort', sourceVersion: '2026-02-01' }
+    )),
 }));
 vi.mock('./apiClient', () => ({ get: mocks.get, postTools: mocks.postTools }));
 vi.mock('./passwordAuthClient', () => ({ getActiveLibraryFromToken: () => mocks.library }));
@@ -29,7 +31,12 @@ const memoryDatabase = () => {
                 objectStore: () => ({
                     get: (key: string) => {
                         const request: { result?: unknown; onsuccess?: () => void } = {};
-                        queueMicrotask(() => { request.result = structuredClone(values.get(key)); request.onsuccess?.(); });
+                        queueMicrotask(() => {
+                            request.result = structuredClone(values.get(key)); request.onsuccess?.();
+                            // A transaction also completes when the version guard
+                            // correctly decides that no put is necessary.
+                            queueMicrotask(() => tx.oncomplete?.());
+                        });
                         return request;
                     },
                     put: (value: unknown, key: string) => {
@@ -69,6 +76,99 @@ describe('index-backed gallery cache', () => {
         expect((await index.getLocalSortIndex())?.[0]).toMatchObject({
             likes: 2, rating: 5, gallery: { ...gallery, liked: false, rotation: 270 },
         });
+    });
+
+    it('applies all deltas on a fresh load and reuses the complete snapshot after reload', async () => {
+        mocks.get.mockResolvedValue({available: true, indexUrl: 'https://storage.test/sort',
+            sourceVersion: '2026-02-01', deltaSeq: 2, deltaUrls: ['https://storage.test/d1', 'https://storage.test/d2']});
+        const fetcher = vi.fn(async (url: string) => new Response(JSON.stringify(url.endsWith('/sort') ? snapshot()
+            : {lineage: '2026-02-01', seq: url.endsWith('/d1') ? 1 : 2,
+                upserts: url.endsWith('/d1') ? [{RowKey: 'c.jpg', rating: 1}] : [{...snapshot().rows[0], rating: 5}],
+                deletes: url.endsWith('/d1') ? ['b.jpg'] : []})));
+        vi.stubGlobal('fetch', fetcher);
+        let index = await import('./localSortIndex');
+        let loaded = await index.getLocalSortIndex();
+        expect(loaded?.map(row => row.filename)).toEqual(['a.jpg', 'c.jpg']);
+        expect(loaded?.[0].rating).toBe(5);
+        expect(fetcher).toHaveBeenCalledTimes(3);
+        vi.resetModules(); index = await import('./localSortIndex');
+        loaded = await index.getLocalSortIndex();
+        expect(loaded?.[0].rating).toBe(5);
+        expect(fetcher).toHaveBeenCalledTimes(3);
+    });
+
+    it('fetches only new deltas when the base is cached', async () => {
+        const index = await import('./localSortIndex');
+        await index.getLocalSortIndex();
+        mocks.get.mockResolvedValue({available: true, indexUrl: 'https://storage.test/sort',
+            sourceVersion: '2026-02-01', deltaSeq: 1, deltaUrls: ['https://storage.test/d1']});
+        const fetcher = vi.fn(async (_url: string) => new Response(JSON.stringify({lineage: '2026-02-01', seq: 1,
+            upserts: [{...snapshot().rows[0], rating: 5}], deletes: ['b.jpg']})));
+        vi.stubGlobal('fetch', fetcher);
+        index.invalidateLocalSortIndex();
+        expect((await index.getLocalSortIndex())?.map(row => [row.filename, row.rating])).toEqual([['a.jpg', 5]]);
+        expect(fetcher.mock.calls[0][0]).toBe('https://storage.test/d1');
+        expect(fetcher).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([{lineage: 'compacted-base', seq: 1}, {lineage: '2026-02-01', seq: 2}])(
+        'rejects a delta from another lineage or position: %j', async identity => {
+            mocks.get.mockResolvedValue({available: true, indexUrl: 'https://storage.test/sort',
+                sourceVersion: '2026-02-01', deltaSeq: 1, deltaUrls: ['https://storage.test/d1']});
+            vi.stubGlobal('fetch', vi.fn(async (url: string) => new Response(JSON.stringify(
+                url.endsWith('/sort') ? snapshot() : {...identity, upserts: [], deletes: []}))));
+            const index = await import('./localSortIndex');
+            expect(await index.getLocalSortIndex()).toBeNull();
+        },
+    );
+
+    it('does not treat an incomplete delta manifest as a current base snapshot', async () => {
+        mocks.get.mockResolvedValue({available: true, indexUrl: 'https://storage.test/sort',
+            sourceVersion: '2026-02-01', deltaSeq: 1, deltaUrls: []});
+        const index = await import('./localSortIndex');
+        expect(await index.getLocalSortIndex()).toBeNull();
+        expect(fetch).not.toHaveBeenCalled();
+    });
+
+    it('recognizes a replacement upload arriving in a delta and drops the old generation edit', async () => {
+        const index = await import('./localSortIndex');
+        await index.getLocalSortIndex();
+        index.patchLocalSortIndexRow('a.jpg', {rating: 5});
+        mocks.get.mockResolvedValue({available: true, indexUrl: 'https://storage.test/sort',
+            sourceVersion: '2026-02-01', deltaSeq: 1, deltaUrls: ['https://storage.test/d1']});
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({lineage: '2026-02-01', seq: 1,
+            upserts: [{...snapshot().rows[0], thumb: 'replacement', rating: 1}], deletes: []}))));
+        index.invalidateLocalSortIndex();
+        expect((await index.getLocalSortIndex())?.[0]).toMatchObject({thumb: 'replacement', rating: 1});
+    });
+
+    it('does not let a slower tab overwrite a newer persisted delta sequence', async () => {
+        let index = await import('./localSortIndex');
+        await index.getLocalSortIndex();
+        mocks.get.mockResolvedValue({available: true, indexUrl: 'https://storage.test/sort',
+            sourceVersion: '2026-02-01', deltaSeq: 1, deltaUrls: ['https://storage.test/d1']});
+        let finishOld!: (response: Response) => void;
+        const slow = vi.fn(() => new Promise<Response>(resolve => { finishOld = resolve; }));
+        vi.stubGlobal('fetch', slow);
+        index.invalidateLocalSortIndex();
+        const oldRead = index.getLocalSortIndex();
+        await vi.waitFor(() => expect(slow).toHaveBeenCalledTimes(1));
+
+        vi.resetModules(); index = await import('./localSortIndex');
+        mocks.get.mockResolvedValue({available: true, indexUrl: 'https://storage.test/sort',
+            sourceVersion: '2026-02-01', deltaSeq: 2, deltaUrls: ['https://storage.test/d1', 'https://storage.test/d2']});
+        const fast = vi.fn(async (url: string) => new Response(JSON.stringify({lineage: '2026-02-01',
+            seq: url.endsWith('/d1') ? 1 : 2, deletes: [],
+            upserts: [{...snapshot().rows[0], rating: url.endsWith('/d1') ? 1 : 2}]})));
+        vi.stubGlobal('fetch', fast);
+        expect((await index.getLocalSortIndex())?.[0].rating).toBe(2);
+        finishOld(new Response(JSON.stringify({lineage: '2026-02-01', seq: 1, deletes: [],
+            upserts: [{...snapshot().rows[0], rating: 1}]})));
+        await oldRead;
+
+        vi.resetModules(); index = await import('./localSortIndex');
+        expect((await index.getLocalSortIndex())?.[0].rating).toBe(2);
+        expect(fast).toHaveBeenCalledTimes(2);
     });
 
 
