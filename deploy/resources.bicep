@@ -258,15 +258,15 @@ resource workerCheckpointShare 'Microsoft.Storage/storageAccounts/fileServices/s
   }
 }
 
-// Delayed checks survive browser loss without an always-running sweeper.
-resource uploadExpiryQueueService 'Microsoft.Storage/storageAccounts/queueServices@2023-05-01' = {
+// Lifecycle directory/notices have no scaler. Core reads on user traffic.
+resource uploadSessionTableService 'Microsoft.Storage/storageAccounts/tableServices@2023-05-01' = {
   parent: storage
   name: 'default'
   properties: {}
 }
-resource uploadExpiryQueue 'Microsoft.Storage/storageAccounts/queueServices/queues@2023-05-01' = {
-  parent: uploadExpiryQueueService
-  name: 'photostore-upload-expiry'
+resource uploadSessionsTable 'Microsoft.Storage/storageAccounts/tableServices/tables@2023-05-01' = {
+  parent: uploadSessionTableService
+  name: 'photouploadsessions'
   properties: {}
 }
 
@@ -1466,7 +1466,7 @@ resource upload 'Microsoft.App/containerApps@2025-01-01' = {
       }
     }
   }
-  dependsOn: [ uploadExpiryQueue ]
+  dependsOn: [ uploadSessionsTable ]
 }
 
 resource web 'Microsoft.App/containerApps@2025-01-01' = {
@@ -1681,21 +1681,6 @@ resource cluster 'Microsoft.App/containerApps@2025-01-01' = {
             }
           }
           {
-            name: 'upload-expiry-queue'
-            custom: {
-              type: 'azure-queue'
-              metadata: {
-                accountName: storageAccountName
-                queueName: 'photostore-upload-expiry'
-                queueLength: '1'
-                // Future deadlines do not hold a replica awake. Due checks
-                // wake it independently of Vision/clustering traffic.
-                queueLengthStrategy: 'visibleonly'
-              }
-              identity: 'system'
-            }
-          }
-          {
             // Separate rule (not just a higher-priority poll order inside the
             // worker) so a library-ops backlog alone -- with the clustering
             // queue empty -- still scales the worker up from zero instead of
@@ -1747,7 +1732,7 @@ resource cluster 'Microsoft.App/containerApps@2025-01-01' = {
   // storageName is a literal, so explicitly wait for the SMB registration.
   dependsOn: [
     workerCheckpointStorage
-    uploadExpiryQueue
+    uploadSessionsTable
   ]
 }
 

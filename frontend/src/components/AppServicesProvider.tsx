@@ -1,4 +1,7 @@
 import { hasForegroundDemand, onForegroundReturn } from '../services/foregroundDemand';
+import { sessionScope } from '../services/sessionScope';
+import { acknowledgeStaleUpload, reconcileUploadSessions } from '../services/uploadSessionRecovery';
+import { observeExpiredWaveSession } from '../services/uploadWaveSync';
 import { waveLiveEnabled, waveShadowEnabled } from '../services/uploadWaveClient';
 import { bindWaveChild, declareWaveSelection, retryWaveOperation } from '../services/uploadWaveOperations';
 import { hasPendingEdits } from '../services/pendingEdits';
@@ -274,7 +277,7 @@ interface AppServicesContextValue {
     startUpload: (filesToUpload: File[], handlesToUpload?: Map<File, FileSystemFileHandle>) => Promise<void>;
     resumeAllPendingUploads: () => Promise<void>;
     stopActiveUpload: () => void;
-    retryPersistedUploadSession: () => Promise<void>;
+    retryPersistedUploadSession: (sessionId?: string) => Promise<void>;
     discardPersistedUploadSession: () => Promise<void>;
     registerUploadCompletionHandler: (handler: () => void | Promise<void>) => () => void;
     /** Called (debounced) when server-side work finished that changes what the library shows: photo
@@ -1767,11 +1770,82 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }, [updateNotification]);
 
     const clearNotifications = useCallback(() => {
+        notifications.forEach(notification => {
+            if (notification.uploadSessionId) void acknowledgeStaleUpload(notification.uploadSessionId).catch(() => undefined);
+        });
         setNotifications([]);
-    }, []);
+    }, [notifications]);
 
     const markAllNotificationsRead = useCallback(() => {
+        notifications.forEach(notification => {
+            if (notification.unread && notification.uploadSessionId) {
+                void acknowledgeStaleUpload(notification.uploadSessionId).catch(() => undefined);
+            }
+        });
         setNotifications((prev) => prev.map((notification) => ({ ...notification, unread: false })));
+    }, [notifications]);
+
+    useEffect(() => {
+        let disposed = false;
+        let inFlight = false;
+        let timer: number | undefined;
+        let lastScope = '';
+        let lastAttempt = -Infinity;
+        let retries = 0;
+        const check = async (continuation = false) => {
+            if (disposed || inFlight || !navigator.onLine || !hasForegroundDemand()) return;
+            const scope = sessionScope();
+            if (!continuation && scope === lastScope && Date.now() - lastAttempt < 60000) return;
+            inFlight = true;
+            try {
+                if (!await canAuthenticateRequests() || disposed || sessionScope() !== scope) return;
+                lastScope = scope;
+                lastAttempt = Date.now();
+                if (!continuation) retries = 0;
+                const response = await reconcileUploadSessions();
+                if (disposed || sessionScope() !== scope) return;
+                for (const notice of response?.notifications || []) {
+                    observeExpiredWaveSession(notice.sessionId);
+                    const id = `stale-upload:${scope}:${notice.sessionId}`;
+                    setNotifications(previous => previous.some(item => item.id === id) ? previous : [{
+                        id, uploadSessionId: notice.sessionId,
+                        title: 'Previous upload closed after inactivity',
+                        details: `${notice.affectedCount} files did not finish. Completed photos are saved. Retry unfinished files if they are still available on this device.`,
+                        timestamp: notice.closedAt * 1000, unread: true,
+                    }, ...previous].slice(0, 40));
+                }
+                // Only outstanding cleanup gets bounded follow-up calls while
+                // a person is using the page. Healthy sessions create no timer.
+                if (response?.pending && retries++ < 10) {
+                    window.clearTimeout(timer);
+                    timer = window.setTimeout(() => { void check(true); }, 30000);
+                }
+            } catch {
+                // Keep durable notices and checkpoints on the server/device;
+                // the next foreground visit can retry a failed reconciliation.
+            } finally {
+                inFlight = false;
+            }
+        };
+        const wake = () => { void check(); };
+        const visible = () => { if (document.visibilityState === 'visible') wake(); };
+        const unsubscribe = onForegroundReturn(wake);
+        window.addEventListener('online', wake);
+        window.addEventListener('focus', wake);
+        window.addEventListener('pointerdown', wake, { passive: true });
+        window.addEventListener('keydown', wake);
+        document.addEventListener('visibilitychange', visible);
+        wake();
+        return () => {
+            disposed = true;
+            window.clearTimeout(timer);
+            unsubscribe();
+            window.removeEventListener('online', wake);
+            window.removeEventListener('focus', wake);
+            window.removeEventListener('pointerdown', wake);
+            window.removeEventListener('keydown', wake);
+            document.removeEventListener('visibilitychange', visible);
+        };
     }, []);
 
     const unreadCount = notifications.filter((notification) => notification.unread).length;
@@ -4542,8 +4616,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         return { matchedCount, unmatchedFiles };
     }, [loadPersistedSession, pendingUploadSession, persistSession, setPendingUploadSessionLive, updatePersistedFile]);
 
-    const retryPersistedUploadSession = useCallback(async () => {
+    const retryPersistedUploadSession = useCallback(async (sessionId?: string) => {
         let session = pendingUploadSessionRef.current || pendingUploadSession || loadPersistedSession();
+        if (sessionId && sessionId !== (session?.waveOperationId || session?.id)) {
+            addNotification('Reselect unfinished files', 'The retry checkpoint for this upload is unavailable on this device. Use Upload to select the unfinished files again.');
+            return;
+        }
         // isResumingUploadRef, not just `uploading`: runUploadSession now flips
         // `uploading` false as soon as bytes finish transferring, while its own
         // background finalize/retry tail (guarded by isResumingUploadRef) can

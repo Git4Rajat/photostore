@@ -22,6 +22,33 @@ upload_bp = Blueprint('upload', __name__)
 upload_bp.teardown_request(upload_teardown)
 
 
+@upload_bp.route('/upload/cleanup', methods=['POST'])
+def cleanup_abandoned_uploads():
+    _, library, error = app._require_owner_context(require_auth=True)
+    if error:
+        return error
+    if app.request.content_length and app.request.content_length > 4096:
+        return app.jsonify(error='Upload cleanup request is too large'), 413
+    body = app.request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return app.jsonify(error='Expected a JSON object'), 400
+    from azure.core.exceptions import AzureError
+    from upload_cleanup import cleanup
+    from upload_waves import Conflict
+    try:
+        result = cleanup(app, library, after=body.get('after', ''))
+        response = app.jsonify(result)
+        response.headers['Cache-Control'] = 'no-store'
+        return response, 200 if result['success'] else 207
+    except Conflict as error:
+        return app.jsonify(error=str(error)), 409
+    except ValueError as error:
+        return app.jsonify(error=str(error)), 400
+    except AzureError:
+        app.app.logger.exception('Upload cleanup storage failure')
+        return app.jsonify(error='Upload cleanup could not finish. Run it again to retry.'), 503
+
+
 @upload_bp.route('/api/upload/telemetry', methods=['POST'])
 @upload_bp.route('/upload/telemetry', methods=['POST'])
 def upload_telemetry():

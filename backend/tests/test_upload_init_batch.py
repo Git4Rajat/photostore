@@ -152,3 +152,17 @@ def test_isolated_reservation_failure_is_not_silently_accepted(batch_ctx, monkey
         storage_utils.reset_upload_tracking_and_reserve_blobs_batch('lib-A', [
             {'filename': 'benchmark.cr3', 'total_size': 100, 'is_fresh': True,
              'initial_metadata': {'processingIsolated': True}}])
+
+
+@pytest.mark.parametrize('batch',[False,True])
+def test_new_init_does_not_reuse_blob_claimed_by_upload_cleanup(batch_ctx,batch):
+    import json
+    batch_ctx.upsert_entity(dict(PartitionKey='lib-A',RowKey='a.jpg',pendingAnonymousBlob='cleaning',
+                                uploadCleanupBlobs=json.dumps(['cleaning']),upload_sha256_expected='same'))
+    if batch:
+        reserved=storage_utils.reset_upload_tracking_and_reserve_blobs_batch('lib-A',[
+            dict(filename='a.jpg',total_size=100,expected_hash='same',is_fresh=True)])['a.jpg']
+    else:
+        reserved=storage_utils.reset_upload_tracking_and_reserve_blob('lib-A','a.jpg',100,'same')
+    assert reserved and reserved!='cleaning'
+    assert json.loads(batch_ctx.get_entity('lib-A','a.jpg')['uploadCleanupBlobs'])==['cleaning']

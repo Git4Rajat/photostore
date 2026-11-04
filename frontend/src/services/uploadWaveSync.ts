@@ -325,6 +325,13 @@ export const quiesceWaveShadowSession = (session: PersistedUploadSession): void 
     stateFor(parent.id).discarding = true;
 };
 
+// Core's durable closure notice is authoritative. Keep the local checkpoint,
+// but prevent another admission into the old parent; explicit retry creates a
+// successor through retryWaveOperation.
+export const observeExpiredWaveSession = (sessionId: string): void => {
+    stateFor(sessionId).expired = true;
+};
+
 export const discardWaveShadowSession = async (session: PersistedUploadSession): Promise<void> => {
     const parent = waveParentFor(session);
     if (!parent) {

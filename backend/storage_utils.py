@@ -809,6 +809,14 @@ def get_anonymous_blob_name(
 PENDING_ANONYMOUS_BLOB_FIELD = 'pendingAnonymousBlob'
 
 
+def _upload_cleanup_owns_blob(entity, blob):
+    try:
+        pending = json.loads(entity.get('uploadCleanupBlobs') or '[]')
+        return not isinstance(pending, list) or blob in pending
+    except (ValueError, TypeError):
+        return True  # Do not reuse a reservation with uncertain cleanup state.
+
+
 def reserve_pending_anonymous_blob(user_id: str, original_filename: str, expected_hash: Optional[str] = None) -> Optional[str]:
     """Return the anonymous blob name for this upload, reserving one on the
     metadata row if none exists yet. Reused verbatim on a resumed /upload/init so
@@ -844,7 +852,7 @@ def reserve_pending_anonymous_blob(user_id: str, original_filename: str, expecte
     )
     existing = str(entity.get(PENDING_ANONYMOUS_BLOB_FIELD) or '').strip()
     existing_hash = str(entity.get('upload_sha256_expected') or '').strip()
-    if existing and (not expected_hash or not existing_hash or existing_hash == expected_hash):
+    if existing and not _upload_cleanup_owns_blob(entity, existing) and (not expected_hash or not existing_hash or existing_hash == expected_hash):
         return existing
     reserved = _generate_anonymous_id()
     entity[PENDING_ANONYMOUS_BLOB_FIELD] = reserved
@@ -12709,7 +12717,7 @@ def reset_upload_tracking_and_reserve_blob(
     # mutations below overwrite upload_sha256_expected with the new value.
     existing = str(entity.get(PENDING_ANONYMOUS_BLOB_FIELD) or '').strip()
     existing_hash = str(entity.get('upload_sha256_expected') or '').strip()
-    reuse = bool(existing) and (not expected_hash or not existing_hash or existing_hash == expected_hash)
+    reuse = bool(existing) and not _upload_cleanup_owns_blob(entity, existing) and (not expected_hash or not existing_hash or existing_hash == expected_hash)
 
     entity['received_ranges'] = json.dumps([])
     entity['upload_total_size'] = total_size
@@ -12790,7 +12798,7 @@ def reset_upload_tracking_and_reserve_blobs_batch(
         # before the mutations below overwrite upload_sha256_expected.
         existing_blob = str(entity.get(PENDING_ANONYMOUS_BLOB_FIELD) or '').strip()
         existing_hash = str(entity.get('upload_sha256_expected') or '').strip()
-        reuse = bool(existing_blob) and (not expected_hash or not existing_hash or existing_hash == expected_hash)
+        reuse = bool(existing_blob) and not _upload_cleanup_owns_blob(entity, existing_blob) and (not expected_hash or not existing_hash or existing_hash == expected_hash)
 
         if f.get('is_fresh'):
             entity['received_ranges'] = json.dumps([])

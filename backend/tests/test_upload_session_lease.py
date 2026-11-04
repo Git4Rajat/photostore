@@ -141,24 +141,10 @@ def test_large_expiry_checkpoints_and_requeues_at_bounded_page_budget():
     assert len(driven)==1 and store._required(store.session_key('one'))['state']=='abandoned'
 
 
-def test_expiry_polls_while_main_clustering_thread_is_busy():
-    import threading
-    from types import SimpleNamespace
-    from upload_session_lease import start_worker, QUEUE_NAME
-    ready=threading.Event();shutdown=threading.Event();calls=[]
-    queue=object()
-    def poll(client,name,max_retries,deadletter):
-        assert client is queue and name==QUEUE_NAME and max_retries==float('inf')
-        calls.append(name);ready.set()
-        return False
-    service=SimpleNamespace(get_queue_client=lambda name:queue)
-    thread=start_worker(service,shutdown,.01,poll,SimpleNamespace(exception=lambda *args:None))
-    try:
-        # No call to the main clustering queue/poll loop is needed for expiry.
-        assert ready.wait(1)
-    finally:
-        shutdown.set();thread.join(1)
-    assert calls and not thread.is_alive()
+def test_retired_expiry_worker_never_polls_or_creates_a_thread():
+    from upload_session_lease import start_worker, send_check
+    assert start_worker(None, None, None, lambda *a: pytest.fail('No poller'), None) is None
+    assert send_check('library', 'session') is None
 
 
 @pytest.mark.parametrize('stop',['discard','browser_loss'])

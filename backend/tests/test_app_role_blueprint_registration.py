@@ -178,3 +178,10 @@ def test_archive_role_serves_only_library_and_public_routes():
         '/api/library/cleanup-info/',
     } <= non_static
     assert '/public/albums/<token>' in non_static
+
+
+def test_upload_reconciliation_is_core_only():
+    path='/api/upload-sessions/reconcile'
+    assert path in _rule_paths_for_role('core')
+    assert path not in _rule_paths_for_role('upload')
+    assert path not in _rule_paths_for_role('indexer')

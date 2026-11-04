@@ -249,7 +249,7 @@ def admit_reprocess(store,metadata):
     return row['waveId']
 
 
-def fence_discard(store,session,*,reason,resumed_from=''):
+def fence_discard(store,session,*,reason,resumed_from='',absent_only=False):
     """Persist cancellation even when a timed-out admission has not committed.
 
     Creating the session key competes atomically with open_session's create.
@@ -271,6 +271,8 @@ def fence_discard(store,session,*,reason,resumed_from=''):
                 state='abandoned',discardAbsent=True,discardRequestedAt=store.clock(),
                 declaredCount=0,registeredCount=0,resolvedCount=0,
                 manifestRevision=uuid.uuid4().hex,resumedFromSessionId=resumed_from)
+        elif absent_only:
+            return dict(old)
         elif old.get('discardAbsent'):
             previous=old.get('resumedFromSessionId','')
             if previous and resumed_from and previous!=resumed_from:
@@ -328,6 +330,8 @@ def abandon(store,session,manifest_revision,*,reason,on_cancelled=None):
         row=dict(old,abandoning=True,abandonReason=reason,
             abandonCursor=items[-1]['RowKey'] if items else cursor,abandonScanComplete=not more,
             resolvedCount=old['resolvedCount']+len(reserved),
+            abandonUnfinishedCount=old.get('abandonUnfinishedCount',0)+len(reserved)+sum(
+                item['outcome'] in ('failed','cancelled') for item in items),
             abandonCancelledCount=old.get('abandonCancelledCount',0)+len(reserved))
         if reserved:
             import uuid

@@ -536,6 +536,7 @@ MERGE_TABLE = os.getenv('MERGE_TABLE', 'personmerges')
 # scan and Python-filter the whole thing (213k+ rows, 17-33s/call). See
 # _upsert_job_status.
 JOBS_TABLE = os.getenv('JOBS_TABLE', 'photojobs')
+UPLOAD_SESSIONS_TABLE = os.getenv('UPLOAD_SESSIONS_TABLE', 'photouploadsessions')
 # CRUD requests below this size finish on the request thread. Larger requests
 # are persisted as blob-backed jobs so queue messages stay far below Azure
 # Queue Storage's message-size limit and workers can make bounded progress.
@@ -1131,6 +1132,7 @@ face_table_client = None
 person_table_client = None
 merge_table_client = None
 jobs_table_client = None
+upload_sessions_table_client = None
 album_token_index_table_client = None
 workbench_actions_table_client = None
 people_dirty_set_table_client = None  # Track which people were modified for incremental rebuild
@@ -1441,7 +1443,7 @@ def _init_storage_clients():
     global blob_service_client, albums_table_client, face_table_client, person_table_client, merge_table_client
     global face_by_filename_table_client, person_members_table_client, album_members_table_client
     global album_token_index_table_client
-    global jobs_table_client
+    global jobs_table_client, upload_sessions_table_client
     global workbench_actions_table_client
     global people_dirty_set_table_client, albums_dirty_set_table_client
     global image_names_table_client
@@ -1475,6 +1477,7 @@ def _init_storage_clients():
         album_members_table_client_local = tbl_svc.get_table_client(ALBUM_MEMBERS_TABLE)
         merge_table_client_local = tbl_svc.get_table_client(MERGE_TABLE)
         jobs_table_client_local = tbl_svc.get_table_client(JOBS_TABLE)
+        upload_sessions_table_client_local = tbl_svc.get_table_client(UPLOAD_SESSIONS_TABLE)
         workbench_actions_table_client_local = tbl_svc.get_table_client(WORKBENCH_ACTIONS_TABLE)
         image_names_table_client_local = tbl_svc.get_table_client(IMAGE_NAMES_TABLE)
         hash_index_table_client_local = tbl_svc.get_table_client(HASH_INDEX_TABLE)
@@ -1548,6 +1551,7 @@ def _init_storage_clients():
         album_members_table_client_local = tbl_svc.get_table_client(ALBUM_MEMBERS_TABLE)
         merge_table_client_local = tbl_svc.get_table_client(MERGE_TABLE)
         jobs_table_client_local = tbl_svc.get_table_client(JOBS_TABLE)
+        upload_sessions_table_client_local = tbl_svc.get_table_client(UPLOAD_SESSIONS_TABLE)
         workbench_actions_table_client_local = tbl_svc.get_table_client(WORKBENCH_ACTIONS_TABLE)
         image_names_table_client_local = tbl_svc.get_table_client(IMAGE_NAMES_TABLE)
         hash_index_table_client_local = tbl_svc.get_table_client(HASH_INDEX_TABLE)
@@ -1584,6 +1588,7 @@ def _init_storage_clients():
     album_store.configure(album_members_table_client)
     merge_table_client = merge_table_client_local
     jobs_table_client = jobs_table_client_local
+    upload_sessions_table_client = upload_sessions_table_client_local
     workbench_actions_table_client = workbench_actions_table_client_local
     people_dirty_set_table_client = people_dirty_set_table_client_local
     albums_dirty_set_table_client = albums_dirty_set_table_client_local
@@ -1646,6 +1651,8 @@ def _init_storage_clients():
         lambda q=clustering_deadletter_queue_client: q.create_queue(),
         lambda q=library_ops_deadletter_queue_client: q.create_queue(),
     ]
+    if os.getenv('APP_ROLE', 'core').strip().lower() in ('', 'core', 'upload'):
+        _ensure_fns.append(upload_sessions_table_client.create_table)
     if index_maintenance_queue_client is not None:
         _ensure_fns.append(index_maintenance_queue_client.create_queue)
     if AUTH_MODE == 'password':
@@ -2680,6 +2687,7 @@ def _require_library_context(require_auth: bool = False):
         if AUTH_MODE == 'password':
             uid = password_auth.OWNER_USER_ID
             _ensure_account_bootstrapped(uid, email=None)
+            g.upload_session_library = uid
             return uid, uid, None
         return None, None, (jsonify({'error': 'Authorization token is required.'}), 401)
 
@@ -2727,6 +2735,7 @@ def _require_library_context(require_auth: bool = False):
         if not is_member:
             return None, None, (jsonify({'error': 'You no longer have access to this library.'}), 403)
 
+    g.upload_session_library = library_id
     return user_id, library_id, None
 
 
@@ -14101,6 +14110,7 @@ UPLOAD_TRACKING_FIELDS = (
     # anonymousImageId at finalize, so any leftover reservation should be cleared
     # alongside the other tracking fields.
     'pendingAnonymousBlob',
+    'uploadCleanupBlobs',
 )
 
 THUMBNAIL_RETRY_COUNT_FIELD = 'thumbnail_retry_count'
@@ -14940,6 +14950,13 @@ def _cleanup_failed_upload(user_id: str, filename: str, upload_id: str = '') -> 
     except Exception:
         metadata = None
 
+    if metadata and metadata.get('uploadCleanupBlobs'):
+        # The Tools cleanup owns exact blob identities and retains them across
+        # partial failures. Legacy browser cancel must not erase that retry
+        # record while removing only the current pending reservation.
+        cleanup['errors'].append('Upload cleanup is pending. Use Upload cleanup in Tools to finish.')
+        return cleanup
+
     has_upload_tracking = bool(metadata) and any(field in metadata for field in UPLOAD_TRACKING_FIELDS)
     # thumbnail_status deliberately excluded: kickOffThumbnailForFile fires an
     # early, thumbnail-only processing claim concurrently with the raw upload
@@ -15592,8 +15609,7 @@ def _maybe_enqueue_coalesced_rerun(job_id: Optional[str], user_id: str) -> None:
 def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, job_type: str,
                                      *, incremental_assign=None, prepared=None) -> None:
     if payload.get('type') == 'upload_session_expiry':
-        from upload_session_lease import consume
-        return consume(payload)
+        return  # Retired expiry messages: Core now reconciles on user traffic.
     if payload.get('type') == 'upload_wave_stage':
         from wave_runtime import consume
         return consume(payload)
@@ -16896,12 +16912,6 @@ def run_clustering_worker() -> None:
     signal.signal(signal.SIGTERM, _handle_shutdown_signal)
     signal.signal(signal.SIGINT, _handle_shutdown_signal)
 
-    # Intake expiry must run even while a long clustering job is in progress.
-    # Its own delayed queue also wakes this app from zero replicas.
-    from upload_session_lease import start_worker
-    expiry_thread=start_worker(queue_service_client_local,shutdown_requested,poll_seconds,
-        _poll_clustering_queue_once,worker_logger)
-
     try:
         while not shutdown_requested.is_set():
             try:
@@ -16944,7 +16954,6 @@ def run_clustering_worker() -> None:
 
     finally:
         shutdown_requested.set()
-        if expiry_thread is not None:expiry_thread.join(timeout=5)
 
     # Synchronous polling finishes the bounded in-flight group before reaching
     # here. Do not initialize an adapter or rebuild an absent/unsafe runtime.
@@ -18447,6 +18456,7 @@ from routes.system import system_bp
 from routes.explore import explore_bp
 from routes.suggestions import suggestions_bp
 from routes.index_events import index_events_bp
+from routes.upload_sessions import upload_sessions_bp
 
 # 2026-09-15: service splits, following the modularity work above. Each
 # split group is registered on its own dedicated container app instead of
@@ -18490,7 +18500,7 @@ else:
     # same-origin /health on core specifically wasn't worth it for zero
     # real memory/CPU savings. people_bp joined this role 2026-10-08; library
     # management joined 2026-11-02, leaving operations/public on archive.
-    for _bp in (auth_bp, photos_bp, albums_bp, system_bp, explore_bp, suggestions_bp, people_bp, library_bp, index_events_bp):
+    for _bp in (auth_bp, photos_bp, albums_bp, system_bp, explore_bp, suggestions_bp, people_bp, library_bp, index_events_bp, upload_sessions_bp):
         app.register_blueprint(_bp)
 
 # Every role answers /health (system_bp only exists on the core role; upload has its own), so the

@@ -97,19 +97,19 @@ def register_routes(blueprint):
     @blueprint.route('/upload/waves/shadow/sessions', methods=['POST'])
     @endpoint
     def wave_shadow_open(store, data):
-        from upload_session_lease import LEASE_SECONDS, send_check, seal_expired
+        from upload_session_lease import LEASE_SECONDS, seal_expired
+        from upload_session_registry import Sessions, configured
         live='/waves/live/' in app.request.path
         existing=store._get(store.session_key(data['sessionId']))
+        if live and (existing is None or existing['state']=='open'):
+            Sessions(configured(), store.library, clock=store.clock).track(data['sessionId'])
         if live:
             if data.get('resumedFromSessionId'):
-                seal_expired(store,data['resumedFromSessionId'])
+                seal_expired(store, data['resumedFromSessionId'])
             if existing:
-                seal_expired(store,data['sessionId'])
-            else:
-                # Queue before commit: failures cannot strand a leased intake.
-                send_check(store.library,data['sessionId'])
+                seal_expired(store, data['sessionId'])
         result=store.open_session(data['sessionId'], data['declaredCount'],
-            resumed_from=data.get('resumedFromSessionId', ''), lease_seconds=LEASE_SECONDS if live else 0)
+            resumed_from=data.get('resumedFromSessionId', ''), lease_seconds=LEASE_SECONDS if live else 0, lifecycle_managed=live)
         from upload_session_lease import active
         return dict(result,leaseActive=active(result,store.clock()),serverNow=store.clock())
 
@@ -183,6 +183,8 @@ def register_routes(blueprint):
         result=store.close(session, data['manifestRevision'], data['closeId'])
         if '/waves/live/' in app.request.path:
             _drive(store,result['waveId'])
+            from upload_session_registry import finish
+            finish(store, result)
         return result
 
     @blueprint.route('/upload/waves/live/sessions/<session>/discard', methods=['POST'])
@@ -211,6 +213,8 @@ def register_routes(blueprint):
         result=abandon(store,session,data.get('manifestRevision',parent['manifestRevision']),reason=reason,
                        on_cancelled=release_tracking)
         _drive(store,result['waveId'])
+        from upload_session_registry import finish
+        finish(store, result)
         return result
 
     @blueprint.route('/upload/waves/live/<wave>/repair',methods=['POST'])
@@ -331,7 +335,7 @@ def _maybe_recover_stuck_stages(store):
 
 def _drive(store,wave_id):
     from upload_wave_execution import advance_wave,stage_work_store,release_and_relay,execution_enabled
-    if not execution_enabled():return
+    if not execution_enabled():return False
     from wave_runtime import send_stage
     work=stage_work_store(store.table)
     wave,_=advance_wave(work,store,store.library,wave_id)
@@ -340,20 +344,29 @@ def _drive(store,wave_id):
         'cluster' if state=='ready' else 'index' if state=='indexing' else None)
     key=(wave.get('visionPendingKey') if destination=='vision' else
          'shadow-cluster!'+wave_id if destination=='cluster' else wave.get('indexPendingKey'))
-    if destination and key:release_and_relay(work,store,store.library,key,destination,send_stage)
+    if destination and key:
+        # A lifecycle directory entry is a retained recovery receipt. An old
+        # notify reservation alone cannot prove its queue send actually landed.
+        release_and_relay(work,store,store.library,key,destination,send_stage,require_delivery=True)
     if state in ('complete', 'cancelled'):
         from wave_runtime import relay_successor, resume_completed_wave_maintenance
-        relay_successor(work,store,wave_id,send_stage)
+        relay_successor(work,store,wave_id,send_stage,require_delivery=True)
         resume_completed_wave_maintenance(store.library)
     # Piggyback recovery of any OTHER stage this library left stuck (e.g. a
     # prior wave whose wake got lost to a worker scale-down race) on this
     # genuine event; independent recovery covers browser and worker loss.
     _maybe_recover_stuck_stages(store)
+    return True
 
 
 def close_resolved_intake(store,session):
     if (session['state']=='open' and session['registeredCount']==session['declaredCount']
             and session['resolvedCount']==session['declaredCount']):
         session=store.close(session['sessionId'],session['manifestRevision'],'auto-complete')
+    if session['state'] != 'open':
+        # A finalize replay can observe the committed close after a failed
+        # handoff. Replay the handoff before removing its recovery directory.
         _drive(store,session['waveId'])
+        from upload_session_registry import finish
+        finish(store, session)
     return session

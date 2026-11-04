@@ -14,6 +14,8 @@ export const NotificationBell: React.FC = () => {
         unreadCount,
         clearNotifications,
         markAllNotificationsRead,
+        retryPersistedUploadSession,
+        uploadActive,
     } = useAppServices();
     const [showNotifications, setShowNotifications] = useState<boolean>(false);
     const wrapRef = useRef<HTMLDivElement | null>(null);
@@ -93,6 +95,12 @@ export const NotificationBell: React.FC = () => {
                                 >
                                     <p className="notification-title">{notification.title}</p>
                                     <p className="notification-details">{notification.details}</p>
+                                    {notification.uploadSessionId && (
+                                        <button type="button" className="btn btn-soft" disabled={uploadActive}
+                                            onClick={() => void retryPersistedUploadSession(notification.uploadSessionId)}>
+                                            Retry unfinished files
+                                        </button>
+                                    )}
                                     {notification.progress && (
                                         <>
                                             <div className="progress-track notification-progress-track">

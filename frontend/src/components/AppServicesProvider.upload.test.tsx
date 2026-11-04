@@ -1,9 +1,11 @@
 import React from 'react';
+import { NotificationBell } from './AppServiceIndicators';
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
     get: vi.fn(),
+    post: vi.fn(),
     getUpload: vi.fn(),
     postUpload: vi.fn(),
     postTools: vi.fn(),
@@ -32,7 +34,7 @@ vi.mock('../services/uploadPreparationPipeline', () => ({UploadPreparationPipeli
 }}));
 vi.mock('../services/apiClient', () => ({
     get: mocks.get,
-    post: vi.fn().mockResolvedValue({}),
+    post: mocks.post,
     getTools: vi.fn().mockResolvedValue({ready: true, building: false}),
     postTools: mocks.postTools,
     getUpload: mocks.getUpload,
@@ -133,6 +135,7 @@ beforeEach(() => {
     mocks.pollAuthenticated = false;
     mocks.processingMode = 'backend';
     mocks.get.mockResolvedValue({});
+    mocks.post.mockResolvedValue({});
     mocks.runBrowserProcessing.mockResolvedValue({ clientProcessing: {}, clientProcessingReport: [] });
     mocks.jobs.mockResolvedValue([]);
     mocks.postTools.mockResolvedValue({});
@@ -1690,4 +1693,49 @@ describe('discard acknowledgment after refresh', () => {
         expect(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)).toBeNull();
     });
 
+});
+
+
+describe('Core stale-upload notifications', () => {
+    it('shows the durable notice outside Tools, deduplicates and acknowledges it when read', async () => {
+        mocks.post.mockImplementation(async (url: string) => url === '/api/upload-sessions/reconcile'
+            ? { notifications: [{ sessionId: 'closed-parent', waveId: 'old-wave', affectedCount: 7, closedAt: Date.now()/1000 }] }
+            : {});
+        render(<AppServicesProvider><Probe toolsPage={false} /><NotificationBell /></AppServicesProvider>);
+        await advance(0);
+        expect(services.notifications.filter(n => n.uploadSessionId === 'closed-parent')).toHaveLength(1);
+        expect(services.notifications.find(n => n.uploadSessionId === 'closed-parent')?.details).toContain('7 files did not finish');
+        expect(mocks.jobs).not.toHaveBeenCalled();
+        await advance(61000);
+        await act(async () => { window.dispatchEvent(new Event('focus')); });
+        expect(services.notifications.filter(n => n.uploadSessionId === 'closed-parent')).toHaveLength(1);
+        await act(async () => { fireEvent.click(screen.getByLabelText('Open notifications')); });
+        await act(async () => { fireEvent.click(screen.getByText('Retry unfinished files')); });
+        expect(services.notifications.some(n => n.title === 'Reselect unfinished files')).toBe(true);
+        expect(mocks.post).toHaveBeenCalledWith('/api/upload-sessions/notifications/closed-parent/ack', {}, expect.any(Object));
+    });
+
+    it('does not poll Core indefinitely for healthy sessions', async () => {
+        render(<AppServicesProvider><Probe toolsPage={false} /></AppServicesProvider>);
+        await advance(0);
+        await advance(180000);
+        expect(mocks.post.mock.calls.filter(([url]) => url === '/api/upload-sessions/reconcile')).toHaveLength(1);
+    });
+
+    it('offers re-selection when a notice has no matching local retry checkpoint', async () => {
+        render(<AppServicesProvider><Probe toolsPage={false} /></AppServicesProvider>);
+        await act(async () => { await services.retryPersistedUploadSession('another-device-session'); });
+        expect(services.notifications.some(n => n.title === 'Reselect unfinished files')).toBe(true);
+        expect(mocks.postUpload).not.toHaveBeenCalledWith('/upload/init-batch', expect.anything(), expect.anything());
+    });
+});
+
+
+it('ends Core recovery follow-ups when pending cleanup drains', async () => {
+    let checks = 0;
+    mocks.post.mockImplementation(async (url: string) => url === '/api/upload-sessions/reconcile'
+        ? { pending: ++checks === 1, notifications: [] } : {});
+    render(<AppServicesProvider><Probe toolsPage={false} /></AppServicesProvider>);
+    await advance(90000);
+    expect(checks).toBe(2);
 });

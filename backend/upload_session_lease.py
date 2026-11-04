@@ -1,34 +1,25 @@
-"""Renewable intake leases and durable, delayed expiry checks.
+"""Authoritative upload activity and ETag fencing; no expiry queue or poller.
 
-A check is queued BEFORE a leased session can be committed. Renewals only
-update that session; a check reschedules itself from the authoritative expiry.
-Duplicate checks and deliveries are safe under the existing ETag fences.
+Core discovers sessions through the lifecycle table when the user returns.
+The expiry helper remains usable by bounded operator recovery.
 """
-import json
-import math
-from azure.core.exceptions import AzureError, ResourceNotFoundError
-from upload_waves import Conflict, ShadowWaves
+from azure.core.exceptions import AzureError
+from upload_waves import Conflict
 
 LEASE_SECONDS = 300
-QUEUE_NAME = 'photostore-upload-expiry'
 TYPE = 'upload_session_expiry'
 
 
 class ExpiryUnavailable(AzureError):
-    """The durable expiry wake cannot be stored; admission must not proceed."""
+    """Compatibility error for older clients during rolling upgrades."""
 
 
-def send_check(library, session, delay=LEASE_SECONDS):
-    import app
-    if app.queue_service_client is None:
-        raise ExpiryUnavailable('Upload expiry queue unavailable')
-    queue = app.queue_service_client.get_queue_client(QUEUE_NAME)
-    # Provisioned in IaC; never acknowledge admission without a durable wake.
-    try:
-        queue.send_message(json.dumps(dict(type=TYPE, userId=library, sessionId=session)),
-                           visibility_timeout=max(0, math.ceil(delay)), time_to_live=-1)
-    except ResourceNotFoundError as error:
-        raise ExpiryUnavailable('Upload expiry queue is not provisioned') from error
+def send_check(*args, **kwargs):
+    """Compatibility no-op: no producer may wake clustering for upload expiry."""
+
+
+def start_worker(*args, **kwargs):
+    """Compatibility no-op for deployments/tests upgrading the old worker."""
 
 
 def active(parent, now):
@@ -41,10 +32,7 @@ def renew(store, session):
         old = store._required(store.session_key(session))
         if not active(old, store.clock()):
             return dict(old, leaseActive=False)
-        # Upgrade old browser sessions safely: queue first, then enable expiry.
-        if not old.get('leaseExpiresAt'):
-            send_check(store.library, session)
-        row = dict(old, heartbeatAt=store.clock(), leaseExpiresAt=store.clock()+LEASE_SECONDS)
+        row = dict(old, heartbeatAt=store.clock(), lastRequestAt=store.clock(), leaseExpiresAt=store.clock()+LEASE_SECONDS)
         store.table.submit_transaction([store._change(old, row), *store._policy_guard()])
         return dict(row, leaseActive=True)
     return store._retry(commit)
@@ -58,13 +46,14 @@ def seal_expired(store, session):
     """
     def commit():
         old = store._get(store.session_key(session))
-        if not old or old['state'] != 'open' or not old.get('leaseExpiresAt'):
+        if not old or old['state'] != 'open':
             return old
-        if old['leaseExpiresAt'] > store.clock() or old.get('abandoning'):
+        deadline = old.get('leaseExpiresAt') or max(old.get('lastRequestAt', 0), old.get('heartbeatAt', 0), old.get('createdAt', 0)) + LEASE_SECONDS
+        if deadline > store.clock() or old.get('abandoning'):
             return old
         control = store._required('control')
         row = dict(old, abandoning=True, abandonReason='Upload heartbeat lease expired',
-                   leaseExpiredAt=store.clock())
+                   leaseExpiredAt=store.clock(), discardRequestedAt=store.clock())
         store._commit(control, [store._change(old, row)], control_updates=(
             {'collectingWaveId': ''} if control.get('collectingWaveId') == old['waveId'] else None))
         return row
@@ -106,33 +95,3 @@ def expire(store, session, send, drive, emit=lambda **fields: None):
             return
         parent = result
     send(store.library, session, 0)
-
-
-def consume(payload):
-    import app
-    import processing_diagnostics
-    from wave_policy import owned
-    from routes.upload_wave_shadow import _drive
-    library, session = payload['userId'], payload['sessionId']
-    if not owned(app.jobs_table_client, library):
-        return
-    expire(ShadowWaves(app.jobs_table_client, library), session, send_check, _drive,
-           emit=lambda **fields: processing_diagnostics.emit(fields.pop('event'), **fields))
-
-
-def start_worker(queue_service, shutdown, poll_seconds, poll, logger):
-    """Poll independently of clustering's potentially long synchronous jobs."""
-    import threading
-    queue=queue_service.get_queue_client(QUEUE_NAME)
-    def run():
-        while not shutdown.is_set():
-            try:
-                # Expiry checks must survive transient outages indefinitely.
-                # The durable session state makes duplicate deliveries safe.
-                if poll(queue,QUEUE_NAME,float('inf'),None):continue
-            except Exception:
-                logger.exception('Upload session expiry poll failed')
-            shutdown.wait(poll_seconds)
-    thread=threading.Thread(target=run,name='upload-expiry',daemon=True)
-    thread.start()
-    return thread

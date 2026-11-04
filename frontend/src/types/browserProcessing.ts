@@ -29,6 +29,7 @@ export interface AppNotification {
     timestamp: number;
     unread: boolean;
     progress?: UploadProgress;
+    uploadSessionId?: string;
 }
 
 export interface FilterOptions {

@@ -154,7 +154,7 @@ def enroll_new(table,library,metadata=None):
 def validate_admission(store,data,*,finalizing=False):
     session,item=data.get('waveSessionId',''),data.get('waveItemId','')
     old=store._required(store.item_key(session,item))
-    from upload_session_lease import active
+    from upload_session_lease import active, LEASE_SECONDS
     if old['filename']!=data.get('filename'):raise Conflict('Upload differs from its reservation')
     sha=data.get('sha256','')
     if not isinstance(sha,str) or len(sha)!=64 or any(c not in '0123456789abcdef' for c in sha):
@@ -173,7 +173,8 @@ def validate_admission(store,data,*,finalizing=False):
             # just to extend an otherwise healthy reservation by a few seconds.
             if row.get('finalizeLeaseUntil',0)-store.clock()>=120:return
         control=store._required('control')
-        store._commit(control,[store._change(current_parent,dict(current_parent)),store._change(row,dict(row,sourceHash=sha,
+        store._commit(control,[store._change(current_parent,dict(current_parent,lastRequestAt=store.clock(),
+            **({'leaseExpiresAt':store.clock()+LEASE_SECONDS} if current_parent.get('leaseExpiresAt') else {}))),store._change(row,dict(row,sourceHash=sha,
             finalizeLeaseUntil=store.clock()+600 if finalizing else 0))])
     store._retry(bind)
     return session,item

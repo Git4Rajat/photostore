@@ -213,7 +213,7 @@ class ShadowWaves:
             return row
         return self._retry(run)
 
-    def open_session(self, session, declared_count, *, resumed_from='', lease_seconds=0):
+    def open_session(self, session, declared_count, *, resumed_from='', lease_seconds=0, lifecycle_managed=False):
         key = self.session_key(session)
         if resumed_from:
             identifier(resumed_from)
@@ -252,7 +252,7 @@ class ShadowWaves:
             wave.update(noWorkProbe='',noWorkImpossible=False)
             row = self._row(key, sessionId=session, waveId=wave_id, declaredCount=declared_count,
                 registeredCount=0, resolvedCount=0, state='open', resumedFromSessionId=resumed_from, manifestRevision=uuid.uuid4().hex,
-                createdAt=self.clock(), **(dict(heartbeatAt=self.clock(),
+                createdAt=self.clock(), lastRequestAt=self.clock(), lifecycleManaged=lifecycle_managed, **(dict(heartbeatAt=self.clock(),
                     leaseExpiresAt=self.clock()+lease_seconds) if lease_seconds else {}))
             # Session evidence is separately paged with the member manifest.
             evidence = self._row(f'e!{wave_id}!s!{session}', kind='session', sessionId=session,
@@ -301,7 +301,10 @@ class ShadowWaves:
             if old['registeredCount'] + len(changes) > old['declaredCount']:
                 raise Conflict('Registration exceeds declared parent selection')
             row = dict(old, registeredCount=old['registeredCount'] + len(changes),
-                       manifestRevision=uuid.uuid4().hex)
+                       lastRequestAt=self.clock(), manifestRevision=uuid.uuid4().hex)
+            if old.get('leaseExpiresAt'):
+                from upload_session_lease import LEASE_SECONDS
+                row['leaseExpiresAt'] = self.clock() + LEASE_SECONDS
             wave = self._required(self.wave_key(old['waveId']))
             control = self._required('control')
             self._commit(control, [self._change(old, row), *changes,
@@ -420,7 +423,12 @@ class ShadowWaves:
                     changes.append(('create', source))
                     existing[source_key] = source
             row = dict(old_session, resolvedCount=old_session['resolvedCount'] + len(pending),
-                       manifestRevision=uuid.uuid4().hex)
+                       failedCount=old_session.get('failedCount', 0) + sum(binding['outcome']=='failed' for _,binding in pending),
+                       cancelledCount=old_session.get('cancelledCount', 0) + sum(binding['outcome']=='cancelled' for _,binding in pending),
+                       lastRequestAt=self.clock(), manifestRevision=uuid.uuid4().hex)
+            if old_session.get('leaseExpiresAt') and not old_session.get('abandoning'):
+                from upload_session_lease import LEASE_SECONDS
+                row['leaseExpiresAt'] = self.clock() + LEASE_SECONDS
             self._commit(control, [*changes, self._change(old_session, row),
                 self._change(wave, next_wave)])
             return row

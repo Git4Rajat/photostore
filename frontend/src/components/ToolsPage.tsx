@@ -41,6 +41,7 @@ import { EmptyState } from './shared/EmptyState';
 import { Loading } from './shared/Loading';
 import { classifyApiError, type ApiError } from '../services/apiError';
 import { useBackendRecoveryRetry } from '../services/useBackendRecoveryRetry';
+import { UploadCleanupButton } from './UploadCleanupButton';
 
 interface Photo {
     filename: string;
@@ -300,7 +301,7 @@ const getToolsPageKey = (pathname: string): ToolsPageKey => {
 const PAGE_SIZE = 50;
 
 const ToolsPage: React.FC = () => {
-    const { browserAiModelState, loadBrowserAiModel, startBrowserProcessing, registerToolsPageJobPolling } = useAppServices();
+    const { browserAiModelState, loadBrowserAiModel, startBrowserProcessing, registerToolsPageJobPolling, uploadActive } = useAppServices();
     useEffect(() => registerToolsPageJobPolling(), [registerToolsPageJobPolling]);
     const mountedRef = useRef(false);
     const snapshotPollTimersRef = useRef<Set<number>>(new Set());
@@ -1741,6 +1742,8 @@ const ToolsPage: React.FC = () => {
 
             {renderIndexStatusPanel()}
 
+            <UploadCleanupButton uploadActive={uploadActive} disabled={!!running} />
+
             <div className="tools-panel tools-actions-panel">
                 <div className="tools-panel-header">
                     <div>
@@ -2052,6 +2055,8 @@ const ToolsPage: React.FC = () => {
     );
 
     const renderRecoveryPage = () => (
+        <>
+        <UploadCleanupButton uploadActive={uploadActive} disabled={!!running} />
         <div className="tools-panel">
             <div className="tools-panel-header">
                 <div>
@@ -2181,6 +2186,7 @@ const ToolsPage: React.FC = () => {
                 </Link>
             </div>
         </div>
+        </>
     );
 
     const renderHistoryPage = () => (

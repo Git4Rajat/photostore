@@ -27,6 +27,8 @@ def live_api(monkeypatch):
     import wave_runtime
     monkeypatch.setattr(wave_runtime,'send_stage',lambda *args:None)
     monkeypatch.setattr(app,'jobs_table_client',table)
+    from upload_session_fakes import RegistryTable
+    monkeypatch.setattr(app,'upload_sessions_table_client',RegistryTable())
     # Terminal upload events also deliver pending maintenance handoffs. Keep
     # the real handoff path enabled with its queue dependency configured.
     monkeypatch.setattr(app,'index_maintenance_queue_client',
@@ -308,12 +310,12 @@ def test_registration_contention_is_a_distinct_retryable_conflict(live_api,monke
     assert response.headers['Retry-After']=='1'
 
 
-def test_open_never_admits_a_lease_without_a_durable_expiry_wake(live_api,monkeypatch):
+def test_open_never_admits_without_a_durable_session_directory(live_api,monkeypatch):
     from azure.core.exceptions import AzureError
     import upload_session_lease
     client,store,_,_=live_api
     def unavailable(*args):raise AzureError('queue unavailable')
-    monkeypatch.setattr(upload_session_lease,'send_check',unavailable)
+    monkeypatch.setattr(app.upload_sessions_table_client,'submit_transaction',unavailable)
     result=client.post('/upload/waves/live/sessions',json=dict(sessionId='no-wake',declaredCount=10))
     assert result.status_code==503
     assert store._get(store.session_key('no-wake')) is None
@@ -364,19 +366,12 @@ def test_discard_uses_current_revision_without_reopening_intake(live_api,monkeyp
     assert client.post('/upload/waves/live/sessions/discard/abandon',json=dict(reason='Retry discard')).status_code==200
 
 
-def test_missing_expiry_queue_is_service_failure_not_missing_photo(live_api,monkeypatch):
-    from azure.core.exceptions import ResourceNotFoundError
-    import upload_session_lease
+def test_open_does_not_require_an_expiry_queue(live_api,monkeypatch):
     client,store,_,_=live_api
-    error=ResourceNotFoundError('The specified queue does not exist.')
-    error.error_code='QueueNotFound'
-    def send(*args,**kwargs):raise error
-    monkeypatch.setattr(app,'queue_service_client',SimpleNamespace(get_queue_client=lambda name:SimpleNamespace(send_message=send)))
-    monkeypatch.setattr(upload_session_lease,'send_check',_SEND_EXPIRY_CHECK)
-    result=client.post('/upload/waves/live/sessions',json=dict(sessionId='missing-queue',declaredCount=1))
-    assert result.status_code==503 and result.json['code']=='upload_expiry_unavailable'
-    assert 'photo' not in result.json['error'].lower()
-    assert store._get(store.session_key('missing-queue')) is None
+    monkeypatch.setattr(app,'queue_service_client',None)
+    result=client.post('/upload/waves/live/sessions',json=dict(sessionId='without-queue',declaredCount=1))
+    assert result.status_code==200
+    assert store._get(store.session_key('without-queue'))['state']=='open'
 
 
 def test_missing_source_still_reports_missing_photo_only_during_resolution(live_api):
@@ -388,18 +383,15 @@ def test_missing_source_still_reports_missing_photo_only_during_resolution(live_
     assert result.status_code==409 and result.json['error']=='Finalized photo not found'
 
 
-def test_unleased_heartbeat_upgrade_reports_missing_queue_as_service_failure(live_api,monkeypatch):
-    from upload_session_lease import ExpiryUnavailable
+def test_unleased_heartbeat_upgrades_without_queue(live_api,monkeypatch):
     client,store,_,_=live_api
     store.open_session('old-unleased',1)
     monkeypatch.setattr(app,'_require_user_id',lambda **kw:('owner',None))
     monkeypatch.setattr(app,'_mark_upload_activity_heartbeat',lambda user:None)
-    def unavailable(*args):raise ExpiryUnavailable('Upload expiry queue is not provisioned')
-    monkeypatch.setattr(upload_session_lease,'send_check',unavailable)
+    monkeypatch.setattr(app,'queue_service_client',None)
     result=client.post('/upload/transfer-heartbeat',json=dict(waveSessionId='old-unleased'))
-    assert result.status_code==503 and result.json['code']=='upload_expiry_unavailable'
-    assert not store._required(store.session_key('old-unleased')).get('leaseExpiresAt')
-
+    assert result.status_code==200 and result.json['leaseActive']
+    assert store._required(store.session_key('old-unleased'))['leaseExpiresAt']>store.clock()
 
 
 def test_discard_tombstone_prevents_late_open_and_ignores_its_expiry_wake(live_api):
@@ -499,7 +491,7 @@ def test_gc_acquiring_after_preflight_still_gets_retryable_admission_error(live_
     def gc_starts(*args):
         policy=store._required('policy')
         store.table.submit_transaction([store._change(policy,dict(policy,gcOwner='gc',gcUntil=store.clock()+600))])
-    monkeypatch.setattr(upload_session_lease,'send_check',gc_starts)
+    monkeypatch.setattr(app.upload_sessions_table_client,'before_commit',gc_starts)
     result=client.post('/upload/waves/live/sessions',json=dict(sessionId='racing-gc',declaredCount=1))
     assert result.status_code==409 and result.json['code']=='wave_artifact_cleanup_busy'
     assert store._get(store.session_key('racing-gc')) is None
