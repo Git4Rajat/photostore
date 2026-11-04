@@ -474,7 +474,7 @@ def test_abandoned_worker_replacements_are_bounded(monkeypatch):
         for _ in range(2):
             assert ipwork_ocr.process_ocr('owner', 'photo.jpg', _make_jpeg_bytes())['errorCode'] == 'ocr_timeout'
         result = ipwork_ocr.process_ocr('owner', 'photo.jpg', _make_jpeg_bytes())
-        assert result['errorCode'] == 'ocr_engine_failed' and 'capacity exhausted' in result['error']
+        assert result['errorCode'] == 'ocr_capacity_exhausted' and 'capacity exhausted' in result['error']
         assert len(pool.workers) == 2
     finally:
         release.set()

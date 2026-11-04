@@ -1,0 +1,12 @@
+// Event alert query: run every minute over a five-minute window. The rule must
+// be provisioned separately. No recurring application worker/repair is needed.
+// These are terminal failures, not proof that a later explicit retry failed.
+ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(5m)
+| extend d = parse_json(extract(@'processing telemetry (\{.*\})', 1, Log_s))
+| where tostring(d.event) == 'wave_stage_failed'
+| where tostring(d.errorClass) == 'DispatchAttemptsExhausted'
+| summarize arg_max(TimeGenerated, *) by library_id=tostring(d.library_id), wave_id=tostring(d.wave_id), stage=tostring(d.stage)
+| project TimeGenerated, library_id, wave_id, stage,
+    attempt_id=tostring(d.attempt_id), dispatch_attempt=toint(d.dispatch_attempt),
+    reason=tostring(d.errorClass)

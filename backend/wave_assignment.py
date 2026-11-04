@@ -52,6 +52,7 @@ class Workspace:
                                 d INTEGER, filename TEXT);
             CREATE TABLE candidates(face TEXT PRIMARY KEY, payload TEXT);
             CREATE TABLE people(person TEXT PRIMARY KEY, payload TEXT);
+            CREATE INDEX input_order ON inputs(a,v,d,filename,face);
         ''')
 
     def close(self):
@@ -66,8 +67,8 @@ class Workspace:
         except sqlite3.IntegrityError as exc:
             raise ValueError('Duplicate face in frozen wave') from exc
 
-    def inputs(self):
-        for (payload,) in self.db.execute('SELECT payload FROM inputs ORDER BY a,v,d,filename,face'):
+    def inputs(self, after=0):
+        for (payload,) in self.db.execute('SELECT payload FROM inputs ORDER BY a,v,d,filename,face LIMIT -1 OFFSET ?', (after,)):
             yield json.loads(payload)
 
     def put(self, table, key, row):
@@ -455,20 +456,26 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
                 from wave_assignment_files import assignment_journal
                 journal = resources.enter_context(assignment_journal(store, wave['waveId'], check,
                     share=assigner.config.checkpoint_dir if local_journal else None, local=directory))
-                header = journal.prepare(workspace, inputs, assigner, binding,
-                    getattr(library_guard, 'checkpoint_revision', None))
-                guard.check()
-                runtime = LiveFaceIndex(directory + '/runtime', config=config.index_config,
-                    candidates=config.candidates, nprobe=config.nprobe,
-                    delta_limit=config.delta_limit, threads=config.threads)
+                from wave_assignment_resume import restore, save
+                with processing_diagnostics.wave_phase_scope('resume_restore'):
+                    resumed = restore(journal, workspace, binding, directory, config)
+                if resumed is not None:
+                    header, runtime, position, chain = resumed
+                else:
+                    header = journal.prepare(workspace, inputs, assigner, binding,
+                        getattr(library_guard, 'checkpoint_revision', None))
+                    guard.check()
+                    runtime = LiveFaceIndex(directory + '/runtime', config=config.index_config,
+                        candidates=config.candidates, nprobe=config.nprobe,
+                        delta_limit=config.delta_limit, threads=config.threads)
+                    with processing_diagnostics.wave_phase_scope('runtime_build'):
+                        runtime.build(_runtime_rows(workspace, guard))
+                    position, chain = 0, digest(['wave-decisions-v1', digest(header)])
                 processing_diagnostics.wave_faces(total=header['faceCount'])
-                with processing_diagnostics.wave_phase_scope('runtime_build'):
-                    runtime.build(_runtime_rows(workspace, guard))
                 guard.check()
-                chain = digest(['wave-decisions-v1', digest(header)])
                 begun = False
                 materialized = False
-                for position, face in enumerate(workspace.inputs()):
+                for position, face in enumerate(workspace.inputs(after=position), start=position):
                     guard.check()
                     if position % page_size == 0:
                         guard.boundary()
@@ -502,6 +509,8 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
                         # slice before any new work is durable. Final pages
                         # finish normally rather than scheduling another pass.
                         if materialized and position + 1 < header['faceCount'] and should_yield():
+                            with processing_diagnostics.wave_phase_scope('resume_save'):
+                                save(journal, workspace, runtime, header, position + 1, chain, directory)
                             raise AssignmentYield('Cluster assignment checkpointed for continuation')
                         materialized = False
                 guard.check()

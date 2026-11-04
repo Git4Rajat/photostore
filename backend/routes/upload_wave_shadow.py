@@ -262,7 +262,16 @@ def register_routes(blueprint):
     @blueprint.route('/upload/waves/shadow/<wave>', methods=['GET'])
     @endpoint
     def wave_shadow_status(store, data, wave):
-        return store.status(wave)
+        from wave_health import status
+        return status(store, wave)
+
+    @blueprint.route('/upload/waves/live/<wave>/failures', methods=['GET'])
+    @endpoint
+    def wave_failure_review(store, data, wave):
+        if app.metadata_table_client is None:
+            raise AzureError('Metadata storage unavailable')
+        from wave_failure_review import page
+        return page(store, app.metadata_table_client, wave, after=app.request.args.get('after', ''))
 
 
 # Durable, cross-replica-safe throttle for the opportunistic recovery sweep

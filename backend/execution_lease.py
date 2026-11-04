@@ -147,7 +147,7 @@ class ExecutionLeases:
                        inputRevision=input_revision, executionId=execution_id, status='running',
                        owner=owner, epoch=epoch, leaseUntil=now + self.lease_seconds,
                        progressCheckpoint=(current.get('progressCheckpoint') or '') if same_revision else '',
-                       lastProgressAt=now, claimedAt=now,
+                       lastProgressAt=current.get('lastProgressAt',now) if same_revision else now, claimedAt=now,
                        completionReceipt=(current.get('completionReceipt') or '') if same_revision else '',
                        failureReason='')
             try:
@@ -258,6 +258,8 @@ class ExecutionLeases:
             current = self._authoritative(ownership)
             if float(current.get('leaseUntil') or 0) <= self.clock():
                 raise OwnershipLost('Execution lease already expired')
+            if current.get('progressCheckpoint') == progress:
+                return  # Repeating a cursor is not new durable progress.
             try:
                 self._replace(current, dict(current, progressCheckpoint=progress, lastProgressAt=self.clock()))
                 return

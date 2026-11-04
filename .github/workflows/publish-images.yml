@@ -181,7 +181,16 @@ jobs:
             -v "$PWD/backend/tests:/app/tests:ro" \
             -v "$PWD/backend/scripts:/app/scripts:ro" \
             -v "$PWD/deploy:/deploy:ro" \
-            "$BACKEND_IMAGE" -c 'python -m pytest tests/test_wave*.py tests/test_upload_wave*.py tests/test_fresh_wave*.py tests/test_processing_artifacts.py -q'
+            "$BACKEND_IMAGE" -c 'python -m pytest tests/test_wave*.py tests/test_upload_wave*.py tests/test_fresh_wave*.py tests/test_execution_lease.py tests/test_processing_artifacts.py tests/test_processing_failure_capsules.py tests/test_clustering_checkpoint.py tests/test_queue_scale_patch.py tests/test_apply_client_processing_recovery.py -q'
+      - name: Qualify Vision queue ownership and OCR in the exact Vision image
+        run: |
+          VISION_IMAGE=$(python3 -c "import json; print(json.load(open('release-images/ipworker.json'))['image'])")
+          docker pull "$VISION_IMAGE"
+          docker run --rm --entrypoint sh \
+            -v "$PWD/backend/tests:/app/tests:ro" \
+            -v "$PWD/backend/scripts:/app/scripts:ro" \
+            -v "$PWD/deploy:/deploy:ro" \
+            "$VISION_IMAGE" -c 'python -m pytest tests/test_ipworker*.py tests/test_ipwork_ocr.py tests/test_apply_client_processing_recovery.py tests/test_processing_failure_capsules.py -q'
       - name: Create tested release contract
         run: python3 deploy/wave_release.py --image-dir release-images --source "${{ github.sha }}" --output wave-release.json
       - uses: actions/upload-artifact@v4

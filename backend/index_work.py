@@ -360,6 +360,48 @@ class WorkStore:
                 continue
         raise RuntimeError('Maintenance lease renewal contention')
 
+    def record_failure(self, claim, details):
+        """Create an immutable attempt capsule fenced by the dispatch owner.
+
+        Diagnostic rows are terminal and cannot be recovered as work intents.
+        Keep them when a later successful finish deletes the live intent.
+        """
+        from processing_failures import capsule, deployment
+        failure = capsule(details)
+        # capsule defaults to a source failure; dispatch knows the actual role.
+        parts = claim.scope.split(':')
+        if len(parts) != 3 or parts[0] not in ('wave-vision', 'wave-cluster', 'wave-index'):
+            raise ValueError('Failure capsules require a wave stage claim')
+        failure['stage'] = parts[0][5:]
+        key = 'failure!' + claim.key + '!' + claim.owner
+        for _ in range(12):
+            current = self._get(claim.key)
+            if (current is None or current.get('owner') != claim.owner
+                    or current.get('revision') != claim.revision
+                    or float(current.get('leaseUntil') or 0) <= self.clock()):
+                raise RuntimeError('Maintenance lease lost')
+            if self._get(key) is not None:
+                return key  # A lost transaction response is an idempotent retry.
+            row = dict(PartitionKey=self.partition, RowKey=key, libraryId=claim.library,
+                scope='diagnostic:' + claim.scope, waveId=parts[1], stage=failure['stage'],
+                revision=claim.revision, owner='', leaseUntil=0, wakeUntil=0, failed=True,
+                recordedAt=self.clock(), dispatchAttempt=claim.attempt,
+                payload=json.dumps(failure, sort_keys=True), **deployment())
+            try:
+                updated = dict(current, lastFailureId=key)
+                if failure.get('errorClass') != 'DispatchAttemptsExhausted':
+                    updated['lastProcessingFailureId'] = key
+                self.table.submit_transaction([('create', row), ('update',
+                    updated, dict(mode=UpdateMode.REPLACE,
+                    etag=etag(current), match_condition=MatchConditions.IfNotModified))])
+                return key
+            except (ResourceModifiedError, ResourceExistsError):
+                continue
+            except TableTransactionError as error:
+                if error.status_code not in (409, 412):
+                    raise
+        raise RuntimeError('Failure capsule write contention')
+
     def release(self, claim, *, deferred=False, retry_delay=None, retry_reason='continuation', reset_attempts=False):
         if reset_attempts and not deferred:
             raise ValueError('Only verified progress may reset deferred work attempts')

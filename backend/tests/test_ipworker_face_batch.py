@@ -365,3 +365,28 @@ def test_wave_source_progress_extends_watchdog_and_ack_uses_renewed_receipt(monk
     monkeypatch.setattr(app,'wait',wait)
     with pytest.raises(_StopLoop):app.run_ipworker()
     assert not exits and renewals and acked==['renewed-'+str(len(renewals))]
+
+
+def test_wave_mode_reserves_one_delivery_without_reducing_source_concurrency(monkeypatch):
+    monkeypatch.setenv('UPLOAD_WAVE_EXECUTION_ENABLED', 'true')
+    monkeypatch.setattr(app, 'IPWORKER_CONCURRENCY', 3)
+    processed = []
+    class Queue:
+        def __init__(self):self.calls=[];self.deleted=[]
+        def create_queue(self):pass
+        def receive_messages(self, **options):
+            self.calls.append(options)
+            assert options['max_messages'] == options['messages_per_page'] == 1
+            if len(self.calls) <= 2:return [message(len(self.calls))]
+            return []
+        def delete_message(self, msg):self.deleted.append(msg.id)
+    queue=Queue()
+    _prepare_queue(monkeypatch,queue)
+    # A large legacy preparation batch must not reserve other wave deliveries.
+    monkeypatch.setattr(app,'IPWORKER_FACE_RECONCILE_BATCH_SIZE',8)
+    monkeypatch.setattr(app,'_prepare_ipwork_face_indexes',lambda *a:pytest.fail('Wave prefetch'))
+    monkeypatch.setattr(app,'_process_ipwork_message',lambda msg:processed.append(msg.id) or 'done')
+    monkeypatch.setattr(app.time,'sleep',lambda seconds:(_ for _ in ()).throw(_StopLoop()))
+    with pytest.raises(_StopLoop):app.run_ipworker()
+    assert processed == queue.deleted == ['1','2']
+    assert app.IPWORKER_CONCURRENCY == 3

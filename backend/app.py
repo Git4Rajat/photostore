@@ -17919,7 +17919,13 @@ def run_ipworker() -> None:
     signal.signal(signal.SIGTERM, _handle_shutdown_signal)
     signal.signal(signal.SIGINT, _handle_shutdown_signal)
 
-    executor = ThreadPoolExecutor(max_workers=IPWORKER_CONCURRENCY, thread_name_prefix='ipwork')
+    from upload_wave_execution import execution_enabled
+    # Wave coordinators already use the process-wide source pool at
+    # IPWORKER_CONCURRENCY. Reserve only one queue delivery here so sibling
+    # replicas can claim other libraries instead of one replica leasing them
+    # all. Legacy per-photo work retains its configured concurrency.
+    queue_concurrency = 1 if execution_enabled() else IPWORKER_CONCURRENCY
+    executor = ThreadPoolExecutor(max_workers=queue_concurrency, thread_name_prefix='ipwork')
     # Time-based flush for _buffer_incremental_assign_filename's per-user
     # buffers -- a slow trickle of photos for one user would otherwise sit
     # buffered (and un-clustered) until the count cap is reached, which may
@@ -17938,7 +17944,7 @@ def run_ipworker() -> None:
         target=_run_incremental_assign_flush_loop, args=(shutdown_requested,),
         name='ipwork-cluster-batch-flush', daemon=True)
     incremental_assign_flush_thread.start()
-    batch_size = IPWORKER_FACE_RECONCILE_BATCH_SIZE
+    batch_size = 1 if execution_enabled() else IPWORKER_FACE_RECONCILE_BATCH_SIZE
     # One bounded wave at a time: at most batch_size queue messages held,
     # regardless of inference concurrency. No images/embeddings are prefetched.
     # Preparation runs off the queue thread so ACKs/signals stay responsive.
@@ -17956,7 +17962,7 @@ def run_ipworker() -> None:
     task_receipts = {}  # bounded by executor slots, monotonic timestamps only
     throughput = _IpworkThroughputWindow()
     processing_diagnostics.ready('vision', concurrency=IPWORKER_CONCURRENCY,
-        preparation_batch_size=batch_size)
+        preparation_batch_size=batch_size, queue_concurrency=queue_concurrency)
     collector = throughput.collector
     wave_started = None
     wave_receipt_at = None
@@ -18084,7 +18090,7 @@ def run_ipworker() -> None:
                     break
 
                 if preparation_executor is not None and not shutdown_requested.is_set():
-                    while ready and len(in_flight) < IPWORKER_CONCURRENCY:
+                    while ready and len(in_flight) < queue_concurrency:
                         message = ready.popleft()
                         collector.state(ready=len(ready))
                         # Do not START work with an old visibility receipt.
@@ -18112,7 +18118,7 @@ def run_ipworker() -> None:
                 # Once shutdown has been requested, stop claiming new work --
                 # each claimed message costs a full visibility timeout if it
                 # can't finish before the process exits.
-                free_slots = 0 if shutdown_requested.is_set() else min(IPWORKER_CONCURRENCY - len(in_flight), 32)
+                free_slots = 0 if shutdown_requested.is_set() else min(queue_concurrency - len(in_flight), 32)
                 if preparation_executor is not None:
                     # Only wait on `ready` and `preparing`, not `in_flight`: once
                     # every message from the current batch has been handed to the

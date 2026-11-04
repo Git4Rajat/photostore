@@ -276,9 +276,26 @@ def consume(payload,*,deadline=None,progress=None):
     if claim is None: return 'noop'
     if claim.revision!=payload.get('intentRevision'):
         work.release(claim,deferred=True);return 'noop'
+    def record_failure(details):
+        try:
+            execution = leases._get(execution_key) or {}
+            checkpoint = execution.get('progressCheckpoint') or ''
+            from processing_failures import checkpoint_details
+            work.record_failure(claim, dict(details, **checkpoint_details(checkpoint)))
+        except Exception:
+            logging.getLogger(__name__).exception('Wave attempt diagnostic persistence failed')
+        processing_diagnostics.emit('wave_stage_failed', wave_id=wave_id, stage=stage,
+            library_id=processing_diagnostics.file_id(library,''),
+            dispatch_attempt=claim.attempt, attempt_id=claim.owner, **details)
     if claim.attempt>5:
+        record_failure(dict(errorClass='DispatchAttemptsExhausted'))
         work.finish(claim,failed=True)
         raise RuntimeError('Wave dispatch attempts exhausted; operator retry required')
+    def made_progress(current):
+        after=leases._get(execution_key) or {}
+        return (after.get('progressCheckpoint','')!=before.get('progressCheckpoint','')
+            or float(current.get('lastProgressAt') or 0)>float(wave.get('lastProgressAt') or 0)
+            or any(current.get(k)!=wave.get(k) for k in ('evaluation','zeroFaceAfter','zeroFaceProbePending')))
     healthy_continuation = True
     try:
         # Dispatcher bookkeeping is renewed separately from stage ownership.
@@ -379,14 +396,12 @@ def consume(payload,*,deadline=None,progress=None):
         same_stage=result and result['state'] in {
             'vision':('processing_pending','processing'),'cluster':('ready',),'index':('indexing',)}[stage]
         if same_stage:
-            after=leases._get(execution_key) or {}
-            progressing=(after.get('progressCheckpoint','')!=before.get('progressCheckpoint','')
-                or float(result.get('lastProgressAt') or 0)>float(wave.get('lastProgressAt') or 0)
-                or any(result.get(k)!=wave.get(k) for k in ('evaluation','zeroFaceAfter','zeroFaceProbePending')))
+            progressing=made_progress(result)
             if not progressing:
                 # No progress is not a healthy slice. Keep the original message
                 # and bound consecutive stalls with the existing failure budget.
                 # No delayed self-wakeup or unlimited refunded barrier loop.
+                record_failure(dict(errorClass='NoProgress'))
                 work.release(claim)
                 processing_diagnostics.emit('wave_no_progress',wave_id=wave_id,stage=stage,
                     dispatch_attempt=claim.attempt,retained_receipt=True)
@@ -443,7 +458,12 @@ def consume(payload,*,deadline=None,progress=None):
         processing_diagnostics.emit('vision_coordination_retry', wave_id=wave_id,
             attempt=claim.attempt, delay_seconds=delay)
         return 'done'
-    except Exception:
-        try: work.release(claim)
+    except Exception as error:
+        from processing_failures import exception_details
+        record_failure(exception_details(error))
+        try:
+            current=store._required(store.wave_key(wave_id))
+            progressed=made_progress(current)
+            work.release(claim,deferred=progressed,reset_attempts=progressed)
         except Exception: pass
         raise

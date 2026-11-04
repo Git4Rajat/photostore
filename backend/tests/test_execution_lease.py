@@ -218,3 +218,20 @@ def test_active_is_false_with_no_leases(leases):
 def test_active_sees_any_live_stage_not_just_vision(leases):
     leases.claim('lib', 'wave-1', 'cluster', 'rev-1')
     assert leases.active('lib') is True
+
+
+def test_repeated_checkpoint_heartbeat_and_reclaim_do_not_refresh_progress_age(leases):
+    first=leases.claim('lib','wave-1','cluster','rev-1')
+    leases.clock.value+=10
+    leases.checkpoint(first,'faces-applied:128')
+    progress_at=leases.row(first)['lastProgressAt']
+    leases.clock.value+=20
+    leases.renew(first)
+    leases.checkpoint(first,'faces-applied:128')
+    assert leases.row(first)['lastProgressAt']==progress_at
+    leases.release(first)
+    replacement=leases.claim('lib','wave-1','cluster','rev-1')
+    assert leases.row(replacement)['lastProgressAt']==progress_at
+    leases.clock.value+=10
+    leases.checkpoint(replacement,'faces-applied:256')
+    assert leases.row(replacement)['lastProgressAt']==leases.clock.value

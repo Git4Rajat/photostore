@@ -314,7 +314,7 @@ def process_ocr(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dic
         return {'hasData': False, 'error': str(exc), 'errorCode': error_code}
     if worker is None:
         close_image()
-        return {'hasData': False, 'error': 'OCR worker capacity exhausted', 'errorCode': error_code}
+        return {'hasData': False, 'error': 'OCR worker capacity exhausted', 'errorCode': 'ocr_capacity_exhausted'}
     job = _OcrJob(metrics.inherit(lambda: _recognize(image), purpose_name='other'), close_image)
     worker.jobs.put_nowait(job)
     try:

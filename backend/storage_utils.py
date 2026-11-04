@@ -10630,7 +10630,8 @@ def _apply_client_processing_results(
             # 'ocr_engine_failed' (ambiguous libtesseract/thread-state failure,
             # not proven deterministic) keep retrying as 'failed'.
             status_updates['ocr_status'] = 'unrecoverable' if code == 'ocr_decode_failed' else 'failed'
-            if not isinstance(code, str) or code not in {'tesserocr_unavailable', 'ocr_decode_failed', 'ocr_engine_failed'}:
+            if not isinstance(code, str) or code not in {'tesserocr_unavailable', 'ocr_decode_failed', 'ocr_engine_failed',
+                                                       'ocr_timeout', 'ocr_capacity_exhausted'}:
                 code = 'ocr_processing_failed'
             _merge_processing_metadata(metadata, 'client_ocr', {
                 'source': origin, 'acceptedAt': _utc_now(),

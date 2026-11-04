@@ -88,6 +88,9 @@ def settle(store,wave_id,member,outcome,reason,*,witness,maintenance=False,pendi
         raise ValueError('Not a terminal settlement outcome')
     payload=dict(waveId=wave_id,photoId=member['photoId'],revision=member['processingRevision'],
                  outcome=outcome,reason=reason,witnessDigest=digest(json.loads(json.dumps(witness,default=str))))
+    if outcome == 'failed_exhausted':
+        from processing_failures import capsule
+        payload['failure'] = capsule(witness)
     identity=digest(payload);key='settlement!'+identity
     def commit():
         control=store._required('control');wave=store._required(store.wave_key(wave_id))
@@ -98,7 +101,9 @@ def settle(store,wave_id,member,outcome,reason,*,witness,maintenance=False,pendi
         if wave['state'] not in allowed:
             raise Conflict('Settlement cannot alter frozen or collecting inputs')
         proof=store._get(key)
-        changes=[] if proof else [('create',store._row(key,payload=json.dumps(payload,sort_keys=True)))]
+        from processing_failures import deployment
+        changes=[] if proof else [('create',store._row(key,payload=json.dumps(payload,sort_keys=True),
+                                                      recordedAt=store.clock(), **deployment()))]
         row=dict(old,outcome=outcome,evidenceId=identity,evidenceQualified=True,
                  outstandingLeases=0,observedAt=store.clock())
         store._commit(control,[*changes,store._change(old,row),
@@ -198,7 +203,7 @@ def inspection_failed(store, wave_id, member, metadata, error):
     return True
 
 
-def exhausted(store,wave_id,member,metadata,count):
+def exhausted(store,wave_id,member,metadata,count,*,error=None):
     """Force a terminal settlement once a source has had its full retry budget,
     regardless of whether a required step ever recorded 'failed'.
 
@@ -221,8 +226,12 @@ def exhausted(store,wave_id,member,metadata,count):
     statuses={step:row.get(step+'_status','pending') for step in steps}
     reason=('required_step_retries_exhausted' if any(status=='failed' for status in statuses.values())
             else 'source_retries_exhausted')
-    settle(store,wave_id,member,'failed_exhausted',reason,
-           witness=dict(attempts=count,statuses=statuses,generation=row.get('processingGeneration','')))
+    from processing_failures import source_details, exception_details
+    details = dict(source_details(row), attempts=count)
+    details['statuses'].update(statuses)
+    if error is not None:
+        details.update(exception_details(error))
+    settle(store,wave_id,member,'failed_exhausted',reason,witness=details)
     return True
 
 

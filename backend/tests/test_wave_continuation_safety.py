@@ -301,3 +301,63 @@ def test_deployment_templates_forbid_cron_and_positive_replica_floors():
         minimum = app['properties']['template']['scale']['minReplicas']
         assert minimum in (0, "[parameters('clusterMinReplicas')]")
     assert template['parameters']['clusterMinReplicas']['maxValue'] == 0
+
+
+@pytest.mark.parametrize('diagnostics_available',[True,False])
+def test_stage_exception_retains_original_error_and_durable_capsule(monkeypatch,vision_dispatch,diagnostics_available):
+    from copy import deepcopy
+    from test_wave_recovery import RuntimeTable
+    _,work,_,token,payload,_=vision_dispatch
+    table=RuntimeTable()
+    table.rows=deepcopy(work.table.rows);table.versions=deepcopy(work.table.versions)
+    work.table=table
+    error=TimeoutError('private signed URL must not enter capsule')
+    def fail(*a,**kw):raise error
+    monkeypatch.setattr(runtime,'run_vision_release',fail)
+    if not diagnostics_available:
+        monkeypatch.setattr(work,'record_failure',lambda *a:(_ for _ in ()).throw(OSError('diagnostics unavailable')))
+    with pytest.raises(TimeoutError) as caught:runtime.consume(payload)
+    assert caught.value is error
+    intent=work._get(token)
+    assert not intent['owner'] and not intent.get('failed')
+    if diagnostics_available:
+        capsule=work._get(intent['lastFailureId'])
+        assert json.loads(capsule['payload'])['errorClass']=='TimeoutError'
+        assert 'private' not in capsule['payload']
+    else:assert not intent.get('lastFailureId')
+
+
+def test_exception_after_committed_cluster_progress_does_not_exhaust_dispatch(monkeypatch,vision_dispatch):
+    from upload_wave_execution import dispatch_outbox
+    from upload_waves import digest
+    store,work,wave,_,_,_=vision_dispatch
+    wid=wave['waveId'];key='shadow-cluster!'+wid
+    current=store._required(store.wave_key(wid))
+    store.table.submit_transaction([store._change(current,dict(current,state='ready',frozenRevision='frozen',manifestDigest='manifest')),
+        ('create',store._row(key,waveId=wid,destination='cluster',inputRevision='frozen',manifestDigest='manifest',dispatchable=False))])
+    assert dispatch_outbox(work,store,store.library,key,'cluster')
+    scope=f'wave-cluster:{wid}:{digest(key)}';token=work.key(store.library,scope)
+    payload=dict(userId=store.library,waveId=wid,stage='cluster',scope=scope,intentRevision=work._get(token)['revision'])
+    monkeypatch.setenv('APP_ROLE','cluster')
+    sys.modules['app']._get_live_faiss_assigner=lambda:object()
+    faces=[0]
+    def slice(leases,*args,**kwargs):
+        owner=leases.claim(store.library,wid,'cluster','frozen')
+        try:
+            faces[0]+=128
+            leases.checkpoint(owner,'faces-applied:'+str(faces[0]))
+            raise OSError('Optional resume snapshot copy failed after progress')
+        finally:leases.release(owner)
+    monkeypatch.setattr(runtime,'run_cluster_release',slice)
+    for _ in range(8):
+        with pytest.raises(OSError,match='snapshot copy'):runtime.consume(payload)
+        assert work._get(token)['attempts']==0
+        assert not work._get(token).get('failed')
+    # Once the durable cursor stops changing, the same repeated error is bounded.
+    def stalled(*args,**kwargs):raise OSError('no new progress')
+    monkeypatch.setattr(runtime,'run_cluster_release',stalled)
+    for expected in range(1,6):
+        with pytest.raises(OSError):runtime.consume(payload)
+        assert work._get(token)['attempts']==expected
+    with pytest.raises(RuntimeError,match='attempts exhausted'):runtime.consume(payload)
+    assert work._get(token)['failed']

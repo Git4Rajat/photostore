@@ -239,3 +239,108 @@ def test_bounded_slices_resume_without_reapplying_or_starving_on_replay(tmp_path
         pytest.fail('assignment did not finish across bounded slices')
     assert len(applied) == len(snapshots)
     assert comparable(assignment_snapshot(h)) == expected
+
+
+def test_resume_snapshot_skips_prefix_preparation_build_and_replay(tmp_path, monkeypatch):
+    expected = oracle()
+    h, snapshots, store, frozen, leases = setup()
+    with pytest.raises(wave.AssignmentYield):
+        run(h, snapshots, store, frozen, leases, tmp_path, page_size=1, should_yield=lambda: True)
+    replayed = []
+    original = wave._replay
+    def replay(workspace, runtime, decision, guard):
+        replayed.append(decision['faceId'])
+        return original(workspace, runtime, decision, guard)
+    monkeypatch.setattr(wave, '_replay', replay)
+    monkeypatch.setattr(wave.WaveAssignmentJournal, 'prepare', lambda *a, **kw: pytest.fail('Recaptured snapshot'))
+    monkeypatch.setattr(wave.LiveFaceIndex, 'build', lambda *a, **kw: pytest.fail('Rebuilt native index'))
+    run(h, snapshots, store, frozen, leases, tmp_path)
+    assert len(replayed) == len(snapshots) - 1
+    assert comparable(assignment_snapshot(h)) == expected
+
+
+@pytest.mark.parametrize('damage', ['workspace', 'runtime', 'missing'])
+def test_optional_resume_snapshot_damage_falls_back_to_journal(tmp_path, damage):
+    expected = oracle()
+    h, snapshots, store, frozen, leases = setup()
+    with pytest.raises(wave.AssignmentYield):
+        run(h, snapshots, store, frozen, leases, tmp_path, page_size=1, should_yield=lambda: True)
+    path, = (tmp_path / 'mount').rglob('workspace.snapshot')
+    if damage == 'workspace':path.write_bytes(b'invalid snapshot')
+    elif damage == 'missing':path.unlink()
+    else:
+        pointer, = (tmp_path / 'mount').rglob('CURRENT')
+        pointer.write_text('{}')
+    run(h, snapshots, store, frozen, leases, tmp_path)
+    assert comparable(assignment_snapshot(h)) == expected
+
+
+def test_interrupted_resume_marker_publication_replays_authoritative_journal(tmp_path, monkeypatch):
+    import wave_assignment_files as files
+    expected = oracle()
+    h, snapshots, store, frozen, leases = setup()
+    original = files.FileAssignmentJournal.put
+    def put(self, key, payload):
+        if key.startswith('resume!'):raise OSError('snapshot marker not published')
+        return original(self, key, payload)
+    with monkeypatch.context() as patch:
+        patch.setattr(files.FileAssignmentJournal, 'put', put)
+        with pytest.raises(OSError, match='not published'):
+            run(h, snapshots, store, frozen, leases, tmp_path, page_size=1, should_yield=lambda: True)
+    run(h, snapshots, store, frozen, leases, tmp_path)
+    assert comparable(assignment_snapshot(h)) == expected
+
+
+@pytest.mark.parametrize('edit', ['curation', 'source'])
+def test_resume_preserves_curation_and_rejects_source_replacement(tmp_path, edit):
+    from clustering_wave import canonical_sort_key
+    h,snapshots,store,frozen,leases=setup()
+    ordered=sorted(snapshots,key=lambda row:canonical_sort_key(row['RowKey'],row))
+    with pytest.raises(wave.AssignmentYield):
+        run(h,snapshots,store,frozen,leases,tmp_path,page_size=1,should_yield=lambda:True)
+    face_id=ordered[1]['RowKey']
+    live=h.faces.rows['u',face_id]
+    if edit=='curation':live.update(reviewStatus='confirmed',personId='alice',rejected=False)
+    else:live['processingRevision']='replacement'
+    h.faces.versions['u',face_id]+=1
+    if edit=='source':
+        with pytest.raises(ValueError,match='source or curation changed'):
+            run(h,snapshots,store,frozen,leases,tmp_path)
+        assert live['processingRevision']=='replacement'
+    else:
+        run(h,snapshots,store,frozen,leases,tmp_path)
+        assert h.faces.rows['u',face_id]['personId']=='alice'
+        assert h.faces.rows['u',face_id]['reviewStatus']=='confirmed'
+
+
+def test_resume_does_not_swallow_guard_io_failure_after_loading_runtime(tmp_path,monkeypatch):
+    import wave_assignment_files as files
+    h,snapshots,store,frozen,leases=setup()
+    with pytest.raises(wave.AssignmentYield):
+        run(h,snapshots,store,frozen,leases,tmp_path,page_size=1,should_yield=lambda:True)
+    original=files.FileAssignmentJournal.__init__
+    def init(self,*args,**kwargs):
+        original(self,*args,**kwargs)
+        def unavailable():raise FileNotFoundError('guard storage disappeared')
+        self.check=unavailable
+    monkeypatch.setattr(files.FileAssignmentJournal,'__init__',init)
+    with pytest.raises(FileNotFoundError,match='guard storage disappeared'):
+        run(h,snapshots,store,frozen,leases,tmp_path)
+
+
+def test_failed_new_resume_publication_invalidates_old_snapshot_safely(tmp_path,monkeypatch):
+    import wave_assignment_files as files
+    h,snapshots,store,frozen,leases=setup()
+    expected=oracle()
+    with pytest.raises(wave.AssignmentYield):
+        run(h,snapshots,store,frozen,leases,tmp_path,page_size=1,should_yield=lambda:True)
+    original=files.FileAssignmentJournal.put
+    def put(self,key,payload):
+        if key.startswith('resume!'):raise OSError('new snapshot marker interrupted')
+        return original(self,key,payload)
+    with monkeypatch.context() as patch:
+        patch.setattr(files.FileAssignmentJournal,'put',put)
+        with pytest.raises(OSError,match='marker interrupted'):
+            run(h,snapshots,store,frozen,leases,tmp_path,page_size=1,should_yield=lambda:True)
+    run(h,snapshots,store,frozen,leases,tmp_path)
+    assert comparable(assignment_snapshot(h))==expected

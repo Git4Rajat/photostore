@@ -493,7 +493,7 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
                     continue
                 count, _ = counts[member['RowKey']]
                 error = errors.get(member['RowKey'])
-                if error is not None and not exhausted(store, wave_id, member, metadata, count):
+                if error is not None and not exhausted(store, wave_id, member, metadata, count, error=error):
                     logger.error('Vision source failed for %s/%s; continuing wave', store.library,
                         member['filename'], exc_info=(type(error), error, error.__traceback__))
                     continue

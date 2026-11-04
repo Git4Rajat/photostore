@@ -30,6 +30,7 @@ class FileAssignmentJournal(WaveAssignmentJournal):
         self.db.execute('PRAGMA cache_size=-512')
         self.db.execute('CREATE TABLE journal(key TEXT PRIMARY KEY, body TEXT, digest TEXT)')
         self.file = None
+        self.directory = directory
         self.preparing = False
         try:
             marker = self.cloud.get('local-v1')
