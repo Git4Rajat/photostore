@@ -205,7 +205,11 @@ def register_routes(blueprint):
                                  resumed_from=data.get('resumedFromSessionId',''))
         if parent.get('discardAbsent'):
             return dict(parent,state='absent')
-        result=abandon(store,session,data.get('manifestRevision',parent['manifestRevision']),reason=reason)
+        def release_tracking(filenames):
+            for name in filenames:
+                app._cleanup_failed_upload(store.library,name)
+        result=abandon(store,session,data.get('manifestRevision',parent['manifestRevision']),reason=reason,
+                       on_cancelled=release_tracking)
         _drive(store,result['waveId'])
         return result
 

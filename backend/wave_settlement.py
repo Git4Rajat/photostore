@@ -290,8 +290,10 @@ def fence_discard(store,session,*,reason,resumed_from=''):
 FINALIZE_DISCARD_GRACE_SECONDS = 30
 
 
-def abandon(store,session,manifest_revision,*,reason):
+def abandon(store,session,manifest_revision,*,reason,on_cancelled=None):
     """Operator-confirmed stop, one bounded reservation page per call.
+    on_cancelled(filenames) runs after a page commits, to release the
+    per-file upload tracking (pending blob reservations) of cancelled items.
     Resolved sources remain members; unknown/missing reservations are cancelled,
     not counted as successfully processed. A stale revision fails before changes.
     """
@@ -301,6 +303,7 @@ def abandon(store,session,manifest_revision,*,reason):
     if parent['state']!='open':return dict(parent)
     def advance():
         old=store._required(store.session_key(session))
+        cancelled[:]=[]
         if old['state']!='open':return dict(old)
         if old['manifestRevision']!=manifest_revision:raise Conflict('Abandonment revision is stale')
         cursor=old.get('abandonCursor','')
@@ -334,8 +337,13 @@ def abandon(store,session,manifest_revision,*,reason):
         # Read the global fence after the page, minimizing its conflict window.
         control=store._required('control')
         store._commit(control,[*changes,store._change(old,row)])
+        cancelled[:]=[item['filename'] for item in reserved if item.get('filename')]
         return row
+    cancelled=[]
     parent=store._retry(advance)
+    if on_cancelled and cancelled:
+        try:on_cancelled(list(cancelled))
+        except Exception:pass
     more=not parent.get('abandonScanComplete',False)
     if parent['state']=='open' and not more:
         parent=store.close(session,parent['manifestRevision'],'abandoned',abandoned=True)
