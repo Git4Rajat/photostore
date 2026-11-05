@@ -18,8 +18,14 @@ def client(monkeypatch):
     monkeypatch.setattr(app, 'mark_albums_dirty', lambda *a, **k: None)
     monkeypatch.setattr(app, '_albums_table_available', lambda: True)
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('u1', None))
+    monkeypatch.setattr(app, '_albums_feature_available', lambda: True)
+    tokens = {}
+    monkeypatch.setattr(app, '_store_album_token_index', lambda token, user, album: tokens.__setitem__(token, (user, album)))
+    monkeypatch.setattr(app, '_delete_album_token_index', lambda token: tokens.pop(token, None))
     app.app.config['PROPAGATE_EXCEPTIONS'] = True
-    return app.app.test_client(), table
+    http = app.app.test_client()
+    http.tokens = tokens
+    return http, table
 
 
 def _create(client, name='Holiday'):
@@ -81,3 +87,79 @@ def test_purge_removes_a_trashed_album_for_good(client):
     assert http.post(f"/albums/{album['id']}/purge", json={}).status_code == 200
     assert album['id'] not in {a['id'] for a in http.get('/albums/trash').json['albums']}
     assert http.post(f"/albums/{album['id']}/restore", json={}).status_code == 404
+
+
+def test_rename_validates_and_updates(client):
+    http, _ = client
+    album = _create(http, 'Old')
+    assert http.post(f"/albums/{album['id']}/rename", json={'name': '  '}).status_code == 400
+    assert http.post('/albums/missing/rename', json={'name': 'X'}).status_code == 404
+    renamed = http.post(f"/albums/{album['id']}/rename", json={'name': ' New '})
+    assert renamed.status_code == 200 and renamed.json['album']['name'] == 'New'
+
+
+def test_rename_refuses_a_deleted_album(client):
+    http, _ = client
+    album = _create(http)
+    http.post(f"/albums/{album['id']}/delete", json={})
+    assert http.post(f"/albums/{album['id']}/rename", json={'name': 'Nope'}).status_code == 404
+
+
+def test_share_creates_a_token_expiry_and_index_entry(client):
+    http, table = client
+    album = _create(http)
+    response = http.post(f"/albums/{album['id']}/share", json={'expiresInDays': 7})
+    assert response.status_code == 200
+    entity = table.get_entity('u1', album['id'])
+    assert entity['isPublic'] and entity['publicToken'] and entity['publicExpiresAt']
+    assert http.tokens[entity['publicToken']] == ('u1', album['id'])
+
+
+def test_share_keeps_the_same_token_when_called_again(client):
+    http, table = client
+    album = _create(http)
+    http.post(f"/albums/{album['id']}/share", json={})
+    first = table.get_entity('u1', album['id'])['publicToken']
+    http.post(f"/albums/{album['id']}/share", json={'expiresInDays': 30})
+    assert table.get_entity('u1', album['id'])['publicToken'] == first
+
+
+def test_share_rejects_a_short_access_code(client):
+    http, table = client
+    album = _create(http)
+    response = http.post(f"/albums/{album['id']}/share", json={'accessCode': 'ab'})
+    assert response.status_code == 400
+    assert not table.get_entity('u1', album['id']).get('isPublic')
+
+
+def test_share_disabled_clears_the_token_and_index(client):
+    http, table = client
+    album = _create(http)
+    http.post(f"/albums/{album['id']}/share", json={})
+    token = table.get_entity('u1', album['id'])['publicToken']
+    http.post(f"/albums/{album['id']}/share", json={'enabled': False})
+    assert table.get_entity('u1', album['id'])['publicToken'] == ''
+    assert token not in http.tokens
+
+
+def test_revoke_clears_token_expiry_code_and_index(client):
+    http, table = client
+    album = _create(http)
+    http.post(f"/albums/{album['id']}/share", json={'expiresInDays': 7, 'accessCode': 'secret'})
+    token = table.get_entity('u1', album['id'])['publicToken']
+    response = http.post(f"/albums/{album['id']}/revoke", json={})
+    assert response.status_code == 200
+    entity = table.get_entity('u1', album['id'])
+    assert not entity['isPublic'] and entity['publicToken'] == '' and entity['publicExpiresAt'] == '' and entity['accessCode'] == ''
+    assert token not in http.tokens
+    assert http.post('/albums/missing/revoke', json={}).status_code == 404
+
+
+def test_delete_multiple_reports_missing_albums_and_validates_types(client):
+    http, _ = client
+    keep, drop = _create(http, 'Keep'), _create(http, 'Drop')
+    assert http.post('/albums/delete-multiple', json={'albumIds': 'nope'}).status_code == 400
+    response = http.post('/albums/delete-multiple', json={'albumIds': [drop['id'], 'ghost']})
+    assert response.status_code == 200
+    ids = {a['id'] for a in http.get('/albums').json['albums']}
+    assert drop['id'] not in ids and keep['id'] in ids
