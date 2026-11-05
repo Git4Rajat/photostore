@@ -10,6 +10,7 @@ import app
 def http(monkeypatch):
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('u1', None))
     monkeypatch.setattr(app, '_people_features_available', lambda: True)
+    monkeypatch.setattr(app, '_library_cut_over_to_waves', lambda user_id: False)
     app.app.config['PROPAGATE_EXCEPTIONS'] = True
     return app.app.test_client()
 
@@ -411,3 +412,34 @@ def test_repair_routes_are_not_admin_gated_today(http, monkeypatch, repair_jobs)
     response = http.post('/api/admin/people/dedupe-faces', json={'repair': True, 'confirm': 'DEDUPE_FACES', 'dryRun': False})
     assert response.status_code == 200
     assert repair_jobs == [('u1', 'dedupe_faces', False)]
+
+
+class TestWaveOwnedLibrary:
+    """Wave-owned libraries process everything through upload waves. The legacy
+    re-queue routes would reset a photo's steps and then queue nothing, so they
+    must refuse before touching any row."""
+
+    @pytest.fixture(autouse=True)
+    def wave_owned(self, http, monkeypatch):
+        # Depends on `http` so this override runs after its non-wave default.
+        monkeypatch.setattr(app, '_library_cut_over_to_waves', lambda user_id: True)
+        monkeypatch.setattr(app, '_iter_metadata_rows_for_user', lambda *a, **k: pytest.fail('scanned rows'))
+        monkeypatch.setattr(app, '_enqueue_processing_steps', lambda *a, **k: pytest.fail('reset steps'))
+        monkeypatch.setattr(app, '_queue_ipwork_processing', lambda *a, **k: pytest.fail('queued work'))
+        monkeypatch.setattr(app, '_get_metadata_entity', lambda *a, **k: pytest.fail('read a row'))
+
+    def test_backfill_is_refused_even_with_a_valid_confirmation(self, http):
+        response = http.post('/api/admin/backfill/photos', json={'repair': True, 'confirm': 'BACKFILL_ALL_PHOTOS'})
+        assert response.status_code == 409 and response.json['code'] == 'wave_owned_library'
+
+    def test_selection_reprocess_is_refused(self, http):
+        response = http.post('/api/admin/ipwork/enqueue', json={'steps': ['ocr'], 'filenames': ['a.jpg'], 'force': True})
+        assert response.status_code == 409 and response.json['code'] == 'wave_owned_library'
+
+    def test_refusal_comes_before_validation_so_nothing_is_inspected(self, http):
+        assert http.post('/api/admin/backfill/photos', json={}).status_code == 409
+        assert http.post('/api/admin/ipwork/enqueue', json={}).status_code == 409
+
+    def test_other_repair_routes_are_unaffected(self, http, repair_jobs):
+        response = http.post('/api/admin/people/dedupe-faces', json={'repair': True, 'confirm': 'DEDUPE_FACES'})
+        assert response.status_code == 200 and repair_jobs == [('u1', 'dedupe_faces', True)]

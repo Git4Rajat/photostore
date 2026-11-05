@@ -12,6 +12,19 @@ import app
 
 admin_bp = Blueprint('admin', __name__)
 
+def _refuse_wave_owned_reprocess(user_id):
+    """A wave-owned library runs all processing through upload waves. The legacy
+    re-queue routes below would supersede a photo's generation (resetting its
+    steps to pending) and then queue nothing, stranding it, so refuse up front,
+    before any row is touched."""
+    if app._library_cut_over_to_waves(user_id):
+        return app.jsonify({
+            'error': 'This library processes photos through upload waves; re-queueing existing photos is not supported.',
+            'code': 'wave_owned_library',
+        }), 409
+    return None
+
+
 @admin_bp.route('/api/admin/indexes/source-reservations', methods=['POST'])
 def recover_source_reservations():
     library, error = app._require_admin(require_auth=True)
@@ -224,6 +237,9 @@ def admin_backfill_photos():
     user_id, error = app._require_user_id()
     if error:
         return error
+    refused = _refuse_wave_owned_reprocess(user_id)
+    if refused:
+        return refused
     data = app.request.get_json(silent=True) or {}
     if data.get('repair') is not True or data.get('confirm') != 'BACKFILL_ALL_PHOTOS':
         return app.jsonify({'error': 'repair confirmation required', 'code': 'protected_repair_required'}), 403
@@ -324,6 +340,9 @@ def admin_enqueue_ipwork():
     user_id, error = app._require_user_id()
     if error:
         return error
+    refused = _refuse_wave_owned_reprocess(user_id)
+    if refused:
+        return refused
     data = app.request.get_json(silent=True) or {}
 
     all_steps = ['preview', 'thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face']
