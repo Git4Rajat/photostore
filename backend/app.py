@@ -609,7 +609,6 @@ ARCHIVE_PUBLIC_BASE_URL = os.getenv('ARCHIVE_PUBLIC_BASE_URL', '').strip()
 # When false (the default), the unauthenticated `X-User-ID` header is never trusted as
 # an identity. It may only be used as a local development convenience by explicitly
 # opting in AND leaving auth un-enforced. Any enforced deployment ignores it entirely.
-TRUST_USER_HEADER = os.getenv('TRUST_USER_HEADER', 'false').lower() in ('1', 'true', 'yes')
 # Admin-only operations (user invite/revoke, index rebuilds) require the caller's role.
 # Optionally seed a comma-separated allow-list of admin identifiers/emails for bootstrap.
 ADMIN_USER_IDS = {
@@ -698,7 +697,6 @@ SEMANTIC_SEARCH_ALLOW_QUERYTIME_ROW_EMBEDDINGS = os.getenv(
 ).lower() in ('1', 'true', 'yes')
 
 # Feature toggles
-MAPS_ENABLED = os.getenv('MAPS_ENABLED', 'true').lower() in ('1', 'true', 'yes')
 MAPS_ON_UPLOAD = os.getenv('MAPS_ON_UPLOAD', 'false').lower() in ('1', 'true', 'yes')
 MAPS_QUEUE_ON_UPLOAD = os.getenv('MAPS_QUEUE_ON_UPLOAD', 'true').lower() in ('1', 'true', 'yes')
 # 'browser' (default): only the client runs OCR/face/vision/geo, matching today's
@@ -878,9 +876,6 @@ IPWORKER_TASK_TIMEOUT_SECONDS = max(1, min(240, int(os.getenv('IPWORKER_TASK_TIM
 # drop) sends SIGTERM constantly, not just on deploys.
 IPWORKER_SHUTDOWN_GRACE_SECONDS = max(1, int(os.getenv('IPWORKER_SHUTDOWN_GRACE_SECONDS', '25')))
 LIBRARY_CLEAN_MAX_IN_PROGRESS_SECONDS = max(60, int(os.getenv('LIBRARY_CLEAN_MAX_IN_PROGRESS_SECONDS', '14400')))
-CLIENT_PROCESSING_LATE_RESULT_WAIT_SECONDS = max(0, int(os.getenv('CLIENT_PROCESSING_LATE_RESULT_WAIT_SECONDS', '750')))
-CLIENT_PROCESSING_DEFAULT_LEASE_SECONDS = max(30, int(os.getenv('CLIENT_PROCESSING_DEFAULT_LEASE_SECONDS', '120')))
-FACE_REQUIRE_AI_PERSON_TAG = os.getenv('FACE_REQUIRE_AI_PERSON_TAG', 'true').lower() in ('1', 'true', 'yes')
 DEFAULT_FACE_PERSON_TAGS = (
     'person,people,portrait,human,face,selfie,man,woman,boy,girl,child,baby,'
     'toddler,adult,group,family,crowd'
@@ -890,7 +885,6 @@ FACE_PERSON_TAGS = {
     for tag in os.getenv('FACE_PERSON_TAGS', DEFAULT_FACE_PERSON_TAGS).split(',')
     if tag.strip()
 }
-FACE_PERSON_SCORE_THRESHOLD = float(os.getenv('FACE_PERSON_SCORE_THRESHOLD', '0.20'))
 
 # Hard floor for automatic face merges into existing people/clusters. This is a
 # safety clamp against a misconfigured-too-loose override, NOT the operating
@@ -1053,7 +1047,6 @@ FACE_CLUSTER_EMBEDDING_VERSION = (
     or 'browser-adaface-ir101-v1-fixed'
 ).strip()
 FACE_CLUSTER_EMBEDDING_DIMENSIONS = int(os.getenv('FACE_CLUSTER_EMBEDDING_DIMENSIONS', '512'))
-FACE_CLUSTER_LEGACY_EMBEDDING_DIMENSIONS = 512
 # ipworker's embeddingVersion string (must match FACE_EMBEDDING_MODEL_TAXONOMY_VERSION
 # in ipwork_face.py verbatim -- duplicated here rather than imported because
 # ipwork_face.py pulls in onnxruntime/opencv/mediapipe, which the plain
@@ -9184,7 +9177,6 @@ SMART_ALBUM_SELECT = [
     'RowKey', 'locationCity', 'locationCountry', 'address', 'latitude', 'longitude', 'tags', 'objects',
     'peopleIds', 'uploadDate', 'upload_started_at', 'last_processing_update', 'clientLastModified', 'exifData',
 ]
-TRASH_SELECT = sorted(set(PHOTO_LIST_SELECT_FIELDS) | {'deletedAt', 'preDeleteStatuses', 'processing_state'})
 CORRUPTED_UPLOAD_SELECT = sorted(set(PHOTO_LIST_SELECT_FIELDS) | {
     'verification_status', 'verification_error', 'last_error', 'upload_sha256_match', 'mimeType', 'corrupted',
 })
@@ -9314,42 +9306,6 @@ def refresh_user_timeline_summary(user_id: str) -> Optional[Dict[str, object]]:
         summary = build_timeline_summary(iter_library_rows(key))
     store_timeline_summary(key, summary)
     return summary
-
-
-class _ExploreSink:
-    def __init__(self, user_id: str, source_version: str) -> None:
-        self.user_id, self.source_version = user_id, source_version
-        self.accumulator = ExploreAccumulator()
-
-    def add(self, row: Dict) -> None:
-        self.accumulator.add(row)
-
-    def abort(self) -> None:
-        pass
-
-    def finish(self) -> None:
-        summary = self.accumulator.finalize(self.user_id)
-        store_explore_summary(self.user_id, {
-            'sourceVersion': self.source_version,
-            'updatedAt': datetime.now(timezone.utc).isoformat(),
-            'places': summary.get('places', []),
-            'things': summary.get('things', []),
-        })
-
-
-class _TimelineSink:
-    def __init__(self, user_id: str) -> None:
-        self.user_id = user_id
-        self.accumulator = TimelineAccumulator()
-
-    def add(self, row: Dict) -> None:
-        self.accumulator.add(row)
-
-    def abort(self) -> None:
-        pass
-
-    def finish(self) -> None:
-        store_timeline_summary(self.user_id, self.accumulator.summary())
 
 
 @catalog_publisher
@@ -10937,7 +10893,6 @@ def _index_build_job_id(user_id: str) -> str:
 INDEX_BUILD_HEARTBEAT_SECONDS = float(os.getenv('INDEX_BUILD_HEARTBEAT_SECONDS', '30'))
 INDEX_BUILD_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_MIN_INTERVAL_SECONDS', '120'))
 # The people/albums rebuild reads every cluster and face, so repeated clustering runs coalesce harder.
-INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS', '180'))
 # Index bugs must not inherit the destructive library-clean retry budget.
 INDEX_BUILD_MAX_RETRIES = max(1, int(os.getenv('INDEX_BUILD_MAX_RETRIES', '5')))
 # Longer than scale-down cooldown; completion signals resume wave waits early.
@@ -14115,7 +14070,6 @@ UPLOAD_TRACKING_FIELDS = (
     'uploadCleanupBlobs',
 )
 
-THUMBNAIL_RETRY_COUNT_FIELD = 'thumbnail_retry_count'
 
 
 def _is_not_found_storage_error(exc: Exception) -> bool:

@@ -64,7 +64,6 @@ import processing_metrics
 import vision_utils
 
 CLIENT_PROCESSING_SCHEMA_VERSION = 2
-CLIENT_PROCESSING_MAX_THUMBNAIL_BYTES = 512 * 1024
 CLIENT_PROCESSING_MAX_EXIF_KEYS = 200
 CLIENT_PROCESSING_MAX_EXIF_VALUE_LENGTH = 512
 CLIENT_PROCESSING_MAX_AI_TAGS = 400
@@ -141,7 +140,6 @@ def _safe_get_entity(table_client, partition_key: str, row_key: str, default=Non
         return table_client.get_entity(partition_key=partition_key, row_key=row_key)
     except Exception:
         return default
-CLIENT_PROCESSING_TERMINAL_STATUSES = {'done', 'skipped', 'failed', 'timeout', 'unsupported'}
 BROWSER_PROCESSING_STEPS = ('preview', 'thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face')
 # Mirrors app.py's BROWSER_PROCESSING_TERMINAL_STATUSES (duplicated, not
 # imported -- app.py imports from this module, not the reverse). Deliberately
@@ -503,17 +501,6 @@ class TagEmbeddingIndexSnapshot:
     updated_at: str
     tags: List[str]
     embeddings: np.ndarray
-
-
-@dataclass
-class ImageNameMapping:
-    library_id: str
-    anonymous_id: str
-    original_filename: str
-    original_extension: str
-    kind: str
-    blob_container: str
-    created_at: str
 
 
 def _escape_odata(value: str) -> str:

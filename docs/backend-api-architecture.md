@@ -355,8 +355,6 @@ The old 'lexical' step built a full in-memory snapshot of the library (`list(que
 Now `storage_utils.stream_library_artifacts` makes **one paged pass** with a server-side column projection (`_STREAM_SELECT_FIELDS` -- embeddings are never downloaded) and offers each row to small sinks, then drops it:
 - `ListingSink` -- gzip-streams the listing blob to a temp file;
 - `search_db.SearchDbSink` -- streams into SQLite (2000-row batches), gzips and uploads;
-- `_ExploreSink` -- `ExploreAccumulator` keeps only counts + first filename per group; full metadata is point-read for the <= 2x`EXPLORE_MAX_GROUPS` winners;
-- `_TimelineSink` -- `TimelineAccumulator` keeps day counters.
 Sort and access scans also iterate instead of `list()`. The 700 MB full lexical blob is **no longer built** (nothing reads it any more; `get_user_listing_index` no longer falls back to building it on the backend either). Nothing is published unless the whole scan succeeds; the lexical manifest (readiness / freshness / dirty flag) is written last.
 
 Measured on identical synthetic data (8,000 photos with 12 KB of heavy columns each): old build peak 288 MB (grows linearly with library size), streaming build peak 2.7 MB. `tests/test_library_stream.py` pins this (peak < 25 MB). Builds are a full scan, so `enqueue_index_build` delays a rebuild that follows a finished one by `INDEX_BUILD_MIN_INTERVAL_SECONDS` (120) instead of letting upload bursts trigger back-to-back builds.
@@ -508,7 +506,7 @@ Build scopes and triggers:
 | `light` | sort + access indexes, then the database delta | ipworker queue drain / every 10k files, dirty sort/access observed, Workbench action |
 | `people` | people + albums indexes, then the database delta | a clustering, recluster or propagate job finishing |
 
-Each scope has its own job row and trigger cooldown. `light` and `people` touch different indexes, so ipworker and clustering do not repeat each other's work; whichever runs second finds the dirty set empty and its delta step is a no-op. `people` requests wait at least `INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS` (600) after the previous one.
+Each scope has its own job row and trigger cooldown. `light` and `people` touch different indexes, so ipworker and clustering do not repeat each other's work; whichever runs second finds the dirty set empty and its delta step is a no-op.
 
 Still full-rebuild-only: the Explore places/things summary. Still O(library) per light build: the sort and access index files (streamed on the worker, but a million-photo sort index is too big for the browser either way).
 
