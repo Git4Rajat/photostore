@@ -864,6 +864,35 @@ def test_rolling_deadline_drains_admitted_sources_without_charging_tail(world, m
     assert [m['outcome'] for m in members] == ['settled', 'settled', 'pending', 'pending', 'pending']
 
 
+def test_inspection_runs_ahead_while_every_worker_is_busy(world, monkeypatch):
+    import upload_wave_execution as execution
+    metadata, wave, key = admit(world, 6)
+    store = world[0]
+    names = [m['filename'] for m in store._page(f'e!{wave}!m!')]
+    inspected, third_inspected = [], threading.Event()
+    original = execution._inspect_vision_member
+    def inspect(store_, wave_, member, *args):
+        inspected.append(member['filename'])
+        if len(inspected) >= 3:
+            third_inspected.set()
+        return original(store_, wave_, member, *args)
+    monkeypatch.setattr(execution, '_inspect_vision_member', inspect)
+    calls, waited, lock = [], [], threading.Lock()
+    def process(library, filename, revision, renew):
+        # Both workers hold their sources until the coordinator has inspected a
+        # third member; without lookahead it cannot, and the wait times out.
+        with lock:
+            first_two = len(calls) < 2
+            calls.append(filename)
+        if first_two:
+            waited.append(third_inspected.wait(2))
+        publish_completion(store, metadata, filename=filename)
+    assert run(world, metadata, wave, key, process, source_workers=2)['state'] == 'ready'
+    assert waited == [True, True], 'Coordinator did not inspect ahead while workers were busy'
+    assert sorted(calls) == sorted(names) and len(calls) == len(set(calls)) == 6
+    assert len(store._page('source-attempt!')) == 6
+
+
 def test_admission_exception_drains_shared_executor_before_releasing_stage(world, monkeypatch):
     import wave_source_batch
     metadata, wave, key = admit(world, 4)

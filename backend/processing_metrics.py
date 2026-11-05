@@ -66,7 +66,7 @@ _FIELDS = {
     'semantic_text_requests', 'semantic_text_request_ms', 'semantic_text_batches', 'semantic_text_batch_items',
     'semantic_text_batch_fallbacks', 'text_tokenize_ms', 'text_lock_wait_ms', 'text_inference_ms',
     'vision_source_queue_ms', 'vision_source_busy_ms', 'vision_pool_ms', 'vision_pool_capacity_ms',
-    'vision_coordinator_wait_ms', 'vision_admission_ms', 'vision_admission_batches', 'vision_settlement_ms',
+    'vision_coordinator_wait_ms', 'vision_inspection_ahead_ms', 'vision_inspection_ahead_members', 'vision_admission_ms', 'vision_admission_batches', 'vision_settlement_ms',
     'ocr_engine_init_ms', 'ocr_engine_inits', 'ocr_recognition_ms',
     'ocr_worker_starts', 'ocr_worker_reuses', 'ocr_worker_timeouts', 'ocr_worker_capacity_errors',
     'clip_preprocess_ms', 'clip_lock_wait_ms', 'clip_inference_ms',

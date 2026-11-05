@@ -343,6 +343,7 @@ def _inspect_vision_member(store, wave_id, member, metadata_table, receipts):
 def _process_vision_group(store, wave_id, members, metadata, process_source, renew, progressed, executor, receipts, inspection_failures=None, *, source_workers=1, expired=lambda: False, processed_members=None):
     """Parallel source effects; the coordinator alone updates wave evidence."""
     from contextvars import copy_context
+    from collections import deque
     from concurrent.futures import wait, FIRST_COMPLETED
     import time
     import processing_metrics as metrics
@@ -356,8 +357,19 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
     planned, counts, errors, futures = [], {}, {}, {}
     remaining = iter(members)
     exhausted_members = False
+    # Members inspected while every worker was busy. Inspection is read-only and
+    # advances no evidence: a member joins processed_members/planned only when
+    # taken below, so an interrupted pass never checkpoints past uninspected tail.
+    lookahead = deque()
     capacity = source_workers if executor is not None else 1
     pool_started = time.monotonic()
+
+    def inspect(member):
+        with processing_diagnostics.image_scope(member['RowKey'], 'inspection'):
+            try:
+                return _inspect_vision_member(store, wave_id, member, metadata, receipts), None
+            except Exception as error:
+                return None, error
 
     def process(item, submitted):
         from processing_receipt_cache import committed_receipt_scope
@@ -384,28 +396,29 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
             # members and later qualifies results; source workers own effects.
             ready = []
             admission_started = time.monotonic()
-            while not exhausted_members and len(futures) + len(ready) < capacity and not expired():
-                member = next(remaining, None)
-                if member is None:
-                    exhausted_members = True
-                    break
+            while (lookahead or not exhausted_members) and len(futures) + len(ready) < capacity and not expired():
+                if lookahead:
+                    member, (item, error) = lookahead.popleft()
+                else:
+                    member = next(remaining, None)
+                    if member is None:
+                        exhausted_members = True
+                        break
+                    item, error = inspect(member)
                 if processed_members is not None:
                     processed_members.append(member)
-                with processing_diagnostics.image_scope(member['RowKey'], 'inspection'):
-                    try:
-                        item = _inspect_vision_member(store, wave_id, member, metadata, receipts)
-                    except (OwnershipLost, NotImplementedError, MutationContention):
+                if error is not None:
+                    if isinstance(error, (OwnershipLost, NotImplementedError, MutationContention)):
                         # A shared coordination row changed, not the photo.
                         # Let the durable stage retry without charging this
                         # member's bounded inspection-failure budget.
-                        raise
-                    except Exception as error:
-                        settled = inspection_failed(store, wave_id, member, metadata, error)
-                        if not settled and inspection_failures is not None:
-                            inspection_failures[0] += 1
-                        logger.exception('Vision member inspection failed for %s/%s; continuing wave',
-                                         store.library, member['filename'])
-                        continue
+                        raise error
+                    settled = inspection_failed(store, wave_id, member, metadata, error)
+                    if not settled and inspection_failures is not None:
+                        inspection_failures[0] += 1
+                    logger.error('Vision member inspection failed for %s/%s; continuing wave',
+                                 store.library, member['filename'], exc_info=(type(error), error, error.__traceback__))
+                    continue
                 if item is not None:
                     planned.append(item)
                     if item['runnable']:
@@ -433,9 +446,22 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
                 if isinstance(error, (OwnershipLost, NotImplementedError)):
                     raise error
             if not futures:
-                if exhausted_members or expired():
+                if (exhausted_members and not lookahead) or expired():
                     break
                 continue
+            # Every worker is busy: inspect upcoming members now so a freed
+            # worker is refilled without waiting on inspection. One member at a
+            # time, stopping as soon as any worker finishes.
+            ahead_started = time.monotonic()
+            while (not exhausted_members and len(lookahead) < capacity and not expired()
+                   and not any(future.done() for future in futures)):
+                member = next(remaining, None)
+                if member is None:
+                    exhausted_members = True
+                    break
+                lookahead.append((member, inspect(member)))
+                metrics.add(vision_inspection_ahead_members=1)
+            metrics.add(vision_inspection_ahead_ms=(time.monotonic() - ahead_started) * 1000)
             wait_started = time.monotonic()
             done, _ = wait(futures, return_when=FIRST_COMPLETED)
             metrics.add(vision_coordinator_wait_ms=(time.monotonic() - wait_started) * 1000)
