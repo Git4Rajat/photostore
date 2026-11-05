@@ -53,7 +53,10 @@ from index_publication import serialize_catalog
 KINDS = ('vector', 'people_embedding', 'tag_embedding', 'lexical_artifact', 'hash')
 CONTROL = '!coverage'
 VERSION = 1
-LIMIT = 512
+LIMIT = 4096
+# Per-kind bound on a certified incremental ID set; larger sets take the full path.
+KIND_ID_CAPS = {'vector': 4096, 'people_embedding': 4096, 'lexical_artifact': 4096,
+                'tag_embedding': 512, 'hash': 512}
 TAG_PARTITION = 'index-model-tag-pending'
 QUIESCENCE_PARTITION = 'index-operator-quiescence'
 SCOPES = {'hash': 'dedup', 'lexical_artifact': 'lexical_artifact'}
@@ -739,7 +742,7 @@ def run(user, kind, *, people_model):
     previous = artifact_base(user, kind)
     control = captured.control
     full = bool(control.get('fullRequired') or not previous or previous != control.get('base')
-                or captured.dirty.truncated)
+                or captured.dirty.truncated or len(captured.ids) > KIND_ID_CAPS.get(kind, 512))
     if not full and not captured.ids and control.get('coveredRevision') == control['revision']:
         return {'status': 'noop'}
     check = lambda: store.check(user, kind, captured)

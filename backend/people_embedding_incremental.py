@@ -22,7 +22,7 @@ import numpy as np
 from azure.core import MatchConditions
 from azure.core.exceptions import ResourceNotFoundError
 
-MAX_IDS = 512
+MAX_IDS = 4096
 MAX_ITEM_CHARS = 262144
 MAX_FACES = 4096
 MAX_FACE_READS = 16384
@@ -316,10 +316,17 @@ def _apply(db, person_table, face_table, user, ids):
     db.commit()
 
 
+def _stored(name):
+    # Float32 matrices barely deflate; skip the CPU cost.
+    info = zipfile.ZipInfo(name)
+    info.compress_type = zipfile.ZIP_STORED
+    return info
+
+
 def _write_output(db, path, directory, source, schema, model):
     count, dim = db.execute('SELECT COUNT(*), COALESCE(MAX(width), 0) FROM rows').fetchone()
     with zipfile.ZipFile(path, 'w', compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
-        with archive.open('embeddings.npy', 'w', force_zip64=True) as member:
+        with archive.open(_stored('embeddings.npy'), 'w', force_zip64=True) as member:
             _write_header(member, (count, dim), '<f4')
             for vector, width in db.execute('SELECT vector, width FROM rows ORDER BY position'):
                 member.write(vector)

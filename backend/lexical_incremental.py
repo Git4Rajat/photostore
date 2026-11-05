@@ -17,7 +17,7 @@ from azure.core.exceptions import ResourceNotFoundError
 
 from index_files import RowsWriter, iter_rows, workspace
 
-MAX_IDS = 512
+MAX_IDS = 4096
 MAX_ID_CHARS = 1024
 MAX_ITEM_CHARS = 1048576
 MAX_DIRTY_BYTES = 8388608

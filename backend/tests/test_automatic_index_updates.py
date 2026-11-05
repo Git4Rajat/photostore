@@ -128,11 +128,32 @@ def test_actual_worker_seeds_then_invokes_strict_incremental(runtime, kind):
         assert options['model_version'] == app.FACE_CLUSTER_EMBEDDING_VERSION
 
 
-def test_more_than_512_falls_back_full_and_drains_complete_dirty_snapshot(runtime):
+def test_more_than_capture_limit_falls_back_full_and_drains_complete_dirty_snapshot(runtime):
+    mark(runtime, 'vector', ['seed'])
+    worker('vector')
+    mark(runtime, 'vector', [str(i) for i in range(automatic.LIMIT + 100)])
+    assert runtime.store.capture('A', 'vector').dirty.truncated
+    worker('vector')
+    assert runtime.calls[-1][1] == {'force_full': True}
+    assert not runtime.store.capture('A', 'vector').ids
+
+
+def test_batch_above_512_stays_incremental_for_bulk_capable_kinds(runtime):
     mark(runtime, 'vector', ['seed'])
     worker('vector')
     mark(runtime, 'vector', [str(i) for i in range(600)])
-    assert runtime.store.capture('A', 'vector').dirty.truncated
+    worker('vector')
+    options = runtime.calls[-1][1]
+    assert options['incremental_only'] is True
+    assert len(options['affected_filenames']) == 600
+    assert not runtime.store.capture('A', 'vector').ids
+
+
+def test_batch_above_kind_cap_takes_full_path(runtime, monkeypatch):
+    monkeypatch.setitem(automatic.KIND_ID_CAPS, 'vector', 512)
+    mark(runtime, 'vector', ['seed'])
+    worker('vector')
+    mark(runtime, 'vector', [str(i) for i in range(600)])
     worker('vector')
     assert runtime.calls[-1][1] == {'force_full': True}
     assert not runtime.store.capture('A', 'vector').ids

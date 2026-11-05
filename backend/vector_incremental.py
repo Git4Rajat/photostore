@@ -21,12 +21,18 @@ from people_embedding_incremental import (
     Deferred, _header, _json_items, _scalar, _write_header, _write_json_member,
 )
 
-MAX_IDS = 512
+MAX_IDS = 4096
 MAX_ID_CHARS = 1024
 MAX_ITEM_CHARS = 262144
 MAX_DIM = 4096
 CHUNK = 65536
 SCHEMA_VERSION = 1
+
+
+def _stored(name):
+    info = zipfile.ZipInfo(name)
+    info.compress_type = zipfile.ZIP_STORED
+    return info
 
 
 @dataclass(frozen=True)
@@ -142,7 +148,8 @@ def _apply(db, metadata_table, embeddings_table, user, ids, compute, dim):
 def _write_output(db, path, directory, source, version, dim):
     count = db.execute('SELECT COUNT(*) FROM rows').fetchone()[0]
     with zipfile.ZipFile(path, 'w', compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
-        with archive.open('embeddings.npy', 'w', force_zip64=True) as member:
+        # Float32 embeddings barely deflate (~7%) but cost most of the merge CPU.
+        with archive.open(_stored('embeddings.npy'), 'w', force_zip64=True) as member:
             _write_header(member, (count, dim if count else 0), '<f4')
             for vector, in db.execute('SELECT vector FROM rows ORDER BY position'):
                 member.write(vector)
