@@ -40,6 +40,7 @@ import hashlib
 import logging
 import os
 import random
+import threading
 import time
 import uuid
 
@@ -62,6 +63,8 @@ QUIESCENCE_PARTITION = 'index-operator-quiescence'
 SCOPES = {'hash': 'dedup', 'lexical_artifact': 'lexical_artifact'}
 LOG = logging.getLogger(__name__)
 _QUIESCED_CLEANUP = ContextVar('quiesced_index_source_cleanup', default=None)
+_WAVE_ASSIGNMENT_COVERAGE = ContextVar('wave_assignment_coverage', default=None)
+_UNHANDLED = object()
 
 
 @contextmanager
@@ -578,6 +581,174 @@ def mutation_targets(source, table, operation, entity, options):
     raise ValueError('Unknown source table')
 
 
+class _WaveAssignmentCoverage:
+    """One conservative people-embedding reservation for a bounded wave page.
+
+    Only the exact face/person proxies supplied by the journaled caller can
+    share it. Live source reads/CAS stay with that caller; uncertain=True covers
+    ALL old/new owners, including owners discovered during foreground races.
+    Admission is still read before every source effect. Never inherit this
+    mutable scope into a different thread or quiesced cleanup operation.
+    """
+    def __init__(self, user, face_table, person_table, check, max_faces):
+        self.user, self.check = user, check
+        self.clients = ((face_table, 'face'), (person_table, 'person'))
+        self.thread = threading.get_ident()
+        self.limit, self.writes = max_faces * 2, 0
+        self.wave_owned = None
+        self.store = self.reservation = None
+
+    def write(self, proxy, name, method, args, options):
+        from wave_policy import source_change_active
+        if (threading.get_ident() != self.thread or not source_change_active()
+                or not any(proxy is client and proxy.source == source for client, source in self.clients)
+                or current_cleanup_check(self.user) is not None):
+            return _UNHANDLED
+        if name not in ('create_entity', 'update_entity'):
+            return _UNHANDLED
+        row = args[0] if args else options.get('entity')
+        if not isinstance(row, dict) or row.get('PartitionKey') != self.user or not row.get('RowKey'):
+            return _UNHANDLED
+        # The live wave adapter only creates people, and all updates carry the
+        # genuine observation ETag. Other source operations keep normal tracking.
+        if name == 'create_entity' and proxy.source != 'person':
+            return _UNHANDLED
+        if name == 'update_entity' and (not options.get('etag') or options['etag'] == '*'
+                or options.get('match_condition') != MatchConditions.IfNotModified):
+            return _UNHANDLED
+        if self.wave_owned is None:
+            import storage_utils as su
+            self.wave_owned = bool(su._CTX.get('wave_owned') and su._CTX['wave_owned'](self.user))
+        if not self.wave_owned:
+            return _UNHANDLED
+        if self.writes >= self.limit:
+            raise RuntimeError('Wave assignment coverage page exceeded its write bound')
+        self.check()
+        check_source_admission(self.user)
+        if self.reservation is None:
+            self.store = configured_store()
+            # Assign only after confirmed begin. An ambiguous begin must remain
+            # active/fail-closed, just as in the ordinary per-write protocol.
+            from processing_diagnostics import wave_phase_scope
+            with wave_phase_scope('coverage_begin'):
+                self.reservation = self.store.begin(self.user, 'people_embedding', [],
+                    uncertain=True, operation='wave_assignment_page')
+            from processing_metrics import add
+            add(cluster_coverage_pages=1)
+            check_source_admission(self.user)  # Fence may have changed during begin.
+        self.check()
+        self.writes += 1
+        from processing_metrics import add
+        add(cluster_coverage_writes=1)
+        return method(*args, **options)
+
+
+@contextmanager
+def wave_assignment_coverage(user, face_table, person_table, check, *, max_faces=128):
+    """Lazy, thread-local coverage; close before progress/snapshot publication."""
+    import storage_utils as su
+    if type(max_faces) is not int or not 1 <= max_faces <= 128:
+        raise ValueError('Wave coverage page must contain between 1 and 128 faces')
+    if (not su.DURABLE_INDEX_UPDATES
+            or os.getenv('WAVE_CLUSTER_COVERAGE_BATCH_ENABLED', 'true').lower() not in ('true', '1', 'yes')):
+        yield
+        return
+    if _WAVE_ASSIGNMENT_COVERAGE.get() is not None:
+        raise RuntimeError('Nested wave assignment coverage pages are not supported')
+    scope = _WaveAssignmentCoverage(user, face_table, person_table, check, max_faces)
+    token = _WAVE_ASSIGNMENT_COVERAGE.set(scope)
+    source_error = None
+    try:
+        yield
+    except BaseException as error:
+        source_error = error
+        raise
+    finally:
+        _WAVE_ASSIGNMENT_COVERAGE.reset(token)
+        if scope.reservation is not None:
+            try:
+                from processing_diagnostics import wave_phase_scope
+                with wave_phase_scope('coverage_finish'):
+                    scope.store.finish(user, 'people_embedding', reservation_id=scope.reservation,
+                                       failed=source_error is not None)
+            except BaseException as error:
+                from processing_metrics import add
+                add(cluster_coverage_finish_errors=1)
+                error.add_note(f'Wave assignment source finish failed: library={user!r}')
+                finalization = BaseExceptionGroup('Automatic source finalization failed; retry required', [error])
+                if source_error is not None:
+                    raise source_error from finalization
+                raise finalization
+
+
+_COALESCED = ContextVar('automatic_coalesced_reservations', default=None)
+
+
+class _CoalescedReservations:
+    """One durable reservation per (library, kind) for a whole wave source.
+
+    Wave-owned writes drop their IDs and always mark the kind fullRequired, so
+    the per-write reservation carries no information a single open reservation
+    does not. The reservation is persisted before the first write and stays
+    active until the scope exits; a SIGKILL leaves it orphaned and fail-closed,
+    exactly as a mid-write crash does today.
+    """
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.held = {}
+        self.failed = set()
+
+    def reserve(self, user, kind, *, deleted, operation):
+        with self.lock:
+            if (user, kind) in self.held:
+                return
+            self.held[(user, kind)] = configured_store().begin(
+                user, kind, [], uncertain=True, deleted=deleted,
+                owner=os.getenv('CONTAINER_APP_NAME') or os.getenv('HOSTNAME') or 'source_writer',
+                operation=operation)
+
+    def fail(self, keys):
+        with self.lock:
+            self.failed.update(keys)
+
+
+@contextmanager
+def coalesced_source_reservations():
+    """Share wave-owned source reservations across all writes in this scope.
+
+    Re-entrant: an inner scope joins the outer one. Writes made in threads that
+    do not inherit this context fall back to per-write reservations.
+    """
+    if _COALESCED.get() is not None:
+        yield
+        return
+    scope = _CoalescedReservations()
+    token = _COALESCED.set(scope)
+    body_error = None
+    try:
+        yield
+    except BaseException as error:
+        body_error = error
+        raise
+    finally:
+        _COALESCED.reset(token)
+        failures = []
+        if scope.held:
+            store = configured_store()
+            for (user, kind), res_id in list(scope.held.items()):
+                try:
+                    store.finish(user, kind, reservation_id=res_id,
+                                 failed=body_error is not None or (user, kind) in scope.failed)
+                except BaseException as error:
+                    error.add_note(f'Coalesced source finish failed: library={user!r}, kind={kind}, reservation={res_id}')
+                    failures.append(error)
+        if failures:
+            finalization = BaseExceptionGroup('Coalesced source finalization failed; retry required', failures)
+            if body_error is not None:
+                raise body_error from finalization
+            raise finalization
+
+
 class SourceTable:
     """Reserve before source writes; finalize every successfully begun intent.
 
@@ -604,6 +775,11 @@ class SourceTable:
             import storage_utils as su
             if not su.DURABLE_INDEX_UPDATES:
                 return method(*args, **kwargs)
+            scope = _WAVE_ASSIGNMENT_COVERAGE.get()
+            if scope is not None:
+                result = scope.write(self, name, method, args, kwargs)
+                if result is not _UNHANDLED:
+                    return result
             if name == 'submit_transaction':
                 operations = list(args[0] if args else kwargs['entity_operations'])
                 if args:
@@ -665,6 +841,7 @@ class SourceTable:
                 cleanup[1]()
                 return result
             store = configured_store()
+            coalesced, coalesced_keys = _COALESCED.get(), []
             reserved = []
             success = False
             source_error = None
@@ -676,12 +853,17 @@ class SourceTable:
                     # failure cannot erase evidence, even if source write fails.
                     if not wave_owned(user):
                         schedule(user, kind)
+                    elif coalesced is not None:
+                        coalesced.reserve(user, kind, deleted=deleted[user, kind],
+                                          operation=f'{self.source}.{name}')
+                        coalesced_keys.append((user, kind))
+                        continue
                     res_id = store.begin(user, kind, ids, uncertain=uncertain[user, kind],
                                          deleted=deleted[user, kind],
                                          owner=os.getenv('CONTAINER_APP_NAME') or os.getenv('HOSTNAME') or 'source_writer',
                                          operation=f'{self.source}.{name}')
                     reserved.append((user, kind, res_id))
-                for user in dict.fromkeys(user for user, _, _ in reserved):
+                for user in dict.fromkeys(user for user, _ in sorted(targets)):
                     check_source_admission(user)
                 result = method(*args, **kwargs)
                 success = True
@@ -690,6 +872,8 @@ class SourceTable:
                 source_error = error
                 raise
             finally:
+                if coalesced_keys and not success:
+                    coalesced.fail(coalesced_keys)
                 failures = []
                 for user, kind, res_id in reserved:
                     try:

@@ -137,6 +137,12 @@ def _source_heartbeat(storage,library,filename,lease,renew):
 
 @source_change
 def process_source(library,filename,revision,renew):
+    from automatic_index_updates import coalesced_source_reservations
+    with coalesced_source_reservations():
+        return _process_source(library,filename,revision,renew)
+
+
+def _process_source(library,filename,revision,renew):
     import app
     import processing_metrics as metrics
     import storage_utils as storage

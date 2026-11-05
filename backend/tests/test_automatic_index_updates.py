@@ -616,3 +616,96 @@ def test_source_write_checks_fence_and_ownership_once_per_library(runtime, monke
     # independent of how many kinds were reserved.
     assert fences == ['A', 'A']
     assert owners == ['A']
+
+
+def _wave_scope(monkeypatch, owned=True):
+    from wave_policy import begin_source_change, end_source_change
+    monkeypatch.setitem(su._CTX, 'wave_owned', lambda user: owned)
+    token = begin_source_change()
+    return lambda: end_source_change(token)
+
+
+def test_coalesced_wave_writes_share_one_reservation_per_kind(runtime, monkeypatch):
+    metadata = su.track_index_source_table(runtime.source, 'metadata')
+    embeddings = su.track_index_source_table(runtime.source, 'embeddings')
+    begins, finishes = [], []
+    begin, finish = automatic.CoverageStore.begin, automatic.CoverageStore.finish
+    monkeypatch.setattr(automatic.CoverageStore, 'begin',
+                        lambda self, *a, **kw: begins.append(a[:2]) or begin(self, *a, **kw))
+    monkeypatch.setattr(automatic.CoverageStore, 'finish',
+                        lambda self, *a, **kw: finishes.append(a[:2]) or finish(self, *a, **kw))
+    end = _wave_scope(monkeypatch)
+    try:
+        with automatic.coalesced_source_reservations():
+            for index in range(5):
+                metadata.upsert_entity({'PartitionKey': 'A', 'RowKey': f'p{index}', 'caption': 'cat'})
+                embeddings.upsert_entity({'PartitionKey': 'A', 'RowKey': f'p{index}'})
+            assert runtime.store.control('A', 'vector')['active'] == 1
+            assert len(begins) == len(set(begins)) >= 2  # one begin per kind, not per write
+            assert finishes == []
+    finally:
+        end()
+    assert sorted(begins) == sorted(set(begins)) and len(begins) == len(finishes) >= 2
+    for _, kind in begins:
+        row = runtime.store.control('A', kind)
+        assert row['active'] == 0 and row['fullRequired']
+    assert runtime.store.reservations('A', 'vector') == []
+    assert len(runtime.source.rows) == 5
+
+
+def test_coalesced_failure_marks_full_required_and_still_finishes(runtime, monkeypatch):
+    table = su.track_index_source_table(runtime.source, 'embeddings')
+    end = _wave_scope(monkeypatch)
+    try:
+        with automatic.coalesced_source_reservations():
+            table.upsert_entity({'PartitionKey': 'A', 'RowKey': 'one'})
+            monkeypatch.setattr(runtime.source, 'upsert_entity',
+                                lambda *a, **kw: (_ for _ in ()).throw(OSError('write failed')))
+            with pytest.raises(OSError):
+                table.upsert_entity({'PartitionKey': 'A', 'RowKey': 'two'})
+    finally:
+        end()
+    row = runtime.store.control('A', 'vector')
+    assert row['active'] == 0 and row['fullRequired']
+
+
+def test_coalesced_body_exception_finishes_reservations(runtime, monkeypatch):
+    table = su.track_index_source_table(runtime.source, 'embeddings')
+    end = _wave_scope(monkeypatch)
+    try:
+        with pytest.raises(KeyError):
+            with automatic.coalesced_source_reservations():
+                table.upsert_entity({'PartitionKey': 'A', 'RowKey': 'one'})
+                raise KeyError('boom')
+    finally:
+        end()
+    assert runtime.store.control('A', 'vector')['active'] == 0
+
+
+def test_abandoned_coalesced_reservation_stays_active_and_blocks_builders(runtime, monkeypatch):
+    table = su.track_index_source_table(runtime.source, 'embeddings')
+    end = _wave_scope(monkeypatch)
+    scope = automatic.coalesced_source_reservations()
+    scope.__enter__()
+    try:
+        table.upsert_entity({'PartitionKey': 'A', 'RowKey': 'one'})
+        # A killed process never reaches __exit__: the reservation must still be
+        # durable, active and fail closed for builders.
+        assert runtime.store.control('A', 'vector')['active'] == 1
+        with pytest.raises(automatic.SourceBusy):
+            runtime.store.capture('A', 'vector')
+    finally:
+        scope.__exit__(None, None, None)
+        end()
+
+
+def test_non_wave_writes_in_scope_keep_per_write_reservations(runtime, monkeypatch):
+    table = su.track_index_source_table(runtime.source, 'embeddings')
+    end = _wave_scope(monkeypatch, owned=False)
+    try:
+        with automatic.coalesced_source_reservations():
+            table.upsert_entity({'PartitionKey': 'A', 'RowKey': 'one'})
+            assert runtime.store.control('A', 'vector')['active'] == 0
+    finally:
+        end()
+    assert runtime.store.capture('A', 'vector').ids == ['one']
