@@ -47,6 +47,8 @@ interface SortIndexResponse {
     indexUrl?: string;
     sourceVersion?: string;
     updatedAt?: string;
+    deltaSeq?: number;
+    deltaUrls?: string[];
 }
 
 interface StoredSortIndex {
@@ -54,6 +56,7 @@ interface StoredSortIndex {
     sourceVersion: string;
     updatedAt: string;
     rows: SortIndexRow[];
+    deltaSeq?: number;
     removedRows?: Record<string, string>;
 }
 
@@ -161,7 +164,9 @@ const fetchWithTimeout = async (url: string, timeoutMs: number): Promise<ArrayBu
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-        const response = await fetch(url, { signal: controller.signal });
+        // Published catalogs overwrite a stable blob URL. Versioned IndexedDB
+        // handles reuse; the HTTP cache can still contain the previous body.
+        const response = await fetch(url, { signal: controller.signal, cache: 'no-store' });
         if (!response.ok) throw new Error(`Failed to download sort index (${response.status})`);
         return await response.arrayBuffer();
     } finally {
@@ -204,6 +209,42 @@ const downloadSortIndexBlob = async (indexUrl: string, scope: string, current: (
         applyRowPatches(rows, parsed.sourceVersion, scope, readTokens);
     }
     return rows;
+};
+
+type SortDelta = { lineage: string; seq: number; upserts: Record<string, unknown>[]; deletes: string[] };
+const sortSnapshotVersion = (lineage: string, seq: number): string => (
+    seq ? `${lineage}:delta:${String(seq).padStart(6, '0')}` : lineage
+);
+
+const downloadSortDelta = async (url: string): Promise<SortDelta> => {
+    const buffer = await fetchWithTimeout(url, BLOB_FETCH_TIMEOUT_MS);
+    let text: string;
+    try { text = new TextDecoder().decode(buffer); } catch { text = ''; }
+    if (!text.trim().startsWith('{')) text = await decompressGzip(buffer);
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed.lineage !== 'string' || !Number.isInteger(parsed.seq)
+        || !Array.isArray(parsed.upserts) || !Array.isArray(parsed.deletes)) {
+        throw new Error('Invalid sort-index delta');
+    }
+    return parsed;
+};
+
+const applySortDeltas = async (rows: SortIndexRow[], urls: string[], lineage: string, firstSeq: number): Promise<SortIndexRow[]> => {
+    const byName = new Map(rows.map((row) => [row.filename, row]));
+    for (let offset = 0; offset < urls.length; offset++) {
+        const delta = await downloadSortDelta(urls[offset]);
+        // Stable blob names may be reused after compaction. Never combine a
+        // new base/delta lineage with an older manifest or cached base.
+        if (delta.lineage !== lineage || delta.seq !== firstSeq + offset) {
+            throw new Error('Sort index changed during delta download');
+        }
+        for (const name of delta.deletes) byName.delete(String(name));
+        for (const raw of delta.upserts) {
+            const normalized = normalizeRows([raw])[0];
+            if (normalized) byName.set(normalized.filename, normalized);
+        }
+    }
+    return Array.from(byName.values());
 };
 
 // Keyed by active library, same reasoning as the former browser search index's indexKey/
@@ -273,11 +314,20 @@ const fetchLocalSortIndex = async (key: string, requestGeneration: number, editS
         return null;
     }
     const sourceVersion = response.sourceVersion || '';
+    const deltaSeq = Number(response.deltaSeq || 0);
+    if (!Number.isInteger(deltaSeq) || deltaSeq < 0
+        || (deltaSeq > 0 && (!sourceVersion || response.deltaUrls?.length !== deltaSeq))) {
+        throw new Error('Incomplete sort-index delta manifest');
+    }
+    const version = sortSnapshotVersion(sourceVersion, deltaSeq);
     const idbStarted = perfNow();
     const stored = await idbGetStored(key).catch(() => null);
     readStoredRemovals(key, stored);
-    perf.recordSpan('index.sort.idb_read', perfNow() - idbStarted, { cached: Boolean(stored && sourceVersion && stored.sourceVersion === sourceVersion) });
-    if (stored && sourceVersion && stored.sourceVersion === sourceVersion) {
+    const storedMatches = stored && sourceVersion && stored.sourceVersion === sourceVersion
+        && Number(stored.deltaSeq || 0) === deltaSeq
+        && (stored.payloadVersion === version || (!stored.payloadVersion && deltaSeq === 0));
+    perf.recordSpan('index.sort.idb_read', perfNow() - idbStarted, { cached: Boolean(storedMatches) });
+    if (storedMatches) {
         // Unchanged since the last download for this library -- skip the
         // blob re-fetch entirely, this is the whole point of persisting it.
         perf.recordSpan('index.sort.total', perfNow() - totalStarted, { cached: true, rows: stored.rows.length });
@@ -288,7 +338,30 @@ const fetchLocalSortIndex = async (key: string, requestGeneration: number, editS
         if (stored.payloadVersion) snapshotVersions.set(visible, stored.payloadVersion);
         return visible;
     }
-    const rows = await downloadSortIndexBlob(response.indexUrl, editScope, () => generation === requestGeneration, readTokens);
+    let rows: SortIndexRow[];
+    const storedSeq = Number(stored?.deltaSeq || 0);
+    if (stored && sourceVersion && stored.sourceVersion === sourceVersion
+        && storedSeq < deltaSeq && response.deltaUrls?.length
+        && (stored.payloadVersion === sortSnapshotVersion(sourceVersion, storedSeq)
+            || (!stored.payloadVersion && storedSeq === 0))) {
+        const pending = response.deltaUrls.slice(storedSeq);
+        rows = await applySortDeltas(stored.rows, pending, sourceVersion, storedSeq + 1);
+    } else {
+        rows = await downloadSortIndexBlob(response.indexUrl, editScope, () => generation === requestGeneration, readTokens);
+        if (deltaSeq) {
+            if (snapshotVersions.get(rows) !== sourceVersion) {
+                throw new Error('Sort index changed during base download');
+            }
+            rows = await applySortDeltas(rows, response.deltaUrls!, sourceVersion, 1);
+        }
+    }
+    if (deltaSeq) {
+        // Delta sequence is part of the projection revision. Preserve it in
+        // IndexedDB and when observing replacement upload generations/edits.
+        snapshotVersions.set(rows, version);
+        if (generation === requestGeneration) rows.forEach(row =>
+            observePhotoGeneration(row.filename, row.thumb, editScope, version));
+    }
     filterRemovedRows(key, rows, generation === requestGeneration);
     // An invalidation (bumping `generation`) during this download can let a
     // newer request's write land in IndexedDB first, then have this now-stale
@@ -300,7 +373,7 @@ const fetchLocalSortIndex = async (key: string, requestGeneration: number, editS
     // write regressing this one (or vice versa).
     if (generation === requestGeneration) {
         const writeStarted = perfNow();
-        await idbPutStoredIfNewer(key, { sourceVersion, payloadVersion: snapshotVersions.get(rows), updatedAt: response.updatedAt || '', rows,
+        await idbPutStoredIfNewer(key, { sourceVersion, payloadVersion: snapshotVersions.get(rows), updatedAt: response.updatedAt || '', rows, deltaSeq,
             removedRows: Object.fromEntries(removalsFor(key)) }).catch(() => {
             // Best-effort persistence -- an in-memory-only session still works,
             // it just re-downloads next reload instead of skipping the fetch.
@@ -309,8 +382,8 @@ const fetchLocalSortIndex = async (key: string, requestGeneration: number, editS
     }
     perf.recordSpan('index.sort.total', perfNow() - totalStarted, { cached: false, rows: rows.length });
     const visible = filterRemovedRows(key, rows);
-    const version = snapshotVersions.get(rows);
-    if (version) snapshotVersions.set(visible, version);
+    const payloadVersion = snapshotVersions.get(rows);
+    if (payloadVersion) snapshotVersions.set(visible, payloadVersion);
     return visible;
 };
 

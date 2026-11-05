@@ -35,8 +35,8 @@ test('with maxActive=1, serializes decoding and starts the next file after compl
     complete(1);
     expect((await first).status).toBe('generated');
     expect((await second).status).toBe('generated');
-    expect(workers.every(worker => vi.mocked(worker.terminate).mock.calls.length === 1)).toBe(true);
     service.dispose();
+    expect(workers.every(worker => vi.mocked(worker.terminate).mock.calls.length === 1)).toBe(true);
 });
 
 test('by default, runs more than one decoder concurrently instead of fully serializing', async () => {
@@ -96,8 +96,8 @@ test('each decoder gets its own timeout after queue admission, retrying once bef
     expect(factory).toHaveBeenCalledTimes(3); // b.CR3 only starts once a.CR3's retry also times out
     complete(2);
     expect((await queued).status).toBe('generated');
-    expect(workers.every(worker => vi.mocked(worker.terminate).mock.calls.length === 1)).toBe(true);
     service.dispose();
+    expect(workers.every(worker => vi.mocked(worker.terminate).mock.calls.length === 1)).toBe(true);
 });
 
 test('does not retry a worker-reported decode failure, only timeout/worker-error', async () => {
@@ -173,5 +173,54 @@ test('skips already-aborted work', async () => {
     controller.abort();
     expect(await service.prepare(new File(['raw'], 'a.CR3'), {signal: controller.signal})).toEqual({status: 'fallback', reason: 'aborted'});
     expect(factory).not.toHaveBeenCalled();
+    service.dispose();
+});
+
+test('reuses raster workers across files and releases them after idle expiry', async () => {
+    const service = new UploadAssetPreparer(factory, 4, 30_000, 1);
+    for (let index = 0; index < 10; index++) {
+        const pending = service.prepare(new File(['jpeg'], `${index}.jpg`));
+        complete(0);
+        expect((await pending).status).toBe('generated');
+    }
+    expect(factory).toHaveBeenCalledTimes(1);
+    expect(workers[0].postMessage).toHaveBeenCalledTimes(10);
+    expect(workers[0].terminate).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(workers[0].terminate).toHaveBeenCalledOnce();
+    const next = service.prepare(new File(['jpeg'], 'next.jpg'));
+    expect(factory).toHaveBeenCalledTimes(2);
+    complete(1);
+    await next;
+    service.dispose();
+    expect(workers[1].terminate).toHaveBeenCalledOnce();
+});
+
+test('never reuses cancelled raster work or accepts its late results for the next job', async () => {
+    const service = new UploadAssetPreparer(factory, 4, 30_000, 1);
+    const controller = new AbortController();
+    const cancelled = service.prepare(new File(['jpeg'], 'first.jpg'), {signal: controller.signal});
+    const stale = workers[0].onmessage!;
+    controller.abort();
+    expect(await cancelled).toMatchObject({reason: 'aborted'});
+    const next = service.prepare(new File(['jpeg'], 'second.jpg'));
+    stale.call(workers[0], {data: {status: 'generated', preview: jpeg(), thumbnail: jpeg()}} as MessageEvent);
+    expect(workers[1].terminate).not.toHaveBeenCalled();
+    complete(1);
+    expect((await next).status).toBe('generated');
+    expect(factory).toHaveBeenCalledTimes(2);
+    service.dispose();
+});
+
+test('replaces a failed raster worker and ignores its late error during retry', async () => {
+    const service = new UploadAssetPreparer(factory);
+    const pending = service.prepare(new File(['jpeg'], 'first.jpg'));
+    const stale = workers[0].onerror!;
+    stale.call(workers[0], new ErrorEvent('error'));
+    expect(workers[0].terminate).toHaveBeenCalledOnce();
+    expect(factory).toHaveBeenCalledTimes(2);
+    stale.call(workers[0], new ErrorEvent('error'));
+    complete(1);
+    expect((await pending).status).toBe('generated');
     service.dispose();
 });

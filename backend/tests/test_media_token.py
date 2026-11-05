@@ -133,7 +133,7 @@ def test_default_summary_unchanged_without_flag(monkeypatch):
 
 def test_sort_row_always_carries_thumb_regardless_of_processing_status():
     """thumb is the physical blob name (anonymousImageId or filename), known from
-    upload time -- present even before thumbnail/preview processing finishes, so
+    finalization -- present even before thumbnail/preview processing finishes, so
     the client can attempt the direct URL instead of asking first."""
     done = storage_utils._sort_index_row({'RowKey': 'a.jpg', 'thumbnail_status': 'done', 'anonymousImageId': 'uuid-1'})
     pending = storage_utils._sort_index_row({'RowKey': 'b.jpg', 'thumbnail_status': 'pending', 'anonymousImageId': 'uuid-2'})

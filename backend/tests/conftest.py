@@ -34,12 +34,13 @@ from routes.photos import photos_bp as _photos_bp  # noqa: E402
 from routes.people import people_bp as _people_bp  # noqa: E402
 from routes.albums import albums_bp as _albums_bp  # noqa: E402
 from routes.public import public_bp as _public_bp  # noqa: E402
+from routes.library_operations import library_operations_bp as _library_operations_bp
 from routes.library import library_bp as _library_bp  # noqa: E402
 from routes.tools import tools_bp as _tools_bp  # noqa: E402
 from routes.admin import admin_bp as _admin_bp  # noqa: E402
 from routes.system import system_bp as _system_bp  # noqa: E402
 
-for _bp in (_auth_bp, _upload_bp, _photos_bp, _people_bp, _albums_bp, _public_bp, _library_bp, _tools_bp, _admin_bp, _system_bp):
+for _bp in (_auth_bp, _upload_bp, _photos_bp, _people_bp, _albums_bp, _public_bp, _library_bp, _library_operations_bp, _tools_bp, _admin_bp, _system_bp):
     if _bp.name not in _app_module.app.blueprints:
         _app_module.app.register_blueprint(_bp)
 

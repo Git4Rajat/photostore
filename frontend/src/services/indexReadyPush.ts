@@ -1,13 +1,9 @@
-import { postTools } from './apiClient';
+import { hasForegroundDemand, onForegroundReturn } from './foregroundDemand';
+import { hasIndexDemand, onIndexDemandReturn } from './indexDemand';
+import { post } from './apiClient';
 import { getActiveLibraryFromToken } from './passwordAuthClient';
 import { isLikelyAuthenticated } from './jobNotifications';
 import { pendingEditScope } from './pendingEdits';
-
-// How long a backgrounded tab is still treated as foreground-active before
-// negotiation/reconnect stop -- see docs/audits/index_ready_idle_reproduction.cjs,
-// which reproduces the un-gated behavior this closes (this module previously
-// negotiated/reconnected on its own timers regardless of tab visibility).
-const FOREGROUND_IDLE_GATE_MS = 5 * 60000;
 
 // The push carries an invalidation only; index reads keep their normal authorization.
 export const startIndexReadyPush = (ready: () => void): (() => void) => {
@@ -17,23 +13,7 @@ export const startIndexReadyPush = (ready: () => void): (() => void) => {
     let retry = 1000;
     let generation = 0;
     let scope = pendingEditScope();
-    const hasVisibility = typeof document !== 'undefined' && typeof document.addEventListener === 'function';
-    let hiddenSince: number | null = hasVisibility && document.visibilityState === 'hidden' ? Date.now() : null;
-    // No visibility signal at all (non-browser context) behaves as always-
-    // foreground, unchanged from before this gate existed.
-    const isGated = () => hiddenSince !== null && Date.now() - hiddenSince >= FOREGROUND_IDLE_GATE_MS;
-    const onVisibilityChange = () => {
-        if (document.visibilityState === 'hidden') { hiddenSince = Date.now(); return; }
-        const wasGated = isGated();
-        hiddenSince = null;
-        if (wasGated) {
-            // Authorized catch-up on return: don't wait out whatever poll
-            // interval was already scheduled while backgrounded.
-            clearTimeout(timer);
-            void connect();
-        }
-    };
-    if (hasVisibility) document.addEventListener('visibilitychange', onVisibilityChange);
+    const isGated = () => !hasForegroundDemand() || !hasIndexDemand();
     const connect = async () => {
         const attempt = ++generation;
         const requestedScope = pendingEditScope();
@@ -41,10 +21,12 @@ export const startIndexReadyPush = (ready: () => void): (() => void) => {
         try {
             if (isGated()) { timer = setTimeout(() => void connect(), 30000); return; }
             if (!isLikelyAuthenticated() || !navigator.onLine) { timer = setTimeout(() => void connect(), 30000); return; }
-            const result = await postTools<{ available: boolean; url?: string; libraryId?: string }>(
-                '/api/tools/index-events/negotiate', {},
+            // Subscription authorization is core work. Sending renewals to
+            // the indexer would wake its maintenance sidecar without any work.
+            const result = await post<{ available: boolean; url?: string; libraryId?: string }>(
+                '/api/index-events/negotiate', {},
             );
-            if (stopped || attempt !== generation || requestedScope !== pendingEditScope()) return;
+            if (stopped || isGated() || attempt !== generation || requestedScope !== pendingEditScope()) return;
             if (!result.available || !result.url) {
                 timer = setTimeout(() => void connect(), 60000);
                 return;
@@ -53,14 +35,16 @@ export const startIndexReadyPush = (ready: () => void): (() => void) => {
             socket = connection;
             timer = setTimeout(() => connection.close(), 15000);
             connection.onopen = () => {
-                if (stopped || attempt !== generation || requestedScope !== pendingEditScope()) return;
+                if (stopped || isGated() || attempt !== generation || requestedScope !== pendingEditScope()) return;
                 clearTimeout(timer);
                 retry = 1000;
                 ready(); // Recover publications missed while disconnected.
+                // Bound subscription authorization by periodically checking
+                // library access again. This renewal uses core, not indexer.
                 timer = setTimeout(() => connection.close(), 4 * 60000);
             };
             connection.onmessage = event => {
-                if (stopped || attempt !== generation || requestedScope !== pendingEditScope()) return;
+                if (stopped || isGated() || attempt !== generation || requestedScope !== pendingEditScope()) return;
                 try {
                     const message = JSON.parse(String(event.data));
                     if (message.type === 'index-ready' && message.libraryId === getActiveLibraryFromToken()) ready();
@@ -80,17 +64,31 @@ export const startIndexReadyPush = (ready: () => void): (() => void) => {
             retry = Math.min(30000, retry * 2);
         }
     };
+    let gated = false;
     const scopeTimer = setInterval(() => {
+        if (isGated()) {
+            if (!gated) { gated = true; generation += 1; clearTimeout(timer); socket?.close(); socket = null; }
+            return;
+        }
         if (scope === pendingEditScope()) return;
         generation += 1;
         clearTimeout(timer);
         socket?.close(); socket = null;
         void connect();
     }, 1000);
+    const foregroundReturn = onForegroundReturn(() => {
+        gated = false; generation += 1; clearTimeout(timer); socket?.close(); socket = null;
+        void connect();
+    });
+    const indexDemandReturn = onIndexDemandReturn(() => {
+        gated = false; generation += 1; clearTimeout(timer); socket?.close(); socket = null;
+        void connect();
+    });
     void connect();
     return () => {
+        foregroundReturn();
+        indexDemandReturn();
         stopped = true; generation += 1;
         clearTimeout(timer); clearInterval(scopeTimer); socket?.close();
-        if (hasVisibility) document.removeEventListener('visibilitychange', onVisibilityChange);
     };
 };

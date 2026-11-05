@@ -1,0 +1,49 @@
+{
+  "before": {
+    "mode": "per_write",
+    "faces": 500,
+    "calls": {
+      "people.query_entities": 37,
+      "faces.query_entities": 1,
+      "faces.get_entity": 1000,
+      "people.get_entity": 1000,
+      "admission.get_entity": 2000,
+      "coverage.get_entity": 2001,
+      "coverage.create_entity": 1,
+      "coverage.submit_transaction": 2000,
+      "people.update_entity": 500,
+      "members.create_entity": 500,
+      "faces.update_entity": 500
+    },
+    "total_measured_calls": 9540,
+    "coverage_pages": 0,
+    "scoped_writes": 0
+  },
+  "after": {
+    "mode": "page",
+    "faces": 500,
+    "calls": {
+      "people.query_entities": 37,
+      "faces.query_entities": 1,
+      "faces.get_entity": 500,
+      "people.get_entity": 500,
+      "admission.get_entity": 1004,
+      "coverage.get_entity": 9,
+      "coverage.create_entity": 1,
+      "coverage.submit_transaction": 8,
+      "people.update_entity": 500,
+      "members.create_entity": 500,
+      "faces.update_entity": 500
+    },
+    "total_measured_calls": 3560,
+    "coverage_pages": 4,
+    "scoped_writes": 1000
+  },
+  "output_parity": true,
+  "limitations": [
+    "Fake storage, no service latency.",
+    "Counts exclude journal/control storage, immutable receipts and network bytes.",
+    "Wave ownership callback is constant; production policy lookup cost excluded.",
+    "Nested fake transaction implementation calls counted only once."
+  ]
+}

@@ -96,6 +96,23 @@ def _change(meta, row):
     storage_utils.touch_user_search_indexes_state('lib', filenames=row['RowKey'])
 
 
+def test_delta_excludes_reservations_and_admits_them_after_finalization(world):
+    _, meta, _ = world
+    row = {'PartitionKey': 'lib', 'RowKey': 'reserved.png', 'pendingAnonymousBlob': 'reserved',
+           'upload_started_at': '2026-10-27T19:21:30+00:00', 'thumbnail_status': 'running'}
+    _change(meta, row)
+    outcome = storage_utils.refresh_user_search_db_incremental('lib')
+    assert outcome['upserts'] == 0 and outcome['deletes'] == 1
+    assert search_db.open_database('lib').row_count() == 3
+
+    row.update(anonymousImageId='reserved', uploadDate='2026-10-28T09:00:00+00:00',
+               thumbnail_status='pending', processing_complete=False)
+    _change(meta, row)
+    outcome = storage_utils.refresh_user_search_db_incremental('lib')
+    assert outcome['upserts'] == 1 and outcome['deletes'] == 0
+    assert search_db.open_database('lib').row_count() == 4
+
+
 def test_an_update_an_insert_and_a_removal_become_searchable_without_a_rebuild(world):
     svc, meta, dirty = world
     db = search_db.open_database('lib')

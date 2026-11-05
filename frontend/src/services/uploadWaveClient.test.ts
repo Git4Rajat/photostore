@@ -1,12 +1,16 @@
 // @vitest-environment node
+import { ApiError } from './apiError';
 import { webcrypto } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const mocks = vi.hoisted(() => ({ post: vi.fn() }));
-vi.mock('./apiClient', () => ({ postUpload: mocks.post }));
-import { closeWaveShadowSession, openWaveShadowSession, registerWaveShadowItems, resolveWaveShadowItem } from './uploadWaveClient';
+const mocks = vi.hoisted(() => ({ post: vi.fn(), get: vi.fn(), scope: 'test' }));
+vi.mock('./sessionScope', () => ({ sessionScope: () => mocks.scope }));
+vi.mock('./apiClient', () => ({ postUpload: mocks.post, getUpload: mocks.get }));
+import { discardWaveSession, abandonWaveShadowSession, renewUploadWaveLease, waveLiveEnabled, waveProtocol, closeWaveShadowSession, openWaveShadowSession, registerWaveShadowItems, resolveWaveShadowItem, resolveWaveShadowItems } from './uploadWaveClient';
 
 beforeEach(() => {
+    mocks.scope = crypto.randomUUID();
+    mocks.get.mockReset().mockResolvedValue({ protocol: 'live' });
     vi.stubGlobal('crypto', webcrypto);
     vi.stubEnv('VITE_UPLOAD_WAVE_SHADOW_ENABLED', 'true');
     mocks.post.mockReset().mockResolvedValue({ manifestRevision: 'rev-1' });
@@ -14,6 +18,17 @@ beforeEach(() => {
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
 
 describe('shadow wire protocol', () => {
+    it('hashes batched outcomes consistently with manifest registration', async () => {
+        await registerWaveShadowItems('parent', [{ itemId: 'key:a', filename: 'a.jpg' }]);
+        await resolveWaveShadowItems('parent', [{ itemId: 'key:a', outcome: 'duplicate', filename: 'a.jpg' },
+            { itemId: 'key:b', outcome: 'failed' }]);
+        const [url, body, config] = mocks.post.mock.calls[1];
+        expect(url).toContain('/resolve-batch');
+        expect(body.items[0]).toEqual({ itemId: mocks.post.mock.calls[0][1].items[0].itemId,
+            outcome: 'duplicate', filename: 'a.jpg' });
+        expect(body.items[1].itemId).toMatch(/^[a-f0-9]{64}$/);
+        expect(config).toEqual({ singleAttempt: true, timeout: 120000 });
+    });
     it('makes no requests while client diagnostics are disabled', async () => {
         vi.stubEnv('VITE_UPLOAD_WAVE_SHADOW_ENABLED', 'false');
         expect(await openWaveShadowSession('parent', 1)).toBeNull();
@@ -46,4 +61,227 @@ describe('shadow wire protocol', () => {
         mocks.post.mockRejectedValue(new Error('offline'));
         expect(await openWaveShadowSession('parent', 1)).toBeNull();
     });
+});
+
+it('discovers live ownership per library and preserves legacy uploads in the same build', async () => {
+    vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
+    mocks.get.mockResolvedValueOnce({ protocol: 'legacy' });
+    expect(await waveProtocol()).toBe('legacy');
+    expect(await openWaveShadowSession('old', 1)).toBeNull();
+    expect(mocks.post).not.toHaveBeenCalled();
+    mocks.scope = 'another-library';
+    expect(await openWaveShadowSession('new', 1)).not.toBeNull();
+    expect(mocks.post.mock.calls[0][0]).toContain('/waves/live/');
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+});
+it('never guesses legacy ownership after a discovery error and permits retry', async () => {
+    mocks.get.mockRejectedValueOnce(new Error('storage unavailable'));
+    await expect(waveProtocol()).rejects.toThrow('storage unavailable');
+    await expect(waveProtocol()).resolves.toBe('live');
+});
+
+it('preserves live admission errors while outcome reports remain best effort', async () => {
+    vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
+    mocks.post.mockRejectedValue({ response: { data: { error: 'Library cleanup is in progress' } } });
+    await expect(openWaveShadowSession('new-selection', 3544)).rejects.toThrow('Library cleanup is in progress');
+    await expect(registerWaveShadowItems('new-selection', [{ itemId: 'key', filename: '000201.webp' }]))
+        .rejects.toThrow('Library cleanup is in progress');
+    await expect(resolveWaveShadowItem('stopped-selection', 'key', 'cancelled')).resolves.toBeNull();
+});
+
+it('allows the deployed runtime flag to opt in without a special frontend image build', async () => {
+    vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'false');
+    vi.stubGlobal('window', { __APP_CONFIG__: { uploadWaveExecutionEnabled: true } });
+    expect(waveLiveEnabled()).toBe(true);
+    await openWaveShadowSession('runtime-parent', 1);
+    expect(mocks.post.mock.calls[0][0]).toContain('/waves/live/');
+    window.__APP_CONFIG__!.uploadWaveExecutionEnabled = false;
+    expect(waveLiveEnabled()).toBe(false);
+});
+
+
+it('retries only transient 409 contention with the identical admission payload', async () => {
+    vi.stubGlobal('crypto', { subtle: { digest: async () => new Uint8Array(32).buffer } });
+    vi.useFakeTimers();
+    try {
+        vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
+        mocks.post.mockRejectedValueOnce({response: {status: 409, data: {code: 'wave_mutation_contention', error: 'Concurrent wave mutation; retry the request'}}})
+            .mockResolvedValueOnce({manifestRevision: 'registered', registeredCount: 1});
+        const pending = registerWaveShadowItems('retry', [{itemId: 'stable', filename: 'photo.jpg'}]);
+        await vi.runAllTimersAsync();
+        await expect(pending).resolves.toEqual({manifestRevision: 'registered', registeredCount: 1});
+        expect(mocks.post).toHaveBeenCalledTimes(2);
+        expect(mocks.post.mock.calls[0][1]).toEqual(mocks.post.mock.calls[1][1]);
+    } finally { vi.useRealTimers(); }
+});
+
+it('does not retry a permanent admission conflict', async () => {
+    vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
+    mocks.post.mockRejectedValue({response: {status: 409, data: {error: 'Session is closed'}}});
+    await expect(openWaveShadowSession('closed', 1)).rejects.toThrow('Session is closed');
+    expect(mocks.post).toHaveBeenCalledTimes(1);
+});
+
+it('automatically retries a timed-out live admission with the identical payload', async () => {
+    vi.useFakeTimers();
+    try {
+        vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
+        mocks.post.mockRejectedValueOnce(new ApiError({kind:'timeout',retriable:true,requestId:'timeout',
+            message:'The server took too long to respond. Please try again in a moment.',rawMessage:'timeout'}))
+            .mockResolvedValueOnce({waveId:'wave-1',manifestRevision:'opened'});
+        const pending=openWaveShadowSession('slow-start',30);
+        await vi.runAllTimersAsync();
+        await expect(pending).resolves.toMatchObject({manifestRevision:'opened'});
+        expect(mocks.post).toHaveBeenCalledTimes(2);
+        expect(mocks.post.mock.calls[0][1]).toEqual(mocks.post.mock.calls[1][1]);
+    } finally { vi.useRealTimers(); }
+});
+
+it('bounds automatic retries for unavailable live admission', async () => {
+    vi.useFakeTimers();
+    try {
+        vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
+        mocks.post.mockRejectedValue(new ApiError({kind:'unreachable',status:503,retriable:true,requestId:'unavailable',
+            message:"Can't reach the server right now",rawMessage:'Service unavailable'}));
+        const pending=openWaveShadowSession('unavailable',30);
+        const checked=expect(pending).rejects.toThrow("Can't reach the server right now");
+        await vi.runAllTimersAsync();
+        await checked;
+        expect(mocks.post).toHaveBeenCalledTimes(4);
+    } finally { vi.useRealTimers(); }
+});
+
+it('bounds contention retries and stops replay if the authenticated scope changes', async () => {
+    vi.useFakeTimers();
+    try {
+        vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
+        const error = {response: {status: 409, data: {code: 'wave_mutation_contention', error: 'Concurrent wave mutation; retry the request'}}};
+        mocks.post.mockRejectedValue(error);
+        const pending = openWaveShadowSession('busy', 1);
+        const checked = expect(pending).rejects.toThrow('Concurrent wave mutation');
+        await vi.runAllTimersAsync(); await checked;
+        expect(mocks.post).toHaveBeenCalledTimes(4);
+        mocks.post.mockClear();
+        mocks.post.mockImplementationOnce(async () => { mocks.scope = 'other-account'; throw error; });
+        const changed = openWaveShadowSession('busy', 1);
+        await vi.runAllTimersAsync();
+        expect(await changed).toBeNull();
+        expect(mocks.post).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
+});
+
+
+it('renews the session lease using the existing heartbeat transport', async () => {
+    mocks.post.mockResolvedValue({leaseActive:false,leaseExpiresAt:123,serverNow:456});
+    expect(await renewUploadWaveLease('parent')).toMatchObject({leaseActive:false});
+    expect(mocks.post).toHaveBeenCalledWith('/upload/transfer-heartbeat',
+        {waveSessionId:'parent'},{singleAttempt:true,timeout:15000});
+});
+
+it('rejects heartbeat acknowledgment after switching libraries', async () => {
+    mocks.post.mockImplementationOnce(async () => { mocks.scope='other';return {leaseActive:true}; });
+    await expect(renewUploadWaveLease('parent')).rejects.toThrow('Upload library changed');
+});
+
+
+it('uses the versioned discard route and preserves its resume lineage', async () => {
+    mocks.post.mockResolvedValue({state:'absent',manifestRevision:'tombstone',resumedFromSessionId:'previous'});
+    await discardWaveSession('retry','previous');
+    const [url,body]=mocks.post.mock.calls[0];
+    expect(url).toContain('/sessions/retry/discard');
+    expect(body).toEqual({reason:'User discarded the paused upload',resumedFromSessionId:'previous'});
+});
+
+it('preserves exact manifest revisions for the preceding API compatibility path', async () => {
+    await abandonWaveShadowSession('parent','revision-42');
+    expect(mocks.post.mock.calls[0][0]).toContain('/sessions/parent/abandon');
+    expect(mocks.post.mock.calls[0][1].manifestRevision).toBe('revision-42');
+});
+
+
+it('keeps structured application 503 errors instead of the generic cold-start message', async () => {
+    vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED','true');
+    mocks.post.mockRejectedValue(new ApiError({kind:'unreachable',status:503,retriable:true,requestId:'test',
+        message:"Can't reach the server right now",rawMessage:'Upload service is temporarily unavailable. Please retry.',
+        responseData:{error:'Upload service is temporarily unavailable. Please retry.',code:'upload_session_directory_unavailable'}}));
+    await expect(openWaveShadowSession('parent',1)).rejects.toMatchObject({status:503,code:'upload_session_directory_unavailable',
+        message:'Upload admission failed: Upload service is temporarily unavailable. Please retry.'});
+});
+
+it('preserves normalized 404 status for the preceding-API discard fallback', async () => {
+    vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED','true');
+    mocks.post.mockRejectedValue(new ApiError({kind:'client',status:404,retriable:false,requestId:'test',
+        message:'Not found',rawMessage:'Not found'}));
+    await expect(discardWaveSession('parent')).rejects.toMatchObject({status:404});
+});
+
+it('retries normalized contention failures with the same stable payload', async () => {
+    vi.useFakeTimers();
+    try {
+        vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED','true');
+        mocks.post.mockRejectedValueOnce(new ApiError({kind:'client',status:409,retriable:false,requestId:'test',
+            message:'Concurrent wave mutation; retry the request',rawMessage:'Concurrent wave mutation; retry the request',
+            responseData:{code:'wave_mutation_contention',error:'Concurrent wave mutation; retry the request'}}))
+            .mockResolvedValueOnce({manifestRevision:'opened'});
+        const pending=openWaveShadowSession('stable-parent',2);
+        await vi.runAllTimersAsync();
+        await expect(pending).resolves.toMatchObject({manifestRevision:'opened'});
+        expect(mocks.post).toHaveBeenCalledTimes(2);
+        expect(mocks.post.mock.calls[0][1]).toEqual(mocks.post.mock.calls[1][1]);
+    } finally { vi.useRealTimers(); }
+});
+
+it('waits through a 34-second artifact cleanup and replays identical admission once it clears', async () => {
+    vi.useFakeTimers();
+    try {
+        vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED','true');
+        const start=Date.now();
+        mocks.post.mockImplementation(async () => {
+            if (Date.now()-start<34000) throw new ApiError({kind:'client',status:409,retriable:false,requestId:'test',
+                message:'Upload is waiting for background cleanup to finish.',rawMessage:'GC active',
+                responseData:{error:'Upload is waiting for background cleanup to finish.',code:'wave_artifact_cleanup_busy'}});
+            return {manifestRevision:'opened'};
+        });
+        const pending=openWaveShadowSession('waiting-parent',2);
+        await vi.runAllTimersAsync();
+        await expect(pending).resolves.toMatchObject({manifestRevision:'opened'});
+        expect(Date.now()-start).toBeGreaterThanOrEqual(34000);
+        expect(Date.now()-start).toBeLessThan(40000);
+        for (const [,body] of mocks.post.mock.calls) expect(body).toEqual({sessionId:'waiting-parent',declaredCount:2});
+    } finally { vi.useRealTimers(); }
+});
+
+it('bounds the artifact-cleanup wait and retains its useful server error', async () => {
+    vi.useFakeTimers();
+    try {
+        vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED','true');
+        const start=Date.now();
+        mocks.post.mockRejectedValue(new ApiError({kind:'client',status:409,retriable:false,requestId:'test',
+            message:'Upload is waiting for background cleanup to finish.',rawMessage:'GC active',
+            responseData:{error:'Upload is waiting for background cleanup to finish.',code:'wave_artifact_cleanup_busy'}}));
+        const pending=openWaveShadowSession('still-busy',1);
+        const checked=expect(pending).rejects.toMatchObject({code:'wave_artifact_cleanup_busy'});
+        await vi.runAllTimersAsync();await checked;
+        expect(Date.now()-start).toBe(90000);
+        expect(mocks.post.mock.calls.length).toBeLessThan(25);
+    } finally { vi.useRealTimers(); }
+});
+
+it('does not keep retrying a real library cleanup or a changed account', async () => {
+    vi.useFakeTimers();
+    try {
+        vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED','true');
+        mocks.post.mockRejectedValueOnce(new ApiError({kind:'client',status:409,retriable:false,requestId:'test',
+            message:'Library cleanup is in progress',rawMessage:'Library cleanup is in progress'}));
+        await expect(openWaveShadowSession('cleaning',1)).rejects.toThrow('Library cleanup is in progress');
+        expect(mocks.post).toHaveBeenCalledTimes(1);
+        mocks.post.mockReset().mockImplementation(async () => {
+            mocks.scope='changed';
+            throw {status:409,responseData:{code:'wave_artifact_cleanup_busy'}};
+        });
+        const pending=openWaveShadowSession('old-account',1);
+        await vi.runAllTimersAsync();
+        expect(await pending).toBeNull();
+        expect(mocks.post).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
 });

@@ -151,6 +151,8 @@ def current_scope() -> Optional[Scope]:
 
 
 def record_io(kind: str, method: str, path: str, status: int, ms: float, nbytes: int) -> None:
+    from processing_metrics import record_io as processing_io
+    processing_io(kind, method, path, status, ms, nbytes)
     op = _op_label(kind, method, path)
     with _totals_lock:
         row = _io_totals.setdefault(op, [0, 0.0, 0])

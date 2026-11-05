@@ -50,6 +50,46 @@ def test_stale_attempt_cannot_write_output(world, change):
     assert not faces.rows
 
 
+@pytest.mark.parametrize('operation', ['claim', 'commit'])
+def test_policy_cache_cannot_hide_cleanup_from_source_claim_or_commit(world, monkeypatch, operation):
+    from processing_cleanup import source_policy_scope, check_source_policy
+    from test_wave_activation import active
+    from test_wave_recovery import RuntimeTable
+    metadata, *_ = world
+    jobs = RuntimeTable()
+    store = active(jobs, 'lib')
+    monkeypatch.setitem(storage_utils._CTX, 'source_policy_check', lambda uid: check_source_policy(jobs, uid))
+    with source_policy_scope(jobs, 'lib'):
+        row = jobs.get_entity(store.partition, 'policy')
+        jobs.update_entity(dict(row, cleanupState='cleaning'), etag=row.metadata['etag'], match_condition='IfNotModified')
+        baseline = metadata.get_entity('lib', 'photo.jpg')
+        with pytest.raises(RuntimeError, match='cleanup'):
+            if operation == 'claim':
+                storage_utils.claim_processing_lease('lib', 'photo.jpg', 'other-owner')
+            else:
+                storage_utils._commit_worker_processing_results('lib', 'photo.jpg', baseline,
+                    dict(baseline), {}, 'owner')
+    assert metadata.update_calls == 0
+
+
+def test_cached_policy_does_not_cache_photo_generation_checks(world, monkeypatch):
+    import processing_fence
+    from processing_cleanup import source_policy_scope, check_source_policy
+    from test_wave_activation import active
+    from test_wave_recovery import RuntimeTable
+    metadata, faces, _, _, fence = world
+    jobs = RuntimeTable()
+    active(jobs, 'lib')
+    monkeypatch.setattr(processing_fence, 'POLICY_CHECK', lambda uid: check_source_policy(jobs, uid))
+    with source_policy_scope(jobs, 'lib'), result_fence(fence):
+        fence.check()
+        row = metadata.get_entity('lib', 'photo.jpg')
+        metadata.upsert_entity(dict(row, processingFence='replacement'))
+        with pytest.raises(StaleProcessingResult):
+            write_artifact(faces, dict(PartitionKey='lib', RowKey='face', filename='photo.jpg'))
+    assert not faces.rows
+
+
 def test_artifact_cas_rejects_newer_curation_instead_of_retrying_with_its_version(world):
     _, faces, _, _, fence = world
     faces.upsert_entity(dict(PartitionKey='lib', RowKey='face', filename='photo.jpg', personId='old'))
@@ -137,3 +177,72 @@ def test_zero_face_result_publishes_an_explicit_attempt_bound_empty_lookup(world
     assert row['state'] == 'complete' and json.loads(row['faceIds']) == []
     assert row['processingFence'] == 'attempt' and row['sourcePhotoId'] == 'photo'
     assert not faces.rows and not embeddings.rows
+
+
+def test_face_batches_keep_one_fresh_source_check_per_transaction(world, monkeypatch):
+    *_, fence = world
+    original = ResultFence.check
+    checks = []
+    def check(self):
+        checks.append(self.attempt)
+        return original(self)
+    monkeypatch.setattr(ResultFence, 'check', check)
+    with result_fence(fence):
+        ids = storage_utils._store_client_face_entities('lib', 'photo.jpg', [_face(0), _face(40)])
+    assert len(ids) == 2
+    # Filename acquire + publish, and one check before each table transaction.
+    # Filename lease checks no longer duplicate those artifact checks.
+    assert len(checks) == 4
+
+
+def test_source_change_during_embedding_read_still_blocks_persistence(world, monkeypatch):
+    metadata, faces, embeddings, _, fence = world
+    read = embeddings.get_entity
+    def changed(*args, **kwargs):
+        row = metadata.get_entity('lib', 'photo.jpg')
+        metadata.upsert_entity(dict(row, processingFence='replacement-attempt'))
+        return read(*args, **kwargs)
+    monkeypatch.setattr(embeddings, 'get_entity', changed)
+    with result_fence(fence), pytest.raises(StaleProcessingResult):
+        storage_utils._store_client_face_entities('lib', 'photo.jpg', [_face(0)])
+    assert not faces.rows and not embeddings.rows
+
+
+def test_immutable_checks_coalesce_but_mutable_writes_keep_immediate_fence(world):
+    from processing_fence import immutable_artifact_checks, check_immutable_source
+    import processing_metrics
+    metadata, faces, _, _, fence = world
+    with result_fence(fence), processing_metrics.accounting() as metrics:
+        metadata.get_calls = 0
+        with immutable_artifact_checks(fence):
+            for _ in range(4): check_immutable_source(fence)
+            assert metadata.get_calls == 0
+            write_artifact(faces, dict(PartitionKey='lib', RowKey='face', filename='photo.jpg'))
+            assert metadata.get_calls == 1  # Mutable artifacts never defer ownership.
+        assert metadata.get_calls == 2  # Exactly one final immutable-publication check.
+    assert metrics.snapshot()['artifact_source_checks_coalesced'] == 3
+    assert metrics.snapshot()['artifact_source_check_batches'] == 1
+
+
+@pytest.mark.parametrize('change', [{'processingRevision': 'replacement'}, {'processingFence': 'successor'},
+    {'processing_lease_owner': 'other'}, {'anonymousImageId': 'other-photo'},
+    {'processing_lease_expires_at': '2000-01-01T00:00:00+00:00'},
+    {'processingGeneration': 'c' * 64}, {'processing_state': 'deleted'}, {'processingIsolated': True}])
+def test_coalesced_boundary_rejects_stale_source_and_scope_is_reset(world, change):
+    from processing_fence import immutable_artifact_checks, check_immutable_source
+    metadata, _, _, _, fence = world
+    with result_fence(fence):
+        with pytest.raises(StaleProcessingResult):
+            with immutable_artifact_checks(fence):
+                check_immutable_source(fence)
+                row = metadata.get_entity('lib', 'photo.jpg'); row.update(change); metadata.upsert_entity(row)
+                check_immutable_source(fence)
+        # A failed scope cannot leave later checks deferred.
+        with pytest.raises(StaleProcessingResult): check_immutable_source(fence)
+
+
+def test_immutable_batch_requires_active_fence(world):
+    from processing_fence import immutable_artifact_checks
+    *_, fence = world
+    with pytest.raises(StaleProcessingResult, match='active source fence'):
+        with immutable_artifact_checks(fence): pass

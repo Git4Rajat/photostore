@@ -1,0 +1,42 @@
+{
+  "table_journal": {
+    "faces": 1000,
+    "mode": "tables",
+    "seconds": 1.694,
+    "calls": {
+      "jobs.get_entity": 13027,
+      "jobs.submit_transaction": 3010,
+      "people.get_entity": 2002,
+      "faces.query_entities": 1,
+      "faces.get_entity": 2000,
+      "people.update_entity": 999,
+      "members.get_entity": 1000,
+      "members.create_entity": 1000,
+      "faces.update_entity": 1000,
+      "people.create_entity": 1
+    },
+    "total_calls": 24040,
+    "receipt": "2bfc8e5feb06ed821131a221b67519d924601e63c93d735ce0e0bccf4ef19f53"
+  },
+  "file_journal": {
+    "faces": 1000,
+    "mode": "files",
+    "seconds": 2.83,
+    "calls": {
+      "jobs.get_entity": 10,
+      "jobs.submit_transaction": 4,
+      "people.get_entity": 2002,
+      "faces.query_entities": 1,
+      "faces.get_entity": 2000,
+      "people.update_entity": 999,
+      "members.get_entity": 1000,
+      "members.create_entity": 1000,
+      "faces.update_entity": 1000,
+      "people.create_entity": 1
+    },
+    "total_calls": 8017,
+    "receipt": "95bae40119af0e58a2020516a5445ed349218363d1d54816234b03c2bb0f19ec"
+  },
+  "output_parity": true,
+  "note": "Synthetic Table I/O; no Azure latency. Guard-check frequency held constant."
+}

@@ -109,13 +109,15 @@ def test_exif_failure_cannot_downgrade_completed_geo(metadata, monkeypatch, serv
     {'GPSLatitude': '10'}, {'GPSLatitude': 'broken', 'GPSLongitude': '20'},
     {'GPS.LatitudeDecimal': 'NaN', 'GPS.LongitudeDecimal': '20'},
 ])
-def test_server_fallback_malformed_gps_is_failed_not_absent(monkeypatch, exif):
+def test_server_fallback_malformed_gps_is_terminal_no_data(metadata, monkeypatch, exif):
+    # Malformed GPS fields are deterministic garbage in the file -- re-parsing
+    # the same bytes always reaches the same verdict, so this must resolve
+    # immediately (no_data) rather than sit as a 'failed' step retried forever.
     monkeypatch.setattr(storage_utils, '_extract_server_exif_for_processing', lambda *_: exif)
-    monkeypatch.setattr(storage_utils, 'mark_step_no_data', lambda *_: pytest.fail('Unverified absence'))
     monkeypatch.setattr(storage_utils.maps_utils, 'reverse_geocode', lambda *_: pytest.fail('Invalid GPS'))
-    row = {}
+    row = metadata.get_entity('owner', 'photo.raw')
     updates = storage_utils._apply_server_exif_fallback('owner', 'photo.raw', row, b'original', fallback_for='test')
-    assert updates == {'exif_status': 'done', 'map_detection_status': 'failed'}
+    assert updates == {'exif_status': 'done', 'map_detection_status': 'no_data'}
     assert json.loads(row['exifData']) == exif
     assert 'latitude' not in row and 'longitude' not in row
 
@@ -160,14 +162,17 @@ def test_real_empty_worker_result_parses_only_once_through_saving(metadata, monk
     {'GPS.LatitudeDecimal': 'NaN', 'GPS.LongitudeDecimal': '20'},
     {'GPSLatitude': '10'}, {'GPSLatitude': '1 75 2', 'GPSLongitude': '20'},
 ])
-def test_packet_gps_validation_without_explicit_geo_never_claims_absence(metadata, monkeypatch, data):
+def test_packet_gps_validation_without_explicit_geo_is_terminal_no_data(metadata, monkeypatch, data):
+    # Malformed GPS fields in a browser metadata packet are deterministic
+    # garbage, same as the server-extraction path -- fail fast to 'no_data'
+    # rather than retrying this step forever.
     monkeypatch.setattr(storage_utils, 'download_media_bytes', lambda *_: pytest.fail('Unexpected original'))
     monkeypatch.setattr(storage_utils.maps_utils, 'reverse_geocode', lambda *_: pytest.fail('Invalid GPS'))
     storage_utils.apply_client_processing_results_for_file('owner', 'photo.raw', origin='ipworker',
         client_processing={'exif': {'hasData': True, 'source': 'browser_metadata_packet', 'data': data}})
     row = metadata.get_entity('owner', 'photo.raw')
     assert row['exif_status'] == 'done'
-    assert row['map_detection_status'] == 'failed'
+    assert row['map_detection_status'] == 'no_data'
     assert 'latitude' not in row and 'longitude' not in row
 
 
@@ -193,11 +198,7 @@ def test_native_worker_metadata_does_not_lose_late_keys_to_the_browser_limit(met
 ])
 def test_shared_gps_validation_numeric_zero_dms_and_references(data, expected):
     from ipwork_geo import geo_coordinates_from_exif
-    if expected is None:
-        with pytest.raises(ValueError):
-            geo_coordinates_from_exif(data)
-    else:
-        assert geo_coordinates_from_exif(data) == expected
+    assert geo_coordinates_from_exif(data) == expected
 
 
 def test_truncated_metadata_is_a_storage_limit_failure(monkeypatch):

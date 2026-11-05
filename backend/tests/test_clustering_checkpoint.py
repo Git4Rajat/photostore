@@ -179,3 +179,10 @@ def test_restore_symlink_share_falls_back_without_copying(snapshot, tmp_path):
     linked = tmp_path / 'linked'
     linked.symlink_to(share, target_is_directory=True)
     assert LiveFaceIndex.restore_checkpoint(linked, tmp_path / 'restore', source_revision=1) is None
+
+def test_explicit_zero_grace_bounds_wave_private_snapshot_retention(snapshot):
+    runtime,share=snapshot
+    generations=[runtime.save_checkpoint(share,source_revision=i) for i in range(5)]
+    checkpoint.cleanup_checkpoints(share,grace_seconds=0)
+    remaining={p.name for p in share.glob('gen-*')}
+    assert remaining == set(generations[-2:])

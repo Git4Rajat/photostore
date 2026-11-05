@@ -1,0 +1,37 @@
+{
+  "kind": "synthetic coordination comparison; not production throughput",
+  "config": {
+    "baseline_ref": "7e76cff",
+    "photos": 80,
+    "workers": 2,
+    "storage_ms": 2.0,
+    "model_ms": 100.0
+  },
+  "baseline_commit": "7e76cffcd12f6c55fd748cb50f3802ff8666bb6d",
+  "before": {
+    "seconds": 18.6581,
+    "calls": {
+      "wave.get_entity": 2831,
+      "wave.submit_transaction": 579,
+      "wave.query_entities": 11,
+      "metadata.get_entity": 240,
+      "observation_transactions": 80,
+      "checkpoints": 81
+    },
+    "verified_sources": 80
+  },
+  "after": {
+    "seconds": 8.9901,
+    "calls": {
+      "wave.get_entity": 1819,
+      "wave.submit_transaction": 219,
+      "wave.query_entities": 11,
+      "metadata.query_entities": 8,
+      "metadata.get_entity": 80,
+      "observation_transactions": 4,
+      "checkpoints": 6
+    },
+    "verified_sources": 80
+  },
+  "speedup": 2.08
+}

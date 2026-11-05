@@ -63,6 +63,7 @@ class CropPreview:
     data: bytes
     source_blob: str
     source_hash: str
+    source_revision: str = ''
 
     def __call__(self):
         return self.data
@@ -88,7 +89,7 @@ def remember_crop_preview(user, filename, metadata, data, width, height):
     source_hash = str(metadata.get('fileHash') or '')
     # Legacy mutable filename-only blobs have no stable source identity.
     if blob or source_hash:
-        job['preview'] = CropPreview(data, blob, source_hash)
+        job['preview'] = CropPreview(data, blob, source_hash, str(metadata.get('processingRevision') or ''))
 
 
 def crop_preview(user, filename, metadata):

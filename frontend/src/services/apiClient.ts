@@ -2,6 +2,7 @@ import { getRuntimeConfig } from '../config/appConfig';
 import { createHttpClient, requestJson, type RequestConfig } from './httpClient';
 import { configureBackendStatus } from './backendStatus';
 import { perf } from './perf';
+import { resolveServiceUrl } from './apiOwnership';
 const runtimeConfig = getRuntimeConfig();
 const env = import.meta.env as Record<string, string | undefined>;
 const apiUrl =
@@ -50,33 +51,12 @@ const INDEXER_BASE_URL = indexerUrl || '';
 const RECOVERY_BASE_URL = recoveryUrl || '';
 const ARCHIVE_BASE_URL = archiveUrl || '';
 
-// Path prefixes exclusively owned by the `archive` container app (library,
-// public share-link routes -- see library.py|public.py's APP_ROLE=archive
-// split). resolveApiUrl uses this so callers that already have a raw path
-// (e.g. a public album's thumbnail URL) resolve to the right origin without
-// every call site having to know which service serves which prefix.
-//
-// people/faces ('/api/persons', '/api/faces', '/api/people', '/persons',
-// '/people') moved off this list 2026-10-08 -- routes/people.py's
-// APP_ROLE=archive split was undone (people_bp moved back to 'core'), so
-// those paths now resolve to API_BASE_URL via the plain get/post, not
-// getArchive/postArchive. See faceService.ts, store.tsx, localPeopleIndex.ts,
-// faceMediaCache.ts for the call sites that switched off getArchive/postArchive.
-const ARCHIVE_PATH_PREFIXES = ['/api/library', '/public', '/api/public'];
-
-export const resolveApiUrl = (url?: string): string => {
+// Shared with libraryClient: management is core; operations/public are archive.
+export const resolveApiUrl = (url?: string, method = 'GET'): string => {
     if (!url) {
         return '';
     }
-    if (/^https?:\/\//i.test(url)) {
-        return url;
-    }
-    const normalized = url.startsWith('/') ? url : `/${url}`;
-    const base = ARCHIVE_PATH_PREFIXES.some((prefix) => normalized.startsWith(prefix)) ? ARCHIVE_BASE_URL : API_BASE_URL;
-    if (!base) {
-        return url;
-    }
-    return `${base.replace(/\/$/, '')}/${url.replace(/^\/+/, '')}`;
+    return resolveServiceUrl(url, method, API_BASE_URL, ARCHIVE_BASE_URL);
 };
 
 const apiClient = createHttpClient(API_BASE_URL);

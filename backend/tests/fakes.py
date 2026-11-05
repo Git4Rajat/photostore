@@ -85,6 +85,18 @@ class FakeTable:
         return rows
 
     def query_entities(self, filter_str, select=None, **kwargs):
+        match = re.fullmatch(r"PartitionKey eq '((?:[^']|'')*)' and RowKey ge '([^']*)' and RowKey lt '([^']*)'", filter_str.strip())
+        if match:
+            pk, lower, upper = match.groups()
+            pk = pk.replace("''", "'")
+            return self._project([dict(row) for (p, key), row in sorted(self.rows.items())
+                                  if p == pk and lower <= key < upper], select)
+        # Cleanup scans filename ownership by library RowKey across partitions.
+        match = re.fullmatch(r"RowKey eq '((?:[^']|'')*)'", filter_str.strip())
+        if match:
+            row_key = match.group(1).replace("''", "'")
+            return self._project([dict(row) for (_, key), row in self.rows.items()
+                                  if key == row_key], select)
         # Compound clause checked first -- the plain-PartitionKey pattern's
         # greedy '(.*)' would otherwise swallow " and field eq ..." as part
         # of the partition key value itself. Second alternative covers

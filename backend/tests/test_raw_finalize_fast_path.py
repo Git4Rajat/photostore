@@ -117,3 +117,35 @@ def test_video_benchmark_retains_isolation_provenance(finalize_ctx):
     row = finalize_ctx.get_entity('lib-A', name)
     assert json.loads(row['processing_metadata'])['isolation']['reason'] == 'upload_only_benchmark'
     assert all(row[f'{step}_status'] == 'skipped' for step in storage_utils.PROCESSING_STEPS)
+
+
+@pytest.mark.parametrize('new_hash,new_photo', [('b' * 64, 'old-photo'), ('a' * 64, 'new-photo')])
+def test_replacement_finalize_clears_previous_source_derivative_receipts(finalize_ctx, new_hash, new_photo):
+    from processing_generation import allocate_generation
+    row = dict(PartitionKey='lib-A', RowKey='photo.cr3', fileHash='a' * 64,
+               anonymousImageId='old-photo', thumbnailArtifact='old-thumbnail',
+               previewArtifact='old-preview', artifactReceipt='old-manifest',
+               processingCompletionOutbox='[]')
+    row.update(allocate_generation('old-revision', photo_id='old-photo', file_hash='a' * 64, is_video=False))
+    finalize_ctx.upsert_entity(row)
+    storage_utils.finalize_uploaded_file('lib-A', 'photo.cr3', 'image/x-canon-cr3',
+                                        client_sha256=new_hash, anonymous_blob_name=new_photo)
+    stored = finalize_ctx.get_entity('lib-A', 'photo.cr3')
+    assert stored['processingRevision'] != 'old-revision'
+    assert stored['anonymousImageId'] == new_photo
+    assert stored['thumbnailArtifact'] == stored['previewArtifact'] == stored['artifactReceipt'] == ''
+
+
+def test_same_source_finalize_retry_preserves_derivative_receipts(finalize_ctx):
+    from processing_generation import allocate_generation
+    row = dict(PartitionKey='lib-A', RowKey='photo.cr3', fileHash='a' * 64,
+               anonymousImageId='photo', thumbnailArtifact='existing-thumbnail',
+               previewArtifact='existing-preview', artifactReceipt='existing-manifest')
+    row.update(allocate_generation('revision', photo_id='photo', file_hash='a' * 64, is_video=False))
+    finalize_ctx.upsert_entity(row)
+    storage_utils.finalize_uploaded_file('lib-A', 'photo.cr3', 'image/x-canon-cr3',
+                                        client_sha256='a' * 64, anonymous_blob_name='photo')
+    stored = finalize_ctx.get_entity('lib-A', 'photo.cr3')
+    assert stored['processingRevision'] == 'revision'
+    for field in ('thumbnailArtifact', 'previewArtifact', 'artifactReceipt'):
+        assert stored[field] == row[field]

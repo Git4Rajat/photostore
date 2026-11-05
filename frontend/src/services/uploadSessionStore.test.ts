@@ -69,12 +69,13 @@ describe('upload recovery checkpoints', () => {
         expect(JSON.parse(storage.getItem(KEY)!).files[0].uploadedBytes).toBe(49);
     });
 
-    it('coalesces completion promises and saves all resume fields before resolving', async () => {
+    it('coalesces completion promises and saves resume fields before resolving', async () => {
         const { store, storage } = setup();
         store.set(session());
         const oldFile = store.current!.files[0];
         store.update('session:0', { uploadId: 'upload', blobName: 'blob', chunkSizeBytes: 25000 });
         store.update('session:0', { blockIds: ['first', 'second'], uploadedBytes: 50000 });
+        store.update('session:0', { error: 'network', previewDataUrl: 'data:image/jpeg;base64,abc' });
         store.update('session:0', { status: 'done' });
         const first = store.checkpoint();
         store.update('session:1', { status: 'done', skippedDuplicate: true });
@@ -85,12 +86,66 @@ describe('upload recovery checkpoints', () => {
         expect(completed).not.toHaveBeenCalled();
         await vi.advanceTimersByTimeAsync(1);
         expect(await first).toBe(true);
+        // blockIds/chunkSizeBytes are resume-only -- once a file is 'done' they're
+        // dropped so a large session's checkpoint doesn't keep growing with dead
+        // weight from every file that already finished (see update()).
         expect(JSON.parse(storage.getItem(KEY)!).files[0]).toMatchObject({
-            uploadId: 'upload', blobName: 'blob', chunkSizeBytes: 25000,
-            blockIds: ['first', 'second'], uploadedBytes: 50000, status: 'done',
+            uploadId: 'upload', blobName: 'blob', uploadedBytes: 50000, status: 'done',
         });
+        expect(JSON.parse(storage.getItem(KEY)!).files[0]).not.toHaveProperty('chunkSizeBytes');
+        expect(JSON.parse(storage.getItem(KEY)!).files[0]).not.toHaveProperty('blockIds');
+        expect(JSON.parse(storage.getItem(KEY)!).files[0]).not.toHaveProperty('error');
+        expect(JSON.parse(storage.getItem(KEY)!).files[0]).not.toHaveProperty('previewDataUrl');
         expect(JSON.parse(storage.getItem(KEY)!).files[1]).toMatchObject({ status: 'done', skippedDuplicate: true });
         expect(oldFile.status).toBe('pending');
+    });
+
+    it('drops a file entirely via remove(), not just trims it, without disturbing other entries', async () => {
+        const { store, storage } = setup();
+        const source = session(5);
+        store.set(source);
+        const untouched1 = store.current!.files[1];
+        const untouched3 = store.current!.files[3];
+        const splice = vi.spyOn(Array.prototype, 'splice');
+        store.update('session:4', { status: 'done' });
+        store.remove('session:4');
+        expect(splice).not.toHaveBeenCalled();
+        expect(store.current!.files).toHaveLength(4);
+        expect(store.current!.files.some((file) => file.key === 'session:4')).toBe(false);
+        // Swap-and-pop moves the last element into the removed slot rather
+        // than shifting everything -- untouched entries keep their object
+        // identity (no copy), only the swapped one's position metadata changes.
+        expect(store.current!.files).toContain(untouched1);
+        expect(store.current!.files).toContain(untouched3);
+        await vi.advanceTimersByTimeAsync(UPLOAD_CHECKPOINT_INTERVAL_MS);
+        const persisted = JSON.parse(storage.getItem(KEY)!);
+        expect(persisted.files).toHaveLength(4);
+        expect(persisted.files.some((file: { key: string }) => file.key === 'session:4')).toBe(false);
+        // Removing a key a second time, or one that was never present, is a
+        // silent no-op (mirrors update()'s own missing-key guard).
+        store.remove('session:4');
+        store.remove('never-existed');
+        expect(store.current!.files).toHaveLength(4);
+    });
+
+    it('keeps checkpoint size bounded by the in-flight/failed working set, not the total wave size', async () => {
+        const { store, storage } = setup();
+        const total = 50000;
+        const stillPending = 10000;
+        store.set(session(total));
+        for (let index = stillPending; index < total; index += 1) {
+            const key = `session:${index}`;
+            store.update(key, { status: 'done' });
+            store.remove(key);
+        }
+        await vi.advanceTimersByTimeAsync(UPLOAD_CHECKPOINT_INTERVAL_MS);
+        const persisted = JSON.parse(storage.getItem(KEY)!);
+        expect(persisted.files).toHaveLength(stillPending);
+        // A 50,000-entry blob measured ~23MB (UTF-16) in practice; bounding it
+        // to the still-pending working set keeps a wave of ANY total size
+        // from ever approaching that regardless of how large the wave is.
+        const serializedLength = storage.getItem(KEY)!.length;
+        expect(serializedLength).toBeLessThan(2_000_000);
     });
 
     it('flushes immediately on lifecycle boundaries without a redundant timer write', async () => {

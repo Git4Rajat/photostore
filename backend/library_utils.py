@@ -26,6 +26,8 @@ memberships (``photomemberships``) — stored in both orientations:
 invites (``photoinvites``)
     invite:       PK=``library_id``       RK=``invite_id``   -> {emailNorm, tokenHash, ...}
     token lookup: PK=``token``            RK=``token_hash``  -> {inviteId, libraryId}
+    active lookup:PK=``library_id``       RK=``pending:{expiry:012d}:{invite_id}`` -> {inviteId}
+    readiness:    PK=``library_id``       RK=``_pending_index_v1`` -> {version: 1}
     send throttle:PK=``throttle``         RK=``library_id``  -> {lastSentAt, window...}
 audit (``photoaudit``)
     PK=``library_id`` RK=``{iso_ts}-{uuid}`` -> {actor, action, target, at}
@@ -90,6 +92,7 @@ _MEMBER_LIB_PREFIX = 'lib:'
 _MEMBER_USR_PREFIX = 'usr:'
 _TOKEN_PK = 'token'
 _THROTTLE_PK = 'throttle'
+_INVITE_INDEX_MARKER = '_pending_index_v1'
 # Per-user password reset (stored in the users table).
 _RESET_PK = 'reset'
 _RESET_THROTTLE_PK = 'reset-throttle'
@@ -137,6 +140,21 @@ def _as_bool(value) -> bool:
     return str(value).strip().lower() in ('1', 'true', 'yes')
 
 
+class InviteIndexNotReady(RuntimeError):
+    """Core must not fall back to scanning historical invitation records."""
+
+
+def cleanup_snapshot(meta: Dict) -> Dict:
+    """A point-read snapshot, with no reconciliation or worker interaction."""
+    return {
+        'lastCleanupStatus': str(meta.get('lastCleanupStatus') or ''),
+        'lastCleanupTime': int(meta.get('lastCleanupTime', 0) or 0),
+        'lastCleanupPhotosDeleted': int(meta.get('lastCleanupPhotosDeleted', 0) or 0),
+        'lastCleanupBlobsDeleted': int(meta.get('lastCleanupBlobsDeleted', 0) or 0),
+        'lastCleanupError': str(meta.get('lastCleanupError') or ''),
+    }
+
+
 class LibraryStore:
     """Reads/writes the account, library, membership, invite, and audit tables."""
 
@@ -149,6 +167,8 @@ class LibraryStore:
         invites_table,
         audit_table,
         clean_requests_table=None,
+        before_create=None,
+        require_invite_index=False,
     ) -> None:
         self.users = users_table
         self.libraries = libraries_table
@@ -156,6 +176,8 @@ class LibraryStore:
         self.invites = invites_table
         self.audit_table = audit_table
         self.clean_requests = clean_requests_table
+        self.before_create = before_create
+        self.require_invite_index = require_invite_index
 
     # -- generic table helpers ------------------------------------------------
     @staticmethod
@@ -423,6 +445,11 @@ class LibraryStore:
             return []
 
     def create_library(self, library_id: str, *, name: str, owner_user_id: str) -> Dict:
+        existing = self._get_checked(self.libraries, _LIBRARY_PK, str(library_id))
+        if existing:
+            return existing
+        if self.before_create is not None:
+            self.before_create(str(library_id))
         entity = {
             'PartitionKey': _LIBRARY_PK,
             'RowKey': str(library_id),
@@ -430,6 +457,9 @@ class LibraryStore:
             'ownerUserId': str(owner_user_id),
             'createdAt': _now(),
         }
+        # Only a genuinely new library has no legacy invitations to backfill.
+        self.invites.upsert_entity({'PartitionKey': str(library_id),
+                                    'RowKey': _INVITE_INDEX_MARKER, 'version': 1})
         self.libraries.upsert_entity(entity)
         return entity
 
@@ -567,9 +597,26 @@ class LibraryStore:
     # -- invites --------------------------------------------------------------
     def pending_invites(self, library_id: str, *, target_type: Optional[str] = None) -> List[Dict]:
         now = _now()
-        rows = self._query(self.invites, f"PartitionKey eq '{library_id}'")
+        pk = str(library_id).replace("'", "''")
+        marker = self._get_checked(self.invites, str(library_id), _INVITE_INDEX_MARKER)
+        if marker and marker.get('version') == 1:
+            # Table's PK/RK index skips all expired lookup rows and history.
+            lookups = self.invites.query_entities(
+                f"PartitionKey eq '{pk}' and RowKey ge 'pending:{now + 1:012d}:' and RowKey lt 'pending;'"
+            )
+            # Canonical point reads also make concurrent backfills safe: an old
+            # lookup cannot resurrect an invitation accepted/revoked meanwhile.
+            rows = (self._get_checked(self.invites, str(library_id), str(row['inviteId']))
+                    for row in lookups if row.get('status', 'pending') == 'pending')
+        elif self.require_invite_index:
+            raise InviteIndexNotReady(str(library_id))
+        else:
+            # Archive compatibility only, until explicit migration completes.
+            rows = self.invites.query_entities(f"PartitionKey eq '{pk}' and RowKey ge 'inv' and RowKey lt 'inw'")
         pending = []
         for row in rows:
+            if not row:
+                continue
             if str(row.get('status') or '') != 'pending':
                 continue
             if int(row.get('expiresAt', 0) or 0) <= now:
@@ -578,6 +625,32 @@ class LibraryStore:
                 continue
             pending.append(row)
         return pending
+
+    @staticmethod
+    def _invite_lookup(invite: Dict) -> Dict:
+        return {
+            'PartitionKey': str(invite['PartitionKey']),
+            'RowKey': f"pending:{int(invite['expiresAt']):012d}:{invite['RowKey']}",
+            'inviteId': str(invite['RowKey']),
+            'status': str(invite.get('status') or 'pending'),
+        }
+
+    def backfill_invite_index(self, library_id: str) -> int:
+        """Explicit, retryable archive/offline migration; never call on core reads.
+
+        Deploy dual-writing invite creation to every writer before running this.
+        A failure leaves readiness absent; retrying only upserts the same keys.
+        """
+        pk = str(library_id).replace("'", "''")
+        count = 0
+        for invite in self.invites.query_entities(
+                f"PartitionKey eq '{pk}' and RowKey ge 'inv' and RowKey lt 'inw'"):
+            if invite.get('status') == 'pending' and int(invite.get('expiresAt', 0) or 0) > _now():
+                self.invites.upsert_entity(self._invite_lookup(invite))
+                count += 1
+        self.invites.upsert_entity({'PartitionKey': str(library_id),
+                                    'RowKey': _INVITE_INDEX_MARKER, 'version': 1})
+        return count
 
     def pending_invite_count(self, library_id: str, *, target_type: Optional[str] = None) -> int:
         return len(self.pending_invites(library_id, target_type=target_type))
@@ -613,7 +686,7 @@ class LibraryStore:
         invite_id = new_invite_id()
         norm = normalize_email(email)
         expires_at = _now() + int(ttl_seconds)
-        self.invites.upsert_entity({
+        invite = {
             'PartitionKey': str(library_id),
             'RowKey': invite_id,
             'emailNorm': norm,
@@ -623,13 +696,19 @@ class LibraryStore:
             'invitedBy': str(invited_by),
             'createdAt': _now(),
             'expiresAt': expires_at,
-        })
+        }
+        # Write the token pointer first: if the same-partition transaction
+        # fails, this dangling pointer resolves to no canonical invitation and
+        # cannot reserve a seat or validate a link. Retrying is safe.
         self.invites.upsert_entity({
             'PartitionKey': _TOKEN_PK,
             'RowKey': token_hash,
             'inviteId': invite_id,
             'libraryId': str(library_id),
         })
+        self.invites.submit_transaction([
+            ('upsert', invite), ('upsert', self._invite_lookup(invite)),
+        ])
         return raw
 
     def get_invite_by_token(self, raw_token: str) -> Optional[Dict]:
@@ -655,13 +734,16 @@ class LibraryStore:
         invite = dict(invite)
         invite['status'] = 'accepted'
         invite['acceptedAt'] = _now()
-        self.invites.upsert_entity(invite)
+        self.invites.submit_transaction([
+            ('upsert', invite), ('upsert', self._invite_lookup(invite)),
+        ])
         self._delete(self.invites, _TOKEN_PK, str(invite.get('tokenHash') or ''))
 
     def delete_all_invites(self, library_id: str) -> None:
         """Delete every invite (and its token lookup) for a library."""
         for row in self._query(self.invites, f"PartitionKey eq '{library_id}'"):
-            self._delete(self.invites, _TOKEN_PK, str(row.get('tokenHash') or ''))
+            if row.get('tokenHash'):
+                self._delete(self.invites, _TOKEN_PK, str(row['tokenHash']))
             self._delete(self.invites, str(library_id), str(row.get('RowKey') or ''))
 
     def delete_all_memberships(self, library_id: str) -> None:
@@ -670,11 +752,15 @@ class LibraryStore:
             self.remove_membership(m['userId'], library_id)
 
     def revoke_invite(self, library_id: str, invite_id: str) -> bool:
+        if not str(invite_id).startswith('inv'):
+            return False  # Only canonical IDs, never expiry-index/marker rows.
         invite = self._get(self.invites, str(library_id), str(invite_id))
         if not invite or str(invite.get('status') or '') != 'pending':
             return False
         invite['status'] = 'revoked'
-        self.invites.upsert_entity(invite)
+        self.invites.submit_transaction([
+            ('upsert', invite), ('upsert', self._invite_lookup(invite)),
+        ])
         self._delete(self.invites, _TOKEN_PK, str(invite.get('tokenHash') or ''))
         return True
 
@@ -736,9 +822,11 @@ class LibraryStore:
         request_id = new_clean_request_id()
         expires_at = _now() + int(ttl_seconds)
         tokens_by_user: Dict[str, str] = {}
+        token_hashes = []
         for user_id in required_user_ids:
             raw = generate_invite_token()
             token_hash = hash_invite_token(raw)
+            token_hashes.append(token_hash)
             tokens_by_user[str(user_id)] = raw
             self.clean_requests.upsert_entity({
                 'PartitionKey': _TOKEN_PK,
@@ -753,6 +841,7 @@ class LibraryStore:
             'requestedBy': str(requested_by),
             'requiredUserIds': ','.join(str(u) for u in required_user_ids),
             'confirmedUserIds': '',
+            'tokenHashes': ','.join(token_hashes),
             'status': 'pending',
             'createdAt': _now(),
             'expiresAt': expires_at,
@@ -760,25 +849,28 @@ class LibraryStore:
         return request_id, tokens_by_user
 
     def confirm_clean_token(self, raw_token: str, *, account_id: str, library_id: str) -> tuple:
-        """Validate a single approver's clean-confirmation token against the
-        caller's authenticated account/library context, and record the
-        approval.
+        """Record one approval; retain its lookup for authenticated status reads.
 
-        Returns ``(status, request)``:
-          - ``'ok'``: the approval was recorded; ``request`` is the updated row.
-          - ``'mismatch'``: the token is real but wasn't issued to this caller
-            (wrong account or wrong active library). Left completely untouched
-            so the real approver can still use it — the caller must never be
-            able to record someone else's approval just by holding their link.
-          - ``'invalid'``: the token is unknown, or its request is gone,
-            already used, or expired. The token (if found) is deleted since
-            it's no longer useful.
-        Every branch other than 'mismatch' consumes the token so it can't be
-        replayed."""
+        Confirmation stays single-use: a recorded approver cannot approve or
+        enqueue again, even though reopening their link can still read status.
+        """
+        status, request = self.get_clean_confirmation(raw_token, account_id=account_id, library_id=library_id)
+        if status == 'mismatch':
+            return status, None
+        if status != 'pending':
+            return 'invalid', None
+        confirmed = [u for u in str(request.get('confirmedUserIds') or '').split(',') if u]
+        confirmed.append(str(account_id))
+        request['confirmedUserIds'] = ','.join(confirmed)
+        self.clean_requests.upsert_entity(request)
+        return 'ok', request
+
+    def get_clean_confirmation(self, raw_token: str, *, account_id: str, library_id: str) -> tuple:
+        """Point-read a link's own request, without approving or starting work."""
         if not raw_token or self.clean_requests is None:
             return 'invalid', None
         token_hash = hash_invite_token(raw_token)
-        lookup = self._get(self.clean_requests, _TOKEN_PK, token_hash)
+        lookup = self._get_checked(self.clean_requests, _TOKEN_PK, token_hash)
         if not lookup:
             return 'invalid', None
         token_library_id = str(lookup.get('libraryId') or '')
@@ -787,18 +879,27 @@ class LibraryStore:
         if token_library_id != str(library_id) or token_user_id != str(account_id):
             return 'mismatch', None
 
-        self._delete(self.clean_requests, _TOKEN_PK, token_hash)
-        request = self._get(self.clean_requests, token_library_id, request_id)
-        if not request or str(request.get('status') or '') != 'pending':
+        request = self._get_checked(self.clean_requests, token_library_id, request_id)
+        if not request:
+            return 'invalid', None
+        if request.get('status') == 'started':
+            return 'started', request
+        if request.get('status') != 'pending':
             return 'invalid', None
         if int(request.get('expiresAt', 0) or 0) <= _now():
-            return 'invalid', None
-        confirmed = [u for u in str(request.get('confirmedUserIds') or '').split(',') if u]
-        if token_user_id not in confirmed:
-            confirmed.append(token_user_id)
-        request['confirmedUserIds'] = ','.join(confirmed)
+            return 'expired', None
+        confirmed = str(request.get('confirmedUserIds') or '').split(',')
+        return ('confirmed' if token_user_id in confirmed else 'pending'), request
+
+    def mark_clean_request_started(self, library_id: str, request_id: str, job: Dict) -> None:
+        """Keep the link-to-job association after approvals have been consumed."""
+        request = self._get_checked(self.clean_requests, str(library_id), str(request_id))
+        if not request:
+            raise RuntimeError('Cleanup confirmation request is unavailable')
+        request['status'] = 'started'
+        request['jobId'] = str(job.get('jobId') or '')
+        request['jobStatus'] = str(job.get('status') or 'unknown')
         self.clean_requests.upsert_entity(request)
-        return 'ok', request
 
     @staticmethod
     def is_clean_request_fully_confirmed(request: Dict) -> bool:
@@ -815,12 +916,14 @@ class LibraryStore:
         request = self._get(self.clean_requests, library_id, request_id) if request_id else self.get_active_clean_request(library_id)
         if not request:
             return
-        # Token rows are keyed by hash, which we no longer have; sweep the
-        # library's token partition instead. Clean requests are rare and this
-        # partition only ever holds a couple of rows at a time.
-        for row in self._query(self.clean_requests, f"PartitionKey eq '{_TOKEN_PK}'"):
-            if str(row.get('requestId') or '') == str(request.get('RowKey') or ''):
-                self._delete(self.clean_requests, _TOKEN_PK, str(row.get('RowKey') or ''))
+        if request.get('tokenHashes'):
+            for token_hash in str(request['tokenHashes']).split(','):
+                self._delete(self.clean_requests, _TOKEN_PK, token_hash)
+        else:
+            # Legacy pending requests did not retain their token hashes.
+            for row in self._query(self.clean_requests, f"PartitionKey eq '{_TOKEN_PK}'"):
+                if str(row.get('requestId') or '') == str(request.get('RowKey') or ''):
+                    self._delete(self.clean_requests, _TOKEN_PK, str(row.get('RowKey') or ''))
         self._delete(self.clean_requests, str(library_id), str(request.get('RowKey') or ''))
 
     def clean_request_send_allowed(self, library_id: str) -> bool:

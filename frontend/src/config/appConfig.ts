@@ -9,9 +9,9 @@ export interface AppConfig {
      * recovery actions, see routes/admin.py) -- falls back to apiBaseUrl when
      * no separate recovery deployment exists for this environment. */
     recoveryApiBaseUrl?: string;
-    /** Base URL for the dedicated `archive` container app (people/faces,
-     * library invites/export/clean, and public share-link routes -- see
-     * routes/people.py, routes/library.py, routes/public.py) -- falls back
+    /** Base URL for the dedicated `archive` container app (whole-library
+     * deletion/export/clean and public share-link routes -- see
+     * routes/library_operations.py and routes/public.py) -- falls back
      * to apiBaseUrl when no separate archive deployment exists for this
      * environment. */
     archiveApiBaseUrl?: string;
@@ -32,6 +32,8 @@ export interface AppConfig {
     processingMode?: 'browser' | 'backend' | 'both';
     /** Default-off upload preparation, independent of browser AI processing. */
     browserUploadPreparation?: boolean;
+    /** Deployment opt-in; durable per-library ownership is still discovered by Upload. */
+    uploadWaveExecutionEnabled?: boolean;
 }
 
 declare global {

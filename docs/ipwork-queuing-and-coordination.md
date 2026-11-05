@@ -347,18 +347,25 @@ layers, not just the lease:
 - `_step_locked_done` (§6d) catches the remaining case where two attempts
   both got far enough to compute a result before either wrote it.
 
-## 8. Autoscaling's dependency on §7a
+## 8. Autoscaling includes active work
 
-The KEDA `azure-queue` scale rule on `photostore-ipwork`
-(`deploy/resources.bicep:750-774`) uses `queueLengthStrategy: 'visibleonly'`
-instead of the default (`'all'`) specifically because of §7a: a message
-deliberately left undeleted for a lease-busy retry is real queue depth
-under the default strategy, and would scale ipworker up to handle photos
-the browser had already finished. `visibleonly` counts only genuinely
-unclaimed (visible) messages — it falls back to `'all'` above 32 messages,
-so a genuinely large backlog still scales correctly; this only changes
-behavior in the small-numbers case that lease-busy retries actually
-produce.
+All four KEDA `azure-queue` rules use `queueLengthStrategy: 'all'`:
+Vision, clustering, library operations, and index maintenance. A claimed
+message remains part of the scale signal until it is acknowledged. This
+protects a single long-running wave, build, or library operation whose
+message is invisible while its receipt is renewed.
+
+All eight Container Apps have a zero minimum replica count. The HTTP apps
+retain request-based scaling; workers return to zero after their queues
+drain and the normal cooldown expires. The retained `clusterMinReplicas`
+deployment parameter accepts only zero.
+
+Azure's total message count is approximate and includes delayed messages.
+Lease-busy retries (§7a) and delayed upload-release checks therefore keep a
+worker eligible until handled or expired. This is an explicit tradeoff:
+Peek cannot distinguish a delayed message from a claimed active message.
+Queue receipt renewal and durable execution leases still provide ownership;
+the scaler does not replace them or prevent platform/deployment restarts.
 
 ## 9. Rough edges surfaced while writing this doc
 

@@ -1,0 +1,45 @@
+// Run each query separately. Raw evidence is retained under /tmp/photostore-vision-production.
+
+// stages
+ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(48h)
+| where ContainerAppName_s == 'forenklaprep1-dev-vision'
+| where Log_s contains 'processing telemetry '
+| extend d=parse_json(extract(@'processing telemetry (.*)$', 1, Log_s))
+| where tostring(d.wave_id)=='39e91938bc3f4f7f85346f54246658e1'
+| where tostring(d.event) in ('vision_step','processing_apply_phase','vision_download','vision_metadata_read','vision_metadata_commit','media_download')
+| summarize n=count(), mean_ms=avg(todouble(d.milliseconds)), p50_ms=percentile(todouble(d.milliseconds),50), p95_ms=percentile(todouble(d.milliseconds),95), max_ms=max(todouble(d.milliseconds)), total_ms=sum(todouble(d.milliseconds)), mean_thread_cpu_ms=avg(todouble(d.thread_cpu_ms)), errors=countif(tobool(d.error) or tostring(d.outcome)=='error'), sdk_attributions=make_set(tostring(d.sdk_attribution)), storage_attributions=make_set(tostring(d.storage_attribution)) by event=tostring(d.event), step=tostring(d.step), phase=tostring(d.phase)
+| order by total_ms desc
+
+
+// attempts
+ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(48h)
+| where ContainerAppName_s == 'forenklaprep1-dev-vision'
+| where Log_s contains 'processing telemetry '
+| extend d=parse_json(extract(@'processing telemetry (.*)$', 1, Log_s))
+| where tostring(d.wave_id)=='39e91938bc3f4f7f85346f54246658e1'
+| where tostring(d.event) in ('vision_wave_attempt_summary','wave_stage_started','wave_retry_scheduled')
+| project d
+
+
+// image-profiles
+ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(48h)
+| where ContainerAppName_s == 'forenklaprep1-dev-vision'
+| where Log_s contains 'processing telemetry '
+| extend d=parse_json(extract(@'processing telemetry (.*)$', 1, Log_s))
+| where tostring(d.wave_id)=='39e91938bc3f4f7f85346f54246658e1'
+| where tostring(d.event)=='vision_image_summary' and tolong(d.source_attempts)>0
+| summarize n=count(), distinct_members=dcount(tostring(d.member_id)), mean_apply_ms=avg(todouble(d.vision_source_apply_ms)), p50_apply_ms=percentile(todouble(d.vision_source_apply_ms),50), p95_apply_ms=percentile(todouble(d.vision_source_apply_ms),95), mean_clip_inference_ms=avg(todouble(d.clip_inference_ms)), p50_clip_inference_ms=percentile(todouble(d.clip_inference_ms),50), p95_clip_inference_ms=percentile(todouble(d.clip_inference_ms),95), mean_clip_wait_ms=avg(todouble(d.clip_lock_wait_ms)), p50_clip_wait_ms=percentile(todouble(d.clip_lock_wait_ms),50), p95_clip_wait_ms=percentile(todouble(d.clip_lock_wait_ms),95), clip_wait_over_50ms=countif(todouble(d.clip_lock_wait_ms)>50), mean_landmark_wait_ms=avg(todouble(d.face_landmark_wait_ms)), ocr_timeouts=sum(tolong(d.ocr_worker_timeouts)), source_errors=sum(tolong(d.source_errors))
+
+
+// inputs-and-downloads
+ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(48h)
+| where ContainerAppName_s == 'forenklaprep1-dev-vision'
+| where Log_s contains 'processing telemetry '
+| extend d=parse_json(extract(@'processing telemetry (.*)$', 1, Log_s))
+| where tostring(d.wave_id)=='39e91938bc3f4f7f85346f54246658e1'
+| where tostring(d.event) in ('vision_input','media_download','media_reuse','vision_metadata_commit')
+| summarize n=count(), mean_ms=avg(todouble(d.milliseconds)), p95_ms=percentile(todouble(d.milliseconds),95), bytes=sum(tolong(d.bytes)), retry_reads=sum(tolong(d.retry_reads)), conflicts=sum(tolong(d.conflicts)), write_attempts=sum(tolong(d.write_attempts)) by event=tostring(d.event), purpose=tostring(d.purpose), source=tostring(d.source), step=tostring(d.step), outcome=tostring(d.outcome)

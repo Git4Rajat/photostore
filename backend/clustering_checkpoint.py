@@ -76,18 +76,22 @@ def _share_lock(share, *, exclusive):
         os.close(fd)
 
 
-def cleanup_checkpoints(directory):
+def cleanup_checkpoints(directory, *, grace_seconds=RETENTION_GRACE_SECONDS):
     """Best-effort aged retention, safe only with the cooperative reader protocol."""
+    if type(grace_seconds) not in (int, float) or not math.isfinite(grace_seconds) or grace_seconds < 0:
+        raise ValueError('Checkpoint retention grace must be finite and nonnegative')
     share = Path(directory)
     try:
         with _share_lock(share, exclusive=True):
-            return _cleanup_checkpoints(share)
+            if grace_seconds == RETENTION_GRACE_SECONDS:
+                return _cleanup_checkpoints(share)
+            return _cleanup_checkpoints(share, grace_seconds=grace_seconds)
     except (OSError, ValueError, KeyError, TypeError):
         _LOGGER.warning('faiss checkpoint retention skipped directory=%s', share, exc_info=True)
         return []
 
 
-def _cleanup_checkpoints(share):
+def _cleanup_checkpoints(share, *, grace_seconds=RETENTION_GRACE_SECONDS):
     # An absent/corrupt CURRENT is not permission to delete anything.
     pointer, _ = _read_json(share / 'CURRENT', 4096)
     current = pointer['generation']
@@ -112,7 +116,7 @@ def _cleanup_checkpoints(share):
     recent = sorted((item for item in candidates if item[3]),
                     key=lambda item: (item[0], item[1].name), reverse=True)
     protected = {current, *(item[1].name for item in recent[:2])}
-    cutoff = time.time() - RETENTION_GRACE_SECONDS
+    cutoff = time.time() - grace_seconds
     removed = []
     for modified, path, files, _ in candidates:
         if path.name in protected or modified >= cutoff:

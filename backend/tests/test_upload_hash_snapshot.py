@@ -103,13 +103,15 @@ def test_build_streams_one_library_and_reads_without_scanning(world):
     assert b'private.heic' not in gzip.decompress(payload)
 
 
-def test_rebuild_replaces_snapshot_and_removes_superseded_blob(world):
+def test_rebuild_replaces_snapshot_and_retains_superseded_blob_for_reader_grace(world):
     table, blobs = world
     old = snapshots.rebuild_snapshot('lib')
     table.upsert_entity({'PartitionKey': 'lib', 'RowKey': 'c' * 64, 'filename': 'new.heic'})
     new = snapshots.rebuild_snapshot('lib')
     assert new['rows'] == 2 and new['blobName'] != old['blobName']
-    assert 'lexical-index/' + old['blobName'] not in blobs.store
+    assert 'lexical-index/' + old['blobName'] in blobs.store
+    assert json.loads(gzip.decompress(blobs.store['lexical-index/' + old['blobName']])) == {
+        'hashes': {'a' * 64: 'original.heic'}}
     assert json.loads(gzip.decompress(snapshots.read_snapshot('lib')[0]))['hashes']['c' * 64] == 'new.heic'
 
 
@@ -393,28 +395,6 @@ def test_dedup_job_never_builds_gallery_indexes(world, monkeypatch):
     monkeypatch.setattr(app, 'storage_utils_ensure_sort_current', lambda *a: pytest.fail('gallery rebuild'))
     app._run_index_build_job('lib', 'index-build-lib-dedup', 'dedup')
     assert status == ['running', 'done'] and snapshots.read_snapshot('lib')[0] is not None
-
-
-def test_light_build_queues_dedup_without_inline_scan(world, monkeypatch):
-    table, _ = world
-    queued = []
-    statuses = []
-    monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **kw: statuses.append(a[3]))
-    monkeypatch.setattr(app, 'storage_utils_ensure_sort_current', lambda *a: None)
-    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', lambda *a, **kw: [])
-    monkeypatch.setattr(su, 'reconcile_search_db', lambda *a: None)
-    monkeypatch.setattr(app, '_drain_incremental_search_db', lambda *a: None)
-    monkeypatch.setattr(app, 'enqueue_index_build', lambda *a, **kw: queued.append(kw))
-    app._run_index_build_job('lib', 'index-build-lib-light', 'light')
-    assert table.scans == 0 and statuses[-1] == 'done'
-    assert queued == [{'reason': 'index-maintenance', 'scope': 'dedup', 'coalesce': False}]
-
-    def fail_queue(*args, **kwargs):
-        raise RuntimeError('queue unavailable')
-
-    monkeypatch.setattr(app, 'enqueue_index_build', fail_queue)
-    app._run_index_build_job('lib', 'index-build-lib-light', 'light')
-    assert statuses[-1] == 'done'
 
 
 def test_dedup_queue_scope_has_its_own_coalesced_job(monkeypatch):

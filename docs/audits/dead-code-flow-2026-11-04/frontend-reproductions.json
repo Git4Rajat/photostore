@@ -1,0 +1,22 @@
+{
+  "index_status_poller_uses_core_client": [
+    {
+      "client": "core",
+      "url": "/api/tools/indexes/status"
+    }
+  ],
+  "unused_status_hook_has_unstable_snapshot": {
+    "sameReference": false
+  },
+  "lost_mutation_response_replays_toggle": {
+    "attempts": 2,
+    "finalLiked": false
+  },
+  "latent_get_dedup_ignores_config_params": {
+    "networkCalls": 1,
+    "returnedPages": [
+      1,
+      1
+    ]
+  }
+}

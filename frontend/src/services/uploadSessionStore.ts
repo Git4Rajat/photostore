@@ -27,7 +27,46 @@ export class UploadSessionStore {
     update(key: string, updates: Partial<PersistedUploadFile>): void {
         const index = this.positions.get(key);
         if (!this.current || index === undefined) return;
-        this.current.files[index] = { ...this.current.files[index], ...updates };
+        const merged = { ...this.current.files[index], ...updates };
+        // A finished file no longer needs its resume-only fields: blockIds/
+        // chunkSizeBytes exist solely to resume an interrupted chunked
+        // transfer, and error/previewDataUrl are leftovers from an earlier
+        // failed attempt before a successful retry. Across a large session
+        // (hundreds-to-thousands of files) these accumulate in the JSON
+        // blob written to localStorage and were pushing sessions over the
+        // browser's per-origin quota, silently losing the resume checkpoint.
+        // `merged` was just freshly allocated above and isn't aliased
+        // anywhere else yet, so deleting in place skips a second full copy.
+        if (merged.status === 'done') {
+            delete merged.blockIds;
+            delete merged.chunkSizeBytes;
+            delete merged.error;
+            delete merged.previewDataUrl;
+        }
+        this.current.files[index] = merged;
+        this.dirty = true;
+        this.schedule();
+    }
+
+    // A `done` file's entry is never read again (every consumer only filters
+    // `done` files out) and the whole session already gets deleted once
+    // nothing is left pending -- so dropping it the moment it's done costs
+    // nothing that isn't already lost at end-of-session, while keeping a
+    // large wave's checkpoint bounded by its in-flight/failed working set
+    // instead of its total size. Swap-and-pop keeps `current.files` a real
+    // array (no splice/reindex), preserving the zero-copy-on-progress
+    // behavior other updates rely on for untouched entries.
+    remove(key: string): void {
+        const index = this.positions.get(key);
+        if (!this.current || index === undefined) return;
+        const files = this.current.files;
+        const last = files.length - 1;
+        if (index !== last) {
+            files[index] = files[last];
+            this.positions.set(files[index].key, index);
+        }
+        files.pop();
+        this.positions.delete(key);
         this.dirty = true;
         this.schedule();
     }

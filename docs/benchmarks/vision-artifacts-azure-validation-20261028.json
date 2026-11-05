@@ -1,0 +1,147 @@
+{
+  "started_utc": "2026-10-28T16:44:28.720583+00:00",
+  "container": "vision-receipt-validation-a1c5c52fdd914592",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "sdk_versions": {
+    "azure-storage-blob": "12.31.0",
+    "azure-core": "1.41.0",
+    "azure-identity": "1.25.3"
+  },
+  "retry_total": 0,
+  "images": 13,
+  "reports": [
+    {
+      "round": 0,
+      "mode": "current",
+      "wall_seconds": 18.01954654091969,
+      "cpu_seconds": 1.223709,
+      "images": 13,
+      "gets": 65,
+      "puts": 26,
+      "independent_receipts_verified": 26
+    },
+    {
+      "round": 0,
+      "mode": "reuse_preview",
+      "wall_seconds": 7.891292666085064,
+      "cpu_seconds": 0.9646239999999997,
+      "images": 13,
+      "gets": 52,
+      "puts": 26,
+      "independent_receipts_verified": 26
+    },
+    {
+      "round": 0,
+      "mode": "upload_response",
+      "wall_seconds": 5.450597582850605,
+      "cpu_seconds": 0.6200260000000002,
+      "images": 13,
+      "gets": 26,
+      "puts": 26,
+      "independent_receipts_verified": 26
+    },
+    {
+      "round": 1,
+      "mode": "upload_response",
+      "wall_seconds": 6.163298666942865,
+      "cpu_seconds": 0.588622,
+      "images": 13,
+      "gets": 26,
+      "puts": 26,
+      "independent_receipts_verified": 26
+    },
+    {
+      "round": 1,
+      "mode": "reuse_preview",
+      "wall_seconds": 6.908084458205849,
+      "cpu_seconds": 0.813269,
+      "images": 13,
+      "gets": 52,
+      "puts": 26,
+      "independent_receipts_verified": 26
+    },
+    {
+      "round": 1,
+      "mode": "current",
+      "wall_seconds": 12.824834083672613,
+      "cpu_seconds": 1.3659349999999995,
+      "images": 13,
+      "gets": 65,
+      "puts": 26,
+      "independent_receipts_verified": 26
+    },
+    {
+      "round": 2,
+      "mode": "current",
+      "wall_seconds": 8.405844083055854,
+      "cpu_seconds": 1.1636359999999986,
+      "images": 13,
+      "gets": 65,
+      "puts": 26,
+      "independent_receipts_verified": 26
+    },
+    {
+      "round": 2,
+      "mode": "reuse_preview",
+      "wall_seconds": 7.518070165999234,
+      "cpu_seconds": 0.8868340000000003,
+      "images": 13,
+      "gets": 52,
+      "puts": 26,
+      "independent_receipts_verified": 26
+    },
+    {
+      "round": 2,
+      "mode": "upload_response",
+      "wall_seconds": 5.703866459429264,
+      "cpu_seconds": 0.5100459999999991,
+      "images": 13,
+      "gets": 26,
+      "puts": 26,
+      "independent_receipts_verified": 26
+    }
+  ],
+  "cases": [
+    {
+      "name": "existing_identical_create_conflict",
+      "passed": true
+    },
+    {
+      "name": "existing_wrong_content_rejected",
+      "passed": true
+    },
+    {
+      "name": "before_commit_no_receipt_and_safe_retry",
+      "passed": true
+    },
+    {
+      "name": "lost_success_no_receipt_and_safe_retry",
+      "passed": true
+    },
+    {
+      "name": "azure_rejects_wrong_transport_md5",
+      "passed": true
+    },
+    {
+      "name": "etag_pinned_verification_rejects_mutation",
+      "passed": true
+    }
+  ],
+  "cleanup_verified": true,
+  "private_container_verified": true,
+  "passed": true,
+  "http_summary": {
+    "DELETE:202": 1,
+    "GET:200": 2,
+    "GET:206": 670,
+    "GET:404": 1,
+    "GET:412": 1,
+    "HEAD:200": 1,
+    "HEAD:404": 2,
+    "PUT:201": 266,
+    "PUT:400": 1,
+    "PUT:409": 3
+  },
+  "validated_puts_with_md5": 86,
+  "finished_utc": "2026-10-28T16:46:38.058057+00:00"
+}

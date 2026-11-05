@@ -28,9 +28,10 @@ def context(monkeypatch):
 
 
 @pytest.mark.parametrize('batch', [False, True])
-def test_assets_and_candidate_are_applied_before_queue_even_after_rename(context, batch):
+@pytest.mark.parametrize('asset', ['preview', 'thumbnail'])
+def test_assets_and_candidate_are_applied_before_queue_even_after_rename(context, batch, asset):
     item = {'filename': 'photo.cr3', 'blobName': 'physical', 'uploadId': 'id', 'totalSize': 100, 'sha256': 'a' * 64,
-            'clientProcessing': {'preview': {'alreadyUploaded': True}}, 'clientMetadata': {'version': 1}}
+            'clientProcessing': {asset: {'alreadyUploaded': True}}, 'clientMetadata': {'version': 1}}
     with app.app.test_request_context('/upload/finalize-batch' if batch else '/upload/finalize', method='POST',
                                      json={'files': [item]} if batch else item):
         response = upload.finalize_upload_batch() if batch else upload.finalize_direct_upload()
@@ -84,6 +85,25 @@ def test_metadata_sas_is_capability_gated(context, monkeypatch, enabled, batch, 
     assert value['uploadPreparationEnabled'] is enabled
     assert value['metadataBlobUrl'] == ('url-metadata/physical.bin' if enabled else None)
     assert ('metadata/physical.bin' in urls) is enabled
+
+
+@pytest.mark.parametrize('batch', [False, True])
+def test_thumbnail_target_is_offered_without_preview_target(context, monkeypatch, batch):
+    monkeypatch.setenv('BROWSER_UPLOAD_PREPARATION', 'true')
+    monkeypatch.setattr(app, '_cleanup_failed_upload', lambda *_: None)
+    monkeypatch.setattr(app, 'reset_upload_tracking_and_reserve_blob', lambda *args, **kwargs: 'physical')
+    monkeypatch.setattr(app, 'reset_upload_tracking_and_reserve_blobs_batch', lambda *args: {'photo.heic': 'physical'})
+    monkeypatch.setattr(app, '_create_direct_upload_blob_url', lambda name: ('original-url', 'expiry'))
+    monkeypatch.setattr(app, '_create_direct_thumbnail_upload_blob_url', lambda name: ('url-' + name, 'expiry'))
+    item = {'filename': 'photo.heic', 'totalSize': 100, 'directToBlob': True}
+    with app.app.test_request_context('/upload/init-batch' if batch else '/upload/init', method='POST',
+                                     json={'files': [item]} if batch else item):
+        response = upload.init_upload_batch() if batch else upload.init_upload()
+    assert response.status_code == 200
+    value = response.get_json()['results'][0] if batch else response.get_json()
+    assert value['uploadPreparationEnabled'] is True
+    assert value['thumbnailBlobUrl'] == 'url-physical'
+    assert value['previewBlobUrl'] is None
 
 
 @pytest.mark.parametrize('batch', [False, True])

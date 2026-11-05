@@ -18,7 +18,7 @@ recall beyond LiveFaceIndex's bounded retrieval and exact candidate reranking.
 from __future__ import annotations
 
 from collections import OrderedDict
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, ExitStack
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -260,7 +260,34 @@ class FaissAssigner:
         active = _ACTIVE
         if active is not None and (active.owner is not self or active.user_id != user_id):
             active.owner.final_checkpoint()
-        return self.lease(user_id)
+        return self._leased(user_id)
+
+    @contextmanager
+    def _leased(self, user_id):
+        """Bounded, short retry on top of ``self.lease`` for a busy lease.
+
+        Unlike index_publication.catalog_serialization's longer backoff,
+        this runs under the process-wide ``_LOCK`` (see _assignment_lease
+        above) -- every other concurrent assign()/batch() call, for any
+        user, stalls for as long as this retries. Keep the window short; a
+        lease still busy after it falls back to the caller's own queue
+        redelivery/retry instead of blocking the whole process.
+        """
+        from clustering_lease import RetryableLibraryLeaseError
+        with ExitStack() as stack:
+            deadline = time.monotonic() + 6
+            attempt = 0
+            while True:
+                try:
+                    guard = stack.enter_context(self.lease(user_id))
+                    break
+                except RetryableLibraryLeaseError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    attempt += 1
+                    time.sleep(min(2 ** attempt, 3, remaining))
+            yield guard
 
     @contextmanager
     def batch(self, user_id, face_ids=(), *, staged=False):
@@ -620,6 +647,28 @@ class FaissAssigner:
             raise ValueError('Legacy person faceIds exceeds 60 KiB; refusing truncation')
         return encoded
 
+    def choose_person(self, user_id, face_id, vector, tier, version, runtime,
+                      validator, person_lookup):
+        """Shared ordered matching rule for legacy and journaled wave execution.
+
+        This computes a choice only. Callers own persistence and runtime replay.
+        """
+        deterministic_id = self.person_id(user_id, face_id)
+        person = person_lookup(deterministic_id)
+        is_new = False
+        if person is None:
+            best, second, matched_id = runtime.best_two(vector, tier, version, validator)
+            if (matched_id is not None and best >= self.config.threshold
+                    and best - second >= self.config.margin):
+                person = person_lookup(matched_id)
+                if person is None:
+                    raise RuntimeError('Matched person disappeared before persistence')
+            else:
+                is_new = True
+                person = {'PartitionKey': user_id, 'RowKey': deterministic_id, 'name': '',
+                          'createdAt': datetime.now(timezone.utc).isoformat(), 'faceIds': '[]'}
+        return dict(person), is_new
+
     def assign(self, user_id, filename, face_ids, *, _guard=None,
                _prefetched=None, _defer_checkpoint=False, _stage=None):
         if not isinstance(user_id, str) or not user_id:
@@ -633,6 +682,13 @@ class FaissAssigner:
         newly_assigned_faces = 0
         already_owned_faces = 0
         with _LOCK, (self._assignment_lease(user_id) if _guard is None else nullcontext(_guard)) as guard:
+            # Point-in-time, not a bounded phase: _LOCK is process-global, so this
+            # is how long THIS call waited behind every other concurrent assign()
+            # (same or different user) plus its own per-user lease acquisition --
+            # the one span batch_assign already measures (lease_ms) but a
+            # standalone live call (the common per-upload path) previously did not.
+            processing_diagnostics.emit('cluster_lease_wait', role='cluster',
+                lease_wait_ms=int((time.monotonic() - started) * 1000), staged=_stage is not None)
             if not callable(getattr(guard, 'check', None)):
                 raise TypeError('lease must yield a guard with check()')
             guard.check()
@@ -669,7 +725,11 @@ class FaissAssigner:
                     continue
                 if not self._allowed(face):
                     continue
-                vector = prefetched[1] if prefetched is not None else self._embedding(user_id, face)
+                if prefetched is not None:
+                    vector = prefetched[1]
+                else:
+                    with processing_diagnostics.phase('cluster', 'embedding_fetch'):
+                        vector = self._embedding(user_id, face)
                 if vector is None:
                     continue
                 tier, version = self.tier(face), self.version(face)
@@ -681,30 +741,15 @@ class FaissAssigner:
                     _LOGGER.info('faiss delta compaction user=%s elapsed_ms=%d', user_id,
                                  int((time.monotonic() - rebuild_started) * 1000))
                     guard.check()
-                deterministic_id = self.person_id(user_id, face_id)
-                person = (dict(_stage['persons'][deterministic_id])
-                          if _stage is not None and deterministic_id in _stage['persons']
-                          else _point(self.person_table, user_id, deterministic_id))
-                is_new = False
-                if person is None:
-                    search_started = time.monotonic()
-                    best, second, matched_id = runtime.best_two(
-                        vector, tier, version, self._validator(user_id, tier, version, stats, _stage))
-                    search_ms += int((time.monotonic() - search_started) * 1000)
-                    if (matched_id is not None and best >= self.config.threshold
-                            and best - second >= self.config.margin):
-                        # Read the matched row directly, not a helper/summary cache.
-                        person = (dict(_stage['persons'][matched_id])
-                                  if _stage is not None and matched_id in _stage['persons']
-                                  else _point(self.person_table, user_id, matched_id))
-                        if person is None:
-                            raise RuntimeError('Matched person disappeared before persistence')
-                    else:
-                        is_new = True
-                        person = {'PartitionKey': user_id, 'RowKey': deterministic_id,
-                                  'name': '',
-                                  'createdAt': datetime.now(timezone.utc).isoformat(),
-                                  'faceIds': '[]'}
+                search_started = time.monotonic()
+                def person_lookup(person_id):
+                    return (dict(_stage['persons'][person_id])
+                            if _stage is not None and person_id in _stage['persons']
+                            else _point(self.person_table, user_id, person_id))
+                with processing_diagnostics.phase('cluster', 'faiss_search'):
+                    person, is_new = self.choose_person(user_id, face_id, vector, tier, version,
+                        runtime, self._validator(user_id, tier, version, stats, _stage), person_lookup)
+                search_ms += int((time.monotonic() - search_started) * 1000)
                 person_id = person['RowKey']
                 person['faceIds'] = self._membership(person, face_id)
                 # Keep the first valid source exemplar, never mix/average tiers.
@@ -726,60 +771,63 @@ class FaissAssigner:
                     assignment_started = True
                 persistence_started = time.monotonic()
                 if _stage is not None:
-                    if len(_stage['faces']) >= 256:
-                        raise ValueError('Staged face batch exceeds bounded capacity (256)')
-                    # Keep the first point-read ETag even when several faces
-                    # add membership to this person in the same transaction.
-                    _stage['persons'][person_id] = dict(person)
-                    if is_new:
-                        _stage['new_people'].add((user_id, person_id))
-                    if self.member_table is not None:
-                        _stage['members'][person_id, face_id] = {
-                            'PartitionKey': person_id, 'RowKey': face_id, 'userId': user_id,
-                            'addedAt': datetime.now(timezone.utc).isoformat()}
-                    face['personId'] = person_id
-                    _stage['faces'][face_id] = dict(face)
-                    try:
-                        runtime.upsert(face_id, person_id, vector, tier, version)
-                    except RebuildNeeded:
-                        runtime.rebuild()
-                        guard.check()
-                        runtime.upsert(face_id, person_id, vector, tier, version)
-                    assignments[face_id] = person_id
-                    newly_assigned_faces += 1
-                    if is_new:
-                        created.add(person_id)
+                    with processing_diagnostics.phase('cluster', 'persist_staged'):
+                        if len(_stage['faces']) >= 256:
+                            raise ValueError('Staged face batch exceeds bounded capacity (256)')
+                        # Keep the first point-read ETag even when several faces
+                        # add membership to this person in the same transaction.
+                        _stage['persons'][person_id] = dict(person)
+                        if is_new:
+                            _stage['new_people'].add((user_id, person_id))
+                        if self.member_table is not None:
+                            _stage['members'][person_id, face_id] = {
+                                'PartitionKey': person_id, 'RowKey': face_id, 'userId': user_id,
+                                'addedAt': datetime.now(timezone.utc).isoformat()}
+                        face['personId'] = person_id
+                        _stage['faces'][face_id] = dict(face)
+                        try:
+                            runtime.upsert(face_id, person_id, vector, tier, version)
+                        except RebuildNeeded:
+                            runtime.rebuild()
+                            guard.check()
+                            runtime.upsert(face_id, person_id, vector, tier, version)
+                        assignments[face_id] = person_id
+                        newly_assigned_faces += 1
+                        if is_new:
+                            created.add(person_id)
+                    persistence_ms += int((time.monotonic() - persistence_started) * 1000)
                     continue
-                _persist(self.person_table, person, guard)
-                if self.member_table is not None:
-                    member = {'PartitionKey': person_id, 'RowKey': face_id,
-                              'userId': user_id,
-                              'addedAt': datetime.now(timezone.utc).isoformat()}
-                    guard.check()
-                    self.member_table.upsert_entity(member)
-                face['personId'] = person_id
-                guard.check()
-                persisted = False
-                try:
-                    _persist(self.face_table, face, guard)
-                    persisted = True
-                finally:
-                    # A failed response may follow a committed remote stamp.
-                    # Do not keep a local snapshot that cannot know its outcome.
-                    if not persisted:
-                        invalidate(user_id)
-                updated = False
-                try:
-                    try:
-                        runtime.upsert(face_id, person_id, vector, tier, version)
-                    except RebuildNeeded:
-                        runtime.rebuild()
+                with processing_diagnostics.phase('cluster', 'persist'):
+                    _persist(self.person_table, person, guard)
+                    if self.member_table is not None:
+                        member = {'PartitionKey': person_id, 'RowKey': face_id,
+                                  'userId': user_id,
+                                  'addedAt': datetime.now(timezone.utc).isoformat()}
                         guard.check()
-                        runtime.upsert(face_id, person_id, vector, tier, version)
-                    updated = True
-                finally:
-                    if not updated:
-                        invalidate(user_id)
+                        self.member_table.upsert_entity(member)
+                    face['personId'] = person_id
+                    guard.check()
+                    persisted = False
+                    try:
+                        _persist(self.face_table, face, guard)
+                        persisted = True
+                    finally:
+                        # A failed response may follow a committed remote stamp.
+                        # Do not keep a local snapshot that cannot know its outcome.
+                        if not persisted:
+                            invalidate(user_id)
+                    updated = False
+                    try:
+                        try:
+                            runtime.upsert(face_id, person_id, vector, tier, version)
+                        except RebuildNeeded:
+                            runtime.rebuild()
+                            guard.check()
+                            runtime.upsert(face_id, person_id, vector, tier, version)
+                        updated = True
+                    finally:
+                        if not updated:
+                            invalidate(user_id)
                 persistence_ms += int((time.monotonic() - persistence_started) * 1000)
                 assignments[face_id] = person_id
                 newly_assigned_faces += 1
@@ -793,7 +841,8 @@ class FaissAssigner:
                     _ACTIVE.checkpoint_safe = False
                 metadata_started = time.monotonic()
                 if _stage is None:
-                    self.metadata_callback(user_id, filename)
+                    with processing_diagnostics.phase('cluster', 'metadata_callback'):
+                        self.metadata_callback(user_id, filename)
                 else:
                     _stage['projections'].add(filename)
                 metadata_ms = int((time.monotonic() - metadata_started) * 1000)

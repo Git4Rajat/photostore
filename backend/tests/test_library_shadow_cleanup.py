@@ -16,7 +16,7 @@ class StreamingTable(FakeTable):
 
     def query_entities(self, query, select=None):
         self.queries.append((query, select))
-        match = re.fullmatch(r"(PartitionKey|userId) eq '((?:[^']|'')*)'", query)
+        match = re.fullmatch(r"(PartitionKey|RowKey|userId) eq '((?:[^']|'')*)'", query)
         assert match, query
         field, value = match.groups()
         value = value.replace("''", "'")
@@ -158,3 +158,45 @@ def test_cleanup_transient_shadow_delete_failure_recovers(monkeypatch):
     app._purge_library_data('lib')
     assert len(calls) == 2
     assert table.rows == {}
+
+
+@pytest.mark.parametrize('cleanup', [app._purge_library_data, app._execute_library_clean])
+def test_cleanup_removes_hashes_and_orphan_filename_owners_only_for_library(monkeypatch, cleanup):
+    library = "lib'a"
+    hashes, owners, metadata, embeddings = (StreamingTable() for _ in range(4))
+    for name, table in (
+        ('hash_index_table_client', hashes), ('filename_owners_table_client', owners),
+        ('metadata_table_client', metadata), ('embeddings_table_client', embeddings),
+    ):
+        monkeypatch.setattr(app, name, table)
+    for owner in (library, 'other'):
+        hashes.upsert_entity({'PartitionKey': owner, 'RowKey': 'same-hash'})
+        embeddings.upsert_entity({'PartitionKey': owner, 'RowKey': 'photo.jpg'})
+        owners.upsert_entity({'PartitionKey': 'photo.jpg', 'RowKey': owner})
+        owners.upsert_entity({'PartitionKey': 'orphan.jpg', 'RowKey': owner})
+    metadata.upsert_entity({'PartitionKey': library, 'RowKey': 'photo.jpg'})
+    cleanup(library)
+    assert set(hashes.rows) == {('other', 'same-hash')}
+    assert set(embeddings.rows) == {('other', 'photo.jpg')}
+    assert set(owners.rows) == {('photo.jpg', 'other'), ('orphan.jpg', 'other')}
+    assert ("RowKey eq 'lib''a'", ['PartitionKey', 'RowKey']) in owners.queries
+    cleanup(library)
+    assert set(owners.rows) == {('photo.jpg', 'other'), ('orphan.jpg', 'other')}
+
+
+@pytest.mark.parametrize('cleanup', [app._purge_library_data, app._execute_library_clean])
+def test_filename_owner_failure_keeps_metadata_for_cleanup_retry(monkeypatch, cleanup):
+    owners, metadata = StreamingTable(), StreamingTable()
+    monkeypatch.setattr(app, 'filename_owners_table_client', owners)
+    monkeypatch.setattr(app, 'metadata_table_client', metadata)
+    owners.upsert_entity({'PartitionKey': 'orphan.jpg', 'RowKey': 'lib'})
+    metadata.upsert_entity({'PartitionKey': 'lib', 'RowKey': 'photo.jpg'})
+    attempts = []
+    def fail(**kwargs):
+        attempts.append(kwargs)
+        raise OSError('ownership delete unavailable')
+    monkeypatch.setattr(owners, 'delete_entity', fail)
+    with pytest.raises(OSError, match='ownership delete unavailable'):
+        cleanup('lib')
+    assert sum(call['partition_key'] == 'orphan.jpg' for call in attempts) == 3
+    assert ('lib', 'photo.jpg') in metadata.rows

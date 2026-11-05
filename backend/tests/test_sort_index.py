@@ -124,6 +124,41 @@ def test_build_snapshot_returns_none_when_table_unconfigured(monkeypatch):
     assert storage_utils._build_user_sort_index_snapshot('lib-A', 'v1') is None
 
 
+@pytest.mark.parametrize('kind', ['sort', 'access'])
+def test_full_and_incremental_catalogs_exclude_reservations_until_finalized(sort_ctx, monkeypatch, kind):
+    table, _, _ = sort_ctx
+    refresh = getattr(storage_utils, f'refresh_user_{kind}_index')
+    load = getattr(storage_utils, f'_load_{kind}_index_blob')
+    # A projection-aware fake ensures the full scan sees the tracking fields.
+    query = table.query_entities
+
+    def projected_query(filter_str, select=None, **kwargs):
+        for row in query(filter_str, **kwargs):
+            yield {k: v for k, v in row.items() if select is None or k in select}
+
+    table.query_entities = projected_query
+    _seed_row(table, 'lib-reserved', 'pending.png', pendingAnonymousBlob='reserved',
+              upload_started_at='2026-10-27T19:21:30+00:00', thumbnail_status='running')
+    _seed_row(table, 'lib-reserved', 'legacy.jpg')
+    refresh('lib-reserved', source_version='v1', force_full=True)
+    assert [r['RowKey'] for r in load('lib-reserved').rows] == ['legacy.jpg']
+
+    # Simulate a catalog built before the fix, then dirty its leaked row.
+    with monkeypatch.context() as old_code:
+        old_code.setattr(storage_utils, 'is_upload_reservation_only', lambda row: False)
+        refresh('lib-reserved', source_version='old-catalog', force_full=True)
+    assert len(load('lib-reserved').rows) == 2
+    storage_utils._mark_search_index_dirty_filenames('lib-reserved', ['pending.png'], kinds={kind})
+    refresh('lib-reserved', source_version='v2')
+    assert [r['RowKey'] for r in load('lib-reserved').rows] == ['legacy.jpg']
+
+    _seed_row(table, 'lib-reserved', 'pending.png', anonymousImageId='reserved',
+              uploadDate='2026-10-28T09:00:00+00:00', thumbnail_status='pending')
+    storage_utils._mark_search_index_dirty_filenames('lib-reserved', ['pending.png'], kinds={kind})
+    refresh('lib-reserved', source_version='v3')
+    assert {r['RowKey'] for r in load('lib-reserved').rows} == {'legacy.jpg', 'pending.png'}
+
+
 def test_build_snapshot_returns_none_on_query_exception_not_empty_rows(monkeypatch):
     class _BoomTable:
         def query_entities(self, filter_str):
@@ -238,6 +273,17 @@ def test_sort_tile_updates_coalesce_dirty_marks(sort_ctx, monkeypatch):
     assert len(dirty.submit_transaction_calls) == 1
     assert len(dirty.submit_transaction_calls[0]) == 2
     storage_utils._get_dirty_search_index_filenames('lib-coalesce', 'lexical')
+
+
+def test_processing_sort_touch_wakes_search_delta_scope_when_durable(monkeypatch):
+    calls = []
+    monkeypatch.setattr(storage_utils, 'DURABLE_INDEX_UPDATES', True)
+    monkeypatch.setattr(storage_utils, 'METADATA_INDEX_REQUEST_HOOK',
+                        lambda user, scope: calls.append((user, scope)) or 'queued')
+    monkeypatch.setattr(storage_utils, 'sort_index_skipped', lambda user: True)
+    monkeypatch.setattr(storage_utils, '_mark_search_index_dirty_filenames', lambda *args, **kwargs: None)
+    storage_utils.touch_user_sort_index_dirty('lib-status', ['a.jpg'])
+    assert calls == [('lib-status', 'search')]
 
 
 @pytest.mark.parametrize('batched', [False, True])
@@ -494,15 +540,27 @@ def test_refresh_incremental_merge_only_refetches_dirty_filenames(sort_ctx):
 
 def test_dirty_set_too_large_to_merge_thresholds(monkeypatch):
     monkeypatch.setattr(storage_utils, '_INDEX_MERGE_MAX_DIRTY_ABS', 2000)
-    monkeypatch.setattr(storage_utils, '_INDEX_MERGE_MAX_DIRTY_FRACTION', 0.10)
+    # concurrency=10, point_read=10ms -> merge_ms = ceil(dirty/10)*10.
+    # scan=1ms/row -> scan_ms = rows. Round numbers to keep the arithmetic
+    # legible: merge cost and scan cost are compared directly, not via a
+    # fixed fraction of the library (see _dirty_set_too_large_to_merge).
+    monkeypatch.setattr(storage_utils, '_INDEX_MERGE_CONCURRENCY', 10)
+    monkeypatch.setattr(storage_utils, '_INDEX_MERGE_POINT_READ_MS', 10.0)
+    monkeypatch.setattr(storage_utils, '_INDEX_MERGE_SCAN_MS_PER_ROW', 1.0)
     # Below the absolute floor -> always stay on the cheap point-read merge,
-    # no matter how large the library is.
+    # no matter how large the library is (not even reached: a huge scan would
+    # obviously win on cost, but the floor short-circuits before computing it).
     monkeypatch.setattr(storage_utils, '_library_row_count', lambda _u: 1_000_000)
     assert storage_utils._dirty_set_too_large_to_merge('u', 1999) is False
-    # Past the floor and >= 10% of the library -> a bulk scan is cheaper.
+    # Past the floor: dirty=2000 -> merge_ms=2000, a 10k-row library's
+    # scan_ms=10000 -> merge is cheaper, still merge.
     monkeypatch.setattr(storage_utils, '_library_row_count', lambda _u: 10_000)
+    assert storage_utils._dirty_set_too_large_to_merge('u', 2000) is False
+    # Same dirty count against a library small enough that scanning it beats
+    # merging: 1,500 rows -> scan_ms=1500 < merge_ms=2000 -> scan.
+    monkeypatch.setattr(storage_utils, '_library_row_count', lambda _u: 1_500)
     assert storage_utils._dirty_set_too_large_to_merge('u', 2000) is True
-    # Past the floor but a small fraction of a big library -> still merge.
+    # Past the floor but a huge library -> merge stays far cheaper than scan.
     monkeypatch.setattr(storage_utils, '_library_row_count', lambda _u: 1_000_000)
     assert storage_utils._dirty_set_too_large_to_merge('u', 2000) is False
     # Library size unknown (no search DB yet) but past the floor -> scan.
@@ -618,6 +676,24 @@ def test_photos_sort_index_returns_available_true_with_sas_url(monkeypatch, sort
     assert payload['indexUrl'] == 'https://example.invalid/abc-sort.json.gz?sas'
     assert payload['sourceVersion'] == 'v2'
     assert payload['updatedAt'] == '2026-01-01'
+
+
+def test_manifest_delta_sequence_reaches_the_sort_index_response(monkeypatch, sort_index_route_ctx):
+    # Exercise the real summary/route boundary, not a pre-composed summary.
+    monkeypatch.setattr(storage_utils, '_load_sort_index_manifest', lambda _: {
+        'sourceVersion': 'base-v1', 'rowCount': 2, 'deltaSeq': 2,
+    })
+    monkeypatch.setattr(app, 'get_index_manifest_summary', storage_utils.get_index_manifest_summary)
+    monkeypatch.setattr(app, 'get_sort_index_blob_location', lambda _: ('catalog', 'sort-base'))
+    monkeypatch.setattr(app, '_create_stable_read_sas_url', lambda container, blob: (f'https://storage.test/{blob}', 'later'))
+    with app.app.test_request_context('/api/photos/sort-index'):
+        payload = photos_sort_index().get_json()
+    assert payload['available']
+    assert payload['sourceVersion'] == 'base-v1'
+    assert payload['deltaSeq'] == 2
+    assert payload['deltaUrls'] == [
+        f'https://storage.test/{storage_utils._sort_index_delta_blob_name("owner", seq)}' for seq in (1, 2)
+    ]
 
 
 def test_photos_sort_index_route_never_loads_the_data_blob(monkeypatch, sort_index_route_ctx):

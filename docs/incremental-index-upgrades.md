@@ -1,0 +1,384 @@
+# Additive incremental index upgrades
+
+## Scope
+
+Existing full/bulk build algorithms and wave publication remain supported.
+Incremental updates are an additional path, not a replacement. This handoff was
+verified against current code on **2026-11-01**; automatic source coverage,
+scheduling, summary refresh and immutable-artifact cleanup are integrated.
+This documentation update changes no code or infrastructure and performs no
+deployment; it does not establish which versions are running in production.
+The goal remains additive upgrades: no new artifact overlays or expansion of
+Core ownership.
+
+## Operational compatibility: cleanup now requires operator quiescence
+
+**When durable updates are active, existing library/account cleanup and even a
+normal library-content wipe require explicit proof that ALL library writers
+are stopped. The existing emailed approvals/cleanup UX alone are insufficient.**
+Wave ownership, an idle coverage counter or expired worker leases do not prove
+quiescence. Unproved cleanup fails closed rather than deleting automatic state.
+Stop/drain upload, vision, clustering, maintenance/full builders, legacy
+processes and paused HTTP requests; keep them stopped through recovery/purge.
+
+The authenticated admin route `POST /api/admin/indexes/source-reservations`
+implements the operator lifecycle (see [backend/routes/admin.py](../backend/routes/admin.py)):
+
+1. `action=fence` with a nonempty `reason` arms an indefinite library admission
+   fence and returns `fenceId`.
+2. After externally stopping/draining **all** writers, send `action=prove`,
+   that `fenceId`, a nonempty `reason`,
+   `confirm=ALL_LIBRARY_WRITERS_STOPPED`, `allWritersStopped=true`,
+   `noPausedRequests=true` and `legacyWritersStopped=true`. The route checks the
+   real renewable catalog guard and absence of live maintenance/model claims;
+   these checks supplement, not replace, the operator's external proof.
+3. For orphan repair, `action=recover` with `fenceId` persists each rebuild
+   intent before resetting reservations to `fullRequired`, preserving dirty IDs.
+   For cleanup, run the existing approved purge/wipe while the proof is live;
+   immutable artifacts and automatic state are purged before cleanup completion,
+   with proof rechecks and retryable failures.
+4. Explicitly send `action=resume` with `fenceId` when recovery/purge has finished
+   and it is safe to release admission. Recovery persists rebuild intents;
+   fenced builders can process those intents after resume. Partial failures
+   leave the fence in place and must be retried, not bypassed.
+
+**Orphan source reservations and the operator fence/proof have no timeout.**
+A SIGKILL or partially completed reservation fails closed until explicit
+operator recovery; elapsed time must never hide a paused source writer.
+
+## Activation
+
+[backend/storage_utils.py](../backend/storage_utils.py) derives the module-level
+`DURABLE_INDEX_UPDATES` boolean at import time from
+`bool(os.getenv('INDEX_MAINTENANCE_QUEUE_NAME', '').strip())`. A nonempty queue
+name enables it; an absent/blank name disables it. **There is no independent
+`DURABLE_INDEX_UPDATES` environment-variable opt-in.** Existing jobs, queue and
+`searchdirty` storage are reused; no new infrastructure is required by this path.
+Configured storage and scheduling hooks must actually be available: failures
+retain evidence/retry work or fail the source operation, not silently certify it.
+
+## Implemented
+
+| Index | Added or strengthened facility | Current activation |
+| --- | --- | --- |
+| Search SQLite | Bounded dirty captures, continuation, original-version acknowledgement, base-plus-delta publication | Core attempts bounded slips; index worker remains the durable backstop and compactor |
+| Sort | Base-plus-delta correction slips with bounded dirty captures and browser delta application | Core attempts small slips; index worker remains the durable backstop and compactor |
+| Access | Strict incremental-only merges: defer instead of full-scan fallback | Existing inline path, subject to ownership/base/budget checks |
+| People/albums | Strict incremental-only merges, membership budgets, artifact CAS; album search dependency checks | Existing inline path, subject to real catalog serialization |
+| Lexical JSON | Streamed gzip merge with bounded changed rows and disk uniqueness table | Automatic certified filenames through existing maintenance work |
+| Photo vector | Streamed NPZ merge, SQLite row mappings, immutable data/manifest CAS | Automatic certified filenames through existing maintenance work |
+| People embeddings | Streamed NPZ merge and targeted person/face reads | Automatic old/new owner coverage and configured model identity |
+| Tag embeddings | SQLite photo-tag contributions/refcounts; only newly required tags encoded | Automatic full sidecar seed/targeted maintenance, **vision owner only** |
+| Upload hash snapshot | Streamed hash-map merge and manifest/delete-epoch transaction CAS | Automatic certified hashes through the dedup maintenance scope |
+| Explore/SQLite timeline | Exact reduced-row memberships and UTC day aggregates inside search SQLite | Atomic delta transactions; worker refresh on every successful drain, including noop |
+| Raw-stream summaries | Standalone ordered contribution sidecar | Explicit utility only; distinct from the integrated SQLite reference |
+| FAISS | Existing incremental delta retained | Unchanged |
+
+The strict artifact paths return lightweight publication receipts rather than
+hydrated library-sized snapshots. Existing ordinary/full callers retain their
+snapshot contracts. Failure to publish cannot count as successful maintenance.
+
+### Automatic coverage and recovery
+
+[backend/automatic_index_updates.py](../backend/automatic_index_updates.py)
+tracks all source tables for its five artifact kinds: metadata, photo embeddings,
+face embeddings, faces, people and hash rows. `SourceTable` wrappers are installed
+at client construction, inside cache proxies, so raw/batched persistence,
+including FAISS writes, follows the same reservation path. Face changes include
+old and new owners; uncertain/racy source reads force full coverage rather than
+guessing a complete affected set.
+
+Exact internal metadata partitions `clustering_maintenance`, `__system__`,
+`jobs` and `performance`, and shared hash `CONTROL_ROWS`, bypass old-row reads,
+source admission and coverage tracking. These are exact reserved identities,
+not filename/field heuristics: media reservations, processing rows, tombstones
+and odd/extensionless names remain tracked even without finalization fields.
+`__init__` belongs to the separate trash table, not a media exclusion.
+
+Before source storage, writers persist WorkStore intent, active reservations and
+versioned dirty IDs. After storage, **all successfully begun reservations finish
+before any post-write scheduling is attempted**, then all schedules are attempted
+even if finalization fails. Every finish/schedule failure is preserved in a
+`BaseExceptionGroup`; an original source/begin error remains primary with that
+group chained beneath it. Successful source writes with failed finalization
+still raise a caller-visible retryable error. Failed/partially committed begins
+are not decremented: their uncertain active state deliberately fails closed.
+Controls/dirty IDs reuse `searchdirty`; jobs reuse the existing `WorkStore` ledger
+and queue recovery. Guarded waves retain their declared outputs/receipts and force
+an automatic coverage seed after wave completion.
+
+Tag requests persist model-tag WorkStore intent and use `notify()` to coalesce
+a targeted `tag_index_maintenance` version-1 payload on the **existing vision
+queue**, with no fabricated filename/steps or photo-processing job. The consumer
+validates exact library, scope, job/key/partition and protocol identities, requires
+the vision role/model, and holds renewable publication ownership plus the real
+catalog lock. Core/index-worker never claims or model-loads tag work; recovery
+only publishes tag wakeups. `SourceBusy` keeps durable retry timing and re-delays
+the original queue receipt by 10 seconds, without charging the failure budget
+or multiplying replacement messages. Post-write revisions/newer requests and
+expired-wakeup recovery preserve the next wake; poison work needs explicit repair.
+The configured roughly five-day vision sweep is now a recovery backstop for
+durable tag work, not its normal trigger: tag writes enqueue an immediate wake
+subject to ordinary coalescing/queue visibility and source barriers.
+
+Queued tag maintenance reports completed source rows, bounded encoding batches,
+SQLite VM work and artifact bytes to Vision's existing stall watchdog. Transfer
+streams capture the task callback for Azure SDK threads. Queue/catalog lease
+renewals, seeks and empty reads do not count as work; stalled source, encoder or
+transfer calls still trigger process recycling. Full vocabulary encoding uses
+64-tag batches so a healthy bootstrap can exceed the photo-task timeout while
+continuing to demonstrate progress.
+
+The worker captures an idle source revision plus **at most 512 dirty IDs** with
+bounded lookahead. Missing/uncertified bases, truncated captures, uncertain
+coverage, incompatible artifacts or model mismatch select the retained full
+builders for bootstrap/bulk/repair. A strict targeted deferral persists
+`fullRequired` for the next durable retry, rather than hiding a publication
+failure with a second build in the same attempt. Full builds remain full-source
+work; the 512 bound limits dirty capture, not total full-build cost.
+
+Publication is followed by source-revision/ETag CAS certification, then original
+dirty-ETag acknowledgements. Full fallback drains overflow acknowledgements in
+bounded batches while the captured revision remains idle. Queue-send/post-write
+scheduler failures leave durable intent or uncovered revisions for existing
+queue recovery; they do not justify dropping dirty work.
+
+### Universal publication lock and immutable GC
+
+All catalog publishers, including full/legacy, wave, hash and model-tag paths,
+share the **real renewable library catalog lock** from base capture through
+pointer commit; same-library nested publishers reuse the live guard. GC acquires
+that same lock **after successful WorkStore completion and claim release**, only
+in `APP_ROLE=index-worker`, not from readers or ordinary HTTP handlers.
+
+The existing 60-second worker recovery scan also retries GC for quiet libraries
+after grace expires. **Any canonical supported family control** can nominate its
+library, independently of certification or hash readiness; GC certifies each
+family under the lock. Two bounded rotating windows deduplicate one slot per
+library using its canonical hash-partition rotation key, without an unbounded
+all-library set, and prevent deferred libraries from starving later ones.
+The default cap is **25 libraries per recovery**, configurable with
+`INDEX_ARTIFACT_CLEANUP_LIBRARIES_PER_RECOVERY` (clamped to 0–1000).
+No new queue, timer resource,
+maintenance scope or metadata-wide scan is required. Operator-fenced libraries
+and active waves are skipped; cleanup failures do not block queue wakeups.
+
+[backend/index_artifact_cleanup.py](../backend/index_artifact_cleanup.py)
+defaults to **24-hour grace, current references plus the newest previous
+generation, and at most 100 blob deletions per pass**. Discovery is paged,
+SHA-library-prefix scoped and bounded (default 256 items/page, 100-page survey
+cap); each family completes its own retention survey before deleting any of its
+bytes. An incomplete survey defers that family, not unrelated eligible families.
+Grace applies to both artifact
+age and the latest manifest/pointer update as a conservative retirement time.
+Frequently updated manifests can therefore defer GC. Fixed aliases and wave
+projections are not immutable GC candidates. Tag NPZ/SQLite sidecars are retained
+as whole generations, using the newest sibling timestamp; a young sibling
+protects the entire generation through bounded point reads.
+
+GC eligibility is **per family**, not an all-five-controls prerequisite: that
+family's exact control must be idle, fully certified and match its current
+manifest lineage. Missing/stale unrelated controls or changed inactive unrelated
+jobs do not block it. The same universal real lock and **global active publication
+claim gate across both maintenance/model-tag partitions** remain conservative.
+Related builder work ETags, including full/reconcile/compact and shared lexical
+dependencies, remain part of each family's proof, not just its output scope.
+Control/work ETags, references and the guard are rechecked before conditional
+candidate deletion; loss of the shared guard stops the pass. Unknown/missing
+family evidence defers that family; a pointer commit alone is not certification.
+Reports include per-kind `status`, `deleted`, `examined` and `reason`, plus
+compatible aggregate totals/status (`complete`, `partial`, `deferred`, `capped`).
+Grace, retention and deletion caps are configurable via
+`INDEX_ARTIFACT_CLEANUP_GRACE_SECONDS`,
+`INDEX_ARTIFACT_CLEANUP_RETAIN_GENERATIONS` and
+`INDEX_ARTIFACT_CLEANUP_MAX_DELETIONS`; the deletion budget is global across
+families and never exceeds 100 blobs per call, even if configured higher.
+Readers must finish within the configured
+grace; indefinitely paused readers are not protected by this retention policy.
+
+## Important cost distinction
+
+Vector, people-embedding, lexical and hash upgrades avoid whole-index Python
+collections, and target source reads to affected records. They still stream
+the existing artifact and rewrite a compatible complete output. Artifact CPU,
+disk and network work therefore remains proportional to artifact size, even
+for one changed record. They are bounded-RAM upgrades, not constant-time delta
+publication. The existing search database already publishes small deltas;
+other artifact formats would need a reader-compatible overlay for that property.
+
+Memory includes fixed SQLite caches, streaming buffers and capped changed
+records. Oversized IDs, memberships, metadata rows, incomplete captures,
+incompatible bases and transient read failures defer/abort. Disk requirements
+include base download, intermediate state and output, and must be budgeted.
+Model-dependent tag inference stays with the existing model owner.
+
+## Correctness contracts
+
+- Explicit affected sets must include **every** relevant change since the
+  expected base, including both people for reassignment and all deletions.
+- A capture marked `has_more` or `truncated` cannot be certified complete.
+- Source mutations and publishers require appropriate serialization/fencing.
+  Manifest CAS alone does not prove that an affected set covers source writes.
+- Dirty acknowledgements use the captured ETags. Concurrent re-marks survive.
+- Incremental-only attempts never bootstrap or silently scan the full source.
+  The durable worker remains the backstop.
+- Lexical snapshot versions are separate from shared catalog coverage;
+  isolated JSON upgrades do not falsely advance Listing/SQLite readiness.
+- Immutable blob pointers are user-scoped; failed pointer CAS does not activate
+   uploaded bytes, and successful pointer commits still require source certification.
+- Full publishers remain compatible with the wave BuildGuard's declared outputs.
+- Source writes and blob/table publication are not one atomic transaction.
+  A source writer overlapping publication may leave a **temporarily stale,
+  uncertified pointer visible to readers**. Certification loses the CAS, no
+  dirty versions are acknowledged, and the next worker rejects that base and
+  performs a full repair. This is not a linearizable read guarantee.
+
+## Remaining limitations
+
+1. **Every running source writer must use this version and its tracked clients.**
+   Mixed-version/legacy processes or external raw table writers bypass the proof;
+   a publisher lock cannot repair untracked source coverage. Verify all writers,
+   not only the maintenance worker, before relying on automatic certification.
+2. Deployment-scale sizing remains unverified: measure RSS, CPU, local disk,
+   source reads, artifact bytes and latency on deployment-size machines.
+   Passing tests is not million-photo sizing certification or a live distributed
+   concurrency/load validation. Whole-artifact rewrites/downloads still scale
+   with artifact size.
+3. Summaries preserve two different full references, not one interchangeable
+   representation. Indexed SQLite summaries are automatic; the standalone raw
+   sidecar still requires explicit admission/order and caller-owned persistence.
+   The two remote summary blobs are not an atomic pair; common source tokens
+   expose their lineage and failed publication is replayed.
+4. Existing cleanup UX now needs the explicit external all-writer shutdown/proof
+   above, including ordinary wipes. No automatic timeout recovery, inferred
+   quiescence or rolling mixed-writer compatibility is claimed.
+
+## Validation
+
+Latest agent-reported full backend suite after feedback 1, 2, 3 and 6:
+**5,300 passed, 14 skipped, 12 existing warnings**. All 14 skips require the
+unavailable private TIFF corpus. Frontend is unchanged; its last verified run
+was **816 passed across 57 files**, a prior run, not a rerun of the current state.
+Neither suite was rerun for this documentation-only update.
+Coverage includes full/incremental equivalence,
+source reservations/CAS, bounded fallback, failed publication/replay, noop/delta
+summary drains, wave guards, tag queue wake/retry, independent per-family and
+periodic GC, fair bounded recovery
+and quiesced purge retry/order. Patch whitespace checks are clean; unrelated
+existing Bicep and frontend TypeScript configuration diagnostics remain untouched.
+No deployment or infrastructure change was performed for this update; these
+results do not certify a live rollout or production-scale sizing.
+
+See [incremental-summaries.md](incremental-summaries.md) for the summary
+adapters' separate reference contracts and operational limitations.
+
+## Indexer idle-cost cleanup (2026-11-02)
+
+Automatic maintenance blocked by an unfinished wave now stores a `wave_wait`
+intent and schedules a recovery receipt after five minutes (configurable with
+`INDEX_BARRIER_RECOVERY_SECONDS`, minimum 300). This replaces ten-second retries
+that could sustain a running replica despite no eligible artifact work. Source
+barriers without a pending wave use the same recovery interval. Durable intent,
+dirty coverage, real failure limits and early-delivery embargoes are preserved.
+
+A terminal wave signals the indexer to resume its library's wave-waiting intents
+immediately. A completed predecessor cannot unblock an unfinished tail, steal a
+live claim, revive a failed intent, or release a non-wave source barrier. Normal
+wave consumption and the route-driven completion path both issue this signal.
+Lost completion signals and failed sends retain the delayed recovery path. A
+late old receipt is acknowledged as obsolete rather than rebuilding an artifact.
+Recovery-only resume can take up to the configured delay plus queue/startup time;
+this trades frequent empty checks for scale-to-zero opportunities.
+
+Index-worker telemetry now charges message processing and periodic recovery to
+its own reporter. Queue handling emits `index_message_outcome` values such as
+`deferred`, `obsolete`, `intent_completed`, or `handled`; acknowledgement/normal
+return alone is not an index-publication receipt. Routine GC wave/quiescence
+barriers return deferred quietly, while unexpected failures retain tracebacks.
+
+The November 3 live-log follow-up distinguishes Vision coordination contention
+from photo inspection failures. `MutationContention` during inspection escapes
+to the existing bounded stage retry path (`vision_coordination_retry`), without
+incrementing a member's inspection counter or spending a source/model attempt.
+ETag checks, execution fencing and queue retry limits remain in force.
+
+Inline Albums readiness emits `index_merge_readiness` with `kind`, `reason`,
+`outcome` (`deferred` or `failed`) and, for failures, `error_type`. Reasons identify
+publication-base reads, missing/invalid Albums artifacts, stale Search lineage
+or delta state, building/dirty Search data, pending member metadata, unavailable
+tracking and bounded-work limits. An explicit safe deferral retains the dirty
+rows, intent and queue wakeup without raising the generic merge error. Storage,
+decode and refresh failures remain failures; a later readiness deferral cannot
+hide an earlier error in the same attempt.
+
+Claimed inline attempts attach the intent revision and an opaque `operation_id`.
+Queue traces and `index_message_outcome` use the same SHA-256-derived, 32-character
+key from the existing queue `operationId`; the original can exceed the telemetry
+label limit and includes a library identity. Queue outcome fields describe the
+delivered intent; a coalescing worker can claim a newer revision, so an outcome
+alone still does not prove publication of every edit. These diagnostics run on
+existing work/read paths and introduce no timers, wakeups or storage requests.
+
+The existing Tools-only browser job-polling change is retained and its polling,
+foreground-demand and index-ready push tests were rerun. No infrastructure change,
+queue purge, image publication or live rollout is part of this code-only cleanup.
+
+Cleanup verification: full backend suite **5,434 passed, 14 skipped** (the private
+TIFF-corpus cases), and **98 frontend tests passed** across Tools-only job polling,
+index demand and index-ready push. The deterministic regression covers immediate
+wave-completion resume, unfinished-tail protection, stale-receipt deduplication,
+live-claim isolation, lost completion/send recovery, and correct worker telemetry.
+
+### Audit follow-up: cancel obsolete delayed recovery wakes
+
+Delayed index wake receipts are now retained in the durable intent. An immediate
+completion signal keeps that fallback until the latest maintenance revision has
+actually finished; merely accepting an immediate queue message is insufficient,
+because a concurrent edit can make that delivery early again. After successful
+intent deletion, the worker (or inline builder) cancels the delayed receipt.
+Failed sends and unfinished/newer revisions keep their recovery path.
+
+Replacement delayed deliveries supersede older receipts only after the new send
+succeeds. A send response arriving after intent completion cancels its own stale
+delivery. If delayed send responses arrive out of order, the late response also
+cancels its own delivery when a newer recovery receipt is already recorded.
+When a response records a replacement, it cancels the receipt displaced by that
+successful conditional write, including one attached while its send was pending.
+Rotated receipts are left to their active consumer, while cancellation
+failures leave an obsolete message safe to acknowledge later. Receipt-bookkeeping
+failures do not reinterpret an accepted send as a failed send or discard work.
+Legacy messages without a stored receipt can still cause one obsolete wake;
+normal cancellation applies to newly tracked messages. No live queues are purged.
+
+This follow-up fixes audit issue 2 only. The five-minute delay for ordinary
+non-wave source barriers (audit issue 1) is unchanged. Changes remain code-only.
+
+Receipt-cleanup verification before the overlapping-send follow-up: full backend
+suite **5,444 passed, 14 skipped**. The overlapping-send follow-ups passed **119**
+targeted receipt, work-store, barrier, recovery and wave-liveness tests.
+Fourteen receipt test cases exercise real sender/worker integration, cancellation after final
+completion, retained fallbacks on failed/early sends, newer revisions, rotated
+consumer receipts, deletion outages, delayed send responses and inline races.
+Out-of-order responses are covered both with another completion signal and with
+only the latest delayed fallback available to recover unfinished work.
+Concurrent tests also cover an older response returning during the newer send,
+before the newer response records the replacement receipt.
+
+### Subscription negotiation no longer wakes the indexer
+
+The push client reconnects every four minutes to recheck library authorization.
+It previously used `postTools('/api/tools/index-events/negotiate')`, so these
+lightweight renewals woke the indexer API and its co-located maintenance sidecar
+without any pending indexing work. Index-demand and foreground gates limit the
+requests, but do not prevent them during an active session.
+
+New browser bundles use core's `POST /api/index-events/negotiate` through the
+core API client. The authenticated library binding, no-store response, short
+subscription token, reconnect reconciliation, and demand gates are retained.
+The legacy tools route delegates to the same handler for older bundles.
+Deployment code adds core's managed identity to the existing Web PubSub grants;
+core already receives `INDEX_EVENTS_ENDPOINT` through the shared backend env.
+
+This is code-only. A future rollout must include the backend route, Web PubSub
+grant, and frontend bundle. Older browser bundles still negotiate on indexer
+until refreshed; no live routing or role assignments were changed here.

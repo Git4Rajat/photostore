@@ -42,7 +42,7 @@ def test_immutable_face_snapshot_survives_live_face_changes_and_qualifies_inbox(
     assert received['completionQualified'] is False  # Scheduling/model-policy is separate.
 
 
-def test_manifest_is_not_published_after_a_partial_snapshot_failure(blobs, monkeypatch):
+def test_manifest_is_not_published_after_a_snapshot_batch_failure(blobs, monkeypatch):
     (metadata, _, _, _, fence), _ = blobs
     table = AtomicTable(); receipts = ArtifactReceipts(table, 'lib')
     row = terminal(dict(metadata.get_entity('lib', 'photo.jpg')))
@@ -53,7 +53,7 @@ def test_manifest_is_not_published_after_a_partial_snapshot_failure(blobs, monke
         submit = table.submit_transaction
         failed = [False]
         def outage(ops):
-            if ops[0][1]['RowKey'].startswith('face!') and len(table.rows) == 1 and not failed[0]:
+            if ops[0][1]['RowKey'].startswith('face!') and not failed[0]:
                 failed[0] = True; raise OSError('snapshot outage')
             return submit(ops)
         monkeypatch.setattr(table, 'submit_transaction', outage)
@@ -72,6 +72,36 @@ def test_empty_face_lookup_is_explicit_and_missing_lookup_cannot_qualify(blobs):
         assert not receipts.table.rows
         storage_utils._store_client_face_entities('lib', 'photo.jpg', [])
         assert receipts.capture(storage_utils, row)
+
+
+def test_quality_rejected_face_result_publishes_qualified_empty_lookup(blobs, monkeypatch):
+    """A completed quality rejection must carry proof, not the init-time lookup."""
+    (metadata, _, _, lookup, _), _ = blobs
+    row = metadata.rows['lib', 'photo.jpg']
+    terminal(row)
+    row['face_status'] = 'running'
+    # Upload initialization's empty lookup predates the processing attempt.
+    storage_utils._store_client_face_entities('lib', 'photo.jpg', [])
+    assert not lookup.get_entity('lib', 'photo.jpg').get('sourcePhotoId')
+    receipts = ArtifactReceipts(AtomicTable(), 'lib')
+    monkeypatch.setenv('UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED', 'true')
+    monkeypatch.setitem(storage_utils._CTX, 'embeddings_table_client', None)
+    monkeypatch.setitem(storage_utils._CTX, 'source_completion_delivery', None)
+    monkeypatch.setitem(storage_utils._CTX, 'source_artifact_receipt_capture',
+                        lambda library, candidate: receipts.capture(storage_utils, candidate))
+    monkeypatch.setattr(storage_utils, '_refresh_semantic_fields', lambda *a: None)
+    result = storage_utils.apply_client_processing_results_for_file(
+        'lib', 'photo.jpg', origin='ipworker', claimed_steps=['face'],
+        lease_owner='owner', expected_processing_revision='rev', expected_processing_fence='attempt',
+        client_processing={'face': dict(hasData=False, faces=[], rawFaceCount=1,
+            filteredFaceCount=1, faceFailureStage='quality_filter_rejected',
+            filteredReason='landmark_detection_failed')})
+    assert result['face_status'] == 'no_data' and result['faceCount'] == 0
+    published = lookup.get_entity('lib', 'photo.jpg')
+    assert published['state'] == 'complete' and json.loads(published['faceIds']) == []
+    assert published['sourcePhotoId'] == 'photo' and published['processingRevision'] == 'rev'
+    assert published['processingFence'] == 'attempt'
+    assert result['artifactReceipt']
 
 
 def test_receipt_storage_outage_preserves_completed_outputs_and_retries_without_models(blobs, monkeypatch):
@@ -117,3 +147,183 @@ def test_incomplete_aggregate_cannot_leave_done_status_without_fields(blobs, mon
             lease_owner='owner', expected_processing_revision='rev', expected_processing_fence='attempt')
     row = metadata.get_entity('lib', 'photo.jpg')
     assert row['face_status'] == 'failed' and not row.get('artifactReceipt')
+
+
+@pytest.mark.parametrize('face_count', ['missing', None, 0])
+def test_video_artifact_receipt_does_not_require_browser_owned_failed_steps(blobs, face_count):
+    from dataclasses import replace
+    from test_processing_completion import video_source
+    (metadata, _, _, _, fence), _ = blobs
+    row = dict(metadata.get_entity('lib', 'photo.jpg'))
+    row.update(video_source(), processingRevision=fence.revision, anonymousImageId=fence.photo,
+        processingGeneration=fence.generation)
+    if face_count == 'missing':
+        row.pop('faceCount', None)
+    else:
+        row['faceCount'] = face_count
+    metadata.rows['lib', 'clip.mp4'] = dict(row,
+        processing_lease_owner='owner', processingFence=fence.attempt,
+        processing_lease_expires_at=metadata.get_entity('lib', 'photo.jpg')['processing_lease_expires_at'])
+    receipts = ArtifactReceipts(AtomicTable(), 'lib')
+    with result_fence(replace(fence, filename='clip.mp4')):
+        reference = receipts.capture(storage_utils, row)
+    manifest = json.loads(receipts._get('manifest!' + reference['id'])['payload'])
+    assert manifest['faceSnapshots'] == [] and manifest['faceCount'] == 0
+    assert row['faceCount'] == 0
+    row.update(artifactReceipt=json.dumps(reference), processing_lease_owner='', processing_lease_expires_at='')
+    prepare_completion(row)
+    intent = json.loads(row['processingCompletionOutbox'])[-1]
+    assert intent['requiredSteps'] == [] and intent['faceCount'] == 0
+    assert receipts.verify_reference(reference, intent)['faceCount'] == 0
+
+
+@pytest.mark.parametrize('video,face_count', [(True, 1), (False, None), (False, 1)])
+def test_skipped_face_receipt_still_rejects_unproven_image_counts_and_existing_faces(blobs, video, face_count):
+    from dataclasses import replace
+    from test_processing_completion import video_source
+    (metadata, _, _, _, fence), _ = blobs
+    row = terminal(dict(metadata.get_entity('lib', 'photo.jpg')))
+    if video:
+        row.update(video_source())
+    row.update(face_status='skipped', faceCount=face_count,
+        processingRevision=fence.revision, processingGeneration=fence.generation)
+    filename = row['RowKey']
+    metadata.rows['lib', filename] = dict(row)
+    receipts = ArtifactReceipts(AtomicTable(), 'lib')
+    with result_fence(replace(fence, filename=filename)), pytest.raises(ValueError, match='explicit prior receipt'):
+        receipts.capture(storage_utils, row)
+    assert not receipts.table.rows
+
+
+@pytest.mark.parametrize('change', ['none', 'face_count', 'exif', 'photo', 'corrupt_manifest', 'valid'])
+def test_video_status_mismatch_recovery_is_narrowly_scoped(blobs, change):
+    from dataclasses import replace
+    from processing_completion import completion_identity
+    from test_processing_completion import video_source
+    (metadata, _, _, _, fence), _ = blobs
+    row = dict(metadata.get_entity('lib', 'photo.jpg'))
+    row.update(video_source(), processingRevision=fence.revision, processingGeneration=fence.generation,
+        thumbnail_status='done')
+    metadata.rows['lib', row['RowKey']] = dict(row)
+    receipts = ArtifactReceipts(AtomicTable(), 'lib')
+    with result_fence(replace(fence, filename=row['RowKey'])):
+        reference = receipts.capture(storage_utils, row)
+    row.update(artifactReceipt=json.dumps(reference), processing_lease_owner='', processing_lease_expires_at='')
+    if change != 'valid':
+        row['thumbnail_status'] = 'failed'
+    prepare_completion(row)
+    intent = json.loads(row['processingCompletionOutbox'])[0]
+    if change == 'face_count': intent['faceCount'] = 1
+    if change == 'exif': intent['statuses']['exif'] = 'done'
+    if change == 'photo': intent['photoId'] = 'replacement'
+    if change == 'corrupt_manifest':
+        receipts.table.rows[receipts.partition, 'manifest!' + reference['id']]['payload'] = '{}'
+    intent['id'] = completion_identity({k: v for k, v in intent.items() if k != 'id'})
+    assert receipts.is_video_status_mismatch(intent) is (change == 'none')
+    row['processingCompletionOutbox'] = json.dumps([intent])
+    with result_fence(replace(fence, filename=row['RowKey'])):
+        receipts.capture(storage_utils, row)
+    assert json.loads(row['processingCompletionOutbox']) == ([] if change == 'none' else [intent])
+
+
+def test_video_result_application_commits_capture_zero_face_normalization(blobs, monkeypatch):
+    from test_processing_completion import video_source
+    (metadata, _, _, _, fence), _ = blobs
+    row = dict(metadata.get_entity('lib', 'photo.jpg'))
+    row.update(video_source(), processingRevision=fence.revision, processingGeneration=fence.generation)
+    row.pop('faceCount')
+    metadata.upsert_entity(row)
+    receipts = ArtifactReceipts(AtomicTable(), 'lib')
+    monkeypatch.setenv('UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED', 'true')
+    monkeypatch.setitem(storage_utils._CTX, 'source_completion_delivery', None)
+    monkeypatch.setitem(storage_utils._CTX, 'source_artifact_receipt_capture',
+        lambda library, candidate: receipts.capture(storage_utils, candidate))
+    monkeypatch.setattr(storage_utils, '_apply_client_processing_results', lambda *a, **k: None)
+    result = storage_utils.apply_client_processing_results_for_file('lib', row['RowKey'], claimed_steps=[],
+        lease_owner='owner', expected_processing_revision=fence.revision, expected_processing_fence=fence.attempt)
+    intent = json.loads(result['processingCompletionOutbox'])[-1]
+    assert result['faceCount'] == intent['faceCount'] == 0
+    assert receipts.verify_reference(json.loads(result['artifactReceipt']), intent)['faceCount'] == 0
+
+
+def test_outbox_recovery_cannot_overwrite_a_concurrent_completion(blobs, monkeypatch):
+    from processing_completion import StaleProcessingResult
+    (metadata, _, _, _, _), _ = blobs
+    baseline = metadata.get_entity('lib', 'photo.jpg')
+    result = dict(baseline, processingCompletionOutbox='[]')
+    update = metadata.update_entity
+    def concurrent_completion(entity, **kwargs):
+        current = metadata.get_entity('lib', 'photo.jpg')
+        metadata.upsert_entity(dict(current, processingCompletionOutbox='[{"id":"concurrent"}]'))
+        return update(entity, **kwargs)
+    monkeypatch.setattr(metadata, 'update_entity', concurrent_completion)
+    with pytest.raises(StaleProcessingResult, match='outbox changed'):
+        storage_utils._commit_worker_processing_results('lib', 'photo.jpg', baseline, result, [], 'owner')
+    assert json.loads(metadata.get_entity('lib', 'photo.jpg')['processingCompletionOutbox']) == [{'id': 'concurrent'}]
+
+
+def test_capture_reuses_same_attempt_publication_readback_for_both_derivatives(blobs, monkeypatch):
+    from processing_artifacts import publish
+    from test_processing_artifacts import jpeg
+    (metadata, _, _, _, fence), _ = blobs
+    row = terminal(dict(metadata.get_entity('lib', 'photo.jpg')))
+    receipts = ArtifactReceipts(AtomicTable(), 'lib')
+    original = storage_utils._get_blob_client
+    with result_fence(fence):
+        for kind in ('thumbnail', 'preview'):
+            publish(storage_utils, row, kind, data=jpeg())
+            row[kind + '_status'] = 'done'
+        storage_utils._store_client_face_entities('lib', 'photo.jpg', [])
+        monkeypatch.setattr(storage_utils, '_get_blob_client',
+                            lambda *a: pytest.fail('Downloaded just-verified immutable output again'))
+        assert receipts.capture(storage_utils, row)
+    # A new attempt must independently verify persisted artifacts.
+    accessed = []
+    monkeypatch.setattr(storage_utils, '_get_blob_client', lambda *a: (accessed.append(a), original(*a))[1])
+    with result_fence(fence):
+        assert receipts.capture(storage_utils, row)
+    assert len(accessed) == 2
+
+
+def test_new_immutable_receipts_skip_point_reads_but_retries_validate_existing_payload(monkeypatch):
+    table = AtomicTable()
+    receipts = ArtifactReceipts(table, 'lib')
+    reads = []
+    original = table.get_entity
+    monkeypatch.setattr(table, 'get_entity', lambda *a: (reads.append(a), original(*a))[1])
+    identity = receipts._put('face', dict(filename='photo.jpg', embedding='[1,0]'))
+    assert not reads
+    assert receipts._put('face', dict(filename='photo.jpg', embedding='[1,0]')) == identity
+    assert len(reads) == 1
+    table.rows[receipts.partition, 'face!' + identity]['payload'] = '{}'
+    with pytest.raises(ValueError, match='identity rebound'):
+        receipts._put('face', dict(filename='photo.jpg', embedding='[1,0]'))
+
+
+def test_face_receipt_batches_are_bounded_and_conflicts_prove_equality():
+    table = AtomicTable(); receipts = ArtifactReceipts(table, 'lib')
+    payloads = [dict(filename='photo.jpg', face=str(i), embedding='[1,0]') for i in range(45)]
+    identities = receipts._put_many('face', payloads)
+    assert [len(ops) for ops in table.transactions] == [20, 20, 5]
+    assert receipts._put_many('face', payloads) == identities
+    key = receipts.partition, 'face!' + identities[7]
+    table.rows[key]['payload'] = '{}'
+    with pytest.raises(ValueError, match='identity rebound'):
+        receipts._put_many('face', payloads)
+
+
+def test_partial_multi_batch_receipts_resume_without_changing_identity(monkeypatch):
+    table = AtomicTable(); receipts = ArtifactReceipts(table, 'lib')
+    payloads = [dict(filename='photo.jpg', face=str(i), embedding='[1,0]') for i in range(45)]
+    original = table.submit_transaction
+    def outage(ops):
+        if len(table.rows) == 20:
+            raise OSError('second batch unavailable')
+        return original(ops)
+    monkeypatch.setattr(table, 'submit_transaction', outage)
+    with pytest.raises(OSError): receipts._put_many('face', payloads)
+    assert len(table.rows) == 20
+    monkeypatch.setattr(table, 'submit_transaction', original)
+    ids = receipts._put_many('face', payloads)
+    assert len(table.rows) == len(set(ids)) == 45
+    assert ids == [receipts._prepare('face', payload)[0] for payload in payloads]

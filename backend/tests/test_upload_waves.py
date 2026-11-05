@@ -53,16 +53,23 @@ class AtomicTable:
                 self.versions[key] = self.versions.get(key, 0) + 1
             self.transactions.append(operations)
 
-    def query_entities(self, query, *, results_per_page):
+    def query_entities(self, query, *, results_per_page=1000):
         self.queries.append((query, results_per_page))
         pk = re.search(r"PartitionKey eq '([^']+)'", query)[1]
+        names = re.findall(r"RowKey eq '((?:[^']|'')*)'", query)
+        if names:
+            names = {name.replace("''", "'") for name in names}
+            with self.lock:
+                return iter([Entity(row, self.versions[key]) for key, row in sorted(self.rows.items())
+                             if key[0] == pk and key[1] in names])
         lower = re.search(r"RowKey ge '([^']+)'", query)[1]
         upper = re.search(r"RowKey lt '([^']+)'", query)[1]
         after_match = re.search(r"RowKey gt '([^']+)'", query)
         with self.lock:
             return iter([Entity(row, self.versions[key]) for key, row in sorted(self.rows.items())
                          if key[0] == pk and lower <= key[1] < upper
-                         and (not after_match or key[1] > after_match[1])][:results_per_page])
+                         and (not after_match or key[1] > after_match[1])
+                         and ("predecessorWaveId eq '" not in query or row.get('predecessorWaveId') == re.search(r"predecessorWaveId eq '([^']+)'", query)[1])][:results_per_page])
 
 
 @pytest.fixture
@@ -108,6 +115,38 @@ def test_overlapping_sessions_join_one_wave_and_both_must_close(world):
     assert finish_scan(store, wave)['state'] == 'processing'
     settle(store, wave, 'photo-2')
     assert finish_scan(store, wave)['state'] == 'ready'
+
+
+def test_resolve_many_advances_shared_control_once_for_a_page(world):
+    store, table, _ = world
+    store.open_session('batch', 10)
+    store.register('batch', [dict(itemId=str(index), filename=f'{index}.jpg')
+                             for index in range(10)])
+    table.transactions.clear()
+    row = store.resolve_many('batch', [dict(item=str(index), outcome='accepted',
+        photo_id=f'photo-{index}', processing_revision=f'revision-{index}',
+        filename=f'{index}.jpg', required_steps=['face']) for index in range(10)])
+    assert row['resolvedCount'] == 10
+    assert len(table.transactions) == 1
+    assert sum(operation[1]['RowKey'] == 'control'
+               for operation in table.transactions[0]) == 1
+    assert store._required(store.wave_key(row['waveId']))['memberCount'] == 10
+
+
+def test_resolve_many_coalesces_same_revision_and_preserves_projection(world):
+    store, _, _ = world
+    parent = store.open_session('same', 2)
+    store.register('same', [dict(itemId='duplicate', filename='copy.jpg'),
+                            dict(itemId='accepted', filename='original.jpg')])
+    store.resolve_many('same', [
+        dict(item='duplicate', outcome='duplicate', photo_id='photo',
+             processing_revision='revision', filename='copy.jpg', required_steps=['face']),
+        dict(item='accepted', outcome='accepted', photo_id='photo',
+             processing_revision='revision', filename='original.jpg', required_steps=['face']),
+    ])
+    members = store._page(f"e!{parent['waveId']}!m!")
+    assert len(members) == 1
+    assert members[0]['needsProjection'] is True
 
 
 def test_whole_parent_selection_spans_900_file_transport_boundary(world):
@@ -240,6 +279,7 @@ def test_scan_survives_store_restart_and_queries_are_bounded(world):
     wave, row = register_accepted(store)
     close(store, 'parent', row)
     settle(store, wave)
+    table.queries.clear()  # Inspect readiness scans, not admission's bounded keyed reads.
     store.evaluate(wave, page_size=1)
     restarted = ShadowWaves(table, 'library-A', clock=lambda: now[0])
     result = finish_scan(restarted, wave, size=1)
@@ -422,3 +462,40 @@ def test_conflict_retries_yield_before_rereading_without_weakening_bounds(world,
         return 'committed'
     assert store._retry(competing_write) == 'committed'
     assert len(pauses) == 3 and all(0 < pause <= .05 for pause in pauses)
+
+
+def test_contention_beyond_old_retry_budget_can_finish_without_partial_writes(world, monkeypatch):
+    import upload_waves
+    store, table, _ = world
+    attempts, pauses = [], []
+    original = table.submit_transaction
+    monkeypatch.setattr(upload_waves.time, 'sleep', pauses.append)
+    def competing(ops):
+        attempts.append(1)
+        if len(attempts) <= 10:
+            raise ResourceModifiedError('busy library control row')
+        return original(ops)
+    monkeypatch.setattr(table, 'submit_transaction', competing)
+    result = store.open_session('after-contention', 0)
+    assert result['state'] == 'open'
+    assert len(attempts) == 11  # ten conflicts, then the atomic intake commit
+    assert len(pauses) == 10 and all(0 < pause <= .5 for pause in pauses)
+    assert len(table.transactions) == 1  # the atomic intake commit
+
+
+def test_storage_contention_is_distinct_and_records_failed_operation(world, monkeypatch):
+    import processing_diagnostics
+    import upload_waves
+    from upload_waves import MutationContention
+    store, _, _ = world
+    events = []
+    monkeypatch.setattr(upload_waves.time, 'sleep', lambda seconds: None)
+    monkeypatch.setattr(processing_diagnostics, 'emit', lambda name, **fields: events.append((name, fields)))
+    def conflict(): raise ResourceModifiedError('ETag changed')
+    with pytest.raises(MutationContention) as caught:
+        store._retry(conflict)
+    assert isinstance(caught.value, Conflict)
+    assert events[0][0] == 'wave_mutation_contention'
+    assert events[0][1]['operation'].endswith('.conflict')
+    assert events[0][1]['attempts'] == MAX_RETRIES
+    assert isinstance(caught.value.__cause__, ResourceModifiedError)

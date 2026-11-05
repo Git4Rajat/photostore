@@ -1,0 +1,383 @@
+{
+  "method": "Top-level undecorated definitions with one textual name occurrence in production backend Python.",
+  "definitions": [
+    {
+      "file": "backend/upload_wave_execution.py",
+      "line": 34,
+      "lines": 5,
+      "name": "live_consumers_available",
+      "testMentions": 0,
+      "operationalMentions": 0,
+      "classification": "candidate_unreferenced"
+    },
+    {
+      "file": "backend/upload_wave_execution.py",
+      "line": 742,
+      "lines": 10,
+      "name": "_load_wave_faces",
+      "testMentions": 7,
+      "operationalMentions": 0,
+      "classification": "qualification_harness"
+    },
+    {
+      "file": "backend/image_utils.py",
+      "line": 123,
+      "lines": 6,
+      "name": "compute_file_hash_from_path",
+      "testMentions": 0,
+      "operationalMentions": 0,
+      "classification": "candidate_unreferenced"
+    },
+    {
+      "file": "backend/image_utils.py",
+      "line": 605,
+      "lines": 21,
+      "name": "create_thumbnail_data_from_path",
+      "testMentions": 0,
+      "operationalMentions": 0,
+      "classification": "candidate_unreferenced"
+    },
+    {
+      "file": "backend/wave_supersession.py",
+      "line": 25,
+      "lines": 26,
+      "name": "member_outcome",
+      "testMentions": 6,
+      "operationalMentions": 0,
+      "classification": "candidate_test_only"
+    },
+    {
+      "file": "backend/wave_supersession.py",
+      "line": 53,
+      "lines": 8,
+      "name": "settlement_requires_original_output",
+      "testMentions": 3,
+      "operationalMentions": 0,
+      "classification": "candidate_test_only"
+    },
+    {
+      "file": "backend/summary_incremental.py",
+      "line": 204,
+      "lines": 22,
+      "name": "contribution_from_row",
+      "testMentions": 1,
+      "operationalMentions": 0,
+      "classification": "candidate_test_only"
+    },
+    {
+      "file": "backend/password_auth.py",
+      "line": 97,
+      "lines": 3,
+      "name": "owner_email",
+      "testMentions": 0,
+      "operationalMentions": 0,
+      "classification": "candidate_unreferenced"
+    },
+    {
+      "file": "backend/password_auth.py",
+      "line": 129,
+      "lines": 5,
+      "name": "verify_owner_password",
+      "testMentions": 0,
+      "operationalMentions": 0,
+      "classification": "candidate_unreferenced"
+    },
+    {
+      "file": "backend/password_auth.py",
+      "line": 331,
+      "lines": 5,
+      "name": "reset_password_with_token",
+      "testMentions": 0,
+      "operationalMentions": 0,
+      "classification": "candidate_unreferenced"
+    },
+    {
+      "file": "backend/library_build.py",
+      "line": 94,
+      "lines": 2,
+      "name": "_is_true",
+      "testMentions": 0,
+      "operationalMentions": 0,
+      "classification": "candidate_unreferenced"
+    },
+    {
+      "file": "backend/ipwork_geo.py",
+      "line": 126,
+      "lines": 3,
+      "name": "process_geo_from_metadata",
+      "testMentions": 1,
+      "operationalMentions": 0,
+      "classification": "candidate_test_only"
+    },
+    {
+      "file": "backend/gunicorn.conf.py",
+      "line": 4,
+      "lines": 8,
+      "name": "post_fork",
+      "testMentions": 0,
+      "operationalMentions": 1,
+      "classification": "gunicorn_runtime_hook"
+    },
+    {
+      "file": "backend/gunicorn.conf.py",
+      "line": 14,
+      "lines": 8,
+      "name": "post_worker_init",
+      "testMentions": 1,
+      "operationalMentions": 0,
+      "classification": "gunicorn_runtime_hook"
+    },
+    {
+      "file": "backend/gunicorn.conf.py",
+      "line": 24,
+      "lines": 8,
+      "name": "worker_exit",
+      "testMentions": 1,
+      "operationalMentions": 0,
+      "classification": "gunicorn_runtime_hook"
+    },
+    {
+      "file": "backend/app.py",
+      "line": 3026,
+      "lines": 3,
+      "name": "_matched_query_locations",
+      "testMentions": 1,
+      "operationalMentions": 1,
+      "classification": "operational_reference"
+    },
+    {
+      "file": "backend/app.py",
+      "line": 4445,
+      "lines": 2,
+      "name": "_cached_sorted_metadata_rows_for_user",
+      "testMentions": 2,
+      "operationalMentions": 0,
+      "classification": "candidate_test_only"
+    },
+    {
+      "file": "backend/app.py",
+      "line": 6014,
+      "lines": 37,
+      "name": "_remove_job_rows_for_filename",
+      "testMentions": 0,
+      "operationalMentions": 0,
+      "classification": "candidate_unreferenced"
+    },
+    {
+      "file": "backend/app.py",
+      "line": 6057,
+      "lines": 14,
+      "name": "_remove_filename_from_albums",
+      "testMentions": 0,
+      "operationalMentions": 0,
+      "classification": "candidate_unreferenced"
+    },
+    {
+      "file": "backend/app.py",
+      "line": 8334,
+      "lines": 10,
+      "name": "_pick_merge_target",
+      "testMentions": 0,
+      "operationalMentions": 0,
+      "classification": "candidate_unreferenced"
+    },
+    {
+      "file": "backend/app.py",
+      "line": 9291,
+      "lines": 19,
+      "name": "_ExploreSink",
+      "testMentions": 0,
+      "operationalMentions": 0,
+      "classification": "candidate_unreferenced"
+    },
+    {
+      "file": "backend/app.py",
+      "line": 9312,
+      "lines": 13,
+      "name": "_TimelineSink",
+      "testMentions": 0,
+      "operationalMentions": 0,
+      "classification": "candidate_unreferenced"
+    },
+    {
+      "file": "backend/exif_utils.py",
+      "line": 399,
+      "lines": 28,
+      "name": "extract_exif_from_path",
+      "testMentions": 7,
+      "operationalMentions": 0,
+      "classification": "candidate_test_only"
+    },
+    {
+      "file": "backend/exif_utils.py",
+      "line": 464,
+      "lines": 3,
+      "name": "extract_exif_from_image",
+      "testMentions": 2,
+      "operationalMentions": 0,
+      "classification": "candidate_test_only"
+    },
+    {
+      "file": "backend/clustering_wave.py",
+      "line": 38,
+      "lines": 81,
+      "name": "ClusteringJournal",
+      "testMentions": 9,
+      "operationalMentions": 0,
+      "classification": "qualification_harness"
+    },
+    {
+      "file": "backend/clustering_wave.py",
+      "line": 121,
+      "lines": 46,
+      "name": "run_wave_assignment",
+      "testMentions": 11,
+      "operationalMentions": 0,
+      "classification": "qualification_harness"
+    },
+    {
+      "file": "backend/clustering_index.py",
+      "line": 107,
+      "lines": 4,
+      "name": "_normalize_rows",
+      "testMentions": 0,
+      "operationalMentions": 0,
+      "classification": "candidate_unreferenced"
+    },
+    {
+      "file": "backend/clustering_index.py",
+      "line": 256,
+      "lines": 22,
+      "name": "search_candidates",
+      "testMentions": 11,
+      "operationalMentions": 2,
+      "classification": "operational_reference"
+    },
+    {
+      "file": "backend/search_db.py",
+      "line": 296,
+      "lines": 10,
+      "name": "build_database",
+      "testMentions": 18,
+      "operationalMentions": 1,
+      "classification": "operational_reference"
+    },
+    {
+      "file": "backend/search_db.py",
+      "line": 979,
+      "lines": 6,
+      "name": "delta_budget_exceeded",
+      "testMentions": 2,
+      "operationalMentions": 0,
+      "classification": "candidate_test_only"
+    },
+    {
+      "file": "backend/storage_utils.py",
+      "line": 721,
+      "lines": 17,
+      "name": "load_image_names_cache",
+      "testMentions": 1,
+      "operationalMentions": 0,
+      "classification": "candidate_test_only"
+    },
+    {
+      "file": "backend/storage_utils.py",
+      "line": 775,
+      "lines": 21,
+      "name": "get_anonymous_blob_name",
+      "testMentions": 10,
+      "operationalMentions": 0,
+      "classification": "candidate_test_only"
+    },
+    {
+      "file": "backend/storage_utils.py",
+      "line": 873,
+      "lines": 6,
+      "name": "restore_original_filename",
+      "testMentions": 4,
+      "operationalMentions": 0,
+      "classification": "candidate_test_only"
+    },
+    {
+      "file": "backend/storage_utils.py",
+      "line": 2664,
+      "lines": 11,
+      "name": "_serialize_vector_index",
+      "testMentions": 1,
+      "operationalMentions": 2,
+      "classification": "operational_reference"
+    },
+    {
+      "file": "backend/storage_utils.py",
+      "line": 2928,
+      "lines": 51,
+      "name": "_merge_user_vector_index_snapshot",
+      "testMentions": 0,
+      "operationalMentions": 0,
+      "classification": "candidate_unreferenced"
+    },
+    {
+      "file": "backend/storage_utils.py",
+      "line": 5886,
+      "lines": 14,
+      "name": "_serialize_sort_index",
+      "testMentions": 1,
+      "operationalMentions": 0,
+      "classification": "candidate_test_only"
+    },
+    {
+      "file": "backend/storage_utils.py",
+      "line": 6751,
+      "lines": 14,
+      "name": "_serialize_access_index",
+      "testMentions": 0,
+      "operationalMentions": 0,
+      "classification": "candidate_unreferenced"
+    },
+    {
+      "file": "backend/storage_utils.py",
+      "line": 6814,
+      "lines": 40,
+      "name": "_merge_user_access_index_snapshot",
+      "testMentions": 0,
+      "operationalMentions": 0,
+      "classification": "candidate_unreferenced"
+    },
+    {
+      "file": "backend/storage_utils.py",
+      "line": 9097,
+      "lines": 5,
+      "name": "prime_user_vector_index",
+      "testMentions": 0,
+      "operationalMentions": 0,
+      "classification": "candidate_unreferenced"
+    },
+    {
+      "file": "backend/storage_utils.py",
+      "line": 9468,
+      "lines": 15,
+      "name": "_thumbnail_matches_source",
+      "testMentions": 0,
+      "operationalMentions": 0,
+      "classification": "candidate_unreferenced"
+    },
+    {
+      "file": "backend/routes/tools.py",
+      "line": 282,
+      "lines": 2,
+      "name": "jsonify_status",
+      "testMentions": 0,
+      "operationalMentions": 0,
+      "classification": "candidate_unreferenced"
+    },
+    {
+      "file": "backend/routes/people.py",
+      "line": 260,
+      "lines": 54,
+      "name": "_confirm_faces_for_person",
+      "testMentions": 4,
+      "operationalMentions": 0,
+      "classification": "candidate_test_only"
+    }
+  ]
+}

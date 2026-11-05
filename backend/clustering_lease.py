@@ -55,8 +55,9 @@ class _LeaseGuard:
         self._stop = threading.Event()
         self._lost = None
         self._closed = False
+        from processing_metrics import inherit
         self._thread = threading.Thread(
-            target=self._run, name='faiss-assignment-lease', daemon=True)
+            target=inherit(self._run), name='faiss-assignment-lease', daemon=True)
 
     def check(self):
         """Fail closed, including when the renewal thread is stalled or stopped."""
@@ -198,7 +199,7 @@ class BlobLibraryLeaseFactory:
     tuple, stable only while both tokens remain unchanged.
     """
 
-    def __init__(self, blob_service_client, container, *, duration=60, renew_seconds=15):
+    def __init__(self, blob_service_client, container, *, duration=60, renew_seconds=15, namespace='faiss-assignment-locks'):
         if type(duration) is not int or not 15 <= duration <= 60:
             raise ValueError('duration must be an integer from 15 to 60')
         if (type(renew_seconds) not in (int, float)
@@ -211,18 +212,30 @@ class BlobLibraryLeaseFactory:
         self._duration = duration
         self._renew_seconds = renew_seconds
         self._owner = str(uuid.uuid4())
+        if namespace not in ('faiss-assignment-locks','catalog-publication-locks'):
+            raise ValueError('Unknown library lease namespace')
+        self._namespace = namespace
 
     @contextmanager
     def __call__(self, user_id):
         if not isinstance(user_id, str) or not user_id:
             raise ValueError('user_id must be a nonempty library ID string')
-        name = 'faiss-assignment-locks/' + hashlib.sha256(user_id.encode('utf-8')).hexdigest() + '.json'
+        name = self._namespace+'/' + hashlib.sha256(user_id.encode('utf-8')).hexdigest() + '.json'
         blob = self._client.get_blob_client(container=self._container, blob=name)
         initial = {'owner': '', 'generation': str(uuid.uuid4())}
         try:
             blob.upload_blob(json.dumps(initial), overwrite=False)
         except ResourceExistsError:
             pass  # Only an already-existing blob is benign; transport errors propagate.
+        except HttpResponseError as error:
+            # A blob that exists AND is currently leased by another owner
+            # fails the overwrite=False conditional check with LeaseIdMissing
+            # instead of ResourceExistsError -- equally benign here, since all
+            # we wanted was confirmation the blob exists. acquire_lease below
+            # turns a still-busy lease into RetryableLibraryLeaseError; it is
+            # the caller's job to decide whether/how long to retry that.
+            if getattr(error, 'error_code', None) != 'LeaseIdMissing':
+                raise
         acquired_at = time.monotonic()
         try:
             lease = blob.acquire_lease(lease_duration=self._duration)

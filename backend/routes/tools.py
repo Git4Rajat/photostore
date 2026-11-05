@@ -11,6 +11,7 @@ import os
 from flask import Blueprint
 
 import app
+from routes.index_events import negotiate_index_events
 
 tools_bp = Blueprint('tools', __name__)
 
@@ -338,19 +339,10 @@ def recover_pending_indexes():
         return app.jsonify({'error': 'Pending index recovery unavailable'}), 503
 
 
-@tools_bp.route('/api/tools/index-events/negotiate', methods=['POST'])
-def negotiate_index_events():
-    library, error = app._require_user_id()
-    if error:
-        return error
-    import index_events
-    try:
-        response = app.jsonify(index_events.negotiate(library))
-        response.headers['Cache-Control'] = 'no-store'
-        return response
-    except Exception:
-        app.app.logger.warning('Index push negotiation unavailable', exc_info=True)
-        return app.jsonify({'available': False}), 503
+# Compatibility for older browser bundles. New subscriptions negotiate on core
+# so renewal traffic does not wake the indexer and its maintenance sidecar.
+tools_bp.add_url_rule('/api/tools/index-events/negotiate',
+    view_func=negotiate_index_events, methods=['POST'])
 
 
 @tools_bp.route('/api/tools/indexes/maintenance/<scope>', methods=['POST'])

@@ -578,6 +578,11 @@ def _dedicated_queue(monkeypatch, queue=None):
     queue = queue or _FakeQueue()
     monkeypatch.setattr(app, 'INDEX_MAINTENANCE_QUEUE_NAME', 'index-maintenance')
     monkeypatch.setattr(app, 'index_maintenance_queue_client', queue)
+    # Delayed wakeups route to the deferred queue (see
+    # INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME) -- same fake sink here since
+    # these tests assert on message content/routing, not which physical
+    # queue a send landed on.
+    monkeypatch.setattr(app, 'index_maintenance_deferred_queue_client', queue)
     monkeypatch.setattr(app, 'jobs_table_client', EtagTable())
     return queue
 
@@ -680,7 +685,8 @@ def test_trigger_prefers_the_queue_over_the_tools_http_path(monkeypatch):
     monkeypatch.setattr(app, '_INDEXER_REBUILD_TRIGGER_LAST', {})
     monkeypatch.setenv('INDEXER_INTERNAL_URL', 'https://indexer.example')
     seen = []
-    monkeypatch.setattr(app, 'enqueue_index_build', lambda uid, reason='', scope='full': seen.append(uid) or 'queued')
+    monkeypatch.setattr(app, 'enqueue_index_build',
+                         lambda uid, reason='', scope='full', **kw: seen.append(uid) or 'queued')
     posted = []
     monkeypatch.setattr('requests.post', lambda *a, **k: posted.append(a))
     app._trigger_indexer_rebuild('lib-9')
@@ -789,6 +795,9 @@ def _job_env(monkeypatch):
     monkeypatch.setattr(app, 'storage_utils_ensure_sort_current', lambda uid: None)
     monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **k: status.append(a[3]))
     monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', lambda uid, **k: primed.append(k.get('kinds')))
+    # These orchestration unit tests fake the search drain, not a SQLite base.
+    # Real summary publication/replay is covered by runtime integration tests.
+    monkeypatch.setattr(app, '_refresh_library_summaries', lambda uid: None)
     return primed, status
 
 

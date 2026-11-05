@@ -1,5 +1,6 @@
 import {isHeicFilename, isRawFilename, isVideoFilename} from '../utils/photoDisplay';
 import {preparationFailureReason} from '../utils/uploadPreparationDiagnostics';
+import {UploadWorkerReuse, discardUploadWorker} from './uploadWorkerReuse';
 import {
     UPLOAD_PREVIEW_MAX_EDGE, UPLOAD_PREVIEW_MAX_BYTES, UPLOAD_THUMBNAIL_MAX_EDGE, UPLOAD_THUMBNAIL_MAX_BYTES,
     validUploadDerivative, type UploadDerivative,
@@ -35,6 +36,7 @@ export class UploadAssetPreparer {
     private queue: Job[] = [];
     private active = new Set<Job>();
     private disposed = false;
+    private rasterWorkers = new UploadWorkerReuse();
     // Previously only one decoder ran at a time, so in a large batch a file near
     // the back of the queue could burn most of its own 30s budget just waiting
     // for its turn -- not because it, or its format, was slow. Running a small
@@ -68,6 +70,7 @@ export class UploadAssetPreparer {
     dispose(): void {
         this.disposed = true;
         for (const job of [...this.queue, ...Array.from(this.active)]) this.finish(job, {status: 'fallback', reason: 'disposed'});
+        this.rasterWorkers.dispose();
     }
 
     private finish(job: Job, result: UploadPreparationResult): void {
@@ -75,7 +78,14 @@ export class UploadAssetPreparer {
         job.settled = true;
         clearTimeout(job.timer);
         job.options.signal?.removeEventListener('abort', job.abort);
-        job.worker?.terminate();
+        if (job.worker) {
+            // RAW/HEIF WASM instances remain one-shot to release decoder heaps.
+            if (result.status === 'generated' && !this.disposed
+                && !isRawFilename(job.file.name) && !isHeicFilename(job.file.name)) {
+                this.rasterWorkers.release(job.worker);
+            } else discardUploadWorker(job.worker);
+            job.worker = undefined;
+        }
         job.controller.abort();
         this.queue = this.queue.filter(item => item !== job);
         this.active.delete(job);
@@ -99,7 +109,7 @@ export class UploadAssetPreparer {
         if (result.status === 'fallback' && !job.retried && RETRYABLE_FAILURE_REASONS.has(result.failureReason ?? '')) {
             job.retried = true;
             clearTimeout(job.timer);
-            job.worker?.terminate();
+            if (job.worker) discardUploadWorker(job.worker);
             job.worker = undefined;
             this.runJob(job);
             return;
@@ -119,9 +129,12 @@ export class UploadAssetPreparer {
             return;
         }
         try {
-            const worker = isHeicFilename(job.file.name) ? this.workerFactory(false, true) : this.workerFactory(isRawFilename(job.file.name));
+            const worker = isHeicFilename(job.file.name) ? this.workerFactory(false, true)
+                : isRawFilename(job.file.name) ? this.workerFactory(true)
+                : this.rasterWorkers.take(() => this.workerFactory(false));
             job.worker = worker;
             worker.onmessage = event => {
+                if (job.settled || job.worker !== worker) return;
                 const result = event.data;
                 // RAW benchmark workers expose blobs separately from dimensions.
                 const preview = result?.previewBlob ? {...result.preview, blob: result.previewBlob} : result?.preview;
@@ -133,7 +146,9 @@ export class UploadAssetPreparer {
                 } else this.retryOrFinish(job, {status: 'fallback', reason: 'generation_failed',
                     failureReason: result?.status === 'generated' ? 'invalid_derivative' : result?.failureReason || preparationFailureReason(result?.error)});
             };
-            worker.onerror = () => this.retryOrFinish(job, {status: 'fallback', reason: 'generation_failed', failureReason: 'worker_error'});
+            worker.onerror = () => {
+                if (job.worker === worker) this.retryOrFinish(job, {status: 'fallback', reason: 'generation_failed', failureReason: 'worker_error'});
+            };
             worker.postMessage({file: job.file, preserveEligibleJpeg: job.options.preserveEligibleJpeg !== false, maxMegapixels: 120, maxBytes: 256 * 1024 * 1024});
         } catch {
             this.finish(job, {status: 'fallback', reason: 'unsupported', failureReason: 'worker_start_failed'});

@@ -151,7 +151,7 @@ it('cancels a cold-start retry after the active library changes', async () => {
     localStorage.setItem('photostore.passwordAuthToken', 'library-A-token');
     vi.useFakeTimers();
     try {
-        const result = requestJson(client, 'post', '/photos/rate-multiple', {}).catch(error => error);
+        const result = requestJson(client, 'get', '/photos').catch(error => error);
         await vi.advanceTimersByTimeAsync(1000);
         expect((await result).kind).toBe('canceled');
         expect(sent).toEqual(['Bearer library-A-token']);

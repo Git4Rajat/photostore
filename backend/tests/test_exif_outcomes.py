@@ -611,15 +611,16 @@ def test_truly_absent_coordinates_are_no_data(monkeypatch, data):
     {'GPS.LatitudeDecimal': '91', 'GPS.LongitudeDecimal': '13'},
     {'GPS.LatitudeDecimal': '55.6', 'GPS.LongitudeDecimal': '-181'},
 ])
-def test_partial_or_malformed_coordinates_raise_and_propagate(monkeypatch, data):
+def test_partial_or_malformed_coordinates_are_terminal_no_data(monkeypatch, data):
+    # Malformed/out-of-range GPS fields are deterministic garbage in the file
+    # itself -- re-parsing the same bytes always reaches the same verdict, so
+    # this is reported as absent data (terminal, no retry) rather than a
+    # raised/retryable failure (reserved for OOM, decode errors, etc.).
     monkeypatch.setattr(ipwork_geo, 'extract_exif_from_bytes', lambda *_: data)
     monkeypatch.setattr(ipwork_geo.maps_utils, 'reverse_geocode', lambda *_: pytest.fail('Invalid coordinates'))
-    with pytest.raises(ValueError, match='Invalid GPS coordinates'):
-        ipwork_geo.geo_coordinates_from_exif(data)
-    with pytest.raises(ValueError, match='Invalid GPS coordinates'):
-        ipwork_geo.process_geo_from_exif(data)
-    with pytest.raises(ValueError, match='Invalid GPS coordinates'):
-        ipwork_geo.process_geo('u', 'photo.jpg', b'data')
+    assert ipwork_geo.geo_coordinates_from_exif(data) is None
+    assert ipwork_geo.process_geo_from_exif(data) == {'hasData': False}
+    assert ipwork_geo.process_geo('u', 'photo.jpg', b'data') == {'hasData': False}
 
 
 @pytest.mark.parametrize('latitude,longitude', [('0', '0'), ('-90', '180'), ('90', '-180')])
@@ -640,7 +641,7 @@ def test_shared_coordinate_validator_never_geocodes(monkeypatch, latitude, longi
         'GPS.LatitudeDecimal': latitude, 'GPS.LongitudeDecimal': longitude}) == (float(latitude), float(longitude))
 
 
-def test_malformed_gps_becomes_worker_failure(monkeypatch):
+def test_malformed_gps_becomes_terminal_no_data_not_worker_failure(monkeypatch):
     import app
 
     monkeypatch.setattr(app, 'IPWORK_REUSE_EXIF', False)
@@ -649,7 +650,7 @@ def test_malformed_gps_becomes_worker_failure(monkeypatch):
     monkeypatch.setitem(app.IPWORK_STEP_PROCESSORS, 'map_detection', ipwork_geo.process_geo)
     monkeypatch.setattr(ipwork_geo, 'extract_exif_from_bytes', lambda *_: {'GPS.LatitudeDecimal': '55.6'})
     assert app._run_ipwork_steps('u', 'photo.jpg', ['map_detection']) == {
-        'map_detection': {'hasData': False, 'error': 'processing_failed'}}
+        'map_detection': {'hasData': False}}
 
 
 @pytest.mark.parametrize('known', [True, False])

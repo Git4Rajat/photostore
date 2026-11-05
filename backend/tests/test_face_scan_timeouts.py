@@ -24,9 +24,9 @@ def test_empty_continuation_pages_renew_or_abort_before_mutations(lookup_ctx, mo
     renew = storage_utils._renew_face_filename_write
     renewals = []
 
-    def track_renew(*args):
+    def track_renew(*args, **kwargs):
         renewals.append(now.value)
-        renew(*args)
+        renew(*args, **kwargs)
 
     class Pages:
         def by_page(self):

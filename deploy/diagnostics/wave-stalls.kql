@@ -1,0 +1,19 @@
+// Latest observation per wave; a predecessor wait is a different cause from a
+// dead stage lease. Thresholds are initial operator budgets, not success proofs.
+ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(30m)
+| extend d = parse_json(extract(@'processing telemetry (\{.*\})', 1, Log_s))
+| where tostring(d.event) == 'wave_recovery'
+| summarize arg_max(TimeGenerated, *) by tostring(d.library_id), tostring(d.wave_id)
+| extend reason = case(
+    toint(d.dispatch_failed_count) > 0, 'dispatch_retries_exhausted',
+    tostring(d.state) == 'waiting_predecessor' and todouble(d.state_age_seconds) > 7200, 'predecessor_blocked',
+    tostring(d.state) == 'collecting' and todouble(d.no_progress_seconds) > 86400, 'intake_stalled',
+    toint(d.outstanding_leases) > 0 and todouble(d.barrier_wait_seconds) > 1800, 'source_lease_barrier',
+    toint(d.outstanding_members) > 0 and todouble(d.barrier_wait_seconds) > 1800, 'source_members_barrier',
+    toint(d.handoff_pending_count) > 0 and todouble(d.handoff_age_seconds) > 900, 'handoff_unclaimed',
+    todouble(d.stage_no_progress_seconds) > 1800, 'stage_no_progress', '')
+| where isnotempty(reason)
+| project TimeGenerated, library_id=tostring(d.library_id), wave_id=tostring(d.wave_id), reason,
+    state=tostring(d.state), predecessor=tostring(d.predecessor_wave_id),
+    outstanding_leases=toint(d.outstanding_leases), outstanding_members=toint(d.outstanding_members)

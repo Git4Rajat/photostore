@@ -31,6 +31,7 @@ def env(monkeypatch):
     monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **kw: None)
     monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', Mock(return_value=[]))
     monkeypatch.setattr(app, 'refresh_user_search_db_incremental', lambda user: {'status': 'noop'})
+    monkeypatch.setattr(app, '_refresh_library_summaries', Mock())
     return state
 
 
@@ -45,7 +46,8 @@ def test_rename_only_saves_name_and_queues_people(env):
     row = env.table.get_entity('u1', 'p1')
     assert row['name'] == 'Bob' and row['faceIds'] == '["f1"]'
     assert row['labelPending'] and not row['labelMembershipPending']
-    assert env.queued == [('u1', {'reason': 'person-label', 'scope': 'people'})]
+    assert env.queued == [('u1', {'reason': 'person-label', 'scope': 'people',
+                                  'coalesce': True, 'capture': None, 'delay_override': None})]
 
 
 def test_repeated_identical_name_is_a_noop(env):

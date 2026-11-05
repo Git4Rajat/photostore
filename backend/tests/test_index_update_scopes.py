@@ -53,10 +53,11 @@ def test_stale_read_kicker_does_not_request_full(monkeypatch, kind):
 def worker(monkeypatch):
     env = SimpleNamespace(
         prime=Mock(return_value=[]), search=Mock(return_value={'status': 'noop'}),
-        sort_upgrade=Mock(), enqueue=Mock(), reconcile=Mock(), statuses=[],
+        summaries=Mock(), sort_upgrade=Mock(), enqueue=Mock(), reconcile=Mock(), statuses=[],
     )
     monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', env.prime)
     monkeypatch.setattr(app, 'refresh_user_search_db_incremental', env.search)
+    monkeypatch.setattr(app, '_refresh_library_summaries', env.summaries)
     monkeypatch.setattr(app, 'storage_utils_ensure_sort_current', env.sort_upgrade)
     monkeypatch.setattr(app, 'enqueue_index_build', env.enqueue)
     monkeypatch.setattr(su, 'reconcile_search_db', env.reconcile)
@@ -80,6 +81,10 @@ def test_worker_only_runs_declared_dependencies(worker, scope, kinds, search, up
     app._run_index_build_job('library-A', f'index-build-library-A-{scope}', scope)
     assert worker.prime.call_args.kwargs['kinds'] == kinds
     assert worker.search.called is search
+    if search:
+        worker.summaries.assert_called_once_with('library-A')
+    else:
+        worker.summaries.assert_not_called()
     assert worker.sort_upgrade.called is upgrade
     worker.reconcile.assert_not_called()
     worker.enqueue.assert_not_called()

@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import app
+import index_updates
 from routes.tools import jobs_status
 
 
@@ -126,3 +127,22 @@ def test_photo_processing_burst_cannot_hide_an_index_completion(jobs_table):
     jobs = _poll()
     assert len(jobs) == 50
     assert jobs[0]['jobId'] == 'index-build-owner-people'
+
+
+@pytest.mark.parametrize('scope', list(index_updates.SCOPE_KINDS))
+@pytest.mark.parametrize('status', ['queued', 'running', 'done', 'failed'])
+def test_every_index_scope_can_be_polled_alongside_other_jobs(jobs_table, monkeypatch, scope, status):
+    monkeypatch.setattr(app, '_maybe_sweep_old_job_rows', lambda _: None)
+    job_id = f'index-build-owner-{scope}'
+    _seed_job(jobs_table, job_id, app.INDEX_BUILD_JOB_TYPE, status)
+    jobs_table.rows[('owner', job_id)]['indexScope'] = scope
+    _seed_job(jobs_table, 'ipwork-owner', 'ipwork', 'done')
+
+    with app.app.test_request_context('/api/jobs/status'):
+        response = app.app.make_response(jobs_status())
+
+    assert response.status_code == 200
+    jobs = response.get_json()['jobs']
+    assert {job['jobId'] for job in jobs} == {job_id, 'ipwork-owner'}
+    assert jobs[0]['indexScope'] == scope
+    assert jobs[0]['status'] == status

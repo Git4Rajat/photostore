@@ -35,7 +35,17 @@ class _FakeBlob:
         self._store = store
         self._key = key
 
-    def upload_blob(self, data, overwrite=True, content_settings=None):
+    def get_blob_properties(self):
+        from types import SimpleNamespace
+        from azure.core.exceptions import ResourceNotFoundError
+        if self._key not in self._store:
+            raise ResourceNotFoundError(self._key)
+        return SimpleNamespace(etag=str(hash(self._store[self._key])))
+
+    def upload_blob(self, data, overwrite=True, content_settings=None, **options):
+        from azure.core.exceptions import ResourceModifiedError
+        if 'etag' in options and options['etag'] != self.get_blob_properties().etag:
+            raise ResourceModifiedError('CAS conflict')
         self._store[self._key] = data
 
     def download_blob(self):

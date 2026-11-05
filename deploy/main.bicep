@@ -39,13 +39,13 @@ param adminPassword string
 ])
 param emailDataLocation string = 'Europe'
 
-@description('Where OCR/face/vision/geo processing runs. "browser" (default): entirely client-side, same as today -- no extra cost, works everywhere. "backend": the browser skips this work entirely and a new vision container processes every upload server-side instead -- better for low-power/mobile clients, and enables bulk background reprocessing of an existing library, at the cost of running vision (which needs meaningfully more CPU/memory than the rest of this deployment). "both": the browser and vision both attempt it and whichever finishes first for a given photo wins -- doubles compute cost per step, useful mainly for comparing the two paths.')
+@description('Where OCR/face/vision/geo processing runs. "browser": entirely client-side -- no extra cost, works everywhere. "backend" (default): the browser skips this work entirely and a new vision container processes every upload server-side instead -- better for low-power/mobile clients, and enables bulk background reprocessing of an existing library, at the cost of running vision (which needs meaningfully more CPU/memory than the rest of this deployment). "both": the browser and vision both attempt it and whichever finishes first for a given photo wins -- doubles compute cost per step, useful mainly for comparing the two paths.')
 @allowed([
   'browser'
   'backend'
   'both'
 ])
-param processingMode string = 'browser'
+param processingMode string = 'backend'
 
 @description('Public core API image. Defaults to :latest for one-click "Deploy to Azure" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run (e.g. :20260806-153045) instead of :latest, so scale-to-zero cold-start restarts keep pulling the exact image you tested rather than whatever :latest has drifted to.')
 param coreImage string = 'ghcr.io/git4rajat/photostore-backend:latest'
@@ -61,14 +61,24 @@ param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker:latest'
 @maxValue(5120)
 param clusterFileShareQuotaGiB int = 100
 
-@description('Minimum clustering replicas. Default 0 scales to zero while idle; fresh graceful checkpoints support recovery. Set 1 to keep the index warm at continuous cost. Missing or stale checkpoints require a cold rebuild.')
+@description('Clustering replica floor. Must remain zero; queued and in-flight work keep the worker active. Checkpoints support recovery after idle scale-down.')
 @minValue(0)
-@maxValue(1)
+@maxValue(0)
 param clusterMinReplicas int = 0
 
 @description('Required: run derived-index maintenance on the indexer queue sidecar. Cluster publishing is no longer supported.')
 @allowed([true])
 param dedicatedIndexWorker bool = true
+
+
+
+@description('Enable qualified wave execution after certificate seeding; fresh installs use deploy/fresh_wave.py.')
+param enableWaveExecution bool = true
+@description('Enroll newly created empty libraries only. Existing libraries never change ownership.')
+param enableNewWaveLibraries bool = true
+@description('Exact-image capability ID. Fresh wave activation requires the seeded release certificate; never leave empty.')
+param waveCapabilityId string = ''
+param waveBootstrapPending bool = false
 
 @description('Provision managed WebSocket notifications when library indexes are published.')
 param enableIndexPush bool = false
@@ -100,6 +110,10 @@ module app 'resources.bicep' = {
     clusterMinReplicas: clusterMinReplicas
     dedicatedIndexWorker: dedicatedIndexWorker
     enableIndexPush: enableIndexPush
+    enableWaveExecution: enableWaveExecution
+    enableNewWaveLibraries: enableNewWaveLibraries
+    waveCapabilityId: waveCapabilityId
+    waveBootstrapPending: waveBootstrapPending
     logAnalyticsWorkspaceName: logAnalyticsWorkspaceName
   }
 }

@@ -5,19 +5,10 @@
 // via passwordAuth.setSessionToken so subsequent calls use the new active
 // library / token version.
 
-import { getRuntimeConfig } from '../config/appConfig';
+import { resolveApiUrl } from './apiClient';
+import { publishLibraryChange } from './libraryChanges';
 import { getAccessToken } from './authClient';
 import * as passwordAuth from './passwordAuthClient';
-
-// library_bp moved to the dedicated `archive` container app (2026-09-17, see
-// app.py's APP_ROLE=archive split) -- falls back to apiBaseUrl when no
-// separate archive deployment exists for this environment, same pattern as
-// apiClient.ts's indexerUrl/recoveryUrl.
-const apiBase = (): string => {
-    const config = getRuntimeConfig();
-    return (config.archiveApiBaseUrl || config.apiBaseUrl || '').replace(/\/$/, '');
-};
-const url = (path: string): string => `${apiBase()}${path}`;
 
 export interface LibrarySummary {
     libraryId: string;
@@ -48,12 +39,14 @@ export interface MembersResponse {
     members: LibraryMember[];
     maxMembers: number;
     pendingInvites?: PendingInvite[];
+    cleanupInfo?: CleanupInfo;
 }
 
 export interface MineResponse {
     activeLibraryId: string;
     libraries: LibrarySummary[];
     maxMembers: number;
+    cleanupInfo?: CleanupInfo;
 }
 
 export interface InviteInfo {
@@ -92,7 +85,7 @@ const authedFetch = async (
     if (token) {
         headers.Authorization = `Bearer ${token}`;
     }
-    return fetch(url(path), { ...init, headers });
+    return fetch(resolveApiUrl(path, init.method || 'GET'), { ...init, headers });
 };
 
 // If a response re-issued a session token, persist it before returning the body.
@@ -258,7 +251,11 @@ export const confirmLibraryClean = async (token: string): Promise<CleanConfirmRe
     if (!response.ok) {
         throw new Error(await parseError(response, 'Could not confirm the cleanup.'));
     }
-    return response.json();
+    const result: CleanConfirmResult = await response.json();
+    // A status signal, not a photo mutation: confirmation may still be awaiting
+    // another approver. Do not invalidate galleries before cleanup executes.
+    publishLibraryChange('library-cleanup', [], { jobId: result.jobId, notifyCurrentTab: true });
+    return result;
 };
 
 export interface CleanStatusResult {
@@ -266,6 +263,18 @@ export interface CleanStatusResult {
     result?: { photosDeleted?: number; blobsDeleted?: number; blobErrors?: number };
     error?: string;
 }
+
+export interface CleanConfirmationStatus extends CleanStatusResult {
+    jobId?: string;
+}
+
+export const getLibraryCleanConfirmationStatus = async (token: string): Promise<CleanConfirmationStatus> => {
+    const response = await authedFetch(`/api/library/clean/confirmation-status?token=${encodeURIComponent(token)}`, { cache: 'no-store' });
+    if (!response.ok) {
+        throw new Error(await parseError(response, 'Could not load cleanup status.'));
+    }
+    return response.json();
+};
 
 export const getLibraryCleanStatus = async (jobId: string): Promise<CleanStatusResult> => {
     const response = await authedFetch(`/api/library/clean/status?jobId=${encodeURIComponent(jobId)}`);

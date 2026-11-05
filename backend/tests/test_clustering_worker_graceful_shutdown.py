@@ -173,8 +173,10 @@ def test_empty_general_queue_does_not_delay_next_priority_poll(monkeypatch):
     monkeypatch.setattr(app, '_live_faiss_assigner', None)
     general = _FakeQueueClient()
     priority = _FakeQueueClient()
+    opened = []
     class Service:
         def get_queue_client(self, name):
+            opened.append(name)
             return priority if name == app.LIBRARY_OPS_QUEUE_NAME else general
     monkeypatch.setattr(app, 'queue_service_client', Service())
     handlers, calls = {}, []
@@ -190,3 +192,25 @@ def test_empty_general_queue_does_not_delay_next_priority_poll(monkeypatch):
     assert time.monotonic() - started < 2
     assert len(calls) == 2
     assert len(general.receive_calls) == 1
+    assert set(opened) == {
+        app.CLUSTERING_QUEUE_NAME, app.LIBRARY_OPS_QUEUE_NAME,
+        app.CLUSTERING_DEFERRED_QUEUE_NAME, app.CLUSTERING_DEADLETTER_QUEUE_NAME,
+        app.LIBRARY_OPS_DEADLETTER_QUEUE_NAME,
+    }
+
+
+def test_retired_expiry_message_never_recovers_uploads_or_runs_clustering(monkeypatch):
+    import upload_session_lease
+    import upload_session_registry
+    import wave_policy
+
+    def unexpected(*args, **kwargs):
+        pytest.fail('A retired message must only be acknowledged')
+
+    monkeypatch.setattr(upload_session_lease, 'seal_expired', unexpected)
+    monkeypatch.setattr(upload_session_registry.Sessions, 'reconcile', unexpected)
+    monkeypatch.setattr(wave_policy, 'legacy_message_suppressed', unexpected)
+    monkeypatch.setattr(app, 'cluster_user_faces', unexpected)
+    assert app._handle_clustering_queue_payload(
+        dict(type='upload_session_expiry', userId='library', sessionId='session'),
+        '', 'library', 'upload_session_expiry') is None

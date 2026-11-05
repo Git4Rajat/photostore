@@ -9,12 +9,13 @@ import math
 from azure.core.exceptions import ResourceNotFoundError
 
 from storage_utils import BROWSER_PROCESSING_STEPS as STEPS
+from processing_completion import TERMINAL
+from processing_generation import required_steps_for_media
+from image_utils import is_video_file
 from upload_waves import MAX_PAGE, Conflict, digest
 
-TERMINAL = {'done', 'no_data', 'skipped', 'unsupported'}
 
-
-def source_identity(row):
+def source_identity(row, allow_pending=False):
     """Returns (photo_id, processing_revision, qualified).
 
     qualified is True once the row carries a real source-allocated
@@ -25,7 +26,7 @@ def source_identity(row):
     comparisons; it is not a real reprocessing generation fence.
     """
     photo = str(row.get('anonymousImageId') or '')
-    if not photo or row.get('processing_state') == 'deleted' or row.get('pendingAnonymousBlob'):
+    if not photo or row.get('processing_state') == 'deleted' or (row.get('pendingAnonymousBlob') and not allow_pending):
         raise Conflict('A finalized, nondeleted photo is required')
     real_revision = str(row.get('processingRevision') or '')
     if real_revision:
@@ -34,12 +35,43 @@ def source_identity(row):
 
 
 def resolve_source(store, metadata_table, session, item, outcome, filename):
-    if outcome not in ('accepted', 'duplicate'):
-        return store.resolve(session, item, outcome=outcome)
-    row = metadata_table.get_entity(store.library, filename)
-    photo, revision, _qualified = source_identity(row)
-    return store.resolve(session, item, outcome=outcome, filename=filename,
-                         photo_id=photo, processing_revision=revision, required_steps=STEPS)
+    return resolve_sources(store, metadata_table, session, [(item, outcome, filename)])
+
+
+def resolve_sources(store, metadata_table, session, sources):
+    """Resolve a bounded set of finalized sources with one wave mutation."""
+    if not isinstance(sources, list) or not 0 < len(sources) <= MAX_PAGE:
+        raise ValueError('Expected 1-20 finalized sources')
+    from table_reads import read_entities
+    filenames = [filename for _item, outcome, filename in sources
+                 if outcome in ('accepted', 'duplicate')]
+    rows = read_entities(metadata_table, store.library, filenames, workers=4)
+    items = read_entities(store.table, store.partition,
+        [store.item_key(session, item) for item, _outcome, _filename in sources], workers=2)
+    resolutions = []
+    for item, outcome, filename in sources:
+        if outcome not in ('accepted', 'duplicate'):
+            resolutions.append(dict(item=item, outcome=outcome))
+            continue
+        row = rows.get(filename)
+        if row is None:
+            raise Conflict('Finalized photo not found')
+        # A duplicate resolves to an already-finalized canonical row; a pending
+        # reservation left on it by a concurrent upload of the same filename is
+        # irrelevant to that finalized source and must not block admission.
+        photo, revision, _qualified = source_identity(row, allow_pending=outcome == 'duplicate')
+        previous = items.get(store.item_key(session, item))
+        if previous is None:
+            raise Conflict('Unknown session, member or wave')
+        if previous['outcome'] in ('accepted', 'duplicate'):
+            # Finalize retries can discover their own prior upload in the dedup
+            # index. Keep the committed classification while validating every
+            # immutable binding in resolve_many.
+            outcome = previous['outcome']
+        resolutions.append(dict(item=item, outcome=outcome, filename=filename,
+            photo_id=photo, processing_revision=revision,
+            required_steps=required_steps_for_media(is_video_file(filename))))
+    return store.resolve_many(session, resolutions)
 
 
 def observe_source(store, member, metadata_table, face_table, face_ids):

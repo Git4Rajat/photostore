@@ -42,6 +42,7 @@ import NotFoundPage from './components/NotFoundPage';
 import { DialogHost } from './components/shared/dialogs';
 import { getActiveAccount, initAuth, isAuthEnabled, signIn, signOut } from './services/authClient';
 import { getMine } from './services/libraryClient';
+import { setIndexDemandTab } from './services/indexDemand';
 import { getRuntimeConfig } from './config/appConfig';
 import { formatBytes } from './components/browserAiShared';
 
@@ -697,6 +698,18 @@ const AppContent: React.FC = () => {
     useEffect(() => {
         const page = pageTitleFor(location.pathname);
         document.title = page ? `${page} · ${APP_NAME}` : APP_NAME;
+    }, [location.pathname]);
+
+    // Tools and Sharing are the only tabs that themselves surface live
+    // index/job state, so they're the only ones that should keep
+    // startIndexReadyPush's WebSocket connected on their own -- see
+    // services/indexDemand.ts. Every other tab relies purely on recent
+    // activity (an upload/edit just submitted) to justify that connection.
+    useEffect(() => {
+        if (location.pathname.startsWith('/tools')) setIndexDemandTab('tools');
+        else if (location.pathname.startsWith('/library')) setIndexDemandTab('sharing');
+        else setIndexDemandTab(null);
+        return () => setIndexDemandTab(null);
     }, [location.pathname]);
 
     // Every routed page gets its own boundary, outside the Suspense so it also

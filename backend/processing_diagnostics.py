@@ -15,6 +15,7 @@ import uuid
 from datetime import datetime, timezone
 
 from ipworker_metrics import replica_identity, resource_sample
+import processing_metrics as io_metrics
 
 _LOGGER = logging.getLogger('processing_diagnostics')
 _INSTANCE = uuid.uuid4().hex
@@ -24,6 +25,101 @@ _STATES = ('startup', 'idle', 'accumulating', 'processing', 'checkpoint')
 _BATCH = ContextVar('processing_upload_batch', default=None)
 _TRACE = ContextVar('processing_message', default=None)
 _MEDIA = ContextVar('processing_media_download', default=None)
+_IMAGES = ContextVar('processing_image_metrics', default=None)
+
+
+def storage_tracing_enabled():
+    import perf_instrumentation
+    return bool(perf_instrumentation.ENABLED and perf_instrumentation._transport_patched)
+
+
+@contextmanager
+def stage_context(wave_id, stage, claim):
+    fields = dict(_TRACE.get() or {}, wave_id=wave_id, stage=stage,
+                  attempt_id=claim.owner, dispatch_attempt=claim.attempt,
+                  schedule_id=claim.schedule_id or None)
+    token = _TRACE.set(fields)
+    try:
+        yield
+    finally:
+        _TRACE.reset(token)
+
+
+@contextmanager
+def image_scope(member_key, phase):
+    images = _IMAGES.get()
+    if images is None:
+        yield
+        return
+    counter = images[member_key]
+    started = time.monotonic()
+    with io_metrics.accounting(counter), io_metrics.purpose(phase):
+        if phase == 'inspection': io_metrics.add(image_inspections=1)
+        if phase == 'processing': io_metrics.add(source_attempts=1)
+        try:
+            yield
+        except BaseException:
+            if phase == 'processing': io_metrics.add(source_errors=1)
+            raise
+        finally:
+            io_metrics.add(**{'image_' + phase + '_ms': (time.monotonic() - started) * 1000})
+
+
+def vision_group_summary(function):
+    @wraps(function)
+    def wrapped(store, wave_id, members, *args, **kwargs):
+        images = {member['RowKey']: io_metrics.Counters() for member in members}
+        token = _IMAGES.set(images)
+        observations, outcome = [], 'error'
+        try:
+            observations = function(store, wave_id, members, *args, **kwargs)
+            outcome = 'success'
+            return observations
+        finally:
+            _IMAGES.reset(token)
+            qualified = {member['RowKey'] for member, completion, _ in observations if completion}
+            for member in members:
+                counter = images[member['RowKey']]
+                if not counter.snapshot()['image_inspections']:
+                    continue  # A deadline can leave the page tail unvisited.
+                io_metrics.add(image_passes=1)
+                counter.add(dict(image_passes=1))
+                file_event('vision_image_summary', store.library, member['filename'], wave_id=wave_id,
+                    member_id=file_id(store.library, member['RowKey']),
+                    measurement_scope='group_pass', outcome=outcome,
+                    receipt_qualified=member['RowKey'] in qualified, storage_attribution='image_context',
+                    storage_tracing_enabled=storage_tracing_enabled(),
+                    **counter.snapshot())
+    return wrapped
+
+
+def vision_wave_summary(function):
+    @wraps(function)
+    def wrapped(leases, work, store, library, wave_id, *args, **kwargs):
+        started, cpu = time.monotonic(), time.process_time()
+        result, outcome = None, 'error'
+        with io_metrics.accounting() as counter:
+            try:
+                result = function(leases, work, store, library, wave_id, *args, **kwargs)
+                outcome = 'success' if result is not None else 'no_work'
+                return result
+            finally:
+                wave = result or {}
+                resources = resource_sample()
+                trace_fields = {key: value for key, value in (_TRACE.get() or {}).items()
+                                if key in ('message_id', 'batch_id', 'attempt_id', 'dispatch_attempt', 'schedule_id')}
+                emit('vision_wave_attempt_summary', wave_id=wave_id, library_id=file_id(library, ''),
+                    measurement_scope='attempt', outcome=outcome, state=wave.get('state'),
+                    vision_complete=wave.get('state') in ('ready', 'indexing', 'complete'),
+                    member_count=wave.get('memberCount'), failed_members=wave.get('failedMembers'),
+                    milliseconds=(time.monotonic() - started) * 1000,
+                    process_cpu_ms=(time.process_time() - cpu) * 1000, cpu_attribution='process',
+                    process_current_rss_bytes=resources.get('current_rss_bytes'),
+                    process_peak_rss_bytes=resources.get('peak_rss_bytes'), memory_attribution='process',
+                    storage_tracing_enabled=storage_tracing_enabled(),
+                    **trace_fields,
+                    **counter.snapshot())
+    return wrapped
 
 
 def media_download_context():
@@ -69,6 +165,12 @@ def file_id(user, filename):
     return hashlib.sha256(json.dumps([str(user), str(filename)], separators=(',', ':')).encode()).hexdigest()[:32]
 
 
+def operation_id(value):
+    # Queue operation IDs can exceed the telemetry label limit and contain a
+    # library identity. Use the same bounded correlation key in every process.
+    return hashlib.sha256(str(value).encode()).hexdigest()[:32] if value else None
+
+
 def emit(event, **fields):
     try:
         record = {'event': event, 'schema': 1, 'process_instance': _INSTANCE,
@@ -112,7 +214,8 @@ def apply_phase(user, filename, phase):
     before = io_snapshot()
     outcome = 'success'
     try:
-        yield
+        with io_metrics.accounting() as local, io_metrics.purpose(phase):
+            yield
     except BaseException:
         outcome = 'error'
         raise
@@ -123,7 +226,141 @@ def apply_phase(user, filename, phase):
             milliseconds=max(0, time.monotonic() - started) * 1000,
             thread_cpu_ms=max(0, time.thread_time() - cpu_started) * 1000,
             sdk_calls=after[1] - before[1] if same_scope else None,
-            sdk_send_ms=after[2] - before[2] if same_scope else None)
+            sdk_send_ms=after[2] - before[2] if same_scope else None,
+            sdk_attribution='shared_scope' if same_scope else None,
+            storage_attribution='phase_context', storage_tracing_enabled=storage_tracing_enabled(),
+            **{key: value for key, value in local.snapshot().items()
+               if value or key in ('storage_calls', 'storage_send_ms', 'storage_bytes', 'storage_errors')})
+
+
+# One bounded accumulator per wave attempt; no per-face logging or retained IDs.
+_WAVE = ContextVar('processing_wave_metrics', default=None)
+
+
+def _scope_io():
+    try:
+        from perf_instrumentation import current_scope
+        scope = current_scope()
+        if scope is not None:
+            with scope.lock:
+                return scope, scope.io_count, scope.io_ms
+    except Exception:
+        pass
+    return None
+
+
+def _io_delta(before):
+    after = _scope_io()
+    if before is not None and after is not None and before[0] is after[0]:
+        return dict(sdk_calls=after[1] - before[1], sdk_send_ms=after[2] - before[2],
+                    sdk_attribution='shared_scope')
+    return {}
+
+
+class WaveMetrics:
+    def __init__(self, library, wave_id, role='cluster'):
+        self.fields = dict(_TRACE.get() or {})
+        self.fields.update(role=role, library_id=file_id(library, ''), wave_id=wave_id)
+        self.phases = {}
+        self.faces = 0
+        self.faces_processed = 0
+
+    @contextmanager
+    def phase(self, name):
+        started, cpu, before = time.monotonic(), time.thread_time(), _scope_io()
+        outcome = 'success'
+        counters = io_metrics.Counters()
+        try:
+            with io_metrics.accounting(counters):
+                yield
+        except BaseException:
+            outcome = 'error'
+            raise
+        finally:
+            row = self.phases.setdefault(name, dict(calls=0, errors=0, milliseconds=0.,
+                                                    thread_cpu_ms=0.))
+            row['calls'] += 1
+            row['errors'] += outcome == 'error'
+            row['milliseconds'] += max(0, time.monotonic() - started) * 1000
+            row['thread_cpu_ms'] += max(0, time.thread_time() - cpu) * 1000
+            for key, value in _io_delta(before).items():
+                if key != 'sdk_attribution':
+                    row[key] = row.get(key, 0) + value
+            for key, value in counters.snapshot().items():
+                if value:
+                    row[key] = row.get(key, 0) + value
+
+
+@contextmanager
+def wave_phase_scope(name):
+    metrics = _WAVE.get()
+    if metrics is None:
+        yield
+    else:
+        with metrics.phase(name):
+            yield
+
+
+def wave_faces(total=None, processed=None):
+    metrics = _WAVE.get()
+    if metrics is not None:
+        if total is not None:
+            metrics.faces = total
+        if processed is not None:
+            metrics.faces_processed = processed
+
+
+def wave_phase(name):
+    """Aggregate inclusive phase costs; nested phases must not be summed."""
+    def decorate(function):
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            with wave_phase_scope(name):
+                return function(*args, **kwargs)
+        return wrapped
+    return decorate
+
+
+def _wave_summary(function, *, role, phase_event, summary_event):
+    @wraps(function)
+    def wrapped(leases, store, library, wave_id, *args, **kwargs):
+        metrics = WaveMetrics(library, wave_id, role=role)
+        token = _WAVE.set(metrics)
+        started, cpu, before = time.monotonic(), time.process_time(), _scope_io()
+        outcome = 'error'
+        with io_metrics.accounting() as counters:
+            try:
+                result = function(leases, store, library, wave_id, *args, **kwargs)
+                outcome = 'success' if result is not None else 'no_work'
+                return result
+            finally:
+                _WAVE.reset(token)
+                for name, totals in metrics.phases.items():
+                    emit(phase_event, **metrics.fields, phase=name,
+                         inclusive=True, sdk_attribution='shared_scope', **totals)
+                emit(summary_event, **metrics.fields, outcome=outcome,
+                     milliseconds=max(0, time.monotonic() - started) * 1000,
+                     process_cpu_ms=max(0, time.process_time() - cpu) * 1000,
+                     cpu_attribution='process', faces=metrics.faces,
+                     faces_processed=metrics.faces_processed, measurement_scope='attempt',
+                     state=result.get('state') if outcome == 'success' and isinstance(result, dict) else None,
+                     storage_tracing_enabled=storage_tracing_enabled(),
+                     **counters.snapshot(), **_io_delta(before))
+    return wrapped
+
+
+def cluster_wave_summary(function):
+    return _wave_summary(function, role='cluster',
+                         phase_event='cluster_wave_phase', summary_event='cluster_wave_summary')
+
+
+def index_wave_summary(function):
+    # Same accounting as clustering, under index_wave_* events. The index stage
+    # was the one downstream stage with no per-phase/io telemetry, so its
+    # ~5m44s/1k-wave cost could not be attributed. Per-scope phases are added at
+    # the publish loop in run_index_release.
+    return _wave_summary(function, role='index',
+                         phase_event='index_wave_phase', summary_event='index_wave_summary')
 
 
 def payload(message):
@@ -143,8 +380,12 @@ def message_fields(message):
 
 @contextmanager
 def trace(message):
+    body = payload(message)
     fields = message_fields(message)
-    fields['batch_id'] = batch_id(payload(message).get('uploadBatchId'))
+    fields['batch_id'] = batch_id(body.get('uploadBatchId'))
+    fields['wave_id'] = batch_id(body.get('waveId'))
+    fields['operation_id'] = operation_id(body.get('operationId'))
+    fields['intent_revision'] = batch_id(body.get('intentRevision'))
     token = _TRACE.set(fields)
     try:
         yield
@@ -273,7 +514,7 @@ def measured(role, name, *, state=None):
     def decorate(function):
         @wraps(function)
         def wrapped(*args, **kwargs):
-            with phase(role, name, state=state):
+            with phase(role() if callable(role) else role, name, state=state):
                 return function(*args, **kwargs)
         return wrapped
     return decorate

@@ -76,15 +76,22 @@ def test_batch_context_is_thread_local_and_reset_on_error():
 
 
 def test_per_step_events_inherit_delivery_identity_and_trace_is_reset(caplog):
+    revision = '42fc715a-5932-49f5-8b30-16cac3ea4315'
+    operation = f'private-library-with-a-long-identifier:people_embedding:{revision}'
     message = SimpleNamespace(id='queue', dequeue_count=2, content=json.dumps({
-        'uploadBatchId': '01234567-89ab-4def-8123-456789abcdef'}))
+        'uploadBatchId': '01234567-89ab-4def-8123-456789abcdef',
+        'operationId': operation, 'intentRevision': revision}))
     with d.trace(message):
         d.file_event('vision_step', 'u', 'photo.jpg', step='ocr')
     d.file_event('vision_step', 'u', 'photo.jpg', step='face')
     first, second = records(caplog)
     assert first['attempt'] == 2 and first['message_id'] == d.message_fields(message)['message_id']
     assert first['batch_id'] == '0123456789ab4def8123456789abcdef'
+    assert first['operation_id'] == d.operation_id(operation)
+    assert first['intent_revision'] == revision.replace('-', '')
+    assert operation not in json.dumps(first)
     assert 'message_id' not in second and 'batch_id' not in second
+    assert 'operation_id' not in second and 'intent_revision' not in second
 
 
 def test_state_accounting_is_exclusive_and_forced_report_includes_partial_window(caplog):
@@ -138,3 +145,85 @@ def test_mixed_activity_and_cluster_face_counts(caplog):
     row, = records(caplog, 'cluster_applied')
     assert row['faces'] == 2
     assert all(secret not in json.dumps(row) for secret in ('p.jpg', 'face1', 'private-user'))
+
+
+def test_wave_metrics_aggregate_inclusive_costs_and_correlate(caplog, monkeypatch):
+    import perf_instrumentation as perf
+    wall, cpu = [0.], [0.]
+    monkeypatch.setattr(d.time, 'monotonic', lambda: wall[0])
+    monkeypatch.setattr(d.time, 'thread_time', lambda: cpu[0])
+    monkeypatch.setattr(d.time, 'process_time', lambda: cpu[0])
+
+    @d.wave_phase('guard_check')
+    def guard():
+        wall[0] += .01
+        cpu[0] += .002
+        perf.current_scope().add_io('table', 'GET', '/jobs', 200, 8, 0)
+
+    @d.cluster_wave_summary
+    def run(leases, store, library, wave_id):
+        d.wave_faces(total=3)
+        with d.wave_phase_scope('matching'):
+            for i in range(3):
+                guard()
+                d.wave_faces(processed=i + 1)
+        return 'receipt'
+
+    with perf.scope('test'):
+        assert run(None, None, 'private-library', 'wave-1') == 'receipt'
+    phases = {r['phase']: r for r in records(caplog, 'cluster_wave_phase')}
+    guard_row = phases['guard_check']
+    assert guard_row['calls'] == 3 and guard_row['errors'] == 0
+    assert guard_row['milliseconds'] == pytest.approx(30)
+    assert guard_row['thread_cpu_ms'] == pytest.approx(6)
+    assert guard_row['sdk_calls'] == 3 and guard_row['sdk_send_ms'] == 24
+    assert phases['matching']['sdk_calls'] == 3  # Inclusive, not another 3 requests.
+    summary, = records(caplog, 'cluster_wave_summary')
+    assert summary['sdk_calls'] == 3 and summary['milliseconds'] == pytest.approx(30)
+    assert summary['process_cpu_ms'] == pytest.approx(6)
+    assert summary['faces'] == summary['faces_processed'] == 3
+    assert summary['wave_id'] == 'wave-1' and summary['outcome'] == 'success'
+    assert summary['sdk_attribution'] == 'shared_scope'
+    assert 'private-library' not in json.dumps(summary)
+    assert d._WAVE.get() is None
+
+
+def test_wave_metrics_report_failure_and_restore_context(caplog):
+    failure = ValueError('original failure')
+
+    @d.cluster_wave_summary
+    def run(leases, store, library, wave_id):
+        with d.wave_phase_scope('assignment_persistence'):
+            d.wave_faces(total=2, processed=1)
+            raise failure
+
+    with pytest.raises(ValueError) as caught:
+        run(None, None, 'u', 'wave-error')
+    assert caught.value is failure
+    summary, = records(caplog, 'cluster_wave_summary')
+    phase, = records(caplog, 'cluster_wave_phase')
+    assert summary['outcome'] == 'error' and summary['faces_processed'] == 1
+    assert phase['errors'] == 1
+
+
+def test_index_wave_summary_emits_per_scope_phases_under_index_events(caplog):
+    @d.index_wave_summary
+    def run(leases, store, library, wave_id):
+        for scope in ('people', 'albums', 'search'):
+            with d.wave_phase_scope('publish:' + scope):
+                pass
+        return {'state': 'complete'}
+
+    assert run(None, None, 'private-library', 'wave-idx')['state'] == 'complete'
+    # Emitted under index_wave_* events, tagged role=index -- never the cluster ones.
+    assert records(caplog, 'cluster_wave_summary') == []
+    summary, = records(caplog, 'index_wave_summary')
+    assert summary['role'] == 'index'
+    assert summary['wave_id'] == 'wave-idx' and summary['outcome'] == 'success'
+    assert summary['state'] == 'complete'
+    assert 'private-library' not in json.dumps(summary)  # Library id stays hashed.
+    phases = {r['phase'] for r in records(caplog, 'index_wave_phase')}
+    assert {'publish:people', 'publish:albums', 'publish:search'} <= phases
+    assert d._WAVE.get() is None  # Context restored after the stage.
+    assert 'sdk_calls' not in summary  # No scope is not zero I/O.
+    assert d._WAVE.get() is None

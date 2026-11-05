@@ -11,7 +11,7 @@ INDEXER_API_BASE_URL="${APP_CONFIG_INDEXER_API_BASE_URL:-$API_BASE_URL}"
 # `recovery` containerApp resource.
 RECOVERY_API_BASE_URL="${APP_CONFIG_RECOVERY_API_BASE_URL:-$API_BASE_URL}"
 # Same fallback pattern as INDEXER_API_BASE_URL -- see deploy/resources.bicep's
-# `archive` containerApp resource (people/faces, library, public share links).
+# `archive` containerApp resource (whole-library operations and public share links).
 ARCHIVE_API_BASE_URL="${APP_CONFIG_ARCHIVE_API_BASE_URL:-$API_BASE_URL}"
 SPA_BASE_URL="${APP_CONFIG_SPA_BASE_URL:-}"
 AZURE_AD_TENANT_ID="${APP_CONFIG_AZURE_AD_TENANT_ID:-}"
@@ -22,6 +22,10 @@ BLAZE_FACE_MODEL_URL="${APP_CONFIG_BLAZE_FACE_MODEL_URL:-/models/browser-ai/mode
 ARC_FACE_MODEL_URL="${APP_CONFIG_ARC_FACE_MODEL_URL:-/models/browser-ai/models/adaface/model.onnx}"
 ARC_FACE_WASM_PATH="${APP_CONFIG_ARC_FACE_WASM_PATH:-/models/browser-ai/runtime/}"
 PROCESSING_MODE="${APP_CONFIG_PROCESSING_MODE:-browser}"
+WAVE_EXECUTION=false
+if [ "${APP_CONFIG_UPLOAD_WAVE_EXECUTION_ENABLED:-false}" = "true" ]; then
+  WAVE_EXECUTION=true
+fi
 UPLOAD_PREPARATION=false
 if [ "${APP_CONFIG_BROWSER_UPLOAD_PREPARATION:-false}" = "true" ]; then
   UPLOAD_PREPARATION=true
@@ -55,6 +59,7 @@ window.__APP_CONFIG__ = {
   arcFaceWasmPath: "${ARC_FACE_WASM_PATH}",
   buildTimestamp: "${BUILD_TS}",
   processingMode: "${PROCESSING_MODE}",
+  uploadWaveExecutionEnabled: ${WAVE_EXECUTION},
   browserUploadPreparation: ${UPLOAD_PREPARATION}
 };
 EOF

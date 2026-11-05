@@ -10,6 +10,7 @@
 import { getTools } from './apiClient';
 import { isAuthEnabled, getActiveAccount } from './authClient';
 import { hasValidSession } from './passwordAuthClient';
+import { noteIndexActivity } from './indexDemand';
 
 export type JobStatusRecord = {
     jobId: string;
@@ -174,6 +175,11 @@ export const onJobPollRequested = (listener: () => void): (() => void) => {
 };
 
 export const requestJobPoll = (): void => {
+    // Every trigger site here means something that touches index/job state
+    // just happened server-side -- also counts as index demand so a WS
+    // connected elsewhere (see indexReadyPush.ts) doesn't immediately get
+    // gated back off while that work is still settling.
+    noteIndexActivity();
     pollListeners.forEach((listener) => {
         try {
             listener();

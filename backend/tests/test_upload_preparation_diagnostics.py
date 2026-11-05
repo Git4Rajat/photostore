@@ -75,32 +75,42 @@ def test_queue_latency_and_retry_attempts_are_bounded():
     assert 'admissionMs' not in clean
 
 
+def receipt_app(row):
+    app = SimpleNamespace(metadata_table_client=SimpleNamespace(get_entity=Mock(return_value=row)),
+                          app=SimpleNamespace(logger=Mock()))
+    def update(user, filename, fields, *, derive_updates):
+        entity = app.metadata_table_client.get_entity(partition_key=user, row_key=filename)
+        entity.update(derive_updates(entity))
+        return entity
+    app._update_metadata_entity_fields = Mock(side_effect=update)
+    return app
+
+
 def test_receipt_uses_backend_state_not_browser_success_claim():
     row = {'preview_status': 'done', 'thumbnail_status': 'pending',
            'processing_metadata': json.dumps({'client_preview': {'source': 'browser'}})}
-    app = SimpleNamespace(metadata_table_client=SimpleNamespace(get_entity=lambda **_: row),
-                          _update_metadata_entity_fields=Mock(), app=SimpleNamespace(logger=Mock()))
+    app = receipt_app(row)
     payload = {'preparationReport': report(), 'clientProcessing': {
         'preview': {'alreadyUploaded': True}, 'thumbnail': {'alreadyUploaded': True}}, 'clientMetadata': {'version': 1}}
     record_receipt(app, 'library', 'photo.cr3', payload, packet_rejection='binding_or_blob_mismatch',
                    processing_rejection='storage_http_404')
-    record = json.loads(app._update_metadata_entity_fields.call_args.args[2]['uploadPreparationReport'])
+    record = json.loads(row['uploadPreparationReport'])
     assert record['backendReceipt'] == {'preview': 'accepted', 'thumbnail': 'rejected',
         'metadata': 'rejected', 'metadataReason': 'binding_or_blob_mismatch', 'processingReason': 'storage_http_404'}
     assert record['browserClaim']['assets']['thumbnail']['upload'] == 'uploaded'
     record_receipt(app, 'library', 'photo.cr3', payload, packet_accepted=True)
-    accepted = json.loads(app._update_metadata_entity_fields.call_args.args[2]['uploadPreparationReport'])
+    accepted = json.loads(row['uploadPreparationReport'])
     assert accepted['backendReceipt']['metadata'] == 'accepted'
     record_receipt(app, 'library', 'photo.cr3', payload, duplicate=True)
-    duplicate = json.loads(app._update_metadata_entity_fields.call_args.args[2]['uploadPreparationReport'])
+    duplicate = json.loads(row['uploadPreparationReport'])
     assert set(duplicate['backendReceipt'].values()) == {'duplicate'}
 
 
 def test_receipt_failure_does_not_reject_original():
-    app = SimpleNamespace(metadata_table_client=SimpleNamespace(get_entity=Mock(side_effect=RuntimeError('offline'))),
-                          _update_metadata_entity_fields=Mock(), app=SimpleNamespace(logger=Mock()))
+    app = receipt_app({})
+    app.metadata_table_client.get_entity.side_effect = RuntimeError('offline')
     record_receipt(app, 'library', 'photo.cr3', {'preparationReport': report()})
-    app._update_metadata_entity_fields.assert_not_called()
+    app._update_metadata_entity_fields.assert_called_once()
     app.app.logger.info.assert_called_once()
 
 
@@ -108,12 +118,11 @@ def test_receipt_preserves_independent_derivative_rejection_reason():
     row = {'preview_status': 'done', 'thumbnail_status': 'pending', 'processing_metadata': json.dumps({
         'client_preview': {'source': 'browser'},
         'client_thumbnail_rejected': {'clientAssetId': 'upload-id', 'reason': 'derivative_byte_limit'}})}
-    app = SimpleNamespace(metadata_table_client=SimpleNamespace(get_entity=lambda **_: row),
-                          _update_metadata_entity_fields=Mock(), app=SimpleNamespace(logger=Mock()))
+    app = receipt_app(row)
     payload = {'uploadId': 'upload-id', 'preparationReport': report(), 'clientProcessing': {
         'preview': {'alreadyUploaded': True}, 'thumbnail': {'alreadyUploaded': True}}}
     record_receipt(app, 'library', 'photo.cr3', payload)
-    receipt = json.loads(app._update_metadata_entity_fields.call_args.args[2]['uploadPreparationReport'])['backendReceipt']
+    receipt = json.loads(row['uploadPreparationReport'])['backendReceipt']
     assert receipt['preview'] == 'accepted'
     assert receipt['thumbnail'] == 'rejected'
     assert receipt['thumbnailReason'] == 'derivative_byte_limit'
@@ -152,3 +161,28 @@ def test_metadata_report_cap_matches_transport_without_widening_derivative_cap()
 ])
 def test_rejection_codes_do_not_forward_exception_text(message, reason):
     assert rejection_reason(ValueError(message)) == reason
+
+
+@pytest.mark.parametrize('race', [False, True])
+def test_receipt_has_one_read_per_conditional_attempt_and_recomputes_after_conflict(monkeypatch, race):
+    import app
+    from azure.core.exceptions import ResourceModifiedError
+    first = {'preview_status': 'done', 'processing_metadata': json.dumps({'client_preview': {'source': 'browser'}})}
+    latest = {'preview_status': 'pending', 'processing_metadata': '{}'}
+    reads = Mock(side_effect=[first, latest] if race else [first])
+    writes = Mock(side_effect=[ResourceModifiedError('changed'), None] if race else [None])
+    monkeypatch.setattr(app, 'metadata_table_client', SimpleNamespace(get_entity=reads, update_entity=writes))
+    monkeypatch.setattr(app, '_photo_processing_complete', lambda row: False)
+    monkeypatch.setattr(app, '_invalidate_metadata_scan_cache', lambda *args: None)
+    monkeypatch.setattr(app.time, 'sleep', lambda *args: None)
+    monkeypatch.setattr(app.storage_utils_module, 'DURABLE_INDEX_UPDATES', False)
+    monkeypatch.setattr(app.storage_utils_module, 'prepare_metadata_index_intent', lambda *args: None)
+    monkeypatch.setattr(app, 'metadata_updates_affect_search_indexes', lambda *args: False)
+    monkeypatch.setattr(app, 'metadata_updates_affect_sort_index', lambda *args: False)
+    record_receipt(app, 'library', 'photo.jpg', {'preparationReport': report(),
+                   'clientProcessing': {'preview': {'alreadyUploaded': True}}})
+    assert reads.call_count == writes.call_count == (2 if race else 1)
+    final = writes.call_args.args[0]
+    receipt = json.loads(final['uploadPreparationReport'])['backendReceipt']
+    assert receipt['preview'] == ('rejected' if race else 'accepted')
+    assert writes.call_args.kwargs['match_condition'] is app.MatchConditions.IfNotModified

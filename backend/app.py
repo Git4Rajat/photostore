@@ -45,6 +45,8 @@ import email_utils
 import library_utils
 from index_ownership import catalog_publisher
 import processing_diagnostics
+from index_publication import serialize_catalog
+from automatic_index_updates import quiesced_cleanup
 from ipworker_metrics import Metrics as IpworkerMetrics, replica_identity, resource_sample
 from ordering_utils import (
     order_photo_entries,
@@ -225,6 +227,14 @@ logging.basicConfig(
 # not another logger's already-set level.
 logging.getLogger('azure').setLevel(logging.WARNING)
 app = Flask(__name__)
+
+
+@app.before_request
+def _wave_install_barrier():
+    if (os.getenv('UPLOAD_WAVE_BOOTSTRAP_PENDING','').lower()=='true'
+            and request.path.rstrip('/')!='/health'):
+        return jsonify(error='Wave deployment bootstrap is pending'),503
+
 # Belt-and-suspenders alongside the basicConfig(force=True) above: Flask's
 # own app.logger can carry an independent level/handler (attached lazily by
 # Flask/Werkzeug) that would otherwise keep filtering out INFO regardless of
@@ -526,6 +536,7 @@ MERGE_TABLE = os.getenv('MERGE_TABLE', 'personmerges')
 # scan and Python-filter the whole thing (213k+ rows, 17-33s/call). See
 # _upsert_job_status.
 JOBS_TABLE = os.getenv('JOBS_TABLE', 'photojobs')
+UPLOAD_SESSIONS_TABLE = os.getenv('UPLOAD_SESSIONS_TABLE', 'photouploadsessions')
 # CRUD requests below this size finish on the request thread. Larger requests
 # are persisted as blob-backed jobs so queue messages stay far below Azure
 # Queue Storage's message-size limit and workers can make bounded progress.
@@ -678,6 +689,7 @@ BLOB_LEXICAL_INDEX_CONTAINER = os.getenv('BLOB_LEXICAL_INDEX_CONTAINER', 'lexica
 # refresh_user_people_index, a LexicalIndexSnapshot of names/cover photos, not
 # embeddings). See PeopleEmbeddingIndexSnapshot in storage_utils.py.
 BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER = os.getenv('BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER', 'people-embedding-index').strip()
+BLOB_TAG_EMBEDDING_INDEX_CONTAINER = os.getenv('BLOB_TAG_EMBEDDING_INDEX_CONTAINER', 'tag-embedding-index').strip()
 VECTOR_INDEX_PRIME_ON_STARTUP = os.getenv('VECTOR_INDEX_PRIME_ON_STARTUP', 'false').lower() in ('1', 'true', 'yes')
 VECTOR_INDEX_PRIME_MAX_USERS = max(0, int(os.getenv('VECTOR_INDEX_PRIME_MAX_USERS', '200')))
 SEMANTIC_SEARCH_ALLOW_QUERYTIME_ROW_EMBEDDINGS = os.getenv(
@@ -702,6 +714,12 @@ if PROCESSING_MODE not in ('browser', 'backend', 'both'):
 # can't drift out of sync the way hand-edited bicep literals have before.
 BROWSER_ONLY_PROCESSING = PROCESSING_MODE == 'browser'
 CLUSTERING_QUEUE_NAME = os.getenv('CLUSTERING_QUEUE_NAME', 'photostore-clustering')
+# Deferred wave-continuation retries (progress/barrier_wait/artifact_cleanup/
+# wave_active) land here instead of CLUSTERING_QUEUE_NAME -- see send_stage's
+# comment in wave_runtime.py for why that queue's 'all' KEDA strategy can't
+# be used for a message that's invisible only because it's intentionally
+# scheduled for later, not because a live job is renewing it.
+CLUSTERING_DEFERRED_QUEUE_NAME = os.getenv('CLUSTERING_DEFERRED_QUEUE_NAME', 'photostore-clustering-deferred')
 # receive_messages() with no visibility_timeout defaults to Azure's 30s -- a
 # full DBSCAN pass over a large library (or a multi-hour library_download
 # export) can exceed that, making Azure redeliver the same message before
@@ -747,6 +765,14 @@ CLUSTERING_WORKER_MAX_RETRIES = int(os.getenv('CLUSTERING_WORKER_MAX_RETRIES', '
 LIBRARY_OPS_QUEUE_NAME = os.getenv('LIBRARY_OPS_QUEUE_NAME', 'photostore-library-ops')
 # Explicit queue configuration is required; never fall back to cluster builds.
 INDEX_MAINTENANCE_QUEUE_NAME = os.getenv('INDEX_MAINTENANCE_QUEUE_NAME', '').strip()
+# Delayed wakeups (coalescing / dedup-idle wait / WorkStore retry backoff) are
+# invisible-by-design, not an actively-renewed in-flight job -- same
+# false-start exposure as clustering (see wave_runtime.send_stage and
+# CLUSTERING_DEFERRED_QUEUE_NAME). Routed to this sibling queue instead, so
+# the main queue's queueLengthStrategy='all' KEDA rule isn't kept reporting
+# work while a retry just waits out its delay.
+INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME = os.getenv(
+    'INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME', 'photostore-index-maintenance-deferred')
 INDEX_MAINTENANCE_DEADLETTER_QUEUE_NAME = os.getenv(
     'INDEX_MAINTENANCE_DEADLETTER_QUEUE_NAME', 'photostore-index-maintenance-deadletter')
 # _execute_library_clean (and _execute_library_download) are naturally
@@ -773,6 +799,7 @@ LIBRARY_CLEAN_MAX_RETRIES = int(os.getenv('LIBRARY_CLEAN_MAX_RETRIES', '30'))
 CLUSTERING_DEADLETTER_QUEUE_NAME = os.getenv('CLUSTERING_DEADLETTER_QUEUE_NAME', 'photostore-clustering-deadletter')
 LIBRARY_OPS_DEADLETTER_QUEUE_NAME = os.getenv('LIBRARY_OPS_DEADLETTER_QUEUE_NAME', 'photostore-library-ops-deadletter')
 IPWORKER_QUEUE_NAME = os.getenv('IPWORKER_QUEUE_NAME', 'photostore-ipwork')
+IPWORKER_DEFERRED_QUEUE_NAME = os.getenv('IPWORKER_DEFERRED_QUEUE_NAME', 'photostore-ipwork-deferred')
 # ipworker's job: thumbnail, exif, ocr, geo (map_detection), vision (ai_vision),
 # face -- the full set the browser can do client-side. Thumbnail used to be a
 # permanent browser-only exception (cheap canvas resize, no model needed, so
@@ -1105,6 +1132,7 @@ face_table_client = None
 person_table_client = None
 merge_table_client = None
 jobs_table_client = None
+upload_sessions_table_client = None
 album_token_index_table_client = None
 workbench_actions_table_client = None
 people_dirty_set_table_client = None  # Track which people were modified for incremental rebuild
@@ -1122,10 +1150,13 @@ audit_table_client = None
 clean_requests_table_client = None
 library_store = None
 clustering_queue_client = None
+clustering_deferred_queue_client = None
 queue_service_client = None
 ipwork_queue_client = None
+ipwork_deferred_queue_client = None
 library_ops_queue_client = None
 index_maintenance_queue_client = None
+index_maintenance_deferred_queue_client = None
 clustering_deadletter_queue_client = None
 library_ops_deadletter_queue_client = None
 
@@ -1376,7 +1407,7 @@ def _bootstrap_owner_account() -> None:
     while the legacy config-table credential remains the source of truth until
     the multi-account cutover. No-op after the first run.
     """
-    if library_store is None or AUTH_MODE != 'password':
+    if library_store is None or AUTH_MODE != 'password' or os.getenv('UPLOAD_WAVE_BOOTSTRAP_PENDING','').lower()=='true':
         return
     try:
         cred = password_auth.get_owner_credential(config_table_client) or {}
@@ -1412,7 +1443,7 @@ def _init_storage_clients():
     global blob_service_client, albums_table_client, face_table_client, person_table_client, merge_table_client
     global face_by_filename_table_client, person_members_table_client, album_members_table_client
     global album_token_index_table_client
-    global jobs_table_client
+    global jobs_table_client, upload_sessions_table_client
     global workbench_actions_table_client
     global people_dirty_set_table_client, albums_dirty_set_table_client
     global image_names_table_client
@@ -1423,8 +1454,9 @@ def _init_storage_clients():
     global config_table_client
     global users_table_client, libraries_table_client, memberships_table_client
     global invites_table_client, audit_table_client, clean_requests_table_client, library_store
-    global clustering_queue_client, queue_service_client, ipwork_queue_client, library_ops_queue_client
-    global index_maintenance_queue_client
+    global clustering_queue_client, clustering_deferred_queue_client, queue_service_client
+    global ipwork_queue_client, ipwork_deferred_queue_client, library_ops_queue_client
+    global index_maintenance_queue_client, index_maintenance_deferred_queue_client
     global clustering_deadletter_queue_client, library_ops_deadletter_queue_client
 
     account_name = STORAGE_ACCOUNT_NAME or os.getenv('AZURE_STORAGE_ACCOUNT_NAME')
@@ -1445,6 +1477,7 @@ def _init_storage_clients():
         album_members_table_client_local = tbl_svc.get_table_client(ALBUM_MEMBERS_TABLE)
         merge_table_client_local = tbl_svc.get_table_client(MERGE_TABLE)
         jobs_table_client_local = tbl_svc.get_table_client(JOBS_TABLE)
+        upload_sessions_table_client_local = tbl_svc.get_table_client(UPLOAD_SESSIONS_TABLE)
         workbench_actions_table_client_local = tbl_svc.get_table_client(WORKBENCH_ACTIONS_TABLE)
         image_names_table_client_local = tbl_svc.get_table_client(IMAGE_NAMES_TABLE)
         hash_index_table_client_local = tbl_svc.get_table_client(HASH_INDEX_TABLE)
@@ -1466,6 +1499,7 @@ def _init_storage_clients():
             blob_service_client_local = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
         queue_service_client_local = QueueServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
         clustering_queue_client_local = queue_service_client_local.get_queue_client(CLUSTERING_QUEUE_NAME)
+        clustering_deferred_queue_client_local = queue_service_client_local.get_queue_client(CLUSTERING_DEFERRED_QUEUE_NAME)
         ipwork_queue_client_local = queue_service_client_local.get_queue_client(IPWORKER_QUEUE_NAME)
         library_ops_queue_client_local = queue_service_client_local.get_queue_client(LIBRARY_OPS_QUEUE_NAME)
         clustering_deadletter_queue_client_local = queue_service_client_local.get_queue_client(CLUSTERING_DEADLETTER_QUEUE_NAME)
@@ -1492,6 +1526,7 @@ def _init_storage_clients():
             connection_pool_maxsize=STORAGE_CONNECTION_POOL_MAXSIZE,
         )
         clustering_queue_client_local = queue_service_client_local.get_queue_client(CLUSTERING_QUEUE_NAME)
+        clustering_deferred_queue_client_local = queue_service_client_local.get_queue_client(CLUSTERING_DEFERRED_QUEUE_NAME)
         ipwork_queue_client_local = queue_service_client_local.get_queue_client(IPWORKER_QUEUE_NAME)
         library_ops_queue_client_local = queue_service_client_local.get_queue_client(LIBRARY_OPS_QUEUE_NAME)
         clustering_deadletter_queue_client_local = queue_service_client_local.get_queue_client(CLUSTERING_DEADLETTER_QUEUE_NAME)
@@ -1516,6 +1551,7 @@ def _init_storage_clients():
         album_members_table_client_local = tbl_svc.get_table_client(ALBUM_MEMBERS_TABLE)
         merge_table_client_local = tbl_svc.get_table_client(MERGE_TABLE)
         jobs_table_client_local = tbl_svc.get_table_client(JOBS_TABLE)
+        upload_sessions_table_client_local = tbl_svc.get_table_client(UPLOAD_SESSIONS_TABLE)
         workbench_actions_table_client_local = tbl_svc.get_table_client(WORKBENCH_ACTIONS_TABLE)
         image_names_table_client_local = tbl_svc.get_table_client(IMAGE_NAMES_TABLE)
         hash_index_table_client_local = tbl_svc.get_table_client(HASH_INDEX_TABLE)
@@ -1532,9 +1568,9 @@ def _init_storage_clients():
         albums_dirty_set_table_client_local = tbl_svc.get_table_client(ALBUMS_DIRTY_SET_TABLE)
 
     # assign to globals
-    metadata_table_client = metadata_table_client_local
-    embeddings_table_client = embeddings_table_client_local
-    face_embeddings_table_client = face_embeddings_table_client_local
+    metadata_table_client = storage_utils_module.track_index_source_table(metadata_table_client_local, 'metadata')
+    embeddings_table_client = storage_utils_module.track_index_source_table(embeddings_table_client_local, 'embeddings')
+    face_embeddings_table_client = storage_utils_module.track_index_source_table(face_embeddings_table_client_local, 'face_embeddings')
     search_index_dirty_table_client = search_index_dirty_table_client_local
     config_table_client = config_table_client_local
     blob_service_client = blob_service_client_local
@@ -1542,19 +1578,22 @@ def _init_storage_clients():
     album_token_index_table_client = album_token_index_table_client_local
     # Wrap so every write (from anywhere in app.py or storage_utils.py) auto-invalidates
     # the people/faces scan cache -- see _InvalidatingTableClient.
-    face_table_client = _InvalidatingTableClient(face_table_client_local, _invalidate_people_scan_cache)
-    person_table_client = _InvalidatingTableClient(person_table_client_local, _invalidate_people_scan_cache)
+    face_table_client = _InvalidatingTableClient(
+        storage_utils_module.track_index_source_table(face_table_client_local, 'face'), _invalidate_people_scan_cache)
+    person_table_client = _InvalidatingTableClient(
+        storage_utils_module.track_index_source_table(person_table_client_local, 'person'), _invalidate_people_scan_cache)
     face_by_filename_table_client = face_by_filename_table_client_local
     person_members_table_client = person_members_table_client_local
     album_members_table_client = album_members_table_client_local
     album_store.configure(album_members_table_client)
     merge_table_client = merge_table_client_local
     jobs_table_client = jobs_table_client_local
+    upload_sessions_table_client = upload_sessions_table_client_local
     workbench_actions_table_client = workbench_actions_table_client_local
     people_dirty_set_table_client = people_dirty_set_table_client_local
     albums_dirty_set_table_client = albums_dirty_set_table_client_local
     image_names_table_client = image_names_table_client_local
-    hash_index_table_client = hash_index_table_client_local
+    hash_index_table_client = storage_utils_module.track_index_source_table(hash_index_table_client_local, 'hash')
     filename_owners_table_client = filename_owners_table_client_local
     trash_index_table_client = trash_index_table_client_local
     users_table_client = users_table_client_local
@@ -1564,10 +1603,15 @@ def _init_storage_clients():
     audit_table_client = audit_table_client_local
     clean_requests_table_client = clean_requests_table_client_local
     clustering_queue_client = clustering_queue_client_local
+    clustering_deferred_queue_client = clustering_deferred_queue_client_local
     ipwork_queue_client = ipwork_queue_client_local
+    ipwork_deferred_queue_client = queue_service_client_local.get_queue_client(IPWORKER_DEFERRED_QUEUE_NAME)
     library_ops_queue_client = library_ops_queue_client_local
     index_maintenance_queue_client = (
         queue_service_client_local.get_queue_client(INDEX_MAINTENANCE_QUEUE_NAME)
+        if INDEX_MAINTENANCE_QUEUE_NAME else None)
+    index_maintenance_deferred_queue_client = (
+        queue_service_client_local.get_queue_client(INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME)
         if INDEX_MAINTENANCE_QUEUE_NAME else None)
     clustering_deadletter_queue_client = clustering_deadletter_queue_client_local
     library_ops_deadletter_queue_client = library_ops_deadletter_queue_client_local
@@ -1602,10 +1646,13 @@ def _init_storage_clients():
     ] + [
         lambda q=clustering_queue_client: q.create_queue(),
         lambda q=ipwork_queue_client: q.create_queue(),
+        lambda q=ipwork_deferred_queue_client: q.create_queue(),
         lambda q=library_ops_queue_client: q.create_queue(),
         lambda q=clustering_deadletter_queue_client: q.create_queue(),
         lambda q=library_ops_deadletter_queue_client: q.create_queue(),
     ]
+    if os.getenv('APP_ROLE', 'core').strip().lower() in ('', 'core', 'upload'):
+        _ensure_fns.append(upload_sessions_table_client.create_table)
     if index_maintenance_queue_client is not None:
         _ensure_fns.append(index_maintenance_queue_client.create_queue)
     if AUTH_MODE == 'password':
@@ -1625,6 +1672,8 @@ def _init_storage_clients():
         invites_table=invites_table_client,
         audit_table=audit_table_client,
         clean_requests_table=clean_requests_table_client,
+        require_invite_index=os.getenv('APP_ROLE', 'core').strip().lower() in ('', 'core'),
+        before_create=lambda library: __import__('wave_policy').enroll_new(jobs_table_client, library, metadata_table_client),
     )
 
     # Password-mode: seed the initial owner credential from
@@ -1655,6 +1704,7 @@ def _init_storage_clients():
         blob_vector_index_container=BLOB_VECTOR_INDEX_CONTAINER,
         blob_lexical_index_container=BLOB_LEXICAL_INDEX_CONTAINER,
         blob_people_embedding_index_container=BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER,
+        blob_tag_embedding_index_container=BLOB_TAG_EMBEDDING_INDEX_CONTAINER,
         image_names_table_client=image_names_table_client,
         hash_index_table_client=hash_index_table_client,
         filename_owners_table_client=filename_owners_table_client,
@@ -1672,6 +1722,8 @@ def _init_storage_clients():
         face_summary_cache_writer=lambda uid, rows: _face_summary_scan_cache.set(uid, rows),
         source_completion_delivery=lambda uid, intent: _accept_upload_source_completion(uid, intent),
         source_artifact_receipt_capture=lambda uid, metadata: _capture_upload_artifacts(uid, metadata),
+        source_policy_check=lambda uid: __import__('processing_cleanup').check_source_policy(jobs_table_client,uid),
+        wave_owned=lambda uid: _library_cut_over_to_waves(uid),
     )
     _prime_vector_indexes_on_startup()
 
@@ -1834,7 +1886,7 @@ def create_albums_dirty_set_table() -> None:
 def create_blob_containers() -> None:
     if blob_service_client is None:
         return
-    for container_name in (BLOB_IMAGE_CONTAINER, BLOB_THUMBNAIL_CONTAINER, BLOB_VECTOR_INDEX_CONTAINER, BLOB_LEXICAL_INDEX_CONTAINER, BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER, BLOB_EXPORTS_CONTAINER, BLOB_MERGE_PAYLOADS_CONTAINER):
+    for container_name in (BLOB_IMAGE_CONTAINER, BLOB_THUMBNAIL_CONTAINER, BLOB_VECTOR_INDEX_CONTAINER, BLOB_LEXICAL_INDEX_CONTAINER, BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER, BLOB_TAG_EMBEDDING_INDEX_CONTAINER, BLOB_EXPORTS_CONTAINER, BLOB_MERGE_PAYLOADS_CONTAINER):
         if not container_name:
             continue
         try:
@@ -2541,6 +2593,12 @@ def _build_photo_summary(user_id: str, filename: str, metadata: Dict, include_pr
             # uses 'ipworker-<jobId>', /upload/processing/claim uses
             # 'browser-<uuid>' by default).
             'activeWorker': _active_processing_worker(metadata),
+            # Human-diagnosable reason per non-'done' step (e.g. 'unrecoverable'
+            # thumbnail's 'raw_preview_extraction_failed'), so the Tools page can
+            # show *why* a step didn't complete instead of just a status color --
+            # computed server-side from processing_metadata breadcrumbs already,
+            # just not previously attached to the photo payload the frontend reads.
+            'reasons': _processing_step_reasons(metadata) or None,
         },
     }
 
@@ -2629,6 +2687,7 @@ def _require_library_context(require_auth: bool = False):
         if AUTH_MODE == 'password':
             uid = password_auth.OWNER_USER_ID
             _ensure_account_bootstrapped(uid, email=None)
+            g.upload_session_library = uid
             return uid, uid, None
         return None, None, (jsonify({'error': 'Authorization token is required.'}), 401)
 
@@ -2676,6 +2735,7 @@ def _require_library_context(require_auth: bool = False):
         if not is_member:
             return None, None, (jsonify({'error': 'You no longer have access to this library.'}), 403)
 
+    g.upload_session_library = library_id
     return user_id, library_id, None
 
 
@@ -3253,6 +3313,7 @@ def _humanize_job(row: Dict) -> Dict:
             'sort': ('Photo ordering index', 'Photo ordering and gallery fields refreshed.'),
             'access': ('Photo access index', 'Photo media availability refreshed.'),
             'search': ('Search index', 'Pending photo search changes refreshed.'),
+            'lexical_artifact': ('Search text index', 'Photo text search refreshed.'),
             'compact': ('Search database compaction', 'Search database maintenance completed.'),
             'reconcile': ('Library reconciliation', 'Missing catalog records checked and queued for repair.'),
             'vector': ('Photo vector index', 'Photo embedding lookup refreshed.'),
@@ -3357,7 +3418,10 @@ def _humanize_job(row: Dict) -> Dict:
     }
 
 
-def _update_metadata_entity_fields(user_id: str, filename: str, updates: Dict) -> Optional[Dict]:
+def _update_metadata_entity_fields(
+    user_id: str, filename: str, updates: Dict, *,
+    derive_updates: Optional[Callable[[Dict], Dict]] = None,
+) -> Optional[Dict]:
     if metadata_table_client is None:
         return None
     last_exc = None
@@ -3368,12 +3432,17 @@ def _update_metadata_entity_fields(user_id: str, filename: str, updates: Dict) -
             return None
         if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
             return None
-        if (storage_utils_module.DURABLE_INDEX_UPDATES and all(entity.get(k) == v for k, v in (updates or {}).items())
+        # Recompute derived fields after every fresh read/ETag retry.
+        current_updates = derive_updates(entity) if derive_updates is not None else updates
+        if (storage_utils_module.DURABLE_INDEX_UPDATES and all(entity.get(k) == v for k, v in (current_updates or {}).items())
                 and entity.get('processing_complete') == _photo_processing_complete(entity)):
-            storage_utils_module.publish_metadata_index_intent(user_id, filename, entity)
+            try:
+                storage_utils_module.publish_metadata_index_intent(user_id, filename, entity)
+            except Exception:
+                app.logger.warning('Metadata saved; index intent delivery pending for %s/%s', user_id, filename, exc_info=True)
             return entity
-        changed = {k: v for k, v in (updates or {}).items() if entity.get(k) != v}
-        entity.update(updates or {})
+        changed = {k: v for k, v in (current_updates or {}).items() if entity.get(k) != v}
+        entity.update(current_updates or {})
         complete = _photo_processing_complete(entity)
         if entity.get('processing_complete') != complete:
             changed['processing_complete'] = complete
@@ -3384,23 +3453,35 @@ def _update_metadata_entity_fields(user_id: str, filename: str, updates: Dict) -
             # Conditional on the etag just read -- see _update_metadata_fields's
             # identical comment in storage_utils.py.
             metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
-            _invalidate_metadata_scan_cache(user_id)
-            if storage_utils_module.DURABLE_INDEX_UPDATES:
-                storage_utils_module.publish_metadata_index_intent(user_id, filename, entity)
-            elif metadata_updates_affect_search_indexes(updates or {}):
-                touch_user_search_indexes_state(
-                    user_id, filenames=filename,
-                    touch_albums=storage_utils_module.metadata_updates_affect_album_covers(updates or {}),
-                )
-            elif metadata_updates_affect_sort_index(updates or {}):
-                touch_user_sort_index_dirty(user_id, [filename])
-            return entity
         except ResourceNotFoundError:
             # Deleted between our read and this write -- nothing left to retry.
             return None
         except Exception as exc:
             last_exc = exc
             time.sleep(0.05 * (2 ** attempt))
+            continue
+        # The source commit succeeded. Projection delivery must not replay the
+        # mutation or turn its acknowledgement into a failed source write.
+        # Durable mode retains the publication intent on the metadata row.
+        for delivery_attempt in range(3):
+            try:
+                _invalidate_metadata_scan_cache(user_id)
+                if storage_utils_module.DURABLE_INDEX_UPDATES:
+                    storage_utils_module.publish_metadata_index_intent(user_id, filename, entity)
+                elif metadata_updates_affect_search_indexes(current_updates or {}):
+                    touch_user_search_indexes_state(
+                        user_id, filenames=filename,
+                        touch_albums=storage_utils_module.metadata_updates_affect_album_covers(current_updates or {}),
+                    )
+                elif metadata_updates_affect_sort_index(current_updates or {}):
+                    touch_user_sort_index_dirty(user_id, [filename])
+                break
+            except Exception:
+                if delivery_attempt == 2:
+                    app.logger.warning('Metadata saved; index refresh pending for %s/%s', user_id, filename, exc_info=True)
+                else:
+                    time.sleep(0.05 * (2 ** delivery_attempt))
+        return entity
     if last_exc:
         app.logger.warning('Failed to update metadata entity %s/%s: %s', user_id, filename, last_exc)
     return None
@@ -3615,6 +3696,7 @@ def _enqueue_clustering_job(
     payload: Optional[Dict] = None,
     coalesce_on_conflict: bool = False,
 ) -> Dict[str, str]:
+    if job_type == 'people_cluster' and _library_cut_over_to_waves(user_id): return {'status': 'wave_owned'}
     if not force:
         existing_job_id = _has_active_clustering_job(user_id)
         if existing_job_id:
@@ -3705,6 +3787,7 @@ def _enqueue_incremental_assign_job(user_id: str, filenames: List[str]) -> Dict[
     request path. No jobId means the worker's own status/coalesced-rerun
     bookkeeping (which all key off a truthy job_id) is a no-op for these.
     """
+    if _library_cut_over_to_waves(user_id): return {'status': 'wave_owned'}
     if not filenames:
         return {'status': 'noop'}
     if clustering_queue_client is None:
@@ -4022,6 +4105,7 @@ def _recover_stranded_cluster_buffer_checkpoints() -> None:
 
 def _buffer_incremental_assign_filename(user_id: str, filename: str, face_count: int = 1) -> None:
     """Accumulate per-library photos until the face cap or oldest deadline."""
+    if _library_cut_over_to_waves(user_id): return
     processing_diagnostics.file_event('cluster_buffered', user_id, filename, role='vision')
     to_flush: Optional[List[str]] = None
     started_at = None
@@ -4268,17 +4352,33 @@ def _enqueue_processing_steps(
     if entity.get('processingIsolated') is True:
         return {step: {'status': 'skipped', 'reason': 'upload_only_benchmark'} for step in steps}
 
-    if force:
-        # Forced reprocessing is an explicit supersession, not an ordinary
-        # retry: it must allocate a fresh processing generation/contract
-        # (see processing_generation.py) so a stale in-flight result from
-        # the old generation is fenced out rather than silently accepted.
-        try:
-            entity = storage_utils_module.supersede_processing_generation(user_id, filename)
-        except Exception:
-            app.logger.exception('Forced reprocess could not allocate a new processing generation for %s/%s', user_id, filename)
-            return {step: {'status': 'error', 'reason': 'generation_allocation_failed'} for step in steps}
+    import processing_generation
+    if force and _library_cut_over_to_waves(user_id):
+        from wave_policy import require_capability
+        from upload_waves import ShadowWaves
+        require_capability(ShadowWaves(jobs_table_client,user_id),os.getenv('APP_ROLE','core'))
+    if force and processing_generation.enforcement_enabled():
+        # Partial forced reprocessing needs explicit carry-forward receipts.
+        # Reject it in enforced mode rather than reuse the old proof identity.
+        required = set(processing_generation.REQUIRED_STEPS)
+        if not required.issubset(steps):
+            return {step: {'status': 'error', 'reason': 'partial_force_requires_full_reprocess'} for step in steps}
+        if required and required.issubset(steps):
+            try:
+                if _library_cut_over_to_waves(user_id):
+                    entity = storage_utils_module.supersede_processing_generation(user_id, filename,record_supersession=True)
+                else:
+                    entity = storage_utils_module.supersede_processing_generation(user_id, filename)
+            except Exception:
+                app.logger.exception('Forced reprocess could not allocate a new processing generation for %s/%s', user_id, filename)
+                return {step: {'status': 'error', 'reason': 'generation_allocation_failed'} for step in steps}
 
+    if _library_cut_over_to_waves(user_id):
+        if force:
+            from wave_settlement import reconcile_supersession
+            from upload_waves import ShadowWaves
+            reconcile_supersession(ShadowWaves(jobs_table_client,user_id),metadata_table_client,entity)
+        return {step: {'status': 'wave_owned'} for step in steps}
     visibility_timeout = max(0, min(int(visibility_timeout or 0), 7 * 24 * 60 * 60))
     for step in steps:
         status_field = f'{step}_status'
@@ -4608,8 +4708,14 @@ def _face_passes_auto_store_quality(face: Dict, confidence: Optional[float] = No
     bbox = normalized or _normalize_face_bbox(face)
     if bbox.get('width', 0) <= 0 or bbox.get('height', 0) <= 0:
         return False
-    image_width = max(0, int(bbox.get('imageWidth', 0) or face.get('imageWidth', 0) or 0))
-    image_height = max(0, int(bbox.get('imageHeight', 0) or face.get('imageHeight', 0) or 0))
+    try:
+        image_width = max(0, int(bbox.get('imageWidth', 0) or face.get('imageWidth', 0) or 0))
+    except Exception:
+        image_width = 0
+    try:
+        image_height = max(0, int(bbox.get('imageHeight', 0) or face.get('imageHeight', 0) or 0))
+    except Exception:
+        image_height = 0
     if image_width <= 0 or image_height <= 0 or confidence_value >= FACE_LOW_CONFIDENCE_REJECT_BELOW:
         return True
     image_area = max(1, image_width * image_height)
@@ -4628,12 +4734,28 @@ def _face_payload_for_metadata(face_id: str, face: Dict) -> Dict:
             bbox = json.loads(bbox or '{}')
         except Exception:
             bbox = {}
+    # Callers build this payload in a list comprehension over every stored
+    # face for a photo/library -- a non-numeric field on one corrupted row
+    # must not raise, or it takes down the whole response instead of just
+    # that one face.
+    try:
+        face_image_width = int(face.get('imageWidth', 0) or 0)
+    except Exception:
+        face_image_width = 0
+    try:
+        face_image_height = int(face.get('imageHeight', 0) or 0)
+    except Exception:
+        face_image_height = 0
+    try:
+        face_confidence = float(face.get('confidence', 0.0) or 0.0)
+    except Exception:
+        face_confidence = 0.0
     payload = {
         'faceId': face_id,
         'bbox': bbox,
-        'imageWidth': int(face.get('imageWidth', 0) or 0),
-        'imageHeight': int(face.get('imageHeight', 0) or 0),
-        'confidence': float(face.get('confidence', 0.0) or 0.0),
+        'imageWidth': face_image_width,
+        'imageHeight': face_image_height,
+        'confidence': face_confidence,
     }
     if face.get('personId'):
         payload['personId'] = face.get('personId')
@@ -6140,6 +6262,11 @@ def _live_faiss_metadata_update(user_id: str, filename: str) -> None:
             'faceCount': len(rows), 'peopleIds': json.dumps(people_ids),
         })
     # Drop legacy/UI snapshots, without scheduling a giant representative build.
+    # FAISS persists through the inner SourceTable proxy, retaining old/new
+    # owners before writes. Replays also re-mark resulting owners here, so
+    # completion retries deliver the durable scheduling signal again.
+    import automatic_index_updates as automatic
+    automatic.people_completion(user_id, person_ids)
     _person_scan_cache.invalidate(user_id)
     _face_summary_scan_cache.invalidate(user_id)
     _people_embedding_index_cache.invalidate(user_id)
@@ -8374,14 +8501,28 @@ def _face_summary_for_person_list(face_id: str, face: Dict, user_id: str = '') -
             bbox_value = {}
     if not isinstance(bbox_value, dict):
         bbox_value = {}
+    # Same list-comprehension exposure as _face_payload_for_metadata above:
+    # one corrupted row must not take down the whole people-list response.
+    try:
+        face_image_width = int(face.get('imageWidth', 0) or 0)
+    except Exception:
+        face_image_width = 0
+    try:
+        face_image_height = int(face.get('imageHeight', 0) or 0)
+    except Exception:
+        face_image_height = 0
+    try:
+        face_confidence = float(face.get('confidence', 0.0) or 0.0)
+    except Exception:
+        face_confidence = 0.0
     return {
         'faceId': face_id,
         'filename': face.get('filename'),
         'thumbnailUrl': _face_thumbnail_url(str(face.get('filename') or ''), user_id),
         'bbox': bbox_value,
-        'imageWidth': int(face.get('imageWidth', 0) or 0),
-        'imageHeight': int(face.get('imageHeight', 0) or 0),
-        'confidence': float(face.get('confidence', 0.0) or 0.0),
+        'imageWidth': face_image_width,
+        'imageHeight': face_image_height,
+        'confidence': face_confidence,
         'reviewStatus': face.get('reviewStatus') or '',
         'suspiciousReason': face.get('suspiciousReason') or '',
     }
@@ -8714,7 +8855,7 @@ def _mark_album_dirty(entity: Dict) -> None:
     # reconcile_dirty_albums to pick up later, so this is best-effort.
     if partition_key:
         try:
-            if enqueue_index_build(partition_key, reason='album-mutation', scope='albums') == 'unavailable':
+            if dispatch_scoped_rebuild(partition_key, 'album-mutation', 'albums') == 'unavailable':
                 worker_logger.warning('Album index enqueue unavailable for %s; dirty row retained for recovery', partition_key)
         except Exception:
             worker_logger.warning('Album index enqueue failed for %s; dirty row retained for recovery', partition_key, exc_info=True)
@@ -9213,30 +9354,35 @@ class _TimelineSink:
 
 @catalog_publisher
 def _finalize_library_summaries(user_id: str, db) -> None:
-    """Explore (places/things) and the timeline, computed from the library's finished database --
-    a local pass over its rows, no table scan. Run after a chunked first build and after each
-    compaction."""
-    accumulator = ExploreAccumulator()
-    for row in db.iter_smart_rows():
-        accumulator.add(row)
-    summary = accumulator.finalize(user_id)
-    store_explore_summary(user_id, {
-        'sourceVersion': datetime.now(timezone.utc).isoformat(),
-        'updatedAt': datetime.now(timezone.utc).isoformat(),
-        'places': summary.get('places', []),
-        'things': summary.get('things', []),
-    })
-    store_timeline_summary(user_id, db.timeline_summary())
+    """Full-build finalization using indexed reduced-row Explore + SQL timeline.
+
+    iter_smart_rows-only test/full-builder adapters remain supported here, not
+    in incremental refresh. Real legacy DBs require explicit compaction first.
+    """
+    import summary_runtime
+    explore, timeline = summary_runtime.finalized_payloads(
+        db, user_id, accumulator_factory=ExploreAccumulator, allow_full_adapter=True)
+    store_explore_summary(user_id, explore)
+    store_timeline_summary(user_id, timeline)
 
 
+@catalog_publisher
 def _refresh_library_summaries(user_id: str) -> None:
+    """Post-successful-search-drain hook, including drains without compaction.
+
+    Maintenance owns serialization/retries. Never scan a missing legacy schema
+    here; surface failure so its dirty work is retained until compaction.
+    """
     import search_db
-    try:
-        db = search_db.open_database(user_id)
-        if db is not None:
-            _finalize_library_summaries(user_id, db)
-    except Exception:
-        worker_logger.exception('Library summaries refresh failed for %s', user_id)
+    import summary_runtime
+    db = search_db.open_database(user_id)
+    if db is None:
+        raise RuntimeError('search database unavailable for summary refresh')
+    explore, timeline = summary_runtime.finalized_payloads(
+        db, user_id, accumulator_factory=ExploreAccumulator)
+    summary_runtime.publish_indexed_payloads(
+        user_id, explore, timeline, store_explore=store_explore_summary, store_timeline=store_timeline_summary,
+        load_explore=load_explore_summary, load_timeline=load_timeline_summary)
 
 
 @catalog_publisher
@@ -9246,13 +9392,14 @@ def _streaming_lexical_build(user_id: str, source_version: Optional[str] = None)
     SQLite search database, the Explore summary and the timeline summary (see
     storage_utils.stream_library_artifacts). Memory stays flat in library size."""
     import search_db
+    import summary_runtime
 
     def _factory(version: str, workdir: str):
         return [
             ListingSink(user_id, version, workdir),
             search_db.SearchDbSink(user_id, version, workdir),
-            _ExploreSink(user_id, version),
-            _TimelineSink(user_id),
+            summary_runtime.RawExploreSink(user_id, version, ExploreAccumulator(), store_explore_summary),
+            summary_runtime.RawTimelineSink(user_id, version, TimelineAccumulator(), store_timeline_summary),
         ]
     return stream_library_artifacts(user_id, source_version, _factory)
 
@@ -9267,8 +9414,9 @@ def _request_scoped_index_build(user_id: str, kind: Optional[str] = None):
 
 
 storage_utils_module.INDEX_BUILD_REQUEST_HOOK = _request_scoped_index_build
-storage_utils_module.METADATA_INDEX_REQUEST_HOOK = lambda user_id, scope: enqueue_index_build(
-    user_id, reason='metadata-change', scope=scope)
+storage_utils_module.METADATA_INDEX_REQUEST_HOOK = lambda user_id, scope: dispatch_scoped_rebuild(
+    user_id, 'metadata-change', scope)
+storage_utils_module.PEOPLE_EMBEDDING_MODEL_VERSION_HOOK = lambda: FACE_CLUSTER_EMBEDDING_VERSION
 
 
 SUGGESTION_UNNAMED_FACE_THRESHOLD = int(os.getenv('SUGGESTION_UNNAMED_FACE_THRESHOLD', '10'))
@@ -9786,11 +9934,16 @@ def _cleanup_row_batches(rows, size=100):
         yield batch
 
 
-def _cleanup_delete_row(client, row) -> None:
+def _cleanup_delete_row(client, row, *, quiesced_check=None) -> None:
     """Retry idempotent deletes; do not report a successful incomplete wipe."""
     for attempt in range(3):
         try:
-            client.delete_entity(partition_key=row['PartitionKey'], row_key=row['RowKey'])
+            if quiesced_check is None:
+                client.delete_entity(partition_key=row['PartitionKey'], row_key=row['RowKey'])
+            else:
+                from automatic_index_updates import quiesced_source_cleanup
+                with quiesced_source_cleanup(row['PartitionKey'], quiesced_check):
+                    client.delete_entity(partition_key=row['PartitionKey'], row_key=row['RowKey'])
             return
         except ResourceNotFoundError:
             return
@@ -9809,6 +9962,19 @@ def _cleanup_library_shadow_rows(library_id: str) -> None:
     """
     pk = _escape_odata(library_id)
     try:
+        if filename_owners_table_client is not None:
+            # Ownership partitions are filenames, with library IDs as RowKey.
+            # Cleanup-only streamed scan also catches orphaned metadata names;
+            # never use a library PartitionKey or remove another owner's row.
+            from automatic_index_updates import current_cleanup_check
+            check = current_cleanup_check(library_id)
+            for row in filename_owners_table_client.query_entities(
+                    f"RowKey eq '{pk}'", select=['PartitionKey', 'RowKey']):
+                if check is not None:
+                    check()
+                _cleanup_delete_row(filename_owners_table_client, row)
+                if check is not None:
+                    check()
         if face_by_filename_table_client is not None:
             for row in face_by_filename_table_client.query_entities(
                     f"PartitionKey eq '{pk}'", select=['PartitionKey', 'RowKey']):
@@ -9829,6 +9995,8 @@ def _cleanup_library_shadow_rows(library_id: str) -> None:
         raise
 
 
+@serialize_catalog
+@quiesced_cleanup
 def _purge_library_data(library_id: str) -> None:
     """Best-effort delete of every data row in a library's partition across the
     photo tables. Image/thumbnail blobs are content-addressed (and may be shared
@@ -9836,10 +10004,15 @@ def _purge_library_data(library_id: str) -> None:
 
     The image_names table is included so no anonymous_id -> original_filename
     mapping (which still holds the plaintext filename) outlives the library."""
+    import processing_cleanup
+    if storage_utils_module.DURABLE_INDEX_UPDATES:
+        _require_quiesced_index_purge(library_id)
+    processing_cleanup.begin_library_cleanup(jobs_table_client,metadata_table_client,library_id)
     pk = _escape_odata(library_id)
     _cleanup_library_shadow_rows(library_id)
     for client in (metadata_table_client, face_table_client, person_table_client,
-                   albums_table_client, merge_table_client, image_names_table_client):
+                   albums_table_client, merge_table_client, image_names_table_client,
+                   hash_index_table_client, embeddings_table_client):
         if client is None:
             continue
         try:
@@ -9847,10 +10020,17 @@ def _purge_library_data(library_id: str) -> None:
                 _cleanup_delete_row(client, row)
         except Exception as exc:
             app.logger.warning('Purge skipped a table for %s: %s', library_id, exc)
+            if storage_utils_module.DURABLE_INDEX_UPDATES or _library_cut_over_to_waves(library_id):
+                raise
     try:
         invalidate_image_names_cache(library_id)
     except Exception:
         pass
+
+    processing_cleanup.collect_library_artifacts(jobs_table_client,storage_utils_module,metadata_table_client,library_id,purge=True)
+    if storage_utils_module.DURABLE_INDEX_UPDATES:
+        quiesced_user_index_artifact_purge(library_id)
+    processing_cleanup.finish_library_cleanup(jobs_table_client,library_id,purged=True)
 
 
 # ---------------------------------------------------------------------------
@@ -10102,11 +10282,37 @@ def _library_cleanup_block_reason(library_id: str) -> Optional[str]:
     return 'Cleanup is still running for this library. Please wait until it finishes before uploading.'
 
 
+@serialize_catalog
+def _require_quiesced_index_purge(library_id):
+    from index_artifact_cleanup import artifact_catalog_serialization
+    import automatic_index_updates as automatic
+    with artifact_catalog_serialization(library_id, storage=storage_utils_module) as guard:
+        automatic.quiescence_check(library_id, guard=guard)()
+
+
+@serialize_catalog
+def quiesced_user_index_artifact_purge(library_id):
+    from index_artifact_cleanup import artifact_catalog_serialization, purge_quiesced_library_artifacts
+    import automatic_index_updates as automatic
+    with artifact_catalog_serialization(library_id, storage=storage_utils_module) as guard:
+        check = automatic.quiescence_check(library_id, guard=guard)
+        return purge_quiesced_library_artifacts(storage_utils_module, jobs_table_client,
+                                               library_id, quiesced_check=check)
+
+
+@serialize_catalog
+@quiesced_cleanup
 def _execute_library_clean(library_id: str) -> Dict:
     """Delete every photo/video and its derived data for a library. Runs on the
     queue-scaled worker (see _enqueue_library_clean_job) since it walks the
     library's full metadata partition, mirroring the existing clustering jobs'
     "don't do full scans inline" rule."""
+    import processing_cleanup
+    if storage_utils_module.DURABLE_INDEX_UPDATES:
+        _require_quiesced_index_purge(library_id)
+    from automatic_index_updates import current_cleanup_check
+    quiesced_check = current_cleanup_check(library_id)
+    processing_cleanup.begin_library_cleanup(jobs_table_client,metadata_table_client,library_id)
     pk = _escape_odata(library_id)
     try:
         # _clean_one_photo below only reads RowKey/anonymousImageId per row --
@@ -10211,7 +10417,7 @@ def _execute_library_clean(library_id: str) -> Dict:
                 blob_name = str(row.get('payloadBlobName') or '')
                 if blob_name:
                     _delete_blob_if_present(BLOB_MERGE_PAYLOADS_CONTAINER, blob_name)
-            _cleanup_delete_row(client, row)
+            _cleanup_delete_row(client, row, quiesced_check=quiesced_check)
 
         with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
             for _ in _bounded_io_map(executor, _delete_row, rows_to_delete):
@@ -10225,12 +10431,17 @@ def _execute_library_clean(library_id: str) -> Dict:
     delete_user_vector_index_data(library_id)
     delete_user_lexical_index_data(library_id)
     delete_user_tag_embedding_index_data(library_id)
+    storage_utils_module.delete_user_people_embedding_index_data(library_id)
     delete_user_sort_index_data(library_id)
     delete_user_access_index_data(library_id)
     delete_user_albums_index_data(library_id)
     delete_user_people_index_data(library_id)
     _invalidate_metadata_scan_cache(library_id)
 
+    processing_cleanup.collect_library_artifacts(jobs_table_client,storage_utils_module,metadata_table_client,library_id)
+    if storage_utils_module.DURABLE_INDEX_UPDATES:
+        quiesced_user_index_artifact_purge(library_id)
+    processing_cleanup.finish_library_cleanup(jobs_table_client,library_id)
     return {'photosDeleted': photos_deleted, 'blobsDeleted': blobs_deleted, 'blobErrors': blob_errors}
 
 
@@ -10729,6 +10940,8 @@ INDEX_BUILD_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_MIN_INTERVAL_SEC
 INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS = float(os.getenv('INDEX_BUILD_PEOPLE_MIN_INTERVAL_SECONDS', '180'))
 # Index bugs must not inherit the destructive library-clean retry budget.
 INDEX_BUILD_MAX_RETRIES = max(1, int(os.getenv('INDEX_BUILD_MAX_RETRIES', '5')))
+# Longer than scale-down cooldown; completion signals resume wave waits early.
+INDEX_BARRIER_RECOVERY_SECONDS = max(300, int(os.getenv('INDEX_BARRIER_RECOVERY_SECONDS', '300')))
 # Safety ceiling for progressive search-database maintenance. Each pass must
 # either publish dirty rows or compact a non-empty delta log; reaching this
 # limit means forward progress is not converging and should be queue-retried.
@@ -10794,17 +11007,62 @@ def light_index_build_needed(user_id: str) -> bool:
     return bool(_load_sort_index_manifest(key).get('dirty')) or access_index_is_dirty(key)
 
 
-def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, coalesce: bool = True) -> str:
+def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, coalesce: bool = True,
+                         capture: Optional[list] = None, delay_override: Optional[int] = None) -> str:
     """Persist scoped work for index-worker; missing configuration fails closed.
 
     Returns 'queued', 'already_active' or 'unavailable'. Library-ops and cluster
     are never a fallback for failed/missing index queue publication.
+
+    capture: optional mutable list the caller passes in to receive the sent
+    QueueMessage (id/pop_receipt) when a NEW message is actually sent this
+    call -- used by inline_index_merge.py to cancel a now-redundant wakeup
+    after an inline merge succeeds. Left untouched (stays empty) when the
+    call coalesces into an already-pending intent ('already_active') or
+    fails, since there's no new message to cancel in that case.
+
+    delay_override: when set, replaces the normally-computed coalescing
+    delay outright (still floored at >=1s) -- used by inline-attempting CRUD
+    sites to give their inline attempt a longer head start before the
+    durable backstop message would become visible.
     """
+    from wave_policy import source_change_active
+    if (source_change_active() or reason.startswith(('upload', 'ipwork', 'post-finalize'))) and _library_cut_over_to_waves(user_id):
+        return 'wave_owned'
     key = str(user_id or '').strip()
     if not key:
         return 'unavailable'
     import index_updates
+    if _library_cut_over_to_waves(user_id) and reason in index_updates.READ_REASONS:
+        from upload_waves import ShadowWaves
+        waves=ShadowWaves(jobs_table_client,user_id)
+        control=waves._get('control')
+        tail=waves._get(waves.wave_key(control['tailWaveId'])) if control and control.get('tailWaveId') else None
+        if tail and tail['state'] not in ('complete','cancelled'):return 'wave_owned'
     scope = index_updates.validate_scope(scope)
+    if INDEX_MAINTENANCE_QUEUE_NAME and scope == 'tag_embedding':
+        # A model-only outbox wakes the EXISTING vision queue, never index-worker
+        # and never a fabricated photo job. Persist before attempting publication.
+        import automatic_index_updates as automatic
+        import index_work
+        if jobs_table_client is None:
+            return 'unavailable'
+        try:
+            store = index_work.WorkStore(jobs_table_client, partition=automatic.TAG_PARTITION)
+            delay = 2 if coalesce and reason not in index_updates.READ_REASONS else 0
+            if delay_override is not None:
+                delay = max(1, int(delay_override))
+            token = store.request(key, scope, advance=reason not in index_updates.READ_REASONS, delay=delay)
+            sent = store.notify(token, lambda library, kind, revision, wait: _send_tag_index_wakeup(
+                library, kind, revision, wait, reason=reason, capture=capture))
+            if not sent:
+                current = store._get(token)
+                if ipwork_queue_client is None or (current and current.get('failed')):
+                    return 'unavailable'
+            return 'queued' if sent else 'already_active'
+        except Exception:
+            worker_logger.exception('Tag maintenance intent unavailable for %s', key)
+            return 'unavailable'
     if INDEX_MAINTENANCE_QUEUE_NAME:
         if index_maintenance_queue_client is None or jobs_table_client is None:
             return 'unavailable'
@@ -10813,9 +11071,23 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, 
         try:
             delay = (max(1, int(UPLOAD_ACTIVITY_WINDOW_SECONDS)) if scope == 'dedup-idle'
                      else (2 if coalesce and reason not in index_updates.READ_REASONS else 0))
-            token = store.request(key, scope, advance=reason not in index_updates.READ_REASONS, delay=delay)
+            if delay_override is not None:
+                delay = max(1, int(delay_override))
+            # Search dirty rows are the source of truth for repeated metadata
+            # changes. Do not rewrite the same maintenance revision for every
+            # processing-status callback; an existing wakeup already covers it.
+            # However, while actively leased by a running worker, newer edits must
+            # advance the revision so the worker's finish() does not delete the row.
+            advance = reason not in index_updates.READ_REASONS
+            if scope == 'search' and reason == 'metadata-change':
+                current = store._get(store.key(key, scope))
+                advance = bool(current and float(current.get('leaseUntil') or 0) > store.clock())
+            # Inline's backstop visibility is not a work embargo: core may
+            # claim immediately. An existing barrier retry still wins in request.
+            inline_delay = delay if capture is not None else 0
+            token = store.request(key, scope, advance=advance, delay=0 if inline_delay else delay)
             sent = store.notify(token, lambda library, kind, revision, wait: _send_index_wakeup(
-                library, kind, revision, wait, reason=reason))
+                library, kind, revision, wait, reason=reason, capture=capture), minimum_delay=inline_delay)
             if not sent and reason in index_updates.READ_REASONS:
                 current = store._get(token)
                 if current and current.get('failed'):
@@ -10828,49 +11100,406 @@ def enqueue_index_build(user_id: str, reason: str = '', scope: str = 'full', *, 
     return 'unavailable'
 
 
-def _send_index_wakeup(library, scope, revision, delay=0, *, reason='pending-recovery'):
+def dispatch_scoped_rebuild(user_id: str, reason: str, scope: str, *, coalesce: bool = True) -> str:
+    """enqueue_index_build, plus a best-effort inline attempt in `core` for
+    the bounded lexical scopes (see inline_index_merge.py). The durable
+    queue call below is unchanged and always happens first; inline only
+    ever cancels the resulting message on success, it never replaces it.
+    Safe to call from any role/scope -- inline_index_merge.submit() is a
+    no-op everywhere this doesn't apply.
+
+    The longer delay_override is only applied when the local queue actually
+    has room to accept the attempt (has_capacity(), a cheap in-process
+    check) -- otherwise every bounded-scope mutation would have its durable
+    backstop message's visibility stretched from ~2s to
+    BACKSTOP_DELAY_SECONDS even when inline was never going to be attempted
+    at all. Live-state eligibility (dirty-set size, schema/version match)
+    is still only knowable inside _attempt, after submission, since that
+    needs I/O this cheap pre-check deliberately avoids -- so a longer delay
+    can still be paid on an attempt that later turns out ineligible; this
+    only closes the no-chance-of-attempting-at-all case."""
+    import index_updates
+    import inline_index_merge
+    attempt_inline = (scope in index_updates.INLINE_MERGE_SCOPES
+                       and inline_index_merge.enabled() and inline_index_merge.has_capacity())
+    capture = [] if attempt_inline else None
+    status = enqueue_index_build(
+        user_id, reason=reason, scope=scope, coalesce=coalesce, capture=capture,
+        delay_override=inline_index_merge.BACKSTOP_DELAY_SECONDS if attempt_inline else None)
+    if attempt_inline and status == 'queued':
+        inline_index_merge.submit(user_id, scope, capture=capture)
+    return status
+
+
+def _send_index_wakeup(library, scope, revision, delay=0, *, reason='pending-recovery', capture=None):
     import index_work
-    queue = index_maintenance_queue_client
+    # Delayed (coalescing / dedup-idle / WorkStore retry-backoff) wakeups are
+    # invisible-by-design -- route them off the main queue so KEDA's 'all'
+    # strategy there doesn't treat a scheduled-but-not-due retry as live work
+    # (see INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME).
+    queue = index_maintenance_deferred_queue_client if delay else index_maintenance_queue_client
     if queue is None:
         raise RuntimeError('Index maintenance queue unavailable')
     job = _index_build_job_id(library) + (f'-{scope}' if scope != 'full' else '')
     # Publish queued status first: a fast consumer must not have its terminal
     # status overwritten by the producer after receiving the wakeup.
     _upsert_job_status(job, library, INDEX_BUILD_JOB_TYPE, 'queued', indexScope=scope)
-    queue.send_message(json.dumps({
+    sent = queue.send_message(json.dumps({
         'type': INDEX_BUILD_JOB_TYPE, 'userId': library, 'jobId': job,
         'scope': scope, 'reason': reason,
         'maintenanceKey': index_work.WorkStore.key(library, scope), 'intentRevision': revision,
+        'operationId': f'{library}:{scope}:{revision}',
     }), visibility_timeout=delay or None)
+    if capture is not None:
+        capture.append((queue, sent))
+    if isinstance(getattr(sent, 'id', None), str) and isinstance(getattr(sent, 'pop_receipt', None), str):
+        return index_work.QueueWakeup(
+            INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME if delay else INDEX_MAINTENANCE_QUEUE_NAME,
+            sent.id, sent.pop_receipt, _cancel_index_wakeup)
+
+
+def _cancel_index_wakeup(receipt):
+    from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
+    queues = {
+        INDEX_MAINTENANCE_QUEUE_NAME: index_maintenance_queue_client,
+        INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME: index_maintenance_deferred_queue_client,
+    }
+    queue = queues.get(receipt.get('queueName'))
+    if queue is None:
+        raise ValueError('Index wake cancellation requires its configured queue')
+    try:
+        queue.delete_message(receipt['messageId'], receipt['popReceipt'])
+    except ResourceNotFoundError:
+        pass
+    except HttpResponseError as error:
+        # A consumer rotates the pop receipt on receive/renewal. Its in-flight
+        # message must remain untouched; it no longer represents a future wake.
+        if getattr(error, 'error_code', None) != 'PopReceiptMismatch':
+            raise
+
+
+_INDEX_ARTIFACT_RECOVERY = threading.local()
+
+
+TAG_INDEX_MAINTENANCE_TYPE = 'tag_index_maintenance'
+
+
+def _tag_index_payload(library, revision):
+    import automatic_index_updates as automatic
+    import index_work
+    return {
+        'type': TAG_INDEX_MAINTENANCE_TYPE, 'protocolVersion': 1,
+        'userId': library, 'scope': 'tag_embedding',
+        'jobId': _index_build_job_id(library) + '-tag_embedding',
+        'maintenancePartition': automatic.TAG_PARTITION,
+        'maintenanceKey': index_work.WorkStore.key(library, 'tag_embedding'),
+        'intentRevision': revision,
+        'operationId': f'{library}:tag_embedding:{revision}',
+    }
+
+
+def _send_tag_index_wakeup(library, scope, revision, delay=0, *, reason='pending-recovery', capture=None):
+    import index_work
+    if scope != 'tag_embedding':
+        raise ValueError('Vision maintenance only accepts tag_embedding')
+    queue = ipwork_deferred_queue_client if delay else ipwork_queue_client
+    if queue is None:
+        raise RuntimeError('Vision queue unavailable')
+    payload = _tag_index_payload(library, revision)
+    payload['reason'] = reason
+    _upsert_job_status(payload['jobId'], library, INDEX_BUILD_JOB_TYPE, 'queued', indexScope=scope)
+    sent = queue.send_message(json.dumps(payload), visibility_timeout=delay or None)
+    if capture is not None:
+        capture.append((queue, sent))
+    if isinstance(getattr(sent, 'id', None), str) and isinstance(getattr(sent, 'pop_receipt', None), str):
+        return index_work.QueueWakeup(
+            IPWORKER_DEFERRED_QUEUE_NAME if delay else IPWORKER_QUEUE_NAME,
+            sent.id, sent.pop_receipt, _cancel_tag_index_wakeup)
+
+
+def _cancel_tag_index_wakeup(receipt):
+    from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
+    queues = {IPWORKER_QUEUE_NAME: ipwork_queue_client,
+              IPWORKER_DEFERRED_QUEUE_NAME: ipwork_deferred_queue_client}
+    queue = queues.get(receipt.get('queueName'))
+    if queue is None:
+        raise ValueError('Tag wake cancellation requires its configured queue')
+    try:
+        queue.delete_message(receipt['messageId'], receipt['popReceipt'])
+    except ResourceNotFoundError:
+        pass
+    except HttpResponseError as error:
+        if getattr(error, 'error_code', None) != 'PopReceiptMismatch':
+            raise
+
+
+def _promote_deferred_ipwork(queue):
+    """Move one due wake to the all-message queue before acknowledging it.
+
+    Processing on the visible-only deferred queue would hide active work from
+    its scaler. Transfer failure leaves the original delivery for retry.
+    """
+    deferred = ipwork_deferred_queue_client
+    if deferred is None:
+        return False
+    for message in deferred.receive_messages(messages_per_page=1, max_messages=1,
+            visibility_timeout=IPWORKER_VISIBILITY_TIMEOUT_SECONDS):
+        queue.send_message(message.content)
+        deferred.delete_message(message)
+        return True
+    return False
 
 
 def recover_pending_index_work(library=None, *, retry_failed=False):
+    from bisect import insort
     import index_work
-    if jobs_table_client is None or index_maintenance_queue_client is None:
+    if jobs_table_client is None or (index_maintenance_queue_client is None and ipwork_queue_client is None):
         return 0
+    # Only the worker's unscoped periodic sweep may discover GC work. Reuse
+    # the existing controls scan, not a metadata scan or another WorkStore scope.
+    gc_limit = 0
+    gc_enabled = library is None and index_maintenance_queue_client is not None
+    if gc_enabled and os.getenv('APP_ROLE', 'core').strip().lower() == 'index-worker':
+        try:
+            gc_limit = max(0, min(1000, int(os.getenv('INDEX_ARTIFACT_CLEANUP_LIBRARIES_PER_RECOVERY', '25'))))
+        except ValueError:
+            worker_logger.warning('Invalid INDEX_ARTIFACT_CLEANUP_LIBRARIES_PER_RECOVERY; using 25')
+            gc_limit = 25
+    cursor = getattr(_INDEX_ARTIFACT_RECOVERY, 'cursor', '')
+    after, before = [], []
     store = index_work.WorkStore(jobs_table_client)
+    import automatic_index_updates as automatic
+    tags = index_work.WorkStore(jobs_table_client, partition=automatic.TAG_PARTITION)
     if retry_failed:
         # Explicit user repair only; poison jobs never restart on a polling read.
-        query = f"PartitionKey eq '{index_work.PARTITION}' and libraryId eq '{_escape_odata(library)}'"
-        for row in jobs_table_client.query_entities(query):
-            if row.get('failed'):
-                store.request(row['libraryId'], row['scope'])
-    return store.recover(_send_index_wakeup, library=library)
+        for target in (store, tags):
+            query = f"PartitionKey eq '{target.partition}' and libraryId eq '{_escape_odata(library)}'"
+            for row in jobs_table_client.query_entities(query):
+                if row.get('failed') and (target is store or row.get('scope') == 'tag_embedding'):
+                    target.request(row['libraryId'], row['scope'])
+    # Source coverage survives a failed post-write scheduler call. Do not
+    # restart poison work automatically: request(advance=False) preserves it.
+    if search_index_dirty_table_client is not None:
+        query = "RowKey eq '!coverage'"
+        if library:
+            query += f" and libraryId eq '{_escape_odata(library)}'"
+        for row in search_index_dirty_table_client.query_entities(query):
+            user, kind = row.get('libraryId'), row.get('kind')
+            # A malformed/cross-library control must not schedule either work
+            # or cleanup for a library named only by its untrusted payload.
+            if (not isinstance(user, str) or not user or user != user.strip()
+                    or kind not in automatic.KINDS
+                    or row.get('RowKey') != automatic.CONTROL
+                    or row.get('PartitionKey') != automatic.partition(user, kind)
+                    or (library is not None and user != library)
+                    or type(row.get('coverageVersion')) is not int
+                    or row['coverageVersion'] != automatic.VERSION):
+                continue
+            if gc_limit:
+                # Any canonical family control can nominate its library. GC
+                # independently certifies each output under the shared lock;
+                # missing/unready hash coverage must not hide other families.
+                # Stable library key + bounded-window dedup keeps one slot per
+                # library without an unbounded all-library identity set.
+                item = (automatic.partition(user, 'hash'), user)
+                window = after if item[0] > cursor else before
+                if item not in window:
+                    insort(window, item)
+                    if len(window) > gc_limit:
+                        window.pop()
+            if row.get('coveredRevision') == row.get('revision'):
+                continue
+            if automatic.wave_pending(user):
+                continue
+            if kind == 'vector' and not automatic.VECTOR_INDEX_AUTOMATIC:
+                continue
+            target = tags if kind == 'tag_embedding' else store
+            target.request(user, automatic.SCOPES.get(kind, kind), advance=False)
+    recovered = store.recover(_send_index_wakeup, library=library) if index_maintenance_queue_client is not None else 0
+    # Recovery publishes only: index-worker must never claim/model-load tag jobs.
+    recovered += tags.recover(_send_tag_index_wakeup, library=library)
+    # Publish pending wakeups first. Even a failing/deferred cleanup consumes
+    # its rotation slot so busy/broken first libraries cannot starve later ones.
+    for key, user in (after + before)[:gc_limit]:
+        _INDEX_ARTIFACT_RECOVERY.cursor = key
+        try:
+            _cleanup_completed_index_artifacts(user)
+        except Exception:
+            worker_logger.warning('Periodic index artifact cleanup failed for %s', user, exc_info=True)
+    return recovered
+
+
+def _run_tag_index_maintenance_payload(payload):
+    """One exact-library vision job. Queue delivery counts aren't failure counts."""
+    import automatic_index_updates as automatic
+    import index_work
+    from clustering_lease import RetryableLibraryLeaseError
+    import index_publication
+    library = payload.get('userId')
+    revision = payload.get('intentRevision')
+    if (not isinstance(library, str) or not library or library != library.strip()
+            or not isinstance(revision, str) or not revision
+            or type(payload.get('protocolVersion')) is not int or payload['protocolVersion'] != 1
+            or any(payload.get(field) != value for field, value in _tag_index_payload(library, revision).items())
+            or any(field in payload for field in ('filename', 'steps', 'user_id', 'correlationId'))):
+        return 'tag_index_invalid'
+    # Wrong-role consumption must not erase valid model work or alter job status.
+    if (os.getenv('APP_ROLE', '').strip().lower() != 'vision'
+            or jobs_table_client is None or not INDEX_MAINTENANCE_QUEUE_NAME
+            or not vision_utils.image_encoder_available()):
+        return 'tag_index_retry'
+    store = index_work.WorkStore(jobs_table_client, partition=automatic.TAG_PARTITION)
+    key = payload['maintenanceKey']
+    claim = None
+    try:
+        current = store._get(key)
+        if current is None:
+            return 'tag_index_noop'
+        if current.get('libraryId') != library or current.get('scope') != 'tag_embedding':
+            return 'tag_index_invalid'
+        if current.get('failed'):
+            return 'tag_index_failed'
+        if float(current.get('notBefore') or 0) > store.clock():
+            # Coalesce early duplicates into one reserved delayed wake before
+            # ACKing them. A failed send falls through to receipt retention.
+            store.notify(key, _send_tag_index_wakeup)
+            return 'tag_index_noop'
+        # An old wake intentionally claims the latest revision of this SAME job.
+        try:
+            claim = store.claim(key)
+        except index_work.WorkLeased:
+            # The live owner or lease-expiry recovery covers this duplicate.
+            return 'tag_index_noop'
+        if claim is None:
+            return 'tag_index_noop'
+        exhausted = False
+        def check_sources():
+            automatic.check_source_admission(library)
+            if automatic.wave_pending(library):
+                raise automatic.SourceBusy('Active upload wave')
+            control = automatic.configured_store().control(library, 'tag_embedding')
+            if control and control.get('active'):
+                raise automatic.SourceBusy('Active tag source reservation')
+        with index_publication.publication(store, claim):
+            # A known wave barrier must not acquire/wait for the catalog lease.
+            check_sources()
+            with index_publication.catalog_serialization(None, library,
+                    storage_utils_module._CTX.get('blob_service_client'),
+                    storage_utils_module._lexical_index_container_name(), require_real=True):
+                # Check source barriers BEFORE the poison ceiling. A pre-write
+                # wake may spend arbitrarily many queue deliveries waiting here.
+                check_sources()  # Recheck after acquiring the real write fence.
+                if claim.attempt > INDEX_BUILD_MAX_RETRIES:
+                    if queue_service_client is None or not INDEX_MAINTENANCE_DEADLETTER_QUEUE_NAME:
+                        raise RuntimeError('Tag maintenance deadletter queue unavailable')
+                    queue_service_client.get_queue_client(INDEX_MAINTENANCE_DEADLETTER_QUEUE_NAME).send_message(
+                        json.dumps({'originalPayload': payload, 'reason': 'Tag maintenance attempts exhausted',
+                                    'intentRevision': claim.revision, 'attempts': claim.attempt - 1}))
+                    exhausted = True
+                else:
+                    _run_index_build_job(library, payload['jobId'], 'tag_embedding')
+        # Stop renewers/check ownership before releasing or deleting the intent.
+        newer = store.finish(claim, failed=exhausted, cancel_wakeup=_cancel_tag_index_wakeup)
+        claim = None
+        if newer:
+            store.notify(key, _send_tag_index_wakeup)
+        if exhausted:
+            if not newer:
+                _upsert_job_status(payload['jobId'], library, INDEX_BUILD_JOB_TYPE, 'failed',
+                    indexScope='tag_embedding', error='Tag maintenance attempts exhausted')
+            return 'tag_index_failed'
+        _notify_index_ready(library, payload['jobId'], 'tag_embedding')
+        return 'tag_index_done'
+    except (automatic.SourceBusy, RetryableLibraryLeaseError):
+        if claim is not None:
+            waiting_wave = automatic.wave_pending(library)
+            if waiting_wave:
+                store.release(claim, deferred=True, retry_reason='wave_wait')
+                if not automatic.wave_pending(library):
+                    resume_index_maintenance_after_wave(library)
+                return 'tag_index_deferred'
+            delay = INDEX_BARRIER_RECOVERY_SECONDS
+            store.release(claim, deferred=True, retry_delay=delay, retry_reason='barrier_wait')
+        try:
+            sent = store.notify(key, _send_tag_index_wakeup)
+            if not sent:
+                current = store._get(key)
+                if current and (float(current.get('wakeUntil') or 0) > store.clock() or current.get('wakeReceipt')):
+                    return 'tag_index_deferred'
+                return 'tag_index_retry'
+        except Exception:
+            worker_logger.warning('Tag barrier wakeup retained for recovery', exc_info=True)
+            return 'tag_index_retry'  # Keep this receipt if replacement failed.
+        return 'tag_index_deferred'  # ACK only after the delayed wake is durable.
+    except Exception:
+        if claim is not None:
+            try:
+                store.release(claim, retry_delay=30)
+            except Exception:
+                worker_logger.warning('Tag maintenance release failed', exc_info=True)
+        worker_logger.exception('Tag maintenance failed; durable intent and queue receipt retained')
+        return 'tag_index_retry'
+
+
+def resume_index_maintenance_after_wave(library):
+    """Deliver wave-waiting maintenance; failures retain the parent wave message."""
+    import automatic_index_updates as automatic
+    import index_work
+    import index_updates
+    if jobs_table_client is None or index_maintenance_queue_client is None:
+        raise RuntimeError('Wave maintenance handoff storage/queue unavailable')
+    if automatic.wave_pending(library):
+        # The unfinished tail wave owns the eventual maintenance handoff.
+        return 0
+    store = index_work.WorkStore(jobs_table_client)
+    resumed = store.resume_wave_waits(library, _send_index_wakeup,
+        scopes=set(index_updates.SCOPE_KINDS) - {'tag_embedding'})
+    tags = index_work.WorkStore(jobs_table_client, partition=automatic.TAG_PARTITION)
+    resumed += tags.resume_wave_waits(library, _send_tag_index_wakeup, scopes={'tag_embedding'})
+    return resumed + recover_pending_index_work(library)
 
 
 def _run_index_maintenance_payload(payload):
     import index_work
+    from clustering_lease import RetryableLibraryLeaseError
     import index_publication
+    import automatic_index_updates as automatic
     store = index_work.WorkStore(jobs_table_client)
     library, scope = str(payload['userId']), str(payload['scope'])
     key = index_work.WorkStore.key(library, scope)
     if payload.get('maintenanceKey') != key:
         raise ValueError('Maintenance identity mismatch')
-    claim = store.claim(key)
+    try:
+        claim = store.claim(key)
+    except index_work.WorkLeased:
+        return 'obsolete'  # The live owner or lease recovery covers this wake.
     if claim is None:
-        return
+        # An early/stale receipt can be ACKed. Reserve at most one delayed
+        # replacement; failed sends remain durable for periodic recovery.
+        current = store._get(key)
+        if current and current.get('retryReason') == 'wave_wait':
+            return 'obsolete'
+        try:
+            sent = store.notify(key, _send_index_wakeup)
+            if not sent:
+                if current and not current.get('failed') and float(current.get('notBefore') or 0) > store.clock():
+                    return 'retry'
+        except Exception:
+            worker_logger.warning('Maintenance wakeup retained for recovery', exc_info=True)
+            return 'retry'
+        return 'obsolete'
     try:
         if claim.attempt > INDEX_BUILD_MAX_RETRIES:
+            if scope in ('vector', 'lexical_artifact', 'people_embedding', 'dedup', 'dedup-idle'):
+                # Like Vision's tag dispatcher, never poison a source barrier
+                # even if earlier real failures used the entire retry budget.
+                automatic.check_source_admission(library)
+                if automatic.wave_pending(library):
+                    raise automatic.SourceBusy('Active upload wave')
+                kind = 'hash' if scope in ('dedup', 'dedup-idle') else scope
+                control = automatic.configured_store().control(library, kind)
+                if control and control.get('active'):
+                    raise automatic.SourceBusy('Active source reservation')
             deadletter = queue_service_client.get_queue_client(INDEX_MAINTENANCE_DEADLETTER_QUEUE_NAME)
             deadletter.send_message(json.dumps({
                 'originalPayload': payload, 'reason': 'Index maintenance attempts exhausted',
@@ -10884,7 +11513,29 @@ def _run_index_maintenance_payload(payload):
             return
         with index_publication.publication(store, claim):
             _run_index_build_job(library, str(payload['jobId']), scope)
-        newer = store.finish(claim)
+        newer = store.finish(claim, cancel_wakeup=_cancel_index_wakeup)
+    except (automatic.SourceBusy, RetryableLibraryLeaseError):
+        # A healthy source barrier wait does not consume the poison budget.
+        waiting_wave = automatic.wave_pending(library)
+        if waiting_wave:
+            store.release(claim, deferred=True, retry_reason='wave_wait')
+            _upsert_job_status(str(payload['jobId']), library, INDEX_BUILD_JOB_TYPE, 'queued', indexScope=scope,
+                error='', result={'status': 'deferred', 'reason': 'barrier_wait', 'ready': False})
+            if not automatic.wave_pending(library):
+                resume_index_maintenance_after_wave(library)
+            return 'deferred'
+        delay = INDEX_BARRIER_RECOVERY_SECONDS
+        store.release(claim, deferred=True, retry_delay=delay, retry_reason='barrier_wait')
+        _upsert_job_status(str(payload['jobId']), library, INDEX_BUILD_JOB_TYPE, 'queued', indexScope=scope,
+            error='', result={'status': 'deferred', 'reason': 'barrier_wait', 'ready': False})
+        try:
+            sent = store.notify(key, _send_index_wakeup)
+            if not sent:
+                return 'retry'
+        except Exception:
+            worker_logger.warning('Barrier wakeup retained for recovery', exc_info=True)
+            return 'retry'
+        return 'deferred'
     except Exception:
         try:
             store.release(claim)
@@ -10893,7 +11544,44 @@ def _run_index_maintenance_payload(payload):
         raise
     if newer:
         store.notify(key, _send_index_wakeup)
+    _cleanup_completed_index_artifacts(library)
     _notify_index_ready(library, str(payload['jobId']), scope)
+    return 'intent_completed'
+
+
+def _cleanup_completed_index_artifacts(library):
+    # No publication/WorkStore claim is held here. GC must acquire the SAME
+    # real all-library catalog lease as hash, model, full and wave publishers.
+    if os.getenv('APP_ROLE', 'core').strip().lower() != 'index-worker':
+        return None
+    from contextlib import contextmanager
+    import automatic_index_updates as automatic
+    from index_artifact_cleanup import cleanup_user_index_artifacts, artifact_catalog_serialization
+
+    def check_quiet(user):
+        if automatic._quiescence_row(user) is not None:
+            raise automatic.SourceBusy('Library is operator-quiesced')
+        if automatic.wave_pending(user):
+            raise automatic.SourceBusy('Library has an active upload wave')
+
+    @contextmanager
+    def serialization(user):
+        with artifact_catalog_serialization(user, storage=storage_utils_module) as guard:
+            check_quiet(user)
+            yield guard
+
+    try:
+        check_quiet(library)
+        report = cleanup_user_index_artifacts(library, storage=storage_utils_module,
+            jobs=jobs_table_client, serialization=serialization)
+    except automatic.SourceBusy as error:
+        # Normal source/wave fencing is a quiet deferral, not a GC failure.
+        return dict(status='deferred', deleted=0, examined=0, reason=str(error))
+    except Exception as error:
+        worker_logger.warning('Index artifact cleanup failed for %s', library, exc_info=True)
+        report = dict(status='deferred', deleted=0, examined=0, reason=f'{type(error).__name__}: {error}')
+    worker_logger.info('Index artifact cleanup library=%s report=%s', library, report)
+    return report
 
 
 def _notify_index_ready(library, job_id, scope):
@@ -10966,7 +11654,12 @@ def publish_person_label_intent(user_id, person_id, person):
             'pendingToken': person['labelPending'],
         })
         mark_people_dirty(user_id, [person_id])
-        if enqueue_index_build(user_id, reason='person-label', scope='people') == 'unavailable':
+        # Note: inline_index_merge's eligibility check bails whenever
+        # _pending_person_labels(user_id) is non-empty (label ack isn't
+        # replicated inline) -- the pending token this call just wrote means
+        # inline will always decline here. Routed through the shared
+        # dispatcher anyway for uniformity; the durable enqueue is unaffected.
+        if dispatch_scoped_rebuild(user_id, 'person-label', 'people') == 'unavailable':
             raise RuntimeError('People maintenance queue unavailable')
         return True
     except Exception:
@@ -11130,21 +11823,32 @@ def reconcile_dirty_albums(user_id: str) -> bool:
     return True
 
 
-def _drain_incremental_search_db(user_id: str, scope: str) -> Dict[str, object]:
+def _drain_incremental_search_db(user_id: str, scope: str, *, max_names: Optional[int] = None,
+                                 max_passes: Optional[int] = None) -> Dict[str, object]:
     """Consume all currently dirty search rows using bounded delta periods."""
     import search_db
 
-    compacted = False
-    for pass_number in range(1, INDEX_BUILD_INCREMENTAL_MAX_PASSES + 1):
-        outcome = refresh_user_search_db_incremental(user_id)
+    pass_limit = INDEX_BUILD_INCREMENTAL_MAX_PASSES if max_passes is None else max(1, int(max_passes))
+    for pass_number in range(1, pass_limit + 1):
+        if max_names is None:
+            outcome = refresh_user_search_db_incremental(user_id)
+        else:
+            outcome = refresh_user_search_db_incremental(user_id, max_names=max_names)
         perf_instrumentation.log_event('search_db_incremental', user=user_id, scope=scope, pass_number=pass_number, **{
             k: v for k, v in outcome.items() if isinstance(v, (int, str))})
         status = str(outcome.get('status') or '')
         if status in ('noop', 'delta'):
-            if compacted:
-                # open_database applies any final deltas before deriving these,
-                # so summaries include the complete progressively-drained set.
+            # A prior delta may already be durable when summary publication
+            # fails. The claim/dirty dependency work stays retryable, and even
+            # noop replay MUST republish from the committed SQLite snapshot.
+            from summary_incremental import SummarySchemaMissing
+            try:
                 _refresh_library_summaries(user_id)
+            except SummarySchemaMissing:
+                if INDEX_MAINTENANCE_QUEUE_NAME:
+                    if enqueue_index_build(user_id, reason='summary-schema-upgrade', scope='compact') == 'unavailable':
+                        raise RuntimeError('Could not schedule summary schema compaction')
+                raise
             return outcome
         if status == 'more':
             continue
@@ -11155,7 +11859,6 @@ def _drain_incremental_search_db(user_id: str, scope: str) -> Dict[str, object]:
                 return {'status': 'deferred', 'nextScope': 'compact'}
             if search_db.compact_database(user_id) is None:
                 raise RuntimeError('search database compaction made no progress')
-            compacted = True
             continue
         if status == 'no_base':
             # Documented, expected outcome for a library with no search database
@@ -11180,10 +11883,13 @@ def _drain_incremental_search_db(user_id: str, scope: str) -> Dict[str, object]:
             # not a reason to mark this job failed.
             return outcome
         raise RuntimeError(f'incremental search database refresh returned {status or "an empty status"}')
+    if max_passes is not None:
+        return {'status': 'deferred', 'nextScope': 'search'}
     raise RuntimeError(
         f'incremental search database refresh did not converge after {INDEX_BUILD_INCREMENTAL_MAX_PASSES} passes')
 
 
+@serialize_catalog
 def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None:
     """Worker-side body of an index_build message. A heartbeat thread keeps the
     job row's updatedAt fresh while a long single step (full table scan,
@@ -11191,8 +11897,10 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
     dead -- and if the process really dies the heartbeat stops and the normal
     staleness sweep (plus queue redelivery) takes over."""
     from index_ownership import require_catalog_owner
-    require_catalog_owner()
+    require_catalog_owner(model_owned_tag=scope == 'tag_embedding')
     import index_updates
+    from clustering_lease import RetryableLibraryLeaseError
+    from automatic_index_updates import SourceBusy
     scope = index_updates.validate_scope(scope)
     started = time.monotonic()
     stop = threading.Event()
@@ -11237,13 +11945,19 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
                         activity = metadata_table_client.get_entity('clustering_maintenance', user_id)
                     except ResourceNotFoundError:
                         pass
-                if upload_hash_snapshot.covers_upload_activity(user_id, activity.get('lastUploadActivityAt')):
+                if (not INDEX_MAINTENANCE_QUEUE_NAME and
+                    upload_hash_snapshot.covers_upload_activity(user_id, activity.get('lastUploadActivityAt'))):
                     _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done')
                     return
             if scope in ('dedup', 'dedup-idle'):
-                if upload_hash_snapshot.rebuild_snapshot(user_id) is None:
+                if INDEX_MAINTENANCE_QUEUE_NAME:
+                    import automatic_index_updates as automatic
+                    result = automatic.run(user_id, 'hash', people_model=FACE_CLUSTER_EMBEDDING_VERSION)
+                elif upload_hash_snapshot.rebuild_snapshot(user_id) is None:
                     raise RuntimeError('upload hash index is not configured')
-                _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done')
+                else:
+                    result = None
+                _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done', result=result)
                 return
             if scope in ('compact', 'reconcile'):
                 if scope == 'compact':
@@ -11267,11 +11981,20 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
                 return
             if scope in ('full', 'light', 'sort'):
                 storage_utils_ensure_sort_current(user_id)
-            if scope in ('vector', 'tag_embedding', 'people_embedding'):
+            if scope in ('vector', 'tag_embedding', 'people_embedding', 'lexical_artifact'):
                 if (scope == 'tag_embedding' and INDEX_MAINTENANCE_QUEUE_NAME
-                        and not vision_utils.image_encoder_available()):
+                        and (os.getenv('APP_ROLE', '').strip().lower() != 'vision'
+                             or not vision_utils.image_encoder_available())):
                     raise RuntimeError('Tag embedding maintenance requires the vision model owner')
-                refresher = getattr(storage_utils_module, f'refresh_user_{scope}_index')
+                if INDEX_MAINTENANCE_QUEUE_NAME:
+                    import automatic_index_updates as automatic
+                    # The configured face/person lineage, not a fabricated
+                    # schema number, identifies the representative space.
+                    result = automatic.run(user_id, scope, people_model=FACE_CLUSTER_EMBEDDING_VERSION)
+                    _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done', result=result)
+                    return
+                refresher = getattr(storage_utils_module,
+                    'refresh_user_lexical_index' if scope == 'lexical_artifact' else f'refresh_user_{scope}_index')
                 snapshot = refresher(user_id)
                 if snapshot is None:
                     raise RuntimeError(f'index build produced no {scope} index')
@@ -11355,6 +12078,14 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
                     if enqueue_index_build(user_id, reason='post-bootstrap', scope='search') == 'unavailable':
                         raise RuntimeError('Could not schedule post-bootstrap catalog updates')
                 _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done')
+    except (SourceBusy, RetryableLibraryLeaseError):
+        # Stop any in-flight heartbeat before publishing the waiting state.
+        # The outer owner releases/debits the claim and schedules recovery.
+        stop.set()
+        heartbeat.join(timeout=5)
+        _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'queued', indexScope=scope,
+            error='', result={'status': 'deferred', 'reason': 'barrier_wait', 'ready': False})
+        raise
     except Exception:
         worker_logger.exception('Index build failed for %s', user_id)
         _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'failed', error='Index build failed')
@@ -11981,7 +12712,11 @@ def _merge_persons_core(
             face_ent.pop('suspiciousReason', None)
             face_ent.pop('rejectedReason', None)
             face_ent.pop('rejectedAt', None)
-            face_ent['confidence'] = max(float(face_ent.get('confidence', 0.0) or 0.0), 1.0)
+            try:
+                existing_confidence = float(face_ent.get('confidence', 0.0) or 0.0)
+            except Exception:
+                existing_confidence = 0.0
+            face_ent['confidence'] = max(existing_confidence, 1.0)
             face_updates[fid] = face_ent
 
     for owner_id, fid in external_removals:
@@ -12284,7 +13019,13 @@ def _split_face_into_new_person(user_id: str, person_id: str, face_id: str) -> D
     }
 
 
-MAX_INIT_BATCH_FILES = 20
+#  2026-10-31: raised 20->40 alongside frontend's INIT_BATCH_MAX_SIZE/
+# FINALIZE_BATCH_MAX_SIZE (12->24, see AppServicesProvider.tsx) -- finalize's
+# sequential per-file loop does real I/O (Table Storage), not CPU-bound work,
+# so a bigger batch means a longer-held thread, not GIL contention (see the
+# `upload` app's GUNICORN_THREADS comment in resources.bicep for the
+# CPU-bound case this doesn't apply to).
+MAX_INIT_BATCH_FILES = 40
 
 
 def _create_blob_sas_url(
@@ -12365,6 +13106,7 @@ def _queue_ipwork_processing(user_id: str, filename: str, steps: Optional[List[s
     to `{"steps": ["ocr"]}`) can pass it explicitly so ipworker doesn't
     silently redo more than was asked.
     """
+    if _library_cut_over_to_waves(user_id): return {'status': 'wave_owned'}
     if is_video_file(filename):
         processing_diagnostics.file_event('vision_excluded', user_id, filename, reason='video_browser_only')
         return {'status': 'skipped', 'reason': 'video_browser_only'}
@@ -12442,6 +13184,7 @@ def _queue_ipwork_release_check(user_id: str) -> None:
     # all converging on the same (idempotent, so harmless) release. Dedupe the
     # same way _run_index_build_job's dedup-idle job does: a deterministic job_id,
     # skip scheduling a second chain while one is already fresh/in flight.
+    if _library_cut_over_to_waves(user_id): return
     job_id = _ipwork_release_check_job_id(user_id)
     if _job_row_fresh_active(user_id, job_id):
         return
@@ -12557,6 +13300,7 @@ def _run_ipwork_release_job(user_id: str, reason: str, force: bool = False) -> N
 
 
 def enqueue_ipwork_release(user_id: str, reason: str, force: bool = False) -> str:
+    if _library_cut_over_to_waves(user_id): return 'wave_owned'
     if library_ops_queue_client is None:
         return 'unavailable'
     try:
@@ -12698,19 +13442,9 @@ def _accept_upload_source_completion(user_id, intent):
 
 
 def _library_cut_over_to_waves(user_id: str) -> bool:
-    """Future per-library cutover gate, held off until live consumers exist.
-
-    Environment flags alone must not suppress the currently functioning
-    assignment path. Durable cohort ownership and consumer validation are
-    still required before live cutover can be enabled.
-    """
-    from upload_wave_execution import live_consumers_available
-    if not live_consumers_available():
-        return False
-    if os.getenv('UPLOAD_WAVE_EXECUTION_ENABLED', '').strip().lower() != 'true':
-        return False
-    cut_over = {name.strip() for name in os.getenv('UPLOAD_WAVE_CUTOVER_LIBRARIES', '').split(',') if name.strip()}
-    return user_id in cut_over
+    """Durable library ownership; pausing execution never restores legacy work."""
+    from wave_policy import owned
+    return owned(jobs_table_client, user_id)
 
 
 def _queue_people_clustering_after_face_processing(user_id: str, filename: str, metadata: Optional[Dict]) -> Optional[Dict[str, str]]:
@@ -12805,7 +13539,7 @@ BROWSER_PROCESSING_STATUS_FIELDS = (
     ('map_detection_status', 'mapDetection'),
     ('face_status', 'face'),
 )
-BROWSER_PROCESSING_TERMINAL_STATUSES = {'done', 'no_data', 'deleted', 'skipped', 'unsupported', 'failed', 'timeout'}
+BROWSER_PROCESSING_TERMINAL_STATUSES = {'done', 'no_data', 'deleted', 'skipped', 'unsupported', 'failed', 'timeout', 'unrecoverable'}
 BROWSER_PROCESSING_PENDING_SELECT = [
     'RowKey',
     'processingIsolated',
@@ -13202,6 +13936,47 @@ def _sweep_tag_embedding_indexes() -> Dict[str, int]:
     reason its lexical/vector-index siblings avoid an expensive synchronous
     rebuild during an interactive request."""
     stats = {'librariesChecked': 0, 'indexesAvailable': 0}
+    if INDEX_MAINTENANCE_QUEUE_NAME:
+        # Durable model-only jobs share the existing jobs table. Do not claim
+        # any other maintenance scope from vision, even if a malformed row is
+        # inserted into the model partition.
+        import automatic_index_updates as automatic
+        import index_work
+        import index_publication
+        if (jobs_table_client is None or os.getenv('APP_ROLE', '').strip().lower() != 'vision'
+                or not vision_utils.image_encoder_available()):
+            return stats
+        store = index_work.WorkStore(jobs_table_client, partition=automatic.TAG_PARTITION)
+        for row in jobs_table_client.query_entities(f"PartitionKey eq '{automatic.TAG_PARTITION}'"):
+            if row.get('scope') != 'tag_embedding' or row.get('failed') or float(row.get('notBefore') or 0) > time.time():
+                continue
+            claim = None
+            try:
+                claim = store.claim(row['RowKey'])
+                if claim is None:
+                    continue
+                stats['librariesChecked'] += 1
+                if claim.attempt > INDEX_BUILD_MAX_RETRIES:
+                    store.finish(claim, failed=True)
+                    continue
+                with index_publication.publication(store, claim):
+                    _run_index_build_job(claim.library,
+                        _index_build_job_id(claim.library) + '-tag_embedding', 'tag_embedding')
+                store.finish(claim)
+                stats['indexesAvailable'] += 1
+            except automatic.SourceBusy:
+                if claim is not None:
+                    delay = INDEX_BARRIER_RECOVERY_SECONDS
+                    store.release(claim, deferred=True, retry_delay=delay, retry_reason='barrier_wait')
+                    try:
+                        store.notify(row['RowKey'], _send_tag_index_wakeup)
+                    except Exception:
+                        worker_logger.warning('Sweep tag barrier wakeup could not be reserved', exc_info=True)
+            except Exception:
+                if claim is not None:
+                    store.release(claim, retry_delay=30)
+                worker_logger.exception('Durable tag maintenance failed for %s', row.get('libraryId'))
+        return stats
     if library_store is None or not vision_utils.image_encoder_available():
         return stats
     try:
@@ -13337,6 +14112,7 @@ UPLOAD_TRACKING_FIELDS = (
     # anonymousImageId at finalize, so any leftover reservation should be cleared
     # alongside the other tracking fields.
     'pendingAnonymousBlob',
+    'uploadCleanupBlobs',
 )
 
 THUMBNAIL_RETRY_COUNT_FIELD = 'thumbnail_retry_count'
@@ -13485,6 +14261,9 @@ def _trash_index_add(user_id: str, filename: str, deleted_at: str) -> None:
         trash_index_table_client.upsert_entity({'PartitionKey': user_id, 'RowKey': filename, 'deletedAt': deleted_at})
     except Exception:
         app.logger.warning('Trash index add failed for %s', filename, exc_info=True)
+        # The caller must retain its request/job for replay; the metadata row
+        # is already deleted and carries its original timestamp/statuses.
+        raise
 
 
 def _trash_index_remove(user_id: str, filenames: List[str]) -> None:
@@ -13553,32 +14332,40 @@ def _mark_processing_deleted_for_file(user_id: str, filename: str) -> Optional[D
     the whole request themselves, the same way the hard-delete route already
     does, instead of paying for it per file.
     """
-    try:
-        entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
-    except Exception:
-        return None
-    # Queue redelivery may replay a chunk after the worker was interrupted.
-    # Preserve the original pre-delete statuses and timestamp in that case so
-    # a later restore remains lossless.
-    if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
+    for _ in range(5):
+        try:
+            entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+        except ResourceNotFoundError:
+            return None
+        # Replays repair a secondary write that failed after the source commit.
+        # Never overwrite the original deletion time or pre-delete statuses.
+        if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
+            _trash_index_add(user_id, filename, str(entity.get('deletedAt') or ''))
+            return entity
+        version = getattr(entity, 'metadata', {}).get('etag')
+        if not version or version == '*':
+            raise RuntimeError('Photo deletion requires a metadata ETag')
+        now_iso = datetime.now(timezone.utc).isoformat()
+        pre_delete_statuses = {field: entity.get(field, 'pending') for field, _ in BROWSER_PROCESSING_STATUS_FIELDS}
+        entity['preDeleteStatuses'] = json.dumps(pre_delete_statuses, separators=(',', ':'))
+        entity['processing_state'] = 'deleted'
+        entity['deletedAt'] = now_iso
+        for status_field, _ in BROWSER_PROCESSING_STATUS_FIELDS:
+            entity[status_field] = 'deleted'
+        entity['processing_lease_owner'] = ''
+        entity['processing_lease'] = ''
+        entity['processing_lease_expires_at'] = ''
+        entity['last_processing_update'] = now_iso
+        try:
+            metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE,
+                etag=version, match_condition=MatchConditions.IfNotModified)
+        except ResourceModifiedError:
+            continue
+        except ResourceNotFoundError:
+            return None
+        _trash_index_add(user_id, filename, now_iso)
         return entity
-    now_iso = datetime.now(timezone.utc).isoformat()
-    # Snapshot the real per-step statuses before overwriting them, so restore
-    # can put them back exactly instead of forcing a wasteful full re-run of
-    # steps (thumbnail/OCR/etc.) whose output blobs are still sitting there.
-    pre_delete_statuses = {field: entity.get(field, 'pending') for field, _ in BROWSER_PROCESSING_STATUS_FIELDS}
-    entity['preDeleteStatuses'] = json.dumps(pre_delete_statuses, separators=(',', ':'))
-    entity['processing_state'] = 'deleted'
-    entity['deletedAt'] = now_iso
-    for status_field, _ in BROWSER_PROCESSING_STATUS_FIELDS:
-        entity[status_field] = 'deleted'
-    entity['processing_lease_owner'] = ''
-    entity['processing_lease'] = ''
-    entity['processing_lease_expires_at'] = ''
-    entity['last_processing_update'] = now_iso
-    metadata_table_client.upsert_entity(entity)
-    _trash_index_add(user_id, filename, now_iso)
-    return entity
+    raise RuntimeError('Concurrent photo deletion requires retry')
 
 
 def _soft_delete_photos_now(
@@ -13864,6 +14651,12 @@ def _set_faces_source_deleted_for_filenames(user_id: str, filenames, deleted: bo
 
         _io_pool_map(_touch_person, sorted(touched_people), workers=12)
     if touched_people:
+        # Record the touched IDs in the same ID-tracked dirty set the
+        # rename/merge/delete paths use, not just the blanket manifest-dirty
+        # flag -- otherwise refresh_user_people_index's ID-targeted incremental
+        # path can never trust affected_person_ids to be complete (see its
+        # comment) and every people rebuild degrades to a full scan.
+        mark_people_dirty(user_id, sorted(touched_people))
         try:
             touch_user_people_index_state(user_id)
         except Exception:
@@ -13878,25 +14671,37 @@ def _restore_deleted_file(user_id: str, filename: str) -> Optional[Dict[str, Any
     steps whose output blobs are still sitting in storage untouched. Same
     "pure mutation, caller batches index/cache touches" contract as the mark
     function above."""
-    try:
-        entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
-    except Exception:
-        return None
-    if entity.get('processing_state') != 'deleted':
+    for _ in range(5):
+        try:
+            entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+        except ResourceNotFoundError:
+            return None
+        if entity.get('processing_state') != 'deleted':
+            _trash_index_remove(user_id, [filename])
+            return entity
+        version = getattr(entity, 'metadata', {}).get('etag')
+        if not version or version == '*':
+            raise RuntimeError('Photo restoration requires a metadata ETag')
+        try:
+            pre_delete_statuses = json.loads(entity.get('preDeleteStatuses') or '{}')
+        except (TypeError, ValueError):
+            pre_delete_statuses = {}
+        entity['processing_state'] = 'active'
+        entity['deletedAt'] = ''
+        entity['preDeleteStatuses'] = ''
+        for status_field, _ in BROWSER_PROCESSING_STATUS_FIELDS:
+            entity[status_field] = pre_delete_statuses.get(status_field, 'pending')
+        entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
+        try:
+            metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE,
+                etag=version, match_condition=MatchConditions.IfNotModified)
+        except ResourceModifiedError:
+            continue
+        except ResourceNotFoundError:
+            return None
+        _trash_index_remove(user_id, [filename])
         return entity
-    try:
-        pre_delete_statuses = json.loads(entity.get('preDeleteStatuses') or '{}')
-    except (TypeError, ValueError):
-        pre_delete_statuses = {}
-    entity['processing_state'] = 'active'
-    entity['deletedAt'] = ''
-    entity['preDeleteStatuses'] = ''
-    for status_field, _ in BROWSER_PROCESSING_STATUS_FIELDS:
-        entity[status_field] = pre_delete_statuses.get(status_field, 'pending')
-    entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
-    metadata_table_client.upsert_entity(entity)
-    _trash_index_remove(user_id, [filename])
-    return entity
+    raise RuntimeError('Concurrent photo restoration requires retry')
 
 
 def _strip_deleted_people_from_photos(user_id: str, person_ids: set, skip_names: set) -> None:
@@ -13988,6 +14793,8 @@ def _hard_delete_photos_chunk(user_id: str, filenames: List[str]) -> Tuple[List[
     failed cleanup remains discoverable and retryable instead of reporting
     deletion success with hidden faces. Returns (deleted, errors, deleted_person_ids).
     """
+    import processing_cleanup
+    processing_cleanup.fence_photo_deletion(jobs_table_client,metadata_table_client,user_id,filenames)
     deleted: List[str] = []
     errors: List[str] = []
     if not filenames:
@@ -14088,6 +14895,7 @@ def _hard_delete_photos_chunk(user_id: str, filenames: List[str]) -> Tuple[List[
     except Exception as exc:
         app.logger.warning('Batch album cleanup failed for %s: %s', user_id, exc)
 
+    processing_cleanup.opportunistic_artifact_cleanup(jobs_table_client,storage_utils_module,metadata_table_client,user_id)
     return deleted, errors, deleted_person_ids
 
 
@@ -14144,6 +14952,13 @@ def _cleanup_failed_upload(user_id: str, filename: str, upload_id: str = '') -> 
     except Exception:
         metadata = None
 
+    if metadata and metadata.get('uploadCleanupBlobs'):
+        # The Tools cleanup owns exact blob identities and retains them across
+        # partial failures. Legacy browser cancel must not erase that retry
+        # record while removing only the current pending reservation.
+        cleanup['errors'].append('Upload cleanup is pending. Use Upload cleanup in Tools to finish.')
+        return cleanup
+
     has_upload_tracking = bool(metadata) and any(field in metadata for field in UPLOAD_TRACKING_FIELDS)
     # thumbnail_status deliberately excluded: kickOffThumbnailForFile fires an
     # early, thumbnail-only processing claim concurrently with the raw upload
@@ -14165,6 +14980,17 @@ def _cleanup_failed_upload(user_id: str, filename: str, upload_id: str = '') -> 
 
     if metadata and has_upload_tracking:
         if has_completed_metadata:
+            # A completed canonical row can also carry a fresh pending blob
+            # from a later upload that deduplicated back to this same photo.
+            # Clearing only the tracking columns orphaned that staged blob.
+            pending_blob = str(metadata.get('pendingAnonymousBlob') or '').strip()
+            permanent_blob = str(metadata.get('anonymousImageId') or '').strip()
+            if pending_blob and pending_blob != permanent_blob:
+                cleanup['errors'].extend(_delete_photo_blobs_if_present(pending_blob))
+                try:
+                    delete_image_name_mapping(user_id, pending_blob)
+                except Exception:
+                    pass
             for field in UPLOAD_TRACKING_FIELDS:
                 metadata.pop(field, None)
             try:
@@ -14784,6 +15610,19 @@ def _maybe_enqueue_coalesced_rerun(job_id: Optional[str], user_id: str) -> None:
 
 def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, job_type: str,
                                      *, incremental_assign=None, prepared=None) -> None:
+    if payload.get('type') == 'upload_session_expiry':
+        # Acknowledge legacy messages accidentally delivered to this queue.
+        # No expiry consumer remains; Core recovers sessions on user traffic.
+        return
+    if payload.get('type') == 'upload_wave_stage':
+        from wave_runtime import consume
+        return consume(payload)
+    if payload.get('type') == 'processing_artifact_cleanup':
+        from processing_cleanup import run_artifact_cleanup
+        return run_artifact_cleanup(payload)
+    from wave_policy import legacy_message_suppressed
+    if legacy_message_suppressed(jobs_table_client,user_id,payload):
+        return
     if not user_id:
         return
     if job_type == PREVIEW_JOB_TYPE:
@@ -14958,7 +15797,7 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
                 _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'done',
                                    indexScope=scope, forwardedTo=target)
         else:
-            _run_index_maintenance_payload(payload)
+            return _run_index_maintenance_payload(payload)
         return
 
     if job_type == 'photo_soft_delete':
@@ -15266,17 +16105,24 @@ def _poll_clustering_queue_once(
         visibility_timeout=CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS,
     ))
     if not messages:
+        processing_diagnostics.count(_queue_worker_role(), 'empty_receives')
         return False
+    processing_diagnostics.count(_queue_worker_role(), 'received_messages', len(messages))
     return _process_clustering_queue_message(
         messages[0], queue_client, queue_name, max_retries, deadletter_queue_client, dispatch=dispatch)
 
 
-@processing_diagnostics.measured('cluster', 'message', state='processing')
+def _queue_worker_role():
+    return 'indexer' if os.getenv('APP_ROLE', '').strip().lower() == 'index-worker' else 'cluster'
+
+
+@processing_diagnostics.measured(_queue_worker_role, 'message', state='processing')
 def _process_clustering_queue_message(message, queue_client, queue_name, max_retries,
                                       deadletter_queue_client=None, *, dispatch=None):
     """Instrumented entry: one `scope_summary` line per queue message (wall time,
     storage round trips, duplicates, peak RSS) tagged with the job type."""
-    processing_diagnostics.message_event('cluster_started', message, role='cluster')
+    role = _queue_worker_role()
+    processing_diagnostics.message_event('cluster_started', message, role=role)
     job_type, user_id = '?', ''
     try:
         body = json.loads(getattr(message, 'content', '') or '{}')
@@ -15287,7 +16133,7 @@ def _process_clustering_queue_message(message, queue_client, queue_name, max_ret
         pass
     if job_type == INDEX_BUILD_JOB_TYPE:
         max_retries = min(max_retries, INDEX_BUILD_MAX_RETRIES)
-    processing_diagnostics.emit('cluster_job_started', role='cluster', job_type=job_type)
+    processing_diagnostics.emit('cluster_job_started', role=role, job_type=job_type)
     with perf_instrumentation.scope(f'queue.{queue_name}.{job_type}', user=user_id,
                                     dequeue=getattr(message, 'dequeue_count', None)):
         return _process_clustering_queue_message_impl(
@@ -15303,7 +16149,55 @@ def _process_clustering_queue_message_impl(message, queue_client, queue_name, ma
     job_type = ''
 
     dequeue_count = int(getattr(message, 'dequeue_count', 0) or 0)
-    if dequeue_count > max_retries:
+    # Durable maintenance charges actual ledger claims, not duplicate queue
+    # deliveries. Otherwise a healthy barrier wait can poison its intent here
+    # before the worker gets a chance to consult notBefore/attempts.
+    durable_index = False
+    durable_wave = False
+    try:
+        candidate = json.loads(message.content or '{}')
+        if isinstance(candidate, dict) and candidate.get('type') == 'upload_wave_stage':
+            from wave_runtime import durable_stage_wake
+            durable_wave = durable_stage_wake(candidate, jobs_table_client,
+                os.getenv('APP_ROLE', 'core').strip().lower())
+        if (isinstance(candidate, dict) and candidate.get('type') == INDEX_BUILD_JOB_TYPE
+                and jobs_table_client is not None
+                and os.getenv('APP_ROLE', 'core').strip().lower() == 'index-worker'
+                and isinstance(candidate.get('userId'), str) and candidate['userId']
+                and isinstance(candidate.get('scope'), str)):
+            import index_work
+            durable_index = candidate.get('maintenanceKey') == index_work.WorkStore.key(
+                candidate['userId'], candidate['scope'])
+    except (ValueError, TypeError):
+        pass
+    if (durable_wave or durable_index) and queue_name in (CLUSTERING_DEFERRED_QUEUE_NAME, INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME):
+        # A deferred queue is visible-only so future work does not keep a
+        # replica alive. Once due, transfer the delivery to its main queue
+        # BEFORE ACKing. The main scaler counts invisible in-flight messages;
+        # processing here would otherwise hide active work and scale it to zero.
+        target = (clustering_queue_client if candidate.get('stage') == 'cluster'
+                  else index_maintenance_queue_client)
+        try:
+            if target is None:
+                raise RuntimeError('Main stage queue unavailable')
+            target.send_message(message.content)
+        except Exception:
+            worker_logger.exception('Stage queue transfer retained for retry: %s', queue_name)
+            if dequeue_count >= max_retries and deadletter_queue_client is not None:
+                # A permanently unavailable target must not create an endless
+                # sequence of cold starts. Preserve the release and a replayable
+                # dead letter; never invalidate a different live stage owner.
+                deadletter_queue_client.send_message(json.dumps(dict(sourceQueue=queue_name,
+                    reason='Main queue transfer attempts exhausted', originalPayload=candidate,
+                    dequeueCount=dequeue_count)))
+                queue_client.delete_message(message)
+            return True
+        try:
+            queue_client.delete_message(message)
+        except Exception:
+            worker_logger.exception('Transferred stage delivery could not be acknowledged: %s',queue_name)
+        return True
+    if dequeue_count > max_retries and not (durable_index or durable_wave):
         try:
             payload = json.loads(message.content or '{}')
             if isinstance(payload, dict):
@@ -15441,13 +16335,23 @@ def _process_clustering_queue_message_impl(message, queue_client, queue_name, ma
                 job_type or 'people_incremental_assign', _clustering_log_filename_summary(payload), user_id, dequeue_count,
                 backlog_age_s,
             )
-            (dispatch or _handle_clustering_queue_payload)(payload, job_id, user_id, job_type)
+            outcome = (dispatch or _handle_clustering_queue_payload)(payload, job_id, user_id, job_type)
+            if _queue_worker_role() == 'indexer':
+                processing_diagnostics.emit('index_message_outcome', role='indexer', job_type=job_type,
+                    outcome=outcome or 'handled', operation_id=processing_diagnostics.operation_id(payload.get('operationId')),
+                    intent_revision=payload.get('intentRevision'), scope=payload.get('scope'),
+                    wave_id=payload.get('waveId'))
             worker_logger.info(
                 'clustering message done job_type=%s filename=%s user=%s elapsed_ms=%d',
                 job_type or 'people_incremental_assign', _clustering_log_filename_summary(payload), user_id,
                 int((time.monotonic() - start_time) * 1000),
             )
-        succeeded = True
+        succeeded = (outcome not in ('retry', 'wave_retry', 'index_retry', 'tag_index_retry'))
+        if not succeeded:
+            try:
+                queue_client.update_message(message_holder[0], visibility_timeout=10)
+            except Exception:
+                worker_logger.exception('Queue retry visibility update failed')
     except Exception as exc:
         worker_logger.info(
             'clustering message failed job_type=%s filename=%s user=%s elapsed_ms=%d',
@@ -15485,16 +16389,18 @@ def _process_clustering_queue_message_impl(message, queue_client, queue_name, ma
             delete_started = time.monotonic()
             try:
                 queue_client.delete_message(final_message)
-                processing_diagnostics.message_event('cluster_acknowledged', message, role='cluster')
-                processing_diagnostics.count('cluster', 'acknowledged_messages')
-                processing_diagnostics.emit('cluster_job_acknowledged', role='cluster', job_type=job_type)
+                role = _queue_worker_role()
+                processing_diagnostics.message_event('cluster_acknowledged', message, role=role)
+                processing_diagnostics.count(role, 'acknowledged_messages')
+                processing_diagnostics.emit('cluster_job_acknowledged', role=role, job_type=job_type)
                 worker_logger.info('clustering message delete queue=%s delete_ms=%d',
                                    queue_name, int((time.monotonic() - delete_started) * 1000))
             except Exception:
                 worker_logger.exception('Failed to delete %s queue message', queue_name)
         else:
-            processing_diagnostics.message_event('cluster_retry', message, role='cluster')
-            processing_diagnostics.count('cluster', 'errors')
+            role = _queue_worker_role()
+            processing_diagnostics.message_event('cluster_retry', message, role=role)
+            processing_diagnostics.count(role, 'errors')
             worker_logger.info(
                 'Leaving %s queue message visible for retry (dequeue_count=%s, max_retries=%s)',
                 queue_name, dequeue_count, max_retries,
@@ -15661,6 +16567,11 @@ def _process_clustering_user_group(user, indices, messages, take, queue_client, 
     many of message i's work items are still outstanding across chunks; the
     message is only acked once every chunk touching it has succeeded.
     """
+    if _library_cut_over_to_waves(user):
+        for i in indices:
+            _process_clustering_queue_message(take(i),queue_client,queue_name,max_retries,deadletter_queue_client,
+                dispatch=lambda *args,**kwargs: None)
+        return
 
     def prepare(i):
         try:
@@ -15877,9 +16788,12 @@ def run_index_worker() -> None:
     queue = index_maintenance_queue_client
     if queue is None:
         raise RuntimeError('Index maintenance queue unavailable')
+    deferred_queue = index_maintenance_deferred_queue_client
+    if deferred_queue is None:
+        raise RuntimeError('Index maintenance deferred queue unavailable')
     deadletter = queue_service_client.get_queue_client(INDEX_MAINTENANCE_DEADLETTER_QUEUE_NAME)
     from azure.core.exceptions import ResourceExistsError
-    for client in (queue, deadletter):
+    for client in (queue, deferred_queue, deadletter):
         try:
             client.create_queue()
         except ResourceExistsError:
@@ -15890,17 +16804,22 @@ def run_index_worker() -> None:
     last_recovery = -60.0
     processing_diagnostics.ready('indexer', queue=INDEX_MAINTENANCE_QUEUE_NAME)
     def dispatch(payload, job_id, user_id, job_type):
-        if job_type != INDEX_BUILD_JOB_TYPE:
+        if job_type not in (INDEX_BUILD_JOB_TYPE, 'upload_wave_stage'):
             raise ValueError('Index queue cannot dispatch other job types')
-        _handle_clustering_queue_payload(payload, job_id, user_id, job_type)
+        return _handle_clustering_queue_payload(payload, job_id, user_id, job_type)
     while not stop.is_set():
         try:
             now = time.monotonic()
             if now - last_recovery >= 60:
-                recover_pending_index_work()
+                with processing_diagnostics.phase('indexer', 'recovery', state='processing'):
+                    recover_pending_index_work()
                 last_recovery = now
             processed = _poll_clustering_queue_once(
                 queue, INDEX_MAINTENANCE_QUEUE_NAME, INDEX_BUILD_MAX_RETRIES, deadletter, dispatch=dispatch)
+            if not processed:
+                processed = _poll_clustering_queue_once(
+                    deferred_queue, INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME, INDEX_BUILD_MAX_RETRIES,
+                    deadletter, dispatch=dispatch)
             if not processed:
                 stop.wait(2)
         except Exception:
@@ -15947,17 +16866,23 @@ def run_clustering_worker() -> None:
     # LIBRARY_OPS_QUEUE_NAME's comment. One extra empty-queue receive_messages
     # call per idle poll cycle is a negligible transaction cost next to that.
     library_ops_client = queue_service_client_local.get_queue_client(LIBRARY_OPS_QUEUE_NAME)
+    # Deferred wave-continuation retries (see send_stage in wave_runtime.py) --
+    # polled like library_ops_client above, not folded into queue_client,
+    # because it's a separate Azure queue with its own KEDA rule.
+    clustering_deferred_client = queue_service_client_local.get_queue_client(CLUSTERING_DEFERRED_QUEUE_NAME)
     clustering_deadletter_client = queue_service_client_local.get_queue_client(CLUSTERING_DEADLETTER_QUEUE_NAME)
     library_ops_deadletter_client = queue_service_client_local.get_queue_client(LIBRARY_OPS_DEADLETTER_QUEUE_NAME)
-    for ensure_client in (queue_client, library_ops_client, clustering_deadletter_client, library_ops_deadletter_client):
+    for ensure_client in (queue_client, library_ops_client, clustering_deferred_client,
+                          clustering_deadletter_client, library_ops_deadletter_client):
         try:
             ensure_client.create_queue()
         except Exception:
             pass
     worker_logger.info(
-        'Worker polling queue %s (priority) then %s every %ss',
+        'Worker polling queue %s (priority) then %s then %s every %ss',
         LIBRARY_OPS_QUEUE_NAME,
         CLUSTERING_QUEUE_NAME,
+        CLUSTERING_DEFERRED_QUEUE_NAME,
         poll_seconds,
     )
     processing_diagnostics.ready('cluster', page_size=batch_size, target_size=target_batch_size,
@@ -15991,37 +16916,48 @@ def run_clustering_worker() -> None:
     signal.signal(signal.SIGTERM, _handle_shutdown_signal)
     signal.signal(signal.SIGINT, _handle_shutdown_signal)
 
-    while not shutdown_requested.is_set():
-        try:
-            # Priority queue first: only fall through to the general
-            # clustering queue once library-ops has nothing waiting, so a
-            # library_clean/library_download never queues behind backfill
-            # traffic. A sustained library-ops backlog can starve clustering
-            # entirely under maxReplicas=1 -- accepted deliberately, since
-            # these are rare, user-initiated, "someone is staring at a
-            # spinner" actions and the whole point is that they win.
-            processed_any = _poll_clustering_queue_once(
-                library_ops_client, LIBRARY_OPS_QUEUE_NAME, LIBRARY_CLEAN_MAX_RETRIES,
-                library_ops_deadletter_client,
-            )
-            if not processed_any and not shutdown_requested.is_set():
-                if batch_size == 1 and target_batch_size <= 1:
+    try:
+        while not shutdown_requested.is_set():
+            try:
+                # Priority queue first: only fall through to the general
+                # clustering queue once library-ops has nothing waiting, so a
+                # library_clean/library_download never queues behind backfill
+                # traffic. A sustained library-ops backlog can starve clustering
+                # entirely under maxReplicas=1 -- accepted deliberately, since
+                # these are rare, user-initiated, "someone is staring at a
+                # spinner" actions and the whole point is that they win.
+                processed_any = _poll_clustering_queue_once(
+                    library_ops_client, LIBRARY_OPS_QUEUE_NAME, LIBRARY_CLEAN_MAX_RETRIES,
+                    library_ops_deadletter_client,
+                )
+                if not processed_any and not shutdown_requested.is_set():
+                    if batch_size == 1 and target_batch_size <= 1:
+                        processed_any = _poll_clustering_queue_once(
+                            queue_client, CLUSTERING_QUEUE_NAME, CLUSTERING_WORKER_MAX_RETRIES,
+                            clustering_deadletter_client)
+                    else:
+                        processed_any = _poll_clustering_queue_batch_once(
+                            queue_client, CLUSTERING_QUEUE_NAME, CLUSTERING_WORKER_MAX_RETRIES,
+                            clustering_deadletter_client, batch_size=batch_size,
+                            target_size=target_batch_size, idle_timeout_seconds=idle_timeout_seconds,
+                            poll_seconds=poll_seconds, shutdown_requested=shutdown_requested,
+                            max_wait_seconds=max_accumulation_seconds)
+                if not processed_any and not shutdown_requested.is_set():
+                    # Deferred retries land here once their delay elapses (see
+                    # send_stage) -- same payload shape as the main queue, so
+                    # the same dispatch function handles it unchanged.
                     processed_any = _poll_clustering_queue_once(
-                        queue_client, CLUSTERING_QUEUE_NAME, CLUSTERING_WORKER_MAX_RETRIES,
-                        clustering_deadletter_client)
-                else:
-                    processed_any = _poll_clustering_queue_batch_once(
-                        queue_client, CLUSTERING_QUEUE_NAME, CLUSTERING_WORKER_MAX_RETRIES,
-                        clustering_deadletter_client, batch_size=batch_size,
-                        target_size=target_batch_size, idle_timeout_seconds=idle_timeout_seconds,
-                        poll_seconds=poll_seconds, shutdown_requested=shutdown_requested,
-                        max_wait_seconds=max_accumulation_seconds)
-            if not processed_any and not shutdown_requested.is_set():
-                time.sleep(poll_seconds)
-        except Exception:
-            worker_logger.exception('Queue polling iteration failed')
-            if not shutdown_requested.is_set():
-                time.sleep(poll_seconds)
+                        clustering_deferred_client, CLUSTERING_DEFERRED_QUEUE_NAME,
+                        CLUSTERING_WORKER_MAX_RETRIES, clustering_deadletter_client)
+                if not processed_any and not shutdown_requested.is_set():
+                    time.sleep(poll_seconds)
+            except Exception:
+                worker_logger.exception('Queue polling iteration failed')
+                if not shutdown_requested.is_set():
+                    time.sleep(poll_seconds)
+
+    finally:
+        shutdown_requested.set()
 
     # Synchronous polling finishes the bounded in-flight group before reaching
     # here. Do not initialize an adapter or rebuild an absent/unsafe runtime.
@@ -16203,7 +17139,10 @@ def _run_ipwork_steps_with_images(user_id: str, filename: str, steps: List[str],
                             source_size = int(get_media_properties('image', source_blob)['size'])
                         if source_size <= 0:
                             raise ValueError('Invalid source size')
-                        preview = download_media_bytes('thumbnail', _preview_cache_blob_name(source_blob))
+                        from vision_prefetch import prefetched_preview
+                        preview = prefetched_preview(user_id, filename, entity)
+                        if preview is None:
+                            preview = download_media_bytes('thumbnail', _preview_cache_blob_name(source_blob))
                         processing_diagnostics.file_event('vision_download', user_id, filename, role='vision',
                             source='preview', bytes=len(preview))
                         _ipwork_metric('preview_download_bytes', count=len(preview))
@@ -16526,7 +17465,7 @@ def _handle_ipwork_queue_payload_impl(payload: Dict, job_id: str, user_id: str) 
     runnable_steps = [
         step for step in steps
         if str(lease_statuses.get(f'{step}Status') or '').strip().lower() not in (
-            {'done'} if step == 'thumbnail' else {'done', 'no_data', 'skipped', 'unsupported'}
+            {'done', 'unrecoverable'} if step == 'thumbnail' else {'done', 'no_data', 'skipped', 'unsupported', 'unrecoverable'}
         )
     ]
     # claim_processing_lease reads the raw face_status field, which doesn't
@@ -16715,6 +17654,11 @@ def _prewarm_ipwork_models() -> None:
     try:
         import vision_utils
         processing_diagnostics.call('vision', 'warm_clip', vision_utils._load_model)
+        # Opt-in one-thread ONNX CLIP (IPWORK_CLIP_ONNX): export the towers here
+        # so the one-time cost is paid at warmup, not on the first photo. A
+        # no-op when the flag is off; falls back to PyTorch if export fails.
+        if vision_utils._clip_onnx_enabled():
+            processing_diagnostics.call('vision', 'warm_clip_onnx', vision_utils._load_onnx_towers)
     except Exception:
         worker_logger.exception('vision_utils CLIP model pre-warm failed')
     try:
@@ -16759,6 +17703,23 @@ def _process_ipwork_message_impl(message) -> str:
         if isinstance(payload, dict):
             job_id = str(payload.get('jobId') or payload.get('correlationId') or '').strip()
             user_id = str(payload.get('user_id') or payload.get('userId') or '').strip()
+            if payload.get('type') == TAG_INDEX_MAINTENANCE_TYPE:
+                import index_progress
+                with index_progress.reporting_to(getattr(_ipwork_metrics_context, 'wave_progress', None)):
+                    return _run_tag_index_maintenance_payload(payload)
+            if payload.get('type') == 'upload_wave_stage':
+                from wave_runtime import consume
+                # Same budget the ipwork watchdog below uses to decide when to
+                # kill a stuck task -- minus a safety margin, so a large wave
+                # voluntarily checkpoints and returns before the watchdog can
+                # kill this whole message mid-pass (which would otherwise burn
+                # one of the stage's 5 delivery attempts on a wave that was
+                # simply too large, not actually stuck).
+                task_limit = min(IPWORKER_TASK_TIMEOUT_SECONDS, max(1, IPWORKER_VISIBILITY_TIMEOUT_SECONDS - 30))
+                return consume(payload, deadline=time.monotonic() + max(0.1, task_limit - 20),
+                    progress=getattr(_ipwork_metrics_context, 'wave_progress', None))
+            if _library_cut_over_to_waves(user_id):
+                return 'noop'
             if dequeue_count > IPWORKER_MAX_RETRIES:
                 if job_id and user_id:
                     try:
@@ -16779,6 +17740,9 @@ def _process_ipwork_message_impl(message) -> str:
                 return 'retry_exhausted'  # terminal ACK, not a productive completion/milestone
             outcome = _handle_ipwork_queue_payload(payload, job_id, user_id)
     except Exception as exc:
+        if isinstance(payload, dict) and payload.get('type') == TAG_INDEX_MAINTENANCE_TYPE:
+            worker_logger.exception('Tag maintenance dispatch failed; retaining queue receipt')
+            return 'tag_index_retry'
         if job_id and user_id:
             try:
                 _upsert_job_status(job_id, user_id, 'ipwork', 'failed', error='Photo processing failed')
@@ -16919,6 +17883,8 @@ def _trigger_indexer_rebuild(user_id: str, reason: str = 'trigger', scope: str =
     The optional HTTP fallback asks indexer's API to persist the same intent;
     neither the caller nor the HTTP handler builds catalog artifacts inline.
     """
+    if str(reason).startswith(('upload','ipwork','post-finalize')) and _library_cut_over_to_waves(user_id):
+        return
     indexer_url = os.getenv('INDEXER_INTERNAL_URL', '').strip()
     key = str(user_id or '').strip()
     if not key or (not indexer_url and index_maintenance_queue_client is None):
@@ -16930,11 +17896,13 @@ def _trigger_indexer_rebuild(user_id: str, reason: str = 'trigger', scope: str =
         if last is not None and (now - last) < _INDEXER_REBUILD_TRIGGER_COOLDOWN_SECONDS:
             return
         _INDEXER_REBUILD_TRIGGER_LAST[cooldown_key] = now
-    # Preferred: queue the build on the worker (see enqueue_index_build). The
-    # indexer HTTP path below is only the fallback when no queue is configured.
+    # Preferred: queue the build on the worker (see enqueue_index_build), and
+    # also try an inline merge in `core` for the bounded scopes (see
+    # dispatch_scoped_rebuild). The indexer HTTP path below is only the
+    # fallback when no queue is configured.
     if index_maintenance_queue_client is not None:
         try:
-            if enqueue_index_build(key, reason=reason, scope=scope) != 'unavailable':
+            if dispatch_scoped_rebuild(key, reason, scope) != 'unavailable':
                 return
         except Exception:
             worker_logger.exception('Failed to enqueue index build for %s', key)
@@ -16977,11 +17945,15 @@ def _prepare_ipwork_face_indexes(messages, cancelled) -> None:
             payload = json.loads(message.content or '{}')
         except (TypeError, ValueError):
             continue
+        if isinstance(payload, dict) and payload.get('type') == TAG_INDEX_MAINTENANCE_TYPE:
+            continue  # Model maintenance is never photo/face preparation.
         if not isinstance(payload, dict) or not isinstance(payload.get('steps'), list) or 'face' not in payload['steps']:
             continue
         user_id = str(payload.get('user_id') or payload.get('userId') or '').strip()
         filename = str(payload.get('filename') or '').strip()
         if not user_id or not filename:
+            continue
+        if _library_cut_over_to_waves(user_id):
             continue
         try:
             metadata = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
@@ -16989,7 +17961,7 @@ def _prepare_ipwork_face_indexes(messages, cancelled) -> None:
             continue
         if str(metadata.get('processing_state') or '').strip().lower() == 'deleted':
             continue
-        if (str(metadata.get('face_status') or '').strip().lower() in {'done', 'no_data', 'skipped', 'unsupported'}
+        if (str(metadata.get('face_status') or '').strip().lower() in {'done', 'no_data', 'skipped', 'unsupported', 'unrecoverable'}
                 and not _browser_processing_face_version_stale(metadata)):
             continue
         by_user.setdefault(user_id, set()).add(filename)
@@ -17051,7 +18023,13 @@ def run_ipworker() -> None:
     signal.signal(signal.SIGTERM, _handle_shutdown_signal)
     signal.signal(signal.SIGINT, _handle_shutdown_signal)
 
-    executor = ThreadPoolExecutor(max_workers=IPWORKER_CONCURRENCY, thread_name_prefix='ipwork')
+    from upload_wave_execution import execution_enabled
+    # Wave coordinators already use the process-wide source pool at
+    # IPWORKER_CONCURRENCY. Reserve only one queue delivery here so sibling
+    # replicas can claim other libraries instead of one replica leasing them
+    # all. Legacy per-photo work retains its configured concurrency.
+    queue_concurrency = 1 if execution_enabled() else IPWORKER_CONCURRENCY
+    executor = ThreadPoolExecutor(max_workers=queue_concurrency, thread_name_prefix='ipwork')
     # Time-based flush for _buffer_incremental_assign_filename's per-user
     # buffers -- a slow trickle of photos for one user would otherwise sit
     # buffered (and un-clustered) until the count cap is reached, which may
@@ -17070,7 +18048,7 @@ def run_ipworker() -> None:
         target=_run_incremental_assign_flush_loop, args=(shutdown_requested,),
         name='ipwork-cluster-batch-flush', daemon=True)
     incremental_assign_flush_thread.start()
-    batch_size = IPWORKER_FACE_RECONCILE_BATCH_SIZE
+    batch_size = 1 if execution_enabled() else IPWORKER_FACE_RECONCILE_BATCH_SIZE
     # One bounded wave at a time: at most batch_size queue messages held,
     # regardless of inference concurrency. No images/embeddings are prefetched.
     # Preparation runs off the queue thread so ACKs/signals stay responsive.
@@ -17083,10 +18061,12 @@ def run_ipworker() -> None:
     batch_received_at = None
     in_flight = {}  # future -> message
     task_started = {}
+    task_progress = {}  # Progress at source/page boundaries, never lease heartbeats.
+    wave_receipts = {}  # future -> last queue visibility renewal
     task_receipts = {}  # bounded by executor slots, monotonic timestamps only
     throughput = _IpworkThroughputWindow()
     processing_diagnostics.ready('vision', concurrency=IPWORKER_CONCURRENCY,
-        preparation_batch_size=batch_size)
+        preparation_batch_size=batch_size, queue_concurrency=queue_concurrency)
     collector = throughput.collector
     wave_started = None
     wave_receipt_at = None
@@ -17097,12 +18077,15 @@ def run_ipworker() -> None:
         collector.state(active_delta=1)
         previous = getattr(_ipwork_metrics_context, 'collector', None)
         _ipwork_metrics_context.collector = collector
+        previous_progress = getattr(_ipwork_metrics_context, 'wave_progress', None)
+        _ipwork_metrics_context.wave_progress = lambda: task_progress.__setitem__(message.id, time.monotonic())
         try:
             return _process_ipwork_message(message)
         finally:
             collector.observe('task', (time.monotonic() - started) * 1000)
             collector.state(active_delta=-1)
             _ipwork_metrics_context.collector = previous
+            _ipwork_metrics_context.wave_progress = previous_progress
 
     def prepare_measured(messages, cancelled):
         started = time.monotonic()
@@ -17179,9 +18162,22 @@ def run_ipworker() -> None:
                 # never detach a writer and ACK its message. Incomplete filename
                 # generations/processing leases expire; receipts redeliver.
                 now = time.monotonic()
+                # A healthy wave can finish its last source after its soft
+                # yield budget. Renew its queue receipt on the polling thread;
+                # acknowledgement must use the newest pop receipt.
+                for future, renewed_at in list(wave_receipts.items()):
+                    if not future.done() and now-renewed_at >= min(30, IPWORKER_VISIBILITY_TIMEOUT_SECONDS/3):
+                        current=in_flight[future]
+                        try:
+                            renewed=queue_client.update_message(current,visibility_timeout=IPWORKER_VISIBILITY_TIMEOUT_SECONDS)
+                            renewed.content=current.content
+                            in_flight[future]=renewed
+                            wave_receipts[future]=now
+                        except Exception:
+                            worker_logger.exception('Failed to renew wave Vision queue receipt')
                 stuck_preparation = preparing is not None and now >= prepare_deadline + 20
                 task_limit = min(IPWORKER_TASK_TIMEOUT_SECONDS, max(1, IPWORKER_VISIBILITY_TIMEOUT_SECONDS - 30))
-                stuck_tasks = sum(not future.done() and now - started >= task_limit
+                stuck_tasks = sum(not future.done() and now - max(started, task_progress.get(in_flight[future].id, started)) >= task_limit
                                   for future, started in task_started.items())
                 if stuck_preparation or stuck_tasks:
                     throughput.record('watchdog_preparation', count=int(stuck_preparation))
@@ -17198,7 +18194,7 @@ def run_ipworker() -> None:
                     break
 
                 if preparation_executor is not None and not shutdown_requested.is_set():
-                    while ready and len(in_flight) < IPWORKER_CONCURRENCY:
+                    while ready and len(in_flight) < queue_concurrency:
                         message = ready.popleft()
                         collector.state(ready=len(ready))
                         # Do not START work with an old visibility receipt.
@@ -17211,6 +18207,10 @@ def run_ipworker() -> None:
                         future = executor.submit(process_measured, message, wave_receipt_at)
                         in_flight[future] = message
                         task_started[future] = submitted_at
+                        try:
+                            if json.loads(message.content).get('type') in ('upload_wave_stage', TAG_INDEX_MAINTENANCE_TYPE):
+                                wave_receipts[future]=submitted_at
+                        except (ValueError,TypeError,AttributeError):pass
                         task_receipts[future] = wave_receipt_at
 
                 # Only fetch as many new messages as there are free worker
@@ -17222,7 +18222,7 @@ def run_ipworker() -> None:
                 # Once shutdown has been requested, stop claiming new work --
                 # each claimed message costs a full visibility timeout if it
                 # can't finish before the process exits.
-                free_slots = 0 if shutdown_requested.is_set() else min(IPWORKER_CONCURRENCY - len(in_flight), 32)
+                free_slots = 0 if shutdown_requested.is_set() else min(queue_concurrency - len(in_flight), 32)
                 if preparation_executor is not None:
                     # Only wait on `ready` and `preparing`, not `in_flight`: once
                     # every message from the current batch has been handed to the
@@ -17244,6 +18244,10 @@ def run_ipworker() -> None:
                             max_messages=free_slots,
                             visibility_timeout=IPWORKER_VISIBILITY_TIMEOUT_SECONDS,
                         ))
+                        if not messages and _promote_deferred_ipwork(queue_client):
+                            messages = list(queue_client.receive_messages(
+                                messages_per_page=free_slots, max_messages=free_slots,
+                                visibility_timeout=IPWORKER_VISIBILITY_TIMEOUT_SECONDS))
                     except Exception:
                         throughput.record('receive_failed', (time.monotonic() - receive_started) * 1000)
                         raise
@@ -17279,6 +18283,10 @@ def run_ipworker() -> None:
                             future = executor.submit(process_measured, message, received_at)
                             in_flight[future] = message
                             task_started[future] = submitted_at
+                            try:
+                                if json.loads(message.content).get('type') in ('upload_wave_stage', TAG_INDEX_MAINTENANCE_TYPE):
+                                    wave_receipts[future]=submitted_at
+                            except (ValueError,TypeError,AttributeError):pass
                             task_receipts[future] = received_at
 
                 if not in_flight and preparing is None and not ready:
@@ -17325,6 +18333,8 @@ def run_ipworker() -> None:
                         continue
                     message = in_flight.pop(future)
                     task_started.pop(future, None)
+                    task_progress.pop(message.id, None)
+                    wave_receipts.pop(future, None)
                     received_at = task_receipts.pop(future)
                     try:
                         outcome = future.result()
@@ -17351,6 +18361,12 @@ def run_ipworker() -> None:
                     if outcome == 'lease_busy' and int(getattr(message, 'dequeue_count', 0) or 0) < IPWORK_LEASE_RETRY_LIMIT:
                         continue
                     if outcome == 'error':
+                        continue
+                    if outcome in ('tag_index_retry', 'retry', 'wave_retry'):
+                        try:
+                            queue_client.update_message(message, visibility_timeout=10)
+                        except Exception:
+                            worker_logger.exception('Queue retry visibility update failed')
                         continue
                     # A real processing completion ('done', vs a noop/not_found
                     # that changed nothing) counts toward this user's rebuild
@@ -17437,11 +18453,14 @@ from routes.people import people_bp
 from routes.albums import albums_bp
 from routes.public import public_bp
 from routes.library import library_bp
+from routes.library_operations import library_operations_bp
 from routes.tools import tools_bp
 from routes.admin import admin_bp
 from routes.system import system_bp
 from routes.explore import explore_bp
 from routes.suggestions import suggestions_bp
+from routes.index_events import index_events_bp
+from routes.upload_sessions import upload_sessions_bp
 
 # 2026-09-15: service splits, following the modularity work above. Each
 # split group is registered on its own dedicated container app instead of
@@ -17474,29 +18493,18 @@ elif _app_role == 'recovery':
     # auth were ever bypassed there.
     app.register_blueprint(admin_bp)
 elif _app_role == 'archive':
-    # 2026-09-17: library/public split off the core role so core
-    # itself can shrink to a 0.5vCPU/1Gi tier sized for just the everyday
-    # gallery loop. These two carry the heavier secondary features (library
-    # export/clean orchestration and public share-link media streaming) that
-    # day-to-day browsing doesn't touch. people_bp moved back to 'core'
-    # (2026-10-08) once its one request-path full-account scan (get_person's
-    # old call into _load_user_face_summary_by_id) was replaced with a
-    # bounded fetch scoped to each person's own faceIds (_load_face_rows_by_ids)
-    # -- the remaining unbounded scan (merge's personId-ownership resolution)
-    # is accepted as a low-frequency, explicit, user-initiated cost, not a
-    # scroll/list-shaped one. See the removed list_persons/list_faces/
-    # suggestions routes' history for the two endpoints that were deleted
-    # outright rather than brought along (zero callers in the live frontend).
-    for _bp in (library_bp, public_bp):
+    # Compatibility window: older frontend bundles still send management here.
+    # Whole-library operations and public traffic remain archive-only.
+    for _bp in (library_bp, library_operations_bp, public_bp):
         app.register_blueprint(_bp)
 else:
     # system_bp stays here rather than moving to 'archive' -- it's negligible
     # weight (a handful of point lookups, including /health) and Container
     # Apps' default TCP probe doesn't need it, but losing a friendly
     # same-origin /health on core specifically wasn't worth it for zero
-    # real memory/CPU savings. people_bp joined this role 2026-10-08 (see the
-    # 'archive' branch's comment above).
-    for _bp in (auth_bp, photos_bp, albums_bp, system_bp, explore_bp, suggestions_bp, people_bp):
+    # real memory/CPU savings. people_bp joined this role 2026-10-08; library
+    # management joined 2026-11-02, leaving operations/public on archive.
+    for _bp in (auth_bp, photos_bp, albums_bp, system_bp, explore_bp, suggestions_bp, people_bp, library_bp, index_events_bp, upload_sessions_bp):
         app.register_blueprint(_bp)
 
 # Every role answers /health (system_bp only exists on the core role; upload has its own), so the

@@ -210,9 +210,14 @@ def order_photo_entries(
     if sort == 'location':
         ordered.sort(key=lambda name: name.lower())
     elif sort == 'rating':
-        ordered.sort(key=lambda name: numeric_key(name, 'rating'), reverse=True)
+        # Matches search_db.SearchDatabase._LIST_ORDER['rating']: rating DESC,
+        # likes DESC, capture_ts DESC, filename ASC.
+        ordered.sort(key=lambda name: (numeric_key(name, 'rating'), numeric_key(name, 'likes'), capture_key(name)),
+                     reverse=True)
     elif sort == 'likes':
-        ordered.sort(key=lambda name: numeric_key(name, 'likes'), reverse=True)
+        # Matches _LIST_ORDER['likes']: likes DESC, rating DESC, capture_ts DESC, filename ASC.
+        ordered.sort(key=lambda name: (numeric_key(name, 'likes'), numeric_key(name, 'rating'), capture_key(name)),
+                     reverse=True)
     elif sort == 'capture':
         ordered.sort(key=capture_key, reverse=True)
     else:  # 'date' and any unknown value: most recently uploaded first

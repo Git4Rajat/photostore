@@ -20,6 +20,11 @@ def worker(monkeypatch):
     monkeypatch.setattr(app, 'jobs_table_client', table)
     monkeypatch.setattr(app, 'index_maintenance_queue_client', SimpleNamespace(
         send_message=lambda body, **kw: sent.append(json.loads(body))))
+    # Delayed wakeups route to the deferred queue (see
+    # INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME) -- same sink here since these
+    # tests assert on message content/routing, not which physical queue.
+    monkeypatch.setattr(app, 'index_maintenance_deferred_queue_client', SimpleNamespace(
+        send_message=lambda body, **kw: sent.append(json.loads(body))))
     monkeypatch.setattr(app, 'library_ops_queue_client', SimpleNamespace(
         send_message=Mock(side_effect=AssertionError('legacy queue'))))
     monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **kw: statuses.append((a, kw)))
@@ -38,7 +43,10 @@ def test_queue_status_is_written_before_a_fast_consumer(worker, monkeypatch):
     def send(*args, **kwargs):
         assert worker.statuses[-1][0][3] == 'queued'
         app._upsert_job_status('job', 'A', app.INDEX_BUILD_JOB_TYPE, 'done')
+    # Default coalesce=True gives this a non-zero delay, so it routes to the
+    # deferred queue, not the main one -- patch both.
     monkeypatch.setattr(app, 'index_maintenance_queue_client', SimpleNamespace(send_message=send))
+    monkeypatch.setattr(app, 'index_maintenance_deferred_queue_client', SimpleNamespace(send_message=send))
     app.enqueue_index_build('A', scope='people')
     assert worker.statuses[-1][0][3] == 'done'
 
@@ -69,7 +77,7 @@ def test_tools_status_detects_a_scoped_job_without_a_full_job(worker, monkeypatc
 
 
 def test_read_poll_during_build_does_not_create_a_followup_loop(worker, monkeypatch):
-    app.enqueue_index_build('A', reason='person-label', scope='people')
+    app.enqueue_index_build('A', reason='person-label', scope='people', coalesce=False)
     def run(*args):
         assert app.enqueue_index_build('A', reason='serving-process', scope='people') == 'already_active'
     monkeypatch.setattr(app, '_run_index_build_job', run)
@@ -89,13 +97,27 @@ def test_read_poll_does_not_report_poison_revision_as_active(worker):
 
 
 def test_edit_during_build_gets_one_durable_followup(worker, monkeypatch):
-    app.enqueue_index_build('A', reason='person-label', scope='people')
+    app.enqueue_index_build('A', reason='person-label', scope='people', coalesce=False)
     runs = []
     def run(*args):
         runs.append(args)
         if len(runs) == 1:
-            assert app.enqueue_index_build('A', reason='person-label', scope='people') == 'already_active'
-            assert app.enqueue_index_build('A', reason='person-label', scope='people') == 'already_active'
+            assert app.enqueue_index_build('A', reason='person-label', scope='people', coalesce=False) == 'already_active'
+            assert app.enqueue_index_build('A', reason='person-label', scope='people', coalesce=False) == 'already_active'
+    monkeypatch.setattr(app, '_run_index_build_job', run)
+    app._run_index_maintenance_payload(worker.sent[0])
+    assert len(worker.sent) == 2
+    app._run_index_maintenance_payload(worker.sent[1])
+    assert len(runs) == 2 and worker.table.rows == {}
+
+
+def test_metadata_edit_during_search_build_gets_durable_followup(worker, monkeypatch):
+    app.enqueue_index_build('A', reason='metadata-change', scope='search', coalesce=False)
+    runs = []
+    def run(*args):
+        runs.append(args)
+        if len(runs) == 1:
+            assert app.enqueue_index_build('A', reason='metadata-change', scope='search', coalesce=False) == 'already_active'
     monkeypatch.setattr(app, '_run_index_build_job', run)
     app._run_index_maintenance_payload(worker.sent[0])
     assert len(worker.sent) == 2
@@ -129,8 +151,11 @@ def test_exhausted_old_wakeup_cannot_fail_the_new_revision_or_notification(worke
 
 
 def test_queue_failure_keeps_work_recoverable(worker, monkeypatch):
-    monkeypatch.setattr(app, 'index_maintenance_queue_client', SimpleNamespace(
-        send_message=Mock(side_effect=OSError('queue unavailable'))))
+    # Default coalesce=True gives this a non-zero delay, so it routes to the
+    # deferred queue, not the main one -- patch both to fail.
+    failing = SimpleNamespace(send_message=Mock(side_effect=OSError('queue unavailable')))
+    monkeypatch.setattr(app, 'index_maintenance_queue_client', failing)
+    monkeypatch.setattr(app, 'index_maintenance_deferred_queue_client', failing)
     assert app.enqueue_index_build('A', reason='person-label', scope='people') == 'unavailable'
     row = next(iter(worker.table.rows.values()))
     assert row['revision'] and not row['failed']
@@ -225,7 +250,7 @@ def test_rating_queues_only_search_sort_and_album_covers(source):
 
 def test_location_does_not_dirty_media_access_or_gallery_sort(source):
     app._update_metadata_entity_fields('A', 'one.jpg', {'locationCity': 'Paris'})
-    assert source.queued == [('A', 'search')]
+    assert source.queued == [('A', 'search'), ('A', 'vector')]
     su.touch_user_sort_index_state.assert_not_called()
     su.touch_user_access_index_state.assert_not_called()
 
@@ -247,7 +272,7 @@ def test_noop_edit_still_repairs_a_stale_derived_completion_flag(source):
 
 def test_unchanged_fields_in_a_real_edit_do_not_expand_dependencies(source):
     app._update_metadata_entity_fields('A', 'one.jpg', {'locationCity': 'Paris', 'rating': 0, 'tags': '[]'})
-    assert source.queued == [('A', 'search')]
+    assert source.queued == [('A', 'search'), ('A', 'vector')]
     su.touch_user_sort_index_state.assert_not_called()
     su.touch_user_tag_embedding_index_state.assert_not_called()
 

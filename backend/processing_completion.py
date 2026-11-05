@@ -7,33 +7,49 @@ Notifications can be lost; the row retains its intent until exact-ID ack.
 import hashlib
 import json
 import os
+import processing_metrics
 
 from azure.core import MatchConditions
 from azure.core.exceptions import ResourceModifiedError
 from azure.data.tables import UpdateMode
 
 STEPS = ('preview', 'thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face')
-TERMINAL = {'done', 'no_data', 'skipped', 'unsupported'}
-SCHEMA_VERSION = 4
+TERMINAL = {'done', 'no_data', 'skipped', 'unsupported', 'unrecoverable'}
+SCHEMA_VERSION = 5
 
 # Distinct provenance for a terminal step outcome -- missing provenance,
 # exhausted failures and unsupported/policy-excluded processing must not be
 # collapsed into one undifferentiated "terminal" bucket at the completion
 # layer. 'verified' is real model output; 'no_data' is a legitimate empty
 # result (e.g. zero faces); 'policy_excluded' is skipped/unsupported by
-# policy (e.g. every step on a video, which is browser-owned). There is
-# deliberately no 'retry_exhausted' outcome yet: a step stuck at 'failed'
-# is not in TERMINAL and blocks completion entirely -- the retry-exhaustion
-# settlement path is still open (see the artifact-receipts audit's
-# remaining release gates).
-PROVENANCE = {'done': 'verified', 'no_data': 'no_data', 'skipped': 'policy_excluded', 'unsupported': 'policy_excluded'}
+# policy on a step that IS required for this media type. 'unrecoverable' is a
+# step that ran and determined -- deterministically, not via a crash -- that
+# this file's data is missing, incomplete, or corrupted for that step (e.g. a
+# preview/thumbnail conversion that produced unusable output, an undecodable
+# image for OCR/face). Re-running the same code on the same bytes will reach
+# the same verdict, so it is terminal on the first attempt rather than
+# retried, but unlike 'no_data' (a clean, expected empty result) it is a
+# genuine failure the user may want to see and manually retry from Tools.
+# 'not_required' is a step outside this media type's required-step set
+# entirely (every step, for video -- see processing_generation.
+# required_steps_for_media) -- its status is a browser-ownership signal, not
+# a backend outcome, and is not constrained to TERMINAL at all (video's
+# finalize-time overrides leave thumbnail/exif at 'failed', which is not
+# itself a terminal value). A REQUIRED step still stuck at 'failed' (an
+# actual exception -- OOM, a transient infra/environment error) is NOT in
+# TERMINAL and blocks completion until the source's own retry budget is
+# exhausted (wave_settlement.MAX_SOURCE_ATTEMPTS).
+PROVENANCE = {'done': 'verified', 'no_data': 'no_data', 'skipped': 'policy_excluded', 'unsupported': 'policy_excluded',
+              'unrecoverable': 'unrecoverable'}
 
 
 class StaleProcessingResult(RuntimeError):
     pass
 
 
-def step_provenance(status):
+def step_provenance(status, *, required):
+    if not required:
+        return 'not_required'
     provenance = PROVENANCE.get(status)
     if provenance is None:
         raise ValueError(f'Status {status!r} has no completion provenance; it is not terminal')
@@ -56,7 +72,8 @@ def completion_identity(payload):
 
 def validate_intent(intent, library):
     keys = {'schemaVersion', 'library', 'filename', 'photoId', 'revision', 'generation', 'attempt',
-            'statuses', 'stepProvenance', 'faceCount', 'metadataDigest', 'derivatives', 'artifactReceipt'}
+            'statuses', 'requiredSteps', 'stepProvenance', 'faceCount', 'metadataDigest', 'derivatives',
+            'artifactReceipt'}
     if set(intent) - (keys | {'id', 'processingCompletionPending'}) or not keys <= set(intent):
         raise ValueError('Invalid source completion envelope')
     payload = {key: intent[key] for key in keys}
@@ -67,9 +84,18 @@ def validate_intent(intent, library):
             or any(char not in '0123456789abcdef' for char in payload['generation'])
             or not isinstance(payload['attempt'], str) or len(payload['attempt']) > 128
             or not isinstance(payload['statuses'], dict) or set(payload['statuses']) != set(STEPS)
-            or any(not isinstance(value, str) or value not in TERMINAL for value in payload['statuses'].values())
+            or any(not isinstance(value, str) for value in payload['statuses'].values())
+            or not isinstance(payload['requiredSteps'], list) or not set(payload['requiredSteps']) <= set(STEPS)
+            or len(set(payload['requiredSteps'])) != len(payload['requiredSteps'])):
+        raise ValueError('Invalid source completion identity or scope')
+    from image_utils import is_video_file
+    import processing_generation
+    required = set(processing_generation.required_steps_for_media(is_video_file(payload['filename'])))
+    if (set(payload['requiredSteps']) != required
+            or any(payload['statuses'][step] not in TERMINAL for step in required)
             or not isinstance(payload['stepProvenance'], dict) or set(payload['stepProvenance']) != set(STEPS)
-            or any(payload['stepProvenance'][step] != step_provenance(payload['statuses'][step]) for step in STEPS)
+            or any(payload['stepProvenance'][step] != step_provenance(payload['statuses'][step], required=step in required)
+                   for step in STEPS)
             or (payload['faceCount'] is not None and
                 (type(payload['faceCount']) is not int or payload['faceCount'] < 0))
             or not isinstance(payload['metadataDigest'], str) or len(payload['metadataDigest']) != 64
@@ -91,9 +117,18 @@ def validate_intent(intent, library):
 def prepare_completion(row):
     """Mutate a pending marker into the SAME row that its caller CAS commits.
 
-    Failed/time-out steps remain blocked; the legacy processing_complete flag
-    counts those as terminal but is insufficient evidence for wave readiness.
+    Only steps required for this row's media type (processing_generation.
+    required_steps_for_media) must be terminal to be eligible -- video's
+    required set is empty (it is browser-owned; finalize's own overrides
+    leave thumbnail/exif at 'failed', which is not itself a TERMINAL value,
+    so checking all seven unconditionally would block every video
+    forever). Failed/timed-out REQUIRED steps still block completion -- the
+    legacy processing_complete flag counts those as terminal but is
+    insufficient evidence for wave readiness.
     """
+    from image_utils import is_video_file
+    import processing_generation
+    required = processing_generation.required_steps_for_media(is_video_file(row.get('RowKey') or ''))
     revision = row.get('processingRevision')
     generation = row.get('processingGeneration')
     statuses = {step: row.get(step + '_status') for step in STEPS}
@@ -101,14 +136,15 @@ def prepare_completion(row):
         and row.get('processing_state') != 'deleted'
         and not row.get('processingIsolated')
         and not any(row.get(key) for key in ('processing_lease_owner', 'processing_lease', 'processing_lease_expires_at'))
-        and all(status in TERMINAL for status in statuses.values()))
+        and all(statuses[step] in TERMINAL for step in required))
     if not eligible:
         if revision or 'processingCompletionPending' in row:
             row['processingCompletionPending'] = ''
         return
     payload = dict(schemaVersion=SCHEMA_VERSION, library=row['PartitionKey'], filename=row['RowKey'],
         photoId=row['anonymousImageId'], revision=revision, generation=generation,
-        stepProvenance={step: step_provenance(statuses[step]) for step in STEPS},
+        requiredSteps=sorted(required),
+        stepProvenance={step: step_provenance(statuses[step], required=step in required) for step in STEPS},
         attempt=row.get('processingFence') or '',
         statuses=statuses, faceCount=row.get('faceCount'),
         artifactReceipt=json.loads(row['artifactReceipt']) if row.get('artifactReceipt') else None,
@@ -133,13 +169,22 @@ def prepare_completion(row):
     row['processingCompletionPending'] = '' if row.get('processingCompletionAck') == identity else identity
 
 
-def relay_completion(table, library, filename, deliver):
+def relay_completion(table, library, filename, deliver, *, committed=None, committed_etag=None):
     """Deliver at least once; acknowledge only the ID delivered, with its ETag.
 
     deliver MUST return the exact durable inbox record after idempotent acceptance.
     A lost response or a racing new completion leaves a recoverable pending row.
     """
-    row = table.get_entity(library, filename)
+    # A successful conditional metadata commit provides the exact outbox and
+    # its new ETag. Acknowledge against that version first; a racing edit falls
+    # back to a fresh read, never a blind overwrite of another generation.
+    snapshot = (committed is not None and isinstance(committed_etag, str)
+                and bool(committed_etag) and committed_etag != '*')
+    if snapshot and (committed.get('PartitionKey') != library or committed.get('RowKey') != filename):
+        raise ValueError('Committed completion source scope mismatch')
+    row = committed if snapshot else table.get_entity(library, filename)
+    if snapshot:
+        processing_metrics.add(completion_ack_snapshot_uses=1)
     backlog = json.loads(row.get('processingCompletionOutbox') or '[]')
     if not backlog:
         return False
@@ -151,21 +196,31 @@ def relay_completion(table, library, filename, deliver):
             'completionId': pending, 'libraryId': library, 'photoId': intent['photoId'],
             'processingRevision': intent['revision']}.items()):
         return False  # No exact durable acceptance receipt, so retain the outbox.
+    if snapshot:
+        try:
+            return _ack_completion(table, row, pending, etag=committed_etag, merge=True)
+        except ResourceModifiedError:
+            processing_metrics.add(completion_ack_snapshot_conflicts=1)
     current = table.get_entity(library, filename)
+    try:
+        return _ack_completion(table, current, pending)
+    except ResourceModifiedError:
+        return False
+
+
+def _ack_completion(table, current, pending, *, etag=None, merge=False):
     remaining = json.loads(current.get('processingCompletionOutbox') or '[]')
     if not any(item['id'] == pending for item in remaining):
         return False
     remaining = [item for item in remaining if item['id'] != pending]
-    version = getattr(current, 'metadata', {}).get('etag')
+    version = etag if etag is not None else getattr(current, 'metadata', {}).get('etag')
     if not version:
         raise RuntimeError('Source completion acknowledgement requires an ETag')
-    fields = dict(current, processingCompletionOutbox=json.dumps(remaining, sort_keys=True, separators=(',', ':')),
+    base = {key: current[key] for key in ('PartitionKey', 'RowKey')} if merge else current
+    fields = dict(base, processingCompletionOutbox=json.dumps(remaining, sort_keys=True, separators=(',', ':')),
         processingCompletionAck=pending)
     if current.get('processingCompletionPending') == pending:
         fields['processingCompletionPending'] = ''
-    try:
-        table.update_entity(fields, etag=version, mode=UpdateMode.REPLACE,
-            match_condition=MatchConditions.IfNotModified)
-    except ResourceModifiedError:
-        return False
+    table.update_entity(fields, etag=version, mode=UpdateMode.MERGE if merge else UpdateMode.REPLACE,
+                        match_condition=MatchConditions.IfNotModified)
     return True

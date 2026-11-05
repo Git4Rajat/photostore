@@ -1,115 +1,115 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import * as library from '../services/libraryClient';
 import AuthShell from './shared/AuthShell';
 
-// Public page reached from the "confirm cleanup" link in a library-clean
-// confirmation email:
-//   /confirm-library-clean?token=<token>
-// The caller must be signed in as the approver the link was addressed to;
-// the backend enforces that and returns a 401/403 otherwise.
+// Opening a link only reads status. Approval always requires an explicit click
+// by the authenticated recipient; consumed approvals remain readable on reload.
 const ConfirmLibraryCleanPage: React.FC = () => {
     const [searchParams] = useSearchParams();
     const token = searchParams.get('token') || '';
-    const [pending, setPending] = useState(false);
+    const [confirming, setConfirming] = useState(false);
     const [errorMessage, setErrorMessage] = useState('');
-    const [outcome, setOutcome] = useState<'idle' | 'awaiting_more_approvals' | 'queued' | 'done' | 'failed'>('idle');
-    const [jobId, setJobId] = useState('');
-    const [statusResult, setStatusResult] = useState<library.CleanStatusResult | null>(null);
-    const pollTimer = useRef<number | null>(null);
-    // Unbounded before this: a transient status-check error just kept polling
-    // forever at the same flat 3s interval with no ceiling. 100 attempts (~5
-    // min) comfortably covers a real cleanup job, which this page's own
-    // design already expects to finish in well under that.
-    const pollAttempts = useRef(0);
-    const MAX_POLL_ATTEMPTS = 100;
+    const [approvalError, setApprovalError] = useState('');
+    const [status, setStatus] = useState<library.CleanConfirmationStatus | null>(null);
+    const [refresh, setRefresh] = useState(0);
+
+    useEffect(() => { setApprovalError(''); }, [token]);
+
+    useEffect(() => {
+        setStatus(null);
+        setErrorMessage('');
+        if (!token) return;
+        let cancelled = false;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let failures = 0;
+        const poll = async () => {
+            try {
+                const result = await library.getLibraryCleanConfirmationStatus(token);
+                if (cancelled) return;
+                failures = 0;
+                setStatus(result);
+                setErrorMessage('');
+                if (['queued', 'running', 'awaiting_more_approvals', 'awaiting_start'].includes(result.status)) {
+                    timer = setTimeout(() => { void poll(); }, 3000);
+                }
+            } catch (error) {
+                if (cancelled) return;
+                setErrorMessage(error instanceof Error ? error.message : 'Could not load cleanup status.');
+                // Keep the last known status during temporary failures. Never
+                // turn a failed status lookup into another confirmation form.
+                failures += 1;
+                if (failures < 5) timer = setTimeout(() => { void poll(); }, 3000);
+            }
+        };
+        void poll();
+        return () => {
+            cancelled = true;
+            clearTimeout(timer);
+        };
+    }, [token, refresh]);
 
     const handleConfirm = async () => {
+        if (confirming) return;
+        setConfirming(true);
         setErrorMessage('');
-        setPending(true);
+        setApprovalError('');
         try {
-            const result = await library.confirmLibraryClean(token);
-            if (result.status === 'awaiting_more_approvals') {
-                setOutcome('awaiting_more_approvals');
-            } else if (result.jobId) {
-                setJobId(result.jobId);
-                setOutcome(result.queued ? 'queued' : 'done');
-            } else {
-                setOutcome('failed');
-                setErrorMessage('The cleanup could not be started.');
-            }
+            await library.confirmLibraryClean(token);
         } catch (error) {
-            setErrorMessage(error instanceof Error ? error.message : 'Could not confirm the cleanup.');
+            setApprovalError(error instanceof Error ? error.message : 'Could not confirm the cleanup.');
         } finally {
-            setPending(false);
+            // Also resolve an ambiguous POST outcome (e.g. its response was
+            // lost after approval): the saved request remains authoritative.
+            setStatus(null);
+            setRefresh((value) => value + 1);
+            setConfirming(false);
         }
     };
 
-    useEffect(() => {
-        if (!jobId || outcome === 'done' || outcome === 'failed') return undefined;
-        pollAttempts.current = 0;
-        const poll = async () => {
-            pollAttempts.current += 1;
-            try {
-                const result = await library.getLibraryCleanStatus(jobId);
-                setStatusResult(result);
-                if (result.status === 'done' || result.status === 'failed') {
-                    setOutcome(result.status as 'done' | 'failed');
-                    return;
-                }
-            } catch {
-                // Keep polling; a transient status-check failure isn't fatal.
-            }
-            if (pollAttempts.current >= MAX_POLL_ATTEMPTS) {
-                setOutcome('failed');
-                setErrorMessage('Lost track of the cleanup job’s status. It may still be running — check back later.');
-                return;
-            }
-            pollTimer.current = window.setTimeout(poll, 3000);
-        };
-        poll();
-        return () => {
-            if (pollTimer.current) window.clearTimeout(pollTimer.current);
-        };
-    }, [jobId, outcome]);
-
     return (
-        <AuthShell kicker="CONFIRM CLEANUP" title="Confirm library cleanup">
+        <AuthShell kicker="LIBRARY CLEANUP" title={status?.status === 'pending' ? 'Confirm library cleanup' : 'Library cleanup status'}>
             {!token ? (
                 <p className="status error">This link is missing its confirmation token.</p>
-            ) : outcome === 'idle' ? (
-                <div className="local-login">
-                    <p className="status error">
-                        This will permanently delete all photos and videos in this library. This cannot be undone.
-                    </p>
-                    {errorMessage && <p className="status error">{errorMessage}</p>}
-                    <button type="button" className="btn btn-soft danger" disabled={pending} onClick={handleConfirm}>
-                        {pending ? 'Confirming…' : 'Confirm cleanup'}
-                    </button>
-                    {/* Hard navigation: this page can render under a router that
-                        only knows the /confirm-library-clean route (see PrototypeApp). */}
-                    <button
-                        type="button"
-                        className="btn btn-link auth-page-link"
-                        onClick={() => { window.location.href = '/login'; }}
-                    >
-                        Back to sign in
-                    </button>
-                </div>
-            ) : outcome === 'awaiting_more_approvals' ? (
-                <p className="status success">
-                    Your confirmation was recorded. Cleanup will start once every required approver has confirmed.
-                </p>
-            ) : outcome === 'failed' ? (
-                <p className="status error">{statusResult?.error || errorMessage || 'The cleanup failed.'}</p>
-            ) : outcome === 'done' ? (
-                <p className="status success">
-                    Cleanup complete
-                    {statusResult?.result?.photosDeleted != null ? ` — ${statusResult.result.photosDeleted} photo(s)/video(s) removed.` : '.'}
-                </p>
             ) : (
-                <p className="status">Cleanup is running in the background…</p>
+                <>
+                    {errorMessage && <p className="status error">{errorMessage}</p>}
+                    {!status ? (
+                        !errorMessage && <p className="status">Checking cleanup status…</p>
+                    ) : status.status === 'pending' ? (
+                        <div className="local-login">
+                            {approvalError && <p className="status error">{approvalError}</p>}
+                            <p className="status error">
+                                This will permanently delete all photos and videos in this library. This cannot be undone.
+                            </p>
+                            <button type="button" className="btn btn-soft danger" disabled={confirming} onClick={handleConfirm}>
+                                {confirming ? 'Confirming…' : 'Confirm cleanup'}
+                            </button>
+                        </div>
+                    ) : status.status === 'awaiting_more_approvals' ? (
+                        <p className="status success">Your confirmation was recorded. Cleanup will start once every required approver has confirmed.</p>
+                    ) : status.status === 'awaiting_start' ? (
+                        <p className="status">Your confirmation was recorded. Waiting for cleanup to start…</p>
+                    ) : status.status === 'failed' ? (
+                        <p className="status error">{status.error || 'The cleanup failed.'}</p>
+                    ) : status.status === 'done' ? (
+                        <p className="status success">
+                            Cleanup complete
+                            {status.result?.photosDeleted != null ? ` — ${status.result.photosDeleted} photo(s)/video(s) removed.` : '.'}
+                        </p>
+                    ) : ['queued', 'running'].includes(status.status) ? (
+                        <p className="status">Cleanup is {status.status === 'queued' ? 'queued' : 'running in the background'}…</p>
+                    ) : (
+                        <p className="status">The saved cleanup status is currently unavailable.</p>
+                    )}
+                    {(errorMessage || status?.status === 'unknown') && (
+                        <button type="button" className="btn btn-soft" onClick={() => setRefresh((value) => value + 1)}>Refresh status</button>
+                    )}
+                </>
             )}
+            <button type="button" className="btn btn-link auth-page-link" onClick={() => { window.location.href = '/login'; }}>
+                Back to sign in
+            </button>
         </AuthShell>
     );
 };

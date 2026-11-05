@@ -54,7 +54,7 @@ def test_never_finalized_upload_is_deleted_not_just_tracking_cleared(metadata_ta
         metadata_table.get_entity('lib-A', 'IMG_9001.jpeg')
 
 
-def test_finalized_upload_only_clears_tracking_fields(metadata_table):
+def test_finalized_upload_only_clears_tracking_fields(metadata_table, monkeypatch):
     """A row that genuinely finished uploading (anonymousImageId stamped at
     finalize) but then stalled during processing must NOT be deleted on a
     fresh re-upload attempt -- only the transient upload-tracking fields."""
@@ -68,6 +68,9 @@ def test_finalized_upload_only_clears_tracking_fields(metadata_table):
         pendingAnonymousBlob='stale-should-be-cleared',
     )
 
+    deleted=[]
+    monkeypatch.setattr(app, '_delete_photo_blobs_if_present',
+                        lambda name, extra=None: deleted.append((name,extra)) or [])
     result = app._cleanup_failed_upload('lib-A', 'IMG_9434.jpeg')
 
     assert result['metadataAction'] == 'trackingCleared'
@@ -75,6 +78,7 @@ def test_finalized_upload_only_clears_tracking_fields(metadata_table):
     assert 'pendingAnonymousBlob' not in stored
     assert stored['anonymousImageId'] == 'real-anon-uuid'
     assert stored['thumbnail_status'] == 'running'
+    assert deleted == [('stale-should-be-cleared',None)]
 
 
 def test_row_with_no_upload_tracking_is_left_alone(metadata_table):

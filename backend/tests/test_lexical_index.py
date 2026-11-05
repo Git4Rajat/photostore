@@ -16,7 +16,10 @@ import gzip
 import json
 import threading
 import time
+from types import SimpleNamespace
 
+from azure.core import MatchConditions
+from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
 import pytest
 
 import app
@@ -30,12 +33,27 @@ class _FakeBlob:
         self._store = store
         self._key = key
 
-    def upload_blob(self, data, overwrite=True, content_settings=None):
+    def get_blob_properties(self):
+        if self._key not in self._store:
+            raise ResourceNotFoundError(self._key)
+        data = self._store[self._key]
+        return SimpleNamespace(size=len(data), etag=str(hash(data)))
+
+    def _check(self, options):
+        if 'etag' in options:
+            assert options['match_condition'] == MatchConditions.IfNotModified
+            if options['etag'] != self.get_blob_properties().etag:
+                raise ResourceModifiedError('CAS conflict')
+
+    def upload_blob(self, data, overwrite=True, content_settings=None, **options):
+        self._check(options)
+        if not overwrite and self._key in self._store:
+            raise ResourceExistsError(self._key)
         self._store[self._key] = data
 
-    def download_blob(self):
-        if self._key not in self._store:
-            raise KeyError(self._key)
+    def download_blob(self, **options):
+        self._check(options)
+        self.get_blob_properties()
         return _Downloaded(self._store[self._key])
 
     def delete_blob(self):
@@ -65,6 +83,9 @@ def _seed_row(table: FakeTable, user_id: str, filename: str, **overrides) -> Non
 
 @pytest.fixture
 def lexical_ctx(monkeypatch):
+    import search_db
+    # Lexical tests do not exercise SQLite's independent storage setup.
+    monkeypatch.setattr(search_db, 'write_for_snapshot', lambda *args: True)
     table = FakeTable()
     blob_service = _FakeBlobServiceClient()
     monkeypatch.setitem(storage_utils._CTX, 'metadata_table_client', table)
@@ -208,17 +229,19 @@ def test_touch_marks_dirty_and_serves_stale_while_rebuilding_in_background(lexic
     immediate = storage_utils.get_user_lexical_index('lib-E', allow_refresh=True)
     assert sorted(row['RowKey'] for row in immediate['rows']) == ['a.jpg']
 
-    lock = storage_utils._LEXICAL_INDEX_REBUILD_LOCKS.lock_for('lib-E')
+    # _rebuild_lexical_index_in_background's lock is only held long enough to
+    # coalesce a *second* concurrent kick-off -- acquire_and_track releases it
+    # on the calling thread's `with` exit, right after the worker thread is
+    # *started*, not when that thread finishes. Polling the lock therefore
+    # only proves a rebuild was launched, not that it completed; poll the
+    # actual observable outcome instead.
     for _ in range(50):
-        if lock.acquire(blocking=False):
-            lock.release()
+        result = storage_utils.get_user_lexical_index('lib-E', allow_refresh=True)
+        if sorted(row['RowKey'] for row in result['rows']) == ['a.jpg', 'b.jpg']:
             break
         time.sleep(0.05)
     else:
         pytest.fail('background lexical index rebuild never completed')
-
-    result = storage_utils.get_user_lexical_index('lib-E', allow_refresh=True)
-    assert sorted(row['RowKey'] for row in result['rows']) == ['a.jpg', 'b.jpg']
 
 
 def test_touch_user_lexical_index_state_is_a_safe_noop_without_blob_client(monkeypatch):
@@ -350,17 +373,16 @@ def test_get_user_lexical_index_cold_non_blocking_returns_none_then_builds_in_ba
     result = storage_utils.get_user_lexical_index('lib-cold', allow_refresh=True, allow_sync_build=False)
     assert result is None  # did NOT block on a synchronous build
 
-    lock = storage_utils._LEXICAL_INDEX_REBUILD_LOCKS.lock_for('lib-cold')
+    # See test_touch_marks_dirty_and_serves_stale_while_rebuilding_in_background:
+    # the rebuild lock is released as soon as the background thread is
+    # started, not when it finishes -- poll the actual outcome instead.
     for _ in range(50):
-        if lock.acquire(blocking=False):
-            lock.release()
+        built = storage_utils.get_user_lexical_index('lib-cold', allow_refresh=False)
+        if built is not None:
             break
         time.sleep(0.05)
     else:
         pytest.fail('background lexical index build never completed')
-
-    built = storage_utils.get_user_lexical_index('lib-cold', allow_refresh=False)
-    assert built is not None
     assert [row['RowKey'] for row in built['rows']] == ['a.jpg']
 
 

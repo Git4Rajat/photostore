@@ -4,7 +4,7 @@ import re
 import pytest
 from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
 
-from index_work import DirtySnapshot, WorkStore, acknowledge_dirty
+from index_work import DirtySnapshot, WorkStore, WakeupContention, acknowledge_dirty
 
 
 class Entity(dict):
@@ -61,12 +61,21 @@ class EtagTable:
         pk = query.split("'")[1]
         with self.lock:
             rows = [Entity(row, self.versions[key]) for key, row in self.rows.items() if key[0] == pk]
+        rows.sort(key=lambda r: str(r.get('RowKey', '')))
         if ' and libraryId eq ' in query:
             library = query.split(' and libraryId eq ')[1].split("'")[1]
             rows = [row for row in rows if row.get('libraryId') == library]
         if 'failed eq false' in query:
             rows = [row for row in rows if not row.get('failed')]
-        for field in ('leaseUntil', 'wakeUntil'):
+        if 'failed eq true' in query:
+            rows = [row for row in rows if row.get('failed')]
+        m_gt = re.search(r"RowKey gt '([^']*)'", query)
+        if m_gt:
+            rows = [row for row in rows if str(row.get('RowKey', '')) > m_gt.group(1)]
+        m_le = re.search(r"RowKey le '([^']*)'", query)
+        if m_le:
+            rows = [row for row in rows if str(row.get('RowKey', '')) <= m_le.group(1)]
+        for field in ('leaseUntil', 'wakeUntil', 'requestedAt', 'failedAt'):
             match = re.search(rf'{field} le ([0-9.]+)', query)
             if match:
                 rows = [row for row in rows if float(row.get(field) or 0) <= float(match[1])]
@@ -75,6 +84,8 @@ class EtagTable:
 
 @pytest.fixture
 def work():
+    from index_work import _RECOVERY_CURSORS
+    _RECOVERY_CURSORS.clear()
     table = EtagTable()
     now = [1000.0]
     return WorkStore(table, clock=lambda: now[0]), table, now
@@ -89,6 +100,24 @@ def test_reserved_work_cannot_starve_later_libraries(work):
     sent = []
     assert store.recover(lambda *args: sent.append(args), limit=1) == 1
     assert sent[0][0] == 'ready'
+
+
+def test_wave_waiting_work_cannot_starve_later_libraries(work, monkeypatch):
+    import automatic_index_updates as automatic
+    monkeypatch.setattr(automatic, 'wave_pending', lambda lib: lib.startswith('wave-'))
+    store, _, now = work
+    # 105 rows waiting for active upload waves with expired wakeUntil
+    for i in range(105):
+        key = store.request(f'wave-{i}', 'vector')
+        claim = store.claim(key)
+        store.release(claim, deferred=True, retry_delay=0, retry_reason='wave_wait')
+        # Simulate elapsed backup wake timer
+        row = store._get(key)
+        store._replace(row, dict(row, wakeUntil=now[0]))
+    store.request('unrelated-ready', 'search')
+    sent = []
+    assert store.recover(lambda *args: sent.append(args), limit=1) == 1
+    assert sent[0][0] == 'unrelated-ready'
 
 
 def test_dirty_ack_keeps_conditional_deletes_batched():
@@ -206,6 +235,47 @@ def test_failure_budget_does_not_restart_until_new_request(work):
     assert store.claim(key) is not None
 
 
+def test_notify_raises_a_distinct_type_for_reservation_contention(work):
+    store, _, _ = work
+    key = store.request('contended', 'people')
+    monkeypatched_replace_calls = []
+    def always_conflicts(current, row):
+        monkeypatched_replace_calls.append(1)
+        raise ResourceModifiedError('conflict')
+    store._replace = always_conflicts
+    with pytest.raises(WakeupContention):
+        store.notify(key, lambda *a: None)
+    assert len(monkeypatched_replace_calls) == 12
+
+
+def test_reservation_contention_does_not_abort_the_recover_batch(work):
+    store, _, _ = work
+    store.request('contended', 'people')
+    store.request('healthy', 'people')
+    original_replace = store._replace
+    def conflict_only_for_contended(current, row):
+        if row.get('libraryId') == 'contended':
+            raise ResourceModifiedError('conflict')
+        return original_replace(current, row)
+    store._replace = conflict_only_for_contended
+    sent = []
+    assert store.recover(lambda library, *rest: sent.append(library)) == 1
+    assert sent == ['healthy']
+
+
+def test_one_poison_row_does_not_abort_the_rest_of_the_batch(work):
+    store, _, _ = work
+    store.request('poison', 'people')
+    store.request('healthy', 'people')
+    sent = []
+    def send(library, *rest):
+        if library == 'poison':
+            raise RuntimeError('queue unavailable for this stage')
+        sent.append(library)
+    assert store.recover(send) == 1
+    assert sent == ['healthy']
+
+
 def test_old_failure_cannot_poison_a_new_revision(work):
     store, _, _ = work
     key = store.request('A', 'people')
@@ -241,3 +311,146 @@ def test_ack_subset_does_not_clear_other_work():
 def test_unversioned_snapshot_fails_closed():
     with pytest.raises(RuntimeError, match='ETag'):
         acknowledge_dirty(EtagTable(), DirtySnapshot([{'PartitionKey': 'A', 'RowKey': 'one'}]))
+
+
+def test_healthy_deferred_barrier_waits_do_not_exhaust_work_attempts(work):
+    store,table,now=work
+    key=store.request('u','wave-vision:w:key')
+    for _ in range(10):
+        claim=store.claim(key)
+        assert claim.attempt==1
+        store.release(claim,deferred=True)
+        now[0]+=200
+    claim=store.claim(key)
+    store.release(claim)  # A real error remains charged.
+    now[0]+=200
+    claim=store.claim(key)
+    assert claim.attempt==2
+    store.release(claim,deferred=True)
+    now[0]+=200
+    assert store.claim(key).attempt==2
+
+
+def test_verified_progress_resets_failures_only_for_the_claimed_revision(work):
+    store, _, _ = work
+    key = store.request('A', 'wave-vision:w:key')
+    first = store.claim(key)
+    store.release(first)
+    second = store.claim(key)
+    assert second.attempt == 2
+    store.release(second, deferred=True, reset_attempts=True)
+    third = store.claim(key)
+    assert third.attempt == 1
+    store.request('A', 'wave-vision:w:key')
+    newer = store._get(key)
+    store.release(third, deferred=True, reset_attempts=True)
+    assert store._get(key)['attemptRevision'] == newer['attemptRevision']
+    assert store._get(key)['attempts'] == newer['attempts']
+
+
+def test_failure_cannot_reset_its_own_attempt_budget(work):
+    store, _, _ = work
+    key = store.request('A', 'wave-vision:w:key')
+    claim = store.claim(key)
+    with pytest.raises(ValueError, match='verified progress'):
+        store.release(claim, reset_attempts=True)
+    assert store._get(key)['owner'] == claim.owner
+
+
+def test_retry_timing_is_piggybacked_consumed_once_and_invalidated_by_new_revision(work):
+    store, table, now = work
+    key = store.request('A', 'wave-vision:wave:outbox')
+    first = store.claim(key)
+    calls = []
+    original_get, original_update = table.get_entity, table.update_entity
+    table.get_entity = lambda *a: (calls.append('get'), original_get(*a))[1]
+    table.update_entity = lambda *a, **kw: (calls.append('update'), original_update(*a, **kw))[1]
+    store.release(first, retry_delay=2, retry_reason='coordination_conflict')
+    assert calls == ['get', 'update']  # No telemetry read or write.
+    now[0] += 7
+    second = store.claim(key)
+    assert second.scheduled_at == 1000 and second.scheduled_delay == 2
+    assert second.schedule_id and second.schedule_reason == 'coordination_conflict'
+    store.release(second)
+    third = store.claim(key)
+    assert third.schedule_id == ''  # Duplicate delivery cannot reuse old timing.
+    store.release(third, retry_delay=2)
+    store.request('A', 'wave-vision:wave:outbox')
+    fourth = store.claim(key)
+    assert fourth.schedule_id == ''  # A newer requested revision has another origin.
+
+
+def test_malformed_optional_retry_telemetry_cannot_block_a_claim(work):
+    store, table, _ = work
+    key = store.request('A', 'scope')
+    current = store._get(key)
+    table.update_entity(dict(current, retryScheduledAt='invalid', retryDelaySeconds='invalid',
+        retryScheduleRevision=current['revision'], retryScheduleId='invalid'), etag=current.metadata['etag'])
+    claim = store.claim(key)
+    assert claim and not claim.schedule_id
+
+
+def test_wave_handoff_lost_send_response_replays_same_operation_without_timer(work):
+    store, table, now = work
+    key = store.request('A', 'vector')
+    claim = store.claim(key)
+    store.release(claim, deferred=True, retry_reason='wave_wait')
+    accepted = []
+    def lost_response(*args):
+        accepted.append(args)  # Queue accepted, but the client cannot prove it.
+        raise OSError('send response lost')
+    with pytest.raises(OSError, match='response lost'):
+        store.resume_wave_waits('A', lost_response, scopes={'vector'})
+    assert store._get(key)['retryReason'] == 'wave_wait'
+    assert store.resume_wave_waits('A', lambda *args: accepted.append(args), scopes={'vector'}) == 1
+    assert accepted[0] == accepted[1]
+    assert now[0] == 1000.0
+    assert store.resume_wave_waits('A', lambda *args: pytest.fail('handoff already accepted'),
+        scopes={'vector'}) == 0
+
+
+def test_recovery_cursor_advances_past_large_waiting_backlog(work, monkeypatch):
+    import automatic_index_updates as automatic
+    monkeypatch.setattr(automatic, 'wave_pending', lambda lib: lib.startswith('waiting-'))
+    store, table, now = work
+
+    # Insert 1050 waiting rows with row keys sorted 'w-0000' ... 'w-1049'
+    for i in range(1050):
+        key = f'w-{i:04d}'
+        table.create_entity({
+            'PartitionKey': store.partition,
+            'RowKey': key,
+            'libraryId': f'waiting-{i}',
+            'scope': 'vector',
+            'revision': 'rev',
+            'failed': False,
+            'leaseUntil': 0.0,
+            'wakeUntil': 0.0,
+            'notBefore': 0.0,
+            'retryReason': 'wave_wait',
+        })
+
+    # Insert 1 runnable row with row key 'z-runnable' (after all waiting rows)
+    table.create_entity({
+        'PartitionKey': store.partition,
+        'RowKey': 'z-runnable',
+        'libraryId': 'runnable',
+        'scope': 'search',
+        'revision': 'rev',
+        'failed': False,
+        'leaseUntil': 0.0,
+        'wakeUntil': 0.0,
+        'notBefore': 0.0,
+        'retryReason': '',
+    })
+
+    sent = []
+    # Pass 1: max_scan is 1000. It scans first 1000 waiting rows and stops.
+    assert store.recover(lambda *args: sent.append(args), limit=1) == 0
+    assert not sent
+
+    # Pass 2: With cursor tracking, it resumes from cursor ('w-0999')
+    # scans remaining 50 waiting rows and finds 'z-runnable'!
+    assert store.recover(lambda *args: sent.append(args), limit=1) == 1
+    assert len(sent) == 1
+    assert sent[0][0] == 'runnable'

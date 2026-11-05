@@ -12,6 +12,46 @@ import app
 
 admin_bp = Blueprint('admin', __name__)
 
+@admin_bp.route('/api/admin/indexes/source-reservations', methods=['POST'])
+def recover_source_reservations():
+    library, error = app._require_admin(require_auth=True)
+    if error:
+        return error
+    operator, _library, error = app._require_library_context(require_auth=True)
+    if error:
+        return error
+    import automatic_index_updates as automatic
+    from index_artifact_cleanup import artifact_catalog_serialization
+    data = app.request.get_json(silent=True) or {}
+    action = data.get('action')
+    try:
+        if action == 'fence':
+            result = automatic.operator_fence(library, operator=operator, reason=data.get('reason'))
+        else:
+            fence = data.get('fenceId')
+            if not isinstance(fence, str) or not fence:
+                raise ValueError('fenceId required')
+            with artifact_catalog_serialization(library, storage=app.storage_utils_module) as guard:
+                if action == 'prove':
+                    if data.get('confirm') != 'ALL_LIBRARY_WRITERS_STOPPED':
+                        raise ValueError('ALL_LIBRARY_WRITERS_STOPPED confirmation required')
+                    result = automatic.operator_prove(library, fence, guard=guard, operator=operator,
+                        reason=data.get('reason'), all_writers_stopped=data.get('allWritersStopped'),
+                        no_paused_requests=data.get('noPausedRequests'),
+                        legacy_writers_stopped=data.get('legacyWritersStopped'))
+                elif action == 'recover':
+                    result = automatic.recover_quiesced_source_reservations(library, guard=guard, fence_id=fence)
+                elif action == 'resume':
+                    result = automatic.resume_quiesced_sources(library, guard=guard, fence_id=fence)
+                else:
+                    raise ValueError('Unknown recovery action')
+        return app.jsonify(result)
+    except ValueError as exc:
+        return app.jsonify({'error': str(exc)}), 400
+    except Exception as exc:
+        app.worker_logger.warning('Quiesced index recovery deferred', exc_info=True)
+        return app.jsonify({'error': str(exc), 'status': 'deferred'}), 409
+
 @admin_bp.route('/api/admin/people/recluster', methods=['POST'])
 @admin_bp.route('/admin/people/recluster', methods=['POST'])
 def admin_recluster_people():

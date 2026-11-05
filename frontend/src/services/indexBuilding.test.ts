@@ -1,13 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const getMock = vi.fn();
-vi.mock('./apiClient', () => ({ get: (...args: unknown[]) => getMock(...args) }));
+const coreGetMock = vi.fn();
+vi.mock('./apiClient', () => ({
+    get: (...args: unknown[]) => coreGetMock(...args),
+    getTools: (...args: unknown[]) => getMock(...args),
+}));
 
 import { __resetIndexBuildingForTests, onIndexReady, reportIndexBuilding } from './indexBuilding';
 
 // useIndexBuilding is a thin useSyncExternalStore wrapper; the behaviour lives in report/poll.
 describe('indexBuilding', () => {
-    beforeEach(() => { vi.useFakeTimers(); getMock.mockReset(); __resetIndexBuildingForTests(); });
+    beforeEach(() => { vi.useFakeTimers(); getMock.mockReset(); coreGetMock.mockReset(); __resetIndexBuildingForTests(); });
     afterEach(() => { __resetIndexBuildingForTests(); vi.useRealTimers(); });
 
     it('polls index-status while the library builds, then clears and tells listeners once it is ready', async () => {
@@ -20,6 +24,8 @@ describe('indexBuilding', () => {
 
         await vi.advanceTimersByTimeAsync(8000);
         expect(getMock).toHaveBeenCalledTimes(1);
+        expect(getMock).toHaveBeenCalledWith('/api/tools/indexes/status');
+        expect(coreGetMock).not.toHaveBeenCalled();
         expect(ready).not.toHaveBeenCalled();                    // still building
 
         await vi.advanceTimersByTimeAsync(8000);

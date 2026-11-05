@@ -46,7 +46,9 @@ describe('index-backed gallery', () => {
         __resetPendingEditsForTests();
         __resetAlbumOperationsForTests();
         mocks.get.mockReset().mockResolvedValue({ years: {} });
-        mocks.post.mockReset().mockResolvedValue({ photos: [] });
+        mocks.post.mockReset().mockImplementation(async (path: string, data: {filenames?: string[]}) => (
+            path === '/photos/rate-multiple' ? {rated: data.filenames || []} : {photos: []}
+        ));
         mocks.index.mockReset().mockResolvedValue(rows());
         mocks.token.mockReset().mockResolvedValue({ baseUrl: 'https://storage.invalid', sas: 'token' });
         mocks.albumsIndex.mockReset().mockResolvedValue([]);
@@ -489,6 +491,40 @@ describe('index-backed gallery', () => {
         expect(mocks.poll).toHaveBeenCalledTimes(1);
         await act(async () => { store.toggleLike('p0.jpg'); });
         expect(mocks.poll).toHaveBeenCalledTimes(2);
+    });
+
+    it('confirms only saved bulk ratings and rolls back the failed files', async () => {
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await waitFor(() => expect(store.photosLoading).toBe(false));
+        mocks.post.mockResolvedValueOnce({rated: ['p0.jpg'], errors: ['p1.jpg: Could not save rating']});
+        await act(async () => { store.ratePhotos(['p0.jpg', 'p1.jpg'], 5); });
+        expect(store.photoById('p0.jpg')?.rating).toBe(5);
+        expect(store.photoById('p1.jpg')?.rating).toBe(3);
+        await act(async () => { store.reloadPhotos(); });
+        await waitFor(() => expect(store.photosLoading).toBe(false));
+        expect(store.photoById('p0.jpg')?.rating).toBe(5);
+        expect(store.photoById('p1.jpg')?.rating).toBe(3);
+    });
+
+    it('does not retain an optimistic rating when no file was saved', async () => {
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await waitFor(() => expect(store.photosLoading).toBe(false));
+        mocks.post.mockResolvedValueOnce({rated: [], success: false});
+        await act(async () => { store.ratePhotos(['p0.jpg'], 5); });
+        expect(store.photoById('p0.jpg')?.rating).toBe(3);
+    });
+
+    it('resends the same desired like state after an ambiguous failure', async () => {
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await waitFor(() => expect(store.photosLoading).toBe(false));
+        mocks.post.mockRejectedValueOnce(new Error('response lost after commit'));
+        await act(async () => { store.toggleLike('p0.jpg'); });
+        expect(store.photoById('p0.jpg')?.liked).toBe(true);
+        mocks.post.mockResolvedValueOnce({liked: false, likes: 0});
+        await act(async () => { store.toggleLike('p0.jpg'); });
+        const likes = mocks.post.mock.calls.filter(([path]) => path.endsWith('/like'));
+        expect(likes.map(([, data]) => data)).toEqual([{liked: false}, {liked: false}]);
+        expect(store.photoById('p0.jpg')?.liked).toBe(false);
     });
 
     it('date jumps and rating filters stay index-only', async () => {

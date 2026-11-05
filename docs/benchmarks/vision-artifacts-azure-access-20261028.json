@@ -1,0 +1,12 @@
+{
+  "container": "vision-receipt-validation-a1c5c52fdd914592",
+  "scope": "/subscriptions/c14d0e72-4b72-429d-bf2a-8cede087b9a8/resourceGroups/forenklaprep1-dev-rg/providers/Microsoft.Storage/storageAccounts/forenklaprep1devmqwhngus/blobServices/default/containers/vision-receipt-validation-a1c5c52fdd914592",
+  "assignment_id": "/subscriptions/c14d0e72-4b72-429d-bf2a-8cede087b9a8/resourceGroups/forenklaprep1-dev-rg/providers/Microsoft.Storage/storageAccounts/forenklaprep1devmqwhngus/blobServices/default/containers/vision-receipt-validation-a1c5c52fdd914592/providers/Microsoft.Authorization/roleAssignments/145e8319-d133-45de-8819-8bf2bb8cfc86",
+  "principal": "73312e38-b31d-4f16-bab1-a51e5a22caf6",
+  "role": "Storage Blob Data Contributor",
+  "role_removed": true,
+  "container_removed": true,
+  "validation_exit_code": 0,
+  "finished_utc": "2026-10-28T16:46:49.086374+00:00",
+  "role_cleanup_verified_utc": "2026-10-28T16:47:01.451812+00:00"
+}

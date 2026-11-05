@@ -1,8 +1,8 @@
 """Uninterrupted reference orchestration for the existing real FAISS matcher.
 
 Intentionally does not use batch(), restart, checkpoint or production queue
-grouping. This qualifies current chunk orchestration, not the future wave
-decision journal/source-fencing protocol. Fixed fixtures also assert expected
+grouping. This is the comparison target for legacy chunk and journaled wave execution;
+source fencing and publication are covered by their integration tests. Fixed fixtures also assert expected
 identity relationships so comparing two equally wrong runs isn't sufficient.
 """
 import json

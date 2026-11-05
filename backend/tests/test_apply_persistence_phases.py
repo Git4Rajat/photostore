@@ -77,6 +77,18 @@ def test_mixed_results_build_semantic_inputs_once_with_identical_final_values(ap
     assert metadata.rows[('private-user', 'private.jpg')]['processing_lease_owner'] == ''
 
 
+def test_unfenced_browser_result_defers_redundant_text_embedding_write(apply_context):
+    metadata, embeddings, encoded = apply_context
+    result = storage_utils.apply_client_processing_results_for_file(
+        'private-user', 'private.jpg', origin='browser', claimed_steps=['ocr'],
+        client_processing={'ocr': {'hasData': True, 'text': 'browser text'}})
+    assert result['ocrText'] == 'browser text'
+    assert result['ocr_status'] == 'done'
+    assert len(encoded) == 1
+    assert ('private-user', 'private.jpg') not in embeddings.rows
+    assert metadata.rows[('private-user', 'private.jpg')]['semanticText']
+
+
 def test_apply_phases_separate_cpu_storage_and_index_work(apply_context, monkeypatch, caplog):
     caplog.set_level(logging.INFO, logger='processing_diagnostics')
     table = apply_context[0]
@@ -88,10 +100,17 @@ def test_apply_phases_separate_cpu_storage_and_index_work(apply_context, monkeyp
     with perf_instrumentation.scope('test'):
         apply({'ocr': {'hasData': True, 'text': 'private document text'}})
     rows = events(caplog)
-    assert [row['phase'] for row in rows] == ['semantic_refresh', 'embedding_write', 'metadata_cas', 'index_dirty']
+    # Four more granular phases (lease_and_policy_check/metadata_merge/
+    # completion_validation/completion_delivery) were added between
+    # semantic/embedding work and the metadata_cas write since this was
+    # written; none of them do I/O, so the CPU/storage split this test
+    # guards still holds.
+    assert [row['phase'] for row in rows] == [
+        'semantic_refresh', 'embedding_write', 'lease_and_policy_check', 'metadata_merge',
+        'completion_validation', 'metadata_cas', 'completion_delivery', 'index_dirty']
     assert all(row['outcome'] == 'success' and row['milliseconds'] >= 0 and row['thread_cpu_ms'] >= 0 for row in rows)
-    assert [row['sdk_calls'] for row in rows] == [0, 0, 1, 0]
-    assert rows[2]['sdk_send_ms'] == 12
+    assert [row['sdk_calls'] for row in rows] == [0, 0, 0, 0, 0, 1, 0, 0]
+    assert rows[5]['sdk_send_ms'] == 12
     assert all(secret not in json.dumps(rows) for secret in ('private-user', 'private.jpg', 'private document text'))
 
 

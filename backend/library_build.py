@@ -208,8 +208,8 @@ def bootstrap_library_build(
                 sort_row = su._sort_index_row(dict(row))
                 if sort_row is not None:
                     sort_rows.append(sort_row)
-                # Every non-deleted photo is listed, processed or not: the gallery/Workbench/album covers
-                # read this database, and a just-uploaded photo must show up before its OCR/face steps finish.
+                # Finalized and legacy photos are listed before processing finishes;
+                # row_record excludes reservations that have not finalized.
                 record = search_db.row_record(row)
                 if record is not None:
                     upserts.append(record)

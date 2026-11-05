@@ -1,11 +1,13 @@
 """Guards tests/fixtures/lexical_search_parity.json against silent drift.
 
-This fixture is the shared contract with the TypeScript port of lexical
-search (frontend/src/services/localLexicalSearch.ts, used for client-side
-/photos/search -- see backend-cpu-optimization-2026-09 memory). If this test
-fails, search_utils.py's scoring changed without regenerating the fixture:
-run `python scripts/generate_lexical_search_parity_fixtures.py`, then update
-localLexicalSearch.ts to match the new behavior before committing either.
+Originally the shared contract with a TypeScript port of lexical search
+(frontend/src/services/localLexicalSearch.ts, client-side /photos/search) --
+that port and its own parity test were removed in 70deac5 ("Remove
+browser-side search"), so this is now a plain golden-fixture regression
+test for search_utils.py's scoring alone. If this test fails,
+search_utils.py's scoring changed without regenerating the fixture: run
+`python scripts/generate_lexical_search_parity_fixtures.py` and commit the
+result after confirming the new scores are intentional.
 """
 from __future__ import annotations
 
@@ -14,6 +16,7 @@ import os
 from datetime import datetime, timezone
 
 import app as app_module
+import exif_utils
 import search_utils
 
 FIXTURE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fixtures', 'lexical_search_parity.json')
@@ -59,7 +62,7 @@ def test_case_matches_live_search_utils_output(case):
     assert tokens['required_object'] == expected['tokens']['requiredObject']
     assert tokens['exact_phrases'] == expected['tokens']['exactPhrases']
 
-    exif_data = search_utils.parse_exif_data(row.get('exifData', '{}'))
+    exif_data = exif_utils.parse_exif_data(row.get('exifData', '{}'))
     matched_person_groups = app_module._matched_query_people_groups(query, name_to_ids)
     matched_location_terms = app_module._matched_query_locations(query, [row])
     assert matched_person_groups == expected['matchedPersonGroups']

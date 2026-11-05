@@ -1,0 +1,2438 @@
+{
+  "environment": {
+    "python": "3.13.2 (main, Feb  4 2025, 14:51:09) [Clang 16.0.0 (clang-1600.0.26.6)]",
+    "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "dimensions": 512,
+    "identities": 32,
+    "latency_ms_per_fake_call": 1.0,
+    "repeats": 3
+  },
+  "scope": "Fresh wave runner, including local journal and instrumented control calls; excludes upload, Vision, immutable receipt fetching, claim/release, Index and publication.",
+  "limitations": [
+    "Synthetic orthogonal vectors and known identities; not a face-quality benchmark.",
+    "In-memory tables do not enforce Azure request/entity byte limits.",
+    "Fake query implementation scans rows; CPU costs may differ from Azure.",
+    "Fixed sleeps model call latency, not a real transport or throughput forecast.",
+    "No continuation, live curation races or cross-process storage tested here.",
+    "Wave ownership callback is constant; production policy lookup cost excluded.",
+    "Python allocation tracing disabled to avoid distorting timing."
+  ],
+  "runs": [
+    {
+      "mode": "per_write",
+      "faces": 1,
+      "calls": {
+        "jobs.get_entity": 12,
+        "people.query_entities": 4,
+        "faces.query_entities": 1,
+        "jobs.submit_transaction": 3,
+        "faces.get_entity": 2,
+        "people.get_entity": 2,
+        "admission.get_entity": 4,
+        "coverage.get_entity": 5,
+        "coverage.create_entity": 1,
+        "coverage.submit_transaction": 4,
+        "people.update_entity": 1,
+        "members.create_entity": 1,
+        "faces.update_entity": 1
+      },
+      "total_measured_calls": 41,
+      "coverage_pages": 0,
+      "scoped_writes": 0,
+      "elapsed_seconds": 0.0948313339613378,
+      "cpu_seconds": 0.026968000000000103,
+      "faces_per_second": 10.545037786853175,
+      "journal_fsyncs": 4,
+      "phases": {
+        "lease_wait": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.029292015824466944,
+          "thread_cpu_ms": 0.026333000000100526
+        },
+        "journal_open": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 6.625875015743077,
+          "thread_cpu_ms": 0.8740000000000414
+        },
+        "resume_restore": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.0237500062212348,
+          "thread_cpu_ms": 0.023915999999957194
+        },
+        "journal_write": {
+          "calls": 73,
+          "errors": 0,
+          "milliseconds": 31.419998907949775,
+          "thread_cpu_ms": 8.653704000002094,
+          "journal_flush_ms": 2.595250029116869,
+          "journal_flushes": 4,
+          "journal_fsync_ms": 0.208458979614079,
+          "journal_fsyncs": 4
+        },
+        "guard_ownership_read": {
+          "calls": 6,
+          "errors": 0,
+          "milliseconds": 7.568541041109711,
+          "thread_cpu_ms": 0.06691500000011175
+        },
+        "snapshot_prepare": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 27.17220800695941,
+          "thread_cpu_ms": 15.022624999999845,
+          "batch_keys": 33,
+          "batch_missing": 1,
+          "batch_peak_inflight": 1,
+          "batch_queries": 4,
+          "batch_queue_ms": 0.008791976142674685,
+          "batch_requests": 4,
+          "batch_rows": 32,
+          "batch_service_ms": 5.075832945294678,
+          "batch_wall_ms": 5.200750951189548,
+          "journal_flush_ms": 1.0116249904967844,
+          "journal_flushes": 1,
+          "journal_fsync_ms": 0.09558303281664848,
+          "journal_fsyncs": 1
+        },
+        "runtime_build": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 3.2053340109996498,
+          "thread_cpu_ms": 2.127417000000076
+        },
+        "matching": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.60374999884516,
+          "thread_cpu_ms": 0.6041660000000171
+        },
+        "curation_check": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 1.3017909950576723,
+          "thread_cpu_ms": 0.05179100000018977
+        },
+        "assignment_persistence": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 25.30508302152157,
+          "thread_cpu_ms": 0.5446250000002983
+        },
+        "runtime_update": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 1.7625420005060732,
+          "thread_cpu_ms": 0.6945830000000264
+        },
+        "checkpoint": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.003207998815923929,
+          "thread_cpu_ms": 0.003167000000026121
+        }
+      },
+      "latency_ms_per_fake_call": 1.0,
+      "includes_control_calls": true,
+      "identities": 32,
+      "dimensions": 512,
+      "trial": 0,
+      "output_parity": true
+    },
+    {
+      "mode": "page",
+      "faces": 1,
+      "calls": {
+        "jobs.get_entity": 12,
+        "people.query_entities": 4,
+        "faces.query_entities": 1,
+        "jobs.submit_transaction": 3,
+        "faces.get_entity": 1,
+        "people.get_entity": 1,
+        "admission.get_entity": 3,
+        "coverage.get_entity": 3,
+        "coverage.create_entity": 1,
+        "coverage.submit_transaction": 2,
+        "people.update_entity": 1,
+        "members.create_entity": 1,
+        "faces.update_entity": 1
+      },
+      "total_measured_calls": 34,
+      "coverage_pages": 1,
+      "scoped_writes": 2,
+      "elapsed_seconds": 0.08438879199093208,
+      "cpu_seconds": 0.026621000000000006,
+      "faces_per_second": 11.849914857265098,
+      "journal_fsyncs": 4,
+      "phases": {
+        "lease_wait": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.027749978471547365,
+          "thread_cpu_ms": 0.027584000000135944
+        },
+        "journal_open": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 6.9518330274149776,
+          "thread_cpu_ms": 0.9402920000001203
+        },
+        "resume_restore": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.02504198346287012,
+          "thread_cpu_ms": 0.025166999999992612
+        },
+        "journal_write": {
+          "calls": 73,
+          "errors": 0,
+          "milliseconds": 30.69524688180536,
+          "thread_cpu_ms": 8.3992540000013,
+          "journal_flush_ms": 2.497543056961149,
+          "journal_flushes": 4,
+          "journal_fsync_ms": 0.17979094991460443,
+          "journal_fsyncs": 4
+        },
+        "guard_ownership_read": {
+          "calls": 6,
+          "errors": 0,
+          "milliseconds": 7.483833061996847,
+          "thread_cpu_ms": 0.07229099999994659
+        },
+        "snapshot_prepare": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 24.23737500794232,
+          "thread_cpu_ms": 14.558290999999723,
+          "batch_keys": 33,
+          "batch_missing": 1,
+          "batch_peak_inflight": 3,
+          "batch_queries": 4,
+          "batch_queue_ms": 0.25029201060533524,
+          "batch_requests": 2,
+          "batch_rows": 32,
+          "batch_service_ms": 5.102790892124176,
+          "batch_wall_ms": 2.8409999795258045,
+          "journal_flush_ms": 0.7940420182421803,
+          "journal_flushes": 1,
+          "journal_fsync_ms": 0.07333297980949283,
+          "journal_fsyncs": 1
+        },
+        "runtime_build": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 3.886040998622775,
+          "thread_cpu_ms": 2.2525839999998354
+        },
+        "matching": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.5991670186631382,
+          "thread_cpu_ms": 0.599582999999626
+        },
+        "curation_check": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 1.2891669757664204,
+          "thread_cpu_ms": 0.03895800000019989
+        },
+        "coverage_begin": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 4.77337499614805,
+          "thread_cpu_ms": 0.07683300000005389
+        },
+        "assignment_persistence": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 13.633416965603828,
+          "thread_cpu_ms": 0.4002089999999292,
+          "cluster_coverage_pages": 1,
+          "cluster_coverage_writes": 2
+        },
+        "runtime_update": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 1.8848329782485962,
+          "thread_cpu_ms": 0.6491670000001726
+        },
+        "coverage_finish": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 2.5587910204194486,
+          "thread_cpu_ms": 0.05395800000007611
+        },
+        "checkpoint": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.002792046871036291,
+          "thread_cpu_ms": 0.0027919999996406375
+        }
+      },
+      "latency_ms_per_fake_call": 1.0,
+      "includes_control_calls": true,
+      "identities": 32,
+      "dimensions": 512,
+      "trial": 0,
+      "output_parity": true
+    },
+    {
+      "mode": "page",
+      "faces": 1,
+      "calls": {
+        "jobs.get_entity": 12,
+        "people.query_entities": 4,
+        "faces.query_entities": 1,
+        "jobs.submit_transaction": 3,
+        "faces.get_entity": 1,
+        "people.get_entity": 1,
+        "admission.get_entity": 3,
+        "coverage.get_entity": 3,
+        "coverage.create_entity": 1,
+        "coverage.submit_transaction": 2,
+        "people.update_entity": 1,
+        "members.create_entity": 1,
+        "faces.update_entity": 1
+      },
+      "total_measured_calls": 34,
+      "coverage_pages": 1,
+      "scoped_writes": 2,
+      "elapsed_seconds": 0.07820079202065244,
+      "cpu_seconds": 0.026450000000000085,
+      "faces_per_second": 12.787594270604126,
+      "journal_fsyncs": 4,
+      "phases": {
+        "lease_wait": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.027958012651652098,
+          "thread_cpu_ms": 0.027792000000026462
+        },
+        "journal_open": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 6.259999994654208,
+          "thread_cpu_ms": 0.8078750000000134
+        },
+        "resume_restore": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.021374959032982588,
+          "thread_cpu_ms": 0.021541999999818984
+        },
+        "journal_write": {
+          "calls": 73,
+          "errors": 0,
+          "milliseconds": 30.09158093482256,
+          "thread_cpu_ms": 8.452829000001216,
+          "journal_flush_ms": 2.196876041125506,
+          "journal_flushes": 4,
+          "journal_fsync_ms": 0.1688740449026227,
+          "journal_fsyncs": 4
+        },
+        "guard_ownership_read": {
+          "calls": 6,
+          "errors": 0,
+          "milliseconds": 7.580291014164686,
+          "thread_cpu_ms": 0.07041699999987827
+        },
+        "snapshot_prepare": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 24.4095420348458,
+          "thread_cpu_ms": 14.773916999999859,
+          "batch_keys": 33,
+          "batch_missing": 1,
+          "batch_peak_inflight": 3,
+          "batch_queries": 4,
+          "batch_queue_ms": 0.14970905613154173,
+          "batch_requests": 2,
+          "batch_rows": 32,
+          "batch_service_ms": 5.106666008941829,
+          "batch_wall_ms": 2.8006669599562883,
+          "journal_flush_ms": 0.869459006935358,
+          "journal_flushes": 1,
+          "journal_fsync_ms": 0.0755410292185843,
+          "journal_fsyncs": 1
+        },
+        "runtime_build": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 3.0172079568728805,
+          "thread_cpu_ms": 2.220042000000255
+        },
+        "matching": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.6259169895201921,
+          "thread_cpu_ms": 0.6262499999998283
+        },
+        "curation_check": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 1.2909159995615482,
+          "thread_cpu_ms": 0.04058300000009396
+        },
+        "coverage_begin": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 5.083290976472199,
+          "thread_cpu_ms": 0.08766699999984695
+        },
+        "assignment_persistence": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 14.176374999806285,
+          "thread_cpu_ms": 0.42020900000006023,
+          "cluster_coverage_pages": 1,
+          "cluster_coverage_writes": 2
+        },
+        "runtime_update": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.9409170015715063,
+          "thread_cpu_ms": 0.5547500000000483
+        },
+        "coverage_finish": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 2.539707988034934,
+          "thread_cpu_ms": 0.039083999999967034
+        },
+        "checkpoint": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.0027909991331398487,
+          "thread_cpu_ms": 0.0027920000000847267
+        }
+      },
+      "latency_ms_per_fake_call": 1.0,
+      "includes_control_calls": true,
+      "identities": 32,
+      "dimensions": 512,
+      "trial": 1,
+      "output_parity": true
+    },
+    {
+      "mode": "per_write",
+      "faces": 1,
+      "calls": {
+        "jobs.get_entity": 12,
+        "people.query_entities": 4,
+        "faces.query_entities": 1,
+        "jobs.submit_transaction": 3,
+        "faces.get_entity": 2,
+        "people.get_entity": 2,
+        "admission.get_entity": 4,
+        "coverage.get_entity": 5,
+        "coverage.create_entity": 1,
+        "coverage.submit_transaction": 4,
+        "people.update_entity": 1,
+        "members.create_entity": 1,
+        "faces.update_entity": 1
+      },
+      "total_measured_calls": 41,
+      "coverage_pages": 0,
+      "scoped_writes": 0,
+      "elapsed_seconds": 0.09142441704170778,
+      "cpu_seconds": 0.02623799999999976,
+      "faces_per_second": 10.937997007339957,
+      "journal_fsyncs": 4,
+      "phases": {
+        "lease_wait": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.028084032237529755,
+          "thread_cpu_ms": 0.027832999999866104
+        },
+        "journal_open": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 6.716458010487258,
+          "thread_cpu_ms": 0.8881669999998287
+        },
+        "resume_restore": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.023083004634827375,
+          "thread_cpu_ms": 0.023207999999996787
+        },
+        "journal_write": {
+          "calls": 73,
+          "errors": 0,
+          "milliseconds": 30.653877358417958,
+          "thread_cpu_ms": 8.463914999999655,
+          "journal_flush_ms": 2.3432510206475854,
+          "journal_flushes": 4,
+          "journal_fsync_ms": 0.20470801973715425,
+          "journal_fsyncs": 4
+        },
+        "guard_ownership_read": {
+          "calls": 6,
+          "errors": 0,
+          "milliseconds": 7.588998996652663,
+          "thread_cpu_ms": 0.07050099999927895
+        },
+        "snapshot_prepare": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 26.758624997455627,
+          "thread_cpu_ms": 14.639791000000013,
+          "batch_keys": 33,
+          "batch_missing": 1,
+          "batch_peak_inflight": 1,
+          "batch_queries": 4,
+          "batch_queue_ms": 0.009499955922365189,
+          "batch_requests": 4,
+          "batch_rows": 32,
+          "batch_service_ms": 5.079875991214067,
+          "batch_wall_ms": 5.209624010603875,
+          "journal_flush_ms": 0.9486250346526504,
+          "journal_flushes": 1,
+          "journal_fsync_ms": 0.10212499182671309,
+          "journal_fsyncs": 1
+        },
+        "runtime_build": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 3.0129580409266055,
+          "thread_cpu_ms": 2.137540999999743
+        },
+        "matching": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.6062909960746765,
+          "thread_cpu_ms": 0.6066670000000052
+        },
+        "curation_check": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 1.2882499722763896,
+          "thread_cpu_ms": 0.038041999999904874
+        },
+        "assignment_persistence": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 25.554833002388477,
+          "thread_cpu_ms": 0.5202089999998272
+        },
+        "runtime_update": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 1.1695839930325747,
+          "thread_cpu_ms": 0.6113330000001582
+        },
+        "checkpoint": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.002874992787837982,
+          "thread_cpu_ms": 0.00287499999984675
+        }
+      },
+      "latency_ms_per_fake_call": 1.0,
+      "includes_control_calls": true,
+      "identities": 32,
+      "dimensions": 512,
+      "trial": 1,
+      "output_parity": true
+    },
+    {
+      "mode": "per_write",
+      "faces": 1,
+      "calls": {
+        "jobs.get_entity": 12,
+        "people.query_entities": 4,
+        "faces.query_entities": 1,
+        "jobs.submit_transaction": 3,
+        "faces.get_entity": 2,
+        "people.get_entity": 2,
+        "admission.get_entity": 4,
+        "coverage.get_entity": 5,
+        "coverage.create_entity": 1,
+        "coverage.submit_transaction": 4,
+        "people.update_entity": 1,
+        "members.create_entity": 1,
+        "faces.update_entity": 1
+      },
+      "total_measured_calls": 41,
+      "coverage_pages": 0,
+      "scoped_writes": 0,
+      "elapsed_seconds": 0.102254958008416,
+      "cpu_seconds": 0.028354999999999908,
+      "faces_per_second": 9.779476902407959,
+      "journal_fsyncs": 4,
+      "phases": {
+        "lease_wait": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.028791953809559345,
+          "thread_cpu_ms": 0.02854199999990925
+        },
+        "journal_open": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 7.408167002722621,
+          "thread_cpu_ms": 0.8478749999998314
+        },
+        "resume_restore": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.021832995116710663,
+          "thread_cpu_ms": 0.02195800000004411
+        },
+        "journal_write": {
+          "calls": 73,
+          "errors": 0,
+          "milliseconds": 39.17050262680277,
+          "thread_cpu_ms": 9.278123999998389,
+          "journal_flush_ms": 10.292041057255119,
+          "journal_flushes": 4,
+          "journal_fsync_ms": 0.24804193526506424,
+          "journal_fsyncs": 4
+        },
+        "guard_ownership_read": {
+          "calls": 6,
+          "errors": 0,
+          "milliseconds": 7.613959955051541,
+          "thread_cpu_ms": 0.11150000000004212
+        },
+        "snapshot_prepare": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 26.796167017892003,
+          "thread_cpu_ms": 14.948334000000063,
+          "batch_keys": 33,
+          "batch_missing": 1,
+          "batch_peak_inflight": 1,
+          "batch_queries": 4,
+          "batch_queue_ms": 0.009541981853544712,
+          "batch_requests": 4,
+          "batch_rows": 32,
+          "batch_service_ms": 4.878917010501027,
+          "batch_wall_ms": 5.013625021092594,
+          "journal_flush_ms": 0.9337500086985528,
+          "journal_flushes": 1,
+          "journal_fsync_ms": 0.08920795517042279,
+          "journal_fsyncs": 1
+        },
+        "runtime_build": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 4.295583989005536,
+          "thread_cpu_ms": 2.135416999999862
+        },
+        "matching": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.617832993157208,
+          "thread_cpu_ms": 0.6183749999997268
+        },
+        "curation_check": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 1.309916959144175,
+          "thread_cpu_ms": 0.059749999999691994
+        },
+        "assignment_persistence": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 25.749584019649774,
+          "thread_cpu_ms": 0.8746660000000794
+        },
+        "runtime_update": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 2.7329170261509717,
+          "thread_cpu_ms": 0.8959170000002459
+        },
+        "checkpoint": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.005667039658874273,
+          "thread_cpu_ms": 0.005708000000215208
+        }
+      },
+      "latency_ms_per_fake_call": 1.0,
+      "includes_control_calls": true,
+      "identities": 32,
+      "dimensions": 512,
+      "trial": 2,
+      "output_parity": true
+    },
+    {
+      "mode": "page",
+      "faces": 1,
+      "calls": {
+        "jobs.get_entity": 12,
+        "people.query_entities": 4,
+        "faces.query_entities": 1,
+        "jobs.submit_transaction": 3,
+        "faces.get_entity": 1,
+        "people.get_entity": 1,
+        "admission.get_entity": 3,
+        "coverage.get_entity": 3,
+        "coverage.create_entity": 1,
+        "coverage.submit_transaction": 2,
+        "people.update_entity": 1,
+        "members.create_entity": 1,
+        "faces.update_entity": 1
+      },
+      "total_measured_calls": 34,
+      "coverage_pages": 1,
+      "scoped_writes": 2,
+      "elapsed_seconds": 0.0852331249625422,
+      "cpu_seconds": 0.030497999999999692,
+      "faces_per_second": 11.732527704920765,
+      "journal_fsyncs": 4,
+      "phases": {
+        "lease_wait": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.028708018362522125,
+          "thread_cpu_ms": 0.02854199999990925
+        },
+        "journal_open": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 6.4207499963231385,
+          "thread_cpu_ms": 1.3591250000000166
+        },
+        "resume_restore": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.0367090106010437,
+          "thread_cpu_ms": 0.03695799999992033
+        },
+        "journal_write": {
+          "calls": 73,
+          "errors": 0,
+          "milliseconds": 30.861210951115936,
+          "thread_cpu_ms": 9.17728899999748,
+          "journal_flush_ms": 2.384709019679576,
+          "journal_flushes": 4,
+          "journal_fsync_ms": 0.24887401377782226,
+          "journal_fsyncs": 4
+        },
+        "guard_ownership_read": {
+          "calls": 6,
+          "errors": 0,
+          "milliseconds": 7.469664968084544,
+          "thread_cpu_ms": 0.08425000000000793
+        },
+        "snapshot_prepare": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 25.101082981564105,
+          "thread_cpu_ms": 15.4386660000001,
+          "batch_keys": 33,
+          "batch_missing": 1,
+          "batch_peak_inflight": 3,
+          "batch_queries": 4,
+          "batch_queue_ms": 0.3299150848761201,
+          "batch_requests": 2,
+          "batch_rows": 32,
+          "batch_service_ms": 5.161332956049591,
+          "batch_wall_ms": 2.9017089400440454,
+          "journal_flush_ms": 0.7763750036247075,
+          "journal_flushes": 1,
+          "journal_fsync_ms": 0.10679103434085846,
+          "journal_fsyncs": 1
+        },
+        "runtime_build": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 3.0889170011505485,
+          "thread_cpu_ms": 2.4421249999999617
+        },
+        "matching": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.7665829616598785,
+          "thread_cpu_ms": 0.7670829999999462
+        },
+        "curation_check": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 1.318165974225849,
+          "thread_cpu_ms": 0.06654200000033583
+        },
+        "coverage_begin": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 5.1547089824453,
+          "thread_cpu_ms": 0.1533340000001715
+        },
+        "assignment_persistence": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 14.458124991506338,
+          "thread_cpu_ms": 0.6941249999998789,
+          "cluster_coverage_pages": 1,
+          "cluster_coverage_writes": 2
+        },
+        "runtime_update": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 1.3372909743338823,
+          "thread_cpu_ms": 0.8214579999998861
+        },
+        "coverage_finish": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 2.584833011496812,
+          "thread_cpu_ms": 0.07800000000024454
+        },
+        "checkpoint": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.003958994057029486,
+          "thread_cpu_ms": 0.004082999999877046
+        }
+      },
+      "latency_ms_per_fake_call": 1.0,
+      "includes_control_calls": true,
+      "identities": 32,
+      "dimensions": 512,
+      "trial": 2,
+      "output_parity": true
+    },
+    {
+      "mode": "per_write",
+      "faces": 128,
+      "calls": {
+        "jobs.get_entity": 12,
+        "people.query_entities": 13,
+        "faces.query_entities": 1,
+        "jobs.submit_transaction": 3,
+        "faces.get_entity": 256,
+        "people.get_entity": 256,
+        "admission.get_entity": 512,
+        "coverage.get_entity": 513,
+        "coverage.create_entity": 1,
+        "coverage.submit_transaction": 512,
+        "people.update_entity": 128,
+        "members.create_entity": 128,
+        "faces.update_entity": 128
+      },
+      "total_measured_calls": 2463,
+      "coverage_pages": 0,
+      "scoped_writes": 0,
+      "elapsed_seconds": 4.231366541993339,
+      "cpu_seconds": 0.8943889999999999,
+      "faces_per_second": 30.250274640518608,
+      "journal_fsyncs": 258,
+      "phases": {
+        "lease_wait": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.028959009796380997,
+          "thread_cpu_ms": 0.02879199999972215
+        },
+        "journal_open": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 6.823457952123135,
+          "thread_cpu_ms": 1.0684579999997723
+        },
+        "resume_restore": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.03787496825680137,
+          "thread_cpu_ms": 0.03816700000003337
+        },
+        "journal_write": {
+          "calls": 454,
+          "errors": 0,
+          "milliseconds": 435.45471015386283,
+          "thread_cpu_ms": 241.8156680000042,
+          "journal_flush_ms": 182.97636281931773,
+          "journal_flushes": 258,
+          "journal_fsync_ms": 15.592868789099157,
+          "journal_fsyncs": 258
+        },
+        "guard_ownership_read": {
+          "calls": 6,
+          "errors": 0,
+          "milliseconds": 7.607791922055185,
+          "thread_cpu_ms": 0.09704199999926999
+        },
+        "snapshot_prepare": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 78.74795800307766,
+          "thread_cpu_ms": 34.85862500000003,
+          "batch_keys": 160,
+          "batch_missing": 128,
+          "batch_peak_inflight": 1,
+          "batch_queries": 13,
+          "batch_queue_ms": 0.027957954443991184,
+          "batch_requests": 13,
+          "batch_rows": 32,
+          "batch_service_ms": 16.50504191638902,
+          "batch_wall_ms": 17.54491514293477,
+          "journal_flush_ms": 0.8952500065788627,
+          "journal_flushes": 1,
+          "journal_fsync_ms": 0.1127920113503933,
+          "journal_fsyncs": 1
+        },
+        "runtime_build": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 3.6862920387648046,
+          "thread_cpu_ms": 2.3138750000000208
+        },
+        "matching": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 275.7033733651042,
+          "thread_cpu_ms": 273.9121290000056
+        },
+        "curation_check": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 166.63271596189588,
+          "thread_cpu_ms": 7.269450000002564
+        },
+        "assignment_persistence": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 3006.0527090681717,
+          "thread_cpu_ms": 126.82215799999955
+        },
+        "runtime_update": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 195.7777869538404,
+          "thread_cpu_ms": 125.28421000000245
+        },
+        "checkpoint": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.01166702713817358,
+          "thread_cpu_ms": 0.011791999999566372
+        }
+      },
+      "latency_ms_per_fake_call": 1.0,
+      "includes_control_calls": true,
+      "identities": 32,
+      "dimensions": 512,
+      "trial": 0,
+      "output_parity": true
+    },
+    {
+      "mode": "page",
+      "faces": 128,
+      "calls": {
+        "jobs.get_entity": 12,
+        "people.query_entities": 13,
+        "faces.query_entities": 1,
+        "jobs.submit_transaction": 3,
+        "faces.get_entity": 128,
+        "people.get_entity": 128,
+        "admission.get_entity": 257,
+        "coverage.get_entity": 3,
+        "coverage.create_entity": 1,
+        "coverage.submit_transaction": 2,
+        "people.update_entity": 128,
+        "members.create_entity": 128,
+        "faces.update_entity": 128
+      },
+      "total_measured_calls": 932,
+      "coverage_pages": 1,
+      "scoped_writes": 256,
+      "elapsed_seconds": 1.8144206250435673,
+      "cpu_seconds": 0.46729800000000044,
+      "faces_per_second": 70.54593528825572,
+      "journal_fsyncs": 258,
+      "phases": {
+        "lease_wait": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.02604199107736349,
+          "thread_cpu_ms": 0.02616700000057648
+        },
+        "journal_open": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 6.732999987434596,
+          "thread_cpu_ms": 0.9384169999995251
+        },
+        "resume_restore": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.024250010028481483,
+          "thread_cpu_ms": 0.024374999999743352
+        },
+        "journal_write": {
+          "calls": 454,
+          "errors": 0,
+          "milliseconds": 288.5128306224942,
+          "thread_cpu_ms": 141.1709840000057,
+          "journal_flush_ms": 132.30600277893245,
+          "journal_flushes": 258,
+          "journal_fsync_ms": 10.157913260627538,
+          "journal_fsyncs": 258
+        },
+        "guard_ownership_read": {
+          "calls": 6,
+          "errors": 0,
+          "milliseconds": 7.579624943900853,
+          "thread_cpu_ms": 0.07629299999933892
+        },
+        "snapshot_prepare": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 45.5109589966014,
+          "thread_cpu_ms": 33.22187500000062,
+          "batch_keys": 160,
+          "batch_missing": 128,
+          "batch_peak_inflight": 4,
+          "batch_queries": 13,
+          "batch_queue_ms": 0.7534600445069373,
+          "batch_requests": 4,
+          "batch_rows": 32,
+          "batch_service_ms": 16.65408391272649,
+          "batch_wall_ms": 6.394999974872917,
+          "journal_flush_ms": 0.9236250189132988,
+          "journal_flushes": 1,
+          "journal_fsync_ms": 0.10587502038106322,
+          "journal_fsyncs": 1
+        },
+        "runtime_build": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 3.2655419781804085,
+          "thread_cpu_ms": 2.2337500000002564
+        },
+        "matching": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 137.67725130310282,
+          "thread_cpu_ms": 137.43520300000438
+        },
+        "curation_check": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 165.1928347419016,
+          "thread_cpu_ms": 5.603837999998973
+        },
+        "coverage_begin": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 5.095125001389533,
+          "thread_cpu_ms": 0.09391600000085987
+        },
+        "assignment_persistence": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 1002.771916158963,
+          "thread_cpu_ms": 39.652716000000865,
+          "cluster_coverage_pages": 1,
+          "cluster_coverage_writes": 256
+        },
+        "runtime_update": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 119.24745183205232,
+          "thread_cpu_ms": 61.17887500000663
+        },
+        "coverage_finish": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 2.5578339700587094,
+          "thread_cpu_ms": 0.061125000000217256
+        },
+        "checkpoint": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.0024999608285725117,
+          "thread_cpu_ms": 0.0024999999999053557
+        }
+      },
+      "latency_ms_per_fake_call": 1.0,
+      "includes_control_calls": true,
+      "identities": 32,
+      "dimensions": 512,
+      "trial": 0,
+      "output_parity": true
+    },
+    {
+      "mode": "page",
+      "faces": 128,
+      "calls": {
+        "jobs.get_entity": 12,
+        "people.query_entities": 13,
+        "faces.query_entities": 1,
+        "jobs.submit_transaction": 3,
+        "faces.get_entity": 128,
+        "people.get_entity": 128,
+        "admission.get_entity": 257,
+        "coverage.get_entity": 3,
+        "coverage.create_entity": 1,
+        "coverage.submit_transaction": 2,
+        "people.update_entity": 128,
+        "members.create_entity": 128,
+        "faces.update_entity": 128
+      },
+      "total_measured_calls": 932,
+      "coverage_pages": 1,
+      "scoped_writes": 256,
+      "elapsed_seconds": 1.824151333014015,
+      "cpu_seconds": 0.4909509999999999,
+      "faces_per_second": 70.16961678749959,
+      "journal_fsyncs": 258,
+      "phases": {
+        "lease_wait": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.03070896491408348,
+          "thread_cpu_ms": 0.030707999999712854
+        },
+        "journal_open": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 7.139708031900227,
+          "thread_cpu_ms": 0.9647499999996256
+        },
+        "resume_restore": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.025916961021721363,
+          "thread_cpu_ms": 0.025999999999193335
+        },
+        "journal_write": {
+          "calls": 454,
+          "errors": 0,
+          "milliseconds": 285.4629163630307,
+          "thread_cpu_ms": 149.10658500000918,
+          "journal_flush_ms": 131.1981660546735,
+          "journal_flushes": 258,
+          "journal_fsync_ms": 10.158091085031629,
+          "journal_fsyncs": 258
+        },
+        "guard_ownership_read": {
+          "calls": 6,
+          "errors": 0,
+          "milliseconds": 7.578167074825615,
+          "thread_cpu_ms": 0.07508200000128085
+        },
+        "snapshot_prepare": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 45.648417028132826,
+          "thread_cpu_ms": 33.20208299999994,
+          "batch_keys": 160,
+          "batch_missing": 128,
+          "batch_peak_inflight": 4,
+          "batch_queries": 13,
+          "batch_queue_ms": 0.5792080191895366,
+          "batch_requests": 4,
+          "batch_rows": 32,
+          "batch_service_ms": 16.662709997035563,
+          "batch_wall_ms": 6.286293035373092,
+          "journal_flush_ms": 0.9291669703088701,
+          "journal_flushes": 1,
+          "journal_fsync_ms": 0.11387502308934927,
+          "journal_fsyncs": 1
+        },
+        "runtime_build": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 3.1384589965455234,
+          "thread_cpu_ms": 2.2790419999996203
+        },
+        "matching": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 144.31445603258908,
+          "thread_cpu_ms": 143.89837699999305
+        },
+        "curation_check": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 165.93703610124066,
+          "thread_cpu_ms": 5.942791999993702
+        },
+        "coverage_begin": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 5.1112500368617475,
+          "thread_cpu_ms": 0.10754099999932265
+        },
+        "assignment_persistence": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 1005.295876879245,
+          "thread_cpu_ms": 42.65346200001119,
+          "cluster_coverage_pages": 1,
+          "cluster_coverage_writes": 256
+        },
+        "runtime_update": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 121.06949783628806,
+          "thread_cpu_ms": 64.92800400000397
+        },
+        "coverage_finish": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 2.5642910040915012,
+          "thread_cpu_ms": 0.06395800000014162
+        },
+        "checkpoint": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.002874992787837982,
+          "thread_cpu_ms": 0.002916999999769132
+        }
+      },
+      "latency_ms_per_fake_call": 1.0,
+      "includes_control_calls": true,
+      "identities": 32,
+      "dimensions": 512,
+      "trial": 1,
+      "output_parity": true
+    },
+    {
+      "mode": "per_write",
+      "faces": 128,
+      "calls": {
+        "jobs.get_entity": 12,
+        "people.query_entities": 13,
+        "faces.query_entities": 1,
+        "jobs.submit_transaction": 3,
+        "faces.get_entity": 256,
+        "people.get_entity": 256,
+        "admission.get_entity": 512,
+        "coverage.get_entity": 513,
+        "coverage.create_entity": 1,
+        "coverage.submit_transaction": 512,
+        "people.update_entity": 128,
+        "members.create_entity": 128,
+        "faces.update_entity": 128
+      },
+      "total_measured_calls": 2463,
+      "coverage_pages": 0,
+      "scoped_writes": 0,
+      "elapsed_seconds": 4.320879792037886,
+      "cpu_seconds": 0.9991449999999995,
+      "faces_per_second": 29.62359661934277,
+      "journal_fsyncs": 258,
+      "phases": {
+        "lease_wait": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.026291992980986834,
+          "thread_cpu_ms": 0.026375000000022908
+        },
+        "journal_open": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 5.896124988794327,
+          "thread_cpu_ms": 0.8980830000000495
+        },
+        "resume_restore": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.023625034373253584,
+          "thread_cpu_ms": 0.02379200000035553
+        },
+        "journal_write": {
+          "calls": 454,
+          "errors": 0,
+          "milliseconds": 450.33179194433615,
+          "thread_cpu_ms": 275.5316160000013,
+          "journal_flush_ms": 207.109289127402,
+          "journal_flushes": 258,
+          "journal_fsync_ms": 19.157788425218314,
+          "journal_fsyncs": 258
+        },
+        "guard_ownership_read": {
+          "calls": 6,
+          "errors": 0,
+          "milliseconds": 7.944832963403314,
+          "thread_cpu_ms": 0.4059579999990959
+        },
+        "snapshot_prepare": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 55.96158298430964,
+          "thread_cpu_ms": 32.665084000000455,
+          "batch_keys": 160,
+          "batch_missing": 128,
+          "batch_peak_inflight": 1,
+          "batch_queries": 13,
+          "batch_queue_ms": 0.022999942302703857,
+          "batch_requests": 13,
+          "batch_rows": 32,
+          "batch_service_ms": 16.366457100957632,
+          "batch_wall_ms": 17.316166136879474,
+          "journal_flush_ms": 1.196958008222282,
+          "journal_flushes": 1,
+          "journal_fsync_ms": 0.14462502440437675,
+          "journal_fsyncs": 1
+        },
+        "runtime_build": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 3.4492090344429016,
+          "thread_cpu_ms": 2.4522500000001557
+        },
+        "matching": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 294.9465382262133,
+          "thread_cpu_ms": 292.2161200000025
+        },
+        "curation_check": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 169.77483476512134,
+          "thread_cpu_ms": 9.76600300000019
+        },
+        "assignment_persistence": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 3039.9320339784026,
+          "thread_cpu_ms": 154.4445389999955
+        },
+        "runtime_update": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 206.76750008715317,
+          "thread_cpu_ms": 136.07916800000461
+        },
+        "checkpoint": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.011458003427833319,
+          "thread_cpu_ms": 0.011417000000513156
+        }
+      },
+      "latency_ms_per_fake_call": 1.0,
+      "includes_control_calls": true,
+      "identities": 32,
+      "dimensions": 512,
+      "trial": 1,
+      "output_parity": true
+    },
+    {
+      "mode": "per_write",
+      "faces": 128,
+      "calls": {
+        "jobs.get_entity": 12,
+        "people.query_entities": 13,
+        "faces.query_entities": 1,
+        "jobs.submit_transaction": 3,
+        "faces.get_entity": 256,
+        "people.get_entity": 256,
+        "admission.get_entity": 512,
+        "coverage.get_entity": 513,
+        "coverage.create_entity": 1,
+        "coverage.submit_transaction": 512,
+        "people.update_entity": 128,
+        "members.create_entity": 128,
+        "faces.update_entity": 128
+      },
+      "total_measured_calls": 2463,
+      "coverage_pages": 0,
+      "scoped_writes": 0,
+      "elapsed_seconds": 4.159497916989494,
+      "cpu_seconds": 0.8684959999999995,
+      "faces_per_second": 30.772944849228853,
+      "journal_fsyncs": 258,
+      "phases": {
+        "lease_wait": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.030082999728620052,
+          "thread_cpu_ms": 0.029958000000718243
+        },
+        "journal_open": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 6.072457996197045,
+          "thread_cpu_ms": 1.1606249999998042
+        },
+        "resume_restore": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.03787496825680137,
+          "thread_cpu_ms": 0.038083999999827256
+        },
+        "journal_write": {
+          "calls": 454,
+          "errors": 0,
+          "milliseconds": 407.4916250538081,
+          "thread_cpu_ms": 238.63371000000126,
+          "journal_flush_ms": 177.0708374097012,
+          "journal_flushes": 258,
+          "journal_fsync_ms": 15.836796606890857,
+          "journal_fsyncs": 258
+        },
+        "guard_ownership_read": {
+          "calls": 6,
+          "errors": 0,
+          "milliseconds": 7.727375021204352,
+          "thread_cpu_ms": 0.204541999998753
+        },
+        "snapshot_prepare": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 57.761917007155716,
+          "thread_cpu_ms": 34.64879099999951,
+          "batch_keys": 160,
+          "batch_missing": 128,
+          "batch_peak_inflight": 1,
+          "batch_queries": 13,
+          "batch_queue_ms": 0.0265840208157897,
+          "batch_requests": 13,
+          "batch_rows": 32,
+          "batch_service_ms": 16.37075108010322,
+          "batch_wall_ms": 17.3650830402039,
+          "journal_flush_ms": 1.134374993853271,
+          "journal_flushes": 1,
+          "journal_fsync_ms": 0.10795798152685165,
+          "journal_fsyncs": 1
+        },
+        "runtime_build": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 2.960583020467311,
+          "thread_cpu_ms": 2.2302919999992454
+        },
+        "matching": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 255.25178312091157,
+          "thread_cpu_ms": 253.32845700000726
+        },
+        "curation_check": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 167.2152474639006,
+          "thread_cpu_ms": 8.378708999994267
+        },
+        "assignment_persistence": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 3001.720166183077,
+          "thread_cpu_ms": 130.67737800000057
+        },
+        "runtime_update": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 179.95716904988512,
+          "thread_cpu_ms": 118.00104499999969
+        },
+        "checkpoint": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.004665984306484461,
+          "thread_cpu_ms": 0.004750000000441901
+        }
+      },
+      "latency_ms_per_fake_call": 1.0,
+      "includes_control_calls": true,
+      "identities": 32,
+      "dimensions": 512,
+      "trial": 2,
+      "output_parity": true
+    },
+    {
+      "mode": "page",
+      "faces": 128,
+      "calls": {
+        "jobs.get_entity": 12,
+        "people.query_entities": 13,
+        "faces.query_entities": 1,
+        "jobs.submit_transaction": 3,
+        "faces.get_entity": 128,
+        "people.get_entity": 128,
+        "admission.get_entity": 257,
+        "coverage.get_entity": 3,
+        "coverage.create_entity": 1,
+        "coverage.submit_transaction": 2,
+        "people.update_entity": 128,
+        "members.create_entity": 128,
+        "faces.update_entity": 128
+      },
+      "total_measured_calls": 932,
+      "coverage_pages": 1,
+      "scoped_writes": 256,
+      "elapsed_seconds": 1.8773019579821266,
+      "cpu_seconds": 0.5210589999999993,
+      "faces_per_second": 68.18295770467559,
+      "journal_fsyncs": 258,
+      "phases": {
+        "lease_wait": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.031374976970255375,
+          "thread_cpu_ms": 0.03166700000001299
+        },
+        "journal_open": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 6.648957962170243,
+          "thread_cpu_ms": 0.9814170000002065
+        },
+        "resume_restore": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.02379098441451788,
+          "thread_cpu_ms": 0.023957999999879576
+        },
+        "journal_write": {
+          "calls": 454,
+          "errors": 0,
+          "milliseconds": 314.6116628777236,
+          "thread_cpu_ms": 157.9413320000072,
+          "journal_flush_ms": 144.2963774316013,
+          "journal_flushes": 258,
+          "journal_fsync_ms": 11.773929465562105,
+          "journal_fsyncs": 258
+        },
+        "guard_ownership_read": {
+          "calls": 6,
+          "errors": 0,
+          "milliseconds": 7.635001034941524,
+          "thread_cpu_ms": 0.11891499999983068
+        },
+        "snapshot_prepare": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 45.46220897464082,
+          "thread_cpu_ms": 32.81904200000163,
+          "batch_keys": 160,
+          "batch_missing": 128,
+          "batch_peak_inflight": 4,
+          "batch_queries": 13,
+          "batch_queue_ms": 0.5823341780342162,
+          "batch_requests": 4,
+          "batch_rows": 32,
+          "batch_service_ms": 16.945960000157356,
+          "batch_wall_ms": 6.480832933448255,
+          "journal_flush_ms": 1.2320419773459435,
+          "journal_flushes": 1,
+          "journal_fsync_ms": 0.1537920325063169,
+          "journal_fsyncs": 1
+        },
+        "runtime_build": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 2.921124978456646,
+          "thread_cpu_ms": 2.060959000001361
+        },
+        "matching": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 151.18833328597248,
+          "thread_cpu_ms": 151.17112499999408
+        },
+        "curation_check": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 167.16953844297677,
+          "thread_cpu_ms": 7.479618999999715
+        },
+        "coverage_begin": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 5.2082500187680125,
+          "thread_cpu_ms": 0.20154199999922184
+        },
+        "assignment_persistence": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 1015.3267431887798,
+          "thread_cpu_ms": 51.62958599999179,
+          "cluster_coverage_pages": 1,
+          "cluster_coverage_writes": 256
+        },
+        "runtime_update": {
+          "calls": 128,
+          "errors": 0,
+          "milliseconds": 121.94812286179513,
+          "thread_cpu_ms": 65.0974219999867
+        },
+        "coverage_finish": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 2.55987502168864,
+          "thread_cpu_ms": 0.05612499999863019
+        },
+        "checkpoint": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.002749962732195854,
+          "thread_cpu_ms": 0.0028329999999243682
+        }
+      },
+      "latency_ms_per_fake_call": 1.0,
+      "includes_control_calls": true,
+      "identities": 32,
+      "dimensions": 512,
+      "trial": 2,
+      "output_parity": true
+    },
+    {
+      "mode": "per_write",
+      "faces": 500,
+      "calls": {
+        "jobs.get_entity": 12,
+        "people.query_entities": 39,
+        "faces.query_entities": 1,
+        "jobs.submit_transaction": 3,
+        "faces.get_entity": 1000,
+        "people.get_entity": 1000,
+        "admission.get_entity": 2000,
+        "coverage.get_entity": 2001,
+        "coverage.create_entity": 1,
+        "coverage.submit_transaction": 2000,
+        "people.update_entity": 500,
+        "members.create_entity": 500,
+        "faces.update_entity": 500
+      },
+      "total_measured_calls": 9557,
+      "coverage_pages": 0,
+      "scoped_writes": 0,
+      "elapsed_seconds": 17.059625042020343,
+      "cpu_seconds": 3.954586000000001,
+      "faces_per_second": 29.30896773923384,
+      "journal_fsyncs": 1002,
+      "phases": {
+        "lease_wait": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.03320904215797782,
+          "thread_cpu_ms": 0.03324999999954059
+        },
+        "journal_open": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 6.955666991416365,
+          "thread_cpu_ms": 0.8813750000005172
+        },
+        "resume_restore": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.022584048565477133,
+          "thread_cpu_ms": 0.022667000001419524
+        },
+        "journal_write": {
+          "calls": 1570,
+          "errors": 0,
+          "milliseconds": 1821.0030822083354,
+          "thread_cpu_ms": 1041.1758760000364,
+          "journal_flush_ms": 854.3304069316946,
+          "journal_flushes": 1002,
+          "journal_fsync_ms": 72.11721345083788,
+          "journal_fsyncs": 1002
+        },
+        "guard_ownership_read": {
+          "calls": 6,
+          "errors": 0,
+          "milliseconds": 7.469832024071366,
+          "thread_cpu_ms": 0.21000000000270802
+        },
+        "snapshot_prepare": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 145.72575001511723,
+          "thread_cpu_ms": 89.74174999999995,
+          "batch_keys": 532,
+          "batch_missing": 500,
+          "batch_peak_inflight": 1,
+          "batch_queries": 39,
+          "batch_queue_ms": 0.07899978663772345,
+          "batch_requests": 39,
+          "batch_rows": 32,
+          "batch_service_ms": 49.54233590979129,
+          "batch_wall_ms": 53.132624889258295,
+          "journal_flush_ms": 1.453333010431379,
+          "journal_flushes": 1,
+          "journal_fsync_ms": 0.34608301939442754,
+          "journal_fsyncs": 1
+        },
+        "runtime_build": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 3.1770409550517797,
+          "thread_cpu_ms": 2.2370830000006947
+        },
+        "matching": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 1289.4496661028825,
+          "thread_cpu_ms": 1263.3687670000188
+        },
+        "curation_check": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 661.9709759834222,
+          "thread_cpu_ms": 37.634649000013454
+        },
+        "assignment_persistence": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 11843.943375453819,
+          "thread_cpu_ms": 590.4823289999737
+        },
+        "runtime_update": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 900.2925955574028,
+          "thread_cpu_ms": 556.1219180000147
+        },
+        "checkpoint": {
+          "calls": 4,
+          "errors": 0,
+          "milliseconds": 0.032542040571570396,
+          "thread_cpu_ms": 0.033624000000287424
+        }
+      },
+      "latency_ms_per_fake_call": 1.0,
+      "includes_control_calls": true,
+      "identities": 32,
+      "dimensions": 512,
+      "trial": 0,
+      "output_parity": true
+    },
+    {
+      "mode": "page",
+      "faces": 500,
+      "calls": {
+        "jobs.get_entity": 12,
+        "people.query_entities": 39,
+        "faces.query_entities": 1,
+        "jobs.submit_transaction": 3,
+        "faces.get_entity": 500,
+        "people.get_entity": 500,
+        "admission.get_entity": 1004,
+        "coverage.get_entity": 9,
+        "coverage.create_entity": 1,
+        "coverage.submit_transaction": 8,
+        "people.update_entity": 500,
+        "members.create_entity": 500,
+        "faces.update_entity": 500
+      },
+      "total_measured_calls": 3577,
+      "coverage_pages": 4,
+      "scoped_writes": 1000,
+      "elapsed_seconds": 8.03259475005325,
+      "cpu_seconds": 2.5885409999999993,
+      "faces_per_second": 62.24638682247544,
+      "journal_fsyncs": 1002,
+      "phases": {
+        "lease_wait": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.04062504740431905,
+          "thread_cpu_ms": 0.038041999999904874
+        },
+        "journal_open": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 6.59379200078547,
+          "thread_cpu_ms": 1.0419589999983714
+        },
+        "resume_restore": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.023667002096772194,
+          "thread_cpu_ms": 0.023874999998341195
+        },
+        "journal_write": {
+          "calls": 1570,
+          "errors": 0,
+          "milliseconds": 1428.0554190045223,
+          "thread_cpu_ms": 713.7060249999985,
+          "journal_flush_ms": 682.5917629757896,
+          "journal_flushes": 1002,
+          "journal_fsync_ms": 46.14026617491618,
+          "journal_fsyncs": 1002
+        },
+        "guard_ownership_read": {
+          "calls": 6,
+          "errors": 0,
+          "milliseconds": 7.6916670659556985,
+          "thread_cpu_ms": 0.1748759999991023
+        },
+        "snapshot_prepare": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 109.46999996667728,
+          "thread_cpu_ms": 82.48466699999923,
+          "batch_keys": 532,
+          "batch_missing": 500,
+          "batch_peak_inflight": 4,
+          "batch_queries": 39,
+          "batch_queue_ms": 1.539540127851069,
+          "batch_requests": 10,
+          "batch_rows": 32,
+          "batch_service_ms": 51.51745799230412,
+          "batch_wall_ms": 17.048918991349638,
+          "journal_flush_ms": 1.3068749685771763,
+          "journal_flushes": 1,
+          "journal_fsync_ms": 0.25795900728553534,
+          "journal_fsyncs": 1
+        },
+        "runtime_build": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 2.900333027355373,
+          "thread_cpu_ms": 2.06554200000042
+        },
+        "matching": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 918.0655130185187,
+          "thread_cpu_ms": 917.4876670000006
+        },
+        "curation_check": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 661.3412149599753,
+          "thread_cpu_ms": 36.78117200001374
+        },
+        "coverage_begin": {
+          "calls": 4,
+          "errors": 0,
+          "milliseconds": 13.119667011778802,
+          "thread_cpu_ms": 0.5948340000010433
+        },
+        "assignment_persistence": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 4018.7134584994055,
+          "thread_cpu_ms": 252.71292099998422,
+          "cluster_coverage_pages": 4,
+          "cluster_coverage_writes": 1000
+        },
+        "runtime_update": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 610.401957819704,
+          "thread_cpu_ms": 315.0589980000102
+        },
+        "coverage_finish": {
+          "calls": 4,
+          "errors": 0,
+          "milliseconds": 10.610792960505933,
+          "thread_cpu_ms": 0.6545000000031109
+        },
+        "checkpoint": {
+          "calls": 4,
+          "errors": 0,
+          "milliseconds": 0.021250045392662287,
+          "thread_cpu_ms": 0.021249999999639613
+        }
+      },
+      "latency_ms_per_fake_call": 1.0,
+      "includes_control_calls": true,
+      "identities": 32,
+      "dimensions": 512,
+      "trial": 0,
+      "output_parity": true
+    },
+    {
+      "mode": "page",
+      "faces": 500,
+      "calls": {
+        "jobs.get_entity": 12,
+        "people.query_entities": 39,
+        "faces.query_entities": 1,
+        "jobs.submit_transaction": 3,
+        "faces.get_entity": 500,
+        "people.get_entity": 500,
+        "admission.get_entity": 1004,
+        "coverage.get_entity": 9,
+        "coverage.create_entity": 1,
+        "coverage.submit_transaction": 8,
+        "people.update_entity": 500,
+        "members.create_entity": 500,
+        "faces.update_entity": 500
+      },
+      "total_measured_calls": 3577,
+      "coverage_pages": 4,
+      "scoped_writes": 1000,
+      "elapsed_seconds": 8.151413250016049,
+      "cpu_seconds": 2.6233649999999997,
+      "faces_per_second": 61.339056757920545,
+      "journal_fsyncs": 1002,
+      "phases": {
+        "lease_wait": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.03208301495760679,
+          "thread_cpu_ms": 0.029707999999573076
+        },
+        "journal_open": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 6.656999990809709,
+          "thread_cpu_ms": 0.957624999999851
+        },
+        "resume_restore": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.01933303428813815,
+          "thread_cpu_ms": 0.01941600000066046
+        },
+        "journal_write": {
+          "calls": 1570,
+          "errors": 0,
+          "milliseconds": 1485.43097008951,
+          "thread_cpu_ms": 713.4704870000037,
+          "journal_flush_ms": 698.3300404972397,
+          "journal_flushes": 1002,
+          "journal_fsync_ms": 47.28198261000216,
+          "journal_fsyncs": 1002
+        },
+        "guard_ownership_read": {
+          "calls": 6,
+          "errors": 0,
+          "milliseconds": 7.5833750306628644,
+          "thread_cpu_ms": 0.15037499999870363
+        },
+        "snapshot_prepare": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 104.03666703496128,
+          "thread_cpu_ms": 82.71491700000055,
+          "batch_keys": 532,
+          "batch_missing": 500,
+          "batch_peak_inflight": 4,
+          "batch_queries": 39,
+          "batch_queue_ms": 1.5336659271270037,
+          "batch_requests": 10,
+          "batch_rows": 32,
+          "batch_service_ms": 51.79495707852766,
+          "batch_wall_ms": 17.188958008773625,
+          "journal_flush_ms": 1.2652080040425062,
+          "journal_flushes": 1,
+          "journal_fsync_ms": 0.27600000612437725,
+          "journal_fsyncs": 1
+        },
+        "runtime_build": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 2.7858749963343143,
+          "thread_cpu_ms": 2.3026250000004467
+        },
+        "matching": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 948.6280454439111,
+          "thread_cpu_ms": 948.5763600000205
+        },
+        "curation_check": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 660.8807135489769,
+          "thread_cpu_ms": 35.970222999985424
+        },
+        "coverage_begin": {
+          "calls": 4,
+          "errors": 0,
+          "milliseconds": 13.068375003058463,
+          "thread_cpu_ms": 0.5459159999983143
+        },
+        "assignment_persistence": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 4015.226089861244,
+          "thread_cpu_ms": 249.70983200000242,
+          "cluster_coverage_pages": 4,
+          "cluster_coverage_writes": 1000
+        },
+        "runtime_update": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 654.2529545840807,
+          "thread_cpu_ms": 323.8920240000381
+        },
+        "coverage_finish": {
+          "calls": 4,
+          "errors": 0,
+          "milliseconds": 10.544998978730291,
+          "thread_cpu_ms": 0.522250999999585
+        },
+        "checkpoint": {
+          "calls": 4,
+          "errors": 0,
+          "milliseconds": 0.020457955542951822,
+          "thread_cpu_ms": 0.020665999997504514
+        }
+      },
+      "latency_ms_per_fake_call": 1.0,
+      "includes_control_calls": true,
+      "identities": 32,
+      "dimensions": 512,
+      "trial": 1,
+      "output_parity": true
+    },
+    {
+      "mode": "per_write",
+      "faces": 500,
+      "calls": {
+        "jobs.get_entity": 12,
+        "people.query_entities": 39,
+        "faces.query_entities": 1,
+        "jobs.submit_transaction": 3,
+        "faces.get_entity": 1000,
+        "people.get_entity": 1000,
+        "admission.get_entity": 2000,
+        "coverage.get_entity": 2001,
+        "coverage.create_entity": 1,
+        "coverage.submit_transaction": 2000,
+        "people.update_entity": 500,
+        "members.create_entity": 500,
+        "faces.update_entity": 500
+      },
+      "total_measured_calls": 9557,
+      "coverage_pages": 0,
+      "scoped_writes": 0,
+      "elapsed_seconds": 17.917293500038795,
+      "cpu_seconds": 4.615780000000001,
+      "faces_per_second": 27.906000423496852,
+      "journal_fsyncs": 1002,
+      "phases": {
+        "lease_wait": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.03850000211969018,
+          "thread_cpu_ms": 0.03833399999919607
+        },
+        "journal_open": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 6.5177499782294035,
+          "thread_cpu_ms": 0.9719169999975463
+        },
+        "resume_restore": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.029333983547985554,
+          "thread_cpu_ms": 0.02954099999996629
+        },
+        "journal_write": {
+          "calls": 1570,
+          "errors": 0,
+          "milliseconds": 2197.434342233464,
+          "thread_cpu_ms": 1247.726618999945,
+          "journal_flush_ms": 1014.0933836810291,
+          "journal_flushes": 1002,
+          "journal_fsync_ms": 82.7071561361663,
+          "journal_fsyncs": 1002
+        },
+        "guard_ownership_read": {
+          "calls": 6,
+          "errors": 0,
+          "milliseconds": 7.772250100970268,
+          "thread_cpu_ms": 0.25062599999259305
+        },
+        "snapshot_prepare": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 145.97941702231765,
+          "thread_cpu_ms": 89.4779579999998,
+          "batch_keys": 532,
+          "batch_missing": 500,
+          "batch_peak_inflight": 1,
+          "batch_queries": 39,
+          "batch_queue_ms": 0.06099906750023365,
+          "batch_requests": 39,
+          "batch_rows": 32,
+          "batch_service_ms": 49.82637712964788,
+          "batch_wall_ms": 53.237877844367176,
+          "journal_flush_ms": 1.480833045206964,
+          "journal_flushes": 1,
+          "journal_fsync_ms": 0.34600001526996493,
+          "journal_fsyncs": 1
+        },
+        "runtime_build": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 2.8021670295856893,
+          "thread_cpu_ms": 2.322166999999098
+        },
+        "matching": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 1476.2658256222494,
+          "thread_cpu_ms": 1467.7915009999642
+        },
+        "curation_check": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 670.5359700717963,
+          "thread_cpu_ms": 46.48096099998611
+        },
+        "assignment_persistence": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 11970.477045106236,
+          "thread_cpu_ms": 716.4962230000224
+        },
+        "runtime_update": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 1028.2893397961743,
+          "thread_cpu_ms": 629.4224609999868
+        },
+        "checkpoint": {
+          "calls": 4,
+          "errors": 0,
+          "milliseconds": 0.04550005542114377,
+          "thread_cpu_ms": 0.04624999999691681
+        }
+      },
+      "latency_ms_per_fake_call": 1.0,
+      "includes_control_calls": true,
+      "identities": 32,
+      "dimensions": 512,
+      "trial": 1,
+      "output_parity": true
+    },
+    {
+      "mode": "per_write",
+      "faces": 500,
+      "calls": {
+        "jobs.get_entity": 12,
+        "people.query_entities": 39,
+        "faces.query_entities": 1,
+        "jobs.submit_transaction": 3,
+        "faces.get_entity": 1000,
+        "people.get_entity": 1000,
+        "admission.get_entity": 2000,
+        "coverage.get_entity": 2001,
+        "coverage.create_entity": 1,
+        "coverage.submit_transaction": 2000,
+        "people.update_entity": 500,
+        "members.create_entity": 500,
+        "faces.update_entity": 500
+      },
+      "total_measured_calls": 9557,
+      "coverage_pages": 0,
+      "scoped_writes": 0,
+      "elapsed_seconds": 18.03919862495968,
+      "cpu_seconds": 4.775134999999999,
+      "faces_per_second": 27.71741751921186,
+      "journal_fsyncs": 1002,
+      "phases": {
+        "lease_wait": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.04650000482797623,
+          "thread_cpu_ms": 0.046458999999998696
+        },
+        "journal_open": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 12.024750001728535,
+          "thread_cpu_ms": 1.2425840000034327
+        },
+        "resume_restore": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.0237500062212348,
+          "thread_cpu_ms": 0.023749999996880433
+        },
+        "journal_write": {
+          "calls": 1570,
+          "errors": 0,
+          "milliseconds": 2209.371092263609,
+          "thread_cpu_ms": 1303.8744380000326,
+          "journal_flush_ms": 1033.4611318539828,
+          "journal_flushes": 1002,
+          "journal_fsync_ms": 85.74732893612236,
+          "journal_fsyncs": 1002
+        },
+        "guard_ownership_read": {
+          "calls": 6,
+          "errors": 0,
+          "milliseconds": 7.692331913858652,
+          "thread_cpu_ms": 0.17737300000320033
+        },
+        "snapshot_prepare": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 146.42712497152388,
+          "thread_cpu_ms": 89.64050000000157,
+          "batch_keys": 532,
+          "batch_missing": 500,
+          "batch_peak_inflight": 1,
+          "batch_queries": 39,
+          "batch_queue_ms": 0.055710901506245136,
+          "batch_requests": 39,
+          "batch_rows": 32,
+          "batch_service_ms": 50.095414044335485,
+          "batch_wall_ms": 53.658835240639746,
+          "journal_flush_ms": 1.6445420333184302,
+          "journal_flushes": 1,
+          "journal_fsync_ms": 0.2748340484686196,
+          "journal_fsyncs": 1
+        },
+        "runtime_build": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 3.041124960873276,
+          "thread_cpu_ms": 2.1449999999987313
+        },
+        "matching": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 1526.52321185451,
+          "thread_cpu_ms": 1517.0639240000116
+        },
+        "curation_check": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 672.2658280050382,
+          "thread_cpu_ms": 47.07610199995216
+        },
+        "assignment_persistence": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 11986.186255991925,
+          "thread_cpu_ms": 726.78119299999
+        },
+        "runtime_update": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 1046.8170852400362,
+          "thread_cpu_ms": 656.2984219999635
+        },
+        "checkpoint": {
+          "calls": 4,
+          "errors": 0,
+          "milliseconds": 0.03620801726356149,
+          "thread_cpu_ms": 0.03658400000006168
+        }
+      },
+      "latency_ms_per_fake_call": 1.0,
+      "includes_control_calls": true,
+      "identities": 32,
+      "dimensions": 512,
+      "trial": 2,
+      "output_parity": true
+    },
+    {
+      "mode": "page",
+      "faces": 500,
+      "calls": {
+        "jobs.get_entity": 12,
+        "people.query_entities": 39,
+        "faces.query_entities": 1,
+        "jobs.submit_transaction": 3,
+        "faces.get_entity": 500,
+        "people.get_entity": 500,
+        "admission.get_entity": 1004,
+        "coverage.get_entity": 9,
+        "coverage.create_entity": 1,
+        "coverage.submit_transaction": 8,
+        "people.update_entity": 500,
+        "members.create_entity": 500,
+        "faces.update_entity": 500
+      },
+      "total_measured_calls": 3577,
+      "coverage_pages": 4,
+      "scoped_writes": 1000,
+      "elapsed_seconds": 8.092496083991136,
+      "cpu_seconds": 2.557500000000001,
+      "faces_per_second": 61.78563385271422,
+      "journal_fsyncs": 1002,
+      "phases": {
+        "lease_wait": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.033958000130951405,
+          "thread_cpu_ms": 0.034708000001160144
+        },
+        "journal_open": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 5.903916957322508,
+          "thread_cpu_ms": 0.8947500000004993
+        },
+        "resume_restore": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 0.024667009711265564,
+          "thread_cpu_ms": 0.024833000001223127
+        },
+        "journal_write": {
+          "calls": 1570,
+          "errors": 0,
+          "milliseconds": 1452.997701941058,
+          "thread_cpu_ms": 693.109478000039,
+          "journal_flush_ms": 684.7763653495349,
+          "journal_flushes": 1002,
+          "journal_fsync_ms": 46.71186418272555,
+          "journal_fsyncs": 1002
+        },
+        "guard_ownership_read": {
+          "calls": 6,
+          "errors": 0,
+          "milliseconds": 7.662583026103675,
+          "thread_cpu_ms": 0.15050200000388259
+        },
+        "snapshot_prepare": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 102.887750021182,
+          "thread_cpu_ms": 81.07379199999798,
+          "batch_keys": 532,
+          "batch_missing": 500,
+          "batch_peak_inflight": 4,
+          "batch_queries": 39,
+          "batch_queue_ms": 1.504582935012877,
+          "batch_requests": 10,
+          "batch_rows": 32,
+          "batch_service_ms": 52.0180388703011,
+          "batch_wall_ms": 17.109583073761314,
+          "journal_flush_ms": 1.8294579931534827,
+          "journal_flushes": 1,
+          "journal_fsync_ms": 0.3437079722061753,
+          "journal_fsyncs": 1
+        },
+        "runtime_build": {
+          "calls": 1,
+          "errors": 0,
+          "milliseconds": 3.2979169627651572,
+          "thread_cpu_ms": 2.2168750000020054
+        },
+        "matching": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 920.0886649196036,
+          "thread_cpu_ms": 919.7191380000788
+        },
+        "curation_check": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 660.605045792181,
+          "thread_cpu_ms": 36.687003000036356
+        },
+        "coverage_begin": {
+          "calls": 4,
+          "errors": 0,
+          "milliseconds": 13.219041924457997,
+          "thread_cpu_ms": 0.704251000001932
+        },
+        "assignment_persistence": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 4014.974550518673,
+          "thread_cpu_ms": 248.01528600002598,
+          "cluster_coverage_pages": 4,
+          "cluster_coverage_writes": 1000
+        },
+        "runtime_update": {
+          "calls": 500,
+          "errors": 0,
+          "milliseconds": 659.4971319427714,
+          "thread_cpu_ms": 314.13824299993115
+        },
+        "coverage_finish": {
+          "calls": 4,
+          "errors": 0,
+          "milliseconds": 10.628251009620726,
+          "thread_cpu_ms": 0.616875999995159
+        },
+        "checkpoint": {
+          "calls": 4,
+          "errors": 0,
+          "milliseconds": 0.021541083697229624,
+          "thread_cpu_ms": 0.021750000001929948
+        }
+      },
+      "latency_ms_per_fake_call": 1.0,
+      "includes_control_calls": true,
+      "identities": 32,
+      "dimensions": 512,
+      "trial": 2,
+      "output_parity": true
+    }
+  ],
+  "summaries": [
+    {
+      "faces": 1,
+      "output_parity": true,
+      "before": {
+        "median_seconds": 0.0948313339613378,
+        "faces_per_second": 10.545037786853175,
+        "min_seconds": 0.09142441704170778,
+        "max_seconds": 0.102254958008416,
+        "median_cpu_seconds": 0.026968000000000103,
+        "median_counted_calls": 41,
+        "median_fsyncs": 4
+      },
+      "after": {
+        "median_seconds": 0.08438879199093208,
+        "faces_per_second": 11.849914857265098,
+        "min_seconds": 0.07820079202065244,
+        "max_seconds": 0.0852331249625422,
+        "median_cpu_seconds": 0.026621000000000006,
+        "median_counted_calls": 34,
+        "median_fsyncs": 4
+      },
+      "measured_speedup": 1.1237432332427253,
+      "counted_call_reduction_percent": 17.07317073170732
+    },
+    {
+      "faces": 128,
+      "output_parity": true,
+      "before": {
+        "median_seconds": 4.231366541993339,
+        "faces_per_second": 30.250274640518608,
+        "min_seconds": 4.159497916989494,
+        "max_seconds": 4.320879792037886,
+        "median_cpu_seconds": 0.8943889999999999,
+        "median_counted_calls": 2463,
+        "median_fsyncs": 258
+      },
+      "after": {
+        "median_seconds": 1.824151333014015,
+        "faces_per_second": 70.16961678749959,
+        "min_seconds": 1.8144206250435673,
+        "max_seconds": 1.8773019579821266,
+        "median_cpu_seconds": 0.4909509999999999,
+        "median_counted_calls": 932,
+        "median_fsyncs": 258
+      },
+      "measured_speedup": 2.3196356932743742,
+      "counted_call_reduction_percent": 62.15996751928543
+    },
+    {
+      "faces": 500,
+      "output_parity": true,
+      "before": {
+        "median_seconds": 17.917293500038795,
+        "faces_per_second": 27.906000423496852,
+        "min_seconds": 17.059625042020343,
+        "max_seconds": 18.03919862495968,
+        "median_cpu_seconds": 4.615780000000001,
+        "median_counted_calls": 9557,
+        "median_fsyncs": 1002
+      },
+      "after": {
+        "median_seconds": 8.092496083991136,
+        "faces_per_second": 61.78563385271422,
+        "min_seconds": 8.03259475005325,
+        "max_seconds": 8.151413250016049,
+        "median_cpu_seconds": 2.5885409999999993,
+        "median_counted_calls": 3577,
+        "median_fsyncs": 1002
+      },
+      "measured_speedup": 2.214062671650027,
+      "counted_call_reduction_percent": 62.57193680025112
+    }
+  ],
+  "complete": true
+}

@@ -39,6 +39,15 @@ def test_core_role_does_not_serve_tools_routes():
     assert '/api/photos' in paths  # sanity: other groups still registered
 
 
+def test_subscription_negotiation_is_core_with_legacy_indexer_compatibility():
+    core = _rule_paths_for_role('core')
+    indexer = _rule_paths_for_role('indexer')
+    assert '/api/index-events/negotiate' in core
+    assert '/api/tools/index-events/negotiate' not in core
+    assert '/api/index-events/negotiate' not in indexer
+    assert '/api/tools/index-events/negotiate' in indexer
+
+
 def test_core_role_does_not_serve_upload_routes():
     paths = _rule_paths_for_role(None)
     assert '/api/upload/init' not in paths
@@ -51,16 +60,26 @@ def test_core_role_does_not_serve_admin_routes():
     assert '/api/photos' in paths  # sanity: other groups still registered
 
 
-def test_core_role_does_not_serve_archive_routes():
-    """2026-09-17: library/public moved to their own 'archive' role so core can
-    shrink to a 0.5vCPU/1Gi everyday-browsing tier. people_bp moved back to
-    'core' 2026-10-08 once get_person's request-path full-account scan was
-    replaced with a bounded per-person fetch -- see app.py's 'archive' branch
-    comment -- so core DOES serve people_bp now; only library/public don't."""
+def test_core_role_serves_management_but_not_archive_operations():
+    """Management is core; whole-library operations/public stay on archive."""
     paths = _rule_paths_for_role(None)
     assert '/api/persons/page' in paths  # people_bp moved here 2026-10-08
     assert '/api/faces/delete' in paths
-    assert '/api/library/mine' not in paths
+    assert '/api/library/mine' in paths
+    assert {
+        '/api/library/members', '/api/library/switch', '/api/library/rename',
+        '/api/library/invite', '/api/library/invite/info',
+        '/api/library/invite/accept', '/api/library/invite/revoke',
+        '/api/library/members/remove', '/api/library/leave',
+    } <= paths
+    assert not {
+        '/api/library', '/api/library/export/manifest',
+        '/api/library/download/request', '/api/library/download/status',
+        '/api/library/clean/request', '/api/library/clean/confirm',
+        '/api/library/clean/status', '/api/library/cleanup-info',
+        '/api/library/clean/confirmation-status',
+        '/api/library/cleanup-info/',
+    } & paths
     assert '/public/albums/<token>' not in paths
     assert '/api/photos' in paths  # sanity: other groups still registered
     assert '/health' in paths  # system_bp stays on core -- see app.py's comment
@@ -150,4 +169,19 @@ def test_archive_role_serves_only_library_and_public_routes():
     archive_prefixes = ('/api/library', '/public', '/api/public')
     assert all(p.startswith(archive_prefixes) for p in non_static)
     assert '/api/library/mine' in non_static
+    assert {
+        '/api/library', '/api/library/export/manifest',
+        '/api/library/download/request', '/api/library/download/status',
+        '/api/library/clean/request', '/api/library/clean/confirm',
+        '/api/library/clean/status', '/api/library/cleanup-info',
+        '/api/library/clean/confirmation-status',
+        '/api/library/cleanup-info/',
+    } <= non_static
     assert '/public/albums/<token>' in non_static
+
+
+def test_upload_reconciliation_is_core_only():
+    path='/api/upload-sessions/reconcile'
+    assert path in _rule_paths_for_role('core')
+    assert path not in _rule_paths_for_role('upload')
+    assert path not in _rule_paths_for_role('indexer')

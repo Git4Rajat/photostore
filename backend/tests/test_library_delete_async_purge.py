@@ -14,7 +14,7 @@ import json
 import pytest
 
 import app
-from routes.library import library_delete
+from routes.library_operations import library_delete
 
 
 class _FakeLibraryStore:

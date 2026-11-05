@@ -13,8 +13,9 @@ from azure.data.tables import TableTransactionError
 
 from processing_artifacts import verify_receipt
 from processing_completion import STEPS, TERMINAL
-from processing_fence import current_fence
+from processing_fence import current_fence, check_immutable_source
 from upload_waves import digest
+import processing_metrics
 
 
 class ArtifactReceipts:
@@ -25,12 +26,17 @@ class ArtifactReceipts:
         self.partition = 'processing-artifacts-' + digest(library)
 
     def _get(self, key):
+        from processing_receipt_cache import cached_receipt
+        row = cached_receipt(self.table, self.partition, key)
+        return row if row is not None else self._read_durable(key)
+
+    def _read_durable(self, key):
         try:
             return self.table.get_entity(self.partition, key)
         except ResourceNotFoundError:
             return None
 
-    def _put(self, kind, payload):
+    def _prepare(self, kind, payload):
         def timestamp(value):
             if isinstance(value, datetime):
                 return value.isoformat()
@@ -41,34 +47,78 @@ class ArtifactReceipts:
             raise ValueError('Artifact snapshot exceeds property byte budget')
         identity = digest(payload)
         key = kind + '!' + identity
-        previous = self._get(key)
-        if previous is None:
-            row = dict(PartitionKey=self.partition, RowKey=key, payload=encoded)
+        row = dict(PartitionKey=self.partition, RowKey=key, payload=encoded)
+        return identity, row
+
+    def _put(self, kind, payload):
+        identity, row = self._prepare(kind, payload)
+        key, encoded = row['RowKey'], row['payload']
+        try:
+            # New immutable receipts are the common path. Create-only proves
+            # absence without a preliminary GET; retries must prove equality.
+            self.table.submit_transaction([('create', row)])
+            processing_metrics.add(receipt_creates=1)
+        except (ResourceExistsError, TableTransactionError) as exc:
+            if isinstance(exc, TableTransactionError) and exc.status_code != 409:
+                raise
+            processing_metrics.add(receipt_create_conflicts=1)
+            # Conflict equality must be proved from storage, never a cached
+            # write acknowledgement from an earlier create in this scope.
+            previous = self._read_durable(key)
+            if previous is None:
+                raise
+            if previous.get('payload') != encoded:
+                raise ValueError('Artifact receipt identity rebound')
+        from processing_receipt_cache import remember_committed
+        remember_committed(self.table, row)
+        return identity
+
+    def _put_many(self, kind, payloads):
+        """Bounded create-only transactions; a conflicting batch fully rolls back.
+
+        Retry individual immutable creates only on 409, proving equality for
+        existing identities. Never publish a manifest until every batch succeeds.
+        """
+        prepared = [self._prepare(kind, payload) for payload in payloads]
+        for offset in range(0, len(prepared), 20):
+            batch = prepared[offset:offset + 20]
+            unique = {row['RowKey']: row for _, row in batch}
             try:
-                self.table.submit_transaction([('create', row)])
+                self.table.submit_transaction([('create', row) for row in unique.values()])
+                processing_metrics.add(receipt_creates=len(unique), receipt_write_batches=1)
+                from processing_receipt_cache import remember_committed
+                for row in unique.values():
+                    remember_committed(self.table, row)
             except (ResourceExistsError, TableTransactionError) as exc:
                 if isinstance(exc, TableTransactionError) and exc.status_code != 409:
                     raise
-                previous = self._get(key)
-                if previous is None:
-                    raise
-        if previous is not None and previous.get('payload') != encoded:
-            raise ValueError('Artifact receipt identity rebound')
-        return identity
+                for _, row in batch:
+                    self._put(kind, json.loads(row['payload']))
+        return [identity for identity, _ in prepared]
 
+    @processing_metrics.purpose('artifact_capture')
     def capture(self, storage, metadata):
         fence = current_fence(self.library, metadata['RowKey'])
         if fence is None:
             raise ValueError('Artifact capture requires a source attempt fence')
-        fence.check()
+        check_immutable_source(fence)
         statuses = {step: metadata.get(step + '_status') for step in STEPS}
-        if any(status not in TERMINAL for status in statuses.values()):
+        from image_utils import is_video_file
+        from processing_generation import required_steps_for_media
+        required = required_steps_for_media(is_video_file(metadata['RowKey']))
+        if any(statuses[step] not in TERMINAL for step in required):
             return None
-        derivatives = {kind: verify_receipt(storage, metadata, kind) for kind in ('thumbnail', 'preview')
-                       if statuses[kind] == 'done'}
+        # Browser-owned video never runs face detection and can omit its
+        # count entirely. Persist the contract's zero-face result with the
+        # receipt so completion and frozen face coverage use the same value.
+        # Required image face work and positive counts still need proof.
+        if 'face' not in required and metadata.get('faceCount') is None:
+            metadata['faceCount'] = 0
+        derivatives = {kind: verify_receipt(storage, metadata, kind, reuse_published=True) for kind in ('thumbnail', 'preview')
+                       if statuses[kind] == 'done' and (kind in required or metadata.get(kind + 'Artifact'))}
         snapshot_ids = []
         lookup_generation = ''
-        if statuses['face'] in ('done', 'no_data'):
+        if 'face' in required and statuses['face'] in ('done', 'no_data'):
             table = storage._CTX.get('face_by_filename_table_client')
             if table is None:
                 raise ValueError('Complete face lookup required for artifact receipt')
@@ -79,13 +129,27 @@ class ArtifactReceipts:
                     or lookup.get('processingRevision') != fence.revision):
                 raise ValueError('Face lookup is not qualified for this source generation')
             lookup_generation = lookup['generation']
-            for face_id in sorted(ids):
-                face = storage._CTX['face_table_client'].get_entity(self.library, face_id)
+            ordered_ids = sorted(ids)
+            face_table = storage._CTX['face_table_client']
+            embedding_table = storage._CTX.get('face_embeddings_table_client')
+            face_rows, embedding_rows = {}, {}
+            if len(ordered_ids) >= 4:
+                from table_reads import read_entities
+                face_rows = read_entities(face_table, self.library, ordered_ids)
+                if embedding_table:
+                    embedding_rows = read_entities(embedding_table, self.library, ordered_ids)
+            snapshots = []
+            for face_id in ordered_ids:
+                face = face_rows.get(face_id) if face_id in face_rows else face_table.get_entity(self.library, face_id)
+                if face is None:
+                    raise ValueError('Face snapshot row missing')
                 if (face.get('filename') != fence.filename or face.get('sourcePhotoId') != fence.photo
                         or face.get('processingRevision') != fence.revision or not face.get('processingFence')):
                     raise ValueError('Face snapshot source identity mismatch')
-                embedding_table = storage._CTX.get('face_embeddings_table_client')
-                embedded = embedding_table.get_entity(self.library, face_id) if embedding_table else face
+                embedded = (embedding_rows.get(face_id) if face_id in embedding_rows else
+                    embedding_table.get_entity(self.library, face_id)) if embedding_table else face
+                if embedded is None:
+                    raise ValueError('Face snapshot embedding missing')
                 if any(embedded.get(key) != face.get(key) for key in ('sourcePhotoId', 'processingRevision', 'processingFence')):
                     raise ValueError('Face and embedding attempts differ')
                 vector = json.loads(embedded.get('embedding') or '[]')
@@ -93,20 +157,64 @@ class ArtifactReceipts:
                         or any(type(v) not in (float, int) or not math.isfinite(v) for v in vector)
                         or not any(vector)):
                     raise ValueError('Face snapshot requires a valid versioned embedding')
-                snapshot_ids.append(self._put('face', dict(face, embedding=json.dumps(vector, separators=(',', ':')))))
+                snapshots.append(dict(face, embedding=json.dumps(vector, separators=(',', ':'))))
+            snapshot_ids = self._put_many('face', snapshots)
             # Do not publish a receipt from a lookup concurrently replaced by repair.
             again = table.get_entity(self.library, fence.filename)
             if dict(again) != dict(lookup):
                 raise ValueError('Face lookup changed during artifact capture')
         elif metadata.get('faceCount') != 0:
             raise ValueError('Skipped face work with existing faces requires an explicit prior receipt')
-        fence.check()
         payload = dict(schemaVersion=1, library=self.library, filename=fence.filename, photoId=fence.photo,
             revision=fence.revision, statuses=statuses, derivatives=derivatives, faceCount=metadata.get('faceCount'),
             faceSnapshots=snapshot_ids, faceLookupGeneration=lookup_generation)
         identity = self._put('manifest', payload)
-        fence.check()
+        check_immutable_source(fence)
+        # Replace only the known, unacceptably mismatched video intents. The
+        # caller commits this outbox delta with the newly captured proof under
+        # the same source fence. Valid and other-generation intents survive.
+        backlog = json.loads(metadata.get('processingCompletionOutbox') or '[]')
+        remaining = [intent for intent in backlog if not (
+            all(intent.get(key) == value for key, value in dict(library=self.library,
+                filename=fence.filename, photoId=fence.photo, revision=fence.revision,
+                generation=fence.generation).items())
+            and self.is_video_status_mismatch(intent))]
+        if remaining != backlog:
+            metadata['processingCompletionOutbox'] = json.dumps(remaining, sort_keys=True, separators=(',', ':'))
         return dict(id=identity, library=self.library, filename=fence.filename, photoId=fence.photo, revision=fence.revision)
+
+    def is_video_status_mismatch(self, intent):
+        """Recognize the historical post-capture optional-derivative downgrade.
+
+        This is not a general invalid-receipt escape hatch: require a valid
+        envelope and immutable manifest, with only unreceipted video derivative
+        statuses changed from done to failed. No face or derivative proof may
+        be discarded, and no missing/corrupt manifest is recoverable here.
+        """
+        from image_utils import is_video_file
+        from processing_completion import validate_intent
+        if not is_video_file(intent.get('filename') or ''):
+            return False
+        try:
+            validate_intent(intent, self.library)
+            reference = intent['artifactReceipt']
+            if not isinstance(reference, dict):
+                return False
+            row = self._get('manifest!' + str(reference.get('id')))
+            if row is None:
+                return False
+            manifest = json.loads(row['payload'])
+            differences = {step for step in STEPS
+                if manifest['statuses'].get(step) != intent['statuses'].get(step)}
+            if (not differences or not differences <= {'thumbnail', 'preview'}
+                    or manifest.get('faceCount') != 0 or manifest.get('faceSnapshots') != []
+                    or any(manifest['statuses'][step] != 'done' or intent['statuses'][step] != 'failed'
+                        or step in manifest['derivatives'] or step in intent['derivatives'] for step in differences)):
+                return False
+            self.verify_reference(reference, dict(intent, statuses=manifest['statuses']))
+            return True
+        except (ValueError, KeyError, TypeError):
+            return False
 
     def verify_reference(self, reference, intent):
         if (not isinstance(reference, dict) or any(reference.get(key) != intent.get(key)

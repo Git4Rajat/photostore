@@ -46,13 +46,13 @@ param adminPassword string
 ])
 param emailDataLocation string = 'Europe'
 
-@description('Where OCR/face/vision/geo processing runs. "browser" (default): entirely client-side, same as today -- no extra cost, works everywhere. "backend": the browser skips this work entirely and a new vision container processes every upload server-side instead -- better for low-power/mobile clients, and enables bulk background reprocessing of an existing library, at the cost of running vision (which needs meaningfully more CPU/memory than the rest of this deployment). "both": the browser and vision both attempt it and whichever finishes first for a given photo wins -- doubles compute cost per step, useful mainly for comparing the two paths.')
+@description('Where OCR/face/vision/geo processing runs. "browser": entirely client-side -- no extra cost, works everywhere. "backend" (default): the browser skips this work entirely and a new vision container processes every upload server-side instead -- better for low-power/mobile clients, and enables bulk background reprocessing of an existing library, at the cost of running vision (which needs meaningfully more CPU/memory than the rest of this deployment). "both": the browser and vision both attempt it and whichever finishes first for a given photo wins -- doubles compute cost per step, useful mainly for comparing the two paths.')
 @allowed([
   'browser'
   'backend'
   'both'
 ])
-param processingMode string = 'browser'
+param processingMode string = 'backend'
 
 @description('Prepare thumbnails, previews and metadata in the browser, and reuse accepted assets for backend processing.')
 param browserUploadPreparation bool = true
@@ -71,14 +71,25 @@ param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker:latest'
 @maxValue(5120)
 param clusterFileShareQuotaGiB int = 100
 
-@description('Minimum clustering replicas. Default 0 scales to zero while idle; fresh graceful checkpoints support recovery. Set 1 to keep the index warm at continuous cost. Missing or stale checkpoints require a cold rebuild.')
+@description('Clustering replica floor. Must remain zero; queued and in-flight work keep the worker active. Checkpoints support recovery after idle scale-down.')
 @minValue(0)
-@maxValue(1)
+@maxValue(0)
 param clusterMinReplicas int = 0
 
 @description('Required: run index maintenance on the indexer sidecar; cluster only forwards legacy index messages.')
 @allowed([true])
 param dedicatedIndexWorker bool = true
+
+@description('Enable qualified wave execution after certificate seeding; fresh installs use deploy/fresh_wave.py.')
+param enableWaveExecution bool = true
+@description('Enroll newly created empty libraries only. Existing libraries never change ownership.')
+param enableNewWaveLibraries bool = true
+@description('Exact-image capability ID. Fresh wave activation requires the seeded release certificate; never leave empty.')
+param waveCapabilityId string = ''
+
+@description('Fresh-install preparation only: block upload intake and run certificate seeding as a manual recovery job. Activate only after that job succeeds.')
+param waveBootstrapPending bool = false
+
 
 @description('Enable managed WebSocket index-ready notifications. Adds a Web PubSub Standard unit; polling remains the fallback.')
 param enableIndexPush bool = false
@@ -247,6 +258,18 @@ resource workerCheckpointShare 'Microsoft.Storage/storageAccounts/fileServices/s
   }
 }
 
+// Lifecycle directory/notices have no scaler. Core reads on user traffic.
+resource uploadSessionTableService 'Microsoft.Storage/storageAccounts/tableServices@2023-05-01' = {
+  parent: storage
+  name: 'default'
+  properties: {}
+}
+resource uploadSessionsTable 'Microsoft.Storage/storageAccounts/tableServices/tables@2023-05-01' = {
+  parent: uploadSessionTableService
+  name: 'photouploadsessions'
+  properties: {}
+}
+
 resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
   parent: storage
   name: 'default'
@@ -398,9 +421,30 @@ resource indexPush 'Microsoft.SignalRService/webPubSub@2024-03-01' = if (enableI
 
 // Shared backend/worker environment variables.
 var backendEnv = [
+  { name: 'UPLOAD_WAVE_BOOTSTRAP_PENDING', value: waveBootstrapPending ? 'true' : 'false' }
+  { name: 'UPLOAD_WAVE_EXECUTION_ENABLED', value: enableWaveExecution ? 'true' : 'false' }
+  { name: 'UPLOAD_WAVE_NEW_LIBRARIES_ENABLED', value: enableNewWaveLibraries ? 'true' : 'false' }
+  { name: 'UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED', value: (enableWaveExecution || enableNewWaveLibraries) ? 'true' : 'false' }
+  { name: 'PROCESSING_GENERATION_ENFORCEMENT_ENABLED', value: (enableWaveExecution || enableNewWaveLibraries) ? 'true' : 'false' }
+  { name: 'UPLOAD_WAVE_CAPABILITY_ID', value: waveCapabilityId }
+
   { name: 'INDEX_EVENTS_ENDPOINT', value: enableIndexPush ? 'https://${indexPush!.properties.hostName}' : '' }
   { name: 'INDEX_MAINTENANCE_QUEUE_NAME', value: 'photostore-index-maintenance' }
+  { name: 'INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME', value: 'photostore-index-maintenance-deferred' }
+  { name: 'IPWORKER_DEFERRED_QUEUE_NAME', value: 'photostore-ipwork-deferred' }
   { name: 'INDEX_BUILD_ROLES', value: 'index-worker' }
+  // Inline merge (see backend/inline_index_merge.py): lets `core` finish a
+  // small CRUD-triggered people/albums/sort/access rebuild itself, through a
+  // bounded local queue, instead of always waking the dedicated index-worker
+  // role. Only takes effect on APP_ROLE=core regardless of this flag's value
+  // elsewhere. Enabled 2026-10-31 after the TOCTOU/newer-signal/delay-gating
+  // fixes from the code review landed (see git history); requires a built
+  // image containing inline_index_merge.py to actually do anything.
+  { name: 'INLINE_INDEX_MERGE_ENABLED', value: 'true' }
+  { name: 'INLINE_INDEX_MERGE_WORKERS', value: '2' }
+  { name: 'INLINE_INDEX_MERGE_QUEUE_SIZE', value: '32' }
+  { name: 'INLINE_INDEX_MERGE_MAX_ROWS', value: '5000' }
+  { name: 'INLINE_INDEX_MERGE_BACKSTOP_DELAY_SECONDS', value: '20' }
   { name: 'STORAGE_ACCOUNT_NAME', value: storageAccountName }
   { name: 'USE_MANAGED_IDENTITY', value: 'true' }
   // 'sas': browsers fetch media straight from blob storage via short-lived
@@ -641,7 +685,7 @@ var backendEnv = [
   { name: 'PEOPLE_CLUSTER_MAINTENANCE_COOLDOWN_SECONDS', value: '1800' }
 ]
 
-resource core 'Microsoft.App/containerApps@2024-03-01' = {
+resource core 'Microsoft.App/containerApps@2025-01-01' = {
   name: coreAppName
   location: location
   identity: {
@@ -749,6 +793,7 @@ resource core 'Microsoft.App/containerApps@2024-03-01' = {
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'core' }
+            { name: 'UPLOAD_WAVE_DEPLOYMENT_ID', value: coreImage }
             // Shared Azure Files volume: index blobs are cached here by ETag so a
             // restart/scale-out re-reads from disk instead of re-downloading them.
             { name: 'INDEX_DISK_CACHE_DIR', value: '/mnt/photostore/shared/index-cache' }
@@ -888,6 +933,7 @@ resource core 'Microsoft.App/containerApps@2024-03-01' = {
         { name: 'search-db', storageType: 'EmptyDir' }
       ]
       scale: {
+        cooldownPeriod: 300
         minReplicas: 0
         // Was 3. Raised to 5 after a real HAR capture showed the client-side
         // upload-parallelism fix (effectiveRtt cross-check, see
@@ -990,6 +1036,7 @@ resource indexer 'Microsoft.App/containerApps@2025-01-01' = {
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'indexer' }
+            { name: 'UPLOAD_WAVE_DEPLOYMENT_ID', value: coreImage }
             // Shared Azure Files volume: index blobs are cached here by ETag so a
             // restart/scale-out re-reads from disk instead of re-downloading them.
             { name: 'INDEX_DISK_CACHE_DIR', value: '/mnt/photostore/shared/index-cache' }
@@ -1014,6 +1061,7 @@ resource indexer 'Microsoft.App/containerApps@2025-01-01' = {
           ]
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'index-worker' }
+            { name: 'UPLOAD_WAVE_DEPLOYMENT_ID', value: coreImage }
             { name: 'INDEX_DISK_CACHE_DIR', value: '/mnt/photostore/shared/index-cache' }
             { name: 'INDEX_BUILD_WORK_DIR', value: '/mnt/photostore/shared/index-build' }
             { name: 'SEARCH_DB_DIR', value: '/tmp/photostore-index-search' }
@@ -1029,6 +1077,10 @@ resource indexer 'Microsoft.App/containerApps@2025-01-01' = {
         { name: 'index-cache', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
       ]
       scale: {
+        // Lowered from 300s: idle-cooldown tail was ~50% of billed replica
+        // time (see docs/benchmarks/cluster-false-starts-20261030.md);
+        // background worker, no user-facing cold-start latency to protect.
+        cooldownPeriod: 60
         minReplicas: 0
         // One publisher process during migration; API and queue work are
         // isolated containers, while work leases protect restart overlap.
@@ -1050,6 +1102,25 @@ resource indexer 'Microsoft.App/containerApps@2025-01-01' = {
               metadata: {
                 accountName: storageAccountName
                 queueName: 'photostore-index-maintenance'
+                queueLength: '1'
+                // Claimed messages remain work until ACK, including long builds.
+                queueLengthStrategy: 'all'
+              }
+              identity: 'system'
+            }
+          }
+          {
+            // Delayed wakeups (coalescing / dedup-idle wait / retry backoff --
+            // see INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME) are never actively
+            // held, only waiting out a schedule, so 'visibleonly' correctly
+            // reports empty while they wait -- same fix shape as
+            // clustering-deferred-queue (see docs/benchmarks/cluster-false-starts-20261030.md).
+            name: 'index-maintenance-deferred-queue'
+            custom: {
+              type: 'azure-queue'
+              metadata: {
+                accountName: storageAccountName
+                queueName: 'photostore-index-maintenance-deferred'
                 queueLength: '1'
                 queueLengthStrategy: 'visibleonly'
               }
@@ -1076,7 +1147,7 @@ resource indexer 'Microsoft.App/containerApps@2025-01-01' = {
 // backend-cpu-optimization-2026-09 memory. Isolating this onto its own app
 // also keeps its mutate-everything endpoints off the gallery-facing
 // replica's attack surface.
-resource recovery 'Microsoft.App/containerApps@2024-03-01' = {
+resource recovery 'Microsoft.App/containerApps@2025-01-01' = {
   name: recoveryAppName
   location: location
   identity: {
@@ -1111,6 +1182,7 @@ resource recovery 'Microsoft.App/containerApps@2024-03-01' = {
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'recovery' }
+            { name: 'UPLOAD_WAVE_DEPLOYMENT_ID', value: coreImage }
             { name: 'GUNICORN_WORKERS', value: '1' }
             { name: 'GUNICORN_THREADS', value: '4' }
             { name: 'VECTOR_INDEX_PRIME_ON_STARTUP', value: 'false' }
@@ -1121,6 +1193,9 @@ resource recovery 'Microsoft.App/containerApps@2024-03-01' = {
         }
       ]
       scale: {
+        // Lowered from 300s: background worker, no user-facing cold-start
+        // latency to protect (see docs/benchmarks/cluster-false-starts-20261030.md).
+        cooldownPeriod: 60
         minReplicas: 0
         maxReplicas: 2
         rules: [
@@ -1169,7 +1244,10 @@ resource recovery 'Microsoft.App/containerApps@2024-03-01' = {
 // outright rather than carried along, since they were the only genuinely
 // unbounded-by-design reads in this blueprint. 'archive' now carries only
 // library/public.
-resource archive 'Microsoft.App/containerApps@2024-03-01' = {
+// 2026-11-02: library management now runs on core. Archive retains whole-library
+// deletion/export/cleanup and public traffic, plus temporary management routes
+// for old frontend bundles. No sizing/scaling change accompanies the split.
+resource archive 'Microsoft.App/containerApps@2025-01-01' = {
   name: archiveAppName
   location: location
   identity: {
@@ -1222,6 +1300,7 @@ resource archive 'Microsoft.App/containerApps@2024-03-01' = {
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'archive' }
+            { name: 'UPLOAD_WAVE_DEPLOYMENT_ID', value: coreImage }
             { name: 'INDEX_DISK_CACHE_DIR', value: '/mnt/photostore/shared/index-cache' }
             { name: 'GUNICORN_WORKERS', value: '1' }
             { name: 'GUNICORN_THREADS', value: '4' }
@@ -1236,6 +1315,9 @@ resource archive 'Microsoft.App/containerApps@2024-03-01' = {
         { name: 'index-cache', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
       ]
       scale: {
+        // Lowered from 300s: background worker, no user-facing cold-start
+        // latency to protect (see docs/benchmarks/cluster-false-starts-20261030.md).
+        cooldownPeriod: 60
         minReplicas: 0
         maxReplicas: 3
         rules: [
@@ -1278,7 +1360,7 @@ resource archive 'Microsoft.App/containerApps@2024-03-01' = {
 // lightweight coordination calls (the actual image bytes go browser->Blob
 // directly, never through this app), so this resize carries materially less
 // risk than the sibling apps' below.
-resource upload 'Microsoft.App/containerApps@2024-03-01' = {
+resource upload 'Microsoft.App/containerApps@2025-01-01' = {
   name: uploadAppName
   location: location
   identity: {
@@ -1314,12 +1396,34 @@ resource upload 'Microsoft.App/containerApps@2024-03-01' = {
             // SHA-256 hash of a large RAW file during dedup check) will
             // throttle slightly at 0.5 vCPU, but that only slows one hash
             // op by a few seconds -- not worth 50% more idle-replica cost.
-            cpu: json('0.5')
-            memory: '1Gi'
+            //
+            // 2026-10-31: partially reverted (0.5->0.75 vCPU, 1Gi->1.5Gi) to
+            // retest more per-replica capacity -- but via GUNICORN_WORKERS,
+            // not GUNICORN_THREADS. Raising THREADS for these exact handlers
+            // (finalize/init-batch/client-processing) was already tried live
+            // (2026-08-28, 4->12) and made things WORSE: p90 latency 85-94s
+            // -> 197-240s, clustered right at the gateway timeout -- because
+            // those handlers do real CPU-bound work per call (the SHA-256
+            // dedup hash above) that holds the GIL, so more threads in one
+            // process just adds contention, not parallelism. WORKERS are
+            // separate processes with their own GIL, so this is a genuinely
+            // different lever, not a retry of the disproven one. The CPU/
+            // memory bump pairs with it because a 2nd worker duplicates the
+            // ~250-350MB numpy/Pillow/Azure-SDK import baseline (see
+            // backend's own GUNICORN_WORKERS comment) and needs real spare
+            // CPU to actually run concurrently with the first instead of
+            // time-slicing the same 0.5 vCPU. Watch WorkingSetBytes/
+            // UsageNanoCores after this ships; revert both the worker count
+            // and this sizing together if it doesn't hold up live.
+            cpu: json('0.75')
+            memory: '1.5Gi'
           }
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'upload' }
-            { name: 'GUNICORN_WORKERS', value: '1' }
+            { name: 'UPLOAD_WAVE_DEPLOYMENT_ID', value: coreImage }
+            // 2026-10-31: 1->2, see the resources comment above for why this
+            // (not GUNICORN_THREADS) is the lever being retested.
+            { name: 'GUNICORN_WORKERS', value: '2' }
             { name: 'GUNICORN_THREADS', value: '4' }
             { name: 'GUNICORN_MAX_REQUESTS', value: '4000' }
             { name: 'GUNICORN_MAX_REQUESTS_JITTER', value: '400' }
@@ -1331,6 +1435,16 @@ resource upload 'Microsoft.App/containerApps@2024-03-01' = {
         }
       ]
       scale: {
+        // Reverted to 300s (was briefly lowered to 60s alongside the other
+        // background-worker apps, see fe773f3) -- upload is user-facing
+        // during active uploads, unlike cluster/indexer/recovery/archive.
+        // Confirmed live on forenklaprep1-dev: a 60s cooldown let KEDA scale
+        // 5->1 replicas during a lull mid-upload, then a resumed burst
+        // pushed the lone survivor to 55-58% CPU for ~9 minutes and timed
+        // out a client-side 15s admission call ("Upload admission failed:
+        // The server took too long to respond"). 300s rides out that kind
+        // of lull instead of scaling down into it.
+        cooldownPeriod: 300
         minReplicas: 0
         maxReplicas: 5
         rules: [
@@ -1338,7 +1452,13 @@ resource upload 'Microsoft.App/containerApps@2024-03-01' = {
             name: 'http-scaler'
             http: {
               metadata: {
-                concurrentRequests: '4'
+                // 2026-10-31: 4->8, matching GUNICORN_WORKERS=2 x
+                // GUNICORN_THREADS=4 (see resources comment above) -- same
+                // 1x-real-capacity convention this threshold has followed
+                // historically (not 2x), so sustained demand still has to
+                // clearly exceed one replica's real capacity to trigger
+                // scale-out rather than sitting flush with it.
+                concurrentRequests: '8'
               }
             }
           }
@@ -1346,9 +1466,10 @@ resource upload 'Microsoft.App/containerApps@2024-03-01' = {
       }
     }
   }
+  dependsOn: [ uploadSessionsTable ]
 }
 
-resource web 'Microsoft.App/containerApps@2024-03-01' = {
+resource web 'Microsoft.App/containerApps@2025-01-01' = {
   name: webAppName
   location: location
   properties: {
@@ -1389,6 +1510,7 @@ resource web 'Microsoft.App/containerApps@2024-03-01' = {
             // (core container, above) were wired correctly; this was the
             // missing piece on the web side.
             { name: 'APP_CONFIG_PROCESSING_MODE', value: processingMode }
+            { name: 'APP_CONFIG_UPLOAD_WAVE_EXECUTION_ENABLED', value: enableWaveExecution ? 'true' : 'false' }
             { name: 'APP_CONFIG_BROWSER_UPLOAD_PREPARATION', value: browserUploadPreparation ? 'true' : 'false' }
             { name: 'APP_CONFIG_FACE_API_MODEL_URL', value: '/models/face-api' }
             // Explicit pin, added with the AdaFace swap: docker-entrypoint.sh
@@ -1404,6 +1526,8 @@ resource web 'Microsoft.App/containerApps@2024-03-01' = {
         }
       ]
       scale: {
+        // Lowered from 300s: idle-cooldown tail is pure waste here too.
+        cooldownPeriod: 60
         // Scale-to-zero: nginx serving the SPA cold-starts in a couple of
         // seconds, and an idle deployment should cost nothing.
         minReplicas: 0
@@ -1462,6 +1586,7 @@ resource cluster 'Microsoft.App/containerApps@2025-01-01' = {
           ]
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'cluster' }
+            { name: 'UPLOAD_WAVE_DEPLOYMENT_ID', value: coreImage }
             { name: 'PEOPLE_FAISS_WORK_DIR', value: '/var/lib/photostore/faiss-work' }
             { name: 'PEOPLE_FAISS_CHECKPOINT_DIR', value: '/mnt/photostore/faiss-checkpoints' }
             // Same share the backend/tools mount at /mnt/photostore/shared -- worker builds the
@@ -1532,13 +1657,14 @@ resource cluster 'Microsoft.App/containerApps@2025-01-01' = {
         { name: 'faiss-checkpoints', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
       ]
       scale: {
-        // Live FAISS cannot amortize training if queue lulls destroy its only
-        // replica. A replica floor, not merely cooldown, prevents this teardown.
-        // It does not prevent deployment/platform/OOM restarts or cache changes.
+        // Lowered from 300s: measured ~50% of billed replica-time was
+        // idle-cooldown tail (docs/benchmarks/cluster-false-starts-20261030.md).
+        // Background worker, no user-facing cold-start latency to protect.
+        cooldownPeriod: 60
+        // Queued and claimed work keep this worker active. Once queues drain,
+        // scale to zero; checkpoints support the next cold start.
         minReplicas: clusterMinReplicas
         maxReplicas: 1
-        // Relevant only when explicitly opting back into a zero-replica floor.
-        cooldownPeriod: 300
         rules: [
           {
             name: 'clustering-queue'
@@ -1548,13 +1674,8 @@ resource cluster 'Microsoft.App/containerApps@2025-01-01' = {
                 accountName: storageAccountName
                 queueName: 'photostore-clustering'
                 queueLength: '1'
-                // Defensive, mirroring library-ops-queue's fix below: nothing
-                // sends a deliberately-delayed message here today, but a
-                // future self-rescheduling batch trigger (e.g. the planned
-                // "N faces or N minutes" cluster-batch check) would hit the
-                // exact same false-wake bug if this is left on the KEDA
-                // default ('all', which counts invisible/delayed messages).
-                queueLengthStrategy: 'visibleonly'
+                // Renewing visibility must not hide active clustering from KEDA.
+                queueLengthStrategy: 'all'
               }
               identity: 'system'
             }
@@ -1571,19 +1692,34 @@ resource cluster 'Microsoft.App/containerApps@2025-01-01' = {
                 accountName: storageAccountName
                 queueName: 'photostore-library-ops'
                 queueLength: '1'
-                // _queue_ipwork_release_check (backend/app.py) deliberately
-                // delays its self-rescheduling "is upload quiet yet?" message
-                // with visibility_timeout=IPWORK_RELEASE_IDLE_SECONDS so it
-                // isn't receivable until that window elapses. The KEDA
-                // default strategy ('all') counts that message anyway via
-                // Azure's approximate-message-count, which includes
-                // not-yet-visible messages -- so this rule was scaling the
-                // cluster app up for the ENTIRE duration of every upload,
-                // not just when real library-ops work existed. 'visibleonly'
-                // (same fix as ipwork-queue above) makes KEDA ignore the
-                // delayed message until it's actually receivable, so cluster
-                // only wakes for the ~instant it takes to re-send the check
-                // every IPWORK_RELEASE_IDLE_SECONDS, not continuously.
+                // Includes claimed work and delayed release checks. Delayed
+                // checks retain the worker until handled; hiding them would
+                // also hide an actively running library operation.
+                queueLengthStrategy: 'all'
+              }
+              identity: 'system'
+            }
+          }
+          {
+            // Deferred wave-continuation retries (progress/barrier_wait/
+            // artifact_cleanup/wave_active -- see send_stage in
+            // wave_runtime.py) land on this sibling queue instead of
+            // photostore-clustering, specifically so they can use
+            // 'visibleonly' here. The main clustering-queue rule above needs
+            // 'all' to avoid SIGTERM-killing an actively-renewed in-flight
+            // job, but that same setting can't distinguish a real in-flight
+            // message from one that's invisible only because it's
+            // deliberately scheduled for later -- every scheduled retry was
+            // keeping that rule's queueLength>=1 for its whole delay,
+            // measured live 2026-10-30 at ~45% of cluster wake-ups doing zero
+            // work (docs/benchmarks/cluster-false-starts-20261030.md).
+            name: 'clustering-deferred-queue'
+            custom: {
+              type: 'azure-queue'
+              metadata: {
+                accountName: storageAccountName
+                queueName: 'photostore-clustering-deferred'
+                queueLength: '1'
                 queueLengthStrategy: 'visibleonly'
               }
               identity: 'system'
@@ -1596,6 +1732,7 @@ resource cluster 'Microsoft.App/containerApps@2025-01-01' = {
   // storageName is a literal, so explicitly wait for the SMB registration.
   dependsOn: [
     workerCheckpointStorage
+    uploadSessionsTable
   ]
 }
 
@@ -1634,6 +1771,7 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
           ]
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'vision' }
+            { name: 'UPLOAD_WAVE_DEPLOYMENT_ID', value: visionImage }
             { name: 'IPWORKER_POLL_SECONDS', value: '2' }
             // Shared Azure Files volume, same share indexer/worker/clustering
             // already mount: a crash (SIGKILL/OOM, not a graceful SIGTERM
@@ -1643,17 +1781,20 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
             // See _write_cluster_buffer_checkpoint / _recover_stranded_cluster_buffer_checkpoints.
             { name: 'CLUSTER_BUFFER_CHECKPOINT_DIR', value: '/mnt/photostore/shared/cluster-buffers' }
             // How many photos one replica processes concurrently (see
-            // IPWORKER_CONCURRENCY in backend/app.py). Was raised live to 3
-            // out-of-band at some point (found as bicep/live drift on
-            // 2026-08-25). Lowered back to 2 on 2026-08-27 after per-step
-            // timing logs (see _run_ipwork_steps/_handle_ipwork_queue_payload)
-            // showed 3 concurrent OCR/face passes (both CPU-bound: pytesseract
-            // shells out to the tesseract binary, face runs YOLO+AdaFace)
-            // fighting over only 2 vCPU -- per-message wall time (steps_ms)
-            // ran 2-5x higher than any single photo's own step-sum, the
-            // signature of CPU oversubscription rather than I/O wait.
-            // Re-benchmark before raising this again without also raising cpu.
-            { name: 'IPWORKER_CONCURRENCY', value: '2' }
+            // IPWORKER_CONCURRENCY in backend/app.py). History: raised live to 3
+            // out-of-band (bicep/live drift 2026-08-25), then lowered to 2 on
+            // 2026-08-27 when 3 concurrent OCR/face passes oversubscribed 2 vCPU
+            // (per-message steps_ms ran 2-5x a single photo's own step-sum --
+            // CPU oversubscription, not I/O wait). That oversubscription was
+            // then fixed at its source by the native-thread caps below
+            // (OMP_THREAD_LIMIT=1, OPENBLAS_NUM_THREADS=1). A matched Azure run
+            // (docs/benchmarks/vision-concurrency-azure-20261029.md) showed 3
+            // workers beat 2 by ~15-24% while apply/storage still has wait to
+            // overlap, and 3 has run live since. 3 is now the source of truth
+            // (was still '2' in bicep -- drift corrected 2026-10-30). Retest and
+            // consider returning to 2 if apply/persistence gets much faster
+            // under the same 2 vCPU quota.
+            { name: 'IPWORKER_CONCURRENCY', value: '3' }
             // Confirmed live 2026-08-27: this image's tesseract build spawns
             // multiple OS threads per image_to_string() call by default (no
             // prior thread cap existed anywhere in this Dockerfile/entrypoint).
@@ -1668,6 +1809,23 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
             // concurrency fix. No correctness impact -- purely how many OS
             // threads one call spawns, not what it returns.
             { name: 'OMP_THREAD_LIMIT', value: '1' }
+            // Separate from Tesseract's OpenMP cap: NumPy/SciPy/OpenCV use
+            // OpenBLAS pools. Matched two-CPU runs measured 29.5% less stage
+            // wall time at one BLAS thread, with identical outputs on 48 inputs.
+            // Keep aligned with the Vision image default; this single-thread cap
+            // is what makes IPWORKER_CONCURRENCY=3 safe on 2 vCPU.
+            { name: 'OPENBLAS_NUM_THREADS', value: '1' }
+            // Run the per-image CLIP image/text encode through a one-thread FP32
+            // ONNX session instead of PyTorch (backend/vision_utils.py). Same
+            // weights, preprocessing, normalization and shared model lock; a
+            // matched local run (docs/benchmarks/vision-next-gains-independent-
+            // 20261029.md) measured ~7% less wall AND CPU per encode at identical
+            // embeddings (cosine > 0.999999). Fixed batch size 1 (a dynamic axis
+            // regressed the single-image case). Exports the towers once at warmup
+            // and falls back to PyTorch if export/load fails, so it can degrade
+            // but never break encoding. Enabled live 2026-10-30 (was an az
+            // env-var override before this; bicep is now the source of truth).
+            { name: 'IPWORK_CLIP_ONNX', value: 'true' }
             // receive_messages() with no visibility_timeout defaults to Azure's
             // 30s, which a single ipwork pass (YOLO + MediaPipe + AdaFace + CLIP
             // + tesseract OCR in sequence) can exceed -- see
@@ -1696,14 +1854,8 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
             // Backend/worker keep the 20s default; only ipworker's per-photo
             // cadence outlasts it.
             { name: 'PEOPLE_SCAN_CACHE_TTL_SECONDS', value: '120' }
-            // How often the background maintenance sweep (tag-embedding
-            // index check, trash purge) runs per replica
-            // (backend/app.py, _ipwork_sweep_loop). It no longer re-offers
-            // stuck photos: that safety net was removed in favor of the
-            // upload-end release plus the Tools "Process now" button. Kept in sync
-            // with the 'ipwork-sweep-wake' cron rule's ~5-day period below --
-            // a replica only stays up for that rule's 5-minute window, so
-            // this only needs to fire once per wake.
+            // Maintenance may run only while queue-triggered work has this
+            // replica active. Never add a periodic scale-up trigger.
             { name: 'IPWORK_SWEEP_INTERVAL_SECONDS', value: '432000' }
             // Lets vision trigger a derived-index rebuild on the indexer
             // role (2vCPU/4Gi) when it drains the queue -- and every
@@ -1720,6 +1872,8 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
         { name: 'index-cache', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
       ]
       scale: {
+        // Shorter than the 300s barrier retry so idle retries can scale to zero.
+        cooldownPeriod: 60
         minReplicas: 0
         // 1: uploads release their vision work in one burst at upload end
         // (IPWORK_DEFER_UNTIL_UPLOAD_END), and a measured 1809-file run used
@@ -1735,64 +1889,30 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
               metadata: {
                 accountName: storageAccountName
                 queueName: 'photostore-ipwork'
-                // 2026-09-21: raised 1->2 to match IPWORKER_CONCURRENCY=2 --
-                // a real 986-file forenkla2-qa upload showed KEDA scaling to
-                // all 4 replicas while average CPU never exceeded 35% (max
-                // 88%), meaning replicas were under-utilized even at the
-                // scale ceiling. Targeting one replica's actual concurrent
-                // capacity (2 messages) before adding another consolidates
-                // the same work onto fewer, better-utilized replicas instead
-                // of one replica per single queued message. Re-verify replica
-                // count/CPU on the next real upload; revert to '1' if backlog
-                // drain latency regresses under a much bigger burst than this
-                // one.
-                queueLength: '2'
-                // Default strategy ('all') counts messages that are dequeued
-                // but not yet deleted, not just genuinely unclaimed ones. In
-                // 'both' processing mode, a message ipworker lost the
-                // per-photo lease race on is deliberately left undeleted so
-                // Azure redelivers and retries it later (see
-                // IPWORK_LEASE_RETRY_LIMIT in backend/app.py) -- with the
-                // default strategy that retry-pending message still counts
-                // as backlog, scaling ipworker up to handle photos the
-                // browser already finished. 'visibleonly' (falls back to
-                // 'all' above 32 messages, so real large backlogs still scale
-                // correctly) fixes that without touching genuine backlog
-                // handling.
-                queueLengthStrategy: 'visibleonly'
+                // Each wave message can keep a replica's source pool busy.
+                // Request one replica per message so independent libraries
+                // can scale out without waiting for a third queued wave.
+                queueLength: '1'
+                // A wave message can own hundreds of images. It remains
+                // invisible while its receipt is renewed, so count it until
+                // ACK; otherwise KEDA scales down during healthy processing.
+                // Delayed tag maintenance uses the visible-only sibling queue.
+                queueLengthStrategy: 'all'
               }
               identity: 'system'
             }
           }
           {
-            // The queue-length rule above only wakes ipworker when there's
-            // already a message on the queue -- but a photo that never got
-            // enqueued in the first place (uploaded while ipworker was
-            // stopped, or during a 'browser'-only PROCESSING_MODE window)
-            // leaves the queue empty forever, so with only that rule
-            // ipworker would never come up to run its own background
-            // orphaned-photo sweep (_ipwork_sweep_loop in backend/app.py).
-            // This cron rule wakes one replica for a 5-minute window roughly
-            // every 5 days purely so that sweep gets a chance to run,
-            // independent of current queue depth; it scales back to 0
-            // afterward same as the queue rule. Keep this in sync with
-            // IPWORK_SWEEP_INTERVAL_SECONDS below (also 5 days) -- a wider
-            // gap here would leave a wake cycle with nothing to do, and a
-            // narrower one would waste replica time re-sweeping mid-cycle.
-            // Standard cron has no native "every N days" step that survives
-            // month boundaries -- day-of-month '*/5' fires on 1,6,11,...,26,31
-            // and simply skips a date that doesn't exist in a shorter month
-            // (e.g. Feb), so real gaps land at 5 days +/- a few, not exactly
-            // 5.00 days. Fine for a background safety-net sweep.
-            name: 'ipwork-sweep-wake'
+            name: 'ipwork-deferred-queue'
             custom: {
-              type: 'cron'
+              type: 'azure-queue'
               metadata: {
-                timezone: 'Etc/UTC'
-                start: '0 0 */5 * *'
-                end: '5 0 */5 * *'
-                desiredReplicas: '1'
+                accountName: storageAccountName
+                queueName: 'photostore-ipwork-deferred'
+                queueLength: '1'
+                queueLengthStrategy: 'visibleonly'
               }
+              identity: 'system'
             }
           }
         ]
@@ -1889,13 +2009,14 @@ resource archiveStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01
   }
 ]
 
-// The API negotiates subscriptions; dedicated and legacy index consumers publish.
-resource indexPushRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for appRole in ['indexer', 'cluster']: if (enableIndexPush) {
+// Core negotiates subscriptions without waking indexer. Retain indexer's grant
+// for publishing and negotiation by older browser bundles; cluster also publishes.
+resource indexPushRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for appRole in ['indexer', 'cluster', 'core']: if (enableIndexPush) {
   name: guid(indexPush!.id, appRole, 'index-events-owner')
   scope: indexPush
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '12cf5a90-567b-43ae-8102-96cf46c7d9b4')
-    principalId: appRole == 'indexer' ? indexer.identity.principalId : cluster.identity.principalId
+    principalId: appRole == 'indexer' ? indexer.identity.principalId : appRole == 'core' ? core.identity.principalId : cluster.identity.principalId
     principalType: 'ServicePrincipal'
   }
 }]
@@ -1917,3 +2038,13 @@ output recoveryUrl string = 'https://${recovery.properties.configuration.ingress
 
 @description('Archive (people/library/public) API URL.')
 output archiveUrl string = 'https://${archive.properties.configuration.ingress.fqdn}'
+
+
+// There is no standing wave-recovery compute host: no scheduled sweep, no
+// persistent job resource. Recovery rides on real wave-lifecycle events
+// (routes/upload_wave_shadow.py's opportunistic nudge) and explicit manual
+// repair; a library with no activity and nobody visiting self-heals only
+// when one of those happens again. Fresh-install certificate bootstrap and
+// same-protocol upgrade migration each provision a throwaway Manual-trigger
+// job of their own at deploy time (see deploy/fresh_wave.py, deploy/
+// upgrade_wave.py) instead of reusing a pre-declared standing resource.

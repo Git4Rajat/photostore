@@ -118,3 +118,12 @@ def test_current_contract_reflects_live_face_embedding_versions(monkeypatch):
     monkeypatch.setenv('FACE_CLUSTER_EMBEDDING_VERSION', 'custom-version')
     contract = current_contract()
     assert 'custom-version' in contract['faceEmbeddingVersions']
+
+
+def test_default_contract_accepts_the_deployed_browser_and_worker_face_models(monkeypatch):
+    monkeypatch.delenv('FACE_CLUSTER_EMBEDDING_VERSION', raising=False)
+    monkeypatch.delenv('IPWORKER_FACE_CLUSTER_EMBEDDING_VERSION', raising=False)
+    assert set(current_contract()['faceEmbeddingVersions']) == {
+        'browser-adaface-ir101-v1-fixed',
+        'adaface-ir101-webface4m-512d-v1+mediapipe-landmark-478',
+    }

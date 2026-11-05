@@ -49,14 +49,17 @@ def _graph(scopes, prerequisite_scopes):
     return graph
 
 
-def compute_obligations(library, wave_id, frozen_revision, required_scopes, *, prerequisite_scopes=None):
+def compute_obligations(library, wave_id, frozen_revision, required_scopes, *, prerequisite_scopes=None, assignment_revision=''):
     graph = _graph(required_scopes, prerequisite_scopes)
     ids = {}
     def identity(scope):
         if scope not in ids:
-            ids[scope] = digest(dict(schemaVersion=2, library=library, waveId=wave_id,
+            payload=dict(schemaVersion=2, library=library, waveId=wave_id,
                 frozenRevision=frozen_revision, scope=scope,
-                prerequisiteIds=sorted(identity(parent) for parent in graph[scope])))
+                prerequisiteIds=sorted(identity(parent) for parent in graph[scope]))
+            if assignment_revision:
+                payload.update(schemaVersion=3,assignmentReceiptId=assignment_revision)
+            ids[scope]=digest(payload)
         return ids[scope]
     for scope in graph:
         identity(scope)
@@ -64,13 +67,14 @@ def compute_obligations(library, wave_id, frozen_revision, required_scopes, *, p
 
 
 class ObligationLedger:
-    def __init__(self, table, wave_id, *, library=None, frozen_revision=None):
+    def __init__(self, table, wave_id, *, library=None, frozen_revision=None, assignment_revision=''):
         if not isinstance(wave_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', wave_id):
             raise ValueError('Invalid wave identity')
         if bool(library) != bool(frozen_revision):
             raise ValueError('Library and frozen revision must be supplied together')
         self.table, self.wave_id = table, wave_id
         self.library, self.frozen_revision = library or '', frozen_revision or ''
+        self.assignment_revision=assignment_revision
         self.partition = PARTITION_PREFIX + wave_id
 
     def _get(self, key):
@@ -81,7 +85,8 @@ class ObligationLedger:
 
     def _manifest(self):
         row = self._get(MANIFEST_KEY)
-        if row is not None and (row.get('libraryId') != self.library or row.get('frozenRevision') != self.frozen_revision):
+        if row is not None and (row.get('libraryId') != self.library or row.get('frozenRevision') != self.frozen_revision
+                                or row.get('assignmentReceiptId','') != self.assignment_revision):
             raise RuntimeError('Publication manifest identity mismatch')
         return row
 
@@ -93,7 +98,7 @@ class ObligationLedger:
             raise ValueError('Obligation IDs must be distinct content digests')
         if self.library:
             expected = compute_obligations(self.library, self.wave_id, self.frozen_revision,
-                                          obligations.keys(), prerequisite_scopes=graph)
+                                          obligations.keys(), prerequisite_scopes=graph, assignment_revision=self.assignment_revision)
             if expected != obligations:
                 raise ValueError('Obligation IDs do not cover the declared wave/revision/dependencies')
         specs = {scope: dict(id=key, prerequisites=sorted(obligations[parent] for parent in graph[scope]))
@@ -101,10 +106,11 @@ class ObligationLedger:
         payload = json.dumps(specs, sort_keys=True, separators=(',', ':'))
         if len(payload.encode('utf-16-le')) > 60000:
             raise ValueError('Required obligation manifest exceeds the Table string-property limit')
-        identity = digest([self.library, self.wave_id, self.frozen_revision, specs])
+        identity = digest([self.library, self.wave_id, self.frozen_revision, specs]+
+                          ([self.assignment_revision] if self.assignment_revision else []))
         manifest = dict(PartitionKey=self.partition, RowKey=MANIFEST_KEY, schemaVersion=2,
             waveId=self.wave_id, libraryId=self.library, frozenRevision=self.frozen_revision,
-            requiredSetId=identity, obligations=payload)
+            requiredSetId=identity, obligations=payload, assignmentReceiptId=self.assignment_revision)
         try:
             self.table.create_entity(manifest)
         except ResourceExistsError:
@@ -204,4 +210,5 @@ class ObligationLedger:
                 raise RuntimeError('Publication obligations are incomplete')
             receipts[spec['id']] = row['receipt']
         return dict(libraryId=self.library, waveId=self.wave_id, frozenRevision=self.frozen_revision,
-                    requiredSetId=manifest['requiredSetId'], receiptDigest=digest(receipts))
+                    requiredSetId=manifest['requiredSetId'], receiptDigest=digest(receipts),
+                    assignmentReceiptId=self.assignment_revision)

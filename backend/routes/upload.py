@@ -6,7 +6,8 @@ as app.<name> throughout, matching the exact late-binding lookup semantics
 the code relied on when these functions lived in app.py directly, so
 test-time monkeypatching of app.<name> globals still works unchanged).
 """
-from flask import Blueprint
+from flask import Blueprint, g
+from azure.core.exceptions import ResourceNotFoundError
 import processing_diagnostics
 import re
 from upload_diagnostics import instrument_upload, timed_call, upload_count, upload_finalized, upload_results, upload_teardown
@@ -15,9 +16,37 @@ import app
 from benchmark_upload import authorize_entry, validate_finalization, isolated
 from upload_metadata import uploads_enabled, qualified_family, packet_blob_name, stamp_candidate
 from upload_preparation_diagnostics import record_receipt, rejection_reason, metadata_offer_reason
+from wave_policy import finalization_item
 
 upload_bp = Blueprint('upload', __name__)
 upload_bp.teardown_request(upload_teardown)
+
+
+@upload_bp.route('/upload/cleanup', methods=['POST'])
+def cleanup_abandoned_uploads():
+    _, library, error = app._require_owner_context(require_auth=True)
+    if error:
+        return error
+    if app.request.content_length and app.request.content_length > 4096:
+        return app.jsonify(error='Upload cleanup request is too large'), 413
+    body = app.request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return app.jsonify(error='Expected a JSON object'), 400
+    from azure.core.exceptions import AzureError
+    from upload_cleanup import cleanup
+    from upload_waves import Conflict
+    try:
+        result = cleanup(app, library, after=body.get('after', ''))
+        response = app.jsonify(result)
+        response.headers['Cache-Control'] = 'no-store'
+        return response, 200 if result['success'] else 207
+    except Conflict as error:
+        return app.jsonify(error=str(error)), 409
+    except ValueError as error:
+        return app.jsonify(error=str(error)), 400
+    except AzureError:
+        app.app.logger.exception('Upload cleanup storage failure')
+        return app.jsonify(error='Upload cleanup could not finish. Run it again to retry.'), 503
 
 
 @upload_bp.route('/api/upload/telemetry', methods=['POST'])
@@ -44,8 +73,8 @@ def upload_transfer_heartbeat():
     # detection window (IPWORK_RELEASE_IDLE_SECONDS / UPLOAD_ACTIVITY_WINDOW_SECONDS)
     # on a slow connection, wrongly releasing vision work / flushing clustering
     # buffers while the upload is still genuinely running. Deliberately minimal:
-    # no body, no cleanup-block check -- a stale ping during a blocked cleanup
-    # should still keep the "upload is active" signal alive, not fail.
+    # Library-only pings remain compatible. A waveSessionId also renews that
+    # parent's lease; this never resurrects a closed or expired intake.
     user_id, error = app._require_user_id()
     if error:
         return error
@@ -53,6 +82,26 @@ def upload_transfer_heartbeat():
         app._mark_upload_activity_heartbeat(user_id)
     except Exception:
         app.app.logger.exception('Failed to record transfer heartbeat for %s', user_id)
+    data=app.request.get_json(silent=True) or {}
+    session=data.get('waveSessionId') if isinstance(data,dict) else None
+    if session:
+        from upload_waves import ShadowWaves, Conflict
+        from wave_policy import owned
+        from upload_session_lease import renew
+        # Resolve the authenticated library, never trust a library from JSON.
+        _,library,error=app._require_library_context(require_auth=True)
+        if error:return error
+        if owned(app.jobs_table_client,library):
+            try:
+                parent=renew(ShadowWaves(app.jobs_table_client,library),session)
+                return app.jsonify(dict(recorded=True,sessionId=session,
+                    leaseActive=parent['leaseActive'],leaseExpiresAt=parent.get('leaseExpiresAt',0),serverNow=app.time.time()))
+            except (ValueError,KeyError):
+                return app.jsonify({'error':'Invalid upload session'}),400
+            except Conflict as error:
+                return app.jsonify({'error':str(error)}),409
+            except ResourceNotFoundError:
+                return app.jsonify({'error':'Upload session not found'}),404
     return app.jsonify({'recorded': True})
 
 
@@ -160,7 +209,9 @@ def init_upload():
     is_fresh_upload = not data.get('uploadId')
     if benchmark_fields and (not direct or not is_fresh_upload):
         return app.jsonify({'error': 'Benchmark requires a fresh direct upload'}), 400
-    if is_fresh_upload:
+    live_admission=getattr(g,'wave_upload',None) is not None
+    if live_admission and not direct:return app.jsonify(error='Live uploads require direct storage transfer'),409
+    if is_fresh_upload and not live_admission:
         try:
             timed_call('cleanup', app._cleanup_failed_upload, user_id, filename)
         except Exception:
@@ -171,7 +222,7 @@ def init_upload():
     # the browser keeps staging blocks to the same blob — a fresh UUID per call
     # would orphan already-staged blocks (InvalidBlockList) and break retry/resume.
     anonymous_blob_name = None
-    if is_fresh_upload and direct:
+    if direct and (is_fresh_upload or live_admission):
         # Fast path for the common case (new upload, direct-to-blob): one read
         # + one write against the metadata row instead of reset_received_ranges
         # and reserve_pending_anonymous_blob each separately re-reading and
@@ -182,6 +233,7 @@ def init_upload():
                 initial_metadata=benchmark_fields or None,
             )
         except Exception:
+            if live_admission:return app.jsonify(error='Live upload reservation requires retry'),503
             app.app.logger.debug('Failed to reset tracking / reserve anonymous blob name for %s', filename)
     else:
         if is_fresh_upload:
@@ -329,6 +381,8 @@ def init_upload_batch():
             )
         except Exception:
             app.app.logger.exception('Batch upload-tracking reservation failed for %s files', len(valid))
+            if getattr(g,'wave_upload',None) is not None:
+                return app.jsonify(error='Live upload reservations require retry'),503
 
     results = []
     for p in parsed:
@@ -453,6 +507,10 @@ def finalize_direct_upload():
         return app.jsonify({'error': 'Invalid filename'}), 400
     if total_size <= 0 or total_size > app.MAX_UPLOAD_FILE_BYTES:
         return app.jsonify({'error': 'Invalid totalSize'}), 400
+    from routes.upload_wave_live import finalized_replay
+    replay=finalized_replay(data)
+    if replay is not None:
+        return app.jsonify(dict(replay))
     if app.is_video_file(filename) and not re.fullmatch(r'[a-f0-9]{64}', str(data.get('sha256') or '')):
         return app.jsonify({'error': 'Video uploads require a client SHA-256'}), 400
 
@@ -498,6 +556,12 @@ def finalize_direct_upload():
     except Exception as exc:
         app.app.logger.exception('Direct upload finalization failed for %s', filename)
         return app.jsonify({'error': 'Upload finalization failed'}), 500
+    if duplicates:
+        # finalize_uploaded_file intentionally leaves the canonical source
+        # untouched. Remove this request's staged blob/tracking row now that
+        # the duplicate is durably identified.
+        timed_call('cleanup', app._cleanup_failed_upload, user_id, filename,
+                   str(data.get('uploadId') or ''))
     # finalize_uploaded_file writes metadata via storage_utils (bypassing
     # _update_metadata_entity_fields), so drop the scan cache explicitly: the
     # gallery refetches right after an upload and must see the new photo.
@@ -505,20 +569,25 @@ def finalize_direct_upload():
     # Persist the blob size (validated above) and the adding account in one write:
     # the size lets the gallery listing skip a per-photo blob HEAD, and uploadedBy
     # attributes the photo to the library member who added it.
-    try:
-        finalize_updates: app.Dict[str, object] = {'size': total_size}
-        finalize_updates.update(processing_diagnostics.upload_fields(data))
-        if account_id:
-            finalize_updates['uploadedBy'] = account_id
-        client_last_modified_iso = app.epoch_millis_to_iso(data.get('clientLastModified'))
-        if client_last_modified_iso:
-            finalize_updates['clientLastModified'] = client_last_modified_iso
-        timed_call('metadata_stamp', app._update_metadata_entity_fields, user_id, final_name, finalize_updates)
-    except Exception:
-        app.app.logger.debug('Could not stamp finalize metadata for %s', final_name)
     metadata = None
     try:
-        metadata = timed_call('metadata_read', app.metadata_table_client.get_entity, partition_key=user_id, row_key=final_name)
+        if duplicates:
+            metadata = timed_call('metadata_read', app.metadata_table_client.get_entity,
+                                  partition_key=user_id, row_key=final_name)
+        else:
+            finalize_updates: app.Dict[str, object] = {'size': total_size}
+            finalize_updates.update(processing_diagnostics.upload_fields(data))
+            if account_id:
+                finalize_updates['uploadedBy'] = account_id
+            client_last_modified_iso = app.epoch_millis_to_iso(data.get('clientLastModified'))
+            if client_last_modified_iso:
+                finalize_updates['clientLastModified'] = client_last_modified_iso
+            metadata = timed_call('metadata_stamp', app._update_metadata_entity_fields, user_id, final_name, finalize_updates)
+    except Exception:
+        app.app.logger.debug('Could not stamp finalize metadata for %s', final_name)
+    try:
+        if metadata is None:
+            metadata = timed_call('metadata_read', app.metadata_table_client.get_entity, partition_key=user_id, row_key=final_name)
         if metadata.get('upload_sha256_expected') and metadata.get('upload_sha256_match') is False:
             return app.jsonify({
                 'error': 'Upload hash mismatch',
@@ -528,7 +597,7 @@ def finalize_direct_upload():
     except Exception:
         pass
     processing_rejection = None
-    if data.get('clientProcessing') or data.get('clientProcessingReport'):
+    if not duplicates and (data.get('clientProcessing') or data.get('clientProcessingReport')):
         try:
             metadata = timed_call('client_processing', app.apply_client_processing_results_for_file,
                 user_id,
@@ -560,10 +629,11 @@ def finalize_direct_upload():
             app.app.logger.info('Metadata sidecar rejected for %s; original fallback=%s', final_name, not app.is_video_file(final_name))
     record_receipt(app, user_id, final_name, data, packet_accepted=packet_accepted,
                    packet_rejection=packet_rejection, processing_rejection=processing_rejection, duplicate=bool(duplicates))
-    try:
-        timed_call('enqueues', processing_diagnostics.queued_call, app._queue_upload_processing, user_id, final_name, data)
-    except Exception:
-        app.app.logger.exception('Failed to queue post-finalize processing for %s', final_name)
+    if not duplicates:
+        try:
+            timed_call('enqueues', processing_diagnostics.queued_call, app._queue_upload_processing, user_id, final_name, data)
+        except Exception:
+            app.app.logger.exception('Failed to queue post-finalize processing for %s', final_name)
     try:
         timed_call('enqueues', app._mark_fresh_upload_activity, user_id)
     except Exception:
@@ -572,10 +642,11 @@ def finalize_direct_upload():
         timed_call('enqueues', app._mark_upload_activity_heartbeat, user_id)
     except Exception:
         app.app.logger.exception('Failed to record upload activity heartbeat for %s', user_id)
-    try:
-        timed_call('enqueues', app._queue_people_clustering_after_face_processing, user_id, final_name, metadata)
-    except Exception:
-        app.app.logger.exception('Failed to auto-queue clustering for %s', final_name)
+    if not duplicates:
+        try:
+            timed_call('enqueues', app._queue_people_clustering_after_face_processing, user_id, final_name, metadata)
+        except Exception:
+            app.app.logger.exception('Failed to auto-queue clustering for %s', final_name)
     upload_finalized(total_size)
     processing_diagnostics.upload_event(user_id, final_name, data, size=total_size,
                                        duplicate=bool(duplicates), video=app.is_video_file(final_name))
@@ -658,6 +729,11 @@ def finalize_upload_batch():
         if total_size <= 0 or total_size > app.MAX_UPLOAD_FILE_BYTES:
             results.append({'index': idx, 'filename': filename, 'error': 'Invalid totalSize'})
             continue
+        from routes.upload_wave_live import finalized_replay
+        replay=finalized_replay(item)
+        if replay is not None:
+            results.append(dict(replay,index=idx))
+            continue
         if app.is_video_file(filename) and not re.fullmatch(r'[a-f0-9]{64}', str(item.get('sha256') or '')):
             results.append({'index': idx, 'filename': filename, 'error': 'Video uploads require a client SHA-256'})
             continue
@@ -683,40 +759,51 @@ def finalize_upload_batch():
             continue
 
         try:
-            duplicates, final_name = timed_call('finalize_metadata', app.finalize_uploaded_file,
-                user_id,
-                filename,
-                content_type,
-                client_processing=item.get('clientProcessing'),
-                client_processing_report=item.get('clientProcessingReport'),
-                client_asset_id=str(item.get('clientAssetId') or item.get('uploadId') or ''),
-                client_sha256=str(item.get('sha256') or ''),
-                anonymous_blob_name=anonymous_blob_name,
-            )
+            # This call writes one source. Checking every other reservation on
+            # each internal write fence made a batch's storage reads quadratic.
+            with finalization_item(item.get('waveSessionId'), item.get('waveItemId')):
+                duplicates, final_name = timed_call('finalize_metadata', app.finalize_uploaded_file,
+                    user_id,
+                    filename,
+                    content_type,
+                    client_processing=item.get('clientProcessing'),
+                    client_processing_report=item.get('clientProcessingReport'),
+                    client_asset_id=str(item.get('clientAssetId') or item.get('uploadId') or ''),
+                    client_sha256=str(item.get('sha256') or ''),
+                    anonymous_blob_name=anonymous_blob_name,
+                )
         except Exception as exc:
             app.app.logger.exception('Batch finalize failed for %s', filename)
             results.append({'index': idx, 'filename': filename, 'error': 'Upload finalization failed'})
             continue
+        if duplicates:
+            timed_call('cleanup', app._cleanup_failed_upload, user_id, filename,
+                       str(item.get('uploadId') or ''))
 
         # Same per-file follow-up as single-file finalize above, just inline
         # in this loop instead of a separate request.
         app._invalidate_metadata_scan_cache(user_id)
+        metadata = None
         try:
-            finalize_updates: app.Dict[str, object] = {'size': total_size}
-            finalize_updates.update(processing_diagnostics.upload_fields(item))
-            if account_id:
-                finalize_updates['uploadedBy'] = account_id
-            client_last_modified_iso = app.epoch_millis_to_iso(item.get('clientLastModified'))
-            if client_last_modified_iso:
-                finalize_updates['clientLastModified'] = client_last_modified_iso
-            timed_call('metadata_stamp', app._update_metadata_entity_fields, user_id, final_name, finalize_updates)
+            if duplicates:
+                metadata = timed_call('metadata_read', app.metadata_table_client.get_entity,
+                                      partition_key=user_id, row_key=final_name)
+            else:
+                finalize_updates: app.Dict[str, object] = {'size': total_size}
+                finalize_updates.update(processing_diagnostics.upload_fields(item))
+                if account_id:
+                    finalize_updates['uploadedBy'] = account_id
+                client_last_modified_iso = app.epoch_millis_to_iso(item.get('clientLastModified'))
+                if client_last_modified_iso:
+                    finalize_updates['clientLastModified'] = client_last_modified_iso
+                metadata = timed_call('metadata_stamp', app._update_metadata_entity_fields, user_id, final_name, finalize_updates)
         except Exception:
             app.app.logger.debug('Could not stamp finalize metadata for %s', final_name)
 
-        metadata = None
         hash_mismatch = False
         try:
-            metadata = timed_call('metadata_read', app.metadata_table_client.get_entity, partition_key=user_id, row_key=final_name)
+            if metadata is None:
+                metadata = timed_call('metadata_read', app.metadata_table_client.get_entity, partition_key=user_id, row_key=final_name)
             if metadata.get('upload_sha256_expected') and metadata.get('upload_sha256_match') is False:
                 hash_mismatch = True
         except Exception:
@@ -731,7 +818,7 @@ def finalize_upload_batch():
             continue
 
         processing_rejection = None
-        if item.get('clientProcessing') or item.get('clientProcessingReport'):
+        if not duplicates and (item.get('clientProcessing') or item.get('clientProcessingReport')):
             try:
                 metadata = timed_call('client_processing', app.apply_client_processing_results_for_file,
                     user_id,
@@ -763,14 +850,15 @@ def finalize_upload_batch():
                 app.app.logger.info('Metadata sidecar rejected for %s; original fallback=%s', final_name, not app.is_video_file(final_name))
         record_receipt(app, user_id, final_name, item, packet_accepted=packet_accepted,
                        packet_rejection=packet_rejection, processing_rejection=processing_rejection, duplicate=bool(duplicates))
-        try:
-            timed_call('enqueues', processing_diagnostics.queued_call, app._queue_upload_processing, user_id, final_name, item)
-        except Exception:
-            app.app.logger.exception('Failed to queue post-finalize processing for %s', final_name)
-        try:
-            timed_call('enqueues', app._queue_people_clustering_after_face_processing, user_id, final_name, metadata)
-        except Exception:
-            app.app.logger.exception('Failed to auto-queue clustering for %s', final_name)
+        if not duplicates:
+            try:
+                timed_call('enqueues', processing_diagnostics.queued_call, app._queue_upload_processing, user_id, final_name, item)
+            except Exception:
+                app.app.logger.exception('Failed to queue post-finalize processing for %s', final_name)
+            try:
+                timed_call('enqueues', app._queue_people_clustering_after_face_processing, user_id, final_name, metadata)
+            except Exception:
+                app.app.logger.exception('Failed to auto-queue clustering for %s', final_name)
 
         results.append({
             'index': idx,
@@ -801,15 +889,22 @@ def finalize_upload_batch():
         sc = app.perf_instrumentation.current_scope()
         if sc is not None and results:
             queue_sends = sum(int(row[0]) for label, row in sc.ops.items() if label.startswith('queue:'))
-            job_table_writes = sum(
+            job_table_operations = sum(
                 int(row[0]) for label, row in sc.ops.items()
                 if label.startswith('table:') and label.split(':', 2)[-1].split('(')[0] == app.JOBS_TABLE
             )
+            job_table_writes = sum(
+                int(row[0]) for label, row in sc.ops.items()
+                if label.startswith(('table:POST:', 'table:PUT:', 'table:PATCH:', 'table:DELETE:'))
+                and label.split(':', 2)[-1].split('(')[0] == app.JOBS_TABLE
+            )
             app.perf_instrumentation.log_event(
                 'finalize_batch_fanout', files=len(results),
-                queue_sends=queue_sends, job_table_writes=job_table_writes,
+                queue_sends=queue_sends, job_table_operations=job_table_operations,
+                job_table_writes=job_table_writes,
                 queue_sends_per_file=round(queue_sends / len(results), 2),
-                job_rows_per_file=round(job_table_writes / len(results), 2),
+                job_table_operations_per_file=round(job_table_operations / len(results), 2),
+                job_table_writes_per_file=round(job_table_writes / len(results), 2),
             )
     except Exception:
         pass
@@ -1215,3 +1310,6 @@ def processing_status():
 # The shadow protocol is explicitly feature-gated and never alters legacy intake.
 from routes.upload_wave_shadow import register_routes as _register_wave_shadow_routes
 _register_wave_shadow_routes(upload_bp)
+
+from routes.upload_wave_live import install as _install_live_wave_admission
+_install_live_wave_admission(upload_bp)

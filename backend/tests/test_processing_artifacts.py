@@ -20,21 +20,28 @@ def jpeg(color='red', edge=40):
 class Blob:
     def __init__(self):
         self.data = None; self.version = 0; self.before_download = None
-    def upload_blob(self, data, *, overwrite, content_settings):
+        self.heads = self.gets = 0
+    def upload_blob(self, data, *, overwrite, content_settings, validate_content=False):
         assert overwrite is False
         if self.data is not None: raise ResourceExistsError('exists')
         self.data = data; self.version += 1
+        return {'etag': str(self.version)}
     def get_blob_properties(self):
+        self.heads += 1
+        return self._properties()
+    def _properties(self):
         if self.data is None: raise ResourceNotFoundError('missing')
         return SimpleNamespace(size=len(self.data), etag=str(self.version), content_settings=SimpleNamespace(content_type='image/jpeg'))
-    def download_blob(self, *, offset, length, etag, match_condition):
+    def download_blob(self, *, offset, length, etag=None, match_condition=None):
+        self.gets += 1
         if self.before_download: self.before_download()
-        if etag != str(self.version): raise ResourceModifiedError('changed')
-        return SimpleNamespace(readall=lambda: self.data[offset:offset+length])
+        if etag is not None and etag != str(self.version): raise ResourceModifiedError('changed')
+        return SimpleNamespace(readall=lambda: self.data[offset:offset+length], properties=self._properties())
 
 
 @pytest.fixture
 def blobs(world, monkeypatch):
+    monkeypatch.setenv('IPWORK_ARTIFACT_UPLOAD_RESPONSE_ENABLED', 'false')
     objects = {}
     monkeypatch.setitem(storage_utils._CTX, 'blob_thumbnail_container', 'thumbs')
     monkeypatch.setattr(storage_utils, '_get_blob_client', lambda container, name: objects.setdefault(name, Blob()))
@@ -101,8 +108,35 @@ def test_serving_retains_previous_derivative_for_same_photo_but_rejects_cross_ph
     with result_fence(fence): receipt = publish(storage_utils, row, 'thumbnail', data=jpeg())
     row['processingRevision'] = 'new-revision'
     assert derivative_blob(row, 'thumbnail', 'legacy') == receipt['blob']
+    assert storage_utils._sort_index_row(row)['thumb'] == receipt['blob']
+    assert storage_utils._access_index_row(row)['thumbnailArtifact'] == row['thumbnailArtifact']
     row['anonymousImageId'] = 'replacement'
     with pytest.raises(ValueError): derivative_blob(row, 'thumbnail', 'legacy')
+
+
+@pytest.mark.parametrize('bad', ['photo', 'library', 'blob', 'missing', 'typed', 'json', 'list', 'null'])
+def test_catalog_omits_invalid_receipts_without_weakening_completion_validation(blobs, bad):
+    from processing_artifacts import published_name, validate_receipt
+    (metadata, *_, fence), _ = blobs
+    row = metadata.get_entity('lib', 'photo.jpg')
+    with result_fence(fence):
+        receipt = publish(storage_utils, row, 'thumbnail', data=jpeg())
+    invalid = dict(receipt)
+    if bad in ('photo', 'library'):
+        invalid['photoId' if bad == 'photo' else 'library'] = 'other'
+        invalid['blob'] = published_name(invalid['library'], invalid['photoId'], invalid['revision'], 'thumbnail', invalid['sha256'])
+    elif bad == 'blob': invalid['blob'] = 'untrusted/path.jpg'
+    elif bad == 'missing': del invalid['revision']
+    elif bad == 'typed': invalid['library'] = 123
+    raw = {'json': '{', 'list': '[]', 'null': 'null'}.get(bad, json.dumps(invalid))
+    row['thumbnailArtifact'] = row['previewArtifact'] = raw
+    assert storage_utils._sort_index_row(row)['thumb'] == row['anonymousImageId']
+    projected = storage_utils._access_index_row(row)
+    assert projected['RowKey'] == row['RowKey'] and projected['blobName'] == row['anonymousImageId']
+    assert 'thumbnailArtifact' not in projected and 'previewArtifact' not in projected
+    assert row['thumbnailArtifact'] == raw  # Projection never rewrites durable evidence.
+    with pytest.raises((ValueError, KeyError, TypeError)):
+        validate_receipt(row, 'thumbnail')
 
 
 def test_receipt_detects_tampering_and_requires_the_current_processing_revision(blobs):
@@ -147,6 +181,54 @@ def test_unverified_client_done_report_cannot_commit_success_in_fenced_mode(blob
         client_processing_report=[{'step': 'thumbnail', 'status': 'done'}])
     assert result['thumbnail_status'] == 'failed'
     assert not result.get('processingCompletionPending')
+
+
+@pytest.mark.parametrize('converted', [
+    None, b'', b'undecodable raw', b'raw' * 600_000, jpeg(edge=2049), jpeg()[:100],
+])
+def test_invalid_server_preview_is_committed_as_unrecoverable_without_publication(blobs, monkeypatch, converted):
+    # Deterministic on these bytes (same conversion, same input, every time),
+    # so this resolves to terminal 'unrecoverable' on the first attempt
+    # instead of a retryable 'failed'.
+    (metadata, *_, fence), objects = blobs
+    monkeypatch.setenv('UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED', 'true')
+    monkeypatch.setitem(storage_utils._CTX, 'source_completion_delivery', None)
+    monkeypatch.setitem(storage_utils._CTX, 'embeddings_table_client', None)
+    monkeypatch.setattr(storage_utils, '_refresh_semantic_fields', lambda *a: None)
+    monkeypatch.setattr(storage_utils, 'download_media_bytes', lambda *a: b'original raw')
+    monkeypatch.setattr(storage_utils, 'convert_image_to_jpeg', lambda *a: converted)
+    result = storage_utils.apply_client_processing_results_for_file('lib', 'photo.jpg',
+        lease_owner='owner', expected_processing_revision='rev', expected_processing_fence='attempt',
+        claimed_steps=['preview'], origin='ipworker',
+        client_processing={'preview': {'hasData': False, 'error': 'source_undecodable'}})
+    stored = metadata.get_entity('lib', 'photo.jpg')
+    assert result['preview_status'] == stored['preview_status'] == 'unrecoverable'
+    assert stored['processing_lease_owner'] == ''
+    assert not stored.get('previewArtifact') and not objects
+    assert not stored.get('processingCompletionPending')
+
+
+def test_valid_server_preview_publishes_verified_artifact(blobs, monkeypatch):
+    (metadata, *_, fence), objects = blobs
+    monkeypatch.setattr(storage_utils, 'convert_image_to_jpeg', lambda *a: jpeg())
+    row = metadata.get_entity('lib', 'photo.jpg')
+    with result_fence(fence):
+        result = storage_utils._apply_server_preview_fallback('lib', 'photo.jpg', row,
+            b'original raw', fallback_for='client_preview_failed')
+    assert result['preview_status'] == 'done'
+    receipt = json.loads(row['previewArtifact'])
+    assert objects[receipt['blob']].data == jpeg()
+
+
+@pytest.mark.parametrize('error', [OSError('storage unavailable'), StaleProcessingResult('replaced')])
+def test_server_preview_publication_errors_still_propagate(monkeypatch, error):
+    monkeypatch.setattr(storage_utils, 'convert_image_to_jpeg', lambda *a: jpeg())
+    def fail(*a, **k):
+        raise error
+    monkeypatch.setattr(storage_utils, '_publish_processing_derivative', fail)
+    with pytest.raises(type(error)):
+        storage_utils._apply_server_preview_fallback('lib', 'photo.jpg', {},
+            b'original raw', fallback_for='client_preview_failed')
 
 
 def test_sort_and_access_projections_preserve_versioned_derivative_pointers(blobs, monkeypatch):
@@ -230,3 +312,179 @@ def test_unfenced_legacy_publication_keeps_its_existing_content_type(monkeypatch
     storage_utils._publish_processing_derivative({'RowKey': 'legacy.png'}, 'thumbnail', b'legacy-png',
         filename='legacy.png', content_type='image/png')
     assert writes == [('thumbnail', 'legacy.png', b'legacy-png', 'image/png')]
+
+
+@pytest.mark.parametrize('kind', ['thumbnail', 'preview'])
+@pytest.mark.parametrize('invalid', ['photo', 'revision', 'malformed', 'list', 'null'])
+def test_prepared_promotion_replaces_stale_receipts_using_current_photo_bytes(blobs, kind, invalid):
+    from processing_artifacts import promote_prepared, verify_receipt, published_name
+    (metadata, *_, fence), objects = blobs
+    row = metadata.get_entity('lib', 'photo.jpg')
+    with result_fence(fence):
+        previous = publish(storage_utils, row, kind, data=jpeg('red'))
+    old_blob = previous['blob']
+    if invalid in ('malformed', 'list', 'null'):
+        row[kind + 'Artifact'] = {'malformed': 'not-json', 'list': '[]', 'null': 'null'}[invalid]
+    else:
+        stale = dict(previous)
+        stale['photoId' if invalid == 'photo' else 'revision'] = 'previous-source'
+        stale['blob'] = published_name(stale['library'], stale['photoId'], stale['revision'], kind, stale['sha256'])
+        row[kind + 'Artifact'] = json.dumps(stale)
+    row[kind + '_status'] = 'done'
+    prepared = Blob(); prepared.data = jpeg('blue'); prepared.version = 1
+    objects['photo' if kind == 'thumbnail' else 'preview/photo.jpg'] = prepared
+    with result_fence(fence):
+        promote_prepared(storage_utils, row)
+        current = verify_receipt(storage_utils, row, kind)
+    assert current['photoId'] == fence.photo and current['revision'] == fence.revision
+    assert current['sha256'] != previous['sha256']
+    assert objects[current['blob']].data == jpeg('blue')
+    assert objects[old_blob].data == jpeg('red')
+
+
+@pytest.mark.parametrize('kind', ['thumbnail', 'preview'])
+def test_prepared_promotion_preserves_valid_receipt_without_reading_preparation(blobs, monkeypatch, kind):
+    from processing_artifacts import promote_prepared
+    (metadata, *_, fence), _ = blobs
+    row = metadata.get_entity('lib', 'photo.jpg')
+    with result_fence(fence):
+        publish(storage_utils, row, kind, data=jpeg())
+        row[kind + '_status'] = 'done'
+        original = row[kind + 'Artifact']
+        monkeypatch.setattr(storage_utils, '_get_blob_client', lambda *a: pytest.fail('Reread valid prepared artifact'))
+        promote_prepared(storage_utils, row)
+    assert row[kind + 'Artifact'] == original
+
+
+@pytest.mark.parametrize('kind', ['thumbnail', 'preview'])
+def test_stale_receipt_repair_rejects_invalid_prepared_bytes(blobs, kind):
+    from processing_artifacts import promote_prepared
+    (metadata, *_, fence), objects = blobs
+    row = metadata.get_entity('lib', 'photo.jpg')
+    row.update({kind + '_status': 'done', kind + 'Artifact': '{}'})
+    prepared = Blob(); prepared.data = b'not-an-image'; prepared.version = 1
+    objects['photo' if kind == 'thumbnail' else 'preview/photo.jpg'] = prepared
+    with result_fence(fence), pytest.raises((ValueError, OSError)):
+        promote_prepared(storage_utils, row)
+    assert row[kind + 'Artifact'] == '{}'
+    assert not any(name.startswith('derived/') for name in objects)
+
+
+def test_capture_can_reuse_just_published_bytes_but_other_attempts_must_verify(blobs, monkeypatch):
+    from processing_artifacts import verify_receipt
+    (metadata, *_, fence), _ = blobs
+    row = metadata.get_entity('lib', 'photo.jpg')
+    original = storage_utils._get_blob_client
+    reads = []
+    monkeypatch.setattr(storage_utils, '_get_blob_client', lambda *a: (reads.append(a), original(*a))[1])
+    with result_fence(fence):
+        receipt = publish(storage_utils, row, 'thumbnail', data=jpeg())
+        reads.clear()
+        assert verify_receipt(storage_utils, row, 'thumbnail', reuse_published=True) == receipt
+        assert not reads
+        # Ordinary verification still checks the blob even inside this attempt.
+        verify_receipt(storage_utils, row, 'thumbnail')
+        assert reads
+    with result_fence(fence):
+        reads.clear()
+        verify_receipt(storage_utils, row, 'thumbnail', reuse_published=True)
+        assert reads  # Reentering even the same fence cannot reuse old trust.
+
+
+def test_modified_receipt_cannot_use_publication_verification_cache(blobs):
+    from processing_artifacts import verify_receipt
+    (metadata, *_, fence), _ = blobs
+    row = metadata.get_entity('lib', 'photo.jpg')
+    with result_fence(fence):
+        receipt = publish(storage_utils, row, 'thumbnail', data=jpeg())
+        row['thumbnailArtifact'] = json.dumps(dict(receipt, etag='another-version'))
+        with pytest.raises(ValueError, match='no longer matches'):
+            verify_receipt(storage_utils, row, 'thumbnail', reuse_published=True)
+
+
+def test_two_prepared_derivatives_need_two_source_checks_and_no_head_round_trips(blobs, monkeypatch):
+    from processing_artifacts import promote_prepared
+    (metadata, *_, fence), objects = blobs
+    row = metadata.get_entity('lib', 'photo.jpg')
+    row.update(thumbnail_status='done', preview_status='done')
+    for name in ['photo', 'preview/photo.jpg']:
+        blob = Blob(); blob.data = jpeg(); blob.version = 1; objects[name] = blob
+    original = metadata.get_entity
+    reads = []
+    monkeypatch.setattr(metadata, 'get_entity', lambda *a, **kw: (reads.append(a), original(*a, **kw))[1])
+    with result_fence(fence):
+        promote_prepared(storage_utils, row)
+    assert len(reads) == 2  # Was seven: fresh publication checks, no generic metadata cache.
+    assert sum(blob.heads for blob in objects.values()) == 0
+    assert sum(blob.gets for blob in objects.values()) == 4
+    assert row['thumbnailArtifact'] and row['previewArtifact']
+
+
+def test_bounded_artifact_get_rejects_oversized_or_truncated_response():
+    from processing_artifacts import _read, LIMITS
+    blob = Blob(); blob.data = b'x' * (LIMITS['thumbnail'][0] + 20); blob.version = 1
+    with pytest.raises(ValueError, match='size or content type'):
+        _read(blob, 'thumbnail')
+    blob.data = jpeg()
+    original = blob.download_blob
+    def truncated(**options):
+        result = original(**options)
+        result.readall = lambda: blob.data[:-1]
+        return result
+    blob.download_blob = truncated
+    with pytest.raises(ValueError, match='changed while being read'):
+        _read(blob, 'thumbnail')
+
+
+def test_empty_blob_range_error_is_invalid_content():
+    from azure.core.exceptions import HttpResponseError
+    from processing_artifacts import _read
+    def empty(**options):
+        error = HttpResponseError('InvalidRange'); error.status_code = 416; raise error
+    with pytest.raises(ValueError, match='blob size'):
+        _read(SimpleNamespace(download_blob=empty), 'thumbnail')
+
+
+def test_artifact_counters_report_request_and_verification_reuse(blobs):
+    import processing_metrics as metrics
+    from processing_artifacts import promote_prepared, verify_receipt
+    (metadata, *_, fence), objects = blobs
+    row = dict(metadata.get_entity('lib', 'photo.jpg'), thumbnail_status='done', preview_status='done')
+    for name in ['photo', 'preview/photo.jpg']:
+        blob = Blob(); blob.data = jpeg(); blob.version = 1; objects[name] = blob
+    with metrics.accounting() as counter, result_fence(fence):
+        promote_prepared(storage_utils, row)
+        for kind in ['thumbnail', 'preview']:
+            verify_receipt(storage_utils, row, kind, reuse_published=True)
+    values = counter.snapshot()
+    assert values['artifact_gets'] == values['artifact_verifications'] == 4
+    assert values['artifact_verification_reuse'] == 2 and values['artifact_heads'] == 0
+    assert values['artifact_verified_bytes'] == 4 * len(jpeg())
+
+
+def test_promotion_and_receipt_capture_share_one_final_source_check(blobs):
+    from processing_artifacts import promote_prepared
+    from processing_completion import STEPS
+    from processing_fence import immutable_artifact_checks
+    from processing_receipts import ArtifactReceipts
+    from test_upload_waves import AtomicTable
+    import processing_metrics
+    (metadata, _, _, _, fence), objects = blobs
+    row = dict(metadata.get_entity('lib', 'photo.jpg'), faceCount=0,
+               **{step + '_status': 'no_data' for step in STEPS})
+    row.update(thumbnail_status='done', preview_status='done')
+    for name in ['photo', 'preview/photo.jpg']:
+        blob = Blob(); blob.data = jpeg(); blob.version = 1; objects[name] = blob
+    receipts = ArtifactReceipts(AtomicTable(), 'lib')
+    with result_fence(fence):
+        storage_utils._store_client_face_entities('lib', 'photo.jpg', [])
+        metadata.get_calls = 0
+        with processing_metrics.accounting() as metrics:
+            with immutable_artifact_checks(fence):
+                promote_prepared(storage_utils, row)
+                reference = receipts.capture(storage_utils, row)
+        assert metadata.get_calls == 1  # Two promotion + two capture checks -> one.
+    assert reference and row['thumbnailArtifact'] and row['previewArtifact']
+    assert sum(blob.gets for blob in objects.values()) == 4  # Read-back verification retained.
+    assert metrics.snapshot()['artifact_source_checks_coalesced'] == 3
+    assert metrics.snapshot()['artifact_verification_reuse'] == 2

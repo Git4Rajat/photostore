@@ -32,26 +32,36 @@ def process_exif(user_id: str, filename: str, image_bytes: bytes) -> Dict:
 
 
 def geo_coordinates_from_exif(exif_data: Dict) -> Optional[Tuple[float, float]]:
-    """None means no coordinates; present but unusable coordinates raise."""
+    """None means no usable coordinates -- absent, or present but malformed.
+
+    A malformed GPS field (wrong ref letter, boolean-typed value, out-of-range
+    or non-finite decimal) is deterministic garbage in the file itself: re-
+    running this same parser on the same bytes will reach the same verdict
+    every time, so it is reported as absent data (terminal 'no_data'), not a
+    retryable failure -- unlike a raised exception (OOM, a decode error), which
+    the caller still retries since a later attempt could plausibly succeed.
+    """
     for keys, allowed in ((('GPS.GPSLatitudeRef', 'GPSLatitudeRef'), {'N', 'S'}),
                           (('GPS.GPSLongitudeRef', 'GPSLongitudeRef'), {'E', 'W'})):
         if any(key in exif_data and str(exif_data[key]).strip().upper()[:1] not in allowed for key in keys):
-            raise ValueError('Invalid GPS reference')
+            return None
     if any(isinstance(exif_data.get(key), bool) for key in (
             'GPS.LatitudeDecimal', 'GPS.LongitudeDecimal', 'GPSLatitude', 'GPSLongitude',
             'GPS.GPSLatitude', 'GPS.GPSLongitude', 'GPS.Latitude', 'GPS.Longitude')):
-        raise ValueError('Invalid GPS coordinates')
+        return None
     lat_str, lon_str = extract_gps_decimal_from_exif(exif_data)
     if not lat_str or not lon_str:
-        if any(key in exif_data for key in (
-                'GPS.LatitudeDecimal', 'GPS.LongitudeDecimal',
-                'GPS.GPSLatitude', 'GPS.GPSLongitude', 'GPSLatitude', 'GPSLongitude',
-                'GPS.Latitude', 'GPS.Longitude')):
-            raise ValueError('Invalid GPS coordinates')
         return None
-    lat, lon = float(lat_str), float(lon_str)
+    try:
+        # extract_gps_decimal_from_exif's own DMS/garbage-string path already
+        # validates before returning, but its GPS.*Decimal cache-key shortcut
+        # trusts the value as-is -- a non-numeric value stored there (e.g. a
+        # corrupted cache write) would otherwise raise here uncaught.
+        lat, lon = float(lat_str), float(lon_str)
+    except (ValueError, TypeError, OverflowError):
+        return None
     if not math.isfinite(lat) or not math.isfinite(lon) or not -90 <= lat <= 90 or not -180 <= lon <= 180:
-        raise ValueError('Invalid GPS coordinates')
+        return None
     return lat, lon
 
 

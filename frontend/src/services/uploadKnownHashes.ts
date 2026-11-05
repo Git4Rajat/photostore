@@ -3,8 +3,8 @@ import type { RequestConfig } from './httpClient';
 import { perf } from './perf';
 
 export const UPLOAD_HASH_DOWNLOAD_TIMEOUT_MS = 60000;
-export const UPLOAD_HASH_DOWNLOAD_ATTEMPTS = 3;
-const RETRY_DELAYS_MS = [2000, 5000];
+export const UPLOAD_HASH_DOWNLOAD_ATTEMPTS = 5;
+const RETRY_DELAYS_MS = [2000, 5000, 8000, 8000];
 
 export type UploadEndReason = 'completed' | 'stopped' | 'failed' | 'interrupted' | 'discarded';
 
@@ -26,7 +26,11 @@ function waitForRetry(ms: number, signal?: AbortSignal): Promise<void> {
     });
 }
 
-// Background-only download: its deadline/retries never hold up upload workers.
+// Also doubles as the upload app's wake-up call: AppServicesProvider awaits
+// this once, blocking, at the start of an upload click specifically so a
+// scaled-to-zero replica has woken up by the time registration/init starts
+// (see startUpload). Retries up to UPLOAD_HASH_DOWNLOAD_ATTEMPTS times before
+// giving up and letting the upload proceed anyway with no known-hash dedup.
 export async function fetchKnownUploadHashes(signal?: AbortSignal): Promise<Record<string, string>> {
     for (let attempt = 0; attempt < UPLOAD_HASH_DOWNLOAD_ATTEMPTS && !signal?.aborted; attempt += 1) {
         const startedAt = performance.now();

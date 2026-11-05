@@ -43,13 +43,16 @@ import sqlite3
 import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import perf_instrumentation
 from index_ownership import catalog_publisher
 import search_utils
+from catalog_metadata import is_upload_reservation_only
 from ordering_utils import metadata_capture_datetime, metadata_upload_datetime
+from summary_incremental import DatabaseSummaryAdapter, SummarySchemaMissing, smart_row_from_record
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -161,9 +164,10 @@ def _collect_location_terms(into: set, row: Dict) -> None:
 def row_record(row: Dict) -> Optional[Dict]:
     """Everything the database stores for one photo (shared by the full build and by delta
     updates, so both produce byte-identical rows): the reduced JSON, gallery columns, people ids,
-    the full-text document and the place-name terms. None when the row has no filename."""
+    the full-text document and the place-name terms. None for missing filenames
+    or upload reservations that have not finalized."""
     filename = str(row.get('RowKey') or '').strip()
-    if not filename:
+    if not filename or is_upload_reservation_only(row):
         return None
     slim = reduced_row(row)
     captured = metadata_capture_datetime(row)
@@ -227,6 +231,8 @@ class DatabaseBuilder:
                 tokenize='unicode61 remove_diacritics 2', prefix='3 4');
             '''
         )
+        DatabaseSummaryAdapter(self._conn).create()
+        self._conn.execute("INSERT INTO meta VALUES('summary_base_id', ?)", (uuid.uuid4().hex,))
 
     def add(self, row: Dict) -> None:
         record = row_record(row)
@@ -241,6 +247,7 @@ class DatabaseBuilder:
         self._fts.append((self.count, record['doc']))
         self._people.extend((pid, self.count) for pid in record['people'])
         self._terms.update(record['terms'])
+        DatabaseSummaryAdapter(self._conn).change(self.count, record)
         if len(self._rows) >= self.BATCH:
             self._flush()
 
@@ -348,9 +355,10 @@ class SearchDatabase:
 
     def applied_seq(self) -> int:
         """Sequence number of the last delta applied to this local copy (0 = the base as built)."""
-        if self._seq is None:
-            row = self._conn().execute("SELECT value FROM meta WHERE key='delta_seq'").fetchone()
-            self._seq = int(row[0]) if row else 0
+        # A different process/instance can commit to this WAL file. Never use an
+        # instance cache to label a newer read snapshot with an older sequence.
+        row = self._conn().execute("SELECT value FROM meta WHERE key='delta_seq'").fetchone()
+        self._seq = int(row[0]) if row else 0
         return self._seq
 
     def apply_delta(self, delta: Dict) -> None:
@@ -365,13 +373,21 @@ class SearchDatabase:
         try:
             conn.execute('PRAGMA journal_mode=WAL')
             conn.execute('BEGIN IMMEDIATE')
+            stored_seq = conn.execute("SELECT value FROM meta WHERE key='delta_seq'").fetchone()
+            if int(delta['seq']) <= (int(stored_seq[0]) if stored_seq else 0):
+                conn.rollback()
+                return  # replay/concurrent replica: rows and summaries are already committed
+            aggregates = DatabaseSummaryAdapter(conn)
+            summaries_ready = aggregates.ready()
             touched = list(dict.fromkeys([*deletes, *(str(u['filename']) for u in upserts)]))
             for start in range(0, len(touched), 500):
                 chunk = touched[start:start + 500]
                 marks = ','.join('?' * len(chunk))
-                for row_id, filename, row_json in conn.execute(
-                    f'SELECT id, filename, row_json FROM rows WHERE filename IN ({marks})', chunk,
+                for row_id, filename, row_json, capture_day in conn.execute(
+                    f'SELECT id, filename, row_json, capture_day FROM rows WHERE filename IN ({marks})', chunk,
                 ).fetchall():
+                    if summaries_ready:
+                        aggregates.change(row_id, {'capture_day': capture_day}, remove=True)
                     try:
                         old_doc = document_text(filename, json.loads(row_json))
                         conn.execute("INSERT INTO fts(fts, rowid, doc) VALUES('delete', ?, ?)", (row_id, old_doc))
@@ -393,6 +409,8 @@ class SearchDatabase:
                 conn.execute('INSERT INTO fts(rowid, doc) VALUES(?, ?)', (next_id, upsert['doc']))
                 conn.executemany('INSERT INTO row_people(person_id, id) VALUES(?, ?)',
                                  [(str(pid), next_id) for pid in upsert.get('people') or []])
+                if summaries_ready:
+                    aggregates.change(next_id, upsert)
                 terms.update(upsert.get('terms') or [])
                 next_id += 1
             if terms:
@@ -413,22 +431,32 @@ class SearchDatabase:
         self._timeline = None
 
     def timeline_summary(self, *, today=None) -> Dict:
-        """Year/month/day photo counts for the timeline, from the stored capture days (same shape
-        and rules as TimelineAccumulator: undated and future-dated photos are counted aside).
-        Cached until the next delta, so it always reflects new uploads."""
+        """Exact production UTC-day counts and SHA-ranked SQL period covers.
+
+        Materialized day counts replace the former full COUNT/GROUP BY scans.
+        Counts/covers share one committed snapshot, including today rollover.
+        The raw streaming TimelineAccumulator is a different full algorithm.
+        """
         from datetime import date as _date
         today = today or datetime.now(timezone.utc).date()
-        seq = self.applied_seq()
-        cached = self._timeline
-        if cached is not None and cached[0] == seq and cached[1].get('today') == today.isoformat():
-            return cached[1]
         conn = self._conn()
-        total = int(conn.execute('SELECT COUNT(*) FROM rows').fetchone()[0])
-        undated = int(conn.execute('SELECT COUNT(*) FROM rows WHERE capture_day IS NULL').fetchone()[0])
+        # Pin counts AND covers to one read snapshot, including cross-process
+        # writers. Nested use by summary_snapshot shares its transaction.
+        if not conn.in_transaction:
+            with conn:
+                conn.execute('BEGIN')
+                return self.timeline_summary(today=today)
+        if not DatabaseSummaryAdapter(conn).ready():
+            raise SummarySchemaMissing('summary schema missing: compact the search database explicitly')
+        total = undated = 0
         years: Dict[str, Dict] = {}
         future = 0
         first = last = None
-        for ordinal, count in conn.execute('SELECT capture_day, COUNT(*) FROM rows WHERE capture_day IS NOT NULL GROUP BY capture_day'):
+        for ordinal, count in conn.execute('SELECT day,count FROM summary_days ORDER BY day'):
+            total += int(count)
+            if ordinal == 0:
+                undated += int(count)
+                continue
             day = _date.fromordinal(int(ordinal))
             if day > today:
                 future += int(count)
@@ -473,8 +501,29 @@ class SearchDatabase:
             'firstDate': first.isoformat() if first else None, 'lastDate': last.isoformat() if last else None,
             'today': today.isoformat(), 'undatedCount': undated, 'futureCount': future, 'totalCount': total,
         }
-        self._timeline = (seq, summary)
         return summary
+
+    def explore_groups(self, *, limit=24) -> Dict:
+        """Exact pre-hydration Explore winners over iter_smart_rows order."""
+        return DatabaseSummaryAdapter(self._conn()).groups(limit)
+
+    def summary_snapshot(self, *, today=None) -> Dict:
+        """One committed sequence for bounded Explore winners and SQL timeline.
+
+        The base identity survives backup/compaction and changes on a full
+        rebuild. No wall-clock timestamp is used as a source version.
+        """
+        conn = self._conn()
+        with conn:
+            conn.execute('BEGIN')
+            groups = self.explore_groups()
+            timeline = self.timeline_summary(today=today)
+            base = conn.execute("SELECT value FROM meta WHERE key='summary_base_id'").fetchone()
+            if not base:
+                raise SummarySchemaMissing('summary base identity missing: explicit compaction required')
+            seq = self.applied_seq()
+            return {'groups': groups, 'timeline': timeline, 'sequence': seq,
+                    'sourceVersion': f'search-summary:{base[0]}:{seq}:{timeline["today"]}'}
 
     def location_terms(self) -> List[str]:
         if self._location_terms is None:
@@ -767,29 +816,10 @@ class SearchDatabase:
         search index keeps."""
         cur = self._conn().execute('SELECT filename, row_json, capture_ts, upload_ts, lat, lon FROM rows')
         for filename, row_json, capture_ts, upload_ts, lat, lon in cur:
-            try:
-                row = json.loads(row_json)
-            except Exception:
-                continue
-            row['RowKey'] = filename
-            if lat is not None and lon is not None:
-                row['latitude'], row['longitude'] = repr(lat), repr(lon)
-            else:
-                row.pop('latitude', None)
-                row.pop('longitude', None)
-            tags: List[str] = []
-            for field in ('subjectTags', 'tags'):
-                try:
-                    tags.extend(str(t) for t in json.loads(row.get(field) or '[]'))
-                except Exception:
-                    pass
-            row['tags'] = json.dumps(tags, ensure_ascii=False)
-            row['objects'] = '[]'
-            if capture_ts is not None:
-                row['_capture_dt'] = datetime.fromtimestamp(capture_ts, tz=timezone.utc)
-            if upload_ts is not None:
-                row['_upload_dt'] = datetime.fromtimestamp(upload_ts, tz=timezone.utc)
-            yield row
+            row = smart_row_from_record(dict(filename=filename, row_json=row_json, capture_ts=capture_ts,
+                                             upload_ts=upload_ts, lat=lat, lon=lon))
+            if row is not None:
+                yield row
 
 
 # --- blob storage + local ephemeral cache -------------------------------------
@@ -1173,7 +1203,23 @@ def compact_database(user_id: str) -> Optional[Dict]:
             dst = sqlite3.connect(dst_path)
             try:
                 src.backup(dst)
+                # Backup can include a concurrent committed delta newer than
+                # the preliminary applied_seq above. Label ONLY the backed-up
+                # snapshot's sequence, never overwrite it with the earlier one.
+                snapshot_seq = dst.execute("SELECT value FROM meta WHERE key='delta_seq'").fetchone()
+                applied = int(snapshot_seq[0]) if snapshot_seq else 0
                 dst.execute('PRAGMA journal_mode=DELETE')
+                # Legacy bases gain summaries only in this explicit worker
+                # compaction. Request readers/delta replay never scan to seed.
+                aggregates = DatabaseSummaryAdapter(dst)
+                if not aggregates.ready():
+                    aggregates.create()
+                    dst.execute("INSERT OR REPLACE INTO meta VALUES('summary_base_id', ?)", (uuid.uuid4().hex,))
+                    for row_id, filename, row_json, capture_day, capture_ts, upload_ts, lat, lon in dst.execute(
+                        'SELECT id,filename,row_json,capture_day,capture_ts,upload_ts,lat,lon FROM rows ORDER BY id'
+                    ):
+                        aggregates.change(row_id, dict(filename=filename, row_json=row_json, capture_day=capture_day,
+                                                       capture_ts=capture_ts, upload_ts=upload_ts, lat=lat, lon=lon))
                 dst.execute("INSERT INTO fts(fts) VALUES('optimize')")
                 count = int(dst.execute('SELECT COUNT(*) FROM rows').fetchone()[0])
                 dst.execute("INSERT OR REPLACE INTO meta VALUES('delta_seq', ?)", (str(applied),))
