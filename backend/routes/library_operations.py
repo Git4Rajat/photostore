@@ -311,6 +311,8 @@ def get_library_cleanup_info():
     _account_id, library_id, error = app._require_library_context(require_auth=True)
     if error:
         return error
+    if app.library_store is None:
+        return app.jsonify({'error': 'Library store not configured'}), 503
     app._reconcile_stale_library_cleanup(library_id)
     meta = app.library_store.get_library(library_id) or {}
     return app.jsonify({

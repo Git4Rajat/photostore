@@ -1127,6 +1127,8 @@ def upload_processing_release():
     data = app.request.get_json(silent=True) or {}
     filename = app._validate_media_filename(str(data.get('filename') or '')) or ''
     lease_id = str(data.get('leaseId') or '')
+    if not filename or not lease_id:
+        return app.jsonify({'error': 'filename and leaseId are required'}), 400
     fence_options = {'expected_processing_fence': data['processingFence']} if 'processingFence' in data else {}
     app.release_processing_lease(user_id, filename, lease_id, **fence_options)
     return app.jsonify({'ok': True})
