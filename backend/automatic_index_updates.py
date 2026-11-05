@@ -109,11 +109,27 @@ def _quiescence_row(user):
         return None
 
 
+_UNFENCED_TTL = 2.0
+_UNFENCED_UNTIL = {}
+
+
 def check_source_admission(user):
-    """Indefinite operator fence; never confuse an expired lease with a drain."""
+    """Indefinite operator fence; never confuse an expired lease with a drain.
+
+    Every source write asks this, so an unfenced answer is remembered for a couple of
+    seconds in this process instead of re-reading the fence row per write; a fence
+    created here is seen at once, one created elsewhere within the TTL.
+    """
     import storage_utils as su
-    if su.DURABLE_INDEX_UPDATES and _quiescence_row(user) is not None:
+    if not su.DURABLE_INDEX_UPDATES:
+        return
+    now = time.monotonic()
+    if _UNFENCED_UNTIL.get(user, 0.0) > now:
+        return
+    if _quiescence_row(user) is not None:
+        _UNFENCED_UNTIL.pop(user, None)
         raise SourceBusy('Library writers fenced for operator quiescence')
+    _UNFENCED_UNTIL[user] = now + _UNFENCED_TTL
 
 
 def _check_publication_claims(user):
@@ -134,6 +150,7 @@ def operator_fence(user, *, operator, reason):
     import app
     if not operator or not reason or app.jobs_table_client is None:
         raise ValueError('Authenticated operator, reason and jobs storage required')
+    _UNFENCED_UNTIL.pop(user, None)
     existing = _quiescence_row(user)
     if existing is None:
         row = dict(PartitionKey=QUIESCENCE_PARTITION, RowKey=hashlib.sha256(user.encode()).hexdigest(),
