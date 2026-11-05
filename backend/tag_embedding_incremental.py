@@ -13,6 +13,7 @@ library/vocabulary: fixed SQLite cache, capped IDs/photo fields, and one capped
 encoding batch. Disk and blob IO are O(sidecar + output); NPZ is the unchanged
 consumer format. Immutable unreferenced generations require external GC.
 """
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -116,6 +117,75 @@ def _replace(db, filename, tags):
         db.execute('INSERT INTO photos VALUES (?, ?)', (filename, json.dumps(tags, ensure_ascii=False)))
         for tag in tags:
             db.execute('INSERT INTO tags VALUES (?, 1, NULL) ON CONFLICT(tag) DO UPDATE SET refs = refs + 1', (tag,))
+
+
+class KnownVectors:
+    """Read-only lookup of vectors published by the previous bootstrap/merge.
+
+    A tag's vector depends only on the tag text and the model, so a vector in
+    the sidecar for the SAME model/schema is exactly what re-encoding would
+    produce. Lets a post-wave full rebuild encode only genuinely new tags.
+    """
+    def __init__(self, db, dim):
+        self.db, self.dim = db, dim
+
+    def lookup(self, tags):
+        found = {}
+        for start in range(0, len(tags), 500):
+            batch = tags[start:start + 500]
+            marks = ','.join('?' * len(batch))
+            for tag, vector in self.db.execute(f'SELECT tag, vector FROM tags WHERE tag IN ({marks})', batch):
+                if vector is None or len(vector) != self.dim * 4:
+                    continue
+                array = np.frombuffer(vector, dtype='<f4')
+                if np.isfinite(array).all():
+                    found[tag] = array.astype(np.float32)
+        return found
+
+
+def _open_known(user, model, schema, manifest_client, blob_client, directory):
+    if manifest_client is None:
+        return None
+    manifest, _ = _manifest(manifest_client, allow_missing=True)
+    name = manifest.get('contributionBlobName')
+    if (not manifest or manifest.get('userId') != user or manifest.get('embeddingVersion') != model or
+            manifest.get('schemaVersion') != schema or manifest.get('contributionVersion') != STATE_VERSION or
+            not isinstance(name, str) or len(name) > 1024 or '/' in name or not name.endswith('.sqlite')):
+        return None
+    path = Path(directory) / 'known.sqlite'
+    client = blob_client(name)
+    props = client.get_blob_properties()
+    with path.open('wb') as stream:
+        client.download_blob(etag=props.etag, match_condition=MatchConditions.IfNotModified).readinto(
+            index_progress.Stream(stream))
+    db = _open(path)
+    try:
+        rows = db.execute('SELECT user, model, schema, version, dim FROM provenance').fetchmany(2)
+        if (len(rows) != 1 or rows[0][:4] != (user, model, schema, STATE_VERSION) or
+                type(rows[0][4]) is not int or not 0 < rows[0][4] <= MAX_DIM):
+            db.close()
+            return None
+        return KnownVectors(db, rows[0][4])
+    except Exception:
+        db.close()
+        raise
+
+
+@contextmanager
+def known_vectors(*, user, model, schema, manifest_client, blob_client):
+    """Yield KnownVectors, or None when no compatible sidecar exists. Never raises
+    for an unusable sidecar: the caller then simply encodes every tag."""
+    with tempfile.TemporaryDirectory(prefix='tag-embedding-known-') as directory:
+        known = None
+        try:
+            known = _open_known(user, model, schema, manifest_client, blob_client, directory)
+        except Exception:
+            known = None
+        try:
+            yield known
+        finally:
+            if known is not None:
+                known.db.close()
 
 
 def _manifest(client, allow_missing=False):

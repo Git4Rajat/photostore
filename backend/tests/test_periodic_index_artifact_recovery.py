@@ -291,6 +291,7 @@ def test_configured_gc_cap_is_bounded(recovery, monkeypatch, setting, expected):
 
 
 def test_gc_exception_does_not_stop_wakeups_or_later_libraries(recovery, monkeypatch, caplog):
+    monkeypatch.setattr(automatic, 'VECTOR_INDEX_AUTOMATIC', True)
     recovery.dirty.rows.clear()
     for user in ('a', 'b', 'c'):
         certified(recovery, user)

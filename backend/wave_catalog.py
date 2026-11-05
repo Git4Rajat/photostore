@@ -11,11 +11,15 @@ import tempfile
 from azure.core import MatchConditions
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 
+import index_updates
 from execution_lease import guard_operations
 from index_publication import guarded_publication, serialize_catalog
 from upload_waves import digest
 
-SCOPES = ('sort', 'access', 'people', 'albums', 'search', 'vector', 'people_embedding', 'dedup')
+ACCEPTED_SCOPES = ('sort', 'access', 'people', 'albums', 'search', 'vector', 'people_embedding', 'dedup')
+# New waves no longer require the (unread) photo-vector artifact; obligations
+# recorded earlier by in-flight waves still verify/publish via ACCEPTED_SCOPES.
+SCOPES = tuple(scope for scope in ACCEPTED_SCOPES if scope != 'vector' or index_updates.VECTOR_INDEX_AUTOMATIC)
 PREREQUISITES = {'search': ('people','albums'), 'people_embedding': ('people',)}
 
 
@@ -118,7 +122,7 @@ class CatalogPublisher:
 
     def verify(self, scope, obligation):
         """Verify a recorded immutable output without rebuilding missing proof."""
-        if scope not in SCOPES:
+        if scope not in ACCEPTED_SCOPES:
             raise ValueError('Unknown wave publication scope')
         self.check()
         key = f'publication!{self.wave_id}!{obligation}'
@@ -135,7 +139,7 @@ class CatalogPublisher:
     def publish(self, scope, obligation):
         from index_ownership import require_catalog_owner
         require_catalog_owner()
-        if scope not in SCOPES:
+        if scope not in ACCEPTED_SCOPES:
             raise ValueError('Unknown wave publication scope')
         self.check()
         key = f'publication!{self.wave_id}!{obligation}'

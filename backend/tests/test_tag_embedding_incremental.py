@@ -494,3 +494,53 @@ def test_incremental_allocations_do_not_scale_with_library_or_output(ctx, monkey
         assert max(chunk_sizes) <= 65536
     assert peaks[1] < peaks[0] + 512 * 1024
     assert max(peaks) < 2 * 1024 * 1024
+
+
+def rebootstrap(source):
+    return storage.refresh_user_tag_embedding_index('u', source_version=source, model_version='clip-test',
+                                                     bootstrap_incremental=True)
+
+
+def test_rebootstrap_encodes_only_new_tags_and_matches_full_encoding(ctx):
+    table, _, encoded = ctx
+    seed(table, 'a.jpg', ['dog', 'beach'])
+    seed(table, 'b.jpg', ['dog'])
+    assert bootstrap() is not None
+    encoded.clear()
+    seed(table, 'c.jpg', ['sunset', 'dog'])
+    assert rebootstrap('v2') is not None
+    assert encoded == [['sunset']]
+    assert_equivalent('v2')
+
+
+def test_rebootstrap_reuses_everything_when_vocabulary_unchanged(ctx):
+    table, _, encoded = ctx
+    seed(table, 'a.jpg', ['dog', 'beach'])
+    assert bootstrap() is not None
+    encoded.clear()
+    seed(table, 'b.jpg', ['dog'])
+    assert rebootstrap('v2') is not None
+    assert encoded == []
+    assert_equivalent('v2')
+
+
+def test_rebootstrap_encodes_everything_when_model_changed(ctx, monkeypatch):
+    table, _, encoded = ctx
+    seed(table, 'a.jpg', ['dog'])
+    assert bootstrap() is not None
+    encoded.clear()
+    monkeypatch.setattr(vision_utils, 'get_text_embedding_version', lambda: 'clip-next')
+    assert storage.refresh_user_tag_embedding_index(
+        'u', source_version='v2', model_version='clip-next', bootstrap_incremental=True) is not None
+    assert encoded == [['dog']]
+
+
+def test_rebootstrap_ignores_corrupt_sidecar_and_encodes_all(ctx):
+    table, blobs, encoded = ctx
+    seed(table, 'a.jpg', ['dog', 'beach'])
+    assert bootstrap() is not None
+    blobs.blobs['tags/' + manifest(blobs)['contributionBlobName']] = b'not sqlite'
+    encoded.clear()
+    assert rebootstrap('v2') is not None
+    assert encoded == [['beach', 'dog']]
+    assert_equivalent('v2')

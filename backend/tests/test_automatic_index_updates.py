@@ -216,6 +216,7 @@ def test_active_and_abandoned_prewrite_intents_never_expire(runtime):
 
 
 def test_source_proxy_records_before_write_and_schedules_after(runtime, monkeypatch):
+    monkeypatch.setattr(automatic, 'VECTOR_INDEX_AUTOMATIC', True)
     table = su.track_index_source_table(runtime.source, 'metadata')
     observed = []
     original = runtime.source.upsert_entity
@@ -302,6 +303,7 @@ def test_vision_sweep_uses_tag_bootstrap_with_real_model_version(runtime, monkey
 
 
 def test_failed_postwrite_schedule_recovered_from_coverage(runtime, monkeypatch):
+    monkeypatch.setattr(automatic, 'VECTOR_INDEX_AUTOMATIC', True)
     mark(runtime, 'vector', ['one'])
     assert not WorkStore(runtime.jobs)._get(WorkStore.key('A', 'vector'))
     sent = []
@@ -709,3 +711,15 @@ def test_non_wave_writes_in_scope_keep_per_write_reservations(runtime, monkeypat
     finally:
         end()
     assert runtime.store.capture('A', 'vector').ids == ['one']
+
+
+def test_vector_is_not_scheduled_automatically_by_default(runtime, monkeypatch):
+    monkeypatch.setattr(automatic, 'VECTOR_INDEX_AUTOMATIC', False)
+    automatic.schedule('A', 'vector')  # must not call the scheduling hook or raise
+    assert not runtime.calls
+
+
+def test_wave_scopes_exclude_vector_but_still_accept_it_for_in_flight_waves():
+    import wave_catalog
+    assert 'vector' not in wave_catalog.SCOPES
+    assert 'vector' in wave_catalog.ACCEPTED_SCOPES

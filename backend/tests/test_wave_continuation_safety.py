@@ -9,6 +9,7 @@ import pytest
 import wave_runtime as runtime
 from execution_lease import ExecutionLeases, OwnershipLost
 from upload_wave_execution import run_index_release, stage_work_store
+from wave_catalog import SCOPES as WAVE_SCOPES
 from wave_publication import ObligationLedger
 from test_wave_runtime import vision_dispatch
 from test_wave_liveness import live, admit, complete_source, wake
@@ -162,7 +163,7 @@ def test_index_resumes_preparation_publications_and_final_markers(index_wave, mo
         if result['state'] == 'complete':break
     assert result['state'] == 'complete'
     assert len(prepared) == len(set(prepared)) == 45
-    assert len(published) == len(set(published)) == 8
+    assert len(published) == len(set(published)) == len(WAVE_SCOPES)
     assert any('"phase": "prepare"' in p for p in pages)
     assert any('"phase": "members"' in p for p in pages)
     assert len(store._page('published-source!', size=100)) == 45
@@ -180,7 +181,7 @@ def test_index_recovers_interruption_after_all_outputs_before_completion(index_w
     lease = ExecutionLeases(store.table, partition=store.partition)._get(
         ExecutionLeases.key(store.library, wave['waveId'], 'index'))
     assert not lease['owner'] and lease['leaseUntil'] == 0
-    assert ledger.is_complete() and len(built) == 8
+    assert ledger.is_complete() and len(built) == len(WAVE_SCOPES)
     monkeypatch.setattr(wave_no_work, 'record_publication_members', original)
     def forbidden(*a, **kw):pytest.fail('Rebuilt already published output')
     result, _ = execute_index(index_wave, publisher=forbidden, prepare_page=forbidden)

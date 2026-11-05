@@ -3888,7 +3888,8 @@ _TAG_META_COLUMNS = [
 ]
 
 
-def _build_user_tag_embedding_index_snapshot(user_id: str, source_version: str, *, contribution_hook=None) -> Optional[TagEmbeddingIndexSnapshot]:
+def _build_user_tag_embedding_index_snapshot(user_id: str, source_version: str, *, contribution_hook=None,
+                                             known_vectors=None) -> Optional[TagEmbeddingIndexSnapshot]:
     import index_progress
     # The one guard that matters: only ever build where real CLIP is loaded.
     # Building this from the backend role would silently produce hash-
@@ -3905,8 +3906,9 @@ def _build_user_tag_embedding_index_snapshot(user_id: str, source_version: str, 
     # every photo was loaded into one list first).
     tag_set = set()
     try:
-        for row in _query_projected(
-            metadata_table_client, f"PartitionKey eq '{_escape_odata(user_id)}'", _TAG_META_COLUMNS,
+        for row in table_scan.scan_partition(
+            metadata_table_client.query_entities, f"PartitionKey eq '{_escape_odata(user_id)}'",
+            select=_TAG_META_COLUMNS,
         ):
             if contribution_hook is not None:
                 contribution_hook(row)
@@ -3925,18 +3927,38 @@ def _build_user_tag_embedding_index_snapshot(user_id: str, source_version: str, 
     # Complete bounded encoding batches so a large vocabulary reports real
     # work to Vision's watchdog. A blocked encoder emits no progress.
     from tag_embedding_incremental import ENCODE_BATCH
-    raw_embeddings = []
-    for start in range(0, len(tags), ENCODE_BATCH):
-        batch = tags[start:start + ENCODE_BATCH]
-        encoded = vision_utils.encode_text_embeddings_batch(batch)
-        if not encoded or len(encoded) != len(batch):
+    # Vectors already published for this model are reused verbatim; only new tags are encoded.
+    reused = known_vectors.lookup(tags) if known_vectors is not None else {}
+
+    def encode(names):
+        raw = []
+        for start in range(0, len(names), ENCODE_BATCH):
+            batch = names[start:start + ENCODE_BATCH]
+            encoded = vision_utils.encode_text_embeddings_batch(batch)
+            if not encoded or len(encoded) != len(batch):
+                return None
+            raw.extend(encoded)
+            index_progress.completed()
+        array = np.asarray(raw, dtype=np.float32)
+        if array.size:
+            norms = np.linalg.norm(array, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            array = (array / norms).astype(np.float32, copy=False)
+        return array
+
+    fresh = encode([tag for tag in tags if tag not in reused])
+    if fresh is None:
+        return None
+    if reused and fresh.size and fresh.shape[1] != known_vectors.dim:
+        reused = {}   # model dimension changed: reuse nothing, encode every tag
+        fresh = encode(tags)
+        if fresh is None:
             return None
-        raw_embeddings.extend(encoded)
-        index_progress.completed()
-    matrix = np.asarray(raw_embeddings, dtype=np.float32)
-    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    matrix = (matrix / norms).astype(np.float32, copy=False)
+    width = fresh.shape[1] if fresh.size else known_vectors.dim
+    matrix = np.zeros((len(tags), width), dtype=np.float32)
+    fresh_rows = iter(fresh)
+    for position, tag in enumerate(tags):
+        matrix[position] = reused[tag] if tag in reused else next(fresh_rows)
     return TagEmbeddingIndexSnapshot(
         user_id=str(user_id), source_version=source_version, embedding_version=embedding_version,
         updated_at=source_version, tags=tags, embeddings=matrix,
@@ -3978,8 +4000,9 @@ def refresh_user_tag_embedding_index(
                     raise ValueError('tag model changed during encoding')
                 return encoded
 
-            def checked_build(hook):
-                built = _build_user_tag_embedding_index_snapshot(key, source_version, contribution_hook=hook)
+            def checked_build(hook, known=None):
+                built = _build_user_tag_embedding_index_snapshot(
+                    key, source_version, contribution_hook=hook, known_vectors=known)
                 if vision_utils.get_text_embedding_version() != model_version:
                     raise ValueError('tag model changed during bootstrap')
                 return built
@@ -3991,7 +4014,12 @@ def refresh_user_tag_embedding_index(
                            blob_client=_tag_embedding_index_blob_client, blob_prefix=_tag_embedding_index_blob_key(key),
                            content_settings=lambda mime: BlobContentSettings(content_type=mime))
             if bootstrap_incremental:
-                result = bootstrap_and_publish(**options, build=checked_build)
+                from tag_embedding_incremental import known_vectors
+                with known_vectors(user=key, model=model_version, schema=_TAG_EMBEDDING_INDEX_SCHEMA_VERSION,
+                                   manifest_client=options['manifest_client'],
+                                   blob_client=options['blob_client']) as known:
+                    result = bootstrap_and_publish(
+                        **options, build=lambda hook: checked_build(hook, known))
             elif affected_filenames is not None:
                 result = merge_and_publish(**options, ids=bounded_ids(affected_filenames),
                                            expected=str(previous_source_version or ''),
@@ -5343,7 +5371,8 @@ def _build_user_lexical_index_snapshot(user_id: str, source_version: str) -> Opt
         # also means fewer entities come back over the wire during an active
         # upload burst, instead of paying to fetch-then-discard them below.
         with perf_instrumentation.span('index.lexical.table_scan', user=user_id):
-            rows = list(metadata_table_client.query_entities(
+            rows = list(table_scan.scan_partition(
+                metadata_table_client.query_entities,
                 f"PartitionKey eq '{_escape_odata(user_id)}' and processing_complete eq true"
             ))
     except Exception:
@@ -6073,7 +6102,8 @@ def _build_user_sort_index_snapshot(user_id: str, source_version: str) -> Option
             trimmed_rows: List[Dict[str, object]] = []
             # lazily paged and trimmed row by row -- never list()ed: the raw rows
             # carry whole EXIF JSON strings, which add up at 130k photos.
-            for row in metadata_table_client.query_entities(
+            for row in table_scan.scan_partition(
+                metadata_table_client.query_entities,
                 f"PartitionKey eq '{_escape_odata(user_id)}'",
                 select=_SORT_INDEX_SOURCE_FIELDS,
             ):
@@ -6366,7 +6396,8 @@ def _refresh_rows_index_on_disk(
                     dirty_to_clear = dirty
                 else:
                     with perf_instrumentation.step(f'index.{kind}.table_scan', user=key):
-                        for entity in metadata_table_client.query_entities(
+                        for entity in table_scan.scan_partition(
+                            metadata_table_client.query_entities,
                             f"PartitionKey eq '{_escape_odata(key)}'", select=source_fields,
                         ):
                             if not keep_entity(entity):

@@ -51,6 +51,8 @@ from azure.data.tables import UpdateMode
 from index_work import DirtySnapshot, WorkStore, PARTITION, acknowledge_dirty, etag
 from index_publication import serialize_catalog
 
+from index_updates import VECTOR_INDEX_AUTOMATIC
+
 KINDS = ('vector', 'people_embedding', 'tag_embedding', 'lexical_artifact', 'hash')
 CONTROL = '!coverage'
 VERSION = 1
@@ -200,7 +202,8 @@ def recover_quiesced_source_reservations(user, *, guard, fence_id):
         # leaves the fence + IDs + intent, never a silently clean artifact.
         work = WorkStore(app.jobs_table_client, partition=TAG_PARTITION if kind == 'tag_embedding'
                          else PARTITION)
-        work.request(user, SCOPES.get(kind, kind))
+        if kind != 'vector' or VECTOR_INDEX_AUTOMATIC:
+            work.request(user, SCOPES.get(kind, kind))
         pk = partition(user, kind)
         cleaned = []
         try:
@@ -490,6 +493,8 @@ def people_completion(user, ids):
 
 def schedule(user, kind):
     import storage_utils as su
+    if kind == 'vector' and not VECTOR_INDEX_AUTOMATIC:
+        return  # coverage is still tracked; the artifact is rebuilt on explicit request only
     hook = su.METADATA_INDEX_REQUEST_HOOK
     if hook is None or hook(user, SCOPES.get(kind, kind)) == 'unavailable':
         raise RuntimeError('Automatic artifact scheduling unavailable')

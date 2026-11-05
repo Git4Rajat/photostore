@@ -3,6 +3,7 @@
 These scopes constrain the legacy publishers; they do not make whole-file
 publishers bounded. Delta-based publication is a separate migration.
 """
+import os
 
 SCOPE_KINDS = {
     'full': ('sort', 'access', 'albums', 'people'),
@@ -21,6 +22,11 @@ SCOPE_KINDS = {
     'dedup': (),
     'dedup-idle': (),
 }
+
+# Nothing on a serving path reads the photo-vector artifact any more (semantic
+# scoring left /api/photos/search), and its full rebuild cost ~20 s twice per
+# wave. Keep it manual-only (admin repair) unless explicitly re-enabled.
+VECTOR_INDEX_AUTOMATIC = os.getenv('VECTOR_INDEX_AUTOMATIC', '').strip().lower() in ('1', 'true', 'yes')
 
 SEARCH_SCOPES = frozenset(('light', 'people', 'search'))
 

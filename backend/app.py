@@ -11311,6 +11311,8 @@ def recover_pending_index_work(library=None, *, retry_failed=False):
                 continue
             if automatic.wave_pending(user):
                 continue
+            if kind == 'vector' and not automatic.VECTOR_INDEX_AUTOMATIC:
+                continue
             target = tags if kind == 'tag_embedding' else store
             target.request(user, automatic.SCOPES.get(kind, kind), advance=False)
     recovered = store.recover(_send_index_wakeup, library=library) if index_maintenance_queue_client is not None else 0

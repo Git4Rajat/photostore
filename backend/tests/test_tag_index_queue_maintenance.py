@@ -623,7 +623,7 @@ def test_poll_loop_healthy_tag_scan_outlives_watchdog_budget(env, monkeypatch):
             time.sleep(0.05)
             yield {'PartitionKey': 'A', 'RowKey': str(i), 'tags': '["cat"]'}
 
-    monkeypatch.setattr(su, '_query_projected', rows)
+    monkeypatch.setattr(su.table_scan, 'scan_partition', rows)
     monkeypatch.setattr(app.vision_utils, 'encode_text_embeddings_batch', lambda tags: [[1.0, 0.0] for _ in tags])
     elapsed = []
 

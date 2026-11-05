@@ -131,7 +131,8 @@ def test_no_real_guard_cannot_recover_or_purge(runtime):
             pytest.fail('unsafe guard')
 
 
-def test_quiesced_recovery_resets_orphan_without_losing_ids_and_persists_all_jobs(leased):
+def test_quiesced_recovery_resets_orphan_without_losing_ids_and_persists_all_jobs(leased, monkeypatch):
+    monkeypatch.setattr(automatic, 'VECTOR_INDEX_AUTOMATIC', True)
     runtime, _ = leased
     runtime.store.begin('A', 'vector', ['orphan'])
     fence = prove()
@@ -157,6 +158,7 @@ def test_quiesced_recovery_resets_orphan_without_losing_ids_and_persists_all_job
 
 
 def test_recovery_job_failure_keeps_orphan_active_and_fenced(leased, monkeypatch):
+    monkeypatch.setattr(automatic, 'VECTOR_INDEX_AUTOMATIC', True)
     runtime, _ = leased
     runtime.store.begin('A', 'vector', ['orphan'])
     fence = prove()
