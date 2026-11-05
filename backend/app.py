@@ -38,7 +38,6 @@ from azure.storage.blob import (
 )
 from azure.storage.queue import QueueServiceClient
 from flask import Flask, Response, g, has_request_context, jsonify, make_response, request, stream_with_context
-from auth_utils import get_request_user_id as resolve_request_user_id
 from auth_utils import validate_bearer_token as validate_entra_bearer_token
 import password_auth
 import email_utils
@@ -68,7 +67,6 @@ from image_utils import (
 )
 import vision_utils
 from search_utils import (
-    build_expanded_query_text,
     build_semantic_text,
     cosine_similarity,
     lexical_search_score,
@@ -112,7 +110,6 @@ from storage_utils import (
     prime_available_vector_indexes,
     refresh_user_vector_index,
     refresh_user_search_db_incremental,
-    get_vector_index_manifest_summary,
     get_vector_index_blob_location,
     invalidate_user_vector_index_cache,
     delete_user_vector_index_data,
@@ -157,7 +154,6 @@ from storage_utils import (
     iter_library_rows,
     stream_library_artifacts,
     ListingSink,
-    ensure_user_search_db as storage_utils_ensure_search_db,
     ensure_user_sort_index_current as storage_utils_ensure_sort_current,
     _SORT_INDEX_SCHEMA_VERSION as SORT_INDEX_SCHEMA_VERSION,
     _load_sort_index_manifest,
