@@ -570,7 +570,9 @@ export const ToolsPage: React.FC = () => {
                                 <span title={h.detail ?? undefined}>
                                     {h.outcome && <span className={`qchip${h.outcome === 'success' ? '' : ' warn'}`}>{h.outcome}</span>}{' '}
                                     {(h.action ?? 'Action')} · {h.scope ?? 'library'}
-                                    {Array.isArray(h.steps) && h.steps.length ? ` · ${h.steps.join(', ')}` : ''}
+                                    {Array.isArray(h.steps) && h.steps.length && !(h.steps.length === 1 && h.steps[0] === h.action)
+                                        ? ` · ${h.steps.join(', ')}`
+                                        : ''}
                                     {typeof h.filenameCount === 'number' && h.filenameCount > 0 ? ` · ${h.filenameCount} photos` : ''}
                                     {h.createdAt ? ` · ${new Date(h.createdAt).toLocaleString()}` : ''}
                                     {h.detail && h.outcome !== 'success' ? ` · ${h.detail}` : ''}
