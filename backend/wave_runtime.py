@@ -391,12 +391,16 @@ def consume(payload,*,deadline=None,progress=None):
                 @source_change
                 def prepare_page(check,after):
                     from upload_waves import MAX_PAGE
+                    from automatic_index_updates import coalesced_source_reservations
                     from wave_no_work import map_members
                     members=store._page(f'e!{wave_id}!m!',after)
                     def project(member):
                         check();app._live_faiss_metadata_update(library,member['filename']);check()
-                    map_members([member for member in members if member['outcome'] in ('settled','failed_exhausted')],
-                                project,int(os.getenv('WAVE_PREPARE_CONCURRENCY','8')))
+                    # One durable reservation per kind for the whole page, not per photo:
+                    # per-photo begin/finish serialized every worker on the same coverage row.
+                    with coalesced_source_reservations():
+                        map_members([member for member in members if member['outcome'] in ('settled','failed_exhausted')],
+                                    project,int(os.getenv('WAVE_PREPARE_CONCURRENCY','4')))
                     return (members[-1]['RowKey'] if members else after),len(members)<MAX_PAGE
                 from index_publication import catalog_serialization
                 with catalog_serialization(store.table,library,app.blob_service_client,app.BLOB_LEXICAL_INDEX_CONTAINER):
