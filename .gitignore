@@ -25,3 +25,7 @@ codex-memory/
 
 # Backfill scripts
 backend/scripts/backfill_face_by_filename_table.py
+
+# Local Azurite emulator state
+__azurite_db_*.json
+__blobstorage__/

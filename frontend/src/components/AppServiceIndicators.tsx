@@ -4,7 +4,7 @@
 // only on the public useAppServices() contract, so they can live independently
 // of the (much larger) provider component itself.
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { BellIcon, ServerIcon, TrashIcon, UserGroupIcon, XMarkIcon } from '@heroicons/react/24/outline';
+import { BellIcon, TrashIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { formatMegabytesPerSecond } from './browserAiShared';
 import { useAppServices } from './AppServicesProvider';
 
@@ -165,55 +165,4 @@ export const NotificationBell: React.FC = () => {
     );
 };
 
-// Global icon shown while a people-clustering job (initial cluster, recluster,
-// or "find more faces") is queued/running on the worker. Clustering runs out of
-// band, so without this the user was blind to it happening. Data comes from the
-// existing /api/jobs/status poll (see pollJobStatusesOnce).
-export const ClusteringActivityIndicator: React.FC = () => {
-    const { clusteringActive, clusteringStatusLabel, loadBrowserAiModel, browserAiButtonDisabled } = useAppServices();
-    if (!clusteringActive) {
-        return null;
-    }
-    return (
-        <button
-            type="button"
-            className="btn btn-soft icon-btn"
-            onClick={() => void loadBrowserAiModel()}
-            disabled={browserAiButtonDisabled}
-            aria-live="polite"
-            aria-label={clusteringStatusLabel}
-            title={clusteringStatusLabel}
-        >
-            <UserGroupIcon className="toolbar-icon bg-activity-icon" aria-hidden="true" />
-            <span className="sr-only">{clusteringStatusLabel}</span>
-        </button>
-    );
-};
 
-// Global icon shown while ipwork (backend/both processing mode) is generating
-// thumbnails/faces/vision data for at least one photo. ipwork runs off-screen
-// on a scale-to-zero server container with no other persistent signal: the
-// per-tile "processing on server" badge only lights up for a tile that's both
-// on-screen and actively leased, and ipwork completions are deliberately kept
-// out of the notification bell (one job per photo — see jobNotifications.ts)
-// to avoid a toast-per-photo storm on a bulk upload. Without this, a large
-// background batch was entirely invisible. Not a button — there's no action
-// to take here, just a status.
-export const IpworkActivityIndicator: React.FC = () => {
-    const { ipworkActive, ipworkStatusLabel } = useAppServices();
-    if (!ipworkActive) {
-        return null;
-    }
-    return (
-        <span
-            className="btn btn-soft icon-btn"
-            role="status"
-            aria-live="polite"
-            aria-label={ipworkStatusLabel}
-            title={ipworkStatusLabel}
-        >
-            <ServerIcon className="toolbar-icon bg-activity-icon" aria-hidden="true" />
-            <span className="sr-only">{ipworkStatusLabel}</span>
-        </span>
-    );
-};

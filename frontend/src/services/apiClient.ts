@@ -128,11 +128,8 @@ export const get = async <T = any>(url: string, config?: Parameters<typeof apiCl
 export const getUpload = async <T = any>(url: string, config?: Parameters<typeof uploadClient.get>[1]) => requestJson<T>(uploadClient, 'get', url, undefined, config);
 export const post = async <T = any, D = unknown>(url: string, data: D, config?: Parameters<typeof apiClient.post>[2]) => requestJson<T>(apiClient, 'post', url, data, config);
 export const postUpload = async <T = any, D = unknown>(url: string, data: D, config?: Parameters<typeof uploadClient.post>[2]) => requestJson<T>(uploadClient, 'post', url, data, config);
-export const getUploadJson = async <T = any>(url: string) => requestJson<T>(uploadClient, 'get', url);
-export const postUploadJson = async <T = any, D = unknown>(url: string, data: D) => requestJson<T>(uploadClient, 'post', url, data);
 export const getTools = async <T = any>(url: string, config?: Parameters<typeof indexerClient.get>[1]) => requestJson<T>(indexerClient, 'get', url, undefined, config);
 export const postTools = async <T = any, D = unknown>(url: string, data: D, config?: RequestConfig) => requestJson<T>(indexerClient, 'post', url, data, config);
-export const getAdmin = async <T = any>(url: string, config?: Parameters<typeof recoveryClient.get>[1]) => requestJson<T>(recoveryClient, 'get', url, undefined, config);
 export const postAdmin = async <T = any, D = unknown>(url: string, data: D) => requestJson<T>(recoveryClient, 'post', url, data);
 export const getExtras = async <T = any>(url: string, config?: Parameters<typeof archiveClient.get>[1]) => requestJson<T>(archiveClient, 'get', url, undefined, config);
 export const postExtras = async <T = any, D = unknown>(url: string, data: D, config?: Parameters<typeof archiveClient.post>[2]) => requestJson<T>(archiveClient, 'post', url, data, config);

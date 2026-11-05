@@ -81,13 +81,4 @@ export const SUGGESTIONS: Suggestion[] = [
     { id: 'onthisday', text: 'On this day, 2023', action: 'View', target: { page: 'gallery' } },
 ];
 
-export const QUEUE_STAGES = [
-    { name: 'Thumbnails', wait: 4, run: 1, noData: 0, fail: 0 },
-    { name: 'EXIF', wait: 2, run: 0, noData: 0, fail: 0 },
-    { name: 'OCR', wait: 11, run: 2, noData: 3, fail: 0 },
-    { name: 'AI Vision', wait: 6, run: 1, noData: 0, fail: 0 },
-    { name: 'Map tagging', wait: 0, run: 0, noData: 0, fail: 1 },
-    { name: 'Faces', wait: 3, run: 0, noData: 0, fail: 0 },
-];
 
-export const ALL_SWATCHES = SWATCHES;

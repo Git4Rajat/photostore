@@ -655,6 +655,24 @@ def test_coalesced_wave_writes_share_one_reservation_per_kind(runtime, monkeypat
     assert len(runtime.source.rows) == 5
 
 
+def test_threaded_page_writes_share_one_reservation_per_kind(runtime, monkeypatch):
+    import wave_no_work
+    metadata = su.track_index_source_table(runtime.source, 'metadata')
+    begins = []
+    begin = automatic.CoverageStore.begin
+    monkeypatch.setattr(automatic.CoverageStore, 'begin',
+                        lambda self, *a, **kw: begins.append(a[:2]) or begin(self, *a, **kw))
+    end = _wave_scope(monkeypatch)
+    try:
+        with automatic.coalesced_source_reservations():
+            wave_no_work.map_members(
+                range(12), lambda i: metadata.upsert_entity({'PartitionKey': 'A', 'RowKey': f'p{i}', 'caption': 'cat'}), 4)
+            assert len(begins) == len(set(begins)) >= 1
+    finally:
+        end()
+    assert len(runtime.source.rows) == 12
+
+
 def test_coalesced_failure_marks_full_required_and_still_finishes(runtime, monkeypatch):
     table = su.track_index_source_table(runtime.source, 'embeddings')
     end = _wave_scope(monkeypatch)

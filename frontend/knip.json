@@ -1,0 +1,14 @@
+{
+  "$schema": "https://unpkg.com/knip@5/schema.json",
+  "entry": [
+    "src/index.tsx",
+    "src/mockups/main.tsx",
+    "src/benchmark/main.js",
+    "src/workers/*.{ts,js}",
+    "scripts/*.{mjs,ts}",
+    "vite.config.ts",
+    "vite.benchmark.config.mjs"
+  ],
+  "project": ["src/**/*.{ts,tsx,js}", "scripts/**/*.{mjs,ts}"],
+  "ignore": ["public/**", "vendor/**", "src/vendor/**"]
+}
