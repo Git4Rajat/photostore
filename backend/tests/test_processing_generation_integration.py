@@ -5,6 +5,8 @@ processing_generation.py and docs/audits/upload-artifact-receipts-2026-10-23.md.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 import app
@@ -64,6 +66,23 @@ def test_supersede_allocates_a_fresh_revision_and_generation(metadata):
     assert updated['processingRevision'] != original['processingRevision']
     assert all(updated[step + '_status'] == 'pending' for step in storage_utils.BROWSER_PROCESSING_STEPS)
     assert updated['processingFence'] == '' and updated['processing_lease_owner'] == ''
+
+
+def test_supersede_with_supersession_record_backlogs_the_old_revision(metadata):
+    _seed_row(metadata, 'lib-A', 'photo.jpg')
+    updated = storage_utils.supersede_processing_generation('lib-A', 'photo.jpg', record_supersession=True)
+    assert json.loads(updated['waveSupersessionBacklog']) == ['rev-1']
+
+
+def test_supersede_with_supersession_record_handles_a_photo_that_never_had_a_revision(metadata):
+    """Rows created before processingRevision existed (or by an import path that
+    never set it) were never frozen into a wave, so there is nothing to backlog.
+    Backfill / forced reprocess must still work on them, not KeyError."""
+    _seed_row(metadata, 'lib-A', 'legacy.jpg')
+    del metadata.rows[('lib-A', 'legacy.jpg')]['processingRevision']
+    updated = storage_utils.supersede_processing_generation('lib-A', 'legacy.jpg', record_supersession=True)
+    assert updated['processingRevision']
+    assert json.loads(updated.get('waveSupersessionBacklog') or '[]') == []
 
 
 def test_supersede_raises_for_a_deleted_photo(metadata):

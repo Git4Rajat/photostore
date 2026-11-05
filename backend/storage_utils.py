@@ -12178,10 +12178,14 @@ def supersede_processing_generation(user_id: str, filename: str, *, record_super
         if entity.get('processingIsolated') is True:
             raise PhotoNotFoundError('Photo is isolated for an upload-only benchmark.')
         if record_supersession:
-            backlog=json.loads(entity.get('waveSupersessionBacklog') or '[]')
-            if len(backlog)>=16:raise RuntimeError('Supersession backlog requires recovery')
-            backlog.append(entity['processingRevision'])
-            entity['waveSupersessionBacklog']=json.dumps(backlog)
+            # Only a photo with a revision can have been frozen into a wave, so a
+            # row without one (legacy/imported) has nothing to reconcile.
+            old_revision=entity.get('processingRevision')
+            if old_revision:
+                backlog=json.loads(entity.get('waveSupersessionBacklog') or '[]')
+                if len(backlog)>=16:raise RuntimeError('Supersession backlog requires recovery')
+                backlog.append(old_revision)
+                entity['waveSupersessionBacklog']=json.dumps(backlog)
         entity.update(supersede(entity, uuid.uuid4().hex, is_video=is_video_file(filename)))
         entity['processingFence'] = ''
         entity['processing_lease_owner'] = ''
