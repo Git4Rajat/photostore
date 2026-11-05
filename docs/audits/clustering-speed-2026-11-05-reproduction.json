@@ -1,0 +1,61 @@
+{
+  "results": [
+    {
+      "mode": "raw",
+      "faces": 128,
+      "calls": {
+        "faces.get_entity": 128,
+        "faces.query_entities": 1,
+        "faces.update_entity": 128,
+        "members.create_entity": 128,
+        "people.get_entity": 128,
+        "people.query_entities": 11,
+        "people.update_entity": 128
+      },
+      "schedule_calls": 0
+    },
+    {
+      "mode": "tracked_current",
+      "faces": 128,
+      "calls": {
+        "admission.get_entity": 768,
+        "coverage.create_entity": 1,
+        "coverage.get_entity": 513,
+        "coverage.submit_transaction": 512,
+        "faces.get_entity": 256,
+        "faces.query_entities": 1,
+        "faces.update_entity": 128,
+        "members.create_entity": 128,
+        "people.get_entity": 256,
+        "people.query_entities": 11,
+        "people.update_entity": 128
+      },
+      "schedule_calls": 512
+    },
+    {
+      "mode": "tracked_source_scope",
+      "faces": 128,
+      "calls": {
+        "admission.get_entity": 768,
+        "coverage.create_entity": 1,
+        "coverage.get_entity": 513,
+        "coverage.submit_transaction": 512,
+        "faces.get_entity": 256,
+        "faces.query_entities": 1,
+        "faces.update_entity": 128,
+        "members.create_entity": 128,
+        "people.get_entity": 256,
+        "people.query_entities": 11,
+        "people.update_entity": 128
+      },
+      "schedule_calls": 0
+    }
+  ],
+  "assignment_output_parity": true,
+  "limitations": [
+    "No network or Azure latency; synthetic hot-person workload.",
+    "Wave-owned policy lookup is a constant callback.",
+    "Scheduling recorded only; real WorkStore/queue overhead excluded.",
+    "Raw mode is a measurement control, not a proposed production bypass."
+  ]
+}

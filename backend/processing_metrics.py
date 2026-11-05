@@ -17,6 +17,9 @@ _PURPOSES = {'inspection', 'qualification', 'claim', 'heartbeat', 'source_releas
              'face_persistence', 'semantic_refresh', 'embedding_write',
              'metadata_commit', 'metadata_cas', 'lease_and_policy_check', 'completion_delivery', 'other'}
 _FIELDS = {
+    'cluster_resume_hits', 'cluster_resume_misses',
+    'cluster_faces_newly_resolved', 'cluster_faces_replayed',
+    'cluster_member_fetches', 'cluster_member_rows_fetched',
     'receipt_commit_cache_hits', 'receipt_commit_cache_misses',
     'receipt_commit_cache_oversize', 'receipt_commit_cache_evictions',
     'receipt_commit_cache_peak_bytes', 'receipt_commit_cache_peak_rows', 'receipt_commit_handoff_rows',

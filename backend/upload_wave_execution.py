@@ -680,63 +680,78 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
             except OwnershipLost: pass
 
 
-def _iter_wave_faces(store, wave_id, *, renew=lambda: None):
-    """Read one bounded member page and one immutable face snapshot at a time."""
+def _iter_wave_faces(store, wave_id, *, renew=lambda: None, member_fetch_size=1000):
+    """Fetch frozen members in larger ranges; qualify receipts in small groups."""
     from wave_source_batch import ReceiptBatch
     with ReceiptBatch(store.table, store.library) as receipts:
-        yield from _iter_wave_faces_cached(store, wave_id, receipts, renew=renew)
+        yield from _iter_wave_faces_cached(store, wave_id, receipts, renew=renew,
+                                          member_fetch_size=member_fetch_size)
 
 
-def _iter_wave_faces_cached(store, wave_id, receipts, *, renew):
-    from upload_waves import MAX_PAGE, digest
-    from table_reads import read_entities
+def _iter_wave_faces_cached(store, wave_id, receipts, *, renew, member_fetch_size=1000):
+    from upload_waves import MAX_PAGE
+    from processing_metrics import add
+    if type(member_fetch_size) is not int or not MAX_PAGE <= member_fetch_size <= 1000:
+        raise ValueError('Cluster member fetch size must be between 20 and 1000')
     after = ''
     while True:
         renew()
-        page = store._page(f'e!{wave_id}!m!', after, size=MAX_PAGE)
-        inboxes = read_entities(store.table, store.partition, [
-            'source-completion!' + digest([member['photoId'], member['processingRevision']]) + '!' + member['evidenceId']
-            for member in page if member['outcome'] == 'settled'], workers=4, group_namespaces=True)
-        # Prefetch only immutable rows. verify_reference still checks every
-        # digest and source binding before any row becomes a clustering input.
-        references = [json.loads(row['payload']).get('artifactReceipt', {})
-                      for row in inboxes.values() if row is not None]
-        receipts.prefetch('manifest!' + ref['id'] for ref in references
-                          if isinstance(ref, dict) and isinstance(ref.get('id'), str))
-        def face_keys():
-            for ref in references:
-                if not isinstance(ref, dict) or not isinstance(ref.get('id'), str): continue
-                manifest = receipts._get('manifest!' + ref['id'])
-                if manifest is not None:
-                    for identity in json.loads(manifest['payload'])['faceSnapshots']:
-                        yield 'face!' + identity
-        receipts.prefetch(face_keys())
-        for member in page:
+        page = store._page(f'e!{wave_id}!m!', after, size=member_fetch_size)
+        add(cluster_member_fetches=1, cluster_member_rows_fetched=len(page))
+        # Only frozen membership is buffered. Keep inbox/receipt working sets
+        # bounded independently, and validate each source before yielding it.
+        for offset in range(0, len(page), MAX_PAGE):
             renew()
-            if member['outcome']!='settled':
-                from wave_settlement import verified
-                if verified(store,member):continue
-            if member['outcome'] != 'settled' or not member.get('evidenceQualified'):
-                raise ValueError('Frozen member lacks qualified completion evidence')
-            completion = _completion(store, member, member['evidenceId'], receipts, inboxes)
-            if completion is None:
-                raise ValueError('Frozen completion receipt is missing')
-            intent, manifest = completion
-            count = 0
-            for snapshot_id in manifest['faceSnapshots']:
-                renew()
-                row = json.loads(receipts._get('face!' + snapshot_id)['payload'])
-                if (row.get('filename') != member['filename']
-                        or row.get('sourcePhotoId') != member['photoId']
-                        or row.get('processingRevision') != member['processingRevision']):
-                    raise ValueError('Frozen face identity mismatch')
-                count += 1
-                yield row
-            if count != manifest['faceCount']:
-                raise ValueError('Frozen face coverage mismatch')
-        if len(page) < MAX_PAGE:
+            yield from _iter_wave_face_group(store, page[offset:offset + MAX_PAGE],
+                                             receipts, renew=renew)
+        if len(page) < member_fetch_size:
             return
         after = page[-1]['RowKey']
+
+
+def _iter_wave_face_group(store, page, receipts, *, renew):
+    from upload_waves import digest
+    from table_reads import read_entities
+    inboxes = read_entities(store.table, store.partition, [
+        'source-completion!' + digest([member['photoId'], member['processingRevision']]) + '!' + member['evidenceId']
+        for member in page if member['outcome'] == 'settled'], workers=4, group_namespaces=True)
+    # Prefetch only immutable rows. verify_reference still checks every
+    # digest and source binding before any row becomes a clustering input.
+    references = [json.loads(row['payload']).get('artifactReceipt', {})
+                  for row in inboxes.values() if row is not None]
+    receipts.prefetch('manifest!' + ref['id'] for ref in references
+                      if isinstance(ref, dict) and isinstance(ref.get('id'), str))
+    def face_keys():
+        for ref in references:
+            if not isinstance(ref, dict) or not isinstance(ref.get('id'), str): continue
+            manifest = receipts._get('manifest!' + ref['id'])
+            if manifest is not None:
+                for identity in json.loads(manifest['payload'])['faceSnapshots']:
+                    yield 'face!' + identity
+    receipts.prefetch(face_keys())
+    for member in page:
+        renew()
+        if member['outcome']!='settled':
+            from wave_settlement import verified
+            if verified(store,member):continue
+        if member['outcome'] != 'settled' or not member.get('evidenceQualified'):
+            raise ValueError('Frozen member lacks qualified completion evidence')
+        completion = _completion(store, member, member['evidenceId'], receipts, inboxes)
+        if completion is None:
+            raise ValueError('Frozen completion receipt is missing')
+        intent, manifest = completion
+        count = 0
+        for snapshot_id in manifest['faceSnapshots']:
+            renew()
+            row = json.loads(receipts._get('face!' + snapshot_id)['payload'])
+            if (row.get('filename') != member['filename']
+                    or row.get('sourcePhotoId') != member['photoId']
+                    or row.get('processingRevision') != member['processingRevision']):
+                raise ValueError('Frozen face identity mismatch')
+            count += 1
+            yield row
+        if count != manifest['faceCount']:
+            raise ValueError('Frozen face coverage mismatch')
 
 
 def _load_wave_faces(store, wave_id, face_table=None, face_ids=None, *, renew=lambda: None):

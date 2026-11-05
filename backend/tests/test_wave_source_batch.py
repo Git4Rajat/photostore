@@ -744,12 +744,75 @@ def test_frozen_face_inputs_use_bounded_queries_without_receipt_point_reads(worl
     faces = list(_iter_wave_faces(store, wave))
     assert len(faces) == 20
     assert not reads
-    assert len(table.queries) == 8  # Two queries per inbox/manifest/face set, two member pages.
+    assert len(table.queries) == 7  # Two per inbox/manifest/face set, one member fetch.
     # Prefetch changes transport only; every snapshot still needs a valid hash.
     face_key = next(k for k in table.rows if k[1].startswith('face!'))
     table.rows[face_key]['payload'] = '{}'
     with pytest.raises(ValueError, match='invalid face snapshots'):
         list(_iter_wave_faces(store, wave))
+
+
+def test_frozen_member_fetches_do_not_enlarge_receipt_groups_or_change_inputs(world, monkeypatch):
+    import upload_wave_execution as execution
+    import processing_metrics as metrics
+    metadata, wave, key = admit(world, 41)
+    store = world[0]
+    for i in range(41):
+        filename = f'photo-{i}.jpg'
+        row = metadata.rows[store.library, filename]
+        row['face_status'] = 'done'
+        version = json.loads(row['processingContract'])['faceEmbeddingVersions'][0]
+        _publish_completion(store, metadata, filename=filename, faces=[dict(
+            PartitionKey=store.library, RowKey=f'face-{i}', filename=filename,
+            sourcePhotoId=f'photo-{i}', processingRevision='revision-1',
+            embedding='[1,0]', embeddingVersion=version)])
+    run(world, metadata, wave, key, lambda *args: pytest.fail('Reran completed image'))
+    with metrics.accounting() as old_counter:
+        expected = list(execution._iter_wave_faces(store, wave, member_fetch_size=20))
+    groups = []
+    original = execution._iter_wave_face_group
+    def group(store, page, receipts, *, renew):
+        groups.append(len(page))
+        yield from original(store, page, receipts, renew=renew)
+    monkeypatch.setattr(execution, '_iter_wave_face_group', group)
+    with metrics.accounting() as new_counter:
+        actual = list(execution._iter_wave_faces(store, wave))
+    assert actual == expected and len(actual) == 41
+    assert groups == [20, 20, 1]
+    assert old_counter.snapshot()['cluster_member_fetches'] == 3
+    assert new_counter.snapshot()['cluster_member_fetches'] == 1
+    assert new_counter.snapshot()['cluster_member_rows_fetched'] == 41
+
+
+@pytest.mark.parametrize('size', [0, 19, 1001, True])
+def test_invalid_cluster_fetch_bound_fails_before_storage(size):
+    from upload_wave_execution import _iter_wave_faces_cached
+    with pytest.raises(ValueError, match='Cluster member fetch size'):
+        list(_iter_wave_faces_cached(object(), 'wave', None, renew=lambda: None,
+                                     member_fetch_size=size))
+
+
+@pytest.mark.parametrize('count', [0, 1, 1000, 1001])
+def test_frozen_member_range_boundaries_do_not_skip_or_duplicate_groups(monkeypatch, count):
+    from types import SimpleNamespace
+    import upload_wave_execution as execution
+    rows = [dict(RowKey=f'e!wave!m!{i:05d}') for i in range(count)]
+    fetches, groups = [], []
+    def page(prefix, after, *, size):
+        assert prefix == 'e!wave!m!'
+        fetches.append((after, size))
+        return [row for row in rows if row['RowKey'] > after][:size]
+    def group(store, members, receipts, *, renew):
+        assert 1 <= len(members) <= 20
+        groups.append(len(members))
+        yield from members
+    monkeypatch.setattr(execution, '_iter_wave_face_group', group)
+    actual = list(execution._iter_wave_faces_cached(
+        SimpleNamespace(_page=page), 'wave', None, renew=lambda: None))
+    assert actual == rows
+    assert sum(groups) == count
+    assert len(fetches) == count // 1000 + 1
+    assert all(size == 1000 for after, size in fetches)
 
 
 def test_rolling_pool_refills_before_slow_sibling_finishes(world):

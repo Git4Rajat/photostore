@@ -17,6 +17,7 @@ import sqlite3
 import tempfile
 
 import processing_diagnostics
+import processing_metrics
 
 from azure.core import MatchConditions
 from azure.core.exceptions import ResourceNotFoundError, ResourceExistsError
@@ -28,6 +29,7 @@ from faiss_assignment import FaissAssigner, _point, _vector, _rejected, invalida
 from clustering_runtime import LiveFaceIndex, RebuildNeeded
 from upload_waves import digest
 from table_reads import read_entities, key_batches
+from wave_policy import source_change
 
 
 def encoded(value):
@@ -314,7 +316,12 @@ def _curation_override(journal, position, assigner, library, face, decision, gua
 
 
 @processing_diagnostics.wave_phase('assignment_persistence')
+@source_change
 def _apply(assigner, library, face, decision, decision_id, guard, wave_id, observed=None):
+    # These writes belong to the wave's downstream publication. Keep source
+    # admission and coverage reservations, but do not schedule independent
+    # maintenance before/after every face/person mutation. Scope only this
+    # materialization call; foreground callers keep their ordinary policy.
     if decision['outcome'] == 'excluded':
         return
     # Reuse the curation witness with its genuine ETag. A later face edit
@@ -454,14 +461,17 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
             resources = ExitStack()
             try:
                 from wave_assignment_files import assignment_journal
-                journal = resources.enter_context(assignment_journal(store, wave['waveId'], check,
-                    share=assigner.config.checkpoint_dir if local_journal else None, local=directory))
+                with processing_diagnostics.wave_phase_scope('journal_open'):
+                    journal = resources.enter_context(assignment_journal(store, wave['waveId'], check,
+                        share=assigner.config.checkpoint_dir if local_journal else None, local=directory))
                 from wave_assignment_resume import restore, save
                 with processing_diagnostics.wave_phase_scope('resume_restore'):
                     resumed = restore(journal, workspace, binding, directory, config)
                 if resumed is not None:
+                    processing_metrics.add(cluster_resume_hits=1)
                     header, runtime, position, chain = resumed
                 else:
+                    processing_metrics.add(cluster_resume_misses=1)
                     header = journal.prepare(workspace, inputs, assigner, binding,
                         getattr(library_guard, 'checkpoint_revision', None))
                     guard.check()
@@ -498,13 +508,20 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
                             begun = True
                         _apply(assigner, store.library, face, decision, identity, guard, wave['waveId'],observed)
                         journal.put(f'applied!{position:012d}', {'decisionId': identity})
+                        processing_metrics.add(cluster_faces_newly_resolved=1)
                         materialized = True
+                    else:
+                        processing_metrics.add(cluster_faces_replayed=1)
                     _replay(workspace, runtime, decision, guard)
                     chain = digest([chain, position, identity])
                     processing_diagnostics.wave_faces(processed=position + 1)
                     if (position + 1) % page_size == 0 or position + 1 == header['faceCount']:
-                        with processing_diagnostics.wave_phase_scope('checkpoint'):
-                            progress(position + 1)
+                        # Reconstructing an applied prefix is not new durable
+                        # work. Do not rewind the execution cursor or repeatedly
+                        # checkpoint old pages during canonical fallback replay.
+                        if materialized:
+                            with processing_diagnostics.wave_phase_scope('checkpoint'):
+                                progress(position + 1)
                         # Replaying an existing prefix must never use up the
                         # slice before any new work is durable. Final pages
                         # finish normally rather than scheduling another pass.

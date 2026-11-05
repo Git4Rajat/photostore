@@ -11,7 +11,8 @@ from test_wave_assignment_journal import setup, oracle, comparable
 from clustering_reference_oracle import assignment_snapshot
 
 
-def run(h, snapshots, store, frozen, leases, root, *, local=True, page_size=3, should_yield=lambda: False):
+def run(h, snapshots, store, frozen, leases, root, *, local=True, page_size=3, should_yield=lambda: False,
+        progress=lambda count: None):
     (root / 'work').mkdir(exist_ok=True)
     h.assigner.config = replace(h.assigner.config, checkpoint_dir=str(root / 'mount'), work_dir=str(root / 'work'))
     ownership = leases.claim('u', frozen['waveId'], 'cluster', frozen['frozenRevision'])
@@ -20,7 +21,8 @@ def run(h, snapshots, store, frozen, leases, root, *, local=True, page_size=3, s
     try:
         with execution_scope(leases, ownership, store, lambda: leases.check(ownership)):
             return wave.run_frozen_assignment(store, frozen, h.assigner,
-                lambda: iter(deepcopy(snapshots)), check, local_journal=local, page_size=page_size, should_yield=should_yield)
+                lambda: iter(deepcopy(snapshots)), check, local_journal=local, page_size=page_size,
+                should_yield=should_yield, progress=progress)
     finally:
         try:
             leases.release(ownership)
@@ -242,6 +244,7 @@ def test_bounded_slices_resume_without_reapplying_or_starving_on_replay(tmp_path
 
 
 def test_resume_snapshot_skips_prefix_preparation_build_and_replay(tmp_path, monkeypatch):
+    import processing_metrics as metrics
     expected = oracle()
     h, snapshots, store, frozen, leases = setup()
     with pytest.raises(wave.AssignmentYield):
@@ -254,9 +257,14 @@ def test_resume_snapshot_skips_prefix_preparation_build_and_replay(tmp_path, mon
     monkeypatch.setattr(wave, '_replay', replay)
     monkeypatch.setattr(wave.WaveAssignmentJournal, 'prepare', lambda *a, **kw: pytest.fail('Recaptured snapshot'))
     monkeypatch.setattr(wave.LiveFaceIndex, 'build', lambda *a, **kw: pytest.fail('Rebuilt native index'))
-    run(h, snapshots, store, frozen, leases, tmp_path)
+    with metrics.accounting() as counter:
+        run(h, snapshots, store, frozen, leases, tmp_path)
     assert len(replayed) == len(snapshots) - 1
     assert comparable(assignment_snapshot(h)) == expected
+    assert counter.snapshot()['cluster_resume_hits'] == 1
+    assert counter.snapshot()['cluster_resume_misses'] == 0
+    assert counter.snapshot()['cluster_faces_replayed'] == 0
+    assert counter.snapshot()['cluster_faces_newly_resolved'] == len(snapshots) - 1
 
 
 @pytest.mark.parametrize('damage', ['workspace', 'runtime', 'missing'])
@@ -344,3 +352,86 @@ def test_failed_new_resume_publication_invalidates_old_snapshot_safely(tmp_path,
             run(h,snapshots,store,frozen,leases,tmp_path,page_size=1,should_yield=lambda:True)
     run(h,snapshots,store,frozen,leases,tmp_path)
     assert comparable(assignment_snapshot(h))==expected
+
+
+@pytest.mark.parametrize('wave_owned', [True, False])
+@pytest.mark.parametrize('lost_reply', [False, True])
+def test_wave_materialization_keeps_coverage_without_leaking_source_scope(
+        tmp_path, monkeypatch, wave_owned, lost_reply):
+    import app
+    import automatic_index_updates as automatic
+    import storage_utils as su
+    from tests.test_automatic_index_updates import Table
+    from wave_policy import source_change_active
+
+    expected = oracle()
+    h, snapshots, store, frozen, leases = setup()
+    dirty = Table()
+    monkeypatch.setattr(su, 'DURABLE_INDEX_UPDATES', True)
+    monkeypatch.setattr(su, '_CTX', {'search_index_dirty_table_client': dirty,
+                                   'wave_owned': lambda _: wave_owned})
+    monkeypatch.setattr(app, 'jobs_table_client', Table())
+    scheduled = []
+    monkeypatch.setattr(automatic, 'schedule',
+                        lambda *args: scheduled.append(source_change_active()))
+    coverage = automatic.CoverageStore(dirty)
+    writes = []
+    def observe(row):
+        assert source_change_active()
+        assert coverage.control('u', 'people_embedding')['active'] == 1
+        writes.append(row['RowKey'])
+    h.faces.after_write = h.people.after_write = observe
+    h.assigner.face_table = automatic.SourceTable(h.faces, 'face')
+    h.assigner.person_table = automatic.SourceTable(h.people, 'person')
+
+    assert not source_change_active()
+    if lost_reply:
+        h.faces.fail = OSError('lost face write reply')
+        with pytest.raises(OSError, match='lost face write reply'):
+            run(h, snapshots, store, frozen, leases, tmp_path)
+        assert not source_change_active()
+        assert coverage.control('u', 'people_embedding')['active'] == 0
+    run(h, snapshots, store, frozen, leases, tmp_path)
+    assert comparable(assignment_snapshot(h)) == expected
+    assert writes
+    assert not source_change_active()
+    assert coverage.control('u', 'people_embedding')['active'] == 0
+    assert not coverage.reservations('u', 'people_embedding')
+    assert scheduled == ([] if wave_owned else [True] * len(scheduled))
+    if not wave_owned:
+        assert scheduled
+
+    # A subsequent ordinary foreground mutation must still schedule coverage.
+    h.people.after_write = None
+    scheduled.clear()
+    h.assigner.person_table.upsert_entity(dict(PartitionKey='u', RowKey='manual', name='Manual'))
+    assert scheduled == [False, False]
+    assert coverage.control('u', 'people_embedding')['active'] == 0
+
+
+def test_fallback_replay_only_checkpoints_newly_resolved_pages(tmp_path):
+    import processing_metrics as metrics
+    h, snapshots, store, frozen, leases = setup()
+    initial = []
+    with pytest.raises(wave.AssignmentYield):
+        run(h, snapshots, store, frozen, leases, tmp_path, page_size=1,
+            should_yield=lambda: True, progress=initial.append)
+    assert initial == [1]
+    # Lose only the optional acceleration snapshot, not the assignment journal.
+    path, = (tmp_path / 'mount').rglob('workspace.snapshot')
+    path.unlink()
+    checkpoints = []
+    with metrics.accounting() as counter:
+        run(h, snapshots, store, frozen, leases, tmp_path, page_size=1,
+            progress=checkpoints.append)
+    assert checkpoints == list(range(2, len(snapshots) + 1))
+    assert counter.snapshot()['cluster_faces_replayed'] == 1
+    assert counter.snapshot()['cluster_faces_newly_resolved'] == len(snapshots) - 1
+    assert counter.snapshot()['cluster_resume_misses'] == 1
+    # A completed duplicate delivery neither rewinds progress nor resolves again.
+    checkpoints.clear()
+    with metrics.accounting() as counter:
+        run(h, snapshots, store, frozen, leases, tmp_path, progress=checkpoints.append)
+    assert not checkpoints
+    assert counter.snapshot()['cluster_faces_newly_resolved'] == 0
+    assert counter.snapshot()['cluster_faces_replayed'] == len(snapshots)
