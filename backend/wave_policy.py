@@ -6,6 +6,7 @@ import os
 import re
 import uuid
 import json
+import weakref
 
 from azure.core.exceptions import ResourceNotFoundError, ResourceExistsError
 from upload_waves import ShadowWaves, Conflict, digest
@@ -13,6 +14,7 @@ from upload_waves import ShadowWaves, Conflict, digest
 PROTOCOL = 'library-wave-v1'
 ROLES = ('core','upload','vision','cluster','index-worker','archive','recovery')
 CAPABILITIES = 'upload-wave-capabilities'
+_OWNED = weakref.WeakKeyDictionary()
 
 
 def _supported_certificate_roles(builds):
@@ -103,8 +105,15 @@ def owned(table,library):
         if os.getenv('UPLOAD_WAVE_NEW_LIBRARIES_ENABLED','').lower()=='true':
             raise RuntimeError('Wave policy storage unavailable')
         return False
+    # Ownership is one-way (policy rows are never removed), so a positive answer
+    # is stable for the life of the table client; negatives are never cached.
+    try:known=_OWNED.setdefault(table,set())
+    except TypeError:known=None
+    if known is not None and library in known:return True
     policy=ShadowWaves(table,library)._get('policy')
-    return bool(policy and policy.get('protocol')==PROTOCOL)
+    result=bool(policy and policy.get('protocol')==PROTOCOL)
+    if result and known is not None:known.add(library)
+    return result
 
 
 def require_capability(store,role,*,allow_cleanup=False):

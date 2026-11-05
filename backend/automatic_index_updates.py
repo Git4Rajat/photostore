@@ -620,6 +620,17 @@ class SourceTable:
                 operations = [(name.split('_')[0], entity, kwargs)]
             targets, uncertain, deleted = {}, {}, {}
             from wave_policy import source_change_active
+            # Ownership is one durable policy read per library; resolve it (and
+            # the admission fence) once per library for this write, not once per
+            # operation/kind.
+            wave_by_user, admitted = {}, set()
+
+            def wave_owned(user):
+                if user not in wave_by_user:
+                    wave_by_user[user] = bool(source_change_active() and su._CTX.get('wave_owned')
+                                              and su._CTX['wave_owned'](user))
+                return wave_by_user[user]
+
             for operation in operations:
                 op, entity = operation[:2]
                 options = operation[2] if len(operation) > 2 else {}
@@ -630,10 +641,11 @@ class SourceTable:
                 cleanup_check = current_cleanup_check(user)
                 if cleanup_check is not None:
                     cleanup_check()
-                else:
+                elif user not in admitted:
                     check_source_admission(user)
+                    admitted.add(user)
                 user, kinds, unsafe, gone = mutation_targets(self.source, self.table, op, entity, options)
-                wave = bool(source_change_active() and su._CTX.get('wave_owned') and su._CTX['wave_owned'](user))
+                wave = wave_owned(user)
                 for kind, ids in kinds.items():
                     pair = (user, kind)
                     targets.setdefault(pair, set()).update(() if wave else ids)
@@ -655,17 +667,18 @@ class SourceTable:
             source_error = None
             try:
                 for (user, kind), ids in sorted(targets.items()):
-                    check_source_admission(user)
+                    # The admission fence was checked per library above; the
+                    # final fence check below still precedes the source write.
                     # WorkStore persistence precedes source storage; a queue
                     # failure cannot erase evidence, even if source write fails.
-                    if not (source_change_active() and su._CTX.get('wave_owned') and su._CTX['wave_owned'](user)):
+                    if not wave_owned(user):
                         schedule(user, kind)
                     res_id = store.begin(user, kind, ids, uncertain=uncertain[user, kind],
                                          deleted=deleted[user, kind],
                                          owner=os.getenv('CONTAINER_APP_NAME') or os.getenv('HOSTNAME') or 'source_writer',
                                          operation=f'{self.source}.{name}')
                     reserved.append((user, kind, res_id))
-                for user, kind, _ in reserved:
+                for user in dict.fromkeys(user for user, _, _ in reserved):
                     check_source_admission(user)
                 result = method(*args, **kwargs)
                 success = True
@@ -683,7 +696,7 @@ class SourceTable:
                         failures.append(error)
                 for user, kind, _ in reserved:
                     try:
-                        if not (source_change_active() and su._CTX.get('wave_owned') and su._CTX['wave_owned'](user)):
+                        if not wave_owned(user):
                             # A very fast worker may consume the pre-write wakeup
                             # before begin(). Advance again AFTER the source commit.
                             schedule(user, kind)

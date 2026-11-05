@@ -577,3 +577,21 @@ def test_source_reservation_attribution_lifecycle(runtime):
 
     captured = runtime.store.capture('A', 'vector')
     assert set(captured.ids) == {'photo1', 'photo2'}
+
+
+def test_source_write_checks_fence_and_ownership_once_per_library(runtime, monkeypatch):
+    table = su.track_index_source_table(runtime.source, 'metadata')
+    fences, owners = [], []
+    monkeypatch.setattr(automatic, 'check_source_admission', lambda user: fences.append(user))
+    monkeypatch.setitem(su._CTX, 'wave_owned', lambda user: owners.append(user) or False)
+    # Multi-kind metadata write: vector + tag_embedding + lexical_artifact.
+    from wave_policy import begin_source_change, end_source_change
+    token = begin_source_change()
+    try:
+        table.upsert_entity({'PartitionKey': 'A', 'RowKey': 'one', 'caption': 'cat', 'photoEmbedding': 'x'})
+    finally:
+        end_source_change(token)
+    # One fence check before reservations and one immediately before the write,
+    # independent of how many kinds were reserved.
+    assert fences == ['A', 'A']
+    assert owners == ['A']
