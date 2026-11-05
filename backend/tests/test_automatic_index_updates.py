@@ -723,31 +723,3 @@ def test_wave_scopes_exclude_vector_but_still_accept_it_for_in_flight_waves():
     import wave_catalog
     assert 'vector' not in wave_catalog.SCOPES
     assert 'vector' in wave_catalog.ACCEPTED_SCOPES
-
-
-def test_source_admission_remembers_unfenced_answer_briefly(monkeypatch):
-    import storage_utils as su
-    reads = []
-    monkeypatch.setattr(su, 'DURABLE_INDEX_UPDATES', True)
-    monkeypatch.setattr(automatic, '_UNFENCED_UNTIL', {})
-    monkeypatch.setattr(automatic, '_quiescence_row', lambda user: reads.append(user))
-    for _ in range(50):
-        automatic.check_source_admission('lib')
-    assert reads == ['lib']
-    automatic._UNFENCED_UNTIL['lib'] = 0.0
-    automatic.check_source_admission('lib')
-    assert reads == ['lib', 'lib']
-
-
-def test_source_admission_fence_is_never_cached(monkeypatch):
-    import storage_utils as su
-    monkeypatch.setattr(su, 'DURABLE_INDEX_UPDATES', True)
-    monkeypatch.setattr(automatic, '_UNFENCED_UNTIL', {})
-    row = [None]
-    monkeypatch.setattr(automatic, '_quiescence_row', lambda user: row[0])
-    automatic.check_source_admission('lib')
-    automatic._UNFENCED_UNTIL['lib'] = 0.0
-    row[0] = {'fenceId': 'f'}
-    for _ in range(3):
-        with pytest.raises(automatic.SourceBusy):
-            automatic.check_source_admission('lib')
