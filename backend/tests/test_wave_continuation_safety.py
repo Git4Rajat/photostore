@@ -195,13 +195,13 @@ def test_index_replays_only_interrupted_marker_page(index_wave, monkeypatch):
     writes = [0]
     def interrupt(control, changes, **kwargs):
         if any(op[1]['RowKey'].startswith('published-source!') for op in changes):
-            if writes[0] == 25:raise OSError('worker interrupted mid-page')
+            if writes[0] == 1:raise OSError('worker interrupted mid-page')
             writes[0] += 1
         return commit(control, changes, **kwargs)
     monkeypatch.setattr(store, '_commit', interrupt)
     with pytest.raises(OSError):
         execute_index(index_wave, publisher=lambda scope, *a: scope)
-    assert len(store._page('published-source!', size=100)) == 25
+    assert len(store._page('published-source!', size=100)) == 20
     leases = ExecutionLeases(store.table, partition=store.partition)
     checkpoint = json.loads(leases._get(leases.key(store.library,wave['waveId'],'index'))['progressCheckpoint'][6:])
     assert checkpoint['phase'] == 'members' and checkpoint['after']

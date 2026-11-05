@@ -15,21 +15,52 @@ def record_publication_members(store,wave,check,*,after='',checkpoint=lambda aft
     """
     while True:
         page=store._page(f'e!{wave["waveId"]}!m!',after)
-        for member in page:
-            if member['outcome']!='settled':continue
-            check();key=publication_key(member)
+        settled=[member for member in page if member['outcome']=='settled']
+        if settled:
+            check()
             def commit():
-                old=store._get(key);control=store._required('control')
-                row=store._row(key,waveId=wave['waveId'],photoId=member['photoId'],
-                    processingRevision=member['processingRevision'],evidenceId=member['evidenceId'])
-                if old and all(old.get(k)==v for k,v in row.items()):return
-                store._commit(control,[store._change(old,row)],advance=False)
+                control=store._required('control');changes=[]
+                for member in settled:
+                    key=publication_key(member);old=store._get(key)
+                    row=store._row(key,waveId=wave['waveId'],photoId=member['photoId'],
+                        processingRevision=member['processingRevision'],evidenceId=member['evidenceId'])
+                    if old and all(old.get(k)==v for k,v in row.items()):continue
+                    changes.append(store._change(old,row))
+                # One guarded transaction per page; markers are immutable and idempotent.
+                if changes:store._commit(control,changes,advance=False)
             store._retry(commit)
         if page:
             after=page[-1]['RowKey']
             checkpoint(after)
         if len(page)<MAX_PAGE:return True
         if should_yield():return False
+
+
+def map_members(items,work,workers):
+    """Run work(item) over a page concurrently; raise the earliest item's error.
+
+    Each task runs in a copy of the caller's context so write fences and metrics follow it.
+    """
+    import contextvars
+    from concurrent.futures import ThreadPoolExecutor
+    items=list(items)
+    if workers<=1 or len(items)<=1:
+        for item in items:work(item)
+        return
+    with ThreadPoolExecutor(max_workers=min(workers,len(items)),thread_name_prefix='wave-prepare') as pool:
+        futures=[pool.submit(contextvars.copy_context().run,work,item) for item in items]
+        error=None
+        for future in futures:
+            if error is not None:future.cancel()
+            else:
+                try:future.result()
+                except BaseException as caught:error=caught
+        if error is not None:
+            for future in futures:
+                if not future.cancelled():
+                    try:future.result()
+                    except BaseException:pass
+            raise error
 
 
 def advance_empty(store,wave_id):
