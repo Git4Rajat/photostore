@@ -405,45 +405,4 @@ export async function downloadPhoto(photo: Photo): Promise<void> {
     }
 }
 
-async function toShareFile(photo: Photo): Promise<File | null> {
-    const objectUrl = await fetchDownloadBlobUrl(photo);
-    if (!objectUrl) return null;
-    try {
-        const blob = await (await fetch(objectUrl)).blob();
-        return new File([blob], photo.filename, { type: blob.type || 'application/octet-stream' });
-    } finally {
-        URL.revokeObjectURL(objectUrl);
-    }
-}
 
-export type ShareOutcome = 'shared' | 'downloaded' | 'unsupported' | 'cancelled';
-
-/**
- * Shares one or more photos via the Web Share API (real image files). Falls
- * back to downloading a single photo, or reports 'unsupported' for a multi-photo
- * share the platform can't handle.
- */
-export async function sharePhotos(photos: Photo[]): Promise<ShareOutcome> {
-    if (photos.length === 0) return 'cancelled';
-    try {
-        const files = (await Promise.all(photos.slice(0, 10).map(toShareFile))).filter((f): f is File => Boolean(f));
-        if (files.length && navigator.canShare?.({ files }) && navigator.share) {
-            await navigator.share({ files, title: files.length === 1 ? files[0].name : `${files.length} photos` });
-            return 'shared';
-        }
-    } catch (err) {
-        if (err instanceof Error && err.name === 'AbortError') {
-            return 'cancelled';
-        }
-    }
-    // No Web Share (or it rejected): a single photo can still be downloaded.
-    if (photos.length === 1) {
-        try {
-            await downloadPhoto(photos[0]);
-            return 'downloaded';
-        } catch {
-            return 'unsupported';
-        }
-    }
-    return 'unsupported';
-}

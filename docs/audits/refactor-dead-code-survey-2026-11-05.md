@@ -1,5 +1,18 @@
 # Refactoring / dead-code survey — 2026-11-05
 
+## Status (updated)
+
+| Item | Branch / commit |
+|---|---|
+| Dead constants, `_ExploreSink`/`_TimelineSink`, `ImageNameMapping`, MetricCard, blazeface | `codex/prepare-coverage-batching` a5e2eaf (+ MetricCard in d7ea1c9) |
+| 4 dead `app.py` imports, Azurite untracked + ignored, `frontend/knip.json` | `codex/dead-code-cleanup` 5757a61 |
+| Unreachable legacy UI (`App.tsx` + 21 files, 10k lines) | `codex/remove-legacy-ui` c500018 |
+| 16 zero-reference frontend exports (+ orphaned `toShareFile`, `ShareOutcome`, 2 icon imports) | `codex/remove-legacy-ui` (follow-up commit) |
+| Still open | §3 remaining unused exports (see below), §4 scripts/audit repros, §5 refactors, §6 shadow-wave code |
+
+Remaining frontend knip "unused exports" are mostly named exports of components whose default export is the one imported (duplicate-export noise), exports used only within their own file, or test hooks (`__reset…ForTests`, `_backgroundRequestQueueLength`); they were left alone deliberately.
+
+
 Method: `vulture` (backend, min-confidence 60, tests/scripts excluded) and `knip` (frontend), then every hit cross-checked with grep. Both tools produce many false positives here (Flask route decorators, `React.lazy` imports, test monkeypatching of `app.X`), so only verified items are listed. Nothing was changed.
 
 ## 1. Safe deletions (high confidence)

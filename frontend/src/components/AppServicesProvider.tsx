@@ -629,14 +629,6 @@ export const isBrowserProcessingTurboEnabled = (): boolean => {
     }
 };
 
-export const setBrowserProcessingTurbo = (enabled: boolean): void => {
-    try {
-        window.localStorage.setItem(BROWSER_PROCESSING_TURBO_KEY, enabled ? '1' : '0');
-    } catch {
-        // Ignore storage failures (private mode / disabled storage); turbo simply
-        // stays at its previous value for this session.
-    }
-};
 
 // How many photos to process concurrently. Capped by both core count and device
 // memory so a low-end device can't spawn enough concurrent model instances to

@@ -380,8 +380,3 @@ export const getLibraryExportManifestPage = async (cursor?: string | null): Prom
     return response.json();
 };
 
-// Builds a file's actual downloadable URL from a manifest page's shared
-// baseUrl/sas and one entry's blobName.
-export const buildExportFileUrl = (page: Pick<ExportManifestPage, 'baseUrl' | 'sas'>, blobName: string): string => (
-    `${page.baseUrl}/${encodeURIComponent(blobName)}?${page.sas}`
-);

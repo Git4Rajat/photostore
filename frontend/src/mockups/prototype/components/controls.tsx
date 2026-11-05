@@ -7,7 +7,6 @@ import { ZoomOut as MagnifyingGlassMinusIcon, ZoomIn as MagnifyingGlassPlusIcon 
 export const TILE_STEP = 30;
 export const TILE_RANGE = { min: 72, max: 260 };
 export const TILE_DEFAULT = 120;
-export const clampTile = (n: number): number => Math.min(TILE_RANGE.max, Math.max(TILE_RANGE.min, n));
 
 // Per-view size bounds. Photo grids share the default range; the Workbench
 // tiles carry a step-badge footer, so they use a larger floor/ceiling.

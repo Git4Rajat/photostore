@@ -200,27 +200,3 @@ export const resetPassword = async (token: string, newPassword: string): Promise
     }
 };
 
-export const changePassword = async (currentPassword: string, newPassword: string): Promise<void> => {
-    const token = getToken();
-    const response = await fetch(url('/auth/change-password'), {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: JSON.stringify({ currentPassword, newPassword }),
-    });
-    if (!response.ok) {
-        throw new Error(await parseError(response, 'Could not change password.'));
-    }
-    // The server bumps the account's token version (invalidating other sessions)
-    // and returns a fresh token for THIS session so the user stays signed in.
-    try {
-        const body = await response.json();
-        if (body?.token) {
-            setToken(String(body.token));
-        }
-    } catch {
-        // No token in the response is fine; the current one remains valid.
-    }
-};

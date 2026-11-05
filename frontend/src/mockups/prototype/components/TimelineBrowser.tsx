@@ -5,7 +5,6 @@ const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', '
 const pad = (n: number | string) => String(n).padStart(2, '0');
 const lastDayOf = (year: string, month: string) => new Date(Number(year), Number(month), 0).getDate();
 
-export const yearRange = (y: string): CaptureRange => ({ start: `${y}-01-01`, end: `${y}-12-31`, label: y });
 export const monthRange = (y: string, m: string): CaptureRange => ({
     start: `${y}-${m}-01`, end: `${y}-${m}-${pad(lastDayOf(y, m))}`, label: `${MONTHS[Number(m) - 1]} ${y}`,
 });

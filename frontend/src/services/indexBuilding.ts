@@ -98,8 +98,6 @@ export const onIndexReady = (cb: () => void): (() => void) => {
     return () => { readyListeners.delete(cb); };
 };
 
-/** Get current per-index status. Returns {sort, lexical, albums, people} with ready/dirty/updated_at. */
-export const getCurrentIndexStatus = (): IndexStatus => ({ ...indexStatus });
 
 const subscribe = (l: Listener) => {
     listeners.add(l);
