@@ -12,7 +12,9 @@ unrecorded candidates, and each face enters the private runtime at most once.
 from contextlib import contextmanager, ExitStack
 from dataclasses import asdict
 from datetime import datetime
+from itertools import groupby, islice
 import json
+import os
 import sqlite3
 import tempfile
 
@@ -28,7 +30,7 @@ from execution_lease import guard_operations
 from faiss_assignment import FaissAssigner, _point, _vector, _rejected, invalidate, _LOCK
 from clustering_runtime import LiveFaceIndex, RebuildNeeded
 from upload_waves import digest
-from table_reads import read_entities, key_batches
+from table_reads import read_entities
 from wave_policy import source_change
 
 
@@ -165,9 +167,14 @@ class WaveAssignmentJournal:
         # UUID5 person rows can predate their face stamps after an interrupted
         # legacy write. Freeze those too: the reference reuses them rather than
         # treating them as a new-person collision on recovery.
-        for keys in key_batches(assigner.person_id(self.store.library, face['RowKey']) for face in workspace.inputs()):
+        parallel = os.getenv('WAVE_CLUSTER_PERSON_READ_BATCH_ENABLED', 'true').lower() in ('true', '1', 'yes')
+        window_size, workers = (56, 4) if parallel else (14, 1)
+        person_ids = (assigner.person_id(self.store.library, face['RowKey']) for face in workspace.inputs())
+        while keys := list(islice(person_ids, window_size)):
             self.check()
-            for person_id, person in read_entities(assigner.person_table, self.store.library, keys).items():
+            people = read_entities(assigner.person_table, self.store.library, keys, workers=workers)
+            self.check()
+            for person_id, person in people.items():
                 if person is not None:
                     workspace.put('people', person_id, clean(person))
         # Empty waves need no candidate scan.
@@ -176,7 +183,9 @@ class WaveAssignmentJournal:
             def capture_candidates():
                 self.check()
                 keys = [row['personId'] for row in candidates if workspace.get('people', row['personId']) is None]
-                for person_id, person in read_entities(assigner.person_table, self.store.library, keys).items():
+                people = read_entities(assigner.person_table, self.store.library, keys, workers=workers)
+                self.check()
+                for person_id, person in people.items():
                     if person is not None:
                         workspace.put('people', person_id, clean(person))
                 for candidate in candidates:
@@ -184,7 +193,7 @@ class WaveAssignmentJournal:
                         embedding=candidate['embedding'].tolist()))
             for candidate in assigner._cold_rows(self.store.library):
                 candidates.append(candidate)
-                if len(candidates) == 14:
+                if len(candidates) == window_size:
                     capture_candidates()
                     candidates.clear()
             if candidates:
@@ -485,51 +494,51 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
                 guard.check()
                 begun = False
                 materialized = False
-                for position, face in enumerate(workspace.inputs(after=position), start=position):
-                    guard.check()
-                    if position % page_size == 0:
-                        guard.boundary()
-                        workspace.db.commit()
-                    decision = journal.decision(position)
-                    if decision is None:
-                        decision = _decide(assigner, store.library, face, workspace, runtime, guard)
-                        decision.update(manifestId=digest(header), position=position, previousDigest=chain)
-                        journal.put(f'decision!{position:012d}', decision)
-                    if (decision['faceId'] != face['RowKey'] or decision['inputDigest'] != digest(face)
-                            or decision.get('manifestId') != digest(header)
-                            or decision.get('position') != position or decision.get('previousDigest') != chain):
-                        raise ValueError('Decision is bound to another frozen face')
-                    observed = {}
-                    decision = _curation_override(journal,position,assigner,store.library,face,decision,guard,observed)
-                    identity = digest(decision)
-                    if not journal.applied(position, identity):
-                        if not begun:
-                            library_guard.begin_assignment()
-                            begun = True
-                        _apply(assigner, store.library, face, decision, identity, guard, wave['waveId'],observed)
-                        journal.put(f'applied!{position:012d}', {'decisionId': identity})
-                        processing_metrics.add(cluster_faces_newly_resolved=1)
-                        materialized = True
-                    else:
-                        processing_metrics.add(cluster_faces_replayed=1)
-                    _replay(workspace, runtime, decision, guard)
-                    chain = digest([chain, position, identity])
-                    processing_diagnostics.wave_faces(processed=position + 1)
-                    if (position + 1) % page_size == 0 or position + 1 == header['faceCount']:
-                        # Reconstructing an applied prefix is not new durable
-                        # work. Do not rewind the execution cursor or repeatedly
-                        # checkpoint old pages during canonical fallback replay.
-                        if materialized:
-                            with processing_diagnostics.wave_phase_scope('checkpoint'):
-                                progress(position + 1)
-                        # Replaying an existing prefix must never use up the
-                        # slice before any new work is durable. Final pages
-                        # finish normally rather than scheduling another pass.
-                        if materialized and position + 1 < header['faceCount'] and should_yield():
-                            with processing_diagnostics.wave_phase_scope('resume_save'):
-                                save(journal, workspace, runtime, header, position + 1, chain, directory)
-                            raise AssignmentYield('Cluster assignment checkpointed for continuation')
-                        materialized = False
+                from automatic_index_updates import wave_assignment_coverage
+                ordered = enumerate(workspace.inputs(after=position), start=position)
+                for _, page in groupby(ordered, key=lambda item: item[0] // page_size):
+                    guard.boundary()
+                    workspace.db.commit()
+                    with wave_assignment_coverage(store.library, assigner.face_table,
+                            assigner.person_table, guard.check, max_faces=page_size):
+                        for position, face in page:
+                            guard.check()
+                            decision = journal.decision(position)
+                            if decision is None:
+                                decision = _decide(assigner, store.library, face, workspace, runtime, guard)
+                                decision.update(manifestId=digest(header), position=position, previousDigest=chain)
+                                journal.put(f'decision!{position:012d}', decision)
+                            if (decision['faceId'] != face['RowKey'] or decision['inputDigest'] != digest(face)
+                                    or decision.get('manifestId') != digest(header)
+                                    or decision.get('position') != position or decision.get('previousDigest') != chain):
+                                raise ValueError('Decision is bound to another frozen face')
+                            observed = {}
+                            decision = _curation_override(journal,position,assigner,store.library,face,decision,guard,observed)
+                            identity = digest(decision)
+                            if not journal.applied(position, identity):
+                                if not begun:
+                                    library_guard.begin_assignment()
+                                    begun = True
+                                _apply(assigner, store.library, face, decision, identity, guard, wave['waveId'],observed)
+                                journal.put(f'applied!{position:012d}', {'decisionId': identity})
+                                processing_metrics.add(cluster_faces_newly_resolved=1)
+                                materialized = True
+                            else:
+                                processing_metrics.add(cluster_faces_replayed=1)
+                            _replay(workspace, runtime, decision, guard)
+                            chain = digest([chain, position, identity])
+                            processing_diagnostics.wave_faces(processed=position + 1)
+                    # Coverage must close successfully before recording execution
+                    # progress or saving a resumable page. Replay alone is not
+                    # new work and must not rewind the durable execution cursor.
+                    if materialized:
+                        with processing_diagnostics.wave_phase_scope('checkpoint'):
+                            progress(position + 1)
+                    if materialized and position + 1 < header['faceCount'] and should_yield():
+                        with processing_diagnostics.wave_phase_scope('resume_save'):
+                            save(journal, workspace, runtime, header, position + 1, chain, directory)
+                        raise AssignmentYield('Cluster assignment checkpointed for continuation')
+                    materialized = False
                 guard.check()
                 return journal.finish(header, chain)
             finally:

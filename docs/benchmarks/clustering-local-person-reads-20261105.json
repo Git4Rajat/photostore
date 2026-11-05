@@ -1,0 +1,390 @@
+{
+  "scope": "Real read_entities helper, 56 keys, 512D payloads, five alternating trials.",
+  "limitation": "Fixed per-query sleep only; not Azure response times or whole-wave throughput.",
+  "summaries": [
+    {
+      "latency_ms": 0,
+      "case": "existing",
+      "serial_median_ms": 0.4903749795630574,
+      "parallel_median_ms": 0.4420830518938601,
+      "measured_speedup": 1.109237229209121,
+      "output_parity": true,
+      "samples": {
+        "1": [
+          {
+            "seconds": 0.0005546659813262522,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.0004903749795630574,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.00048570800572633743,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.0004980410449206829,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.00044408399844542146,
+            "queries": 4,
+            "peak_inflight": 1
+          }
+        ],
+        "4": [
+          {
+            "seconds": 0.0005627080099657178,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.0004619590472429991,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.0004420830518938601,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.00044174998765811324,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.0004124160041101277,
+            "queries": 4,
+            "peak_inflight": 1
+          }
+        ]
+      }
+    },
+    {
+      "latency_ms": 0,
+      "case": "missing",
+      "serial_median_ms": 0.3386249882169068,
+      "parallel_median_ms": 0.23041601525619626,
+      "measured_speedup": 1.4696243567982656,
+      "output_parity": true,
+      "samples": {
+        "1": [
+          {
+            "seconds": 0.00034724996658042073,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.0003386249882169068,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.00032633397495374084,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.00034733396023511887,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.0003242089878767729,
+            "queries": 4,
+            "peak_inflight": 1
+          }
+        ],
+        "4": [
+          {
+            "seconds": 0.00022649997845292091,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.00022062502102926373,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.00023041601525619626,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.0002306249807588756,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.00023075001081451774,
+            "queries": 4,
+            "peak_inflight": 1
+          }
+        ]
+      }
+    },
+    {
+      "latency_ms": 1,
+      "case": "existing",
+      "serial_median_ms": 5.484124994836748,
+      "parallel_median_ms": 1.6927500255405903,
+      "measured_speedup": 3.2397725075120634,
+      "output_parity": true,
+      "samples": {
+        "1": [
+          {
+            "seconds": 0.0055239160428754985,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.005499167018570006,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.005276084004435688,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.005484124994836748,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.00547916698269546,
+            "queries": 4,
+            "peak_inflight": 1
+          }
+        ],
+        "4": [
+          {
+            "seconds": 0.0016472910065203905,
+            "queries": 4,
+            "peak_inflight": 4
+          },
+          {
+            "seconds": 0.0017034999909810722,
+            "queries": 4,
+            "peak_inflight": 4
+          },
+          {
+            "seconds": 0.0016927500255405903,
+            "queries": 4,
+            "peak_inflight": 4
+          },
+          {
+            "seconds": 0.0016981659573502839,
+            "queries": 4,
+            "peak_inflight": 4
+          },
+          {
+            "seconds": 0.0016799169825389981,
+            "queries": 4,
+            "peak_inflight": 4
+          }
+        ]
+      }
+    },
+    {
+      "latency_ms": 1,
+      "case": "missing",
+      "serial_median_ms": 5.332583037670702,
+      "parallel_median_ms": 1.479750033468008,
+      "measured_speedup": 3.603705299585649,
+      "output_parity": true,
+      "samples": {
+        "1": [
+          {
+            "seconds": 0.005386665987316519,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.0053348750225268304,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.005323917022906244,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.005332583037670702,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.0053291249787434936,
+            "queries": 4,
+            "peak_inflight": 1
+          }
+        ],
+        "4": [
+          {
+            "seconds": 0.0015095410053618252,
+            "queries": 4,
+            "peak_inflight": 4
+          },
+          {
+            "seconds": 0.0014828330022282898,
+            "queries": 4,
+            "peak_inflight": 4
+          },
+          {
+            "seconds": 0.0014749999972991645,
+            "queries": 4,
+            "peak_inflight": 4
+          },
+          {
+            "seconds": 0.001479750033468008,
+            "queries": 4,
+            "peak_inflight": 4
+          },
+          {
+            "seconds": 0.0014733340358361602,
+            "queries": 4,
+            "peak_inflight": 4
+          }
+        ]
+      }
+    },
+    {
+      "latency_ms": 5,
+      "case": "existing",
+      "serial_median_ms": 25.533000007271767,
+      "parallel_median_ms": 6.700792000629008,
+      "measured_speedup": 3.8104450943821218,
+      "output_parity": true,
+      "samples": {
+        "1": [
+          {
+            "seconds": 0.025533000007271767,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.024562040984164923,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.025631833006627858,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.02550820796750486,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.025612875004298985,
+            "queries": 4,
+            "peak_inflight": 1
+          }
+        ],
+        "4": [
+          {
+            "seconds": 0.006284292030613869,
+            "queries": 4,
+            "peak_inflight": 4
+          },
+          {
+            "seconds": 0.005597457988187671,
+            "queries": 4,
+            "peak_inflight": 4
+          },
+          {
+            "seconds": 0.006703625025693327,
+            "queries": 4,
+            "peak_inflight": 4
+          },
+          {
+            "seconds": 0.006700792000629008,
+            "queries": 4,
+            "peak_inflight": 4
+          },
+          {
+            "seconds": 0.0072565419832244515,
+            "queries": 4,
+            "peak_inflight": 4
+          }
+        ]
+      }
+    },
+    {
+      "latency_ms": 5,
+      "case": "missing",
+      "serial_median_ms": 25.548124976921827,
+      "parallel_median_ms": 6.857833010144532,
+      "measured_speedup": 3.7253932749790577,
+      "output_parity": true,
+      "samples": {
+        "1": [
+          {
+            "seconds": 0.024999957997351885,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.02577491698320955,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.025925917027052492,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.025332916993647814,
+            "queries": 4,
+            "peak_inflight": 1
+          },
+          {
+            "seconds": 0.025548124976921827,
+            "queries": 4,
+            "peak_inflight": 1
+          }
+        ],
+        "4": [
+          {
+            "seconds": 0.006857833010144532,
+            "queries": 4,
+            "peak_inflight": 4
+          },
+          {
+            "seconds": 0.006336707971058786,
+            "queries": 4,
+            "peak_inflight": 4
+          },
+          {
+            "seconds": 0.007106749981176108,
+            "queries": 4,
+            "peak_inflight": 4
+          },
+          {
+            "seconds": 0.007355292036663741,
+            "queries": 4,
+            "peak_inflight": 4
+          },
+          {
+            "seconds": 0.0065127499983645976,
+            "queries": 4,
+            "peak_inflight": 4
+          }
+        ]
+      }
+    }
+  ]
+}

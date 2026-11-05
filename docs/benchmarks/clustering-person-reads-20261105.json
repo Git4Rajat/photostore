@@ -1,0 +1,84 @@
+{
+  "results": [
+    {
+      "case": "existing",
+      "mode": "query_serial",
+      "keys": 56,
+      "found": 56,
+      "median_ms": 1111.9432499981485,
+      "samples_ms": [
+        1111.9432499981485,
+        380.0955829792656,
+        1798.2318330323324
+      ],
+      "helper_requests_per_trial": 4
+    },
+    {
+      "case": "existing",
+      "mode": "query_window_parallel",
+      "keys": 56,
+      "found": 56,
+      "median_ms": 328.09066702611744,
+      "samples_ms": [
+        491.1773340427317,
+        327.9042499489151,
+        328.09066702611744
+      ],
+      "helper_requests_per_trial": 4
+    },
+    {
+      "case": "existing",
+      "mode": "point_parallel",
+      "keys": 56,
+      "found": 56,
+      "median_ms": 859.7946669906378,
+      "samples_ms": [
+        808.1901670084335,
+        1012.3341670259833,
+        859.7946669906378
+      ],
+      "helper_requests_per_trial": 56
+    },
+    {
+      "case": "missing",
+      "mode": "query_serial",
+      "keys": 56,
+      "found": 0,
+      "median_ms": 935.3348750155419,
+      "samples_ms": [
+        4525.42799996445,
+        485.38741702213883,
+        935.3348750155419
+      ],
+      "helper_requests_per_trial": 4
+    },
+    {
+      "case": "missing",
+      "mode": "query_window_parallel",
+      "keys": 56,
+      "found": 0,
+      "median_ms": 64.33966697659343,
+      "samples_ms": [
+        64.33966697659343,
+        1099.0847499924712,
+        54.89074997603893
+      ],
+      "helper_requests_per_trial": 4
+    },
+    {
+      "case": "missing",
+      "mode": "point_parallel",
+      "keys": 56,
+      "found": 0,
+      "median_ms": 517.2882080078125,
+      "samples_ms": [
+        560.5110839824192,
+        506.5659169922583,
+        517.2882080078125
+      ],
+      "helper_requests_per_trial": 56
+    }
+  ],
+  "output_parity": true,
+  "note": "Read-only same-library sample; helper request counts exclude SDK retry/page requests. Does not measure whole-wave throughput or authorize mutable-row caching."
+}

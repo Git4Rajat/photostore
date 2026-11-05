@@ -475,3 +475,71 @@ def test_wave_path_emits_aggregated_phase_costs_without_changing_assignments(cap
     summary, = records(caplog, 'cluster_wave_summary')
     assert summary['faces'] == summary['faces_processed'] == len(snapshots)
     assert summary['wave_id'] == frozen['waveId']
+
+
+def test_parallel_person_windows_preserve_the_exact_frozen_manifest(monkeypatch):
+    import numpy as np
+    h, snapshots, store, frozen, _ = setup()
+    inputs = [dict(snapshots[0], RowKey=f'input-{i:04d}') for i in range(137)]
+    candidates = []
+    for i in range(113):
+        person_id = f'baseline-person-{i:04d}'
+        h.people.create_entity(dict(PartitionKey='u', RowKey=person_id, faceIds='[]'))
+        candidates.append(dict(faceId=f'baseline-face-{i:04d}', personId=person_id,
+                               embedding=np.array([1., 0., 0.])))
+    # Include a deterministic person left by an interrupted legacy write.
+    h.people.create_entity(dict(PartitionKey='u',
+        RowKey=h.assigner.person_id('u', inputs[0]['RowKey']), faceIds='[]'))
+    monkeypatch.setattr(h.assigner, '_cold_rows', lambda _: iter(deepcopy(candidates)))
+    real_read, observed = wave.read_entities, []
+    def read(table, library, keys, **options):
+        keys = list(keys)
+        observed.append((len(keys), options['workers']))
+        return real_read(table, library, keys, **options)
+    monkeypatch.setattr(wave, 'read_entities', read)
+    manifests = []
+    for enabled, size, workers in [('false', 14, 1), ('true', 56, 4)]:
+        monkeypatch.setenv('WAVE_CLUSTER_PERSON_READ_BATCH_ENABLED', enabled)
+        journal = wave.WaveAssignmentJournal(store, frozen['waveId'], lambda: None)
+        records = {}
+        monkeypatch.setattr(journal, 'get', records.get)
+        monkeypatch.setattr(journal, 'put', lambda key, value: records.update({key: value}))
+        workspace = wave.Workspace(':memory:')
+        observed.clear()
+        try:
+            header = journal.prepare(workspace, lambda: iter(deepcopy(inputs)),
+                                     h.assigner, 'fixed-binding', 7)
+            assert max(count for count, _ in observed) == size
+            assert all(count <= size and worker == workers for count, worker in observed)
+            assert header['faceCount'] == 137
+            assert header['baselineCount'] == 113
+            assert header['personCount'] == 114
+            manifests.append(deepcopy(records))
+        finally:
+            workspace.close()
+    assert manifests[0] == manifests[1]
+
+
+def test_page_finalization_failure_cannot_publish_progress_or_continuation(monkeypatch):
+    from contextlib import contextmanager
+    import automatic_index_updates as automatic
+    h, snapshots, store, frozen, leases = setup()
+    progress = []
+    @contextmanager
+    def failed_finish(*args, **kwargs):
+        yield
+        raise OSError('coverage finalization unavailable')
+    monkeypatch.setattr(automatic, 'wave_assignment_coverage', failed_finish)
+    owner = leases.claim('u', frozen['waveId'], 'cluster', frozen['frozenRevision'])
+    try:
+        with execution_scope(leases, owner, store, lambda: leases.check(owner)):
+            with pytest.raises(OSError, match='coverage finalization'):
+                wave.run_frozen_assignment(store, frozen, h.assigner,
+                    lambda: iter(deepcopy(snapshots)), lambda: None, page_size=1,
+                    progress=progress.append, should_yield=lambda: True)
+    finally:
+        leases.release(owner)
+    assert not progress
+    journal = wave.WaveAssignmentJournal(store, frozen['waveId'], lambda: None)
+    assert journal.decision(0)  # Durable decisions remain available for retry.
+    assert not journal.get('complete')

@@ -1,6 +1,6 @@
 # Clustering algorithm compatible with the current wave protocol
 
-Revision 2 — 2026-11-05. Status: compatible optimization design, with an initial subset implemented locally and not deployed. Source baseline: `ec52b307620e6bdb01963f9baf5d77c29b17be2a`. See the [implementation and measured call counts](benchmarks/clustering-compatible-optimization-20261105.md) for the exact completed scope.
+Revision 3 — 2026-11-05. Status: compatible optimization design; initial subset deployed, bounded coverage and concurrent frozen-person preparation implemented locally on `1f5e426`, not yet deployed. See the [initial implementation](benchmarks/clustering-compatible-optimization-20261105.md) and [follow-up measurements and validation](benchmarks/clustering-page-coverage-20261105.md) for exact scope.
 
 **Decision:** retain the existing assignment authority, per-face live curation protocol, wave state machine and publication contracts. Use local artifacts to reduce preparation/replay overhead, not to replace authoritative person/face/member tables. The previous proposal's assignment-head control plane and snapshot-isolated override semantics are withdrawn from this revision.
 
@@ -206,7 +206,7 @@ Curation/materialization constraints retained from current code:
 - Read the current target person before updating it; preserve current name/other curation fields. Reject resurrection of a deleted matched person and collisions of deterministic new-person identities.
 - Create/validate membership before the final stamped face write. A lost member/person/face reply replays the same durable decision; it does not recompute a new person choice.
 - Call `_replay` only on the resolved decision, after current application handling. A `curated` override has no candidate; do not inject the overridden automatic candidate into later matching.
-- The existing baseline is frozen for the logical run. This design does not promise stronger global interleaving semantics for unrelated baseline-person edits than current code provides.
+- Frozen person preparation uses bounded 56-key windows and at most four concurrent fourteen-key queries through the existing shared read pool. Set `WAVE_CLUSTER_PERSON_READ_BATCH_ENABLED=false` to restore serial fourteen-key windows. This changes preparation transport only; current person/face observations at materialization remain live. The existing baseline is frozen for the logical run. This design does not promise stronger global interleaving semantics for unrelated baseline-person edits than current code provides.
 
 No page-wide person/face transaction, blanket prefetch of mutable state, reordered canonical matching or whole-page journal group commit is approved by this algorithm.
 
@@ -216,7 +216,7 @@ There are two separate optimization gates:
 
 **Gate A — wave-source context (implemented locally).** Establish a narrowly scoped `source_change` context only around validated wave assignment materialization. Coverage/scheduling regressions prove that ordinary foreground operations retain their behavior and the context resets on success/error. Keep source admission, begin/finish reservations, mutation tracking, ETags and lease checks. This removes redundant maintenance scheduling; it does not remove coverage traffic.
 
-**Gate B — bounded coverage scope.** A later explicit API may consolidate repeated reservations and redundant source observations across a bounded assignment page. It is disabled until its proof and failure-path tests exist. It must retain the same source-write order and live curation checks; it cannot use raw clients as an untracked bypass.
+**Gate B — bounded coverage scope (implemented locally, 2026-11-05 follow-up).** The explicit `wave_assignment_coverage` API consolidates reservations across at most 128 faces and 256 face/person writes, using existing `uncertain=True` / `fullRequired` coverage before the first effect. It retains source-write order, genuine ETags, per-effect operator admission and live curation checks. Only the exact wave face/person proxies, library and originating thread can join; all other writes retain ordinary tracking. No reservation expires. Finalization must succeed before progress or continuation publication. See the [implementation, failure checks and measured limits](benchmarks/clustering-page-coverage-20261105.md). Set `WAVE_CLUSTER_COVERAGE_BATCH_ENABLED=false` to restore per-write tracking.
 
 ```text
 Before any source effect:
@@ -367,4 +367,4 @@ Required acceptance cases:
 - `backend/automatic_index_updates.py:578` — tracked write/admission/coverage protocol.
 - `backend/storage_utils.py:7979` — current People source-table consumer.
 
-Design validation consisted of source-contract tracing, document consistency checks (including syntax parsing of all five Python pseudocode blocks) and **135 passing existing tests** across `test_wave_assignment_journal.py`, `test_wave_assignment_files.py`, `test_wave_execution_consumers.py`, `test_wave_publication.py`, `test_wave_continuation_safety.py` and `test_wave_health.py`. The subsequent initial implementation has a separate **412-test validation and added boundary checks**, documented in the linked implementation report. Deferred cache/coverage optimizations still require implementation-specific tests before release. No cloud data, queue or deployment has been changed.
+Design validation consisted of source-contract tracing, document consistency checks (including syntax parsing of all five Python pseudocode blocks) and **135 passing existing tests** across `test_wave_assignment_journal.py`, `test_wave_assignment_files.py`, `test_wave_execution_consumers.py`, `test_wave_publication.py`, `test_wave_continuation_safety.py` and `test_wave_health.py`. The subsequent initial implementation has a separate **412-test validation and added boundary checks**, documented in the linked implementation report. The subsequent bounded coverage and frozen-person-read implementation has separate implementation-specific validation in the [follow-up report](benchmarks/clustering-page-coverage-20261105.md). Further deferred caching still requires its own proof and tests. No cloud data, queue or deployment has been changed.
