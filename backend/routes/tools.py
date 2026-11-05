@@ -37,6 +37,12 @@ def record_workbench_action():
         filename_count = 0
     raw_filenames = data.get('filenames')
     filenames = [str(f) for f in raw_filenames][:50] if isinstance(raw_filenames, list) else []
+    # What came of the run, so History can say more than "it was clicked".
+    # Optional and validated: older clients simply omit it.
+    outcome = str(data.get('outcome') or '').strip().lower()
+    if outcome not in ('success', 'partial', 'failed'):
+        outcome = ''
+    detail = str(data.get('detail') or '').strip()[:200]
     action_id = str(app.uuid.uuid4())
     try:
         app.workbench_actions_table_client.upsert_entity({
@@ -48,6 +54,8 @@ def record_workbench_action():
             'filenameCount': filename_count,
             'filenames': app.json.dumps(filenames),
             'force': bool(data.get('force')),
+            'outcome': outcome,
+            'detail': detail,
             'createdAt': app.datetime.now(app.timezone.utc).isoformat(),
         })
     except Exception:
@@ -68,7 +76,7 @@ def list_workbench_actions():
     # Project only the small columns the history list needs -- same reasoning
     # as list_merges() excluding its heavy `payload` column: never pull the
     # (capped but still non-trivial) `filenames` blob just to list rows.
-    select_cols = ['RowKey', 'action', 'steps', 'scope', 'filenameCount', 'force', 'createdAt']
+    select_cols = ['RowKey', 'action', 'steps', 'scope', 'filenameCount', 'force', 'outcome', 'detail', 'createdAt']
     try:
         rows_iter = app.workbench_actions_table_client.query_entities(
             f"PartitionKey eq '{app._escape_odata(user_id)}'",
@@ -87,6 +95,8 @@ def list_workbench_actions():
                     'scope': row.get('scope'),
                     'filenameCount': row.get('filenameCount'),
                     'force': row.get('force'),
+                    'outcome': row.get('outcome') or None,
+                    'detail': row.get('detail') or None,
                     'createdAt': row.get('createdAt'),
                 })
             except Exception:
