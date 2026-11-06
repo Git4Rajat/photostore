@@ -498,27 +498,27 @@ export const ToolsPage: React.FC = () => {
                     <div className="card-glass pt-recover-card">
                         <strong>Deduplicate faces</strong>
                         <span>Find and remove duplicate face rows across your library.</span>
-                        <button type="button" className="btn mock-cta" disabled={busy} onClick={() => void runAdmin('Face dedupe', '/api/admin/people/dedupe-faces', { repair: true, confirm: 'DEDUPE_FACES' })}>Apply</button>
+                        <button type="button" className="btn mock-cta" disabled={busy} onClick={() => void runAdmin('Face dedupe', '/api/admin/people/dedupe-faces', { repair: true, dryRun: false, confirm: 'DEDUPE_FACES' })}>Apply</button>
                     </div>
                     <div className="card-glass pt-recover-card">
                         <strong>Rebuild people index</strong>
                         <span>Recompute the photo→person mapping index. Use this if people are not appearing on their photos.</span>
-                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('People index rebuild', '/api/admin/people/rebuild-photo-people-index', { repair: true, confirm: 'REBUILD_PEOPLE_INDEX' })}>Rebuild</button>
+                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('People index rebuild', '/api/admin/people/rebuild-photo-people-index', { repair: true, dryRun: false, confirm: 'REBUILD_PEOPLE_INDEX' })}>Rebuild</button>
                     </div>
                     <div className="card-glass pt-recover-card">
                         <strong>Repair stale memberships</strong>
                         <span>Fix people-cluster membership rows left inconsistent by an interrupted merge or split.</span>
-                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('Repair stale memberships', '/api/admin/people/repair-stale-memberships', { repair: true, confirm: 'REPAIR_STALE_MEMBERSHIPS' })}>Repair</button>
+                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('Repair stale memberships', '/api/admin/people/repair-stale-memberships', { repair: true, dryRun: false, confirm: 'REPAIR_STALE_MEMBERSHIPS' })}>Repair</button>
                     </div>
                     <div className="card-glass pt-recover-card">
                         <strong>Unblock low-confidence faces</strong>
                         <span>Re-admit faces previously held back by the suspicious-face confidence gate.</span>
-                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('Unblock low-confidence faces', '/api/admin/people/unblock-low-confidence-faces', { repair: true, confirm: 'UNBLOCK_LOW_CONFIDENCE_FACES' })}>Unblock</button>
+                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('Unblock low-confidence faces', '/api/admin/people/unblock-low-confidence-faces', { repair: true, dryRun: false, confirm: 'UNBLOCK_LOW_CONFIDENCE_FACES' })}>Unblock</button>
                     </div>
                     <div className="card-glass pt-recover-card">
                         <strong>Suppress suspicious faces</strong>
                         <span>Hide faces flagged as likely false detections from clustering and people counts.</span>
-                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('Suppress suspicious faces', '/api/admin/people/suppress-suspicious-faces', { repair: true, confirm: 'SUPPRESS_SUSPICIOUS_FACES' })}>Suppress</button>
+                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('Suppress suspicious faces', '/api/admin/people/suppress-suspicious-faces', { repair: true, dryRun: false, confirm: 'SUPPRESS_SUSPICIOUS_FACES' })}>Suppress</button>
                     </div>
                     <div className="card-glass pt-recover-card">
                         <strong>Purge orphaned photo data</strong>
