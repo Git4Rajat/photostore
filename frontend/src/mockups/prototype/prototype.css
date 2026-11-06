@@ -102,28 +102,12 @@
 .pt-account-head span { font-size: 0.76rem; color: var(--muted); }
 .pt-account-sep { height: 1px; background: var(--lg-edge); margin: 6px 0; }
 .pt-account-theme { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 10px; font-size: 0.85rem; }
-
-.pt-bell-menu { min-width: 300px; }
-.pt-suggest-card { padding: 10px; border-radius: var(--r-xs); }
-.pt-suggest-card + .pt-suggest-card { border-top: 1px solid var(--lg-edge); }
-.pt-suggest-card p { margin: 0 0 8px; font-size: 0.88rem; }
-.pt-suggest-actions { display: flex; gap: 14px; }
 .pt-linkish { background: none; border: 0; color: var(--accent); font: inherit; font-weight: 600; cursor: pointer; padding: 4px 2px; min-height: var(--tap-min); display: inline-flex; align-items: center; gap: 4px; }
 .pt-linkish.strong { font-weight: 700; }
 .pt-linkish.muted { color: var(--muted); }
 /* Heroicons ship no intrinsic size -- without this, a .toolbar-icon inside
    .pt-linkish has no width/height and renders at the oversized SVG default. */
 .pt-linkish .toolbar-icon { width: 15px; height: 15px; flex: 0 0 auto; }
-
-.pt-album-menu { min-width: 260px; }
-.pt-album-menu-row { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; background: none; border: 0; padding: 8px; border-radius: var(--r-xs); cursor: pointer; font: inherit; color: var(--text); }
-.pt-album-menu-row:hover { background: var(--lg-surface-wash); }
-.pt-album-menu-cover { width: 32px; height: 32px; border-radius: 6px; flex: 0 0 auto; object-fit: cover; }
-.pt-album-menu-cover.empty { background: var(--lg-edge); }
-.pt-album-menu-name { flex: 1; font-size: 0.86rem; }
-.pt-album-menu-count { font-size: 0.74rem; color: var(--muted); }
-.pt-album-menu-new { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; background: none; border: 0; border-top: 1px solid var(--lg-edge); margin-top: 6px; padding: 10px 8px 4px; color: var(--accent); font: inherit; font-weight: 650; cursor: pointer; }
-.pt-album-menu-new svg { width: 16px; height: 16px; }
 .pt-rate-pop { padding: 6px 8px; }
 
 /* ---- avatar (bits) ---- */
@@ -180,7 +164,6 @@
 }
 .pt-rating-options > button:hover { background: var(--lg-surface-wash); }
 .pt-rating-options > button.active { color: var(--accent); background: var(--accent-soft); font-weight: 700; }
-.seg-icon { width: 13px; height: 13px; }
 .pt-filter-button.active,
 .pt-like-filter.active { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
 .pt-date-jump {
@@ -225,18 +208,6 @@
 .pt-filter-popover-content .pt-date-jump { width: 100%; justify-content: center; }
 
 /* ---- gallery timeline scrubber (year -> month -> day) ---- */
-.pt-timeline-wrap { margin-bottom: 12px; }
-.pt-timeline-crumbs { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; font-size: 0.78rem; color: var(--muted); }
-.pt-timeline-crumbs button { background: none; border: 0; color: var(--muted); font: inherit; font-size: 0.78rem; font-weight: 600; cursor: pointer; padding: 2px 4px; border-radius: 5px; }
-.pt-timeline-crumbs button:hover { color: var(--text); }
-.pt-timeline-crumbs button.on { color: var(--accent); }
-.pt-timeline { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 6px; -webkit-overflow-scrolling: touch; }
-.pt-timeline-chip { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px; min-height: var(--tap-min); border: 1px solid var(--lg-edge); background: var(--lg-surface-wash); border-radius: var(--r-pill); padding: 5px 12px; font: inherit; font-size: 0.8rem; font-weight: 600; color: var(--text); cursor: pointer; }
-.pt-timeline-chip:hover { border-color: var(--accent); }
-.pt-timeline-chip.on { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
-.pt-timeline-count { font-size: 0.72rem; font-weight: 700; color: var(--muted); }
-.pt-timeline-chip.on .pt-timeline-count { color: var(--accent); }
-.pt-suggest-empty { color: var(--muted); padding: 10px 6px; font-size: 0.84rem; }
 @media (max-width: 620px) {
   .pt-toolbar { flex-direction: column; align-items: flex-start; }
   .pt-toolbar-actions { width: 100%; }
@@ -475,9 +446,6 @@
    distinguishable without relying on the icon tint. */
 .wb-step { position: relative; display: inline-flex; line-height: 0; }
 .wb-step::after { position: absolute; right: -3px; bottom: -3px; font-size: 9px; font-weight: 800; line-height: 1; }
-.wb-step-done::after { content: '✓'; color: #34c759; }
-.wb-step-failed::after { content: '✕'; color: #ff453a; }
-.wb-step-no-data::after { content: '!'; color: #d19a00; }
 .wb-info-panel { position: absolute; top: 44px; right: 6px; left: 6px; z-index: 5; background: var(--bg-1); border: 1px solid var(--lg-edge); border-radius: var(--r-sm); padding: 10px 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.28); }
 .wb-info-title { font-weight: 700; font-size: 0.78rem; margin-bottom: 6px; word-break: break-all; }
 .wb-info-row { font-size: 0.78rem; color: var(--text); margin-bottom: 3px; }
@@ -653,11 +621,6 @@
 
 .pt-albums-new-row { display: flex; gap: 8px; margin-top: 8px; }
 .pt-albums-new-row .albm-newbtn { width: auto; flex: 1; margin-top: 0; }
-.pt-smart-album-menu { min-width: 220px; }
-.pt-smart-album-menu button { display: flex; align-items: center; gap: 10px; }
-.pt-smart-album-menu button svg { width: 18px; height: 18px; flex: 0 0 auto; color: var(--muted); }
-.pt-smart-album-menu button span { display: flex; flex-direction: column; gap: 1px; }
-.pt-smart-album-menu button small { color: var(--muted); font-size: 0.74rem; font-weight: 400; }
 
 /* ---- toasts (mobile-safe) ---- */
 .pt-toasts { position: fixed; left: 16px; right: 16px; bottom: 100px; z-index: 90; display: flex; flex-direction: column; gap: 8px; align-items: center; pointer-events: none; }
@@ -679,8 +642,6 @@
     .pt-viewer-title { display: none; }
     .pt-toolbar { align-items: flex-start; }
 }
-
-/* ---- viewer floating tools: tap-to-reveal on touch ---- */
 /* The zoom/rotate toolbar floats over the top of the photo, covering tall
    portrait shots on a phone. On touch, keep it hidden until the user taps the
    photo (iOS-style chrome toggle); desktop leaves it always visible. */

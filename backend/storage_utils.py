@@ -2569,38 +2569,6 @@ def touch_user_vector_index_state(user_id: str, *, embedding_version: Optional[s
     return source_version
 
 
-def get_vector_index_manifest_summary(user_id: str) -> Optional[Dict[str, object]]:
-    """Best-effort manifest read for the vector-index blob, WITHOUT the
-    version-gated freshness check get_user_vector_index applies.
-
-    That gate compares the manifest's embeddingVersion against
-    vision_utils.get_text_embedding_version() -- which is always the
-    hashing-fallback string on any process without torch/open_clip
-    installed (backend/photos/upload/tools all run backendImage, which
-    never installs them; only requirements-ipworker.txt does). On this
-    deployment shape, get_user_vector_index(allow_refresh=False) always
-    returns None even when a perfectly good real-CLIP index exists in
-    storage (built by ipworker or the browser), and
-    allow_refresh=True would be actively destructive: _build_user_vector_index_snapshot
-    would treat every photo's real photoEmbedding as version-incompatible
-    and silently rebuild the whole index from the hashing fallback,
-    overwriting real embeddings with noise. This function exists so a
-    torch-less caller (routes/photos.py:photos_search_index, for Phase B
-    client-side semantic search) can still discover and hand out the blob's
-    SAS URL without ever touching that gate."""
-    key = str(user_id or '').strip()
-    if not key:
-        return None
-    manifest = _load_vector_index_manifest(key)
-    if not manifest:
-        return None
-    return {
-        'source_version': str(manifest.get('sourceVersion') or ''),
-        'embedding_version': str(manifest.get('embeddingVersion') or ''),
-        'updated_at': str(manifest.get('updatedAt') or ''),
-        'dirty': bool(manifest.get('dirty')),
-    }
-
 
 def _load_vector_index_manifest(user_id: str) -> Dict[str, str]:
     blob_client = _vector_index_blob_client(_vector_index_manifest_blob_name(user_id))
@@ -4914,22 +4882,6 @@ def refresh_user_lexical_artifacts(user_id: str, source_version: Optional[str] =
     return refresh_user_lexical_index(user_id, source_version=source_version)
 
 
-def ensure_user_search_db(user_id: str) -> bool:
-    """Make sure a current SQLite search database exists, running the streaming
-    library build if it does not (heavy: a full table scan, so only the worker
-    role calls this). True when a current DB exists."""
-    import search_db
-    key = str(user_id or '').strip()
-    if not key:
-        return False
-    lexical_version = str(_load_lexical_index_manifest(key).get('sourceVersion') or '')
-    if lexical_version and search_db.is_current(key, lexical_version):
-        return True
-    if refresh_user_lexical_artifacts(key) is None:
-        return False
-    new_version = str(_load_lexical_index_manifest(key).get('sourceVersion') or '')
-    return bool(new_version) and search_db.is_current(key, new_version)
-
 
 def delete_user_lexical_index_data(user_id: str) -> None:
     """Delete a library's cached lexical-index blobs (data + manifest) and
@@ -6135,45 +6087,6 @@ def _build_user_sort_index_snapshot(user_id: str, source_version: str) -> Option
     )
 
 
-def _merge_user_sort_index_snapshot(
-    user_id: str, existing: LexicalIndexSnapshot, dirty_filenames: Set[str], source_version: str,
-) -> Optional[LexicalIndexSnapshot]:
-    """Incremental counterpart to _build_user_sort_index_snapshot: only
-    re-fetch the filenames known to have changed and merge them into the
-    existing snapshot's rows, instead of re-scanning the whole partition --
-    mirrors _merge_user_lexical_index_snapshot exactly."""
-    metadata_table_client = _CTX.get('metadata_table_client')
-    if metadata_table_client is None:
-        return None
-    by_filename: Dict[str, Dict[str, object]] = {
-        str(row.get('RowKey') or ''): row for row in existing.rows if row.get('RowKey')
-    }
-
-    def _refresh_one(filename: str) -> Tuple[str, Optional[Dict[str, object]]]:
-        try:
-            entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
-        except Exception:
-            return filename, None
-        if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
-            return filename, None
-        return filename, _sort_index_row(dict(entity))
-
-    if dirty_filenames:
-        with ThreadPoolExecutor(max_workers=min(_INDEX_MERGE_CONCURRENCY, max(1, len(dirty_filenames)))) as executor:
-            for filename, trimmed_row in executor.map(_refresh_one, dirty_filenames):
-                if trimmed_row is None:
-                    by_filename.pop(filename, None)
-                else:
-                    by_filename[filename] = trimmed_row
-
-    return LexicalIndexSnapshot(
-        user_id=str(user_id),
-        source_version=source_version,
-        schema_version=_SORT_INDEX_SCHEMA_VERSION,
-        updated_at=source_version,
-        rows=list(by_filename.values()),
-    )
-
 
 def _upload_file_to_blob(client, path: str, **kwargs):
     """Publish a finished local file. Share-backed/real clients stream it from
@@ -6857,47 +6770,6 @@ def _build_user_access_index_snapshot(user_id: str, source_version: str) -> Opti
         rows=trimmed_rows,
     )
 
-
-def _merge_user_access_index_snapshot(
-    user_id: str, existing: LexicalIndexSnapshot, dirty_filenames: Set[str], source_version: str,
-) -> Optional[LexicalIndexSnapshot]:
-    """Incremental counterpart to _build_user_access_index_snapshot: only
-    re-fetch the filenames known to have changed and merge them into the
-    existing snapshot's rows, instead of re-scanning the whole partition --
-    mirrors _merge_user_sort_index_snapshot, with one deliberate difference:
-    a dirty filename that now reads processing_state == 'deleted' (soft
-    trash) is refreshed and KEPT, not dropped -- see the module comment
-    above for why. Only a filename whose row is genuinely gone (hard delete
-    -- get_entity raises) is removed."""
-    metadata_table_client = _CTX.get('metadata_table_client')
-    if metadata_table_client is None:
-        return None
-    by_filename: Dict[str, Dict[str, object]] = {
-        str(row.get('RowKey') or ''): row for row in existing.rows if row.get('RowKey')
-    }
-
-    def _refresh_one(filename: str) -> Tuple[str, Optional[Dict[str, object]]]:
-        try:
-            entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
-        except Exception:
-            return filename, None
-        return filename, _access_index_row(dict(entity))
-
-    if dirty_filenames:
-        with ThreadPoolExecutor(max_workers=min(_INDEX_MERGE_CONCURRENCY, max(1, len(dirty_filenames)))) as executor:
-            for filename, trimmed_row in executor.map(_refresh_one, dirty_filenames):
-                if trimmed_row is None:
-                    by_filename.pop(filename, None)
-                else:
-                    by_filename[filename] = trimmed_row
-
-    return LexicalIndexSnapshot(
-        user_id=str(user_id),
-        source_version=source_version,
-        schema_version=_ACCESS_INDEX_SCHEMA_VERSION,
-        updated_at=source_version,
-        rows=list(by_filename.values()),
-    )
 
 
 @catalog_publisher

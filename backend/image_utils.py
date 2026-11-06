@@ -601,28 +601,6 @@ def create_video_thumbnail_data(video_bytes: bytes, filename: str = '') -> Optio
     return create_thumbnail_data(frame_bytes)
 
 
-def create_thumbnail_data_from_path(path: str) -> bytes:
-    try:
-        with Image.open(path) as image:
-            image = ImageOps.exif_transpose(image)
-            image.thumbnail(THUMBNAIL_SIZE, RESAMPLING_LANCZOS)
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
-            return _save_image_to_bytes(image, THUMBNAIL_FORMAT)
-    except Exception:
-        preview = extract_raw_preview_from_path(path)
-        if preview:
-            try:
-                with Image.open(io.BytesIO(preview)) as image:
-                    image = ImageOps.exif_transpose(image)
-                    image.thumbnail(THUMBNAIL_SIZE, RESAMPLING_LANCZOS)
-                    if image.mode != 'RGB':
-                        image = image.convert('RGB')
-                    return _save_image_to_bytes(image, THUMBNAIL_FORMAT)
-            except Exception:
-                pass
-        return create_placeholder_thumbnail()
-
 
 def extract_embedded_jpeg(raw_bytes: bytes, raw_flip: int = 0) -> Optional[bytes]:
     candidates = []

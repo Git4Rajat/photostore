@@ -49,12 +49,3 @@ def member_outcome(member, row, *, is_video):
         return 'superseded'
     return 'valid'
 
-
-def settlement_requires_original_output(outcome):
-    """True when `outcome` needs the member's ORIGINAL immutable artifacts
-    (not a fresh capture) to settle -- i.e. 'valid'. A 'superseded' outcome
-    needs either that same original output (if still retained) or an
-    explicit recorded supersession/deletion outcome; it is a release
-    decision which of those a given deployment requires, not something
-    this primitive can decide on its own."""
-    return outcome == 'valid'
