@@ -20,7 +20,6 @@ export interface AppConfig {
     azureAdClientId?: string;
     azureAdApiScope?: string;
     authMode?: string;
-    blazeFaceModelUrl?: string;
     arcFaceModelUrl?: string;
     arcFaceWasmPath?: string;
     buildTimestamp?: string;

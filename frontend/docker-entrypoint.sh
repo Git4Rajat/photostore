@@ -18,7 +18,6 @@ AZURE_AD_TENANT_ID="${APP_CONFIG_AZURE_AD_TENANT_ID:-}"
 AZURE_AD_CLIENT_ID="${APP_CONFIG_AZURE_AD_CLIENT_ID:-}"
 AZURE_AD_API_SCOPE="${APP_CONFIG_AZURE_AD_API_SCOPE:-}"
 AUTH_MODE="${APP_CONFIG_AUTH_MODE:-entra}"
-BLAZE_FACE_MODEL_URL="${APP_CONFIG_BLAZE_FACE_MODEL_URL:-/models/browser-ai/models/blazeface/model.json}"
 ARC_FACE_MODEL_URL="${APP_CONFIG_ARC_FACE_MODEL_URL:-/models/browser-ai/models/adaface/model.onnx}"
 ARC_FACE_WASM_PATH="${APP_CONFIG_ARC_FACE_WASM_PATH:-/models/browser-ai/runtime/}"
 PROCESSING_MODE="${APP_CONFIG_PROCESSING_MODE:-browser}"
@@ -54,7 +53,6 @@ window.__APP_CONFIG__ = {
   azureAdClientId: "${AZURE_AD_CLIENT_ID}",
   azureAdApiScope: "${AZURE_AD_API_SCOPE}",
   authMode: "${AUTH_MODE}",
-  blazeFaceModelUrl: "${BLAZE_FACE_MODEL_URL}",
   arcFaceModelUrl: "${ARC_FACE_MODEL_URL}",
   arcFaceWasmPath: "${ARC_FACE_WASM_PATH}",
   buildTimestamp: "${BUILD_TS}",

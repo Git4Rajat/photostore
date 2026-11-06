@@ -7,10 +7,9 @@
   "scripts": {
     "start": "vite",
     "dev": "vite",
-    "sync:blazeface-model": "node scripts/sync-blazeface-model.mjs",
     "sync:browser-ai-runtime": "node scripts/sync-browser-ai-runtime.mjs",
     "sync:video-runtime": "node scripts/sync-video-runtime.mjs",
-    "prebuild": "npm run sync:blazeface-model && npm run sync:browser-ai-runtime && npm run sync:video-runtime",
+    "prebuild": "npm run sync:browser-ai-runtime && npm run sync:video-runtime",
     "build": "vite build && chmod -R a+rX build/models",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src",

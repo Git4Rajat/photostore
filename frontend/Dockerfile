@@ -12,7 +12,6 @@ COPY package*.json ./
 RUN npm ci --no-audit --no-fund
 
 COPY . ./
-RUN npm run sync:blazeface-model
 RUN node scripts/sync-browser-ai-runtime.mjs
 # TEMPORARY (2026-08-12): the repo's Git LFS budget is exceeded, so CI
 # checks these two files out with lfs:false (real bytes never materialize --
@@ -26,9 +25,7 @@ RUN curl -fsSL -o public/models/browser-ai/models/adaface/model.onnx \
 RUN curl -fsSL -o public/models/browser-ai/models/yolo-face/model.onnx \
     https://github.com/Git4Rajat/photostore/releases/download/model-weights-lfs-workaround/yolo-face-model.onnx
 RUN chmod -R a+rX public/models
-RUN test -f public/models/browser-ai/models/blazeface/model.json && \
-    test -f public/models/browser-ai/models/blazeface/group1-shard1of1.bin && \
-    test -f public/models/browser-ai/models/adaface/model.onnx && \
+RUN test -f public/models/browser-ai/models/adaface/model.onnx && \
     test -f public/models/browser-ai/models/adaface/LICENSE && \
     test -f public/models/browser-ai/models/yolo-face/model.onnx
 # Guard against the YOLOv8n-face model shipping as a Git LFS pointer (~130 B)
@@ -58,7 +55,7 @@ RUN onnx=public/models/browser-ai/models/adaface/model.onnx; \
 # etc., which is what deploy/resources.bicep actually pins -- keep both in sync
 # when the model path changes (a mismatch here is exactly how the AdaFace swap
 # silently kept loading the old ArcFace model despite the code/version bump).
-RUN node -e 'const fs=require("fs"); const ts=new Date().toISOString(); const content = `window.__APP_CONFIG__ = { apiBaseUrl: "", uploadBaseUrl: "", spaBaseUrl: "", azureAdTenantId: "", azureAdClientId: "", azureAdApiScope: "", authMode: "entra", blazeFaceModelUrl: "/models/browser-ai/models/blazeface/model.json", arcFaceModelUrl: "/models/browser-ai/models/adaface/model.onnx", arcFaceWasmPath: "/models/browser-ai/runtime/", buildTimestamp: "${ts}" };`; try{fs.writeFileSync("public/env.js", content)}catch(e){console.error("failed to write public/env.js",e); process.exit(1);} '
+RUN node -e 'const fs=require("fs"); const ts=new Date().toISOString(); const content = `window.__APP_CONFIG__ = { apiBaseUrl: "", uploadBaseUrl: "", spaBaseUrl: "", azureAdTenantId: "", azureAdClientId: "", azureAdApiScope: "", authMode: "entra", arcFaceModelUrl: "/models/browser-ai/models/adaface/model.onnx", arcFaceWasmPath: "/models/browser-ai/runtime/", buildTimestamp: "${ts}" };`; try{fs.writeFileSync("public/env.js", content)}catch(e){console.error("failed to write public/env.js",e); process.exit(1);} '
 RUN npm run build
 RUN mkdir -p build/decoder-licenses && \
     cp node_modules/@colorhythm/libraw-wasm/LibRaw/* build/decoder-licenses/ && \

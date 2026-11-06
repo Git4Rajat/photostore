@@ -1,7 +1,5 @@
-azure-functions
 azure-core
 Flask
-azure-storage-file-share
 azure-storage-blob
 azure-storage-queue
 azure-data-tables
@@ -13,7 +11,6 @@ azure-messaging-webpubsubservice>=1.3.0,<2
 Pillow>=12.3.0
 pillow-heif
 pillow-jxl-plugin
-imagehash
 numpy
 scikit-learn
 geopy
