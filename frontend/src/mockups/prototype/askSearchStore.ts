@@ -14,7 +14,7 @@ import type { Photo } from './types';
  */
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
-export const mapSearchResult = (b: BackendPhoto): Photo => {
+const mapSearchResult = (b: BackendPhoto): Photo => {
     const iso = b.captureDate || b.uploadDate || null;
     const d = iso ? new Date(iso) : null;
     const valid = d && !Number.isNaN(d.getTime()) ? d : null;

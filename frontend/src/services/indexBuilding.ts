@@ -8,29 +8,16 @@ import { getTools } from './apiClient';
  *
  * Exports:
  * - useIndexBuilding() - returns true if any index is building (for banner)
- * - useIndexStatus() - returns detailed per-index status {sort, lexical, albums, people}
  * - reportIndexBuilding(source, bool) - pages report when they need to wait
  * - onIndexReady() - callback when all indexes become ready
  */
 
 type Listener = () => void;
 
-interface IndexDetail {
-  ready: boolean;
-  dirty: boolean;
-  updated_at?: string;
-}
-
-interface IndexStatus {
-  [key: string]: IndexDetail;
-}
-
 const sources = new Set<string>();
 const listeners = new Set<Listener>();
 const readyListeners = new Set<() => void>();
 let isBuilding = false;
-let indexStatus: IndexStatus = { sort: { ready: false, dirty: false }, lexical: { ready: false, dirty: false }, albums: { ready: false, dirty: false }, people: { ready: false, dirty: false } };
-const statusListeners = new Set<Listener>();
 let timer: ReturnType<typeof setTimeout> | null = null;
 let polling = false;
 let tries = 0;
@@ -48,22 +35,13 @@ const emit = () => {
     }
 };
 
-const emitStatus = () => {
-    statusListeners.forEach((l) => l());
-};
-
 const poll = async () => {
     timer = null;
     if (polling) return;
     polling = true;
     try {
-        const status = await getTools<{ ready?: boolean; building?: boolean; indexes?: IndexStatus }>('/api/tools/indexes/status').catch(() => null);
+        const status = await getTools<{ ready?: boolean; building?: boolean }>('/api/tools/indexes/status').catch(() => null);
         if (status) {
-            // Update detailed index status
-            if (status.indexes) {
-                indexStatus = status.indexes as IndexStatus;
-                emitStatus();
-            }
             // If all indexes ready and not building, clear polling sources
             if (status.ready && !status.building) {
                 POLLED.forEach((s) => sources.delete(s));
@@ -103,25 +81,15 @@ const subscribe = (l: Listener) => {
     return () => { listeners.delete(l); };
 };
 
-const subscribeStatus = (l: Listener) => {
-    statusListeners.add(l);
-    return () => { statusListeners.delete(l); };
-};
-
 export const useIndexBuilding = (): boolean => useSyncExternalStore(subscribe, () => isBuilding, () => false);
-
-/** Subscribe to per-index status updates. Returns current status and unsubscribe function. */
-export const useIndexStatus = (): IndexStatus => useSyncExternalStore(subscribeStatus, () => ({ ...indexStatus }), () => indexStatus);
 
 export const __resetIndexBuildingForTests = (): void => {
     sources.clear();
     readyListeners.clear();
-    statusListeners.clear();
     if (timer) clearTimeout(timer);
     timer = null;
     polling = false;
     tries = 0;
     isBuilding = false;
-    indexStatus = { sort: { ready: false, dirty: false }, lexical: { ready: false, dirty: false }, albums: { ready: false, dirty: false }, people: { ready: false, dirty: false } };
     emit();
 };

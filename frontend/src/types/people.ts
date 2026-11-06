@@ -19,11 +19,3 @@ export interface PersonFace {
     confidence?: number;
 }
 
-export interface PersonSummary {
-    personId: string;
-    name?: string;
-    faceIds?: string[];
-    faceCount?: number;
-    representativeFace?: PersonFace;
-    representativeFaces?: PersonFace[];
-}

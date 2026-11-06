@@ -180,7 +180,6 @@ const zoomAroundPoint = (
 };
 
 const panView = (view: TimelineViewState, deltaDays: number, totalSpanDays: number): TimelineViewState => {
-    const span = view.endDay - view.startDay;
     let newStart = view.startDay + deltaDays;
     let newEnd = view.endDay + deltaDays;
     if (newStart < 0) {

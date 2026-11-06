@@ -19,7 +19,7 @@ const initialsFor = (value: string): string => {
 const SharingPage: React.FC = () => {
     const {
         members, pendingInvites, libraryName, isOwner, maxMembers, membersLoading,
-        reloadMembers, fetchMembers, invite, revokeInvite, removeMember, renameLibrary, toast,
+        fetchMembers, invite, revokeInvite, removeMember, renameLibrary, toast,
     } = useStore();
     const [email, setEmail] = useState('');
     const [targetType, setTargetType] = useState<'join' | 'fresh'>('join');
