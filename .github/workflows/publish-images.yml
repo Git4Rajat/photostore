@@ -177,6 +177,8 @@ jobs:
           pattern: wave-image-*
           path: release-images
           merge-multiple: true
+      # pytest is deliberately absent from the production image, so install it
+      # (into the container's user site, not the image) just for this check.
       - name: Qualify wave code in the exact backend image
         run: |
           BACKEND_IMAGE=$(python3 -c "import json; print(json.load(open('release-images/backend.json'))['image'])")
@@ -185,7 +187,7 @@ jobs:
             -v "$PWD/backend/tests:/app/tests:ro" \
             -v "$PWD/backend/scripts:/app/scripts:ro" \
             -v "$PWD/deploy:/deploy:ro" \
-            "$BACKEND_IMAGE" -c 'python -m pytest tests/test_wave*.py tests/test_upload_wave*.py tests/test_fresh_wave*.py tests/test_execution_lease.py tests/test_processing_artifacts.py tests/test_processing_failure_capsules.py tests/test_clustering_checkpoint.py tests/test_queue_scale_patch.py tests/test_apply_client_processing_recovery.py tests/test_maintenance_efficiency.py tests/test_person_label_indexes.py tests/test_periodic_index_artifact_recovery.py tests/test_index_maintenance_worker.py tests/test_people_index.py tests/test_summary_database_integration.py tests/test_metadata_write_concurrency.py tests/test_search_db*.py tests/test_index_source_reads.py tests/test_lexical_incremental.py tests/test_people_embedding_incremental.py -q'
+            "$BACKEND_IMAGE" -c 'pip install --user -q pytest==9.2.0 && python -m pytest tests/test_wave*.py tests/test_upload_wave*.py tests/test_fresh_wave*.py tests/test_execution_lease.py tests/test_processing_artifacts.py tests/test_processing_failure_capsules.py tests/test_clustering_checkpoint.py tests/test_queue_scale_patch.py tests/test_apply_client_processing_recovery.py tests/test_maintenance_efficiency.py tests/test_person_label_indexes.py tests/test_periodic_index_artifact_recovery.py tests/test_index_maintenance_worker.py tests/test_people_index.py tests/test_summary_database_integration.py tests/test_metadata_write_concurrency.py tests/test_search_db*.py tests/test_index_source_reads.py tests/test_lexical_incremental.py tests/test_people_embedding_incremental.py -q'
       - name: Qualify Vision queue ownership and OCR in the exact Vision image
         run: |
           VISION_IMAGE=$(python3 -c "import json; print(json.load(open('release-images/ipworker.json'))['image'])")
