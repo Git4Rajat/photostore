@@ -207,11 +207,8 @@ html[data-theme='dark'] {
   .card-glass,
   .field,
   .btn,
-  .sort-btn,
   .photo-card,
-  .person-tile,
-  .ios-header,
-  .file-input {
+  .ios-header {
     border-width: 1.5px;
   }
 }
@@ -248,32 +245,15 @@ html[data-theme='dark'] {
   .card-glass,
   .field,
   .btn,
-  .sort-btn,
-  .file-input,
   .photo-card,
-  .person-tile,
   .ios-header,
-  .people-searchbar,
-  .people-merge-input,
-  .people-icon-btn,
   .icon-btn,
   .notification-pane,
-  .people-panel,
   .tools-panel,
-  .albums-sidebar,
-  .albums-canvas,
-  .gallery-controls-surface,
-  .album-list-card,
-  .exif-panel,
   .photo-preview-panel,
   .photo-preview-details,
   .photo-preview-icon,
-  .photo-preview-nav,
-  .theme-switcher,
-  .theme-option,
-  .account-menu-pane,
-  .app-menu-panel,
-  .app-menu-backdrop {
+  .photo-preview-nav {
     backdrop-filter: none;
     -webkit-backdrop-filter: none;
   }
@@ -299,36 +279,18 @@ html[data-theme='dark'] {
   .card-glass,
   .ios-header,
   .photo-card,
-  .person-tile,
   .btn,
   .field,
-  .file-input,
-  .album-list-card,
   .tools-panel,
-  .tools-queue-card,
-  .people-panel,
   .notification-pane,
   .photo-preview-panel,
   .photo-preview-thumb,
-  .person-avatar,
-  .people-hero-icon,
-  .albums-metric-card,
-  .public-banner,
-  .additional-card,
-  .theme-switcher {
+  .additional-card {
     corner-shape: squircle;
   }
 
-  .sort-btn,
-  .people-icon-btn,
   .icon-btn,
-  .people-secondary-btn,
-  .people-merge-btn,
-  .like-btn,
-  .person-select-indicator,
-  .check-float,
-  .photo-preview-icon,
-  .theme-option {
+  .photo-preview-icon {
     corner-shape: squircle;
   }
 }
@@ -871,9 +833,7 @@ a {
 }
 
 .icon-btn[aria-label]:hover::after,
-.icon-btn[aria-label]:focus-visible::after,
-.people-icon-btn[aria-label]:hover::after,
-.people-icon-btn[aria-label]:focus-visible::after {
+.icon-btn[aria-label]:focus-visible::after {
   content: attr(aria-label);
   position: absolute;
   bottom: calc(100% + 8px);
@@ -890,9 +850,7 @@ a {
 }
 
 .icon-btn[aria-label]:hover::before,
-.icon-btn[aria-label]:focus-visible::before,
-.people-icon-btn[aria-label]:hover::before,
-.people-icon-btn[aria-label]:focus-visible::before {
+.icon-btn[aria-label]:focus-visible::before {
   content: '';
   position: absolute;
   bottom: calc(100% + 3px);
@@ -1161,9 +1119,7 @@ html[data-theme='light'] .notification-item.unread {
 }
 
 .field,
-.sort-btn,
-.btn,
-.file-input {
+.btn {
   border: 1px solid var(--lg-edge);
   border-radius: var(--r-lg);
   background: var(--lg-surface-strong);
@@ -1173,16 +1129,12 @@ html[data-theme='light'] .notification-item.unread {
   transition: border-color var(--dur-quick) ease, box-shadow var(--dur-quick) ease, background-color var(--dur-quick) ease, transform var(--dur-quick) ease;
 }
 
-.field,
-.file-input {
+.field {
   padding: 10px 12px;
 }
 
 .field:focus-visible,
-.file-input:focus-visible,
-.field-select:focus-visible,
-.field-compact:focus-visible,
-.field-date:focus-visible {
+.field-select:focus-visible {
   outline: none;
   border-color: rgba(30, 106, 225, 0.4);
   box-shadow: var(--focus-ring);
@@ -1259,7 +1211,6 @@ html[data-theme='light'] .notification-item.unread {
   height: 16px;
 }
 
-.sort-btn,
 .btn {
   padding: 9px 13px;
   cursor: pointer;
@@ -1277,20 +1228,17 @@ html[data-theme='light'] .notification-item.unread {
   flex: 0 0 auto;
 }
 
-.sort-btn:focus-visible,
 .btn:focus-visible {
   outline: none;
   border-color: rgba(30, 106, 225, 0.4);
   box-shadow: var(--focus-ring);
 }
 
-.sort-btn:hover,
 .btn:hover {
   transform: translateY(-1px);
   box-shadow: var(--lg-shadow-resting);
 }
 
-.sort-btn:active,
 .btn:active {
   transform: scale(0.97);
 }
@@ -2383,17 +2331,13 @@ video.photo-preview-media.is-loading {
   text-align: center;
 }
 
-.tools-action-button .toolbar-icon,
-.tools-force-button .toolbar-icon,
-.tools-admin-button .toolbar-icon,
-.tools-admin-link .toolbar-icon {
+.tools-admin-button .toolbar-icon {
   width: 14px;
   height: 14px;
   flex: 0 0 auto;
 }
 
-.tools-admin-button,
-.tools-admin-link {
+.tools-admin-button {
   min-height: 36px;
   width: auto;
   min-width: 44px;
@@ -2439,18 +2383,13 @@ video.photo-preview-media.is-loading {
 /* Bottom scrim: label + count baked over the image, matching the mockup's
    place/thing cards, instead of plain text below the thumbnail. */
 
-.tools-hero-actions .icon-btn,
-.tools-panel .icon-btn,
-.tools-admin .icon-btn {
+.tools-panel .icon-btn {
   min-height: 36px;
   min-width: 36px;
   padding: 7px 8px;
 }
 
-.tools-panel .btn,
-.tools-panel .sort-btn,
-.tools-admin .btn,
-.tools-admin .sort-btn {
+.tools-panel .btn {
   padding: 7px 10px;
   font-size: 12px;
 }
@@ -2571,10 +2510,7 @@ video.photo-preview-media.is-loading {
     display: none;
   }
 
-  .tools-hero,
-  .tools-panel-header,
-  .tools-selection-row,
-  .tools-workbench-footnote {
+  .tools-panel-header {
     flex-direction: column;
     align-items: stretch;
   }
@@ -2732,16 +2668,12 @@ video.photo-preview-media.is-loading {
     align-items: center;
   }
 
-  .tools-action-button,
-  .tools-admin-button,
-  .tools-admin-link {
+  .tools-admin-button {
     width: auto;
     justify-content: center;
   }
 
-  .field-select,
-  .field-compact,
-  .field-date {
+  .field-select {
     width: 100%;
   }
 }
