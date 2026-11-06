@@ -237,6 +237,19 @@ describe('index-backed gallery cache', () => {
         expect(fetch).toHaveBeenCalledTimes(1); // restore can reuse the persisted snapshot
     });
 
+    it('does not re-hide a photo that was restored right after it was deleted', async () => {
+        let index = await import('./localSortIndex');
+        await index.getLocalSortIndex();
+        // Delete then restore back-to-back, before the delete's IndexedDB
+        // write-back has run (Trash > Restore all straight after a delete).
+        index.removeLocalSortIndexRows(['a.jpg']);
+        index.clearLocalSortIndexRemovals(['a.jpg']);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        vi.resetModules();
+        index = await import('./localSortIndex');
+        expect((await index.getLocalSortIndex())?.map(row => row.filename)).toEqual(['a.jpg', 'b.jpg']);
+    });
+
     it('filters deleted rows even when a stale snapshot is downloaded again', async () => {
         const index = await import('./localSortIndex');
         await index.getLocalSortIndex();

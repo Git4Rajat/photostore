@@ -28,6 +28,7 @@ vi.mock('../../services/jobNotifications', () => ({ requestJobPoll: mocks.poll }
 import { __resetPendingEditsForTests, beginPendingEdit, confirmPendingEdit, rollbackPendingEdit, pendingEditScope } from '../../services/pendingEdits';
 import { AlbumsPage } from './pages/AlbumsPage';
 import { __resetAlbumOperationsForTests, beginAlbumDelete, updateAlbumCreateReceipt, hasAlbumDeleteTombstone, clearAlbumDeleteTombstone } from '../../services/albumOperations';
+import { clearLocalSortIndexRemovals } from '../../services/localSortIndex';
 import { galleryIndexPhoto, StoreProvider, useStore } from './store';
 
 let store: ReturnType<typeof useStore>;
@@ -67,6 +68,14 @@ describe('index-backed gallery', () => {
         expect(mocks.post).toHaveBeenCalledWith('/albums/a1/photos/remove', { filenames: ['p1.jpg', 'p2.jpg'] });
         expect(mocks.post).not.toHaveBeenCalledWith('/photos/delete', expect.anything());
         expect(store.albums.find((a) => a.id === 'a1')?.photoCount).toBe(1);
+    });
+
+    it('restoring all of the trash un-hides the photos the server restored, even ones this tab never loaded', async () => {
+        mocks.post.mockResolvedValue({ restored: ['gone.jpg'], success: true });
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async () => { store.restoreAllTrash(); });
+        expect(mocks.post).toHaveBeenCalledWith('/photos/trash/restore-all', {});
+        await waitFor(() => expect(clearLocalSortIndexRemovals).toHaveBeenCalledWith(['gone.jpg']));
     });
 
     it('audit: purging an album deleted in another browser must create local protection', async () => {
