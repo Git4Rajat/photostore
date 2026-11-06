@@ -343,7 +343,9 @@ email transport above to be configured, since invites are delivered by email.)
 a password? Deploy, then run [`deploy/setup-auth.sh`](deploy/setup-auth.sh) in
 [Azure Cloud Shell](https://portal.azure.com) to create Entra app
 registrations and switch the app to `AUTH_MODE=entra`. This requires rights to
-register apps and grant admin consent in your directory.
+register apps and grant admin consent in your directory. Download the script and
+read it before running it; to match your deployment exactly, fetch it from your
+release's tag or commit rather than `main`.
 
 ### Container images
 

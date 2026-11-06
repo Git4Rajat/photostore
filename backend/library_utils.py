@@ -52,6 +52,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
+from azure.core.exceptions import ResourceExistsError
+
 # The cap on how many members a single library may have, counting the owner and
 # any outstanding (pending) invites. Settled with the product owner.
 MAX_LIBRARY_MEMBERS = 15
@@ -138,6 +140,10 @@ def _as_bool(value) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in ('1', 'true', 'yes')
+
+
+class EmailAlreadyRegistered(RuntimeError):
+    """Another account already owns this email's lookup row."""
 
 
 class InviteIndexNotReady(RuntimeError):
@@ -251,8 +257,13 @@ class LibraryStore:
         email: str,
         password_hash: Optional[str] = None,
         user_id: Optional[str] = None,
+        exclusive: bool = False,
     ) -> Dict:
         """Create an account + its email lookup row. Idempotent per user_id.
+
+        ``exclusive=True`` claims the email lookup row atomically and raises
+        ``EmailAlreadyRegistered`` if another account already holds it, so two
+        concurrent self-service sign-ups for one address can't both succeed.
 
         The account's personal library id equals its user id. Callers are
         responsible for also creating the library + owner membership (see
@@ -272,6 +283,13 @@ class LibraryStore:
         }
         if password_hash:
             entity['passwordHash'] = password_hash
+        if exclusive and norm:
+            try:
+                self.users.create_entity({'PartitionKey': _EMAIL_PK, 'RowKey': norm, 'userId': uid})
+            except ResourceExistsError:
+                raise EmailAlreadyRegistered(norm)
+            self.users.upsert_entity(entity)
+            return entity
         self.users.upsert_entity(entity)
         if norm:
             self.users.upsert_entity({

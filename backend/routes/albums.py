@@ -547,7 +547,7 @@ def share_album(album_id: str):
     if clear_access_code:
         entity['accessCode'] = ''
     elif access_code:
-        entity['accessCode'] = access_code
+        entity['accessCode'] = app._hash_album_access_code(access_code)
 
     entity['updatedAt'] = app.datetime.now(app.timezone.utc).isoformat()
     app._save_album_entity(entity)

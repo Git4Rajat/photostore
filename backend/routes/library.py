@@ -129,6 +129,23 @@ def library_invite_revoke():
     app.library_store.audit(library_id, actor=account_id, action='invite-revoked', target=invite_id)
     return app.jsonify({'status': 'ok'})
 
+def _invite_probe_row() -> str:
+    ip = app.request.remote_addr or ''
+    return 'invite-throttle:ip:' + app.hashlib.sha256(ip.encode('utf-8')).hexdigest()[:16]
+
+
+def _invite_probe_blocked():
+    """429 once one address has made too many invalid-token lookups. These
+    endpoints are unauthenticated, so bad guesses are throttled like logins."""
+    if not app.password_auth.login_attempt_allowed(app.config_table_client, _invite_probe_row()):
+        return app.jsonify({'error': 'Too many attempts. Please wait and try again.'}), 429
+    return None
+
+
+def _invite_probe_failed():
+    app.password_auth.record_login_failure(app.config_table_client, row_key=_invite_probe_row(), free_attempts=10)
+
+
 @library_bp.route('/api/library/invite/info', methods=['GET'])
 def library_invite_info():
     """Public: minimal, non-sensitive details so the accept page can render.
@@ -136,9 +153,13 @@ def library_invite_info():
     Reveals only what the recipient already knows (they hold the emailed link):
     the target library name and whether they must set a password (new account).
     """
+    blocked = _invite_probe_blocked()
+    if blocked:
+        return blocked
     token = str(app.request.args.get('token', '') or '')
     invite = app.library_store.get_invite_by_token(token) if app.library_store else None
     if not invite:
+        _invite_probe_failed()
         return app.jsonify({'valid': False}), 404
     library_id = str(invite.get('PartitionKey') or '')
     target_type = str(invite.get('targetType') or 'join')
@@ -156,10 +177,14 @@ def library_invite_info():
 
 @library_bp.route('/api/library/invite/accept', methods=['POST'])
 def library_invite_accept():
+    blocked = _invite_probe_blocked()
+    if blocked:
+        return blocked
     data = app.request.get_json(silent=True) or {}
     token = str(data.get('token', '') or '')
     invite = app.library_store.get_invite_by_token(token) if app.library_store else None
     if not invite:
+        _invite_probe_failed()
         return app.jsonify({'error': 'This invitation is invalid or has expired.'}), 400
     email = app.library_utils.normalize_email(invite.get('emailNorm'))
     target_type = str(invite.get('targetType') or 'join')
@@ -185,7 +210,10 @@ def library_invite_accept():
         if len(password) < 8:
             return app.jsonify({'error': 'Please choose a password of at least 8 characters.'}), 400
         account_id = app.library_utils.new_user_id()
-        app.library_store.create_user(email=email, password_hash=app.password_auth.hash_password(password), user_id=account_id)
+        try:
+            app.library_store.create_user(email=email, password_hash=app.password_auth.hash_password(password), user_id=account_id, exclusive=True)
+        except app.library_utils.EmailAlreadyRegistered:
+            return app.jsonify({'error': 'An account for this email was just created. Please sign in and open the link again.'}), 409
         app.library_store.ensure_personal_library(account_id, name=email)
         new_account = True
 

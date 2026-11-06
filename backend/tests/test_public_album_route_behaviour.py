@@ -242,3 +242,12 @@ def test_share_preview_cache_is_bounded_and_expires(monkeypatch):
     assert public._share_preview_cache_get(('a', 'big')) is None
     monkeypatch.setattr(public, '_SHARE_PREVIEW_CACHE_TTL_SECONDS', -1)
     assert public._share_preview_cache_get(('a', 'v')) is None
+
+
+def test_access_code_matching_supports_hashed_and_legacy_plaintext():
+    hashed = app._hash_album_access_code('correct horse')
+    assert hashed.startswith('scrypt$') and 'correct horse' not in hashed
+    assert app._album_access_code_matches(hashed, 'correct horse')
+    assert not app._album_access_code_matches(hashed, 'wrong code')
+    assert app._album_access_code_matches('legacy-code', 'legacy-code')
+    assert not app._album_access_code_matches('legacy-code', 'légacy-code')

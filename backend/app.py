@@ -2138,7 +2138,20 @@ def _derive_album_grant_secret() -> str:
 
 _ALBUM_GRANT_SECRET = _derive_album_grant_secret()
 _ALBUM_GRANT_COOKIE_PREFIX = 'album_grant_'
-MIN_ALBUM_ACCESS_CODE_LENGTH = 4
+MIN_ALBUM_ACCESS_CODE_LENGTH = 6
+
+
+def _hash_album_access_code(code: str) -> str:
+    """Stored form of a new access code (scrypt, never the plaintext)."""
+    return password_auth.hash_password(code)
+
+
+def _album_access_code_matches(stored: str, provided: str) -> bool:
+    # Codes saved before hashing was introduced are still plaintext; they keep
+    # working and are replaced by a hash the next time the owner re-shares.
+    if stored.startswith('scrypt$'):
+        return password_auth.verify_password(provided, stored)
+    return hmac.compare_digest(stored.encode('utf-8'), provided.encode('utf-8'))
 
 
 def _album_access_code(entity: Dict) -> str:
@@ -2200,7 +2213,7 @@ def _album_access_code_gate(entity: Dict, token: str, provided: str):
     if not password_auth.login_attempt_allowed(config_table_client, row_key):
         retry_after = password_auth.seconds_until_unlocked(config_table_client, row_key)
         return jsonify({'codeRequired': True, 'retryAfterSeconds': retry_after}), 429
-    if provided and hmac.compare_digest(access_code.encode('utf-8'), provided.encode('utf-8')):
+    if provided and _album_access_code_matches(access_code, provided):
         password_auth.record_login_success(config_table_client, row_key)
         return None
     if provided:

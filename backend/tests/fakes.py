@@ -38,6 +38,12 @@ class FakeTable:
         self.rows[key] = dict(entity)
         self.stamps[(entity['PartitionKey'], entity['RowKey'])] = self.clock() if self.clock else datetime.now(timezone.utc)
 
+    def create_entity(self, entity, **kwargs):
+        from azure.core.exceptions import ResourceExistsError
+        if (entity['PartitionKey'], entity['RowKey']) in self.rows:
+            raise ResourceExistsError('entity already exists')
+        self.upsert_entity(entity)
+
     def submit_transaction(self, operations):
         # Real azure-data-tables requires every entity in one transaction to
         # share a PartitionKey and caps it at 100 operations -- not enforced

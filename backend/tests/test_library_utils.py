@@ -155,3 +155,12 @@ def test_set_password_and_bump_version():
     assert s.get_user('owner')['passwordHash'] == 'newhash'
     assert s.token_version('owner') == 1
     assert s.bump_token_version('owner') == 2
+
+
+def test_exclusive_create_user_refuses_an_email_already_claimed():
+    import pytest
+    s = make_store()
+    s.create_user(email='a@x.com', password_hash='h1', user_id='u1', exclusive=True)
+    with pytest.raises(library_utils.EmailAlreadyRegistered):
+        s.create_user(email='A@x.com', password_hash='h2', user_id='u2', exclusive=True)
+    assert s.get_user_by_email('a@x.com')['RowKey'] == 'u1'
