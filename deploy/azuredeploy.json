@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.37.4.10188",
-      "templateHash": "260785427323034723"
+      "templateHash": "16643165623047397997"
     }
   },
   "parameters": {
@@ -249,7 +249,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.37.4.10188",
-              "templateHash": "1472580975380182995"
+              "templateHash": "9450722756310471318"
             }
           },
           "parameters": {
@@ -657,6 +657,14 @@
                       "maxAgeInSeconds": 3600
                     }
                   ]
+                },
+                "deleteRetentionPolicy": {
+                  "enabled": true,
+                  "days": 14
+                },
+                "containerDeleteRetentionPolicy": {
+                  "enabled": true,
+                  "days": 14
                 },
                 "lastAccessTimeTrackingPolicy": "[if(parameters('enableBlobLifecycleManagement'), createObject('enable', true(), 'name', 'AccessTimeTracking', 'trackingGranularityInDays', 1, 'blobType', createArray('blockBlob')), null())]"
               },
@@ -1327,6 +1335,10 @@
                         {
                           "name": "APP_CONFIG_SPA_BASE_URL",
                           "value": "[format('https://{0}.{1}', variables('webAppName'), reference(resourceId('Microsoft.App/managedEnvironments', variables('environmentName')), '2024-03-01').defaultDomain)]"
+                        },
+                        {
+                          "name": "STORAGE_ACCOUNT_NAME",
+                          "value": "[variables('storageAccountName')]"
                         },
                         {
                           "name": "APP_CONFIG_AUTH_MODE",
