@@ -17,7 +17,7 @@ import type { Photo } from './types';
 // we reuse those instead of duplicating the rules.
 
 /** Directly-loadable thumbnail source when no scoped access token is needed. */
-export const directThumbnailSource = (photo: Photo): string | undefined => {
+const directThumbnailSource = (photo: Photo): string | undefined => {
     // Same URL the gallery uses (container token + sort-index blob name) whenever both are
     // loaded, so a thumbnail already fetched on another page is a browser-cache hit instead
     // of a second download through a per-photo SAS link.

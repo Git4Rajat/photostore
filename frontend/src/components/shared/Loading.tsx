@@ -9,7 +9,7 @@ interface LoadingProps {
 
 // Branded loading indicator: the Keepsake mark inside a spinning accent ring.
 // Used for route/Suspense fallbacks in place of plain "Loading…" text.
-export const Loading: React.FC<LoadingProps> = ({ label = 'Loading…', fullPage = true }) => (
+const Loading: React.FC<LoadingProps> = ({ label = 'Loading…', fullPage = true }) => (
     <div className={`loading-state${fullPage ? ' loading-state--page' : ''}`} role="status" aria-live="polite">
         <span className="loading-mark">
             <Logo size={40} />

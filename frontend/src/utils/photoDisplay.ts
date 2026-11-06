@@ -3,7 +3,7 @@
 // a stub VC-5 decoder for .gpr (the real one requires GoPro's non-free gpr_sdk) --
 // all three always fail decoder.open()/unpack(), so listing them here only costs
 // every upload a guaranteed-failed browser attempt before falling back to the backend.
-export const SUPPORTED_RAW_EXTENSIONS = [
+const SUPPORTED_RAW_EXTENSIONS = [
     '3fr', 'arw', 'bay', 'cap', 'cr2', 'cr3', 'crw', 'dcr',
     'dcs', 'dng', 'drf', 'eip', 'erf', 'fff', 'iiq', 'k25', 'kdc',
     'mdc', 'mef', 'mos', 'mrw', 'nef', 'nrw', 'orf', 'ori', 'pef', 'ptx', 'pxn',

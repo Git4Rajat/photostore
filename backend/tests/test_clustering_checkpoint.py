@@ -186,3 +186,90 @@ def test_explicit_zero_grace_bounds_wave_private_snapshot_retention(snapshot):
     checkpoint.cleanup_checkpoints(share,grace_seconds=0)
     remaining={p.name for p in share.glob('gen-*')}
     assert remaining == set(generations[-2:])
+
+
+def test_trained_checkpoint_restores_without_precompute_allocation_or_training(tmp_path, monkeypatch):
+    import numpy as np
+    import clustering_index as ci
+    config = ci.IndexConfig(flat_max_vectors=10, nlist_min=4, nlist_max=4,
+        pq_subquantizers=2, pq_bits=4, training_sample_size=624, training_iterations=2)
+    vectors = np.random.default_rng(41).normal(size=(700, 8)).astype('float32')
+    runtime = LiveFaceIndex(tmp_path/'work', config=config, candidates=64, nprobe=64)
+    restored = None
+    try:
+        runtime.build(dict(faceId=str(i), personId=f'p{i}', embedding=v,
+                           tier='5pt', embeddingVersion='v1') for i,v in enumerate(vectors))
+        runtime.upsert('delta', 'delta-person', [1]*8, '5pt', 'v1')
+        expected = runtime.best_two(vectors[0], '5pt', 'v1')
+        share = tmp_path/'share'
+        runtime.save_checkpoint(share, source_revision='trained')
+        original = ci.faiss.read_index
+        flags_seen = []
+        def read(path, flags):
+            flags_seen.append(flags)
+            index = original(path, flags)
+            if isinstance(index, ci.faiss.IndexIVFPQ):
+                assert index.precomputed_table.size() == 0
+            return index
+        monkeypatch.setattr(ci.faiss, 'read_index', read)
+        monkeypatch.setattr(ci, 'build_face_index', lambda *a,**kw: pytest.fail('restore retrained'))
+        monkeypatch.setattr(LiveFaceIndex, 'build', lambda *a,**kw: pytest.fail('restore rebuilt'))
+        restored = LiveFaceIndex.restore_checkpoint(share, tmp_path/'restored',
+            source_revision='trained', config=config, candidates=64, nprobe=64)
+        assert restored is not None and flags_seen
+        assert all(flag & ci.faiss.IO_FLAG_SKIP_PRECOMPUTE_TABLE for flag in flags_seen)
+        base = restored._base['5pt','v1',8]
+        assert isinstance(base, ci.faiss.IndexIVFPQ)
+        assert base.use_precomputed_table == -1 and base.precomputed_table.size() == 0
+        assert base.nprobe == base.nlist == 4
+        actual = restored.best_two(vectors[0], '5pt', 'v1')
+        assert actual[:2] == pytest.approx(expected[:2]) and actual[2] == expected[2]
+        assert restored._delta_count == 1
+    finally:
+        if restored is not None:
+            restored.close()
+        runtime.close()
+
+
+def database_manifest(runtime):
+    return dict(counts=checkpoint._counts(runtime._db),groups=[
+        checkpoint._description(runtime,key,index,kind,'unused')
+        for kind,indexes in [('base',runtime._base),('delta',runtime._delta)]
+        for key,index in indexes.items()])
+
+
+@pytest.mark.parametrize('table,column,value',[
+    ('base_slots','face_id','missing'),('base_slots','revision',999),
+    ('delta_slots','face_row',999),('delta_slots','revision',999),
+])
+def test_reachability_rejects_unreachable_current_revisions(snapshot,table,column,value):
+    runtime,_=snapshot
+    runtime.upsert('b','bob',[0,1],'5pt','v1')
+    manifest=database_manifest(runtime)
+    checkpoint._validate_database(runtime._db,manifest)
+    runtime._db.execute(f'UPDATE {table} SET {column}=?',(value,))
+    with pytest.raises(checkpoint.CorruptCheckpoint):
+        checkpoint._validate_database(runtime._db,manifest)
+
+
+def test_checkpoint_validation_avoids_quadratic_sql_work(snapshot):
+    runtime,_=snapshot
+    size=2000
+    runtime.build(dict(faceId=f'f-{i}',personId='alice',embedding=[1,0],
+        tier='5pt',embeddingVersion='v1') for i in range(size))
+    for i in range(32):
+        runtime.upsert(f'f-{i}','bob',[0,1],'5pt','v1')
+    manifest=database_manifest(runtime)
+    calls=0
+    def progress():
+        nonlocal calls
+        calls+=1
+        return 0
+    runtime._db.set_progress_handler(progress,1000)
+    try:
+        checkpoint._validate_database(runtime._db,manifest)
+    finally:
+        runtime._db.set_progress_handler(None,0)
+    # Count SQLite VM work rather than relying on a machine-dependent timer.
+    # Repeated full slot scans take millions of operations at this size.
+    assert calls*1000 < size*300

@@ -359,6 +359,9 @@ def test_app_full_fake_adapter_only_and_incremental_publication_retry(tmp_path, 
     def fail(uid, payload):
         raise RuntimeError('publication failed')
 
+    # Force repair of a missing output; an unchanged, already-confirmed
+    # summary now intentionally avoids the store entirely.
+    monkeypatch.setattr(app, 'load_timeline_summary', lambda uid: None)
     monkeypatch.setattr(app, 'store_timeline_summary', fail)
     with pytest.raises(RuntimeError, match='publication'):
         app._refresh_library_summaries('user')

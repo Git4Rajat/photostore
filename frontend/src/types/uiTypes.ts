@@ -1,4 +1,4 @@
-export interface PhotoPersonLink {
+interface PhotoPersonLink {
     personId: string;
     name: string;
 }
@@ -51,41 +51,4 @@ export interface Photo {
          * fields above. Only present for steps that have one. */
         reasons?: Record<string, string> | null;
     };
-}
-
-export interface PhotoMetadata {
-    exifData?: Record<string, string>;
-    tags?: string[];
-}
-
-export interface WorkbenchHistoryEntry {
-    actionId?: string;
-    action?: string;
-    steps?: string[];
-    scope?: 'selected' | 'view' | 'library';
-    filenameCount?: number;
-    force?: boolean;
-    createdAt?: string;
-}
-
-export interface PeopleDiagnostic {
-    totalFaces: number;
-    acceptedForClustering: number;
-    rejectedFaces: number;
-    suspiciousFaces: number;
-    lowConfidenceFaces: number;
-    staleEmbeddingVersionFaces: number;
-    noEmbeddingFaces: number;
-    unassignedFaces: number;
-    confirmedFaces: number;
-    totalPeople: number;
-    clusteringConfiguration: {
-        browserOnlyProcessing: boolean;
-        clusteringQueueAvailable: boolean;
-        activeClusteringJob?: boolean;
-        allowedEmbeddingVersions?: string[];
-        clusteringEps?: number;
-        clusteringPreset?: string;
-    };
-    recommendation?: string;
 }

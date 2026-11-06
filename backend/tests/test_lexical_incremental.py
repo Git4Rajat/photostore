@@ -649,3 +649,30 @@ def test_parser_and_merge_ram_does_not_scale_with_base(tmp_path, streamed):
     small, large = peak(200), peak(20000)
     assert large < small + 2 * 1024 * 1024
     assert large < 4 * 1024 * 1024
+
+
+def test_parallel_read_failure_preserves_manifest_and_original_guard(ctx, monkeypatch):
+    import threading
+    import index_publication
+    table, service = ctx
+    before = dict(service.data)
+    original = table.get_entity
+    barrier = threading.Barrier(2, timeout=3)
+    guard = object()
+    monkeypatch.setenv('INDEX_SOURCE_READ_CONCURRENCY', '2')
+
+    def read(**kwargs):
+        # Actual integration must propagate publication context to the SDK read.
+        assert index_publication._ACTIVE.get() is guard
+        barrier.wait()
+        if kwargs['row_key'] == 'b.jpg':
+            raise TimeoutError('second source read failed')
+        return original(**kwargs)
+
+    monkeypatch.setattr(table, 'get_entity', read)
+    token = index_publication._ACTIVE.set(guard)
+    try:
+        assert refresh(['a.jpg', 'b.jpg']) is None
+    finally:
+        index_publication._ACTIVE.reset(token)
+    assert service.data == before

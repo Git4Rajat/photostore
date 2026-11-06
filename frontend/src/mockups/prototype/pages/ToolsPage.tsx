@@ -8,6 +8,10 @@ import type { BrowserProcessingAction } from '../../../components/AppServicesPro
 import { get, getTools, postTools, postAdmin } from '../../../services/apiClient';
 import { getRuntimeConfig } from '../../../config/appConfig';
 import { confirmDialog } from '../../../components/shared/dialogs';
+import {
+    describeQueueResult, describeStatusResult, failureReason, runBackfillBatches,
+    type ActionResult, type BackfillBatch, type QueueResponse,
+} from '../toolsActions';
 
 
 const TABS = ['Overview', 'Workbench', 'Recovery', 'History', 'Diagnostics'];
@@ -28,7 +32,12 @@ const STEP_ACTIONS: Record<string, BrowserProcessingAction> = {
 // the run isn't silently stuck at 'pending' waiting for a model that never loads.
 const AI_STEPS = new Set<BrowserProcessingAction>(['ocr', 'vision', 'faces']);
 
-interface HistoryEntry { actionId?: string; action?: string; steps?: string[]; scope?: string; filenameCount?: number; createdAt?: string; }
+interface HistoryEntry {
+    actionId?: string; action?: string; steps?: string[]; scope?: string; filenameCount?: number;
+    outcome?: 'success' | 'partial' | 'failed' | null; detail?: string | null; createdAt?: string;
+}
+
+const BACKFILL_PATH = '/api/admin/backfill/photos';
 
 const INDEX_KIND_LABELS: Record<string, string> = {
     sort: 'Sort index',
@@ -73,7 +82,7 @@ interface PeopleDiagnostic {
 }
 
 /** Tools — live pipeline health + a bulk re-run row + recovery/history. */
-export const ToolsPage: React.FC = () => {
+const ToolsPage: React.FC = () => {
     const { toast, route, navigate } = useStore();
     const {
         activeJobs, clusteringActive, clusteringStatusLabel, ipworkActive, ipworkStatusLabel,
@@ -88,6 +97,8 @@ export const ToolsPage: React.FC = () => {
     const [history, setHistory] = useState<HistoryEntry[]>([]);
     const [historyLoading, setHistoryLoading] = useState(false);
     const [busy, setBusy] = useState(false);
+    // Live status line for the long-running Backfill, which walks the library in pages.
+    const [adminProgress, setAdminProgress] = useState<string | null>(null);
     const [reselectingId, setReselectingId] = useState<string | null>(null);
     const [diagnostic, setDiagnostic] = useState<PeopleDiagnostic | null>(null);
     const [diagnosticLoading, setDiagnosticLoading] = useState(false);
@@ -189,7 +200,10 @@ export const ToolsPage: React.FC = () => {
 
     // Log a history row so History reflects the run even for purely in-browser
     // processing (which otherwise never touches the backend). Best-effort.
-    const recordAction = (stepNames: string[], scope: 'selected' | 'library', filenames?: string[], action = 'reprocess') => {
+    const recordAction = (
+        stepNames: string[], scope: 'selected' | 'library', filenames?: string[], action = 'reprocess',
+        result?: Pick<ActionResult, 'outcome' | 'detail'>,
+    ) => {
         void postTools('/api/tools/workbench/actions', {
             action,
             steps: stepNames,
@@ -197,6 +211,7 @@ export const ToolsPage: React.FC = () => {
             filenameCount: filenames?.length ?? 0,
             filenames: filenames ?? [],
             force: true,
+            ...(result ? { outcome: result.outcome, detail: result.detail ?? '' } : {}),
         }).catch(() => { /* logging must never block the run */ });
     };
 
@@ -214,12 +229,14 @@ export const ToolsPage: React.FC = () => {
         ensureModelForActions(actions);
         try {
             const queued = await startBrowserProcessing({ actions, filenames: wbSelection, force: true });
-            recordAction(wbSteps, 'selected', wbSelection);
+            recordAction(wbSteps, 'selected', wbSelection, 'reprocess', { outcome: 'success' });
             toast(queued > 0
                 ? `Re-processing ${queued} photo${queued === 1 ? '' : 's'} · ${wbSteps.join(', ')}`
                 : `Queued ${wbSelection.length} photo${wbSelection.length === 1 ? '' : 's'} · ${wbSteps.join(', ')}`);
-        } catch {
-            toast('Couldn’t start processing', undefined, undefined, 'error');
+        } catch (error) {
+            const message = failureReason(error, 'Couldn’t start processing');
+            recordAction(wbSteps, 'selected', wbSelection, 'reprocess', { outcome: 'failed', detail: message });
+            toast(message, undefined, undefined, 'error');
         }
     };
 
@@ -227,28 +244,34 @@ export const ToolsPage: React.FC = () => {
         const actions = steps.map((s) => STEP_ACTIONS[s]).filter(Boolean);
         if (!actions.length) return;
         if (backendMode) {
-            toast('This deployment processes on the server — use Recovery → Backfill to re-run the whole library.');
+            toast('This deployment processes on the server, so there is nothing to run in the browser. Recovery → Backfill re-runs the library on the server, except for libraries that process through upload waves.');
             return;
         }
         ensureModelForActions(actions);
         try {
             const queued = await startBrowserProcessing({ actions, force: true });
-            recordAction(steps, 'library');
+            recordAction(steps, 'library', undefined, 'reprocess', { outcome: 'success' });
             toast(queued > 0
                 ? `Re-processing ${queued} photo${queued === 1 ? '' : 's'} · ${steps.join(', ')}`
                 : `Started ${steps.join(', ')} — pulling pending photos…`);
-        } catch {
-            toast('Couldn’t start processing', undefined, undefined, 'error');
+        } catch (error) {
+            const message = failureReason(error, 'Couldn’t start processing');
+            recordAction(steps, 'library', undefined, 'reprocess', { outcome: 'failed', detail: message });
+            toast(message, undefined, undefined, 'error');
         }
     };
 
     const runProcessPending = async () => {
         setBusy(true);
         try {
-            await postTools('/api/tools/ipwork/release', {});
-            toast('Sent pending photos to server processing');
-        } catch {
-            toast('Couldn’t start server processing', undefined, undefined, 'error');
+            const res = await postTools<{ status?: string }>('/api/tools/ipwork/release', {});
+            const result = describeStatusResult(res?.status, {
+                queued: 'Sent pending photos to server processing',
+                waveOwned: 'This library processes photos through upload waves, so there is no pending queue to start.',
+            });
+            toast(result.message, undefined, undefined, result.outcome === 'failed' ? 'error' : 'info');
+        } catch (error) {
+            toast(failureReason(error, 'Couldn’t start server processing'), undefined, undefined, 'error');
         } finally {
             setBusy(false);
         }
@@ -257,10 +280,11 @@ export const ToolsPage: React.FC = () => {
     const runFlushCluster = async () => {
         setBusy(true);
         try {
-            await postTools('/api/tools/cluster/flush', {});
-            toast('Sent buffered faces to clustering');
-        } catch {
-            toast('Couldn’t start clustering', undefined, undefined, 'error');
+            const res = await postTools<{ status?: string }>('/api/tools/cluster/flush', {});
+            const result = describeStatusResult(res?.status, { queued: 'Sent buffered faces to clustering' });
+            toast(result.message, undefined, undefined, result.outcome === 'failed' ? 'error' : 'info');
+        } catch (error) {
+            toast(failureReason(error, 'Couldn’t start clustering'), undefined, undefined, 'error');
         } finally {
             setBusy(false);
         }
@@ -275,15 +299,26 @@ export const ToolsPage: React.FC = () => {
         });
         if (!confirmed) return;
         setBusy(true);
+        const errorReason = (error: unknown) => failureReason(error, `Couldn’t start ${label.toLowerCase()}`);
+        let result: ActionResult;
         try {
-            await postAdmin(path, body);
-            recordAction([label], 'library', undefined, label);
-            toast(`${label} started`);
-        } catch {
-            toast(`Couldn’t start ${label.toLowerCase()}`, undefined, undefined, 'error');
-        } finally {
-            setBusy(false);
+            if (path === BACKFILL_PATH) {
+                result = await runBackfillBatches(
+                    (batchBody) => postAdmin<BackfillBatch>(path, batchBody),
+                    (totals) => setAdminProgress(`Backfill running: ${totals.queued} queued, ${totals.skipped} skipped, ${totals.failed} failed so far…`),
+                    errorReason,
+                );
+            } else {
+                result = describeQueueResult(label, await postAdmin<QueueResponse>(path, body));
+            }
+        } catch (error) {
+            result = { outcome: 'failed', message: errorReason(error), detail: errorReason(error) };
         }
+        // Recorded for failures too, so History shows what happened and not just that it was clicked.
+        recordAction([label], 'library', undefined, label, result);
+        toast(result.message, undefined, undefined, result.outcome === 'success' ? 'info' : 'error');
+        setAdminProgress(null);
+        setBusy(false);
     };
 
     const handleRebuildIndex = async (kind: string) => {
@@ -449,10 +484,11 @@ export const ToolsPage: React.FC = () => {
 
             {tab === 'Recovery' && (
                 <div className="pt-recovery">
+                    {adminProgress && <div className="pt-menu-label" role="status">{adminProgress}</div>}
                     <div className="card-glass pt-recover-card">
                         <strong>Backfill all photos</strong>
                         <span>Re-run the full pipeline — thumbnails, EXIF, OCR, AI vision, faces.</span>
-                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('Backfill', '/api/admin/backfill/photos', { repair: true, confirm: 'BACKFILL_ALL_PHOTOS' })}>Run backfill</button>
+                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('Backfill', BACKFILL_PATH, { repair: true, confirm: 'BACKFILL_ALL_PHOTOS' })}>Run backfill</button>
                     </div>
                     <div className="card-glass pt-recover-card">
                         <strong>Rebuild vector index</strong>
@@ -462,32 +498,32 @@ export const ToolsPage: React.FC = () => {
                     <div className="card-glass pt-recover-card">
                         <strong>Deduplicate faces</strong>
                         <span>Find and remove duplicate face rows across your library.</span>
-                        <button type="button" className="btn mock-cta" disabled={busy} onClick={() => void runAdmin('Face dedupe', '/api/admin/people/dedupe-faces', { repair: true, confirm: 'DEDUPE_FACES' })}>Apply</button>
+                        <button type="button" className="btn mock-cta" disabled={busy} onClick={() => void runAdmin('Face dedupe', '/api/admin/people/dedupe-faces', { repair: true, dryRun: false, confirm: 'DEDUPE_FACES' })}>Apply</button>
                     </div>
                     <div className="card-glass pt-recover-card">
                         <strong>Rebuild people index</strong>
                         <span>Recompute the photo→person mapping index. Use this if people are not appearing on their photos.</span>
-                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('People index rebuild', '/api/admin/people/rebuild-photo-people-index', { repair: true, confirm: 'REBUILD_PEOPLE_INDEX' })}>Rebuild</button>
+                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('People index rebuild', '/api/admin/people/rebuild-photo-people-index', { repair: true, dryRun: false, confirm: 'REBUILD_PEOPLE_INDEX' })}>Rebuild</button>
                     </div>
                     <div className="card-glass pt-recover-card">
                         <strong>Repair stale memberships</strong>
                         <span>Fix people-cluster membership rows left inconsistent by an interrupted merge or split.</span>
-                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('Repair stale memberships', '/api/admin/people/repair-stale-memberships', { repair: true, confirm: 'REPAIR_STALE_MEMBERSHIPS' })}>Repair</button>
+                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('Repair stale memberships', '/api/admin/people/repair-stale-memberships', { repair: true, dryRun: false, confirm: 'REPAIR_STALE_MEMBERSHIPS' })}>Repair</button>
                     </div>
                     <div className="card-glass pt-recover-card">
                         <strong>Unblock low-confidence faces</strong>
                         <span>Re-admit faces previously held back by the suspicious-face confidence gate.</span>
-                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('Unblock low-confidence faces', '/api/admin/people/unblock-low-confidence-faces', { repair: true, confirm: 'UNBLOCK_LOW_CONFIDENCE_FACES' })}>Unblock</button>
+                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('Unblock low-confidence faces', '/api/admin/people/unblock-low-confidence-faces', { repair: true, dryRun: false, confirm: 'UNBLOCK_LOW_CONFIDENCE_FACES' })}>Unblock</button>
                     </div>
                     <div className="card-glass pt-recover-card">
                         <strong>Suppress suspicious faces</strong>
                         <span>Hide faces flagged as likely false detections from clustering and people counts.</span>
-                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('Suppress suspicious faces', '/api/admin/people/suppress-suspicious-faces', { repair: true, confirm: 'SUPPRESS_SUSPICIOUS_FACES' })}>Suppress</button>
+                        <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('Suppress suspicious faces', '/api/admin/people/suppress-suspicious-faces', { repair: true, dryRun: false, confirm: 'SUPPRESS_SUSPICIOUS_FACES' })}>Suppress</button>
                     </div>
                     <div className="card-glass pt-recover-card">
                         <strong>Purge orphaned photo data</strong>
                         <span>Remove leftover rows/blobs for photos that no longer exist in the library.</span>
-                        <button type="button" className="btn btn-danger" disabled={busy} onClick={() => void runAdmin('Purge orphaned photo data', '/api/admin/photos/purge-orphaned-data', { repair: true, confirm: 'PURGE_ORPHANED_PHOTO_DATA' })}>Purge</button>
+                        <button type="button" className="btn btn-danger" disabled={busy} onClick={() => void runAdmin('Purge orphaned photo data', '/api/admin/photos/purge-orphaned-data', { repair: true, dryRun: false, confirm: 'PURGE_ORPHANED_PHOTO_DATA' })}>Purge</button>
                     </div>
                     <div className="card-glass pt-recover-card">
                         <strong>Verify/repair face index</strong>
@@ -531,11 +567,15 @@ export const ToolsPage: React.FC = () => {
                     ) : (
                         history.map((h, i) => (
                             <div key={h.actionId ?? i} className="pt-history-row pt-history-row-with-action">
-                                <span>
+                                <span title={h.detail ?? undefined}>
+                                    {h.outcome && <span className={`qchip${h.outcome === 'success' ? '' : ' warn'}`}>{h.outcome}</span>}{' '}
                                     {(h.action ?? 'Action')} · {h.scope ?? 'library'}
-                                    {Array.isArray(h.steps) && h.steps.length ? ` · ${h.steps.join(', ')}` : ''}
+                                    {Array.isArray(h.steps) && h.steps.length && !(h.steps.length === 1 && h.steps[0] === h.action)
+                                        ? ` · ${h.steps.join(', ')}`
+                                        : ''}
                                     {typeof h.filenameCount === 'number' && h.filenameCount > 0 ? ` · ${h.filenameCount} photos` : ''}
                                     {h.createdAt ? ` · ${new Date(h.createdAt).toLocaleString()}` : ''}
+                                    {h.detail && h.outcome !== 'success' ? ` · ${h.detail}` : ''}
                                 </span>
                                 {h.actionId && (
                                     <button

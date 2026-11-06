@@ -1,6 +1,6 @@
 """Bounded-RAM people embedding merges; no whole-index numpy/JSON loads.
 
-Temporary disk is O(base + output). RAM is bounded by one metadata item,
+Temporary disk is O(base + output). RAM is bounded by the source-read window,
 one representative vector, SQLite's fixed cache and the capped dirty set.
 Legacy consumers still receive the same NPZ members. Extra rep_sizes/model
 members certify merge compatibility, including mixed-width representatives.
@@ -21,6 +21,8 @@ import zipfile
 import numpy as np
 from azure.core import MatchConditions
 from azure.core.exceptions import ResourceNotFoundError
+
+from index_source_reads import SourceReads
 
 MAX_IDS = 4096
 MAX_ITEM_CHARS = 262144
@@ -272,47 +274,46 @@ def _entity(table, user, key):
 def _apply(db, person_table, face_table, user, ids):
     next_order = db.execute('SELECT COALESCE(MAX(position), -1) + 1 FROM rows').fetchone()[0]
     face_reads = 0
-    for pid in ids:
-        row = _entity(person_table, user, pid)
-        if row is None:
-            db.execute('DELETE FROM rows WHERE pid = ?', (pid,))
-            continue
-        face_ids = _json_source(row, 'faceIds')
-        if not isinstance(face_ids, list) or len(face_ids) > MAX_FACES:
-            raise Deferred('source membership budget/shape')
-        active = []
-        for fid in face_ids:
-            fid = str(fid)
-            if len(fid) > 1024:
+    with SourceReads() as reads:
+        for pid, row in reads.map(lambda pid: _entity(person_table, user, pid), ids):
+            if row is None:
+                db.execute('DELETE FROM rows WHERE pid = ?', (pid,))
+                continue
+            face_ids = _json_source(row, 'faceIds')
+            if not isinstance(face_ids, list) or len(face_ids) > MAX_FACES:
+                raise Deferred('source membership budget/shape')
+            active = []
+            face_ids = [str(fid) for fid in face_ids]
+            if any(len(fid) > 1024 for fid in face_ids):
                 raise Deferred('invalid face ID')
-            face_reads += 1
+            face_reads += len(face_ids)
             if face_reads > MAX_FACE_READS:
                 raise Deferred('face point-read budget exceeded')
-            face = _entity(face_table, user, fid)
-            if face is None:
+            for fid, face in reads.map(lambda fid: _entity(face_table, user, fid), face_ids):
+                if face is None:
+                    continue
+                if (not face.get('rejected') and
+                        str(face.get('reviewStatus') or '').strip().lower() != 'rejected' and
+                        str(face.get('personId') or '') == pid):
+                    active.append(fid)
+            rep = _json_source(row, 'repEmbedding')
+            if not isinstance(rep, list) or len(rep) > MAX_DIM:
+                raise Deferred('source embedding budget/shape')
+            if not active or not rep:
+                db.execute('DELETE FROM rows WHERE pid = ?', (pid,))
                 continue
-            if (not face.get('rejected') and
-                    str(face.get('reviewStatus') or '').strip().lower() != 'rejected' and
-                    str(face.get('personId') or '') == pid):
-                active.append(fid)
-        rep = _json_source(row, 'repEmbedding')
-        if not isinstance(rep, list) or len(rep) > MAX_DIM:
-            raise Deferred('source embedding budget/shape')
-        if not active or not rep:
-            db.execute('DELETE FROM rows WHERE pid = ?', (pid,))
-            continue
-        vector = np.asarray([v for v in rep if isinstance(v, (int, float))], dtype=np.float32)
-        name = row.get('name', '')
-        if not isinstance(name, str) or len(name) > MAX_ITEM_CHARS:
-            raise Deferred('source name budget/shape')
-        previous = db.execute('SELECT position FROM rows WHERE pid = ?', (pid,)).fetchone()
-        position = previous[0] if previous else next_order
-        next_order += not bool(previous)
-        metadata = json.dumps({'name': name, 'faceIds': active}, ensure_ascii=False)
-        if len(metadata) > MAX_ITEM_CHARS:
-            raise Deferred('combined metadata budget exceeded')
-        db.execute('INSERT OR REPLACE INTO rows VALUES (?, ?, ?, ?, ?)',
-                   (pid, position, metadata, vector.tobytes(), vector.size))
+            vector = np.asarray([v for v in rep if isinstance(v, (int, float))], dtype=np.float32)
+            name = row.get('name', '')
+            if not isinstance(name, str) or len(name) > MAX_ITEM_CHARS:
+                raise Deferred('source name budget/shape')
+            previous = db.execute('SELECT position FROM rows WHERE pid = ?', (pid,)).fetchone()
+            position = previous[0] if previous else next_order
+            next_order += not bool(previous)
+            metadata = json.dumps({'name': name, 'faceIds': active}, ensure_ascii=False)
+            if len(metadata) > MAX_ITEM_CHARS:
+                raise Deferred('combined metadata budget exceeded')
+            db.execute('INSERT OR REPLACE INTO rows VALUES (?, ?, ?, ?, ?)',
+                       (pid, position, metadata, vector.tobytes(), vector.size))
     db.commit()
 
 

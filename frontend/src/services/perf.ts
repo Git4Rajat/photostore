@@ -20,7 +20,7 @@
  * recorded (they carry SAS tokens).
  */
 
-export type PerfEvent = Record<string, string | number | boolean | undefined> & { t: string };
+type PerfEvent = Record<string, string | number | boolean | undefined> & { t: string };
 
 interface RequestRecord {
     method: string;

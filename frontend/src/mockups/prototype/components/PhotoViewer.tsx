@@ -55,7 +55,7 @@ const formatShutterSpeed = (exposureTime?: string): string | null => {
 
 /** Full-screen photo viewer with a persistent action bar, prev/next, keyboard,
  *  rotate + zoom controls, an EXIF/location info panel, and on-demand full-res. */
-export const PhotoViewer: React.FC = () => {
+const PhotoViewer: React.FC = () => {
     const { viewer, photoById, openViewer, closeViewer, viewerStep, ratePhotos, toggleLike, applyPhotoRotation, savePhotoRotation, deletePhotos, navigate, toast, route, registerPhotos } = useStore();
 
     const live = useMemo(

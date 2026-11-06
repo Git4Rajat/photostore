@@ -22,7 +22,7 @@ import { chunk, measureGridCapacity, pageSizeForCapacity, runWithLimit } from '.
 import faceService from '../../services/faceService';
 import * as library from '../../services/libraryClient';
 import type { LibraryMember, PendingInvite } from '../../services/libraryClient';
-import type { PersonFace, PersonSummary } from '../../types/people';
+import type { PersonFace } from '../../types/people';
 import { isNamedLabel } from '../../utils/people';
 import type { Photo as BackendPhoto } from '../../types/uiTypes';
 import type {
@@ -228,20 +228,6 @@ const facesToPhotos = (faces: PersonFace[]): Photo[] => {
     return out;
 };
 
-const mapPerson = (p: PersonSummary): Person => {
-    const cover = p.representativeFace;
-    const coverUrl = cover?.thumbnailUrl
-        || (cover?.faceId ? `/api/faces/crop/${encodeURIComponent(cover.faceId)}` : undefined);
-    return {
-        id: p.personId,
-        name: p.name && p.name.trim() ? p.name : null,
-        swatch: swatchFor(p.personId),
-        photoIds: [],
-        coverThumbnailUrl: coverUrl,
-        faceCount: p.faceCount,
-    };
-};
-
 interface ExploreGroup {
     label: string;
     count: number;
@@ -281,7 +267,7 @@ interface ViewerState {
 
 export type MediaFilter = 'all' | 'photo' | 'video';
 
-export interface GalleryFilters {
+interface GalleryFilters {
     rating: number;
     likedOnly: boolean;
 }
@@ -430,6 +416,7 @@ interface Store {
     autoCreateAlbum: (rule: string) => Promise<{ albumId: string; count: number; message?: string }>;
     renameAlbum: (id: string, name: string) => void;
     addPhotosToAlbum: (albumId: string, ids: string[]) => void;
+    removePhotosFromAlbum: (albumId: string, ids: string[]) => void;
     deleteAlbum: (id: string) => void;
     deleteAlbums: (ids: string[]) => void;
     shareAlbum: (id: string, opts: { expiresInDays: number; accessCode?: string }) => Promise<void>;
@@ -523,6 +510,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const albumsRefreshPendingRef = useRef(false);
     // Album pages live in the session store, so navigation preserves them.
     const [albumPhotos, setAlbumPhotos] = useState<Record<string, Photo[]>>({});
+    const albumPhotosRef = useRef(albumPhotos);
+    albumPhotosRef.current = albumPhotos;
     // Keyed per album id -- a single shared flag raced when switching albums
     // quickly: a fast fetch for album B finishing after a slow fetch for album
     // A was still in flight cleared the flag for both, so A's still-loading,
@@ -1502,7 +1491,16 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             return changed ? next : prev;
         });
         // Albums are server-managed (deletion cascades server-side); just prune
-        // the client-side album-photos cache so open albums reflect the removal.
+        // the client-side album-photos cache so open albums reflect the removal,
+        // and take the same photos off each album's count so the header agrees.
+        const removedPerAlbum = new Map<string, number>();
+        for (const [albumId, list] of Object.entries(albumPhotosRef.current)) {
+            const gone = list.filter((p) => set.has(p.id)).length;
+            if (gone) removedPerAlbum.set(albumId, gone);
+        }
+        if (removedPerAlbum.size) {
+            setAlbums((prev) => prev.map((a) => (removedPerAlbum.has(a.id) ? { ...a, photoCount: Math.max(0, a.photoCount - removedPerAlbum.get(a.id)!) } : a)));
+        }
         setAlbumPhotos((prev) => {
             const next: Record<string, Photo[]> = {};
             for (const [albumId, list] of Object.entries(prev)) {
@@ -1894,9 +1892,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const autoCreateAlbum = useCallback(
         async (rule: string): Promise<{ albumId: string; count: number; message?: string }> => {
             try {
-                const res = await post<{ album?: Album; count?: number; message?: string }>('/albums/autocreate', { rule });
+                const res = await post<{ album?: Album; count?: number; photoCount?: number; message?: string }>('/albums/autocreate', { rule });
                 const created = res?.album;
-                const count = Number(res?.count || 0);
+                // `count` is albums created; the toast wants the album's photos.
+                const count = Number(res?.photoCount ?? created?.photoCount ?? res?.count ?? 0);
                 if (count > 0 && created) {
                     setAlbums((prev) => (prev.some((a) => a.id === created.id) ? prev : [created, ...prev]));
                     invalidateLocalAlbumsIndex();
@@ -2013,7 +2012,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                     }
                     if (deleted()) return;
                     publishLibraryChange('album-photos-added', ['albums'], { itemCount: ids.length });
-                    toast(`Added ${ids.length} to “${album?.name ?? 'album'}”`);
+                    toast(`Added ${ids.length} to “${res?.album?.name ?? album?.name ?? 'album'}”`);
                     // Reconcile with the server (cover, ordering). The cache is
                     // already seeded above, so this refresh never shows a spinner.
                     void openAlbum(albumId);
@@ -2035,6 +2034,30 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // docs/audits/red-dress-album-incident-2026-10-22.md, where two such
     // responses were treated as full successes because nothing inspected
     // the body. deletedAlbums/albumErrors must be read on every call.
+    // Takes photos out of one album only; they stay in the library (unlike deletePhotos).
+    const removePhotosFromAlbum = useCallback((albumId: string, ids: string[]) => {
+        if (!ids.length) return;
+        const idSet = new Set(ids);
+        const cached = albumPhotosRef.current[albumId];
+        const gone = cached ? cached.filter((p) => idSet.has(p.id)).length : ids.length;
+        setAlbumPhotos((prev) => (prev[albumId] ? { ...prev, [albumId]: prev[albumId].filter((p) => !idSet.has(p.id)) } : prev));
+        setAlbums((prev) => prev.map((a) => (a.id === albumId ? { ...a, photoCount: Math.max(0, a.photoCount - gone) } : a)));
+        setSelection([]);
+        invalidateLocalAlbumsIndex();
+        void post<{ success?: boolean; removed?: number; album?: Album }>(
+            `/albums/${encodeURIComponent(albumId)}/photos/remove`, { filenames: ids },
+        )
+            .then(() => {
+                publishLibraryChange('album-photos-removed', ['albums'], { itemCount: ids.length });
+                toast(`Removed ${ids.length} photo${ids.length > 1 ? 's' : ''} from the album`);
+                void openAlbum(albumId);
+            })
+            .catch(() => {
+                toast('Couldn’t remove photos from the album', undefined, undefined, 'error');
+                void openAlbum(albumId);
+            });
+    }, [openAlbum, toast]);
+
     type DeleteMultipleResponse = { deletedAlbums?: string[]; albumErrors?: { albumId: string; error: string }[]; success?: boolean };
 
     // A snapshot belongs to a live delete attempt, not to the album ID.
@@ -2421,6 +2444,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             const movedPhotos = personPhotos[sourceId] ?? [];
             deletedPeopleRef.current.add(sourceId);
             setPeople((prev) => prev.filter((p) => p.id !== sourceId));
+            // The source cluster is gone, so the header counts drop with it.
+            setPeopleTotal((prev) => Math.max(0, prev - 1));
+            if (!removed?.name) setPeopleUnnamedTotal((prev) => Math.max(0, prev - 1));
             setExtraPeople((prev) => {
                 const next = { ...prev };
                 delete next[sourceId];
@@ -2455,6 +2481,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 .catch(() => {
                     deletedPeopleRef.current.delete(sourceId);
                     if (removed) setPeople((prev) => [...prev, removed]);
+                    setPeopleTotal((prev) => prev + 1);
+                    if (!removed?.name) setPeopleUnnamedTotal((prev) => prev + 1);
                     invalidateLocalPeopleIndex();
                     toast('Couldn’t merge people', undefined, undefined, 'error');
                 });
@@ -2475,6 +2503,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             const movedCount = removed.reduce((sum, p) => sum + (p.faceCount ?? 0), 0);
             ids.forEach((id) => deletedPeopleRef.current.add(id));
             setPeople((prev) => prev.filter((p) => !removedSet.has(p.id)));
+            const removedUnnamed = removed.filter((p) => !p.name).length;
+            setPeopleTotal((prev) => Math.max(0, prev - ids.length));
+            if (removedUnnamed) setPeopleUnnamedTotal((prev) => Math.max(0, prev - removedUnnamed));
             setExtraPeople((prev) => {
                 const next = { ...prev };
                 for (const id of ids) delete next[id];
@@ -2514,6 +2545,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 .catch(() => {
                     ids.forEach((id) => deletedPeopleRef.current.delete(id));
                     if (removed.length) setPeople((prev) => [...prev, ...removed]);
+                    setPeopleTotal((prev) => prev + ids.length);
+                    if (removedUnnamed) setPeopleUnnamedTotal((prev) => prev + removedUnnamed);
                     invalidateLocalPeopleIndex();
                     toast('Couldn’t merge people', undefined, undefined, 'error');
                 });
@@ -2794,6 +2827,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             autoCreateAlbum,
             renameAlbum,
             addPhotosToAlbum,
+            removePhotosFromAlbum,
             deleteAlbum,
             deleteAlbums,
             shareAlbum,
@@ -2833,7 +2867,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             restorePhotos, restoreAllTrash, purgePhoto, purgeAllTrash, reloadTrash,
             reloadAlbumTrash, restoreAlbum, purgeAlbum,
             albumsLoading, reloadAlbums, fetchAlbums, openAlbum, isAlbumMissing, isAlbumOpenFailed, isAlbumOpenTerminal, albumPhotosById, isAlbumPhotosLoading, loadMoreAlbumPhotos, albumPhotosTotal, albumPhotosHasMore,
-            createAlbum, autoCreateAlbum, renameAlbum, addPhotosToAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum,
+            createAlbum, autoCreateAlbum, renameAlbum, addPhotosToAlbum, removePhotosFromAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum,
             peopleLoading, peopleTotal, peopleUnnamedTotal, peopleHasMore, peopleUnavailable, loadMorePeople, searchPeople, reloadPeople, fetchPeople, openPerson, personPhotosById, personPhotosTotal, personPhotosHasMore, loadMorePersonPhotos, personPhotosLoading,
             renamePerson, mergePeople, mergePeopleBatch, deletePerson, deletePeopleBatch, applyExternalPeopleRemoval, reloadMembers, fetchMembers, invite, revokeInvite,
             removeMember, renameLibrary, toast, dismissToast,

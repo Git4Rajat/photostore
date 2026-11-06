@@ -22,7 +22,7 @@ export const uploadDerivativeSize = (width: number, height: number, edge: number
     return {width: Math.max(1, Math.round(width * scale)), height: Math.max(1, Math.round(height * scale))};
 };
 
-export async function encodeUploadDerivative(source: Source, edge: number, quality: number): Promise<UploadDerivative> {
+async function encodeUploadDerivative(source: Source, edge: number, quality: number): Promise<UploadDerivative> {
     const {width, height} = uploadDerivativeSize(source.width, source.height, edge);
     const canvas = new OffscreenCanvas(width, height) as OffscreenCanvas & {
         convertToBlob(options: {type: string; quality: number}): Promise<Blob>;

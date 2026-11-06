@@ -1069,6 +1069,20 @@ def delete_faces():
     status = int(result.pop('status', 200))
     return app.jsonify({'success': len(result.get('errors') or []) == 0, **result}), status
 
+def _no_faces_accepted_reason(rejected, suspicious, stale_version, no_embedding):
+    """Names what is actually keeping every face out of clustering, biggest bucket first."""
+    reasons = sorted(
+        [
+            (no_embedding, f'{no_embedding} faces have no embedding yet, so they cannot be clustered; reprocess their photos'),
+            (suspicious, f'{suspicious} faces are held back as suspicious'),
+            (stale_version, f'{stale_version} faces have an out-of-date embedding version'),
+            (rejected, f'{rejected} faces were rejected'),
+        ],
+        key=lambda item: item[0], reverse=True,
+    )
+    return 'No face can be clustered: ' + '; '.join(text for count, text in reasons if count) + '.'
+
+
 @people_bp.route('/api/people/diagnostic', methods=['GET'])
 def people_diagnostic():
     """Diagnostic endpoint: why aren't faces clustering into people?"""
@@ -1150,7 +1164,9 @@ def people_diagnostic():
             },
             'recommendation': (
                 'No faces detected.' if total_faces == 0
-                else 'All faces rejected or below confidence threshold.' if accepted_faces == 0
+                else _no_faces_accepted_reason(
+                    rejected_faces, suspicious_faces, stale_embedding_version_faces, no_embedding_faces,
+                ) if accepted_faces == 0
                 else 'Clustering queue not available; check BROWSER_ONLY_PROCESSING.' if not clustering_available
                 else f'Trigger clustering with POST /api/people/assign-unclustered or POST /api/people/recluster (with repair confirmation).' if unassigned_faces > 0 or len(people) == 0
                 else f'All {accepted_faces} faces already assigned to people.'

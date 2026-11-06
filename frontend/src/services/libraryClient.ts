@@ -10,7 +10,7 @@ import { publishLibraryChange } from './libraryChanges';
 import { getAccessToken } from './authClient';
 import * as passwordAuth from './passwordAuthClient';
 
-export interface LibrarySummary {
+interface LibrarySummary {
     libraryId: string;
     name: string;
     ownerUserId: string;
@@ -316,7 +316,7 @@ export const requestLibraryDownload = async (): Promise<DownloadRequestResult> =
     return response.json();
 };
 
-export interface DownloadPart {
+interface DownloadPart {
     partIndex: number;
     downloadUrl: string;
     expiresAt: string;
@@ -349,7 +349,7 @@ export const getLibraryDownloadStatus = async (jobId: string): Promise<DownloadS
     return response.json();
 };
 
-export interface ExportManifestFile {
+interface ExportManifestFile {
     filename: string;
     blobName: string;
 }

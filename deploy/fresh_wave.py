@@ -104,9 +104,10 @@ def verify_inventory(apps,release,pending):
     ad-hoc job (see run_adhoc_job), created, run and deleted in the 'seed'
     phase, so there is nothing left over here to check against."""
     found=set()
+    publishers = 0
     for app in apps:
-        role=app['name'].rsplit('-',1)[-1]
-        if role not in ('core','upload','vision','cluster','indexer','archive','recovery','web'):continue
+        role='index-worker' if app['name'].endswith('-index-worker') else app['name'].rsplit('-',1)[-1]
+        if role not in ('core','upload','vision','cluster','indexer','index-worker','archive','recovery','web'):continue
         props=app['properties']
         if props.get('provisioningState')!='Succeeded' or props.get('latestRevisionName')!=props.get('latestReadyRevisionName'):
             raise RuntimeError('Latest app revision is not ready: '+app['name'])
@@ -120,12 +121,14 @@ def verify_inventory(apps,release,pending):
                     raise RuntimeError('Web wave flag mismatch')
                 continue
             found.add(env.get('APP_ROLE'))
+            publishers += env.get('APP_ROLE') == 'index-worker'
             flags=dict(UPLOAD_WAVE_CAPABILITY_ID=release['capabilityId'],UPLOAD_WAVE_DEPLOYMENT_ID=expected,
                 UPLOAD_WAVE_BOOTSTRAP_PENDING=str(pending).lower(),UPLOAD_WAVE_EXECUTION_ENABLED=str(not pending).lower(),
                 UPLOAD_WAVE_NEW_LIBRARIES_ENABLED=str(not pending).lower(),PROCESSING_MODE='backend')
             if not pending:flags.update(UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED='true',PROCESSING_GENERATION_ENFORCEMENT_ENABLED='true')
             if any(env.get(k)!=v for k,v in flags.items()):raise RuntimeError('Wave environment mismatch: '+app['name'])
     if not set(release['deployments']).issubset(found):raise RuntimeError('Missing wave app role')
+    if publishers != 1:raise RuntimeError('Expected exactly one index-worker container')
     if not any(a['name'].endswith('-web') for a in apps):raise RuntimeError('Missing web app')
 
 

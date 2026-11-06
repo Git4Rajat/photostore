@@ -1,12 +1,10 @@
-import { getActiveLibraryFromToken } from './passwordAuthClient';
 import type { FileSystemFileHandle } from './fileSystemAccess';
-import { PHOTO_CACHE_STORAGE_KEY } from '../components/browserAiShared';
 
 /**
  * IndexedDB-backed persistence for in-flight upload blobs/handles, extracted
- * from PhotoGallery.tsx (see runBrowserProcessing/runUploadSession, which are
+ * from browserProcessingRuntime.tsx (see runBrowserProcessing/runUploadSession, which are
  * the callers, reached indirectly by AppServicesProvider's
- * `withPhotoGalleryRuntime` lazy-import boundary -- PhotoGallery.tsx
+ * `withBrowserProcessingRuntime` lazy-import boundary -- browserProcessingRuntime.tsx
  * re-exports idbPut/idbGet/idbDelete so that boundary keeps working).
  */
 const UPLOAD_DB_NAME = 'photostore-upload-db';
@@ -60,65 +58,4 @@ export const idbDelete = async (key: string): Promise<void> => {
         tx.onerror = () => reject(tx.error || new Error('Failed to delete upload blob.'));
     });
     db.close();
-};
-
-/**
- * localStorage-backed boot cache for the gallery's initial photo list, so a
- * reload can paint instantly from the last-known page instead of a blank
- * loading state while the first real fetch is in flight.
- */
-export interface PersistedPhotoCache<TPhoto = unknown, TFilterOptions = unknown> {
-    timestamp: number;
-    photos: TPhoto[];
-    totalAvailable: number;
-    offset: number;
-    hasMore: boolean;
-    sortBy: string;
-    searchQuery: string;
-    filters: TFilterOptions;
-    captureStartDate: string;
-    captureEndDate: string;
-}
-
-const PHOTO_CACHE_MAX_AGE_MS = 1000 * 60 * 30;
-
-// Scope the boot cache to the active library so switching libraries never
-// replays the previous library's photos. Falls back to the base key when there
-// is no session (local dev / unauthenticated).
-const photoCacheKey = (): string => {
-    const lib = getActiveLibraryFromToken();
-    return lib ? `${PHOTO_CACHE_STORAGE_KEY}.${lib}` : PHOTO_CACHE_STORAGE_KEY;
-};
-
-export const loadPhotoCache = <TPhoto = unknown, TFilterOptions = unknown>(): PersistedPhotoCache<TPhoto, TFilterOptions> | null => {
-    try {
-        const raw = localStorage.getItem(photoCacheKey());
-        if (!raw) {
-            return null;
-        }
-        const parsed = JSON.parse(raw) as PersistedPhotoCache<TPhoto, TFilterOptions>;
-        if (!parsed || !Array.isArray(parsed.photos) || typeof parsed.timestamp !== 'number') {
-            return null;
-        }
-        if (Date.now() - parsed.timestamp > PHOTO_CACHE_MAX_AGE_MS) {
-            return null;
-        }
-        return parsed;
-    } catch {
-        return null;
-    }
-};
-
-export const writePhotoCache = <TPhoto = unknown, TFilterOptions = unknown>(cache: PersistedPhotoCache<TPhoto, TFilterOptions>) => {
-    try {
-        const key = photoCacheKey();
-        // Purge the pre-scoping global cache entry (written before caches were
-        // scoped per library) so it can never be replayed under another library.
-        if (key !== PHOTO_CACHE_STORAGE_KEY) {
-            localStorage.removeItem(PHOTO_CACHE_STORAGE_KEY);
-        }
-        localStorage.setItem(key, JSON.stringify(cache));
-    } catch {
-        // Ignore storage quota or serialization errors.
-    }
 };

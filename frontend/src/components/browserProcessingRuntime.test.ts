@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createPersistentBrowserAiWorker, getBrowserAiNetworkGate } from './PhotoGallery';
-import type { BrowserAiModelState } from './PhotoGallery';
+import { createPersistentBrowserAiWorker, getBrowserAiNetworkGate } from './browserProcessingRuntime';
+import type { BrowserAiModelState } from './browserProcessingRuntime';
 
 // createPersistentBrowserAiWorker() internally still builds an image payload via
 // createBrowserAiImagePayload (createImageBitmap + canvas readback), same as the

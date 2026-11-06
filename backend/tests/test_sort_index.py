@@ -881,3 +881,41 @@ def test_sort_index_route_still_serves_libraries_under_the_limit(monkeypatch):
     with app_module.app.test_request_context('/api/photos/sort-index'):
         payload = photos.photos_sort_index().get_json()
     assert payload['available'] is True and payload['indexUrl'].startswith('https://x/')
+
+
+def test_sort_index_route_rebuilds_instead_of_serving_deltas_that_no_longer_exist(monkeypatch, sort_index_route_ctx):
+    monkeypatch.setattr(app, 'get_index_manifest_summary', lambda uid, kind: {
+        'source_version': 'base-v1', 'updated_at': 'u', 'dirty': False, 'delta_seq': 2})
+    monkeypatch.setattr(storage_utils, 'sort_index_deltas_present', lambda uid, seq: False)
+    triggered = []
+    monkeypatch.setattr(app, '_trigger_indexer_rebuild', lambda uid, reason='', scope='': triggered.append((reason, scope)))
+    with app.app.test_request_context('/api/photos/sort-index'):
+        payload = photos_sort_index().get_json()
+    assert payload == {'available': False}
+    assert triggered == [('sort-delta-missing', 'light')]
+
+
+class _FakeContainer:
+    def __init__(self, names): self.names = names
+    def list_blobs(self, name_starts_with=''):
+        return [type('B', (), {'name': n})() for n in self.names if n.startswith(name_starts_with)]
+
+
+class _FakeService:
+    def __init__(self, names): self.container = _FakeContainer(names)
+    def get_container_client(self, _): return self.container
+
+
+def test_sort_index_deltas_present_detects_a_missing_slip(monkeypatch):
+    names = [storage_utils._sort_index_delta_blob_name('lib-D', 1)]
+    monkeypatch.setitem(storage_utils._CTX, 'blob_service_client', _FakeService(names))
+    assert storage_utils.sort_index_deltas_present('lib-D', 1) is True
+    assert storage_utils.sort_index_deltas_present('lib-D', 2) is False
+    assert storage_utils.sort_index_deltas_present('lib-D', 0) is True
+
+
+def test_sort_index_deltas_present_fails_open_when_storage_cannot_be_listed(monkeypatch):
+    class _Broken:
+        def get_container_client(self, _): raise RuntimeError('down')
+    monkeypatch.setitem(storage_utils._CTX, 'blob_service_client', _Broken())
+    assert storage_utils.sort_index_deltas_present('lib-D', 3) is True

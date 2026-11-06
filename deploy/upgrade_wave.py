@@ -20,6 +20,7 @@ from wave_release import PROTOCOL, validate_release
 
 ROOT = Path(__file__).resolve().parent
 APP_ROLES = ('core', 'upload', 'vision', 'cluster', 'indexer', 'archive', 'recovery', 'web')
+OPTIONAL_APP_ROLES = ('index-worker',)
 
 
 def read_release(path):
@@ -112,9 +113,10 @@ def main():
         + args.resource_group + '/providers/Microsoft.App/')
     def inventory():
         apps = az('rest', '--method', 'get', '--url', base + 'containerApps?api-version=2025-01-01', *common)['value']
-        apps = [app for app in apps if app['name'] in {args.app_name + '-' + role for role in APP_ROLES}]
-        if len(apps) != len(APP_ROLES):
-            raise RuntimeError('Expected all eight existing app roles')
+        apps = [app for app in apps if app['name'] in {args.app_name + '-' + role for role in APP_ROLES + OPTIONAL_APP_ROLES}]
+        expected = {args.app_name + '-' + role for role in APP_ROLES}
+        if not expected.issubset({app['name'] for app in apps}):
+            raise RuntimeError('Expected all existing API/worker app roles')
         return apps
     def patch(resource, template):
         if resource['properties']['template'] == template:

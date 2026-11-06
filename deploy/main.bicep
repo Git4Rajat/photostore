@@ -66,9 +66,12 @@ param clusterFileShareQuotaGiB int = 100
 @maxValue(0)
 param clusterMinReplicas int = 0
 
-@description('Required: run derived-index maintenance on the indexer queue sidecar. Cluster publishing is no longer supported.')
+@description('Required: use a dedicated index-maintenance consumer. Cluster publishing is no longer supported.')
 @allowed([true])
 param dedicatedIndexWorker bool = true
+
+@description('Run maintenance in its own queue-scaled app instead of the Tools API sidecar.')
+param separateIndexWorker bool = true
 
 
 
@@ -109,6 +112,7 @@ module app 'resources.bicep' = {
     clusterFileShareQuotaGiB: clusterFileShareQuotaGiB
     clusterMinReplicas: clusterMinReplicas
     dedicatedIndexWorker: dedicatedIndexWorker
+    separateIndexWorker: separateIndexWorker
     enableIndexPush: enableIndexPush
     enableWaveExecution: enableWaveExecution
     enableNewWaveLibraries: enableNewWaveLibraries

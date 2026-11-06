@@ -57,7 +57,7 @@ vi.mock('../services/backgroundKeepAlive', () => ({
 }));
 vi.mock('../services/toast', () => ({ showToast: mocks.toast }));
 vi.mock('../services/perf', () => ({ perf: { recordSpan: mocks.span, span: (_name: string, run: () => unknown) => run() } }));
-vi.mock('./PhotoGallery', () => ({
+vi.mock('./browserProcessingRuntime', () => ({
     idbPut: vi.fn().mockResolvedValue(undefined),
     idbGet: mocks.idbGet,
     idbDelete: mocks.idbDelete,

@@ -230,3 +230,43 @@ def test_admin_job_status_hides_other_users_jobs(env, monkeypatch):
     with app.app.test_request_context(f'/api/admin/jobs/status?jobId={job_id}'):
         response = admin_job_status()
     assert response.get_json() == {'status': 'unknown'}
+
+
+def test_purge_orphaned_removes_the_purged_photos_from_albums_and_dirties_indexes(monkeypatch):
+    rows = [{'PartitionKey': 'owner', 'RowKey': name, 'processing_state': 'done'} for name in ('kept.jpg', 'gone.jpg')]
+    deleted = []
+
+    class _Container:
+        def list_blobs(self):
+            return [type('B', (), {'name': 'kept.jpg'})()]
+
+    class _Blobs:
+        def get_container_client(self, _):
+            return _Container()
+
+    class _Meta:
+        def query_entities(self, *a, **k):
+            return list(rows)
+
+        def delete_entity(self, partition_key, row_key):
+            deleted.append(row_key)
+
+    removed, touched = [], []
+    monkeypatch.setattr(app, 'blob_service_client', _Blobs())
+    monkeypatch.setattr(app, 'metadata_table_client', _Meta())
+    monkeypatch.setattr(app, 'face_table_client', None)
+    monkeypatch.setattr(app, '_blob_name_from_metadata', lambda row, filename: filename)
+    monkeypatch.setattr(app, '_batch_remove_filenames_from_albums', lambda uid, names: removed.append(set(names)))
+    monkeypatch.setattr(app, '_invalidate_metadata_scan_cache', lambda uid: None)
+    monkeypatch.setattr(app, 'touch_user_search_indexes_state', lambda uid, filenames=None, **k: touched.append(set(filenames)))
+
+    result = app._purge_orphaned_photo_data('owner', dry_run=False)
+
+    assert deleted == ['gone.jpg']
+    assert result['orphanedMetadataDeleted'] == 1
+    assert removed == [{'gone.jpg'}]
+    assert touched == [{'gone.jpg'}]
+
+    removed.clear(); touched.clear(); deleted.clear()
+    app._purge_orphaned_photo_data('owner', dry_run=True)
+    assert deleted == [] and removed == [] and touched == []

@@ -6,7 +6,7 @@ import { isRawFilename } from './photoDisplay';
  * formats (bare TIFF header, "Exif\0\0"-signed TIFF blocks, and ISO-BMFF/HEIC
  * box containers) -- no third-party EXIF library is used client-side, so
  * this parses just enough of each container to recover GPS + a handful of
- * display fields. Extracted from PhotoGallery.tsx's runBrowserProcessing.
+ * display fields. Extracted from browserProcessingRuntime.tsx's runBrowserProcessing.
  */
 
 export interface ParsedGpsExif {
@@ -396,7 +396,7 @@ const parseIsoBmffExifCandidates = (view: DataView, bytes: Uint8Array, start = 0
 };
 
 /** Max prefix of a RAW file scanned for embedded EXIF -- passed in by the
- * caller (PhotoGallery.tsx's CLIENT_RAW_EXIF_SCAN_MAX_BYTES) so this module
+ * caller (browserProcessingRuntime.tsx's CLIENT_RAW_EXIF_SCAN_MAX_BYTES) so this module
  * doesn't need its own copy of the shared MB-based sizing constant. */
 export const parseRawGpsExif = async (file: File, maxScanBytes: number): Promise<ParsedGpsExif | null> => {
     if (!isRawFilename(file.name)) {

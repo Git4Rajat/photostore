@@ -3,7 +3,7 @@ import { CircleAlert as ExclamationCircleIcon } from 'lucide-react';
 import { useStore } from '../store';
 
 /** Bottom-center toast stack with an optional action (e.g. Undo). */
-export const Toasts: React.FC = () => {
+const Toasts: React.FC = () => {
     const { toasts, dismissToast } = useStore();
     if (!toasts.length) return null;
     return (

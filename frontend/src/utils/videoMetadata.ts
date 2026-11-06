@@ -3,9 +3,9 @@ import {isVideoFilename} from './photoDisplay';
 import type {UploadMetadataPacket} from './uploadMetadata';
 
 export const VIDEO_MAX_SOURCE_BYTES = 10 * 1024 * 1024 * 1024;
-export const VIDEO_METADATA_MAX_BYTES = 1024 * 1024;
-export const VIDEO_METADATA_READ_BYTES = 32 * 1024 * 1024;
-export const VIDEO_METADATA_MAX_READS = 2048;
+const VIDEO_METADATA_MAX_BYTES = 1024 * 1024;
+const VIDEO_METADATA_READ_BYTES = 32 * 1024 * 1024;
+const VIDEO_METADATA_MAX_READS = 2048;
 
 export async function createVideoMetadata(file: File, sourceSha256: string): Promise<UploadMetadataPacket> {
     if (!isVideoFilename(file.name) || !/^[a-f0-9]{64}$/.test(sourceSha256)) throw new Error('Video metadata unsupported');

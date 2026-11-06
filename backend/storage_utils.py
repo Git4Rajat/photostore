@@ -5759,6 +5759,27 @@ def _sort_index_delta_blob_name(user_id: str, seq: int) -> str:
     return f'{_vector_index_blob_key(user_id)}-sortdelta-{int(seq):06d}.json.gz'
 
 
+def sort_index_deltas_present(user_id: str, delta_seq: int) -> bool:
+    """True unless the manifest lists correction slips (1..delta_seq) that are
+    no longer in storage. A rebuild deletes the old chain, so a manifest that
+    outlives its slips would otherwise hand the browser URLs that 404. Fails
+    open: when storage can't be listed, assume they are there."""
+    key = str(user_id or '').strip()
+    if not key or int(delta_seq or 0) <= 0:
+        return True
+    try:
+        service = _CTX.get('blob_service_client')
+        container_name = _lexical_index_container_name()
+        if service is None or not container_name:
+            return True
+        container = service.get_container_client(container_name)
+        prefix = f'{_vector_index_blob_key(key)}-sortdelta-'
+        present = {item.name for item in container.list_blobs(name_starts_with=prefix)}
+        return all(_sort_index_delta_blob_name(key, seq) in present for seq in range(1, int(delta_seq) + 1))
+    except Exception:
+        return True
+
+
 def get_sort_index_blob_location(user_id: str) -> Tuple[str, str]:
     """(container_name, blob_name) for user_id's sort index data blob -- the
     pair a caller needs to mint its own SAS URL (see

@@ -349,7 +349,11 @@ class SearchDatabase:
         conn = getattr(self._local, 'conn', None)
         if conn is None:
             conn = sqlite3.connect(f'file:{self.path}?mode=ro', uri=True, check_same_thread=False)
-            conn.execute('PRAGMA cache_size=-16000')  # ~16MB page cache per thread
+            # Worker scopes use fewer resident SQLite pages; the on-disk DB
+            # and SEARCH_DB_MAX_CACHE_MB remain independent disk budgets.
+            page_cache_kb = max(256, int(os.getenv('SEARCH_DB_SQLITE_CACHE_KB',
+                '4096' if os.getenv('APP_ROLE') == 'index-worker' else '16000')))
+            conn.execute(f'PRAGMA cache_size=-{page_cache_kb}')
             self._local.conn = conn
         return conn
 

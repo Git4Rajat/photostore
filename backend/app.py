@@ -3410,13 +3410,23 @@ def _humanize_job(row: Dict) -> Dict:
 def _update_metadata_entity_fields(
     user_id: str, filename: str, updates: Dict, *,
     derive_updates: Optional[Callable[[Dict], Dict]] = None,
+    initial_entity: Optional[Dict] = None,
 ) -> Optional[Dict]:
     if metadata_table_client is None:
         return None
     last_exc = None
     for attempt in range(5):
         try:
-            entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+            from index_work import etag
+            if (attempt == 0 and initial_entity is not None and etag(initial_entity)
+                    and initial_entity.get('PartitionKey') == user_id
+                    and initial_entity.get('RowKey') == filename):
+                # Keep the captured ETag. A concurrent change fails CAS and the
+                # next attempt reads fresh source state before deriving fields.
+                import copy
+                entity = copy.deepcopy(initial_entity)
+            else:
+                entity = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
         except Exception:
             return None
         if str(entity.get('processing_state') or '').strip().lower() == 'deleted':
@@ -7596,7 +7606,7 @@ def _rebuild_metadata_faces_for_filename(
             'faces': json.dumps(faces_payload),
             'faceCount': len(faces_payload),
             'peopleIds': after_people_json,
-        })
+        }, initial_entity=metadata)
         if strict and written is None:
             raise RuntimeError('Photo membership update failed')
     except Exception:
@@ -9334,7 +9344,7 @@ def _refresh_library_summaries(user_id: str) -> None:
         db, user_id, accumulator_factory=ExploreAccumulator)
     summary_runtime.publish_indexed_payloads(
         user_id, explore, timeline, store_explore=store_explore_summary, store_timeline=store_timeline_summary,
-        load_explore=load_explore_summary, load_timeline=load_timeline_summary)
+        load_explore=load_explore_summary, load_timeline=load_timeline_summary, skip_unchanged=True)
 
 
 @catalog_publisher
@@ -11201,7 +11211,7 @@ def _promote_deferred_ipwork(queue):
     return False
 
 
-def recover_pending_index_work(library=None, *, retry_failed=False):
+def recover_pending_index_work(library=None, *, retry_failed=False, cleanup=True):
     from bisect import insort
     import index_work
     if jobs_table_client is None or (index_maintenance_queue_client is None and ipwork_queue_client is None):
@@ -11209,7 +11219,7 @@ def recover_pending_index_work(library=None, *, retry_failed=False):
     # Only the worker's unscoped periodic sweep may discover GC work. Reuse
     # the existing controls scan, not a metadata scan or another WorkStore scope.
     gc_limit = 0
-    gc_enabled = library is None and index_maintenance_queue_client is not None
+    gc_enabled = cleanup and library is None and index_maintenance_queue_client is not None
     if gc_enabled and os.getenv('APP_ROLE', 'core').strip().lower() == 'index-worker':
         try:
             gc_limit = max(0, min(1000, int(os.getenv('INDEX_ARTIFACT_CLEANUP_LIBRARIES_PER_RECOVERY', '25'))))
@@ -11495,7 +11505,8 @@ def _run_index_maintenance_payload(payload):
         raise
     if newer:
         store.notify(key, _send_index_wakeup)
-    _cleanup_completed_index_artifacts(library)
+    # GC is housekeeping, not publication work. Startup/periodic recovery
+    # surveys it independently; do not re-survey every family after each edit.
     _notify_index_ready(library, str(payload['jobId']), scope)
     return 'intent_completed'
 
@@ -11629,24 +11640,43 @@ def _pending_person_labels(user_id):
 
 
 def _update_label_memberships(user_id, labels):
-    for person_id in labels:
+    import index_files
+    import sqlite3
+    # A label wave can touch many people sharing photos. Deduplicate on disk
+    # and repair bounded pages instead of retaining the whole filename union.
+    with index_files.workspace(sqlite=True) as directory:
+        db = sqlite3.connect(os.path.join(directory, 'label-photos.sqlite'))
         try:
-            person = person_table_client.get_entity(user_id, person_id)
-        except ResourceNotFoundError:
-            continue
-        if not person.get('labelMembershipPending'):
-            continue
-        ids = json.loads(person.get('faceIds') or '[]')
-        faces = _load_face_rows_by_ids(user_id, ids)
-        for face_id in ids:
-            if str(face_id) not in faces:
+            db.execute('PRAGMA cache_size=-1024')
+            db.execute('CREATE TABLE filenames (name TEXT PRIMARY KEY) WITHOUT ROWID')
+            for person_id in labels:
                 try:
-                    faces[str(face_id)] = face_table_client.get_entity(user_id, str(face_id))
+                    person = person_table_client.get_entity(user_id, person_id)
                 except ResourceNotFoundError:
                     continue
-        filenames = {str(face.get('filename')) for face in faces.values() if face.get('filename')}
-        _person_scan_cache.invalidate(user_id)
-        _rebuild_metadata_faces_for_filenames(user_id, filenames, strict=True)
+                if not person.get('labelMembershipPending'):
+                    continue
+                ids = json.loads(person.get('faceIds') or '[]')
+                faces = _load_face_rows_by_ids(user_id, ids)
+                for face_id in ids:
+                    if str(face_id) not in faces:
+                        try:
+                            faces[str(face_id)] = face_table_client.get_entity(user_id, str(face_id))
+                        except ResourceNotFoundError:
+                            continue
+                db.executemany('INSERT OR IGNORE INTO filenames VALUES (?)',
+                    ((str(face['filename']),) for face in faces.values() if face.get('filename')))
+                del faces, ids, person
+            db.commit()
+            cursor = db.execute('SELECT name FROM filenames ORDER BY name')
+            batch = cursor.fetchmany(128)
+            if batch:
+                _person_scan_cache.invalidate(user_id)
+            while batch:
+                _rebuild_metadata_faces_for_filenames(user_id, {row[0] for row in batch}, strict=True)
+                batch = cursor.fetchmany(128)
+        finally:
+            db.close()
 
 
 def _ack_person_labels(user_id, labels):
@@ -15466,6 +15496,7 @@ def _purge_orphaned_photo_data(user_id: str, *, dry_run: bool = True) -> Dict:
         return result
 
     orphaned_filenames: set = set()
+    purged_filenames: set = set()
     for row in user_meta_rows:
         result['metadataRowsChecked'] += 1
         if row.get('processing_state') == 'deleted':
@@ -15487,6 +15518,18 @@ def _purge_orphaned_photo_data(user_id: str, *, dry_run: bool = True) -> Dict:
                 except Exception as exc:
                     app.logger.warning('Purge: metadata delete failed for %s: %s', filename, exc)
                     result['errors'].append(f'metadata delete failed for {filename}')
+                else:
+                    purged_filenames.add(filename)
+
+    if purged_filenames:
+        # The rows are gone, so albums must forget them and the indexes must
+        # rebuild; otherwise album counts and cached listings keep the photo.
+        _batch_remove_filenames_from_albums(user_id, purged_filenames)
+        _invalidate_metadata_scan_cache(user_id)
+        try:
+            touch_user_search_indexes_state(user_id, filenames=purged_filenames)
+        except Exception:
+            app.logger.warning('Purge: could not mark indexes dirty for %s', user_id, exc_info=True)
 
     if not orphaned_filenames:
         return result
@@ -16275,7 +16318,7 @@ def _process_clustering_queue_message_impl(message, queue_client, queue_name, ma
             # state) to even guess what was running. Confirmed live
             # 2026-10-01 on microsvcpoc-dev: this worker had zero per-message
             # visibility at all, unlike ipworker's equivalent timing logs.
-            insertion_time = getattr(message, 'insertion_time', None)
+            insertion_time = getattr(message, 'inserted_on', None) or getattr(message, 'insertion_time', None)
             backlog_age_s = (
                 (datetime.now(timezone.utc) - insertion_time).total_seconds()
                 if insertion_time is not None else -1
@@ -16752,6 +16795,10 @@ def run_index_worker() -> None:
     signal.signal(signal.SIGTERM, lambda *args: stop.set())
     signal.signal(signal.SIGINT, lambda *args: stop.set())
     last_recovery = -60.0
+    last_cleanup = None
+    idle_poll = 2.0
+    max_idle_poll = max(2, float(os.getenv('INDEX_WORKER_IDLE_POLL_MAX_SECONDS', '8')))
+    cleanup_interval = max(60, float(os.getenv('INDEX_ARTIFACT_CLEANUP_INTERVAL_SECONDS', '900')))
     processing_diagnostics.ready('indexer', queue=INDEX_MAINTENANCE_QUEUE_NAME)
     def dispatch(payload, job_id, user_id, job_type):
         if job_type not in (INDEX_BUILD_JOB_TYPE, 'upload_wave_stage'):
@@ -16762,7 +16809,10 @@ def run_index_worker() -> None:
             now = time.monotonic()
             if now - last_recovery >= 60:
                 with processing_diagnostics.phase('indexer', 'recovery', state='processing'):
-                    recover_pending_index_work()
+                    cleanup_due = last_cleanup is None or now - last_cleanup >= cleanup_interval
+                    recover_pending_index_work(cleanup=cleanup_due)
+                    if cleanup_due:
+                        last_cleanup = now
                 last_recovery = now
             processed = _poll_clustering_queue_once(
                 queue, INDEX_MAINTENANCE_QUEUE_NAME, INDEX_BUILD_MAX_RETRIES, deadletter, dispatch=dispatch)
@@ -16771,7 +16821,10 @@ def run_index_worker() -> None:
                     deferred_queue, INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME, INDEX_BUILD_MAX_RETRIES,
                     deadletter, dispatch=dispatch)
             if not processed:
-                stop.wait(2)
+                stop.wait(idle_poll)
+                idle_poll = min(max_idle_poll, idle_poll * 2)
+            else:
+                idle_poll = 2.0
         except Exception:
             worker_logger.exception('Index maintenance polling failed')
             stop.wait(2)

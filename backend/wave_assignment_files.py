@@ -17,7 +17,7 @@ import processing_diagnostics
 import processing_metrics
 
 from upload_waves import digest
-from wave_assignment import WaveAssignmentJournal, encoded
+from wave_assignment import WaveAssignmentJournal, encoded, JOURNAL_PAYLOAD_BYTES
 
 _MAX_LINE = 256_000
 
@@ -110,7 +110,7 @@ class FileAssignmentJournal(WaveAssignmentJournal):
     def put(self, key, payload):
         self.check()
         body = encoded(payload)
-        if len(body.encode('utf-16-le')) > 60_000:
+        if len(body.encode('utf-16-le')) > JOURNAL_PAYLOAD_BYTES:
             raise ValueError('Assignment journal row exceeds byte budget')
         identity = digest(payload)
         previous = self.get(key)

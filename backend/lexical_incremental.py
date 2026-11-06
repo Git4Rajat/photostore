@@ -1,4 +1,4 @@
-"""Opt-in lexical JSON merges, bounded by the dirty set and one JSON row.
+"""Opt-in lexical JSON merges, bounded by dirty IDs and the source-read window.
 
 The caller certifies ALL filenames changed since ``expected`` and serializes
 source mutations. Manifest CAS fences publishers, not source-table writes.
@@ -16,6 +16,7 @@ from azure.core import MatchConditions
 from azure.core.exceptions import ResourceNotFoundError
 
 from index_files import RowsWriter, iter_rows, workspace
+from index_source_reads import SourceReads
 
 MAX_IDS = 4096
 MAX_ID_CHARS = 1024
@@ -178,32 +179,36 @@ class _JSONStream:
 def _affected_rows(table, user, ids, excluded):
     dirty = {}
     total = 0
-    for filename in ids:
+
+    def read(filename):
         try:
-            row = table.get_entity(partition_key=user, row_key=filename)
+            return table.get_entity(partition_key=user, row_key=filename)
         except ResourceNotFoundError as error:
             # Missing tables/accounts are not evidence of an entity deletion.
             if getattr(error, 'error_code', None) not in (None, 'ResourceNotFound', 'EntityNotFound'):
                 raise
-            row = None
-        if row is not None:
-            if row.get('RowKey') != filename or row.get('PartitionKey') != user:
-                raise Deferred('point-read identity mismatch')
-            if (row.get('processing_complete') is not True or
-                    str(row.get('processing_state') or '').strip().lower() == 'deleted'):
-                row = None
-            else:
-                row = {k: v for k, v in dict(row).items() if k not in excluded}
-                if any(isinstance(value, (str, bytes)) and len(value) > MAX_ITEM_CHARS
-                       for value in row.values()):
-                    raise Deferred('source field budget exceeded')
-                text = json.dumps(row, ensure_ascii=False, separators=(',', ':'), default=str)
-                if len(text) > MAX_ITEM_CHARS:
-                    raise Deferred('source row budget exceeded')
-                total += len(text.encode('utf-8'))
-                if total > MAX_DIRTY_BYTES:
-                    raise Deferred('dirty row memory budget exceeded')
-        dirty[filename] = row
+            return None
+
+    with SourceReads() as reads:
+        for filename, row in reads.map(read, ids):
+            if row is not None:
+                if row.get('RowKey') != filename or row.get('PartitionKey') != user:
+                    raise Deferred('point-read identity mismatch')
+                if (row.get('processing_complete') is not True or
+                        str(row.get('processing_state') or '').strip().lower() == 'deleted'):
+                    row = None
+                else:
+                    row = {k: v for k, v in dict(row).items() if k not in excluded}
+                    if any(isinstance(value, (str, bytes)) and len(value) > MAX_ITEM_CHARS
+                           for value in row.values()):
+                        raise Deferred('source field budget exceeded')
+                    text = json.dumps(row, ensure_ascii=False, separators=(',', ':'), default=str)
+                    if len(text) > MAX_ITEM_CHARS:
+                        raise Deferred('source row budget exceeded')
+                    total += len(text.encode('utf-8'))
+                    if total > MAX_DIRTY_BYTES:
+                        raise Deferred('dirty row memory budget exceeded')
+            dirty[filename] = row
     return dirty
 
 

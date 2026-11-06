@@ -72,3 +72,15 @@ def test_collector_counts_active_revisions_on_later_pages(monkeypatch):
     monkeypatch.setattr(residency,'az',arm)
     sample=residency.collect('test-rg','test','complete',0,'a'*36)
     assert all(app['replicas']==2 for app in sample['roles'].values())
+
+
+def test_split_worker_is_index_owner_without_waking_api():
+    rows = samples()
+    for row in rows:
+        active = row['phase'] == 'index'
+        row['roles']['index-worker'] = dict(min=0, cooldown=60, replicas=int(active))
+        if active:
+            row['roles']['indexer']['replicas'] = 0
+    assert verify(rows) == []
+    next(row for row in rows if row['phase'] == 'index')['roles']['indexer']['replicas'] = 1
+    assert any('unexpected resident indexer' in e for e in verify(rows))

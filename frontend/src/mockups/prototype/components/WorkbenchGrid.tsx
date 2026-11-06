@@ -23,9 +23,9 @@ import ScrollSentinel from './ScrollSentinel';
 // thumbnail, so it needs a larger floor than the plain photo grids.
 const WB_TILE = { min: 150, max: 320, default: 200, step: 40 };
 
-export type WorkbenchStep = 'Preview' | 'Thumbnails' | 'EXIF' | 'OCR' | 'Vision' | 'Geo' | 'Faces';
+type WorkbenchStep = 'Preview' | 'Thumbnails' | 'EXIF' | 'OCR' | 'Vision' | 'Geo' | 'Faces';
 
-export const WORKBENCH_STEPS: WorkbenchStep[] = ['Preview', 'Thumbnails', 'EXIF', 'OCR', 'Vision', 'Geo', 'Faces'];
+const WORKBENCH_STEPS: WorkbenchStep[] = ['Preview', 'Thumbnails', 'EXIF', 'OCR', 'Vision', 'Geo', 'Faces'];
 
 const STEP_ICONS: Record<WorkbenchStep, React.ComponentType<React.SVGProps<SVGSVGElement>>> = {
     Preview: CameraIcon,
@@ -172,7 +172,7 @@ const SELECT_ALL_CAP = 100000;
 
 const stubPhoto = (filename: string): Photo => ({ id: filename, filename, swatch: 's1', dateLabel: '', year: 0, rating: 0, liked: false, placeId: null, personIds: [], tags: [] });
 
-export const WorkbenchGrid: React.FC<{
+const WorkbenchGrid: React.FC<{
     /** Deep-linked filenames: pinned at the top (while not searching) even if they are far down the library. */
     pinned?: string[];
     selection: string[];

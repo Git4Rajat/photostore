@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Plus as PlusIcon, Search as SearchIcon } from 'lucide-react';
 import { BottomSheet } from './BottomSheet';
 import { useStore } from '../store';
@@ -20,11 +20,15 @@ export const AddToAlbumSheet: React.FC<{
     // does once the add completes, instead of leaving it stuck selected.
     onAdded?: () => void;
 }> = ({ open, onClose, photoIds, onAdded }) => {
-    const { albums, addPhotosToAlbum, createAlbum } = useStore();
+    const { albums, albumsLoading, fetchAlbums, addPhotosToAlbum, createAlbum } = useStore();
     const [query, setQuery] = useState('');
     const covers = useProtectedBlobUrls(
         albums.map((a) => a.coverThumbnailUrl).filter((u): u is string => Boolean(u)),
     );
+
+    // The picker can open before the Albums page was ever visited; load the
+    // list then rather than claiming there are none.
+    useEffect(() => { if (open) void fetchAlbums(); }, [open, fetchAlbums]);
 
     const close = () => { setQuery(''); onClose(); };
 
@@ -89,7 +93,7 @@ export const AddToAlbumSheet: React.FC<{
                 ))}
                 {filtered.length === 0 && (
                     <p className="pt-sheet-empty">
-                        {albums.length === 0 ? 'No albums yet — create your first one above.' : `No albums match “${query.trim()}”.`}
+                        {albums.length === 0 && albumsLoading ? 'Loading albums…' : albums.length === 0 ? 'No albums yet — create your first one above.' : `No albums match “${query.trim()}”.`}
                     </p>
                 )}
             </div>

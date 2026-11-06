@@ -5,7 +5,7 @@ const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', '
 const pad = (n: number | string) => String(n).padStart(2, '0');
 const lastDayOf = (year: string, month: string) => new Date(Number(year), Number(month), 0).getDate();
 
-export const monthRange = (y: string, m: string): CaptureRange => ({
+const monthRange = (y: string, m: string): CaptureRange => ({
     start: `${y}-${m}-01`, end: `${y}-${m}-${pad(lastDayOf(y, m))}`, label: `${MONTHS[Number(m) - 1]} ${y}`,
 });
 
@@ -15,7 +15,7 @@ export const monthRange = (y: string, m: string): CaptureRange => ({
  * grid into Months, then Years; tapping a card drills back down into that date
  * range. Counts come straight from /photos/timeline so they match the grid.
  */
-export const TimelineBrowser: React.FC<{
+const TimelineBrowser: React.FC<{
     timeline: TimelineSummary;
     level: 'months' | 'years';
     focusYear: string | null;

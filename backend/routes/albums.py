@@ -491,7 +491,8 @@ def autocreate_albums():
             app.album_store.write_filenames(entity, filenames)
         app._save_album_entity(entity)
         payload = app._album_entity_to_payload(entity)
-        response = {'count': 1, 'rule': rule, 'album': payload}
+        # `count` is the number of albums made (always 1); `photoCount` is what the user sees.
+        response = {'count': 1, 'photoCount': len(filenames), 'rule': rule, 'album': payload}
         if truncated:
             response['message'] = (f'This group is larger than one album can hold; the first {len(filenames)} '
                                    'photos were added.')

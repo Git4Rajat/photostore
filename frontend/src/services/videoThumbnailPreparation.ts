@@ -6,7 +6,7 @@ import {generateUploadThumbnail, uploadDerivativeSize, UPLOAD_THUMBNAIL_MAX_EDGE
 export const VIDEO_MAX_FRAME_PIXELS = 40_000_000;
 const aborted = () => new DOMException('Video preparation aborted', 'AbortError');
 
-export async function nativeVideoThumbnail(file: File, signal: AbortSignal): Promise<UploadDerivative> {
+async function nativeVideoThumbnail(file: File, signal: AbortSignal): Promise<UploadDerivative> {
     if (signal.aborted) throw aborted();
     const video = document.createElement('video');
     const url = URL.createObjectURL(file);

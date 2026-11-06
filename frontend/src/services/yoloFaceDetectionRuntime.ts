@@ -49,7 +49,7 @@ let yoloSessionPromise: Promise<YoloSession> | null = null;
 let loadedModelUrl = '';
 let loadedWasmPath = '';
 
-export class YoloFaceDetectionUnavailableError extends Error {
+class YoloFaceDetectionUnavailableError extends Error {
     constructor(message: string) {
         super(message);
         this.name = 'YoloFaceDetectionUnavailableError';

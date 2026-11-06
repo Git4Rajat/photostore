@@ -54,7 +54,7 @@ export const TileThumbnail: React.FC<{ src: string; alt: string; style?: React.C
  * checkbox toggles selection (which surfaces the command bar). Rating and like
  * state show as small overlays.
  */
-export const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?: React.RefObject<HTMLDivElement>; extendable?: boolean }> = ({ photos, emptyHint, extendable }) => {
+const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?: React.RefObject<HTMLDivElement>; extendable?: boolean }> = ({ photos, emptyHint, extendable }) => {
     const { selection, toggleSelect, selectMany, openViewer, selectMode, setSelectMode } = useStore();
     const thumbs = usePhotoThumbnails(photos);
     const [lastSelected, setLastSelected] = React.useState<number | null>(null);

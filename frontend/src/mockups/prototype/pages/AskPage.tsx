@@ -3,10 +3,9 @@ import { Search as MagnifyingGlassIcon, Plus as PlusIcon } from 'lucide-react';
 import { useStore } from '../store';
 import { Swatch } from '../components/bits';
 import PhotoGrid from '../components/PhotoGrid';
-import { get, post } from '../../../services/apiClient';
-import { getAskState, loadMoreAsk, mapSearchResult as mapResult, runAskSearch, setAskQuery, setAskScroll, useAskState } from '../askSearchStore';
+import { get } from '../../../services/apiClient';
+import { getAskState, loadMoreAsk, runAskSearch, setAskQuery, setAskScroll, useAskState } from '../askSearchStore';
 import type { Photo as BackendPhoto } from '../../../types/uiTypes';
-import type { Photo } from '../types';
 
 // "Save as album" collects matches up to what one album can hold (the server enforces the real limit).
 const SAVE_AS_ALBUM_MAX = 10000;
@@ -16,16 +15,6 @@ const SAVE_PAGE = 500;
 // (thumbnails, ratings, dates, ...) via a point-lookup, preserving the local
 // score order for whatever resolves (lookup-batch can drop a filename it can't
 // resolve, e.g. one deleted between scoring and lookup).
-const resolvePhotos = async (filenames: string[]): Promise<Photo[]> => {
-    if (filenames.length === 0) return [];
-    const response = await post<{ photos?: BackendPhoto[] }>('/api/photos/lookup-batch', { filenames });
-    const byFilename = new Map((response?.photos ?? []).map((p) => [p.filename, p]));
-    return filenames
-        .map((f) => byFilename.get(f))
-        .filter((p): p is BackendPhoto => Boolean(p))
-        .map(mapResult);
-};
-
 /**
  * Ask — one search box fused across people / places / things / years. Search
  * runs entirely on the backend (/photos/search over a per-library SQLite
@@ -35,7 +24,7 @@ const resolvePhotos = async (filenames: string[]): Promise<Photo[]> => {
  * surface as cards, live typeahead disambiguates the trailing term, and a
  * search can be saved as an album.
  */
-export const AskPage: React.FC = () => {
+const AskPage: React.FC = () => {
     const { people, places, route, createAlbum, addPhotosToAlbum, registerPhotos, navigate } = useStore();
     const ask = useAskState();
     const { query, results, total, hasMore, rankedWindow, searching, loadingMore, indexBuilding } = ask;

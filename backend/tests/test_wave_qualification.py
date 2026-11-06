@@ -78,3 +78,36 @@ def test_arm_null_rules_and_identity_are_not_treated_as_configuration_proof():
     assert result['containers'][0]['env']=={}
     resource['properties']['template']['scale']['rules']=[dict(http=dict(concurrentRequests=10),custom=None)]
     assert clean(resource)['scale']['rules'][0]['custom']['type'] is None
+
+
+def split_deployment():
+    import copy
+    snapshot = deployment()
+    api = next(a for a in snapshot['containerApps'] if a['name'] == 'test-indexer')
+    worker = copy.deepcopy(api)
+    worker.update(name='test-index-worker', containers=[api['containers'].pop()])
+    worker['scale'].update(maxReplicas=1, cooldownPeriod=60)
+    worker['scale']['rules'].append(dict(custom=dict(type='azure-queue',
+        metadata=dict(queueName='photostore-index-maintenance-deferred'))))
+    api['scale']['rules'] = []
+    snapshot['containerApps'].append(worker)
+    return snapshot
+
+
+def test_independent_worker_qualifies_and_rejects_duplicate_publishers():
+    snapshot = split_deployment()
+    assert check(snapshot)['configurationReady']
+    api = next(a for a in snapshot['containerApps'] if a['name'] == 'test-indexer')
+    worker = next(a for a in snapshot['containerApps'] if a['name'] == 'test-index-worker')
+    api['containers'].append(worker['containers'][0])
+    assert any('duplicate maintenance consumer' in e for e in check(snapshot)['blockers'])
+
+
+def test_split_worker_must_remain_single_publisher_and_queue_only():
+    snapshot = split_deployment()
+    worker = next(a for a in snapshot['containerApps'] if a['name'] == 'test-index-worker')
+    worker['scale'].update(maxReplicas=2)
+    worker['scale']['rules'].append(dict(http=True))
+    errors = check(snapshot)['blockers']
+    assert any('single publisher' in e for e in errors)
+    assert any('HTTP scaler' in e for e in errors)

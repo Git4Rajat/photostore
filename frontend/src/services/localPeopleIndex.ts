@@ -72,17 +72,6 @@ const idbGetStored = async (key: string): Promise<StoredPeopleIndex | null> => {
     return result;
 };
 
-const idbPutStored = async (key: string, value: StoredPeopleIndex): Promise<void> => {
-    const db = await openPeopleIndexDb();
-    await new Promise<void>((resolve, reject) => {
-        const tx = db.transaction(DB_STORE, 'readwrite');
-        tx.objectStore(DB_STORE).put(value, key);
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => reject(tx.error || new Error('Failed to persist people index.'));
-    });
-    db.close();
-};
-
 // `generation` is per-tab, so it can't fence a write against a newer
 // snapshot a *different* tab just persisted -- see localSortIndex.ts's
 // idbPutStoredIfNewer for the full reasoning. `updatedAt` is the manifest's
