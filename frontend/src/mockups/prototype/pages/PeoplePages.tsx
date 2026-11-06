@@ -245,7 +245,7 @@ export const PersonDetailPage: React.FC = () => {
                 </div>
             </div>
             <div className="pt-album-photos-head pt-person-photos-head">
-                <p className="pt-page-sub" style={{ margin: 0 }}>{(personPhotosTotal(person.id) ?? photos?.length ?? person.faceCount ?? 0).toLocaleString()} photos</p>
+                <p className="pt-page-sub" style={{ margin: 0 }}>{(personPhotosHasMore(person.id) ? (personPhotosTotal(person.id) ?? photos?.length ?? person.faceCount ?? 0) : (photos?.length ?? personPhotosTotal(person.id) ?? person.faceCount ?? 0)).toLocaleString()} photos</p>
                 <div className="pt-album-photos-actions">
                     <ThumbSizeControl value={personTile} onChange={setPersonTile} />
                     {photos && photos.length > 0 && (

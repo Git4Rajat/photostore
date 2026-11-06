@@ -440,7 +440,8 @@ export const AlbumsPage: React.FC = () => {
                                 <button type="button" className="pt-linkish" onClick={() => { navigate('gallery'); toast('Select photos, then use “Add to album”'); }}><PlusIcon className="toolbar-icon" /> Add photos</button>
                             </div>
                         </div>
-                        {activePhotos === undefined && isAlbumPhotosLoading(album.id) ? (
+                        {/* Before the fetch starts the cache is empty and nothing is flagged loading yet; an album that has photos must not flash "No photos yet" in that gap. */}
+                        {activePhotos === undefined && (isAlbumPhotosLoading(album.id) || (album.photoCount > 0 && !isAlbumOpenFailed(album.id))) ? (
                             <Spinner label="Loading photos…" center={false} />
                         ) : (
                             <div style={{ ['--pt-tile-min' as string]: `${albumTile}px` } as React.CSSProperties}>

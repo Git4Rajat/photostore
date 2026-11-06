@@ -58,6 +58,17 @@ describe('index-backed gallery', () => {
     });
     afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
+    it('removing photos from an album calls the album route, updates its count, and does not delete them', async () => {
+        mocks.albumsIndex.mockResolvedValue([{albumId: 'a1', name: 'Trip', photoCount: 3, coverFilename: ''}]);
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async () => { await store.fetchAlbums(true); });
+        expect(store.albums.find((a) => a.id === 'a1')?.photoCount).toBe(3);
+        await act(async () => { store.removePhotosFromAlbum('a1', ['p1.jpg', 'p2.jpg']); });
+        expect(mocks.post).toHaveBeenCalledWith('/albums/a1/photos/remove', { filenames: ['p1.jpg', 'p2.jpg'] });
+        expect(mocks.post).not.toHaveBeenCalledWith('/photos/delete', expect.anything());
+        expect(store.albums.find((a) => a.id === 'a1')?.photoCount).toBe(1);
+    });
+
     it('audit: purging an album deleted in another browser must create local protection', async () => {
         mocks.get.mockResolvedValue({albums:[{id:'a1',name:'Old',photoCount:1,deleted:true}]});
         render(<StoreProvider><Probe /></StoreProvider>);

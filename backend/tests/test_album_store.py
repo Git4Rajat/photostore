@@ -79,6 +79,22 @@ def test_smart_album_larger_than_capacity_is_trimmed_with_a_message(monkeypatch)
     assert len(album_store.read_filenames(saved[0])) == payload['album']['photoCount']
 
 
+def test_smart_album_reports_its_photo_count_separately_from_the_albums_made(monkeypatch):
+    names = [f'p{i:03d}.jpg' for i in range(75)]
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('u1', None))
+    monkeypatch.setattr(app, '_albums_table_available', lambda: True)
+    monkeypatch.setattr(app, 'albums_table_client', type('T', (), {'query_entities': lambda self, q: []})())
+    monkeypatch.setattr(app, '_save_album_entity', lambda e: None)
+    monkeypatch.setattr(app, '_smart_album_candidates', lambda uid, rule, rows: [{'name': 'Tag/Object: Comic', 'filenames': names}])
+    import search_db
+    monkeypatch.setattr(search_db, 'open_database', lambda uid, **k: None)
+    monkeypatch.setattr(app, '_iter_metadata_rows_for_user', lambda *a, **k: iter([]))
+    with app.app.test_request_context('/api/albums/autocreate', method='POST', json={'rule': 'recent-upload'}):
+        payload = albums.autocreate_albums().get_json()
+    assert payload['count'] == 1            # albums created
+    assert payload['photoCount'] == 75      # what the toast should say
+
+
 def _album_world(monkeypatch, count=50):
     meta = FakeTable()
     names = [f'p{i:03d}.jpg' for i in range(count)]

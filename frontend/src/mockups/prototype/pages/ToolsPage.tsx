@@ -523,7 +523,7 @@ export const ToolsPage: React.FC = () => {
                     <div className="card-glass pt-recover-card">
                         <strong>Purge orphaned photo data</strong>
                         <span>Remove leftover rows/blobs for photos that no longer exist in the library.</span>
-                        <button type="button" className="btn btn-danger" disabled={busy} onClick={() => void runAdmin('Purge orphaned photo data', '/api/admin/photos/purge-orphaned-data', { repair: true, confirm: 'PURGE_ORPHANED_PHOTO_DATA' })}>Purge</button>
+                        <button type="button" className="btn btn-danger" disabled={busy} onClick={() => void runAdmin('Purge orphaned photo data', '/api/admin/photos/purge-orphaned-data', { repair: true, dryRun: false, confirm: 'PURGE_ORPHANED_PHOTO_DATA' })}>Purge</button>
                     </div>
                     <div className="card-glass pt-recover-card">
                         <strong>Verify/repair face index</strong>

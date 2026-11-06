@@ -57,10 +57,22 @@ export const TrashPage: React.FC = () => {
                     <h1 className="pt-page-title">Recently Deleted</h1>
                     <p className="pt-page-sub">{trash.length} photo{trash.length === 1 ? '' : 's'} · purges after 30 days</p>
                 </div>
-                {trash.length > 0 && (
+                {(trash.length > 0 || albumTrash.length > 0) && (
                     <div className="pt-toolbar-actions">
-                        <button type="button" className="btn" onClick={restoreAllTrash}>Restore all</button>
-                        <button type="button" className="btn btn-danger" onClick={() => void confirmPurgeAll()}>Empty trash</button>
+                        <button
+                            type="button"
+                            className="btn"
+                            onClick={() => {
+                                // "Restore all" covers deleted albums too, not just photos.
+                                if (trash.length > 0) restoreAllTrash();
+                                albumTrash.forEach((t) => restoreAlbum(t.album.id));
+                            }}
+                        >
+                            Restore all
+                        </button>
+                        {trash.length > 0 && (
+                            <button type="button" className="btn btn-danger" onClick={() => void confirmPurgeAll()}>Empty trash</button>
+                        )}
                     </div>
                 )}
             </div>

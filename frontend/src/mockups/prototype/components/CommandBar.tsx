@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import {
     MoreVertical as EllipsisVerticalIcon,
+    MinusCircle as MinusCircleIcon,
     Plus as PlusIcon,
     Star as StarIcon,
     Trash2 as TrashIcon,
@@ -19,7 +20,8 @@ import { useStore } from '../store';
  * way to cancel a selection once the user has scrolled away from the top.
  */
 export const CommandBar: React.FC = () => {
-    const { selection, ratePhotos, deletePhotos, navigate, toast, clearSelection } = useStore();
+    const { selection, ratePhotos, deletePhotos, removePhotosFromAlbum, route, navigate, toast, clearSelection } = useStore();
+    const openAlbumId = route.page === 'albums' ? route.params.albumId : undefined;
     const [albumOpen, setAlbumOpen] = useState(false);
     if (!selection.length) return null;
 
@@ -62,6 +64,12 @@ export const CommandBar: React.FC = () => {
                         <button type="button" className="pt-fm-item" onClick={() => { setAlbumOpen(true); close(); }}>
                             <PlusIcon /> Album
                         </button>
+
+                        {openAlbumId && (
+                            <button type="button" className="pt-fm-item" onClick={() => { removePhotosFromAlbum(openAlbumId, selection); close(); }}>
+                                <MinusCircleIcon /> Remove from album
+                            </button>
+                        )}
 
                         <button type="button" className="pt-fm-item" onClick={() => { navigate('tools', { filenames: selection.slice(0, 50).join(',') }); close(); }}>
                             <WrenchScrewdriverIcon /> Workbench
