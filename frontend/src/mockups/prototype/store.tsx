@@ -415,7 +415,7 @@ interface Store {
     createAlbum: (name?: string) => Promise<string>;
     autoCreateAlbum: (rule: string) => Promise<{ albumId: string; count: number; message?: string }>;
     renameAlbum: (id: string, name: string) => void;
-    addPhotosToAlbum: (albumId: string, ids: string[]) => void;
+    addPhotosToAlbum: (albumId: string, ids: string[]) => Promise<void>;
     removePhotosFromAlbum: (albumId: string, ids: string[]) => void;
     deleteAlbum: (id: string) => void;
     deleteAlbums: (ids: string[]) => void;
@@ -1986,10 +1986,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }, [albums, toast]);
 
     const addPhotosToAlbum = useCallback(
-        (albumId: string, ids: string[]) => {
+        (albumId: string, ids: string[]): Promise<void> => {
             const scope = pendingEditScope();
             const deleted = () => hasAlbumDeleteTombstone(albumId, scope);
-            if (!ids.length || deleted()) return;
+            if (!ids.length || deleted()) return Promise.resolve();
             const album = albums.find((a) => a.id === albumId);
             const idSet = new Set(ids);
             const added = photosByIds(ids);
@@ -2007,7 +2007,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 });
             }
             invalidateLocalAlbumsIndex();
-            void post<{ success?: boolean; added?: string[]; errors?: string[]; album?: Album }>(
+            // Returned so a caller adding several chunks can await each one: the server
+            // read-modify-writes the album row, so concurrent adds overwrite each other.
+            return post<{ success?: boolean; added?: string[]; errors?: string[]; album?: Album }>(
                 `/albums/${encodeURIComponent(albumId)}/photos/add`, { filenames: ids },
             )
                 .then((res) => {

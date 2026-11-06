@@ -13,6 +13,7 @@ import { getBackendStatusSnapshot } from '../services/backendStatus';
 import { showToast } from '../services/toast';
 import { useDragSelect } from '../services/useDragSelect';
 import PhotoViewer, { getMainMediaPath } from './shared/PhotoViewer';
+import { FloatingSelectButton } from '../mockups/prototype/components/FloatingSelectButton';
 import { Logo, LogoLockup } from './shared/Logo';
 import { EmptyState } from './shared/EmptyState';
 import { ErrorState } from './shared/ErrorState';
@@ -804,6 +805,9 @@ const PublicAlbumPage: React.FC = () => {
                                 </footer>
                             )}
                         </div>
+                        {!loading && !error && !codeRequired && photos.length > 0 && (
+                            <FloatingSelectButton selectMode={selectMode} onToggle={() => { if (selectMode) { exitSelectMode(); } else { setSelectMode(true); } }} />
+                        )}
                     </div>
                 </div>
             </div>

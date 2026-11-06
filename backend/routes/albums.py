@@ -250,6 +250,9 @@ def get_album(album_id: str):
         response['hasMore'] = offset + limit < total
     return app.jsonify(response)
 
+_ALBUM_ADD_ATTEMPTS = 5
+
+
 @albums_bp.route('/albums/<album_id>/photos/add', methods=['POST'])
 @albums_bp.route('/api/albums/<album_id>/photos/add', methods=['POST'])
 def add_photos_to_album(album_id: str):
@@ -284,12 +287,26 @@ def add_photos_to_album(album_id: str):
             continue
         candidates.append(safe)
 
-    try:
-        added = app.album_store.add(entity, candidates)
-    except app.album_store.AlbumTooLarge as exc:
-        return app.jsonify({'error': str(exc), 'code': 'album_too_large'}), 413
-    entity['updatedAt'] = app.datetime.now(app.timezone.utc).isoformat()
-    app._save_album_entity(entity)
+    # An inline album keeps its whole photo list in this one row, so a concurrent add that saved
+    # unconditionally would overwrite the other's photos. Save against the loaded ETag and, on a
+    # conflict, re-read and re-merge. Table-backed albums store one row per photo (nothing is lost
+    # there) and promotion rewrites the layout, so both keep the unconditional save below.
+    for _ in range(_ALBUM_ADD_ATTEMPTS):
+        try:
+            added = app.album_store.add(entity, candidates)
+        except app.album_store.AlbumTooLarge as exc:
+            return app.jsonify({'error': str(exc), 'code': 'album_too_large'}), 413
+        entity['updatedAt'] = app.datetime.now(app.timezone.utc).isoformat()
+        if app.album_store.is_table_backed(entity):
+            app._save_album_entity(entity)
+            break
+        if app._save_album_entity_if_unchanged(entity):
+            break
+        entity = app._load_album_entity(user_id, album_id)
+        if not entity:
+            return app.jsonify({'error': 'Album not found'}), 404
+    else:
+        return app.jsonify({'error': 'Album is being updated; please retry'}), 409
     return app.jsonify({'success': True, 'added': added, 'errors': errors, 'album': app._album_entity_to_payload(entity)})
 
 @albums_bp.route('/albums/<album_id>/photos/remove', methods=['POST'])
