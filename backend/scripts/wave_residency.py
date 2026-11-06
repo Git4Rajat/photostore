@@ -13,6 +13,7 @@ import time
 from urllib.parse import quote
 
 ROLES = ('core','web','upload','vision','cluster','indexer','archive','recovery')
+OPTIONAL_ROLES = ('index-worker',)
 PHASES = {'upload': set(), 'vision': {'vision'}, 'cluster': {'cluster'},
           'index': {'indexer'}, 'complete': set()}
 
@@ -25,10 +26,12 @@ def collect(group,prefix,phase,entered_at,subscription):
     roles={}
     from scripts.wave_qualification import collect as inventory
     apps=inventory(subscription,group,prefix)['containerApps']
-    for role in ROLES:
+    for role in ROLES + OPTIONAL_ROLES:
         name=prefix+'-'+role
         found=next((a for a in apps if a['name']==name),None)
-        if not found:raise ValueError('Missing app inventory: '+role)
+        if not found:
+            if role in OPTIONAL_ROLES:continue
+            raise ValueError('Missing app inventory: '+role)
         scale=found['scale']
         url=(f'https://management.azure.com/subscriptions/{subscription}/resourceGroups/{quote(group)}'
              f'/providers/Microsoft.App/containerApps/{name}/revisions?api-version=2025-01-01')
@@ -60,19 +63,21 @@ def verify(samples):
         if at<previous or entered>at:raise ValueError('Invalid sample timeline')
         previous=at
         if phase not in PHASES:raise ValueError('Unknown phase')
-        if set(row['roles'])!=set(ROLES):raise ValueError('Incomplete app inventory')
+        if not set(ROLES).issubset(row['roles']) or set(row['roles']) - set(ROLES + OPTIONAL_ROLES):
+            raise ValueError('Incomplete app inventory')
+        owners = {'index-worker'} if phase == 'index' and 'index-worker' in row['roles'] else PHASES[phase]
         if row['foreground']:raise ValueError('Use a separate inactive qualification capture')
         for role,app in row['roles'].items():
-            if app['min']!=0 or app['cooldown']!=300:
+            if app['min']!=0 or type(app['cooldown']) is not int or not 0 < app['cooldown'] <= 300:
                 errors.append(f'{phase}: {role} configuration prevents five-minute sleep')
             if app['replicas']<0:raise ValueError('Invalid replica count')
         # Allow the explicit five-minute idle tail plus one polling minute.
         if at-entered<360:continue
         qualified.add(phase)
         for role,app in row['roles'].items():
-            if role not in PHASES[phase] and app['replicas']:
+            if role not in owners and app['replicas']:
                 errors.append(f'{phase}: unexpected resident {role} at {at}')
-        if PHASES[phase] and not any(row['roles'][role]['replicas'] for role in PHASES[phase]):
+        if owners and not any(row['roles'][role]['replicas'] for role in owners):
             errors.append(f'{phase}: stage owner absent at {at}')
     missing=set(PHASES)-qualified
     if missing:errors.append('No settled observation for: '+', '.join(sorted(missing)))

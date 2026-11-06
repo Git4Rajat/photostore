@@ -1,0 +1,51 @@
+{
+  "scope": "native SQLite cache RSS, synthetic local DB, three fresh processes per setting",
+  "cases": {
+    "16000": [
+      {
+        "cache_kb": 16000,
+        "elapsed_seconds": 0.07277587498538196,
+        "cpu_seconds": 0.07261200000000001,
+        "rss_increase_bytes": 21135360,
+        "pragma_cache_size": -16000
+      },
+      {
+        "cache_kb": 16000,
+        "elapsed_seconds": 0.08394337492063642,
+        "cpu_seconds": 0.08374999999999999,
+        "rss_increase_bytes": 21184512,
+        "pragma_cache_size": -16000
+      },
+      {
+        "cache_kb": 16000,
+        "elapsed_seconds": 0.08977254200726748,
+        "cpu_seconds": 0.08646400000000001,
+        "rss_increase_bytes": 21151744,
+        "pragma_cache_size": -16000
+      }
+    ],
+    "4096": [
+      {
+        "cache_kb": 4096,
+        "elapsed_seconds": 0.08520354190841317,
+        "cpu_seconds": 0.084101,
+        "rss_increase_bytes": 5996544,
+        "pragma_cache_size": -4096
+      },
+      {
+        "cache_kb": 4096,
+        "elapsed_seconds": 0.0855912909610197,
+        "cpu_seconds": 0.084161,
+        "rss_increase_bytes": 5931008,
+        "pragma_cache_size": -4096
+      },
+      {
+        "cache_kb": 4096,
+        "elapsed_seconds": 0.10765479202382267,
+        "cpu_seconds": 0.10581100000000002,
+        "rss_increase_bytes": 5931008,
+        "pragma_cache_size": -4096
+      }
+    ]
+  }
+}

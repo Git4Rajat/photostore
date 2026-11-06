@@ -12,7 +12,7 @@ import subprocess
 import time
 from urllib.parse import quote
 
-from scripts.wave_residency import ROLES
+from scripts.wave_residency import ROLES, OPTIONAL_ROLES
 from wave_policy import ROLES as CAPABILITY_ROLES, PROTOCOL
 from upload_waves import digest
 
@@ -29,7 +29,7 @@ STILL_REQUIRED=['durable capability certificate verification',
     'assignment oracle and projection receipt coverage on controlled input',
     'foreground CRUD, deletion and reprocessing races',
     'representative latency, memory, disk and transaction-cost budgets',
-    'alert ingestion and all-eight-app inactive residency capture']
+    'alert ingestion and all-app inactive residency capture']
 
 
 def az(*args):
@@ -42,7 +42,7 @@ def clean(resource):
     return dict(name=resource['name'],revision=props.get('latestReadyRevisionName'),
         provisioning=props.get('provisioningState'),scale={
             **{k:scale.get(k) for k in ('minReplicas','maxReplicas','cooldownPeriod')},
-            'rules':[dict(name=r.get('name'),custom=dict(type=(r.get('custom') or {}).get('type'),
+            'rules':[dict(name=r.get('name'),http=bool(r.get('http')),custom=dict(type=(r.get('custom') or {}).get('type'),
                 metadata={'queueName':((r.get('custom') or {}).get('metadata') or {}).get('queueName')}))
                 for r in (scale.get('rules') or [])]},
         configuration={key:props.get('configuration',{}).get(key) for key in
@@ -74,7 +74,7 @@ def collect(subscription,group,prefix):
         # real wave-lifecycle events and a throwaway ad-hoc job a deploy/
         # upgrade script provisions and deletes for its own one-off run, never
         # a resource this preflight should find lingering.
-        names={prefix+'-'+role for role in ROLES} if kind=='containerApps' else {prefix+'-wave-recovery'}
+        names={prefix+'-'+role for role in ROLES + OPTIONAL_ROLES} if kind=='containerApps' else {prefix+'-wave-recovery'}
         inventory[kind]=[clean(row) for row in rows if row['name'] in names]
     return dict(at=time.time(),subscription=subscription,group=group,prefix=prefix,
         apiVersion=API,**inventory)
@@ -100,7 +100,8 @@ def check(snapshot):
         if role in CAPABILITY_ROLES:deployments[role]=image
         if role in ('core','archive'):
             require(env.get('UPLOAD_WAVE_NEW_LIBRARIES_ENABLED')=='true',label+': new-library enrollment disabled')
-    for role in ROLES:
+    split = prefix+'-index-worker' in apps
+    for role in ROLES + (OPTIONAL_ROLES if split else ()):
         label=prefix+'-'+role;row=apps.get(label)
         if not row:
             errors.append(label+': app missing');continue
@@ -108,7 +109,8 @@ def check(snapshot):
         require(bool(row.get('revision')),label+': no ready revision')
         scale=row['scale']
         require(scale.get('minReplicas')==0,label+': min replicas must be zero')
-        require(scale.get('cooldownPeriod')==300,label+': explicit 300-second cooldown required')
+        require(type(scale.get('cooldownPeriod')) is int and 0 < scale['cooldownPeriod'] <= 300,
+                label+': explicit cooldown of at most 300 seconds required')
         containers={c['name']:c for c in row['containers']}
         if role=='web':
             container=containers.get('web')
@@ -118,16 +120,32 @@ def check(snapshot):
                 require(container['env'].get('APP_CONFIG_UPLOAD_WAVE_EXECUTION_ENABLED')=='true',label+': runtime wave flag disabled')
                 require(container['env'].get('APP_CONFIG_PROCESSING_MODE')=='backend',label+': browser AI must be disabled')
         else:
-            expected={role:role} if role!='indexer' else {'indexer':'indexer','index-maintenance':'index-worker'}
+            if role == 'index-worker':
+                expected = {'index-maintenance': 'index-worker'}
+                require(scale.get('maxReplicas') == 1, label+': single publisher required')
+                require(not any(r.get('http') for r in scale.get('rules', [])),
+                    label+': worker must not have an HTTP scaler')
+            elif role == 'indexer':
+                expected = {'indexer': 'indexer'} if split else {'indexer': 'indexer', 'index-maintenance': 'index-worker'}
+                if split:
+                    require('index-maintenance' not in containers, label+': duplicate maintenance consumer')
+                    require(not any((r.get('custom') or {}).get('type') == 'azure-queue'
+                        for r in scale.get('rules', [])), label+': API must not scale from maintenance queues')
+            else:
+                expected = {role: role}
             for name,app_role in expected.items():
                 container=containers.get(name)
                 if container:backend(container,app_role,label+'/'+name)
                 else:errors.append(label+': missing container '+name)
-            if role=='indexer':
+            if role == 'index-worker' or (role == 'indexer' and not split):
                 rules=scale.get('rules',[])
                 require(any((r.get('custom') or {}).get('type')=='azure-queue' and
                     ((r.get('custom') or {}).get('metadata') or {}).get('queueName')=='photostore-index-maintenance' for r in rules),
                     label+': dedicated index-maintenance queue scaler missing')
+                if split:
+                    require(any(((r.get('custom') or {}).get('metadata') or {}).get('queueName')
+                        == 'photostore-index-maintenance-deferred' for r in rules),
+                        label+': deferred maintenance queue scaler missing')
     require(not snapshot['jobs'],prefix+'-wave-recovery: a standing job must not exist -- recovery rides on real '
         'wave-lifecycle events, and bootstrap/upgrade scripts provision their own throwaway job and delete it')
     if set(deployments)==set(CAPABILITY_ROLES):
