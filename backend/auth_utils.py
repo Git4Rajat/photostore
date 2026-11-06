@@ -1,6 +1,6 @@
 import json
 import time
-from typing import Dict, List, Mapping
+from typing import Dict, List
 
 import jwt
 import requests
@@ -92,31 +92,3 @@ def validate_bearer_token(token: str, tenant_id: str, client_id: str, api_audien
     )
     return payload
 
-
-def get_request_user_id(
-    headers: Mapping[str, str],
-    auth_required: bool,
-    tenant_id: str,
-    client_id: str,
-    api_audience: str,
-    trust_user_header: bool = False,
-) -> str:
-    auth_header = str(headers.get('Authorization', '') or '')
-    if auth_header.lower().startswith('bearer '):
-        token = auth_header.split(' ', 1)[1].strip()
-        payload = validate_bearer_token(token, tenant_id, client_id, api_audience)
-        user_id = str(payload.get('oid') or payload.get('sub') or payload.get('preferred_username') or '').strip()
-        if user_id:
-            return user_id
-        raise RuntimeError('Token does not contain a usable user identifier claim.')
-
-    if auth_required:
-        raise RuntimeError('Authorization token is required.')
-
-    # No validated token. Only fall back to the unauthenticated X-User-ID header when the
-    # operator has explicitly opted in (local dev). Otherwise refuse to invent an identity,
-    # so a spoofed header can never impersonate another user.
-    if not trust_user_header:
-        raise RuntimeError('Authorization token is required.')
-
-    return str(headers.get('X-User-ID', 'anonymous'))

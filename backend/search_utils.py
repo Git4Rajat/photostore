@@ -832,14 +832,6 @@ def expand_search_terms(tokens: List[str]) -> List[str]:
     return expanded
 
 
-def build_expanded_query_text(query: str, tokens: Dict[str, List[str]] = None) -> str:
-    tokens = tokens or parse_search_query(query)
-    clean = _normalize_token(query)
-    expanded = tokens.get('expanded', [])
-    if not expanded:
-        return clean or query
-    return ' '.join([clean, *expanded]).strip()
-
 
 def _contains_term(text: str, token: str) -> bool:
     return any(re.search(rf'\b{re.escape(variant)}\b', text) for variant in _token_variants(token))

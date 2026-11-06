@@ -12,7 +12,6 @@ import search_db
 import search_utils
 import storage_utils
 from routes.photos import search_photos
-from tests.fakes import FakeTable
 from tests.test_lexical_index import _FakeBlobServiceClient
 
 
@@ -173,30 +172,6 @@ def test_searchdb_blobs_bypass_the_azure_files_share(blobs, monkeypatch, tmp_pat
     monkeypatch.setattr(storage_utils, 'INDEX_DISK_CACHE_DIR', str(tmp_path / 'share'))
     assert not isinstance(storage_utils._get_blob_client('lexical-index', 'k-searchdb.sqlite.gz'), storage_utils._ShareBackedBlob)
     assert isinstance(storage_utils._get_blob_client('lexical-index', 'k-sort.json.gz'), storage_utils._ShareBackedBlob)
-
-
-def test_ensure_user_search_db_runs_the_streaming_build_only_when_stale(blobs, monkeypatch):
-    cls = blobs.get_blob_client('x', 'y').__class__
-    original = cls.upload_blob
-    monkeypatch.setattr(cls, 'upload_blob', lambda self, data, overwrite=True, content_settings=None:
-                        original(self, data.read() if hasattr(data, 'read') else data, overwrite, content_settings))
-    calls = []
-
-    class _V7(_Snap):
-        source_version = 'v7'
-        updated_at = 'v7'
-
-    def hook(user_id, source_version=None):
-        calls.append(user_id)
-        blobs.blobs['lexical-index/' + storage_utils._lexical_index_manifest_blob_name(user_id)] = json.dumps(
-            {'sourceVersion': 'v7'}).encode()
-        search_db.write_for_snapshot(user_id, _V7([_big_row()]))
-        return 1
-
-    monkeypatch.setattr(storage_utils, 'LEXICAL_BUILD_HOOK', hook)
-    assert storage_utils.ensure_user_search_db('lib') is True and calls == ['lib']   # stale -> built
-    assert storage_utils.ensure_user_search_db('lib') is True and calls == ['lib']   # current -> no rebuild
-    assert storage_utils.ensure_user_search_db('') is False
 
 
 # --- the route ---------------------------------------------------------------------

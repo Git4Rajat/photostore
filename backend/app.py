@@ -6038,44 +6038,6 @@ def _remove_faces_for_filename(user_id: str, filename: str) -> None:
     _rebuild_metadata_faces_for_filename(user_id, filename)
 
 
-def _remove_job_rows_for_filename(user_id: str, filename: str) -> int:
-    # Per-file jobs (preview, ipwork, clustering) are all userId-partitioned
-    # (see _job_partition_key) -- library-scoped job types (library_clean/
-    # library_download) never correlate to an individual filename, so scoping
-    # this to the user's own partition covers every realistic match.
-    if jobs_table_client is None or not filename:
-        return 0
-    try:
-        rows = list(jobs_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
-    except Exception:
-        rows = []
-
-    removed = 0
-    job_prefixes = (
-        f'processing:{user_id}:{filename}:',
-        f'processing:{user_id}:{filename}',
-        f'{user_id}:{filename}:',
-        f'{user_id}:{filename}',
-        filename,
-    )
-    for row in rows:
-        row_key = str(row.get('RowKey') or '')
-        job_id = str(row.get('jobId') or '')
-        row_filename = str(row.get('filename') or '')
-        correlation_id = str(row.get('correlationId') or '')
-        if not (
-            row_filename == filename
-            or filename == correlation_id
-            or any(token and (job_id.startswith(token) or row_key.startswith(token) or correlation_id.startswith(token)) for token in job_prefixes)
-        ):
-            continue
-        try:
-            jobs_table_client.delete_entity(partition_key=user_id, row_key=row_key)
-            removed += 1
-        except Exception:
-            pass
-    return removed
-
 
 def _dedupe_face_ids_preserving_order(face_ids: List[str]) -> List[str]:
     return list(dict.fromkeys([str(face_id) for face_id in face_ids if face_id]))

@@ -74,13 +74,6 @@ def test_unusable_metadata_keeps_original_fallback(monkeypatch, geo_ctx, metadat
     assert geo_ctx == [('image', 'photo.CR3')]
 
 
-def test_zero_coordinates_are_valid(monkeypatch):
-    monkeypatch.setattr(ipwork_geo.maps_utils, 'reverse_geocode', lambda *_: {})
-    result = ipwork_geo.process_geo_from_metadata({'exif_status': 'done', 'latitude': 0, 'longitude': 0,
-                                                  'exifData': {'GPS.LatitudeDecimal': '0', 'GPS.LongitudeDecimal': '0'}})
-    assert result == {'hasData': True, 'latitude': 0.0, 'longitude': 0.0, 'address': '', 'city': '', 'region': '', 'country': ''}
-
-
 def test_disabled_reuse_preserves_original_path(monkeypatch, geo_ctx):
     monkeypatch.setattr(app, 'IPWORK_REUSE_EXIF', False)
     monkeypatch.setattr(app, '_get_metadata_entity', lambda *_: {'exif_status': 'done', 'latitude': '55.6', 'longitude': '13'})

@@ -123,10 +123,6 @@ def geo_exif_from_metadata(metadata: Dict) -> Optional[Dict]:
         return None
 
 
-def process_geo_from_metadata(metadata: Dict) -> Optional[Dict]:
-    exif_data = geo_exif_from_metadata(metadata)
-    return None if exif_data is None else process_geo_from_exif(exif_data)
-
 
 def process_geo(user_id: str, filename: str, image_bytes: bytes) -> Dict:
     exif_result = process_exif(user_id, filename, image_bytes)

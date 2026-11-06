@@ -1,5 +1,5 @@
 from processing_generation import allocate_generation, supersede
-from wave_supersession import member_outcome, settlement_requires_original_output
+from wave_supersession import member_outcome
 
 
 def row(revision='rev-1', **overrides):
@@ -16,7 +16,6 @@ def member(revision='rev-1'):
 
 def test_valid_when_row_still_matches_the_frozen_member():
     assert member_outcome(member(), row(), is_video=False) == 'valid'
-    assert settlement_requires_original_output('valid') is True
 
 
 def test_missing_when_the_row_no_longer_exists():
@@ -28,7 +27,6 @@ def test_superseded_after_a_forced_reprocess_changes_the_revision():
     fields = supersede(current, 'rev-2', is_video=False)
     current.update(fields)
     assert member_outcome(member(), current, is_video=False) == 'superseded'
-    assert settlement_requires_original_output('superseded') is False
 
 
 def test_superseded_once_the_live_model_contract_moves_on(monkeypatch):
