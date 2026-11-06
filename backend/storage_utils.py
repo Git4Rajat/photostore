@@ -4,6 +4,7 @@ import contextvars
 import gzip
 import io
 import hashlib
+import hmac
 import json
 import math
 import logging
@@ -584,6 +585,39 @@ def _generate_anonymous_id() -> str:
     return str(uuid.uuid4())
 
 
+def _blob_tag_secret() -> bytes:
+    # Must be identical on every replica, so only the explicitly configured
+    # secret counts (app.py falls back to a random per-process value).
+    return os.getenv('SESSION_SECRET', '').strip().encode('utf-8')
+
+
+def _blob_name_tag(library_id: str, head: str) -> str:
+    return hmac.new(_blob_tag_secret(), f'blob:{library_id}:{head}'.encode('utf-8'), hashlib.sha256).hexdigest()[:12]
+
+
+def generate_library_blob_name(library_id: str) -> str:
+    """UUID-shaped blob name whose last 12 hex chars are an HMAC bound to the library.
+
+    Lets /finalize prove a client-echoed blobName was reserved for the calling
+    library without a lookup (the echo exists because many same-named files share
+    one metadata row). Falls back to a plain uuid4 when no secret is configured.
+    """
+    if not _blob_tag_secret():
+        return _generate_anonymous_id()
+    head = uuid.uuid4().hex[:20]
+    raw = head + _blob_name_tag(library_id, head)
+    return f'{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}'
+
+
+def blob_name_belongs_to_library(library_id: str, blob_name: str) -> bool:
+    if not _blob_tag_secret():
+        return True  # tagging not configured: legacy behaviour
+    raw = str(blob_name or '').replace('-', '').lower()
+    if len(raw) != 32:
+        return False
+    return hmac.compare_digest(raw[20:], _blob_name_tag(library_id, raw[:20]))
+
+
 def _store_image_name_mapping(
     library_id: str,
     original_filename: str,
@@ -841,14 +875,13 @@ def reserve_pending_anonymous_blob(user_id: str, original_filename: str, expecte
     existing_hash = str(entity.get('upload_sha256_expected') or '').strip()
     if existing and not _upload_cleanup_owns_blob(entity, existing) and (not expected_hash or not existing_hash or existing_hash == expected_hash):
         return existing
-    reserved = _generate_anonymous_id()
+    reserved = generate_library_blob_name(user_id)
     entity[PENDING_ANONYMOUS_BLOB_FIELD] = reserved
     if expected_hash:
         entity['upload_sha256_expected'] = expected_hash
-    try:
-        metadata_table_client.upsert_entity(entity)
-    except Exception:
-        return reserved
+    # An unpersisted reservation can't be found again at finalize, so let the
+    # failure propagate and have /upload/init refuse rather than hand out a name.
+    metadata_table_client.upsert_entity(entity)
     return reserved
 
 
@@ -12551,7 +12584,7 @@ def reset_upload_tracking_and_reserve_blob(
     if expected_hash:
         entity['upload_sha256_expected'] = expected_hash
 
-    anonymous_blob_name = existing if reuse else _generate_anonymous_id()
+    anonymous_blob_name = existing if reuse else generate_library_blob_name(user_id)
     entity[PENDING_ANONYMOUS_BLOB_FIELD] = anonymous_blob_name
     entity.update(initial_metadata or {})
 
@@ -12633,7 +12666,7 @@ def reset_upload_tracking_and_reserve_blobs_batch(
             if expected_hash:
                 entity['upload_sha256_expected'] = expected_hash
 
-        anonymous_blob_name = existing_blob if reuse else _generate_anonymous_id()
+        anonymous_blob_name = existing_blob if reuse else generate_library_blob_name(user_id)
         entity[PENDING_ANONYMOUS_BLOB_FIELD] = anonymous_blob_name
         entity.update(f.get('initial_metadata') or {})
         anonymous_blob_names[filename] = anonymous_blob_name

@@ -571,7 +571,9 @@ SPA_BASE_URL = os.getenv('SPA_BASE_URL', '').strip()
 AZURE_AD_TENANT_ID = os.getenv('AZURE_AD_TENANT_ID', '').strip()
 AZURE_AD_CLIENT_ID = os.getenv('AZURE_AD_CLIENT_ID', '').strip()
 AZURE_AD_API_AUDIENCE = os.getenv('AZURE_AD_API_AUDIENCE', '').strip()
-AUTH_REQUIRED = os.getenv('AUTH_REQUIRED', 'false').lower() in ('1', 'true', 'yes')
+# Fail closed: unauthenticated requests are only mapped to the local 'owner' user
+# when AUTH_REQUIRED=false is set explicitly (local development).
+AUTH_REQUIRED = os.getenv('AUTH_REQUIRED', 'true').lower() in ('1', 'true', 'yes')
 # Auth mode: 'password' (single-owner email + password, the simple self-host default)
 # or 'entra' (Microsoft Entra SSO, for advanced/enterprise deployments).
 AUTH_MODE = os.getenv('AUTH_MODE', 'password').strip().lower()
@@ -2150,7 +2152,7 @@ def _album_grant_valid(entity: Dict, token: str) -> bool:
     provided = str(request.cookies.get(_album_grant_cookie_name(token), '') or '')
     if not provided:
         return False
-    return hmac.compare_digest(provided, _sign_album_grant(token, access_code))
+    return hmac.compare_digest(provided.encode('utf-8'), _sign_album_grant(token, access_code).encode('utf-8'))
 
 
 def _album_access_code_gate(entity: Dict, token: str, provided: str):
@@ -2170,7 +2172,7 @@ def _album_access_code_gate(entity: Dict, token: str, provided: str):
     if not password_auth.login_attempt_allowed(config_table_client, row_key):
         retry_after = password_auth.seconds_until_unlocked(config_table_client, row_key)
         return jsonify({'codeRequired': True, 'retryAfterSeconds': retry_after}), 429
-    if provided and hmac.compare_digest(access_code, provided):
+    if provided and hmac.compare_digest(access_code.encode('utf-8'), provided.encode('utf-8')):
         password_auth.record_login_success(config_table_client, row_key)
         return None
     if provided:
@@ -9354,7 +9356,11 @@ def _find_public_album_by_token(token: str) -> Optional[Dict]:
         # actually valid but predates this index (pre-backfill).
         _delete_album_token_index(token)
     # Fallback: unscoped scan, for tokens created before this index existed and
-    # not yet covered by the backfill script.
+    # not yet covered by backfill_album_token_index.py. Off by default: this
+    # endpoint is unauthenticated, so every random token would otherwise cost a
+    # full albums-table scan.
+    if os.getenv('ALBUM_TOKEN_SCAN_FALLBACK', 'false').lower() not in ('1', 'true', 'yes'):
+        return None
     safe = _escape_odata(token)
     try:
         rows = list(albums_table_client.query_entities(f"publicToken eq '{safe}'"))
@@ -13152,6 +13158,14 @@ def _validate_client_blob_name(value: object) -> Optional[str]:
     return candidate if _ANONYMOUS_BLOB_NAME_RE.match(candidate) else None
 
 
+def _owned_client_blob_name(value: object, library_id: str) -> Optional[str]:
+    """_validate_client_blob_name plus proof the name was reserved for ``library_id``."""
+    candidate = _validate_client_blob_name(value)
+    if candidate and not storage_utils_module.blob_name_belongs_to_library(library_id, candidate):
+        return None
+    return candidate
+
+
 BROWSER_PROCESSING_STATUS_FIELDS = (
     ('thumbnail_status', 'thumbnail'),
     ('exif_status', 'exif'),
@@ -13703,7 +13717,7 @@ def _claim_processing_lease_response(
         # silently overwrite a different, already-correct photo's thumbnail blob
         # (the image itself is untouched since that upload path already uses the
         # client-echoed blobName; only this thumbnail-claim path still had the gap).
-        physical_name = _validate_client_blob_name(client_blob_name) or _resolve_media_blob_name(user_id, filename)
+        physical_name = _owned_client_blob_name(client_blob_name, user_id) or _resolve_media_blob_name(user_id, filename)
         from processing_completion import completion_capture_enabled
         if completion_capture_enabled():
             from processing_artifacts import staging_name

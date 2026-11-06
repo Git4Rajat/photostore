@@ -1568,6 +1568,8 @@ resource web 'Microsoft.App/containerApps@2025-01-01' = {
             { name: 'APP_CONFIG_RECOVERY_API_BASE_URL', value: 'https://${recovery.properties.configuration.ingress.fqdn}' }
             { name: 'APP_CONFIG_ARCHIVE_API_BASE_URL', value: 'https://${archive.properties.configuration.ingress.fqdn}' }
             { name: 'APP_CONFIG_SPA_BASE_URL', value: webUrl }
+            // Lets the web container's CSP allow only this storage account instead of *.blob.core.windows.net.
+            { name: 'STORAGE_ACCOUNT_NAME', value: storageAccountName }
             { name: 'APP_CONFIG_AUTH_MODE', value: 'password' }
             // Without this, the frontend's docker-entrypoint.sh defaults
             // processingMode to 'browser' regardless of what this deployment

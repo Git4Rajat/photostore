@@ -47,3 +47,13 @@ def test_rejects_path_like_values():
 def test_rejects_non_string_input():
     assert app._validate_client_blob_name(12345) is None
     assert app._validate_client_blob_name({'not': 'a string'}) is None
+
+
+def test_library_tagged_blob_names_bind_to_their_library(monkeypatch):
+    import storage_utils
+    monkeypatch.setenv('SESSION_SECRET', 'test-secret-for-blob-tags')
+    name = storage_utils.generate_library_blob_name('library-a')
+    assert app._validate_client_blob_name(name) == name
+    assert app._owned_client_blob_name(name, 'library-a') == name
+    assert app._owned_client_blob_name(name, 'library-b') is None
+    assert app._owned_client_blob_name('550e8400-e29b-41d4-a716-446655440000', 'library-a') is None

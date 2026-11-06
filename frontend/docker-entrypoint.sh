@@ -82,7 +82,17 @@ EOF
 # redirects off to HF's CDN on a *.hf.co subdomain (e.g. us.aws.cdn.hf.co) --
 # confirmed via `curl -I .../resolve/main/model_quantized.onnx` -- hence the
 # wildcard rather than just huggingface.co.
-CONNECT_SRC="wss://*.webpubsub.azure.com 'self' https://*.blob.core.windows.net https://unpkg.com https://tessdata.projectnaptha.com https://huggingface.co https://*.hf.co data:"
+# Scope Azure Blob Storage to this deployment's account when it is known
+# (STORAGE_ACCOUNT_NAME); the wildcard lets script exfiltrate to any account.
+if [ -n "$STORAGE_ACCOUNT_NAME" ]; then
+  BLOB_HOST="https://${STORAGE_ACCOUNT_NAME}.blob.core.windows.net"
+else
+  BLOB_HOST="https://*.blob.core.windows.net"
+fi
+# unpkg.com serves any npm package, so only allow the exact pinned tesseract
+# paths (keep in sync with the tesseract.js / tesseract.js-core versions).
+UNPKG_SRC="https://unpkg.com/tesseract.js@v2.1.5/ https://unpkg.com/tesseract.js-core@v2.2.0/"
+CONNECT_SRC="wss://*.webpubsub.azure.com 'self' ${BLOB_HOST:-https://*.blob.core.windows.net} ${UNPKG_SRC:-https://unpkg.com/tesseract.js@v2.1.5/ https://unpkg.com/tesseract.js-core@v2.2.0/} https://tessdata.projectnaptha.com https://huggingface.co https://*.hf.co data:"
 if [ -n "$API_BASE_URL" ]; then
   CONNECT_SRC="${CONNECT_SRC} ${API_BASE_URL}"
 fi
@@ -116,7 +126,7 @@ fi
 # preview once the universal-preview-tier feature made previewUrl point at
 # archive instead of always resolving to a SAS URL. Built the same
 # only-if-different way as CONNECT_SRC above.
-IMG_SRC="'self' data: blob: https://*.blob.core.windows.net"
+IMG_SRC="'self' data: blob: ${BLOB_HOST}"
 if [ -n "$API_BASE_URL" ]; then
   IMG_SRC="${IMG_SRC} ${API_BASE_URL}"
 fi
@@ -125,5 +135,5 @@ if [ -n "$ARCHIVE_API_BASE_URL" ] && [ "$ARCHIVE_API_BASE_URL" != "$API_BASE_URL
 fi
 
 cat > /etc/nginx/csp.conf <<EOF
-add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' https://unpkg.com; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src ${IMG_SRC}; media-src 'self' blob: https://*.blob.core.windows.net; connect-src ${CONNECT_SRC}; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'" always;
+add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' ${UNPKG_SRC}; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src ${IMG_SRC}; media-src 'self' blob: ${BLOB_HOST}; connect-src ${CONNECT_SRC}; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'" always;
 EOF
