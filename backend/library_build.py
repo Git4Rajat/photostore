@@ -91,10 +91,6 @@ def _read_part(path: str) -> Iterator[Dict]:
                 yield json.loads(line)
 
 
-def _is_true(value) -> bool:
-    return str(value).strip().lower() in ('true', '1')
-
-
 def _building_state(manifest: Dict) -> Optional[Dict]:
     building = manifest.get('building')
     return building if isinstance(building, dict) else None

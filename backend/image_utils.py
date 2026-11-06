@@ -119,14 +119,6 @@ def compute_file_hash(content: bytes) -> str:
     return digest.hexdigest()
 
 
-def compute_file_hash_from_path(path: str) -> str:
-    digest = hashlib.sha256()
-    with open(path, 'rb') as file_handle:
-        for chunk in iter(lambda: file_handle.read(8192), b''):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def allowed_file(filename: str) -> bool:
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 

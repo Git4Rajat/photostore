@@ -8240,17 +8240,6 @@ def _load_face_rows_by_ids(user_id: str, face_ids: List[str]) -> Dict[str, Dict]
     return out
 
 
-def _scan_person_and_face_rows(user_id: str) -> Tuple[List[Dict], Dict[str, Dict]]:
-    """Shared cheap scan used by list_persons/list_faces: every person row (sorted
-    by RowKey) plus the bulk face-summary map. Neither call does per-item work
-    (SAS minting, individual face lookups) -- callers do that only for the page
-    they're about to return.
-    """
-    rows = sorted(_cached_person_rows_for_user(user_id, with_embeddings=False), key=lambda r: str(r.get('RowKey', '')))
-    face_by_id = _load_user_face_summary_by_id(user_id)
-    return rows, face_by_id
-
-
 def _face_thumbnail_url(filename: str, user_id: str = '') -> str:
     """Direct-blob thumbnail URL for a face's source photo, for the People page.
 

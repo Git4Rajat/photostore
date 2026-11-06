@@ -31,13 +31,6 @@ def stage_work_store(table, **kwargs):
     return WorkStore(table, partition=STAGE_PARTITION, **kwargs)
 
 
-def live_consumers_available():
-    # Configuration hint only: actual live admission/consumption also validates
-    # durable ownership and the role's certified deployment identity.
-    from wave_policy import configuration_ready
-    return configuration_ready() and bool(os.getenv('UPLOAD_WAVE_CAPABILITY_ID'))
-
-
 def execution_enabled():
     return os.getenv('UPLOAD_WAVE_EXECUTION_ENABLED', '').strip().lower() == 'true'
 
