@@ -104,12 +104,6 @@ class FaceIndexBuildResult:
     built_at: str
 
 
-def _normalize_rows(vectors: np.ndarray) -> np.ndarray:
-    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    return vectors / norms
-
-
 def _new_index(dimension: int, vector_count: int, *, training_count=None, config=None):
     """L2-normalized vectors + inner product = cosine similarity, matching
     the rest of the clustering code's cosine-based thresholds -- no separate

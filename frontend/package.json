@@ -7,17 +7,15 @@
   "scripts": {
     "start": "vite",
     "dev": "vite",
-    "sync:blazeface-model": "node scripts/sync-blazeface-model.mjs",
     "sync:browser-ai-runtime": "node scripts/sync-browser-ai-runtime.mjs",
     "sync:video-runtime": "node scripts/sync-video-runtime.mjs",
-    "prebuild": "npm run sync:blazeface-model && npm run sync:browser-ai-runtime && npm run sync:video-runtime",
+    "prebuild": "npm run sync:browser-ai-runtime && npm run sync:video-runtime",
     "build": "vite build && chmod -R a+rX build/models",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
-    "face:calibrate": "node scripts/calibrate-face-folder.mjs",
     "postinstall": "node -e \"const fs=require('fs'); const path=require('path'); const target=path.join(process.cwd(),'node_modules','protobufjs','cli','node_modules','underscore','underscore-min.js'); fs.mkdirSync(path.dirname(target),{recursive:true}); fs.writeFileSync(target,'module.exports = {};\\n');\""
   },
   "dependencies": {

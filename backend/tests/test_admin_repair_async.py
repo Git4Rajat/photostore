@@ -18,7 +18,6 @@ from azure.core.exceptions import ResourceNotFoundError
 import app
 from routes.admin import (
     admin_dedupe_faces,
-    admin_job_status,
     admin_purge_orphaned_photo_data,
     admin_rebuild_vector_index,
 )
@@ -192,15 +191,10 @@ def test_vector_index_rebuild_route_uses_dedicated_worker(env, monkeypatch):
     payload = queue.sent[0]
     assert payload['type'] == 'index_build' and payload['scope'] == 'vector'
     app._handle_clustering_queue_payload(payload, body['jobId'], 'owner', 'index_build')
-    with app.app.test_request_context('/api/admin/jobs/status?jobId=' + body['jobId']):
-        status_response = admin_job_status()
-    assert status_response.get_json()['status'] == 'done'
-    assert status_response.get_json()['result']['rowCount'] == 3
-    assert status_response.get_json()['result']['status'] == 'full'
     assert built == ['owner']
 
 
-def test_legacy_vector_repair_forwards_and_status_tracks_real_build(env, monkeypatch):
+def test_legacy_vector_repair_forwards_to_the_index_build(env, monkeypatch):
     table, _queue = env
     monkeypatch.setenv('APP_ROLE', 'cluster')
     monkeypatch.setattr(app, 'refresh_user_vector_index',
@@ -209,27 +203,9 @@ def test_legacy_vector_repair_forwards_and_status_tracks_real_build(env, monkeyp
     job_id = 'cluster:owner:vecempty'
     payload = {'jobId': job_id, 'user_id': 'owner', 'type': 'vector_index_rebuild'}
     app._handle_clustering_queue_payload(payload, job_id, 'owner', 'vector_index_rebuild')
-    target = table.get_entity('owner', job_id)['forwardedTo']
-    for state in ('queued', 'running', 'failed', 'done'):
-        app._upsert_job_status(target, 'owner', 'index_build', state, indexScope='vector')
-        with app.app.test_request_context('/api/admin/jobs/status?jobId=' + job_id):
-            assert admin_job_status().get_json()['status'] == state
+    assert table.get_entity('owner', job_id)['forwardedTo']
 
 
-def test_admin_job_status_unknown_for_missing_job(env):
-    with app.app.test_request_context('/api/admin/jobs/status?jobId=does-not-exist'):
-        response = admin_job_status()
-    assert response.get_json() == {'status': 'unknown'}
-
-
-def test_admin_job_status_hides_other_users_jobs(env, monkeypatch):
-    table, _queue = env
-    job_id = 'cluster:someone-else:xyz'
-    app._upsert_job_status(job_id, 'someone-else', 'people_admin_repair', 'done', result={'duplicateGroups': 1})
-
-    with app.app.test_request_context(f'/api/admin/jobs/status?jobId={job_id}'):
-        response = admin_job_status()
-    assert response.get_json() == {'status': 'unknown'}
 
 
 def test_purge_orphaned_removes_the_purged_photos_from_albums_and_dirties_indexes(monkeypatch):

@@ -65,51 +65,6 @@ def recover_source_reservations():
         app.worker_logger.warning('Quiesced index recovery deferred', exc_info=True)
         return app.jsonify({'error': str(exc), 'status': 'deferred'}), 409
 
-@admin_bp.route('/api/admin/people/recluster', methods=['POST'])
-@admin_bp.route('/admin/people/recluster', methods=['POST'])
-def admin_recluster_people():
-    try:
-        user_id, error = app._require_user_id()
-        if error:
-            return error
-        if not app._people_features_available():
-            return app.jsonify({'error': 'People features not configured'}), 503
-        data = app.request.get_json(silent=True) or {}
-        if data.get('repair') is not True or data.get('confirm') != 'RECLUSTER_REPAIR':
-            return app.jsonify({'error': 'repair confirmation required', 'code': 'protected_repair_required'}), 403
-        queued = app._enqueue_clustering_job(
-            user_id,
-            force=False,
-            job_type='people_recluster',
-            allow_reassign_confirmed=app._coerce_bool(data.get('allowReassignConfirmed', False)),
-        )
-        response = app._clustering_queue_response(queued)
-        if queued.get('status') == 'unavailable':
-            return app.jsonify(response), 503
-        if queued.get('status') == 'failed':
-            return app.jsonify(response), 500
-        return app.jsonify(response)
-    except Exception as exc:
-        app.app.logger.exception('Admin people recluster route failed')
-        return app.jsonify({'error': 'Admin people recluster failed'}), 500
-
-@admin_bp.route('/api/admin/people/recluster/restore', methods=['POST'])
-@admin_bp.route('/admin/people/recluster/restore', methods=['POST'])
-def restore_people_recluster_snapshot():
-    user_id, error = app._require_user_id()
-    if error:
-        return error
-    if not app._people_features_available():
-        return app.jsonify({'error': 'People features not configured'}), 503
-    data = app.request.get_json(silent=True) or {}
-    snapshot_id = str(data.get('snapshotId') or '').strip()
-    if not snapshot_id:
-        return app.jsonify({'error': 'snapshotId required'}), 400
-    result = app._restore_people_repair_snapshot(user_id, snapshot_id)
-    if not result.get('success'):
-        return app.jsonify(result), 404
-    return app.jsonify(result)
-
 @admin_bp.route('/api/admin/people/dedupe-faces', methods=['POST'])
 @admin_bp.route('/admin/people/dedupe-faces', methods=['POST'])
 def admin_dedupe_faces():
@@ -320,74 +275,6 @@ def admin_backfill_photos():
         'processingMode': app.PROCESSING_MODE,
     })
 
-@admin_bp.route('/api/admin/ipwork/enqueue', methods=['POST'])
-@admin_bp.route('/admin/ipwork/enqueue', methods=['POST'])
-def admin_enqueue_ipwork():
-    """Queue specific steps for a caller-supplied set of photos, server-side.
-
-    The Tools page's per-step buttons (Thumbnails/EXIF/OCR/AI vision/Map
-    tagging/Faces) used to only call startBrowserProcessing() -- a purely
-    client-side pipeline. Under PROCESSING_MODE=backend that pipeline
-    self-gates every step to a no-op (see runBrowserProcessing in
-    PhotoGallery.tsx), so those buttons silently did nothing. This is the
-    selection-scoped counterpart to admin_backfill_photos() above (which
-    already does this, but only for the *entire* library): it lets a
-    specific set of filenames be (re)enqueued to ipworker without touching
-    the rest of the account. No confirm gate is required here, unlike the
-    library-wide backfill -- the blast radius is bounded to whatever the
-    caller explicitly selected.
-    """
-    user_id, error = app._require_user_id()
-    if error:
-        return error
-    refused = _refuse_wave_owned_reprocess(user_id)
-    if refused:
-        return refused
-    data = app.request.get_json(silent=True) or {}
-
-    all_steps = ['preview', 'thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face']
-    requested_steps = data.get('steps')
-    if not isinstance(requested_steps, list) or not requested_steps:
-        return app.jsonify({'error': 'steps must be a non-empty list', 'code': 'invalid_steps'}), 400
-    invalid_steps = [step for step in requested_steps if step not in all_steps]
-    if invalid_steps:
-        return app.jsonify({'error': f'invalid steps: {invalid_steps}', 'code': 'invalid_steps'}), 400
-    steps_to_run = requested_steps
-
-    raw_filenames = data.get('filenames')
-    if not isinstance(raw_filenames, list) or not raw_filenames:
-        return app.jsonify({'error': 'filenames must be a non-empty list', 'code': 'invalid_filenames'}), 400
-    if len(raw_filenames) > 2000:
-        return app.jsonify({'error': 'Too many filenames', 'code': 'too_many_filenames'}), 400
-    force = bool(data.get('force'))
-
-    queued = 0
-    skipped = 0
-    for raw_name in raw_filenames:
-        filename = app._validate_media_filename(str(raw_name or ''))
-        entity = app._get_metadata_entity(user_id, filename) if filename else None
-        if not entity or str(entity.get('processing_state') or '').strip().lower() == 'deleted' or app.is_video_file(filename):
-            skipped += 1
-            continue
-        try:
-            app._enqueue_processing_steps(user_id, filename, steps_to_run, force=force)
-            # Same reasoning as admin_backfill_photos: without this, backend/both
-            # mode would never reach ipworker for an already-uploaded photo the
-            # user re-runs from the Tools page.
-            app._queue_ipwork_processing(user_id, filename, steps=steps_to_run)
-            queued += 1
-        except Exception:
-            app.app.logger.exception('ipwork enqueue: failed to enqueue steps for %s/%s', user_id, filename)
-            skipped += 1
-
-    app.app.logger.info('ipwork enqueue: queued %d photos (steps=%s), skipped %d for user %s', queued, steps_to_run, skipped, user_id)
-    return app.jsonify({
-        'queued': queued,
-        'skipped': skipped,
-        'total': queued + skipped,
-        'steps': steps_to_run,
-    })
-
 @admin_bp.route('/api/admin/people/verify-face-index', methods=['POST'])
 @admin_bp.route('/admin/people/verify-face-index', methods=['POST'])
 def admin_verify_face_index():
@@ -439,38 +326,3 @@ def admin_purge_orphaned_photo_data():
         return app.jsonify({'error': 'repair confirmation required', 'code': 'protected_repair_required'}), 403
     queued = app._enqueue_admin_repair_job(user_id, action='purge_orphaned', dry_run=dry_run)
     return app.jsonify(app._clustering_queue_response(queued))
-
-@admin_bp.route('/api/admin/jobs/status', methods=['GET'])
-def admin_job_status():
-    """Poll result for a job enqueued by one of the admin repair/rebuild
-    routes above (people_admin_repair, vector_index_rebuild) -- these run on
-    the standalone clustering worker instead of inline on a backend request
-    thread (see _enqueue_admin_repair_job), so the Tools page polls here for
-    the same dry-run preview / apply result it used to get synchronously."""
-    user_id, error = app._require_user_id()
-    if error:
-        return error
-    job_id = str(app.request.args.get('jobId', '') or '')
-    if not job_id:
-        return app.jsonify({'status': 'unknown'})
-    row = app._get_job_row(user_id, job_id)
-    if row is None:
-        return app.jsonify({'status': 'unknown'})
-    if str(row.get('userId') or '') != user_id:
-        return app.jsonify({'status': 'unknown'})
-    if row.get('forwardedTo'):
-        # A legacy queue acknowledgement is a handoff, not a build receipt.
-        # Only follow one alias, within the authenticated library partition.
-        target = app._get_job_row(user_id, str(row['forwardedTo']))
-        if target is None:
-            return app.jsonify({'status': 'queued', 'result': None, 'error': None})
-        if str(target.get('userId') or '') != user_id or target.get('forwardedTo'):
-            return app.jsonify({'status': 'unknown'})
-        row = target
-    result = row.get('result')
-    if isinstance(result, str):
-        try:
-            result = app.json.loads(result)
-        except Exception:
-            pass
-    return app.jsonify({'status': str(row.get('status') or 'unknown'), 'result': result, 'error': row.get('error')})

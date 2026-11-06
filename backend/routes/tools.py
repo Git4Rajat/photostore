@@ -6,7 +6,6 @@ as app.<name> throughout, matching the exact late-binding lookup semantics
 the code relied on when these functions lived in app.py directly, so
 test-time monkeypatching of app.<name> globals still works unchanged).
 """
-import os
 
 from flask import Blueprint
 
@@ -289,9 +288,6 @@ def tools_indexes_status():
     return app.jsonify(result)
 
 
-def jsonify_status(ready, indexes, building):
-    return app.jsonify({'ready': ready, 'building': bool(building), 'indexes': indexes})
-
 
 @tools_bp.route('/api/tools/indexes/rebuild/<index_kind>', methods=['POST'])
 def tools_rebuild_index(index_kind: str):
@@ -512,28 +508,3 @@ def reconcile_pending_edits():
     response.headers['Cache-Control'] = 'no-store'
     return response
 
-
-@tools_bp.route('/api/tools/waves/shadow/<wave>/compare', methods=['GET'])
-def compare_wave_shadow_to_legacy(wave: str):
-    """Operator diagnostic for the shadow-validation period (step 3 of
-    docs/indexing-clustering-target-state.md's delivery sequence): how much
-    longer the library-wide shadow barrier made each photo in this wave wait
-    versus its own completion time. Read-only; never dispatches."""
-    if os.getenv('UPLOAD_WAVE_SHADOW_ENABLED', '').strip().lower() != 'true':
-        return app.jsonify({'error': 'Shadow upload protocol is disabled'}), 404
-    _, library, error = app._require_library_context(require_auth=True)
-    if error:
-        return error
-    if app.jobs_table_client is None:
-        return app.jsonify({'error': 'Shadow protocol storage unavailable'}), 503
-    from upload_waves import Conflict, ShadowWaves
-    from upload_wave_shadow import compare_against_legacy
-    try:
-        result = compare_against_legacy(ShadowWaves(app.jobs_table_client, library), wave)
-    except Conflict:
-        return app.jsonify({'error': 'Unknown wave'}), 404
-    except ValueError:
-        return app.jsonify({'error': 'Invalid wave id'}), 400
-    response = app.jsonify(result)
-    response.headers['Cache-Control'] = 'no-store'
-    return response

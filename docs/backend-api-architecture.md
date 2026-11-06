@@ -365,9 +365,9 @@ The backend (1Gi) used to hold library-sized data in memory for several endpoint
 
 | Endpoint / helper | Before | Now |
 |---|---|---|
-| `GET /photos` (list), `GET /photos/filter` | whole listing blob (130k rows) loaded + sorted in Python | SQL `ORDER BY/LIMIT/OFFSET` on the per-library SQLite DB (`SearchDatabase.list_page` / `filter_page`); page metadata re-read fresh (parallel point reads). Ordering/filter parity with the old in-memory logic is pinned in `tests/test_library_db_routes.py` |
-| `/api/suggestions` (on this day) | pass over the listing | `GROUP BY capture_year WHERE capture_md = ?` |
-| `/api/search/suggest` (places) | pass over the listing | place vocabulary stored in the DB |
+| `GET /photos` (list), `GET /photos/filter` (route since removed) | whole listing blob (130k rows) loaded + sorted in Python | SQL `ORDER BY/LIMIT/OFFSET` on the per-library SQLite DB (`SearchDatabase.list_page` / `filter_page`); page metadata re-read fresh (parallel point reads). Ordering/filter parity with the old in-memory logic is pinned in `tests/test_library_db_routes.py` |
+| `/api/suggestions` (on this day; route since removed) | pass over the listing | `GROUP BY capture_year WHERE capture_md = ?` |
+| `/api/search/suggest` (places; route since removed) | pass over the listing | place vocabulary stored in the DB |
 | album covers (`_album_cover_thumbnail_url`) | full unprojected, sorted scan of every row | `SearchDatabase.top_rated(album filenames)` (chunked `IN`, O(limit)) + <=12 point reads |
 | `access-batch` | whole access index copied (130k rows) and re-indexed **per call** | one compact filename map per index version (`lookup_access_entries`), no copies; the backend never builds the index |
 | trash list / restore-all | all columns of all rows, filtered in Python | server-side `processing_state eq 'deleted'` + projection |

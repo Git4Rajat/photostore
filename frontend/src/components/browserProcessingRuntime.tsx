@@ -141,7 +141,6 @@ export const resetBrowserFaceModelLoadStateForTests = () => {
 };
 
 type AppRuntimeConfig = {
-    blazeFaceModelUrl?: string;
     arcFaceModelUrl?: string;
     arcFaceWasmPath?: string;
     processingMode?: 'browser' | 'backend' | 'both';

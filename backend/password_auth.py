@@ -94,11 +94,6 @@ def get_owner_credential(table_client) -> Optional[Dict]:
         return None
 
 
-def owner_email(table_client) -> str:
-    entity = get_owner_credential(table_client) or {}
-    return str(entity.get('email', '') or '')
-
-
 def set_owner_password(table_client, password: str, email: Optional[str] = None) -> None:
     """Create or update the owner credential."""
     existing = get_owner_credential(table_client) or {}
@@ -124,13 +119,6 @@ def seed_owner_if_missing(table_client, email: str, password: str) -> bool:
         return False
     set_owner_password(table_client, password, email=email or '')
     return True
-
-
-def verify_owner_password(table_client, password: str) -> bool:
-    entity = get_owner_credential(table_client)
-    if not entity:
-        return False
-    return verify_password(password, str(entity.get('passwordHash', '') or ''))
 
 
 # ---------------------------------------------------------------------------
@@ -327,9 +315,3 @@ def consume_reset_token(table_client, raw: str) -> bool:
         pass
     return valid
 
-
-def reset_password_with_token(table_client, raw_token: str, new_password: str) -> bool:
-    if not consume_reset_token(table_client, raw_token):
-        return False
-    set_owner_password(table_client, new_password)
-    return True

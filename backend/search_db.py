@@ -785,12 +785,6 @@ class SearchDatabase:
             [*all_args, int(limit), max(0, int(offset))])]
         return names, int(total)
 
-    def on_this_day(self, month: int, day: int, exclude_year: int) -> Dict[int, int]:
-        """{year: photo count} for photos captured on this month/day in other years."""
-        return {int(y): int(c) for y, c in self._conn().execute(
-            'SELECT capture_year, COUNT(*) FROM rows WHERE capture_md = ? AND capture_year != ? GROUP BY capture_year',
-            (month * 100 + day, exclude_year))}
-
     def top_rated(self, filenames: Sequence[str], limit: int = 12) -> List[str]:
         """The best `limit` of these filenames by rating -> likes -> recency ->
         filename (album-cover order). Chunked IN() queries keep the SQL variable

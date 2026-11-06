@@ -6,7 +6,6 @@ window.__APP_CONFIG__ = {
   azureAdClientId: "",
   azureAdApiScope: "",
   authMode: "entra",
-  blazeFaceModelUrl: "/models/browser-ai/models/blazeface/model.json",
   arcFaceModelUrl: "/models/browser-ai/models/arcface/model.onnx",
   arcFaceWasmPath: "/models/browser-ai/runtime/",
   browserGeocoderUrl: "https://photon.komoot.io/reverse",

@@ -1,5 +1,4 @@
 """Photo routes: bulk metadata, soft delete, trash restore, purge and rating glue."""
-import datetime
 
 import pytest
 
@@ -13,35 +12,6 @@ def http(monkeypatch):
     app.app.config['PROPAGATE_EXCEPTIONS'] = True
     return app.app.test_client()
 
-
-class TestPhotosMetadata:
-    URL = '/api/photos/metadata'
-
-    def test_rejects_non_list(self, http):
-        assert http.post(self.URL, json={'filenames': 'a.jpg'}).status_code == 400
-
-    def test_reports_each_filename_independently(self, http, monkeypatch):
-        rows = {'a.jpg': {'x': 1}, 'blobless.jpg': {'x': 2}}
-        stamp = datetime.datetime(2026, 1, 2, 3, 4, 5)
-        monkeypatch.setattr(app, '_get_metadata_entity', lambda user, name: rows.get(name))
-        monkeypatch.setattr(app, '_blob_name_from_metadata', lambda row, name: name)
-
-        def props(kind, blob):
-            if blob == 'blobless.jpg':
-                raise FileNotFoundError(blob)
-            return {'size': 12, 'last_modified': stamp}
-
-        monkeypatch.setattr(app, 'get_media_properties', props)
-        body = http.post(self.URL, json={'filenames': ['a.jpg', '../evil', 'missing.jpg', 'blobless.jpg']}).json
-        assert body == {
-            'a.jpg': {'size': 12, 'lastModified': '2026-01-02T03:04:05'},
-            '../evil': {'error': 'Invalid filename'},
-            'missing.jpg': {'error': 'Not found'},
-            'blobless.jpg': {'error': 'Not found'},
-        }
-
-    def test_missing_body_means_empty_result(self, http):
-        assert http.post(self.URL).json == {}
 
 
 class TestSoftDelete:

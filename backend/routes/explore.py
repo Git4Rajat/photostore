@@ -28,14 +28,3 @@ def explore_summary():
         return app.jsonify({'places': [], 'things': []})
     return app.jsonify({'places': summary.get('places', []), 'things': summary.get('things', [])})
 
-
-@explore_bp.route('/api/search/suggest', methods=['GET'])
-@explore_bp.route('/api/search/suggest/', methods=['GET'])
-def search_typeahead():
-    user_id, error = app._require_user_id()
-    if error:
-        return error
-    partial = (app.request.args.get('q') or '').strip()
-    if not partial:
-        return app.jsonify({'suggestions': []})
-    return app.jsonify({'suggestions': app._search_typeahead_suggestions(user_id, partial)})

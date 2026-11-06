@@ -2,7 +2,6 @@
   "$schema": "https://unpkg.com/knip@5/schema.json",
   "entry": [
     "src/index.tsx",
-    "src/mockups/main.tsx",
     "src/benchmark/main.js",
     "src/workers/*.{ts,js}",
     "scripts/*.{mjs,ts}",

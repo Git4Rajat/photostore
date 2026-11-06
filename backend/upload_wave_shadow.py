@@ -135,46 +135,6 @@ def observe_source(store, member, metadata_table, face_table, face_ids):
                 evidence_qualified=qualified)
 
 
-def compare_against_legacy(store, wave_id):
-    """Read-only diagnostic: how much longer the library-wide shadow barrier
-    made each photo wait versus its own completion time.
-
-    There is no durable, queryable record of when legacy per-photo/early-
-    trigger clustering would have fired for a given filename --
-    _buffer_incremental_assign_filename (app.py) is an in-process, ephemeral
-    buffer, not a persisted dispatch log (see docs/indexing-clustering-
-    target-state.md's "Producer batching" row). The nearest durable proxy is
-    each member's own observe() evidence (`observedAt`, written once that
-    photo's required processing settled): that is the earliest instant a
-    per-photo trigger could plausibly have started clustering on it. This
-    compares that against the wave's barrier (frozenAt once ready, else the
-    last evaluation pass) to report the extra wait the wave protocol adds.
-    Never writes, never dispatches -- purely reads already-persisted shadow
-    evidence.
-    """
-    from upload_waves import identifier
-    identifier(wave_id)
-    wave = dict(store._required(store.wave_key(wave_id)))
-    members, after = [], ''
-    while True:
-        page = store._page(f'e!{wave_id}!m!', after)
-        members.extend(page)
-        if len(page) < MAX_PAGE:
-            break
-        after = page[-1]['RowKey']
-    settled = [member for member in members if member['outcome'] != 'pending' and member.get('observedAt')]
-    barrier_at = wave.get('frozenAt') or wave.get('lastEvaluatedAt')
-    waits = sorted(max(0.0, barrier_at - member['observedAt']) for member in settled) if barrier_at else []
-    qualified = sum(1 for member in settled if member.get('evidenceQualified'))
-    return dict(
-        waveId=wave_id, state=wave['state'],
-        memberCount=len(members), settledMemberCount=len(settled), qualifiedMemberCount=qualified,
-        barrierAt=barrier_at,
-        extraWaitSecondsMin=waits[0] if waits else None,
-        extraWaitSecondsMedian=waits[len(waits) // 2] if waits else None,
-        extraWaitSecondsMax=waits[-1] if waits else None,
-    )
-
 
 def reconcile_page(store, wave_id, metadata_table, face_table, face_ids, *, after=''):
     from upload_waves import identifier

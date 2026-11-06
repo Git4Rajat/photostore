@@ -81,57 +81,6 @@ def test_purge_orphaned_data_previews_by_default_and_gates_the_destructive_run(h
     assert repair_jobs[-1] == ('u1', 'purge_orphaned', False)
 
 
-class TestRecluster:
-    URL = '/api/admin/people/recluster'
-    BODY = {'repair': True, 'confirm': 'RECLUSTER_REPAIR'}
-
-    def test_requires_confirmation(self, http, monkeypatch):
-        monkeypatch.setattr(app, '_enqueue_clustering_job', lambda *a, **k: pytest.fail('must not enqueue'))
-        assert http.post(self.URL, json={'repair': True}).status_code == 403
-        assert http.post(self.URL, json={'confirm': 'RECLUSTER_REPAIR'}).status_code == 403
-
-    def test_queues_a_non_forced_recluster_and_protects_confirmed_people_by_default(self, http, monkeypatch):
-        seen = []
-        monkeypatch.setattr(app, '_enqueue_clustering_job',
-                            lambda user, **kw: seen.append((user, kw)) or {'status': 'queued', 'jobId': 'j1'})
-        assert http.post(self.URL, json=self.BODY).json['jobId'] == 'j1'
-        http.post(self.URL, json={**self.BODY, 'allowReassignConfirmed': True})
-        assert seen == [
-            ('u1', {'force': False, 'job_type': 'people_recluster', 'allow_reassign_confirmed': False}),
-            ('u1', {'force': False, 'job_type': 'people_recluster', 'allow_reassign_confirmed': True}),
-        ]
-
-    @pytest.mark.parametrize('status,code', [('unavailable', 503), ('failed', 500), ('already_active', 200)])
-    def test_maps_queue_status_to_http_status(self, http, monkeypatch, status, code):
-        monkeypatch.setattr(app, '_enqueue_clustering_job', lambda *a, **k: {'status': status})
-        assert http.post(self.URL, json=self.BODY).status_code == code
-
-    def test_unexpected_error_is_a_json_500(self, http, monkeypatch):
-        def boom(*a, **k):
-            raise RuntimeError('queue exploded')
-        monkeypatch.setattr(app, '_enqueue_clustering_job', boom)
-        response = http.post(self.URL, json=self.BODY)
-        assert response.status_code == 500 and 'queue exploded' not in response.get_data(as_text=True)
-
-
-class TestRestoreSnapshot:
-    URL = '/api/admin/people/recluster/restore'
-
-    def test_requires_snapshot_id(self, http):
-        assert http.post(self.URL, json={}).status_code == 400
-        assert http.post(self.URL, json={'snapshotId': '   '}).status_code == 400
-
-    def test_restores_trimmed_snapshot_id(self, http, monkeypatch):
-        seen = []
-        monkeypatch.setattr(app, '_restore_people_repair_snapshot',
-                            lambda user, snap: seen.append((user, snap)) or {'success': True, 'restored': 3})
-        assert http.post(self.URL, json={'snapshotId': ' snap-1 '}).json == {'success': True, 'restored': 3}
-        assert seen == [('u1', 'snap-1')]
-
-    def test_unknown_snapshot_is_404_with_the_failure_body(self, http, monkeypatch):
-        monkeypatch.setattr(app, '_restore_people_repair_snapshot', lambda *a: {'success': False, 'error': 'missing'})
-        response = http.post(self.URL, json={'snapshotId': 'nope'})
-        assert response.status_code == 404 and response.json['error'] == 'missing'
 
 
 class TestRebuildVectorIndex:
@@ -255,43 +204,6 @@ class TestBackfillPhotos:
         assert http.post(self.URL, json=self.BODY).json['queued'] == 1
 
 
-class TestEnqueueIpwork:
-    URL = '/api/admin/ipwork/enqueue'
-
-    @pytest.fixture
-    def ipwork(self, monkeypatch):
-        state = {'enqueued': [], 'queued': []}
-        entities = {'a.jpg': {'processing_state': 'done'}, 'gone.jpg': {'processing_state': 'deleted'},
-                    'clip.mp4': {'processing_state': 'done'}}
-        monkeypatch.setattr(app, '_get_metadata_entity', lambda user, name: entities.get(name))
-        monkeypatch.setattr(app, '_enqueue_processing_steps',
-                            lambda user, name, steps, force=False: state['enqueued'].append((name, force)))
-        monkeypatch.setattr(app, '_queue_ipwork_processing', lambda user, name, steps: state['queued'].append(name))
-        return state
-
-    @pytest.mark.parametrize('body,code', [
-        ({'filenames': ['a.jpg']}, 'invalid_steps'),
-        ({'steps': [], 'filenames': ['a.jpg']}, 'invalid_steps'),
-        ({'steps': ['nope'], 'filenames': ['a.jpg']}, 'invalid_steps'),
-        ({'steps': ['ocr']}, 'invalid_filenames'),
-        ({'steps': ['ocr'], 'filenames': []}, 'invalid_filenames'),
-        ({'steps': ['ocr'], 'filenames': ['a.jpg'] * 2001}, 'too_many_filenames'),
-    ])
-    def test_validation(self, http, ipwork, body, code):
-        response = http.post(self.URL, json=body)
-        assert response.status_code == 400 and response.json['code'] == code
-
-    def test_queues_existing_photos_and_skips_missing_trashed_and_video(self, http, ipwork):
-        body = http.post(self.URL, json={'steps': ['ocr'], 'filenames': ['a.jpg', 'missing.jpg', 'gone.jpg', 'clip.mp4'], 'force': 1}).json
-        assert (body['queued'], body['skipped'], body['total']) == (1, 3, 4)
-        assert ipwork['enqueued'] == [('a.jpg', True)] and ipwork['queued'] == ['a.jpg']
-
-    def test_force_defaults_off_and_a_failing_photo_is_skipped(self, http, ipwork, monkeypatch):
-        http.post(self.URL, json={'steps': ['ocr'], 'filenames': ['a.jpg']})
-        assert ipwork['enqueued'] == [('a.jpg', False)]
-        monkeypatch.setattr(app, '_queue_ipwork_processing', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('x')))
-        assert http.post(self.URL, json={'steps': ['ocr'], 'filenames': ['a.jpg']}).json['skipped'] == 1
-
 
 class TestVerifyFaceIndex:
     URL = '/api/admin/people/verify-face-index'
@@ -312,39 +224,6 @@ class TestVerifyFaceIndex:
         monkeypatch.setattr(app, '_people_features_available', lambda: False)
         assert http.post(self.URL, json={'filenames': ['a.jpg']}).status_code == 503
 
-
-class TestJobStatus:
-    URL = '/api/admin/jobs/status'
-
-    @pytest.fixture
-    def rows(self, monkeypatch):
-        table = {}
-        monkeypatch.setattr(app, '_get_job_row', lambda user, job: table.get(job))
-        return table
-
-    def test_missing_or_unknown_job_is_unknown(self, http, rows):
-        assert http.get(self.URL).json == {'status': 'unknown'}
-        assert http.get(self.URL + '?jobId=nope').json == {'status': 'unknown'}
-
-    def test_returns_status_and_parses_json_result(self, http, rows):
-        rows['j1'] = {'userId': 'u1', 'status': 'completed', 'result': '{"fixed": 2}'}
-        assert http.get(self.URL + '?jobId=j1').json == {'status': 'completed', 'result': {'fixed': 2}, 'error': None}
-        rows['j2'] = {'userId': 'u1', 'status': 'failed', 'result': 'not json', 'error': 'boom'}
-        assert http.get(self.URL + '?jobId=j2').json == {'status': 'failed', 'result': 'not json', 'error': 'boom'}
-
-    def test_other_users_job_is_hidden(self, http, rows):
-        rows['j1'] = {'userId': 'someone-else', 'status': 'completed', 'result': '{}'}
-        assert http.get(self.URL + '?jobId=j1').json == {'status': 'unknown'}
-
-    def test_follows_exactly_one_same_user_alias(self, http, rows):
-        rows['old'] = {'userId': 'u1', 'status': 'queued', 'forwardedTo': 'new'}
-        assert http.get(self.URL + '?jobId=old').json['status'] == 'queued'
-        rows['new'] = {'userId': 'u1', 'status': 'completed', 'result': {'ok': 1}}
-        assert http.get(self.URL + '?jobId=old').json['result'] == {'ok': 1}
-        rows['new'] = {'userId': 'u1', 'status': 'completed', 'forwardedTo': 'again'}
-        assert http.get(self.URL + '?jobId=old').json == {'status': 'unknown'}
-        rows['new'] = {'userId': 'other', 'status': 'completed'}
-        assert http.get(self.URL + '?jobId=old').json == {'status': 'unknown'}
 
 
 class TestRecoverSourceReservations:
@@ -432,13 +311,8 @@ class TestWaveOwnedLibrary:
         response = http.post('/api/admin/backfill/photos', json={'repair': True, 'confirm': 'BACKFILL_ALL_PHOTOS'})
         assert response.status_code == 409 and response.json['code'] == 'wave_owned_library'
 
-    def test_selection_reprocess_is_refused(self, http):
-        response = http.post('/api/admin/ipwork/enqueue', json={'steps': ['ocr'], 'filenames': ['a.jpg'], 'force': True})
-        assert response.status_code == 409 and response.json['code'] == 'wave_owned_library'
-
     def test_refusal_comes_before_validation_so_nothing_is_inspected(self, http):
         assert http.post('/api/admin/backfill/photos', json={}).status_code == 409
-        assert http.post('/api/admin/ipwork/enqueue', json={}).status_code == 409
 
     def test_other_repair_routes_are_unaffected(self, http, repair_jobs):
         response = http.post('/api/admin/people/dedupe-faces', json={'repair': True, 'confirm': 'DEDUPE_FACES'})

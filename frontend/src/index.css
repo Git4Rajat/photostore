@@ -207,11 +207,8 @@ html[data-theme='dark'] {
   .card-glass,
   .field,
   .btn,
-  .sort-btn,
   .photo-card,
-  .person-tile,
-  .ios-header,
-  .file-input {
+  .ios-header {
     border-width: 1.5px;
   }
 }
@@ -248,32 +245,15 @@ html[data-theme='dark'] {
   .card-glass,
   .field,
   .btn,
-  .sort-btn,
-  .file-input,
   .photo-card,
-  .person-tile,
   .ios-header,
-  .people-searchbar,
-  .people-merge-input,
-  .people-icon-btn,
   .icon-btn,
   .notification-pane,
-  .people-panel,
   .tools-panel,
-  .albums-sidebar,
-  .albums-canvas,
-  .gallery-controls-surface,
-  .album-list-card,
-  .exif-panel,
   .photo-preview-panel,
   .photo-preview-details,
   .photo-preview-icon,
-  .photo-preview-nav,
-  .theme-switcher,
-  .theme-option,
-  .account-menu-pane,
-  .app-menu-panel,
-  .app-menu-backdrop {
+  .photo-preview-nav {
     backdrop-filter: none;
     -webkit-backdrop-filter: none;
   }
@@ -299,36 +279,18 @@ html[data-theme='dark'] {
   .card-glass,
   .ios-header,
   .photo-card,
-  .person-tile,
   .btn,
   .field,
-  .file-input,
-  .album-list-card,
   .tools-panel,
-  .tools-queue-card,
-  .people-panel,
   .notification-pane,
   .photo-preview-panel,
   .photo-preview-thumb,
-  .person-avatar,
-  .people-hero-icon,
-  .albums-metric-card,
-  .public-banner,
-  .additional-card,
-  .theme-switcher {
+  .additional-card {
     corner-shape: squircle;
   }
 
-  .sort-btn,
-  .people-icon-btn,
   .icon-btn,
-  .people-secondary-btn,
-  .people-merge-btn,
-  .like-btn,
-  .person-select-indicator,
-  .check-float,
-  .photo-preview-icon,
-  .theme-option {
+  .photo-preview-icon {
     corner-shape: squircle;
   }
 }
@@ -797,342 +759,6 @@ a {
   opacity: 0.8;
 }
 
-/* In-progress banner shown while a people-clustering job runs on the worker, so
-   the user isn't blind to grouping happening out of band. Mirrors the global
-   .bg-activity pill's accent treatment. */
-
-.person-tile {
-  position: relative;
-  border-radius: var(--r-lg);
-  padding: 14px 12px 48px;
-  background: var(--lg-surface-strong);
-  border: 1px solid var(--lg-edge);
-  box-shadow: var(--lg-shadow-resting);
-  display: grid;
-  gap: 10px;
-  align-content: space-between;
-  min-height: 170px;
-  animation: peopleTileIn var(--dur-slow) var(--ease-glass) both;
-  animation-delay: var(--stagger, 0ms);
-  transition: box-shadow var(--dur-base) var(--ease-glass), transform var(--dur-base) var(--ease-glass);
-}
-
-.person-tile-main {
-  border: none;
-  background: transparent;
-  padding: 0;
-  cursor: pointer;
-  text-align: center;
-}
-
-.person-avatar {
-  width: 88px;
-  height: 88px;
-  margin: 0 auto;
-  border-radius: 50%;
-  display: grid;
-  place-items: center;
-  color: rgba(30, 30, 30, 0.85);
-  font-size: 1.3rem;
-  font-weight: 600;
-  border: 1px solid var(--lg-specular-soft);
-  box-shadow: inset 0 0 30px rgba(255, 255, 255, 0.5);
-  overflow: hidden;
-  position: relative;
-}
-
-.person-avatar img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-}
-
-.person-avatar-media,
-.person-avatar-loading {
-  width: 100%;
-  height: 100%;
-  display: grid;
-  place-items: center;
-}
-
-.person-avatar-loading {
-  color: #777;
-  font-size: 12px;
-  background: #f3f4f6;
-}
-
-.person-avatar-review-badge {
-  position: absolute;
-  right: 3px;
-  bottom: 3px;
-  width: 24px;
-  height: 24px;
-  border-radius: var(--r-pill);
-  border: 1px solid rgba(255, 255, 255, 0.85);
-  background: rgba(202, 138, 4, 0.95);
-  color: white;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  box-shadow: 0 6px 12px rgba(43, 38, 20, 0.24);
-}
-
-.person-avatar-review-badge svg {
-  width: 15px;
-  height: 15px;
-}
-
-.person-select {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-}
-
-.person-select input {
-  position: absolute;
-  opacity: 0;
-  pointer-events: none;
-}
-
-.person-select-indicator {
-  width: 26px;
-  height: 26px;
-  border-radius: var(--r-pill);
-  border: 1px solid var(--lg-edge);
-  background: var(--lg-surface-strong);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: rgba(20, 120, 255, 0.9);
-  opacity: 0.2;
-  transition: opacity var(--dur-quick) ease;
-}
-
-.person-select input:checked + .person-select-indicator {
-  opacity: 1;
-}
-
-.person-meta {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 6px;
-  min-width: 0;
-}
-
-.person-name {
-  font-size: 0.95rem;
-  font-weight: 500;
-  color: var(--text);
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.person-count {
-  font-size: 0.78rem;
-  padding: 4px 8px;
-  border-radius: var(--r-pill);
-  background: rgba(20, 120, 255, 0.1);
-  color: rgba(20, 120, 255, 0.9);
-  flex: 0 0 auto;
-}
-
-.person-open {
-  position: absolute;
-  bottom: 10px;
-  right: 10px;
-  width: 32px;
-  height: 32px;
-  border-radius: var(--r-sm);
-  border: 1px solid var(--lg-edge);
-  background: var(--lg-surface);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.person-open svg {
-  width: 16px;
-  height: 16px;
-}
-
-.person-delete {
-  left: 10px;
-  right: auto;
-  color: var(--danger);
-}
-
-.person-detail {
-  padding: 16px;
-  display: grid;
-  gap: 14px;
-}
-
-.person-detail-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-  padding-bottom: 10px;
-  border-bottom: 1px solid var(--lg-edge);
-}
-
-.person-detail-title {
-  display: grid;
-  gap: 4px;
-}
-
-.person-detail-kicker {
-  margin: 0;
-  font-size: 11px;
-  text-transform: uppercase;
-  font-family: var(--font-label);
-  letter-spacing: 0.12em;
-  color: var(--muted);
-}
-
-.person-detail-name {
-  margin: 0;
-  font-size: clamp(1.2rem, 2.4vw, 1.8rem);
-  letter-spacing: -0.02em;
-}
-
-.person-detail-meta {
-  margin: 0;
-  font-size: 0.88rem;
-  color: var(--muted);
-}
-
-.person-detail-body {
-  display: grid;
-  gap: 16px;
-}
-
-.person-detail-toolbar {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  align-items: center;
-}
-
-.person-detail-input {
-  width: min(320px, 80vw);
-}
-
-.person-detail-find-faces {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  white-space: nowrap;
-}
-
-.person-detail-find-faces .toolbar-icon {
-  width: 16px;
-  height: 16px;
-  flex: 0 0 auto;
-}
-
-.person-face-grid {
-  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-}
-
-.person-face-media {
-  position: relative;
-}
-
-.person-face-media-frame {
-  position: relative;
-  overflow: hidden;
-  height: 140px;
-  background: #f3f4f6;
-}
-
-.person-face-media-frame .photo-media {
-  height: 100%;
-}
-
-.person-face-detection-box {
-  position: absolute;
-  z-index: 1;
-  box-sizing: border-box;
-  pointer-events: none;
-  border: 3px solid #1478ff;
-  border-radius: 2px;
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.78), 0 0 18px rgba(20, 120, 255, 0.48);
-}
-
-.person-face-actions {
-  justify-content: flex-end;
-  /* 5 icon buttons (4 on the suggested-faces row) don't fit a single line at
-     the grid's minimum card width (180px) -- wrap instead of overflowing the
-     card, which .photo-card's overflow:hidden would otherwise clip. */
-  flex-wrap: wrap;
-}
-
-.person-face-meta-chips {
-  display: inline-flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  align-items: center;
-  justify-content: flex-end;
-}
-
-.person-face-warning {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px 7px;
-  border-radius: var(--r-pill);
-  background: rgba(202, 138, 4, 0.13);
-  color: rgb(133, 77, 14);
-  font-size: 0.72rem;
-  font-weight: 600;
-}
-
-.person-face-warning svg {
-  width: 14px;
-  height: 14px;
-}
-
-.person-merge-panel {
-  margin-top: 4px;
-}
-
-.person-merge-actions {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-}
-
-.person-merge-list {
-  display: grid;
-  gap: 8px;
-  margin-top: 8px;
-}
-
-.person-merge-row {
-  display: grid;
-  grid-template-columns: auto 1fr auto;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 10px;
-  border: 1px solid var(--lg-edge);
-  border-radius: var(--r-md);
-  background: var(--lg-surface);
-}
-
-.person-merge-name {
-  font-weight: 500;
-}
-
-.person-merge-count {
-  font-size: 0.78rem;
-  color: var(--muted);
-}
-
 /* The row's select checkbox reuses .person-select for its hidden-input +
    checked-indicator styling, but inside the horizontal suggestion row it must
    sit inline at the start rather than float absolutely like on a cluster tile. */
@@ -1145,46 +771,6 @@ a {
   to {
     opacity: 1;
     transform: translateY(0);
-  }
-}
-
-.browser-processing-ribbon {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  padding: 12px 16px;
-  margin: 12px 0 0;
-}
-
-.browser-processing-ribbon-main {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  min-width: 0;
-  flex: 1 1 auto;
-}
-
-.browser-processing-summary {
-  margin: 0;
-  color: var(--muted);
-  font-size: 0.94rem;
-  line-height: 1.35;
-}
-
-.browser-processing-action {
-  flex: 0 0 auto;
-  white-space: nowrap;
-}
-
-@media (max-width: 720px) {
-  .browser-processing-ribbon {
-    flex-direction: column;
-    align-items: stretch;
-  }
-
-  .browser-processing-action {
-    width: 100%;
   }
 }
 
@@ -1247,9 +833,7 @@ a {
 }
 
 .icon-btn[aria-label]:hover::after,
-.icon-btn[aria-label]:focus-visible::after,
-.people-icon-btn[aria-label]:hover::after,
-.people-icon-btn[aria-label]:focus-visible::after {
+.icon-btn[aria-label]:focus-visible::after {
   content: attr(aria-label);
   position: absolute;
   bottom: calc(100% + 8px);
@@ -1266,9 +850,7 @@ a {
 }
 
 .icon-btn[aria-label]:hover::before,
-.icon-btn[aria-label]:focus-visible::before,
-.people-icon-btn[aria-label]:hover::before,
-.people-icon-btn[aria-label]:focus-visible::before {
+.icon-btn[aria-label]:focus-visible::before {
   content: '';
   position: absolute;
   bottom: calc(100% + 3px);
@@ -1292,22 +874,9 @@ a {
   overflow: hidden;
 }
 
-.browser-ai-model-spinner {
-  animation: browser-ai-spin 900ms linear infinite;
-}
-
 /* Shown only while a cold (uncached) model load is in progress, so the button
    reads as "N% of the way there" instead of an indeterminate spinner for what
    can be up to ~90s on a first-ever load. */
-.browser-ai-load-progress {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  height: 2px;
-  background: var(--accent);
-  transition: width 300ms ease;
-}
 
 @keyframes browser-ai-spin {
   to {
@@ -1550,9 +1119,7 @@ html[data-theme='light'] .notification-item.unread {
 }
 
 .field,
-.sort-btn,
-.btn,
-.file-input {
+.btn {
   border: 1px solid var(--lg-edge);
   border-radius: var(--r-lg);
   background: var(--lg-surface-strong);
@@ -1562,16 +1129,12 @@ html[data-theme='light'] .notification-item.unread {
   transition: border-color var(--dur-quick) ease, box-shadow var(--dur-quick) ease, background-color var(--dur-quick) ease, transform var(--dur-quick) ease;
 }
 
-.field,
-.file-input {
+.field {
   padding: 10px 12px;
 }
 
 .field:focus-visible,
-.file-input:focus-visible,
-.field-select:focus-visible,
-.field-compact:focus-visible,
-.field-date:focus-visible {
+.field-select:focus-visible {
   outline: none;
   border-color: rgba(30, 106, 225, 0.4);
   box-shadow: var(--focus-ring);
@@ -1648,7 +1211,6 @@ html[data-theme='light'] .notification-item.unread {
   height: 16px;
 }
 
-.sort-btn,
 .btn {
   padding: 9px 13px;
   cursor: pointer;
@@ -1666,20 +1228,17 @@ html[data-theme='light'] .notification-item.unread {
   flex: 0 0 auto;
 }
 
-.sort-btn:focus-visible,
 .btn:focus-visible {
   outline: none;
   border-color: rgba(30, 106, 225, 0.4);
   box-shadow: var(--focus-ring);
 }
 
-.sort-btn:hover,
 .btn:hover {
   transform: translateY(-1px);
   box-shadow: var(--lg-shadow-resting);
 }
 
-.sort-btn:active,
 .btn:active {
   transform: scale(0.97);
 }
@@ -1716,36 +1275,6 @@ html[data-theme='light'] .notification-item.unread {
    they only win by source order. Placed earlier, the generic button colour and the
    disabled 0.62 opacity override them and the button never turns green when AI is
    ready (and looks dimmed because the "ready" state is a disabled button). */
-.browser-ai-model-checking,
-.browser-ai-model-loading {
-  color: #6b7280;
-  border-color: rgba(107, 114, 128, 0.24);
-  background: rgba(107, 114, 128, 0.08);
-}
-
-.browser-ai-model-idle {
-  color: #6b7280;
-  border-color: rgba(107, 114, 128, 0.24);
-  background: rgba(107, 114, 128, 0.08);
-}
-
-.browser-ai-model-available {
-  color: #0f8f4c;
-  border-color: rgba(15, 143, 76, 0.28);
-  background: rgba(15, 143, 76, 0.12);
-}
-
-.browser-ai-model-unavailable {
-  color: #dc2626;
-  border-color: rgba(220, 38, 38, 0.3);
-  background: rgba(220, 38, 38, 0.1);
-}
-
-.browser-ai-model-unsupported {
-  color: #dc2626;
-  border-color: rgba(220, 38, 38, 0.3);
-  background: rgba(220, 38, 38, 0.1);
-}
 
 .browser-ai-model-btn:disabled {
   opacity: 1;
@@ -1927,23 +1456,6 @@ html[data-theme='light'] .notification-item.unread {
   white-space: nowrap;
 }
 
-.photo-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 6px;
-  margin-top: 6px;
-}
-
-.photo-location {
-  margin: 5px 0 0;
-  font-size: 10px;
-  color: var(--muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 .tag-chip {
   font-size: 10px;
   font-weight: 600;
@@ -1955,17 +1467,6 @@ html[data-theme='light'] .notification-item.unread {
   white-space: nowrap;
 }
 
-.photo-body .check-float,
-.photo-body-check {
-  position: static;
-  width: 22px;
-  height: 22px;
-  z-index: auto;
-  flex: 0 0 auto;
-  opacity: 1;
-  cursor: pointer;
-}
-
 /* PhotoViewerRoute's wrapper: the viewer is now a route rendered as a
    sibling of Gallery/Albums (background-location pattern, see App.tsx),
    not a same-page content swap, so it needs real fixed-full-viewport
@@ -1974,13 +1475,6 @@ html[data-theme='light'] .notification-item.unread {
    z-index 100 clears NavDrawer/AccountMenu (also 100, but never open at the
    same time as the viewer) and stays below dialogs/toasts (9999+) so a
    delete-confirm dialog opened from inside the viewer still shows on top. */
-.photo-viewer-route-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 100;
-  background: #14130f;
-  overflow: hidden;
-}
 
 .photo-preview {
   position: relative;
@@ -2837,17 +2331,13 @@ video.photo-preview-media.is-loading {
   text-align: center;
 }
 
-.tools-action-button .toolbar-icon,
-.tools-force-button .toolbar-icon,
-.tools-admin-button .toolbar-icon,
-.tools-admin-link .toolbar-icon {
+.tools-admin-button .toolbar-icon {
   width: 14px;
   height: 14px;
   flex: 0 0 auto;
 }
 
-.tools-admin-button,
-.tools-admin-link {
+.tools-admin-button {
   min-height: 36px;
   width: auto;
   min-width: 44px;
@@ -2893,18 +2383,13 @@ video.photo-preview-media.is-loading {
 /* Bottom scrim: label + count baked over the image, matching the mockup's
    place/thing cards, instead of plain text below the thumbnail. */
 
-.tools-hero-actions .icon-btn,
-.tools-panel .icon-btn,
-.tools-admin .icon-btn {
+.tools-panel .icon-btn {
   min-height: 36px;
   min-width: 36px;
   padding: 7px 8px;
 }
 
-.tools-panel .btn,
-.tools-panel .sort-btn,
-.tools-admin .btn,
-.tools-admin .sort-btn {
+.tools-panel .btn {
   padding: 7px 10px;
   font-size: 12px;
 }
@@ -2998,16 +2483,6 @@ video.photo-preview-media.is-loading {
    on the page.
    ================================================================= */
 
-@media (max-width: 1024px) {
-
-  .gallery-grid,
-  .people-grid,
-  .albums-photo-grid,
-  .person-face-grid {
-    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-  }
-}
-
 @media (max-width: 720px) {
 
   /* Slim, single-row header: hamburger + wordmark + compact actions.
@@ -3035,10 +2510,7 @@ video.photo-preview-media.is-loading {
     display: none;
   }
 
-  .tools-hero,
-  .tools-panel-header,
-  .tools-selection-row,
-  .tools-workbench-footnote {
+  .tools-panel-header {
     flex-direction: column;
     align-items: stretch;
   }
@@ -3196,54 +2668,21 @@ video.photo-preview-media.is-loading {
     align-items: center;
   }
 
-  .tools-action-button,
-  .tools-admin-button,
-  .tools-admin-link {
+  .tools-admin-button {
     width: auto;
     justify-content: center;
   }
 
-  .field-select,
-  .field-compact,
-  .field-date {
+  .field-select {
     width: 100%;
   }
 }
 
 @media (max-width: 380px) {
 
-  .person-avatar {
-    width: 72px;
-    height: 72px;
-  }
-
   .photo-preview-icon {
     width: var(--tap-min);
     height: var(--tap-min);
-  }
-}
-
-/* ---- Component-level responsiveness via container queries ----
-   These respond to the width of the panel a grid sits in, not the
-   viewport, so embedding the same grid inside a narrower sidebar or
-   modal still gets the right column count. */
-@container (max-width: 520px) {
-  .gallery-grid,
-  .people-grid,
-  .albums-photo-grid,
-  .person-face-grid {
-    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
-    gap: 10px;
-  }
-}
-
-@container (max-width: 360px) {
-  .gallery-grid,
-  .people-grid,
-  .albums-photo-grid,
-  .person-face-grid {
-    grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
-    gap: 8px;
   }
 }
 
