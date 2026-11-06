@@ -85,3 +85,19 @@ def test_tiny_capacity_does_not_mistake_a_partial_buffer_for_end_of_wave():
             if window.done:
                 break
     assert observed == list(range(41))
+
+
+def test_decode_refuses_arbitrary_globals():
+    import os
+    import pickle
+    import pytest
+    import vision_buffer
+    with pytest.raises(pickle.UnpicklingError):
+        vision_buffer.decode(pickle.dumps(os.system, protocol=5))
+
+
+def test_decode_round_trips_entity_values():
+    import datetime
+    import vision_buffer
+    row = {'a': 1, 'b': b'x', 'c': datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc), 'd': {1, 2}}
+    assert dict(vision_buffer.decode(vision_buffer.encode(row))) == row

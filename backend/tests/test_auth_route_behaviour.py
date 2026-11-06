@@ -100,7 +100,8 @@ class TestLogin:
         body = http.post(self.URL, json={'email': ' ME@Example.com ', 'password': 'correct horse'}).json
         assert body['token'] == 'tok:u1:lib-u1:password' and body['email'] == 'me@example.com'
         assert body['expiresIn'] == app.SESSION_TTL_SECONDS
-        assert throttle['successes'] == ['login-throttle:me@example.com'] and throttle['failures'] == []
+        assert throttle['successes'][-1] == 'login-throttle:me@example.com' and throttle['failures'] == []
+        assert throttle['successes'][0].startswith('login-throttle:me@example.com:ip:')
 
     def test_wrong_password_and_unknown_email_are_indistinguishable_and_recorded(self, http, store, throttle):
         wrong = http.post(self.URL, json={'email': 'me@example.com', 'password': 'nope'})
@@ -109,7 +110,9 @@ class TestLogin:
         assert wrong.json == unknown.json
         bucket = hashlib.sha256(b'who@example.com').hexdigest()[:2]
         # Unknown emails share one of 256 buckets so guessing addresses can't grow the table.
-        assert throttle['failures'] == ['login-throttle:me@example.com', f'login-throttle:unknown:{bucket}']
+        accounts = [row for row in throttle['failures'] if ':ip:' not in row]
+        assert accounts == ['login-throttle:me@example.com', f'login-throttle:unknown:{bucket}']
+        assert len(throttle['failures']) == 4  # one per-address and one account-wide row for each attempt
 
     def test_throttled_email_is_rejected_even_with_the_right_password(self, http, store, throttle):
         throttle['allowed'] = False

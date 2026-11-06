@@ -2121,11 +2121,22 @@ def _album_is_expired(entity: Dict) -> bool:
 # Secret used to sign short-lived access grants for code-protected public albums so that
 # the media routes (loaded as <img src>, which cannot carry the access code) can verify
 # the visitor already cleared the code check. Falls back to a per-process random secret,
-# which simply means outstanding grants are invalidated on restart.
-_ALBUM_GRANT_SECRET = (
-    os.getenv('ALBUM_GRANT_SECRET', '').strip()
-    or secrets.token_hex(32)
-)
+# which simply means outstanding grants are invalidated on restart (when neither
+# ALBUM_GRANT_SECRET nor SESSION_SECRET is set).
+def _derive_album_grant_secret() -> str:
+    explicit = os.getenv('ALBUM_GRANT_SECRET', '').strip()
+    if explicit:
+        return explicit
+    # Derive from the configured session secret so every replica agrees (a random
+    # per-process value made grants fail whenever a request hit another replica)
+    # without needing a second secret to provision.
+    configured = os.getenv('SESSION_SECRET', '').strip()
+    if configured:
+        return hmac.new(configured.encode('utf-8'), b'album-grant-v1', hashlib.sha256).hexdigest()
+    return secrets.token_hex(32)
+
+
+_ALBUM_GRANT_SECRET = _derive_album_grant_secret()
 _ALBUM_GRANT_COOKIE_PREFIX = 'album_grant_'
 MIN_ALBUM_ACCESS_CODE_LENGTH = 4
 

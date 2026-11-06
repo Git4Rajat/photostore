@@ -40,19 +40,28 @@ def auth_login():
     # (256) instead of each getting a row, so an attacker can't grow the table
     # without bound by guessing addresses.
     if account:
-        throttle_row = f'login-throttle:{email_in}'
+        account_row = f'login-throttle:{email_in}'
     else:
         bucket = app.hashlib.sha256(email_in.encode('utf-8')).hexdigest()[:2]
-        throttle_row = f'login-throttle:unknown:{bucket}'
-    if not app.password_auth.login_attempt_allowed(app.config_table_client, throttle_row):
+        account_row = f'login-throttle:unknown:{bucket}'
+    # Two limits: a strict one per (account, client address) that stops a single
+    # source quickly without letting it lock the real owner out from elsewhere,
+    # and a loose account-wide one that still bounds a distributed guess.
+    client_ip = app.request.remote_addr or ''
+    ip_digest = app.hashlib.sha256(client_ip.encode('utf-8')).hexdigest()[:16]
+    ip_row = f'{account_row}:ip:{ip_digest}'
+    if not (app.password_auth.login_attempt_allowed(app.config_table_client, ip_row)
+            and app.password_auth.login_attempt_allowed(app.config_table_client, account_row)):
         return app.jsonify({'error': 'Too many attempts. Please wait and try again.'}), 429
     # Always run one scrypt verify so response time doesn't reveal whether the
     # account exists.
     verified = app.password_auth.verify_password(password, stored_hash or app.password_auth.DUMMY_PASSWORD_HASH)
     if not account or not stored_hash or not verified:
-        app.password_auth.record_login_failure(app.config_table_client, row_key=throttle_row)
+        app.password_auth.record_login_failure(app.config_table_client, row_key=ip_row)
+        app.password_auth.record_login_failure(app.config_table_client, row_key=account_row, free_attempts=30)
         return app.jsonify({'error': 'Incorrect email or password.'}), 401
-    app.password_auth.record_login_success(app.config_table_client, throttle_row)
+    app.password_auth.record_login_success(app.config_table_client, ip_row)
+    app.password_auth.record_login_success(app.config_table_client, account_row)
     uid = str(account.get('RowKey'))
     email = str(account.get('email') or email_in)
     library_id = app.library_store.get_current_library(uid) if app.library_store else uid
