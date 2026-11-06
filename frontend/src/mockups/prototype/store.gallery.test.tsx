@@ -133,6 +133,20 @@ describe('index-backed gallery', () => {
         expect(store.albums.find(a=>a.id==='a1')?.photoCount).toBe(2);
     });
 
+    it('addPhotosToAlbum resolves only after the server request settles, so chunked adds can run one at a time', async () => {
+        mocks.post.mockResolvedValue({album:{id:'a1',name:'Birthday',photoCount:0}});
+        mocks.get.mockResolvedValue({album:{id:'a1',name:'Birthday',photoCount:1},photos:[]});
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async()=>{await store.createAlbum('Birthday');});
+        let release: (v: unknown) => void = () => {};
+        mocks.post.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+        let settled = false;
+        await act(async()=>{void store.addPhotosToAlbum('a1',['p0.jpg']).then(()=>{settled=true;});});
+        expect(settled).toBe(false);
+        await act(async()=>{release({album:{id:'a1',name:'Birthday',photoCount:1}});});
+        expect(settled).toBe(true);
+    });
+
     it('audit: confirming one index presence cannot let a later old index erase the album', async () => {
         mocks.post.mockResolvedValue({album:{id:'a1',name:'Birthday',photoCount:0}});
         render(<StoreProvider><Probe /></StoreProvider>);

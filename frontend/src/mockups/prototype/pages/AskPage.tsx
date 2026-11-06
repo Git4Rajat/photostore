@@ -125,7 +125,8 @@ const AskPage: React.FC = () => {
                     more = Boolean(res?.hasMore);
                 }
                 const unique = Array.from(new Set(names)).slice(0, SAVE_AS_ALBUM_MAX);
-                for (let i = 0; i < unique.length; i += 2000) addPhotosToAlbum(id, unique.slice(i, i + 2000));
+                // One chunk at a time: concurrent adds race on the album row and the last save wins.
+                for (let i = 0; i < unique.length; i += 2000) await addPhotosToAlbum(id, unique.slice(i, i + 2000));
                 navigate('albums', { albumId: id });
             } finally {
                 setSaving(false);
