@@ -1,0 +1,105 @@
+{
+  "scope": "real source stages; synthetic tables; no Azure; no publication",
+  "delay_ms": 5,
+  "samples": 3,
+  "cases": {
+    "lexical": {
+      "1": {
+        "median_seconds": 1.8553122909506783,
+        "runs": [
+          {
+            "seconds": 1.7867442080751061,
+            "source_calls": 256,
+            "peak_table_reads": 1,
+            "output_sha256": "9a9c0963c0e9764bf86fef5e344676ccf44db74fade16f0c6dc5ab733530aed9"
+          },
+          {
+            "seconds": 1.8553122909506783,
+            "source_calls": 256,
+            "peak_table_reads": 1,
+            "output_sha256": "9a9c0963c0e9764bf86fef5e344676ccf44db74fade16f0c6dc5ab733530aed9"
+          },
+          {
+            "seconds": 1.858362500090152,
+            "source_calls": 256,
+            "peak_table_reads": 1,
+            "output_sha256": "9a9c0963c0e9764bf86fef5e344676ccf44db74fade16f0c6dc5ab733530aed9"
+          }
+        ]
+      },
+      "4": {
+        "median_seconds": 0.47760070906952024,
+        "runs": [
+          {
+            "seconds": 0.4783080839551985,
+            "source_calls": 256,
+            "peak_table_reads": 4,
+            "output_sha256": "9a9c0963c0e9764bf86fef5e344676ccf44db74fade16f0c6dc5ab733530aed9"
+          },
+          {
+            "seconds": 0.470323208021,
+            "source_calls": 256,
+            "peak_table_reads": 4,
+            "output_sha256": "9a9c0963c0e9764bf86fef5e344676ccf44db74fade16f0c6dc5ab733530aed9"
+          },
+          {
+            "seconds": 0.47760070906952024,
+            "source_calls": 256,
+            "peak_table_reads": 4,
+            "output_sha256": "9a9c0963c0e9764bf86fef5e344676ccf44db74fade16f0c6dc5ab733530aed9"
+          }
+        ]
+      },
+      "speedup": 3.8846514582553024
+    },
+    "people_embedding": {
+      "1": {
+        "median_seconds": 2.1005441250745207,
+        "runs": [
+          {
+            "seconds": 2.097300708061084,
+            "source_calls": 288,
+            "peak_table_reads": 1,
+            "output_sha256": "6d1d948f49a2d9d87dded9cd58a48d31181175d7275818453ed54e9e55acd8a1"
+          },
+          {
+            "seconds": 2.1005441250745207,
+            "source_calls": 288,
+            "peak_table_reads": 1,
+            "output_sha256": "6d1d948f49a2d9d87dded9cd58a48d31181175d7275818453ed54e9e55acd8a1"
+          },
+          {
+            "seconds": 2.107223583967425,
+            "source_calls": 288,
+            "peak_table_reads": 1,
+            "output_sha256": "6d1d948f49a2d9d87dded9cd58a48d31181175d7275818453ed54e9e55acd8a1"
+          }
+        ]
+      },
+      "4": {
+        "median_seconds": 0.6727967920014635,
+        "runs": [
+          {
+            "seconds": 0.6727967920014635,
+            "source_calls": 288,
+            "peak_table_reads": 4,
+            "output_sha256": "6d1d948f49a2d9d87dded9cd58a48d31181175d7275818453ed54e9e55acd8a1"
+          },
+          {
+            "seconds": 0.662601749994792,
+            "source_calls": 288,
+            "peak_table_reads": 4,
+            "output_sha256": "6d1d948f49a2d9d87dded9cd58a48d31181175d7275818453ed54e9e55acd8a1"
+          },
+          {
+            "seconds": 0.6766901249065995,
+            "source_calls": 288,
+            "peak_table_reads": 4,
+            "output_sha256": "6d1d948f49a2d9d87dded9cd58a48d31181175d7275818453ed54e9e55acd8a1"
+          }
+        ]
+      },
+      "speedup": 3.1221078192506475
+    }
+  }
+}

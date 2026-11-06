@@ -277,3 +277,24 @@ def test_full_refresh_also_requires_publication_success(ctx, monkeypatch, failur
     assert storage_utils.refresh_user_people_embedding_index('u1', source_version='v2') is None
     assert storage_utils._load_people_embedding_index_manifest('u1')['dirty'] is True
     assert 'u1' not in storage_utils._PEOPLE_EMBEDDING_INDEX_CACHE
+
+def test_parallel_face_failure_does_not_publish_partially_updated_people(ctx, monkeypatch):
+    import threading
+    seed_base(ctx)
+    people, faces, blobs = ctx
+    before = dict(blobs.blobs)
+    original = faces.get_entity
+    barrier = threading.Barrier(2, timeout=3)
+    row = people.rows[('u1', 'p1')]
+    row['faceIds'] = json.dumps(['f1', 'f-broken'])
+    monkeypatch.setenv('INDEX_SOURCE_READ_CONCURRENCY', '2')
+
+    def read(**kwargs):
+        barrier.wait()
+        if kwargs['row_key'] == 'f-broken':
+            raise TimeoutError('second face read failed')
+        return original(**kwargs)
+
+    monkeypatch.setattr(faces, 'get_entity', read)
+    assert refresh(['p1']) is None
+    assert blobs.blobs == before
