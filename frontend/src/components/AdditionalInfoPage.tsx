@@ -102,7 +102,7 @@ const AdditionalInfoPage: React.FC = () => {
                 <article className="additional-card">
                     <h3>Private and Low-Cost by Design</h3>
                     <ul>
-                        <li>Sign in with email and password, or with your personal account.</li>
+                        <li>Sign in with email and password, or with your personal Microsoft account.</li>
                         <li>You only ever see photos in your own library — in the gallery, in search, and through shared links.</li>
                         <li>Links to originals are generated per request and expire quickly.</li>
                         <li>Background workers scale to zero when idle, so hosting costs stay near zero between visits.</li>
