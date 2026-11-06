@@ -2776,6 +2776,18 @@ def _resolve_user_role(user_id: str) -> str:
     return ''
 
 
+def _require_library_owner_id(require_auth: bool = False):
+    """Like _require_user_id (returns the active library id) but only for the
+    library's owner. Repair/rebuild/purge tools act on the whole library, so a
+    shared-library member must not be able to run them."""
+    account_id, library_id, error = _require_library_context(require_auth=require_auth)
+    if error:
+        return None, error
+    if library_store is not None and not library_store.is_owner(account_id, library_id):
+        return None, (jsonify({'error': 'Only the library owner can do that.'}), 403)
+    return library_id, None
+
+
 def _require_admin(require_auth: bool = True):
     """Return (library_id, None) for admins, or (None, error_response) otherwise.
 

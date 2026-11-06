@@ -79,4 +79,4 @@ exec gunicorn app:app \
     --graceful-timeout 60 \
     --keep-alive 30 \
     --access-logfile - \
-    --access-logformat '%(t)s %(h)s "%(r)s" %(s)s "%(a)s"'
+    --access-logformat '%(t)s %(h)s "%(m)s %(U)s %(H)s" %(s)s "%(a)s"'

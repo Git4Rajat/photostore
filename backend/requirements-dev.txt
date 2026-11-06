@@ -1,0 +1,3 @@
+# Test-only dependencies; deliberately not installed in the production image.
+-r requirements.txt
+pytest

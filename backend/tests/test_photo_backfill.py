@@ -8,6 +8,7 @@ from routes import admin
 @pytest.fixture
 def backfill(monkeypatch):
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
+    monkeypatch.setattr(app, '_require_library_owner_id', lambda *a, **k: ('owner', None))
     monkeypatch.setattr(app, 'PROCESSING_MODE', 'backend')
     monkeypatch.setattr(app, 'ipwork_queue_client', object())
     monkeypatch.setattr(app, '_enqueue_processing_steps', lambda uid, name, steps, **kw: {s: {'status': 'queued'} for s in steps})

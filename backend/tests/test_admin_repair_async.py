@@ -57,7 +57,7 @@ def env(monkeypatch):
     monkeypatch.setattr(app, 'face_table_client', object())
     monkeypatch.setattr(app, 'person_table_client', object())
     monkeypatch.setattr(app, 'merge_table_client', object())
-    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
+    monkeypatch.setattr(app, '_require_library_owner_id', lambda *a, **k: ('owner', None))
     return table, queue
 
 

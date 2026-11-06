@@ -138,6 +138,7 @@ def test_cluster_cold_matching_keeps_candidates_without_publishing(monkeypatch):
 @pytest.mark.parametrize('status,code', [('queued', 202), ('already_active', 202), ('unavailable', 503)])
 def test_manual_vector_repair_uses_catalog_queue(monkeypatch, status, code):
     monkeypatch.setattr(app, '_require_user_id', lambda: ('A', None))
+    monkeypatch.setattr(app, '_require_library_owner_id', lambda: ('A', None))
     monkeypatch.setattr(app, '_people_features_available', lambda: True)
     enqueue = Mock(return_value=status)
     monkeypatch.setattr(app, 'enqueue_index_build', enqueue)
@@ -152,6 +153,7 @@ def test_manual_vector_repair_uses_catalog_queue(monkeypatch, status, code):
 
 def test_forwarded_legacy_request_is_not_announced_as_finished(monkeypatch):
     monkeypatch.setattr(app, '_require_user_id', lambda: ('A', None))
+    monkeypatch.setattr(app, '_require_library_owner_id', lambda: ('A', None))
     monkeypatch.setattr(app, '_maybe_sweep_old_job_rows', lambda user: None)
     now = app.datetime.now(app.timezone.utc).isoformat()
     rows = [dict(jobId='old', jobType='index_build', status='done', updatedAt=now,
