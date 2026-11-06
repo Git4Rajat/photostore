@@ -1,0 +1,38 @@
+{
+  "results": [
+    {
+      "faces": 1000,
+      "old_reachability_only": {
+        "seconds": 0.0216552090132609,
+        "sqlite_vm_steps_floor": 2521000
+      },
+      "new_complete_database_validation": {
+        "seconds": 0.0027566669741645455,
+        "sqlite_vm_steps_floor": 96000
+      }
+    },
+    {
+      "faces": 2000,
+      "old_reachability_only": {
+        "seconds": 0.08530304103624076,
+        "sqlite_vm_steps_floor": 10043000
+      },
+      "new_complete_database_validation": {
+        "seconds": 0.005523499916307628,
+        "sqlite_vm_steps_floor": 193000
+      }
+    },
+    {
+      "faces": 4000,
+      "old_reachability_only": {
+        "seconds": 0.33160679205320776,
+        "sqlite_vm_steps_floor": 40086000
+      },
+      "new_complete_database_validation": {
+        "seconds": 0.010504374979063869,
+        "sqlite_vm_steps_floor": 387000
+      }
+    }
+  ],
+  "scope": "Local single samples; old reachability query ONLY versus all current database checks, including reachability. SQLite VM count excludes Python/numpy operations."
+}

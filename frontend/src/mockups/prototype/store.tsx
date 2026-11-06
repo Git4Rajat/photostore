@@ -1614,18 +1614,32 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const snapshot = trash;
         setTrash([]);
         const moved = snapshot.map((t) => t.photo);
+        const movedIds = moved.map((p) => p.id);
+        // Un-hide the rows a delete hid locally; without this a restored photo
+        // stays missing from the gallery on this browser until the marker is
+        // cleared, even though the server has it again.
+        clearLocalSortIndexRemovals(movedIds);
         setPhotos((cur) => [...moved, ...cur]);
         invalidateLocalSortIndex();
         invalidateLocalPeopleIndex();
         invalidateLocalAlbumsIndex();
         adjustPeopleCountsForPhotos(moved, 1);
         applyPhotoRestoreCount(moved.length);
-        void post('/photos/trash/restore-all', {})
-            .then(() => toast('Restored everything from Recently Deleted'))
+        void post<{ restored?: string[] }>('/photos/trash/restore-all', {})
+            .then((res) => {
+                // The server's list also covers photos this tab never had in its trash cache.
+                const restored = (res?.restored ?? []).filter((name) => !movedIds.includes(name));
+                if (restored.length) {
+                    clearLocalSortIndexRemovals(restored);
+                    invalidateLocalSortIndex();
+                }
+                toast('Restored everything from Recently Deleted');
+            })
             .catch(() => {
                 setTrash(snapshot);
                 adjustPeopleCountsForPhotos(moved, -1);
                 applyPhotoDeleteCount(moved.length);
+                removeLocalSortIndexRows(movedIds);
                 toast('Couldn’t restore everything', undefined, undefined, 'error');
             });
     }, [adjustPeopleCountsForPhotos, trash, toast, applyPhotoDeleteCount, applyPhotoRestoreCount]);

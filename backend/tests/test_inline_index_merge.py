@@ -310,6 +310,14 @@ def attempt_ctx(monkeypatch):
                             clear_people=clear_people, clear_albums=clear_albums)
 
 
+def _intent_rows(table):
+    return {k: v for k, v in table.rows.items() if k[0] == index_work.PARTITION}
+
+
+def _job_status(table, job_id):
+    return next((v.get('status') for k, v in table.rows.items() if k[1] == job_id), None)
+
+
 def test_attempt_claims_merges_clears_and_cancels_on_success(attempt_ctx, monkeypatch):
     deleted = []
     sent_message = SimpleNamespace(id='m1', pop_receipt='r1')
@@ -326,7 +334,8 @@ def test_attempt_claims_merges_clears_and_cancels_on_success(attempt_ctx, monkey
     attempt_ctx.clear_albums.assert_not_called()
     assert deleted == [('m1', 'r1')]
     # WorkStore row for this key is gone -- finish() succeeded.
-    assert table.rows == {} if (table := attempt_ctx.table) else True
+    assert not _intent_rows(attempt_ctx.table)
+    assert _job_status(attempt_ctx.table, 'index-build-lib-people') == 'done'
 
 
 def test_search_inline_publishes_delta_and_cancels_backstop(attempt_ctx):
@@ -342,7 +351,7 @@ def test_search_inline_publishes_delta_and_cancels_backstop(attempt_ctx):
         'lib', 'search', max_names=inline_index_merge._SEARCH_MAX_NAMES, max_passes=1)
     attempt_ctx.prime.assert_not_called()
     assert deleted == [('m1', 'r1')]
-    assert not attempt_ctx.table.rows
+    assert not _intent_rows(attempt_ctx.table)
 
 
 def test_search_inline_enters_catalog_ownership_escape_hatch(attempt_ctx, monkeypatch):

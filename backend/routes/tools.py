@@ -262,8 +262,8 @@ def tools_indexes_status():
                 continue
             cutoff = (app.datetime.now(app.timezone.utc) - app.timedelta(
                 minutes=app.INDEX_BUILD_STALE_MINUTES_BY_SCOPE.get(scope, 45))).isoformat()
-            if row['status'] == 'running' and str(row.get('updatedAt') or '') < cutoff:
-                continue
+            if row.get('updatedAt') and str(row['updatedAt']) < cutoff:
+                continue  # orphaned queued/running row (wake cancelled or worker died)
             building_job = {'scope': scope, 'started_at': row.get('Timestamp')}
             break
     elif app._index_build_job_active(user_id):

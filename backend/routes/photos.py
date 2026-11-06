@@ -1239,6 +1239,19 @@ def list_trashed_photos():
     return app.jsonify(response_payload)
 
 
+def _trigger_restore_index_rebuilds(user_id, reason):
+    """Restore dirties people, sort and albums together (touch_user_* above), so
+    request each scope's bounded rebuild. Same path for all three: core tries
+    the merge inline, the index worker's queued backstop covers it otherwise.
+    One message per scope, rate-limited per user/scope; nothing repeats."""
+    for scope in ('people', 'sort', 'albums'):
+        try:
+            app._trigger_indexer_rebuild(user_id, reason=reason, scope=scope)
+        except Exception:
+            app.app.logger.warning('Could not trigger %s index rebuild after %s for %s',
+                                   scope, reason, user_id, exc_info=True)
+
+
 @photos_bp.route('/photos/trash/restore', methods=['POST'])
 @photos_bp.route('/api/photos/trash/restore', methods=['POST'])
 def restore_trashed_photos():
@@ -1272,10 +1285,7 @@ def restore_trashed_photos():
             app.touch_user_people_index_state(user_id)
         except Exception:
             pass
-        try:
-            app._trigger_indexer_rebuild(user_id, reason='photo-restore', scope='people')
-        except Exception:
-            app.app.logger.warning('Could not trigger People index rebuild after photo restore for %s', user_id, exc_info=True)
+        _trigger_restore_index_rebuilds(user_id, 'photo-restore')
 
     return app.jsonify({'restored': restored, 'errors': errors, 'success': len(restored) > 0})
 
@@ -1317,10 +1327,7 @@ def restore_all_trashed_photos():
             app.touch_user_people_index_state(user_id)
         except Exception:
             pass
-        try:
-            app._trigger_indexer_rebuild(user_id, reason='photo-restore-all', scope='people')
-        except Exception:
-            app.app.logger.warning('Could not trigger People index rebuild after restoring trash for %s', user_id, exc_info=True)
+        _trigger_restore_index_rebuilds(user_id, 'photo-restore-all')
 
     return app.jsonify({'restored': restored, 'errors': errors, 'success': len(restored) > 0})
 
