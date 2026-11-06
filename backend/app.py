@@ -9510,6 +9510,17 @@ def _apply_security_headers(response):
     response.headers.setdefault('X-Frame-Options', 'DENY')
     response.headers.setdefault('Referrer-Policy', 'strict-origin-when-cross-origin')
     response.headers.setdefault('Cross-Origin-Resource-Policy', 'same-site')
+    response.headers.setdefault('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=()')
+    mimetype = (response.mimetype or '').lower()
+    if mimetype != 'text/html':
+        # The API serves data, never documents: forbid script/frames outright so a
+        # response that is ever rendered directly can't execute anything.
+        response.headers.setdefault('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'")
+        # Authenticated JSON can hold personal data; keep it out of shared and
+        # disk caches unless the route chose a caching policy (or ETag) itself.
+        if (mimetype == 'application/json' and request.headers.get('Authorization')
+                and 'Cache-Control' not in response.headers and 'ETag' not in response.headers):
+            response.headers['Cache-Control'] = 'no-store'
     # Only advertise HSTS over genuinely secure (HTTPS) requests so local http
     # development is unaffected.
     if request.is_secure:

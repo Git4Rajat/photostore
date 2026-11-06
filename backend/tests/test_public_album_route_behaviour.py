@@ -251,3 +251,13 @@ def test_access_code_matching_supports_hashed_and_legacy_plaintext():
     assert not app._album_access_code_matches(hashed, 'wrong code')
     assert app._album_access_code_matches('legacy-code', 'legacy-code')
     assert not app._album_access_code_matches('legacy-code', 'légacy-code')
+
+
+def test_api_responses_carry_baseline_headers_and_authenticated_json_is_not_cached():
+    client = app.app.test_client()
+    unauth = client.get('/health')
+    assert unauth.headers['Content-Security-Policy'] == "default-src 'none'; frame-ancestors 'none'"
+    assert 'Permissions-Policy' in unauth.headers
+    assert 'Cache-Control' not in unauth.headers
+    authed = client.get('/health', headers={'Authorization': 'Bearer x'})
+    assert authed.headers['Cache-Control'] == 'no-store'

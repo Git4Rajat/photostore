@@ -209,6 +209,8 @@ def library_invite_accept():
         password = str(data.get('password', '') or '')
         if len(password) < 8:
             return app.jsonify({'error': 'Please choose a password of at least 8 characters.'}), 400
+        if len(password) > 256:
+            return app.jsonify({'error': 'Please choose a password of at most 256 characters.'}), 400
         account_id = app.library_utils.new_user_id()
         try:
             app.library_store.create_user(email=email, password_hash=app.password_auth.hash_password(password), user_id=account_id, exclusive=True)

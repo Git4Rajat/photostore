@@ -154,6 +154,11 @@ class TestChangePassword:
 class TestForgotPassword:
     URL = '/api/auth/forgot'
 
+    @pytest.fixture(autouse=True)
+    def run_background_inline(self, monkeypatch):
+        from routes import auth as auth_routes
+        monkeypatch.setattr(auth_routes, '_dispatch_background', lambda fn: fn())
+
     @pytest.fixture
     def mail(self, monkeypatch):
         sent = []
@@ -243,3 +248,9 @@ class TestEntraExchange:
 
 def test_exchange_is_unavailable_outside_entra_mode(http, store):
     assert http.post('/api/auth/exchange', headers={'Authorization': 'Bearer t'}).status_code == 400
+
+
+def test_overlong_passwords_are_rejected_before_hashing(http, monkeypatch):
+    monkeypatch.setattr(app, 'AUTH_MODE', 'password')
+    assert http.post('/api/auth/login', json={'email': 'a@b.c', 'password': 'x' * 257}).status_code == 401
+    assert http.post('/api/auth/reset', json={'token': 't', 'newPassword': 'x' * 257}).status_code == 400

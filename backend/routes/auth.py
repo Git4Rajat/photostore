@@ -6,9 +6,19 @@ as app.<name> throughout, matching the exact late-binding lookup semantics
 the code relied on when these functions lived in app.py directly, so
 test-time monkeypatching of app.<name> globals still works unchanged).
 """
+from concurrent.futures import ThreadPoolExecutor
+
 from flask import Blueprint
 
 import app
+
+_background = ThreadPoolExecutor(max_workers=2, thread_name_prefix='auth-bg')
+
+MAX_PASSWORD_LENGTH = 256  # bounds scrypt input from unauthenticated callers
+
+
+def _dispatch_background(fn):
+    _background.submit(fn)
 
 auth_bp = Blueprint('auth', __name__)
 
@@ -33,6 +43,8 @@ def auth_login():
     password = str(data.get('password', '') or '')
     if not email_in or not password:
         return app.jsonify({'error': 'Email and password are required.'}), 400
+    if len(password) > MAX_PASSWORD_LENGTH:
+        return app.jsonify({'error': 'Incorrect email or password.'}), 401
     account = app.library_store.get_user_by_email(email_in) if app.library_store else None
     stored_hash = str((account or {}).get('passwordHash') or '')
     # Brute-force protection is scoped per account so one targeted account can't
@@ -111,6 +123,8 @@ def auth_change_password():
     new_password = str(data.get('newPassword', '') or '')
     if len(new_password) < 8:
         return app.jsonify({'error': 'New password must be at least 8 characters.'}), 400
+    if len(new_password) > MAX_PASSWORD_LENGTH:
+        return app.jsonify({'error': f'New password must be at most {MAX_PASSWORD_LENGTH} characters.'}), 400
     account = app.library_store.get_user(account_id) if app.library_store else None
     stored_hash = str((account or {}).get('passwordHash') or '')
     if not account or not stored_hash or not app.password_auth.verify_password(current, stored_hash):
@@ -134,16 +148,25 @@ def auth_forgot():
     data = app.request.get_json(silent=True) or {}
     email_in = app.library_utils.normalize_email(data.get('email'))
     generic = app.jsonify({'status': 'ok'})
-    if not app.email_utils.is_configured() or not email_in or app.library_store is None:
+    if not email_in:
         return generic
+    # Do the lookup and the (slow) mail send off the request thread so response
+    # time is the same whether or not the address has an account.
+    _dispatch_background(lambda: _send_reset_link(email_in))
+    return generic
+
+
+def _send_reset_link(email_in):
+    if not app.email_utils.is_configured() or app.library_store is None:
+        return
     account = app.library_store.get_user_by_email(email_in)
     if not account:
-        return generic
+        return
     account_id = str(account.get('RowKey'))
     # Throttle the unauthenticated send path (per account) so it can't be used to
-    # email-bomb a user or burn ACS email quota. Still return the same 200.
+    # email-bomb a user or burn ACS email quota.
     if not app.library_store.reset_email_allowed(account_id):
-        return generic
+        return
     try:
         raw_token = app.library_store.create_reset_token(account_id, ttl_seconds=3600)
         base = (app.PUBLIC_APP_BASE_URL or '').rstrip('/')
@@ -151,7 +174,6 @@ def auth_forgot():
         app.email_utils.send_password_reset_email(str(account.get('email') or email_in), reset_url)
     except Exception as exc:
         app.app.logger.warning('Password reset email failed: %s', exc)
-    return generic
 
 @auth_bp.route('/auth/reset', methods=['POST'])
 @auth_bp.route('/api/auth/reset', methods=['POST'])
@@ -164,6 +186,8 @@ def auth_reset():
     new_password = str(data.get('newPassword', '') or '')
     if len(new_password) < 8:
         return app.jsonify({'error': 'New password must be at least 8 characters.'}), 400
+    if len(new_password) > MAX_PASSWORD_LENGTH:
+        return app.jsonify({'error': f'New password must be at most {MAX_PASSWORD_LENGTH} characters.'}), 400
     user_id = app.library_store.consume_reset_token(token) if app.library_store else None
     if not user_id:
         return app.jsonify({'error': 'This reset link is invalid or has expired. Please request a new one.'}), 400

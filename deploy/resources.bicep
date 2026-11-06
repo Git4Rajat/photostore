@@ -291,6 +291,17 @@ resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01'
         }
       ]
     }
+    // Soft delete: a deleted or overwritten blob/container stays recoverable for
+    // two weeks, so a bug or a compromised credential can't destroy photos
+    // irreversibly.
+    deleteRetentionPolicy: {
+      enabled: true
+      days: 14
+    }
+    containerDeleteRetentionPolicy: {
+      enabled: true
+      days: 14
+    }
     // Powers the blob lifecycle policy below: without this, tierToCool/tierToCold
     // can only key off last-modification time (effectively upload date), which
     // would age out an original a user still opens regularly.
