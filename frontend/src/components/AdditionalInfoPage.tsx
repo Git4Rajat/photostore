@@ -35,7 +35,7 @@ const AdditionalInfoPage: React.FC = () => {
                 <h2 className="additional-title">What Keepsake Does For You</h2>
                 <p className="additional-subtitle">
                     A private photo library that keeps every original, organizes it automatically, and lets you find any
-                    memory in seconds — running in your own Azure subscription, not a subscription photo service.
+                    memory in seconds — on infrastructure you own, not a subscription photo service.
                 </p>
             </header>
 
@@ -43,7 +43,7 @@ const AdditionalInfoPage: React.FC = () => {
                 <article className="additional-card">
                     <h3>Your Originals, Safe and Untouched</h3>
                     <ul>
-                        <li>Every photo and video is stored as a permanent, unmodified original in your own Azure Storage account.</li>
+                        <li>Every photo and video is stored as a permanent, unmodified original in storage you own.</li>
                         <li>Thumbnails, dates, camera details, and GPS locations are prepared on arrival, so new photos are ready to browse right away.</li>
                         <li>HEIC and Canon RAW (CR3) files preview directly in the browser — no conversion needed.</li>
                     </ul>
@@ -102,7 +102,7 @@ const AdditionalInfoPage: React.FC = () => {
                 <article className="additional-card">
                     <h3>Private and Low-Cost by Design</h3>
                     <ul>
-                        <li>Sign in with email and password, or with Microsoft Entra ID.</li>
+                        <li>Sign in with email and password, or with your organization account.</li>
                         <li>You only ever see photos in your own library — in the gallery, in search, and through shared links.</li>
                         <li>Links to originals are generated per request and expire quickly.</li>
                         <li>Background workers scale to zero when idle, so hosting costs stay near zero between visits.</li>
