@@ -1,0 +1,830 @@
+{
+  "schema": 1,
+  "status": "complete",
+  "faces": 100000,
+  "identities": 128,
+  "dimensions": 512,
+  "seed": 20261106,
+  "slice_seconds": 120.0,
+  "first_cut": 4096,
+  "started_at": "2026-11-06T10:51:10.788461+00:00",
+  "environment": {
+    "python": "3.13.2 (main, Feb  4 2025, 14:51:09) [Clang 16.0.0 (clang-1600.0.26.6)]",
+    "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "cpus": 14,
+    "host_memory_bytes": 25769803776,
+    "faiss": "1.15.1"
+  },
+  "source_sha256": {
+    "wave_assignment.py": "703e87e913c25098fe0dd360a05aa8357276d5e2e5bb3600b59516e6f23d84ef",
+    "wave_assignment_files.py": "e0aedfc4b41da40f42e6c0b6f6519d98271e6f8bab491ea89b5de98cc9aba59f",
+    "wave_assignment_resume.py": "4f1afe8899f689c4f754d2d13a57bd566cdba8d3df2e9b1b487c027b859c02bb",
+    "clustering_checkpoint.py": "6bb9274c9e8ccdfe4af2dcfdf0affca5b7fa9a8cc8d238329809eb4d46106e4b",
+    "clustering_runtime.py": "5ae7e80fd105f23c34dbaf081655dde1d21a1a2bafa657a0d39c9d47962c0a2e",
+    "clustering_index.py": "08d993d333b3e0ef7899421dc2aa482a1a362a25f819117f4533e52a8cd8dbb7",
+    "faiss_assignment.py": "8ac2d5fc9990a1d71f6ec5a0d2f624b173e8297165da4a3481de8c41eba51999",
+    "automatic_index_updates.py": "55c2a6801f4451d4eb363c6d5912a3a27e181877958f6174f2807c68880f21df"
+  },
+  "scope": "Current optimized frozen assignment runner and continuation. Fake remote storage; real local durability.",
+  "limitations": [
+    "No upload, Vision, receipt-loader, index publication or Azure latency.",
+    "Synthetic noisy identity vectors; not a face-quality/recall qualification.",
+    "Fake cloud rows remain in process RSS; RSS is not production native-runtime memory alone.",
+    "Fake tables do not enforce all Azure wire/property limits; production journal/membership guards remain.",
+    "One run per scenario, no claimed median or production throughput forecast.",
+    "First checkpoint is forced to exercise resume; later slices use the actual soft time budget.",
+    "Disk sizes sampled every 0.5s; short transient peaks can be missed."
+  ],
+  "attempts": [
+    {
+      "attempt": 1,
+      "outcome": "yield",
+      "seconds": 44.00505491707008,
+      "progress": 4096
+    },
+    {
+      "attempt": 2,
+      "outcome": "yield",
+      "seconds": 123.0371797500411,
+      "progress": 18560
+    },
+    {
+      "attempt": 3,
+      "outcome": "yield",
+      "seconds": 127.26795883395243,
+      "progress": 30080
+    },
+    {
+      "attempt": 4,
+      "outcome": "yield",
+      "seconds": 123.3686617090134,
+      "progress": 41856
+    },
+    {
+      "attempt": 5,
+      "outcome": "yield",
+      "seconds": 123.61808929091785,
+      "progress": 53376
+    },
+    {
+      "attempt": 6,
+      "outcome": "yield",
+      "seconds": 123.53812120808288,
+      "progress": 64000
+    },
+    {
+      "attempt": 7,
+      "outcome": "yield",
+      "seconds": 123.21960125002079,
+      "progress": 74240
+    },
+    {
+      "attempt": 8,
+      "outcome": "yield",
+      "seconds": 124.45767862501089,
+      "progress": 84096
+    },
+    {
+      "attempt": 9,
+      "outcome": "yield",
+      "seconds": 125.50868624995928,
+      "progress": 92032
+    },
+    {
+      "attempt": 10,
+      "outcome": "yield",
+      "seconds": 132.06350208295044,
+      "progress": 96768
+    },
+    {
+      "attempt": 11,
+      "outcome": "yield",
+      "seconds": 130.05830024997704,
+      "progress": 99840
+    },
+    {
+      "attempt": 12,
+      "outcome": "complete",
+      "seconds": 76.73238612501882,
+      "progress": 100000
+    }
+  ],
+  "builds": [
+    {
+      "seconds": 0.001667457981966436,
+      "vectors": 128,
+      "index_type": "flat",
+      "dimension": 512,
+      "nlist": 0
+    },
+    {
+      "seconds": 10.646211250103079,
+      "vectors": 10128,
+      "index_type": "ivfpq",
+      "dimension": 512,
+      "nlist": 259
+    },
+    {
+      "seconds": 4.305541584035382,
+      "vectors": 20128,
+      "index_type": "ivfpq",
+      "dimension": 512,
+      "nlist": 516
+    },
+    {
+      "seconds": 6.6832309160381556,
+      "vectors": 30128,
+      "index_type": "ivfpq",
+      "dimension": 512,
+      "nlist": 772
+    },
+    {
+      "seconds": 8.677794458926655,
+      "vectors": 40128,
+      "index_type": "ivfpq",
+      "dimension": 512,
+      "nlist": 1028
+    },
+    {
+      "seconds": 10.605464249965735,
+      "vectors": 50128,
+      "index_type": "ivfpq",
+      "dimension": 512,
+      "nlist": 1217
+    },
+    {
+      "seconds": 10.980630625039339,
+      "vectors": 60128,
+      "index_type": "ivfpq",
+      "dimension": 512,
+      "nlist": 1215
+    },
+    {
+      "seconds": 11.521971291978844,
+      "vectors": 70128,
+      "index_type": "ivfpq",
+      "dimension": 512,
+      "nlist": 1215
+    },
+    {
+      "seconds": 12.176313875010237,
+      "vectors": 80128,
+      "index_type": "ivfpq",
+      "dimension": 512,
+      "nlist": 1214
+    },
+    {
+      "seconds": 13.230613250052556,
+      "vectors": 90128,
+      "index_type": "ivfpq",
+      "dimension": 512,
+      "nlist": 1214
+    }
+  ],
+  "rebuilds": [
+    {
+      "seconds": 0.025413875002413988,
+      "page_progress": 0,
+      "base_vectors": 0,
+      "kind": "empty_initialization"
+    },
+    {
+      "seconds": 10.77746000001207,
+      "page_progress": 9984,
+      "base_vectors": 10128,
+      "kind": "compaction"
+    },
+    {
+      "seconds": 4.497527832980268,
+      "page_progress": 19968,
+      "base_vectors": 20128,
+      "kind": "compaction"
+    },
+    {
+      "seconds": 6.943421249976382,
+      "page_progress": 29952,
+      "base_vectors": 30128,
+      "kind": "compaction"
+    },
+    {
+      "seconds": 8.907380958087742,
+      "page_progress": 39936,
+      "base_vectors": 40128,
+      "kind": "compaction"
+    },
+    {
+      "seconds": 10.844450291944668,
+      "page_progress": 49920,
+      "base_vectors": 50128,
+      "kind": "compaction"
+    },
+    {
+      "seconds": 11.257764666923322,
+      "page_progress": 59904,
+      "base_vectors": 60128,
+      "kind": "compaction"
+    },
+    {
+      "seconds": 11.828233666950837,
+      "page_progress": 69888,
+      "base_vectors": 70128,
+      "kind": "compaction"
+    },
+    {
+      "seconds": 12.506578459055163,
+      "page_progress": 80000,
+      "base_vectors": 80128,
+      "kind": "compaction"
+    },
+    {
+      "seconds": 13.620136708021164,
+      "page_progress": 89984,
+      "base_vectors": 90128,
+      "kind": "compaction"
+    }
+  ],
+  "saves": [
+    {
+      "position": 4096,
+      "seconds": 1.1260824999772012,
+      "workspace_bytes": 571678720,
+      "native_checkpoint_tree_bytes": 26322533,
+      "journal_bytes": 566973953
+    },
+    {
+      "position": 18560,
+      "seconds": 1.7201250839279965,
+      "workspace_bytes": 750194688,
+      "native_checkpoint_tree_bytes": 123899286,
+      "journal_bytes": 779505640
+    },
+    {
+      "position": 30080,
+      "seconds": 2.4091895420569927,
+      "workspace_bytes": 892440576,
+      "native_checkpoint_tree_bytes": 228741089,
+      "journal_bytes": 948782715
+    },
+    {
+      "position": 41856,
+      "seconds": 2.597767833038233,
+      "workspace_bytes": 1037762560,
+      "native_checkpoint_tree_bytes": 316626283,
+      "journal_bytes": 1121824607
+    },
+    {
+      "position": 53376,
+      "seconds": 2.793694624910131,
+      "workspace_bytes": 1180106752,
+      "native_checkpoint_tree_bytes": 423502943,
+      "journal_bytes": 1291103554
+    },
+    {
+      "position": 64000,
+      "seconds": 2.715424584108405,
+      "workspace_bytes": 1311125504,
+      "native_checkpoint_tree_bytes": 522681143,
+      "journal_bytes": 1447211462
+    },
+    {
+      "position": 74240,
+      "seconds": 2.9280002909945324,
+      "workspace_bytes": 1437536256,
+      "native_checkpoint_tree_bytes": 613483559,
+      "journal_bytes": 1597679673
+    },
+    {
+      "position": 84096,
+      "seconds": 3.5105602089315653,
+      "workspace_bytes": 1559277568,
+      "native_checkpoint_tree_bytes": 699503903,
+      "journal_bytes": 1742506762
+    },
+    {
+      "position": 92032,
+      "seconds": 4.389134000055492,
+      "workspace_bytes": 1657204736,
+      "native_checkpoint_tree_bytes": 771171863,
+      "journal_bytes": 1859121867
+    },
+    {
+      "position": 96768,
+      "seconds": 10.208671416039579,
+      "workspace_bytes": 1715736576,
+      "native_checkpoint_tree_bytes": 830534296,
+      "journal_bytes": 1928713557
+    },
+    {
+      "position": 99840,
+      "seconds": 8.630503583000973,
+      "workspace_bytes": 1753604096,
+      "native_checkpoint_tree_bytes": 879190681,
+      "journal_bytes": 1973854919
+    }
+  ],
+  "restores": [
+    {
+      "seconds": 5.874899215996265e-06,
+      "hit": false,
+      "position": 0
+    },
+    {
+      "seconds": 0.9410830839769915,
+      "hit": true,
+      "position": 4096
+    },
+    {
+      "seconds": 1.6851903749629855,
+      "hit": true,
+      "position": 18560
+    },
+    {
+      "seconds": 2.1681879580719396,
+      "hit": true,
+      "position": 30080
+    },
+    {
+      "seconds": 2.489312042016536,
+      "hit": true,
+      "position": 41856
+    },
+    {
+      "seconds": 2.6308642919175327,
+      "hit": true,
+      "position": 53376
+    },
+    {
+      "seconds": 2.7932485840283334,
+      "hit": true,
+      "position": 64000
+    },
+    {
+      "seconds": 3.0213867090642452,
+      "hit": true,
+      "position": 74240
+    },
+    {
+      "seconds": 3.4599003749899566,
+      "hit": true,
+      "position": 84096
+    },
+    {
+      "seconds": 5.399399999994785,
+      "hit": true,
+      "position": 92032
+    },
+    {
+      "seconds": 5.581738082924858,
+      "hit": true,
+      "position": 96768
+    },
+    {
+      "seconds": 6.767646000022069,
+      "hit": true,
+      "position": 99840
+    }
+  ],
+  "seed_seconds": 7.847333916928619,
+  "seeded_rss_bytes": 1274249216,
+  "config": {
+    "threshold": 0.78,
+    "margin": 0.05,
+    "person_cache_size": 128,
+    "index_config": {
+      "flat_max_vectors": 10000,
+      "nlist_min": 4096,
+      "nlist_max": 8192,
+      "pq_subquantizers": 64,
+      "pq_bits": 8,
+      "training_sample_size": 100000,
+      "training_points_per_centroid": 39,
+      "training_iterations": 25,
+      "seed": 0,
+      "memory_budget_bytes": 3221225472
+    },
+    "candidates": 64,
+    "nprobe": 64,
+    "delta_limit": 10000,
+    "threads": 2,
+    "cold_stream_embeddings": false,
+    "work_dir": "<local-temp>/work",
+    "checkpoint_dir": "<local-temp>/mount",
+    "checkpoint_interval_seconds": 1800,
+    "io_concurrency": 4,
+    "coalesce_writes": false
+  },
+  "progress": 100000,
+  "receipt": "e63956621744340ab769b2586aaf580c366e4d652fc23c506374e10c07824973",
+  "elapsed_seconds": 1376.8931848750217,
+  "process_cpu_seconds": 1117.010562,
+  "counters": {
+    "artifact_create_conflicts": 0,
+    "artifact_gets": 0,
+    "artifact_heads": 0,
+    "artifact_preview_bytes_avoided": 0,
+    "artifact_preview_reuses": 0,
+    "artifact_readback_bytes_avoided": 0,
+    "artifact_readback_fallbacks": 0,
+    "artifact_source_check_batches": 0,
+    "artifact_source_checks": 0,
+    "artifact_source_checks_coalesced": 0,
+    "artifact_upload_response_receipts": 0,
+    "artifact_verification_reuse": 0,
+    "artifact_verifications": 0,
+    "artifact_verified_bytes": 0,
+    "batch_keys": 100128,
+    "batch_missing": 100000,
+    "batch_peak_inflight": 1,
+    "batch_point_errors": 0,
+    "batch_point_reads": 0,
+    "batch_queries": 7153,
+    "batch_query_errors": 0,
+    "batch_queue_ms": 494.9298049323261,
+    "batch_requests": 1789,
+    "batch_rows": 128,
+    "batch_service_ms": 166.228023939766,
+    "batch_wall_ms": 784.4379335874692,
+    "blob_gets": 0,
+    "blob_heads": 0,
+    "clip_image_batch_fallbacks": 0,
+    "clip_image_batch_items": 0,
+    "clip_image_batch_service_ms": 0,
+    "clip_image_batches": 0,
+    "clip_image_queue_ms": 0,
+    "clip_image_request_ms": 0,
+    "clip_image_requests": 0,
+    "clip_image_singleton_batches": 0,
+    "clip_image_stack_ms": 0,
+    "clip_inference_ms": 0,
+    "clip_lock_wait_ms": 0,
+    "clip_preprocess_ms": 0,
+    "cluster_coverage_finish_errors": 0,
+    "cluster_coverage_pages": 782,
+    "cluster_coverage_writes": 200000,
+    "cluster_faces_newly_resolved": 100000,
+    "cluster_faces_replayed": 0,
+    "cluster_member_fetches": 0,
+    "cluster_member_rows_fetched": 0,
+    "cluster_resume_hits": 11,
+    "cluster_resume_misses": 1,
+    "completion_ack_snapshot_conflicts": 0,
+    "completion_ack_snapshot_uses": 0,
+    "completion_inbox_create_conflicts": 0,
+    "completion_inbox_creates": 0,
+    "face_align_ms": 0,
+    "face_decode_ms": 0,
+    "face_detect_ms": 0,
+    "face_embed_ms": 0,
+    "face_landmark_ms": 0,
+    "face_landmark_wait_ms": 0,
+    "face_write_batch_errors": 0,
+    "face_write_batch_ms": 0,
+    "face_write_batch_rows": 0,
+    "face_write_batches": 0,
+    "face_write_lease_checks_deferred": 0,
+    "face_write_version_batches": 0,
+    "face_write_version_keys": 0,
+    "face_write_version_read_errors": 0,
+    "face_write_version_read_ms": 0,
+    "face_write_version_reads": 0,
+    "image_inspection_ms": 0,
+    "image_inspections": 0,
+    "image_passes": 0,
+    "image_processing_ms": 0,
+    "image_qualification_ms": 0,
+    "job_read_requests": 0,
+    "journal_flush_errors": 0,
+    "journal_flush_ms": 122876.93528598174,
+    "journal_flushes": 200013,
+    "journal_fsync_errors": 0,
+    "journal_fsync_ms": 8061.591460951604,
+    "journal_fsyncs": 200013,
+    "member_buffer_capacity_stops": 0,
+    "member_buffer_disk_errors": 0,
+    "member_buffer_disk_file_peak_bytes": 0,
+    "member_buffer_disk_hits": 0,
+    "member_buffer_disk_peak_bytes": 0,
+    "member_buffer_disk_read_ms": 0,
+    "member_buffer_disk_write_ms": 0,
+    "member_buffer_entries_peak": 0,
+    "member_buffer_memory_peak_bytes": 0,
+    "member_buffer_reloads": 0,
+    "metadata_artifact_capture_reads": 0,
+    "metadata_artifact_source_validation_reads": 0,
+    "metadata_artifact_write_reads": 0,
+    "metadata_claim_reads": 0,
+    "metadata_completion_delivery_reads": 0,
+    "metadata_derivative_promotion_reads": 0,
+    "metadata_embedding_write_reads": 0,
+    "metadata_face_persistence_reads": 0,
+    "metadata_heartbeat_reads": 0,
+    "metadata_inspection_reads": 0,
+    "metadata_lease_and_policy_check_reads": 0,
+    "metadata_metadata_cas_reads": 0,
+    "metadata_metadata_commit_reads": 0,
+    "metadata_other_reads": 0,
+    "metadata_point_reads": 0,
+    "metadata_prefetch_reads": 0,
+    "metadata_qualification_reads": 0,
+    "metadata_query_requests": 0,
+    "metadata_read_ms": 0,
+    "metadata_semantic_refresh_reads": 0,
+    "metadata_source_release_reads": 0,
+    "ocr_engine_init_ms": 0,
+    "ocr_engine_inits": 0,
+    "ocr_recognition_ms": 0,
+    "ocr_worker_capacity_errors": 0,
+    "ocr_worker_reuses": 0,
+    "ocr_worker_starts": 0,
+    "ocr_worker_timeouts": 0,
+    "preview_prefetch_bytes": 0,
+    "preview_prefetch_disk_bytes": 0,
+    "preview_prefetch_download_ms": 0,
+    "preview_prefetch_drain_ms": 0,
+    "preview_prefetch_errors": 0,
+    "preview_prefetch_hits": 0,
+    "preview_prefetch_misses": 0,
+    "preview_prefetch_reserved_peak_bytes": 0,
+    "preview_prefetch_skipped_candidates": 0,
+    "preview_prefetch_slots_peak": 0,
+    "preview_prefetch_submitted": 0,
+    "preview_prefetch_transfer_bytes": 0,
+    "preview_prefetch_unused": 0,
+    "preview_prefetch_unused_bytes": 0,
+    "preview_prefetch_wait_ms": 0,
+    "receipt_cache_disk_errors": 0,
+    "receipt_cache_disk_file_peak_bytes": 0,
+    "receipt_cache_disk_hits": 0,
+    "receipt_cache_disk_peak_bytes": 0,
+    "receipt_cache_disk_read_ms": 0,
+    "receipt_cache_disk_write_ms": 0,
+    "receipt_cache_entries_peak": 0,
+    "receipt_cache_evictions": 0,
+    "receipt_cache_hits": 0,
+    "receipt_cache_memory_peak_bytes": 0,
+    "receipt_cache_misses": 0,
+    "receipt_cache_oversize": 0,
+    "receipt_commit_cache_evictions": 0,
+    "receipt_commit_cache_hits": 0,
+    "receipt_commit_cache_misses": 0,
+    "receipt_commit_cache_oversize": 0,
+    "receipt_commit_cache_peak_bytes": 0,
+    "receipt_commit_cache_peak_rows": 0,
+    "receipt_commit_handoff_bytes": 0,
+    "receipt_commit_handoff_ms": 0,
+    "receipt_commit_handoff_rows": 0,
+    "receipt_create_conflicts": 0,
+    "receipt_creates": 0,
+    "receipt_prefetch_cached_keys": 0,
+    "receipt_prefetch_keys": 0,
+    "receipt_prefetch_point_groups": 0,
+    "receipt_prefetch_point_ms": 0,
+    "receipt_prefetch_query_groups": 0,
+    "receipt_prefetch_query_ms": 0,
+    "receipt_prefetch_strategy_switches": 0,
+    "receipt_write_batches": 0,
+    "semantic_embedding_encodes": 0,
+    "semantic_embedding_reuse_read_errors": 0,
+    "semantic_embedding_reuses": 0,
+    "semantic_text_batch_fallbacks": 0,
+    "semantic_text_batch_items": 0,
+    "semantic_text_batch_peak": 0,
+    "semantic_text_batches": 0,
+    "semantic_text_collection_ms": 0,
+    "semantic_text_queue_ms": 0,
+    "semantic_text_request_ms": 0,
+    "semantic_text_requests": 0,
+    "semantic_text_service_ms": 0,
+    "semantic_text_singleton_batches": 0,
+    "source_attempts": 0,
+    "source_errors": 0,
+    "storage_bytes": 0,
+    "storage_calls": 0,
+    "storage_conflicts": 0,
+    "storage_errors": 0,
+    "storage_not_found": 0,
+    "storage_precondition_failed": 0,
+    "storage_send_ms": 0,
+    "storage_server_errors": 0,
+    "storage_throttled": 0,
+    "text_inference_ms": 0,
+    "text_lock_wait_ms": 0,
+    "text_tokenize_ms": 0,
+    "vision_admission_batches": 0,
+    "vision_admission_ms": 0,
+    "vision_checkpoint_calls": 0,
+    "vision_checkpoint_errors": 0,
+    "vision_checkpoint_ms": 0,
+    "vision_coordinator_wait_ms": 0,
+    "vision_evaluation_calls": 0,
+    "vision_evaluation_errors": 0,
+    "vision_evaluation_ms": 0,
+    "vision_face_receipt_fetch_calls": 0,
+    "vision_face_receipt_fetch_errors": 0,
+    "vision_face_receipt_fetch_ms": 0,
+    "vision_inspection_ahead_members": 0,
+    "vision_inspection_ahead_ms": 0,
+    "vision_inspection_prefetch_errors": 0,
+    "vision_inspection_prefetch_ms": 0,
+    "vision_inspection_prefetches": 0,
+    "vision_manifest_fetch_calls": 0,
+    "vision_manifest_fetch_errors": 0,
+    "vision_manifest_fetch_ms": 0,
+    "vision_member_fetch_calls": 0,
+    "vision_member_fetch_errors": 0,
+    "vision_member_fetch_ms": 0,
+    "vision_member_groups": 0,
+    "vision_member_rows_fetched": 0,
+    "vision_metadata_fetch_calls": 0,
+    "vision_metadata_fetch_errors": 0,
+    "vision_metadata_fetch_ms": 0,
+    "vision_metadata_rows_peak": 0,
+    "vision_metadata_snapshot_peak_bytes": 0,
+    "vision_page_commit_calls": 0,
+    "vision_page_commit_errors": 0,
+    "vision_page_commit_ms": 0,
+    "vision_page_load_calls": 0,
+    "vision_page_load_errors": 0,
+    "vision_page_load_ms": 0,
+    "vision_pool_capacity_ms": 0,
+    "vision_pool_ms": 0,
+    "vision_proof_inbox_fetch_calls": 0,
+    "vision_proof_inbox_fetch_errors": 0,
+    "vision_proof_inbox_fetch_ms": 0,
+    "vision_qualification_completed": 0,
+    "vision_qualification_fallback_members": 0,
+    "vision_qualification_fresh_metadata_reads": 0,
+    "vision_qualification_prefetch_calls": 0,
+    "vision_qualification_prefetch_errors": 0,
+    "vision_qualification_prefetch_ms": 0,
+    "vision_qualification_verify_ms": 0,
+    "vision_settlement_ms": 0,
+    "vision_source_apply_calls": 0,
+    "vision_source_apply_errors": 0,
+    "vision_source_apply_ms": 0,
+    "vision_source_busy_ms": 0,
+    "vision_source_claim_calls": 0,
+    "vision_source_claim_errors": 0,
+    "vision_source_claim_ms": 0,
+    "vision_source_prepare_calls": 0,
+    "vision_source_prepare_errors": 0,
+    "vision_source_prepare_ms": 0,
+    "vision_source_qualify_calls": 0,
+    "vision_source_qualify_errors": 0,
+    "vision_source_qualify_ms": 0,
+    "vision_source_queue_ms": 0,
+    "vision_source_release_calls": 0,
+    "vision_source_release_errors": 0,
+    "vision_source_release_ms": 0,
+    "vision_source_steps_calls": 0,
+    "vision_source_steps_errors": 0,
+    "vision_source_steps_ms": 0
+  },
+  "calls": {
+    "jobs.get_entity": 1674,
+    "jobs.submit_transaction": 852,
+    "people.query_entities": 7153,
+    "faces.query_entities": 1,
+    "faces.get_entity": 100000,
+    "people.get_entity": 100000,
+    "admission.get_entity": 200782,
+    "coverage.get_entity": 1565,
+    "coverage.create_entity": 1,
+    "coverage.submit_transaction": 1564,
+    "people.update_entity": 100000,
+    "members.create_entity": 100000,
+    "faces.update_entity": 100000
+  },
+  "phases": {
+    "guard_ownership_read": {
+      "calls": 797,
+      "errors": 0,
+      "milliseconds": 4.6347841853275895,
+      "thread_cpu_ms": 4.679747999022155
+    },
+    "lease_wait": {
+      "calls": 12,
+      "errors": 0,
+      "milliseconds": 8.572041871957481,
+      "thread_cpu_ms": 1.0800410000637584
+    },
+    "journal_open": {
+      "calls": 12,
+      "errors": 0,
+      "milliseconds": 383453.1732919859,
+      "thread_cpu_ms": 377317.9212489999
+    },
+    "resume_restore": {
+      "calls": 12,
+      "errors": 0,
+      "milliseconds": 36951.202790020034,
+      "thread_cpu_ms": 29063.41666699986
+    },
+    "journal_write": {
+      "calls": 300273,
+      "errors": 0,
+      "milliseconds": 300121.057791519,
+      "thread_cpu_ms": 160001.67232300882,
+      "journal_flush_ms": 122876.93528598174,
+      "journal_flushes": 200013,
+      "journal_fsync_ms": 8061.591460951604,
+      "journal_fsyncs": 200013
+    },
+    "snapshot_prepare": {
+      "calls": 1,
+      "errors": 0,
+      "milliseconds": 17188.972917036153,
+      "thread_cpu_ms": 16741.9075,
+      "batch_keys": 100128,
+      "batch_missing": 100000,
+      "batch_peak_inflight": 1,
+      "batch_queries": 7153,
+      "batch_queue_ms": 494.9298049323261,
+      "batch_requests": 1789,
+      "batch_rows": 128,
+      "batch_service_ms": 166.228023939766,
+      "batch_wall_ms": 784.4379335874692,
+      "journal_flush_ms": 115.01558299642056,
+      "journal_flushes": 1,
+      "journal_fsync_ms": 0.9442500304430723,
+      "journal_fsyncs": 1
+    },
+    "runtime_build": {
+      "calls": 1,
+      "errors": 0,
+      "milliseconds": 9.797999984584749,
+      "thread_cpu_ms": 6.930250000003468
+    },
+    "matching": {
+      "calls": 100000,
+      "errors": 0,
+      "milliseconds": 368251.6238782555,
+      "thread_cpu_ms": 355141.8199550087
+    },
+    "curation_check": {
+      "calls": 100000,
+      "errors": 0,
+      "milliseconds": 4125.822043395601,
+      "thread_cpu_ms": 4046.852200001375
+    },
+    "coverage_begin": {
+      "calls": 782,
+      "errors": 0,
+      "milliseconds": 41.52740468271077,
+      "thread_cpu_ms": 41.590791999809085
+    },
+    "assignment_persistence": {
+      "calls": 100000,
+      "errors": 0,
+      "milliseconds": 29538.355572731234,
+      "thread_cpu_ms": 29523.991705970668,
+      "cluster_coverage_pages": 782,
+      "cluster_coverage_writes": 200000
+    },
+    "runtime_update": {
+      "calls": 100000,
+      "errors": 0,
+      "milliseconds": 136430.9716206044,
+      "thread_cpu_ms": 65574.35172100589
+    },
+    "coverage_finish": {
+      "calls": 782,
+      "errors": 0,
+      "milliseconds": 41.61575064063072,
+      "thread_cpu_ms": 41.61204199878199
+    },
+    "checkpoint": {
+      "calls": 782,
+      "errors": 0,
+      "milliseconds": 78.44906905665994,
+      "thread_cpu_ms": 49.492880998990074
+    },
+    "resume_save": {
+      "calls": 11,
+      "errors": 0,
+      "milliseconds": 43057.92050017044,
+      "thread_cpu_ms": 27625.012541000153,
+      "journal_flush_ms": 10.608998709358275,
+      "journal_flushes": 11,
+      "journal_fsync_ms": 0.46154228039085865,
+      "journal_fsyncs": 11
+    }
+  },
+  "resources": {
+    "sampled_runner_peak_rss_bytes": 1307443200,
+    "process_lifetime_peak_rss_bytes": 1307443200,
+    "peak_work_bytes": 8274658978,
+    "peak_mount_bytes": 5968585972,
+    "peak_combined_disk_bytes": 13794078789,
+    "retained_mount_bytes": 4609001116,
+    "sampling_errors": []
+  },
+  "applied_faces": 100000,
+  "owner_digest": "0341e759833c439d8bafdc8a258dca07ef2ad8ae4abbebef40a9a60055740b80",
+  "wrong_identity_count": 0,
+  "total_counted_calls": 713592,
+  "output_validation": "All expected owners, exact membership lists and member-row count verified",
+  "faces_per_second": 72.62727501195151,
+  "coverage_active_after_run": 0,
+  "finished_at": "2026-11-06T11:14:15.679997+00:00"
+}

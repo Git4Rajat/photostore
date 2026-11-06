@@ -34,97 +34,88 @@ const AdditionalInfoPage: React.FC = () => {
                 <p className="additional-kicker">OPEN SOURCE AND SELF HOSTED</p>
                 <h2 className="additional-title">What Keepsake Does For You</h2>
                 <p className="additional-subtitle">
-                    A private photo library that backs up every original, organizes it automatically, and helps you
-                    find any memory in seconds — running entirely in storage you own, not a subscription photo service.
+                    A private photo library that keeps every original, organizes it automatically, and lets you find any
+                    memory in seconds — on infrastructure you own, not a subscription photo service.
                 </p>
             </header>
 
             <div className="additional-grid">
                 <article className="additional-card">
-                    <h3>Your Photos, Backed Up Automatically</h3>
-                    <p>
-                        Every photo and video you upload is kept as a permanent, untouched original in your own Azure
-                        Storage account — not locked inside a subscription you could lose access to or get priced out of.
-                    </p>
-                    <p>
-                        Keepsake also builds fast-loading thumbnails and pulls out useful details like date, camera, and
-                        location as soon as a photo arrives, so your library is ready to browse right away. It&apos;s
-                        built for private or family archives where you stay in control of where the photos actually live.
-                    </p>
+                    <h3>Your Originals, Safe and Untouched</h3>
+                    <ul>
+                        <li>Every photo and video is stored as a permanent, unmodified original in storage you own.</li>
+                        <li>Thumbnails, dates, camera details, and GPS locations are prepared on arrival, so new photos are ready to browse right away.</li>
+                        <li>HEIC and Canon RAW (CR3) files preview directly in the browser — no conversion needed.</li>
+                    </ul>
                 </article>
 
                 <article className="additional-card">
-                    <h3>Upload From Anywhere, Without Worry</h3>
+                    <h3>Uploads That Survive Interruptions</h3>
                     <ul>
-                        <li>Upload straight from your phone, tablet, or computer — including large batches of RAW photos and video.</li>
-                        <li>Uploads keep running in the background, so you can keep browsing or close the tab without stopping the transfer.</li>
-                        <li>If an upload gets interrupted — a dropped connection, a closed laptop lid, a phone that falls asleep — Keepsake picks up where it left off instead of making you start over.</li>
-                        <li>Upload speed automatically adapts to your connection, so it stays fast on Wi-Fi and still works reliably on a slow mobile network.</li>
-                        <li>Every file is checked after it arrives to catch anything that came through incomplete or corrupted, and exact duplicates are skipped automatically so you don&apos;t end up with two copies of the same photo.</li>
+                        <li>Upload large batches of photos, RAW files, and video from any device; transfers continue in the background.</li>
+                        <li>A dropped connection, closed tab, or sleeping phone resumes where it left off — no starting over.</li>
+                        <li>Speed adapts to your connection, and you can stop or discard an upload at any time.</li>
+                        <li>Files are verified on arrival, and exact duplicates are rejected before they use any space.</li>
+                        <li>Failed or corrupted uploads are set aside for review instead of silently disappearing.</li>
                     </ul>
                 </article>
 
                 <article className="additional-card">
                     <h3>Find Any Photo in Seconds</h3>
                     <ul>
-                        <li>Browse your library sorted by date, or filter by capture date, rating, and likes.</li>
-                        <li>Search the way you&apos;d describe a memory — “red dress,” “birthday cake,” “dog at the beach” — and Keepsake understands the subject and its description together, not just keyword matches.</li>
-                        <li>Search draws on everything Keepsake already knows about a photo: auto-generated tags and captions, text spotted in the image, the people in it, and where it was taken.</li>
-                        <li>Every photo&apos;s detail view shows its map location, camera settings, and processing status at a glance — and you can queue or retry any missing step from the Tools page without re-uploading.</li>
-                        <li>iPhone HEIC photos and Canon RAW (CR3) files preview correctly right in your browser, with no extra software or conversion needed.</li>
-                        <li>A bell and toast notification let you know as soon as a background job — like tagging or face detection — finishes.</li>
+                        <li>Search in plain language — “red dress,” “birthday cake,” “dog at the beach.”</li>
+                        <li>Search uses everything Keepsake knows: tags, captions, text in the image, people, and place.</li>
+                        <li><strong>Ask</strong> answers questions about your library, and <strong>Explore</strong> surfaces places, people, and moments to browse.</li>
+                        <li>Filter by date, rating, likes, and media type; open any photo for its map, camera settings, and processing status.</li>
                     </ul>
                 </article>
 
                 <article className="additional-card">
                     <h3>Recognize the People You Love</h3>
                     <ul>
-                        <li>Keepsake automatically groups the faces it detects into people, so you can search a name and instantly pull up every photo they&apos;re in.</li>
-                        <li>Merge two groups that are the same person, with one-click undo if you change your mind — or split a group apart if it mixed up two different people.</li>
-                        <li>Not sure about a match? Confirm or reject individual low-confidence detections, or manually assign faces Keepsake couldn&apos;t group on its own.</li>
-                        <li>You can make face-matching stricter or looser to suit your library, and it takes effect immediately — no update or redeploy needed.</li>
+                        <li>Faces are grouped into people automatically — search a name to see every photo they&apos;re in.</li>
+                        <li>Merge duplicate groups (with undo), split mixed-up ones, and confirm, reject, or manually assign individual faces.</li>
+                        <li>Tune face matching to be stricter or looser; changes apply immediately.</li>
                     </ul>
                 </article>
 
                 <article className="additional-card">
-                    <h3>Keep Everything Organized</h3>
+                    <h3>Albums, Trash, and Tools</h3>
                     <ul>
-                        <li>Build albums by hand, or let smart albums fill themselves automatically by location, date, person, or subject as new matching photos come in.</li>
-                        <li>Download a selection of photos, or a whole album, packaged up and ready to save elsewhere.</li>
-                        <li>Uploads that fail or come through corrupted are set aside on their own page instead of silently vanishing, so you always know what needs another look.</li>
-                        <li>A processing health view shows which photos are missing thumbnails, AI tags, or location/face data, so gaps are easy to find and fix.</li>
+                        <li>Build albums by hand, or use smart albums that fill themselves by place, date, person, or subject.</li>
+                        <li>Download a selection or a whole album in one package.</li>
+                        <li>Deleted photos and albums rest in Recently Deleted for 30 days; restore them any time before they&apos;re purged.</li>
+                        <li>The Tools page shows what is missing (thumbnails, tags, locations, faces) and lets you repair or re-run it without re-uploading. A bell notifies you when background jobs finish.</li>
                     </ul>
                 </article>
 
                 <article className="additional-card">
-                    <h3>Share Your Library With Family</h3>
+                    <h3>Share With Family</h3>
                     <ul>
-                        <li>Turn any album into a public, read-only link for anyone to view — no account needed — and optionally lock it with an access code.</li>
-                        <li>Invite up to 15 people into your library as equal members, so the whole family can upload to and browse the same shared collection.</li>
-                        <li>Anyone you invite can choose to start their own separate library instead, right from the same invite.</li>
-                        <li>Invite links are single-use and expire after 72 hours for safety, and any member can leave a shared library whenever they want.</li>
-                        <li>&quot;Clean library&quot; wipes all content while keeping the account itself — it needs the owner and a second member to both confirm, so it can&apos;t happen by accident.</li>
+                        <li>Turn any album into a public, read-only link — no account needed — optionally locked with an access code.</li>
+                        <li>Invite up to 15 members into one shared library; invitees can also choose to start their own library.</li>
+                        <li>Invite links are single-use and expire after 72 hours; any member can leave at any time.</li>
+                        <li>“Clean library” wipes content but keeps accounts, and requires the owner plus a second member to confirm.</li>
                     </ul>
                 </article>
 
                 <article className="additional-card">
-                    <h3>Your Photos, Your Rules</h3>
+                    <h3>Private and Low-Cost by Design</h3>
                     <ul>
-                        <li>Sign in with email and password, or with your Microsoft work account if your organization uses Entra ID.</li>
-                        <li>No matter how you access it — gallery, search, or a shared link — you only ever see photos that belong to your library.</li>
-                        <li>Links used to upload or view your original files are generated fresh for each request and expire quickly, so they can&apos;t be reused outside their intended purpose.</li>
-                        <li>Because everything runs in your own Azure subscription, the parts of the app you&apos;re not using can power down automatically, keeping hosting costs close to zero between visits.</li>
+                        <li>Sign in with email and password, or with your personal Microsoft account.</li>
+                        <li>You only ever see photos in your own library — in the gallery, in search, and through shared links.</li>
+                        <li>Links to originals are generated per request and expire quickly.</li>
+                        <li>Background workers scale to zero when idle, so hosting costs stay near zero between visits.</li>
                     </ul>
                 </article>
 
                 <article className="additional-card">
-                    <h3>What We&apos;re Improving</h3>
+                    <h3>Coming Next</h3>
                     <ul>
-                        <li>Duplicate detection catches exact copies today; catching near-duplicate shots (like two takes of the same photo) is planned as a background check that won&apos;t slow down your uploads.</li>
-                        <li>Browsing very large libraries is next in line for a faster, dedicated search index, so performance stays snappy as a library grows into the tens of thousands of photos.</li>
-                        <li>“Find similar photos” search will get faster once photo embeddings are precomputed and ready to query directly.</li>
-                        <li>We&apos;re adding safeguards so that if an automatic re-clustering run fails partway through, it can&apos;t accidentally hide people you&apos;ve already identified and named.</li>
-                        <li>When part of the app has powered down to save cost, the UI will soon tell you it&apos;s warming back up instead of just looking slow.</li>
+                        <li>Near-duplicate detection (similar shots, not just exact copies), run in the background without slowing uploads.</li>
+                        <li>Faster “find similar photos” using precomputed embeddings.</li>
+                        <li>Safeguards so a failed re-clustering run can never hide people you&apos;ve already named.</li>
+                        <li>A clear “warming up” message in the UI when idle workers are waking.</li>
                     </ul>
                 </article>
             </div>

@@ -97,7 +97,7 @@ class TestRestore:
         assert body == {'restored': ['a.jpg', 'b.jpg'], 'errors': ['gone.jpg: Not found'], 'success': True}
         assert side_effects['faces'] == [(['a.jpg', 'b.jpg'], False)]
         assert side_effects['search'] == [['a.jpg', 'b.jpg']]
-        assert side_effects['rebuild'] == [('photo-restore', 'people')] and side_effects['cache'] == 1
+        assert side_effects['rebuild'] == [('photo-restore', 'people'), ('photo-restore', 'sort'), ('photo-restore', 'albums')] and side_effects['cache'] == 1
 
     def test_nothing_restored_means_no_index_work(self, http, monkeypatch, side_effects):
         monkeypatch.setattr(app, '_restore_deleted_file', lambda user, name: None)

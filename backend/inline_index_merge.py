@@ -268,6 +268,7 @@ def _attempt_serialized(user_id, scope, capture):
     if newer is None or newer:
         return
     _cancel_backstop(capture)
+    _close_queued_job(user_id, scope, capture)
 
 
 def _merge_claimed(store, claim, guard, user_id, scope):
@@ -339,3 +340,18 @@ def _cancel_backstop(capture: Optional[list]) -> None:
             queue_client.delete_message(sent_message.id, sent_message.pop_receipt)
         except Exception:
             pass
+
+
+def _close_queued_job(user_id: str, scope: str, capture: Optional[list]) -> None:
+    """The producer wrote the job row as 'queued' before sending the backstop
+    wake we just cancelled; no consumer will ever see it, so close it here or
+    the Tools status reports the index as building indefinitely. One table
+    upsert -- no queue message, timer or retry."""
+    if not capture:
+        return
+    try:
+        import app
+        job = app._index_build_job_id(user_id) + (f'-{scope}' if scope != 'full' else '')
+        app._upsert_job_status(job, user_id, app.INDEX_BUILD_JOB_TYPE, 'done', indexScope=scope)
+    except Exception:
+        _LOGGER.warning('Inline job status could not be closed', exc_info=True)
