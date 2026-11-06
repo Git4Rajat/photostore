@@ -246,3 +246,18 @@ def test_activation_waits_for_durable_bootstrap(monkeypatch,tmp_path,bootstrap_s
         fresh_wave.main()
         assert events==['test-wave-bootstrap','certificate-Succeeded','test-wave-activate']
         assert json.loads((output/'state.json').read_text())['phase']=='verified'
+
+
+def test_split_worker_is_verified_and_cannot_duplicate_legacy_sidecar():
+    from copy import deepcopy
+    r = release()
+    apps = inventory(r, False)
+    api = next(a for a in apps if a['name'] == 'test-indexer')
+    worker = deepcopy(api)
+    worker['name'] = 'test-index-worker'
+    worker['properties']['template']['containers'] = [api['properties']['template']['containers'].pop()]
+    apps.append(worker)
+    fresh_wave.verify_inventory(apps, r, False)
+    api['properties']['template']['containers'].append(worker['properties']['template']['containers'][0])
+    with pytest.raises(RuntimeError, match='exactly one index-worker'):
+        fresh_wave.verify_inventory(apps, r, False)

@@ -128,3 +128,18 @@ def test_changed_release_on_resume_makes_no_cloud_mutations(plan, monkeypatch):
     with pytest.raises(ValueError, match='Resume target'):
         upgrade_wave.main()
     assert not cloud.events
+
+
+def test_upgrade_includes_separate_worker_in_every_pause_and_activation(plan):
+    cloud, output, _ = plan
+    api = next(app for app in cloud.apps if app['name'] == 'test-indexer')
+    worker = copy.deepcopy(api)
+    worker.update(name='test-index-worker', id='/fake/apps/test-index-worker')
+    worker['properties']['configuration'].pop('ingress', None)
+    worker['properties']['template']['containers'] = [api['properties']['template']['containers'].pop()]
+    cloud.apps.append(worker)
+    upgrade_wave.main()
+    assert json.loads((output / 'state.json').read_text())['phase'] == 'verified'
+    migration = next(i for i, event in enumerate(cloud.events) if event[0] == 'migrate')
+    assert migration == 18  # Nine apps paused against both old and new bindings.
+    assert sum(event == ('patch', 'test-index-worker') for event in cloud.events) == 3

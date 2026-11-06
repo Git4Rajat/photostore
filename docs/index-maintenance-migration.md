@@ -69,10 +69,14 @@ metadata edit.
 
 - `INDEX_MAINTENANCE_QUEUE_NAME=photostore-index-maintenance` on producers and
   `INDEX_BUILD_ROLES=index-worker` for generic catalog builders.
-- Two containers in the existing indexer app: a 0.5 CPU/1 GiB Tools API and a
-  1.5 CPU/3 GiB queue consumer using the same core image. No ninth app; combined
-  allocation stays 2 CPU/4 GiB.
-- Managed-identity queue scaling (visible messages only), min replicas 0,
+- By default, `separateIndexWorker=true` deploys a 0.5 CPU/1 GiB Tools API in
+  the existing indexer app and a queue-only 1.5 CPU/3 GiB consumer in the new
+  `-index-worker` app, using the same core image. Either app can scale to zero
+  independently. `separateIndexWorker=false` retains the legacy two-container
+  indexer topology for a controlled rollback. Combined simultaneous allocation
+  stays 2 CPU/4 GiB; API-only and worker-only demand reserve less.
+- Managed-identity queue scaling (all messages on the claimed-work queue,
+  visible messages on the deferred queue), min replicas 0,
   max replicas 1, shutdown grace 180 seconds. One publisher is deliberate
   during legacy artifact migration. Library work keys are isolated, but jobs
   execute serially: no parallel-publisher throughput/fair-latency guarantee.
@@ -125,3 +129,13 @@ and publication failures, recovery isolation, naming and batch deadlines.
 Bicep compilation is local template checking, not live Azure validation.
 No live resources were changed. Deployed behavior and cost require rollout
 verification with actual logs.
+
+## Maintenance efficiency bundle — November 6
+
+The independently scaled worker, metadata projection ETag reuse, disk-backed
+label-photo deduplication, unchanged-summary publication skip, smaller SQLite
+page cache, slower GC cadence and empty-poll backoff are described in
+`docs/benchmarks/maintenance-efficiency-20261106/README.md`. A container-image
+upgrade alone does not create the separate worker; existing installations need
+an infrastructure rollout. The image-upgrade and qualification helpers recognize
+the worker once it is provisioned and reject duplicate publisher topologies.

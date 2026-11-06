@@ -371,3 +371,12 @@ def test_rotation_deduplicates_interleaved_family_controls_without_hash(recovery
                                     for i in range(sweep * 25, (sweep + 1) * 25)]
     assert len(set(calls[:25])) == 25
     assert len(recovery.scans) == 3
+
+
+def test_recovery_without_gc_still_delivers_dirty_intents(recovery, monkeypatch):
+    monkeypatch.setattr(automatic, 'VECTOR_INDEX_AUTOMATIC', True)
+    row = certified(recovery, 'pending', 'vector')
+    row['coveredRevision'] = 'old'
+    monkeypatch.setattr(app, '_cleanup_completed_index_artifacts', lambda *a: pytest.fail('GC is not due'))
+    assert app.recover_pending_index_work(cleanup=False) >= 1
+    assert any(message[:2] == ('pending', 'vector') for message in recovery.sent)

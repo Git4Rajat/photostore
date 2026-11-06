@@ -916,7 +916,7 @@ def test_rebuilding_a_photos_faces_uses_the_filename_index_not_a_library_wide_fa
     monkeypatch.setattr(app, '_load_user_face_summary_by_id',
                         lambda uid: (_ for _ in ()).throw(AssertionError('must not scan every face')))
     updates = []
-    monkeypatch.setattr(app, '_update_metadata_entity_fields', lambda uid, fn, fields: updates.append((fn, fields)))
+    monkeypatch.setattr(app, '_update_metadata_entity_fields', lambda uid, fn, fields, **kw: updates.append((fn, fields)))
     result = app._rebuild_metadata_faces_for_filename('u', 'a.jpg', searchable_person_index={'p1': 'Ann'})
     assert result['changed'] and result['peopleIdsAfter'] == ['p1']
     assert updates and updates[0][0] == 'a.jpg' and json.loads(updates[0][1]['peopleIds']) == ['p1']

@@ -304,3 +304,11 @@ def test_old_source_ack_cannot_clear_a_newer_source_edit(source, monkeypatch):
     monkeypatch.setattr(su, 'METADATA_INDEX_REQUEST_HOOK', schedule)
     app._update_metadata_entity_fields('A', 'one.jpg', {'rating': 3})
     assert json.loads(source.table.get_entity('A', 'one.jpg')['indexPending'])['revision'] == 'newer'
+
+
+def test_successful_edit_does_not_repeat_artifact_gc(worker, monkeypatch):
+    app.enqueue_index_build('A', scope='people', coalesce=False)
+    monkeypatch.setattr(app, '_run_index_build_job', lambda *a: None)
+    monkeypatch.setattr(app, '_cleanup_completed_index_artifacts',
+                        lambda *a: pytest.fail('GC belongs to its independent recovery cadence'))
+    assert app._run_index_maintenance_payload(worker.sent[0]) == 'intent_completed'

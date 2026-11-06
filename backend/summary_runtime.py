@@ -17,7 +17,7 @@ RAW_FORMAT = 'raw-stream-summary-v1'
 
 
 def publish_indexed_payloads(user_id, explore, timeline, *, store_explore, store_timeline,
-                             load_explore, load_timeline):
+                             load_explore, load_timeline, skip_unchanged=False):
     """Verify the existing best-effort stores instead of acknowledging failure.
 
     This is called under the maintenance catalog serializer. No new remote
@@ -25,12 +25,21 @@ def publish_indexed_payloads(user_id, explore, timeline, *, store_explore, store
     leaves retryable derived outputs; their matching source tokens certify the
     committed SQLite snapshot, not an atomic transaction across two blobs.
     """
-    store_explore(user_id, explore)
-    if load_explore(user_id) != explore:
-        raise RuntimeError('Explore summary publication was not confirmed')
-    store_timeline(user_id, timeline)
-    if load_timeline(user_id) != timeline:
-        raise RuntimeError('Timeline summary publication was not confirmed')
+    def publish(payload, load, store, label):
+        if skip_unchanged:
+            previous = load(user_id)
+            # Timestamp-only churn is not new derived data. Require the exact
+            # snapshot identity AND content so missing/corrupt blobs get repaired.
+            if (isinstance(previous, dict) and payload.get('sourceVersion')
+                    and {k: v for k, v in previous.items() if k != 'updatedAt'}
+                    == {k: v for k, v in payload.items() if k != 'updatedAt'}):
+                return
+        store(user_id, payload)
+        if load(user_id) != payload:
+            raise RuntimeError(label + ' summary publication was not confirmed')
+
+    publish(explore, load_explore, store_explore, 'Explore')
+    publish(timeline, load_timeline, store_timeline, 'Timeline')
 
 
 def finalized_payloads(db, user_id, *, accumulator_factory, allow_full_adapter=False):
