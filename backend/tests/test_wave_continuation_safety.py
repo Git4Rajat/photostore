@@ -297,7 +297,7 @@ def test_deployment_templates_forbid_cron_and_positive_replica_floors():
         elif isinstance(value, list):
             for item in value:walk(item)
     walk(template)
-    assert len(apps) == 8
+    assert len(apps) == 9
     for app in apps:
         minimum = app['properties']['template']['scale']['minReplicas']
         assert minimum in (0, "[parameters('clusterMinReplicas')]")
