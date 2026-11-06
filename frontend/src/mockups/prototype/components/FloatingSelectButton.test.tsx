@@ -6,11 +6,11 @@ const store = vi.hoisted(() => ({ selectMode: false, setSelectMode: vi.fn() }));
 
 import { FloatingSelectButton } from './FloatingSelectButton';
 
-const renderOver = (withGrid: boolean) => {
+const renderOver = (withGrid: boolean, suppressed = false) => {
     const { container } = render(
         <div>
             <div className="pt-body">{withGrid && <div className="pt-grid" />}</div>
-            <FloatingSelectButton selectMode={store.selectMode} onToggle={() => store.setSelectMode(!store.selectMode)} />
+            <FloatingSelectButton selectMode={store.selectMode} onToggle={() => store.setSelectMode(!store.selectMode)} suppressed={suppressed} />
         </div>,
     );
     return container.querySelector('.pt-body') as HTMLElement;
@@ -60,5 +60,13 @@ describe('FloatingSelectButton', () => {
         expect(button.className).toContain('visible');
         fireEvent.click(button);
         expect(store.setSelectMode).toHaveBeenCalledWith(false);
+    });
+
+    it('steps aside when another control (the selection bar) occupies its corner', () => {
+        const body = renderOver(true, true);
+        scrollTo(body, 900);
+        const button = screen.getByRole('button', { name: 'Select photos' });
+        expect(button.className).not.toContain('visible');
+        expect(button.tabIndex).toBe(-1);
     });
 });

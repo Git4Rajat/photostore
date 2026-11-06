@@ -15,7 +15,7 @@ const SETTLE_MS = 150;
  * behaviour. Select state belongs to the host page (the store's global select mode in
  * the app, local state on the public album page), so it is passed in.
  */
-export const FloatingSelectButton: React.FC<{ selectMode: boolean; onToggle: () => void }> = ({ selectMode, onToggle }) => {
+export const FloatingSelectButton: React.FC<{ selectMode: boolean; onToggle: () => void; suppressed?: boolean }> = ({ selectMode, onToggle, suppressed = false }) => {
     const [visible, setVisible] = useState(false);
     const settleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -44,15 +44,18 @@ export const FloatingSelectButton: React.FC<{ selectMode: boolean; onToggle: () 
         };
     }, []);
 
+    // `suppressed`: another control already occupies this corner (the app's bottom selection bar,
+    // which has its own close button, covers it once something is selected).
+    const shown = visible && !suppressed;
     const label = selectMode ? 'Done selecting' : 'Select photos';
     return (
         <button
             type="button"
-            className={`pt-float-select${visible ? ' visible' : ''}${selectMode ? ' active' : ''}`}
+            className={`pt-float-select${shown ? ' visible' : ''}${selectMode ? ' active' : ''}`}
             onClick={onToggle}
             aria-label={label}
             aria-pressed={selectMode}
-            tabIndex={visible ? 0 : -1}
+            tabIndex={shown ? 0 : -1}
         >
             {selectMode ? <Check size={18} aria-hidden="true" /> : <ListChecks size={18} aria-hidden="true" />}
             <span>{selectMode ? 'Done' : 'Select'}</span>
