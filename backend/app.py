@@ -15496,6 +15496,7 @@ def _purge_orphaned_photo_data(user_id: str, *, dry_run: bool = True) -> Dict:
         return result
 
     orphaned_filenames: set = set()
+    purged_filenames: set = set()
     for row in user_meta_rows:
         result['metadataRowsChecked'] += 1
         if row.get('processing_state') == 'deleted':
@@ -15517,6 +15518,18 @@ def _purge_orphaned_photo_data(user_id: str, *, dry_run: bool = True) -> Dict:
                 except Exception as exc:
                     app.logger.warning('Purge: metadata delete failed for %s: %s', filename, exc)
                     result['errors'].append(f'metadata delete failed for {filename}')
+                else:
+                    purged_filenames.add(filename)
+
+    if purged_filenames:
+        # The rows are gone, so albums must forget them and the indexes must
+        # rebuild; otherwise album counts and cached listings keep the photo.
+        _batch_remove_filenames_from_albums(user_id, purged_filenames)
+        _invalidate_metadata_scan_cache(user_id)
+        try:
+            touch_user_search_indexes_state(user_id, filenames=purged_filenames)
+        except Exception:
+            app.logger.warning('Purge: could not mark indexes dirty for %s', user_id, exc_info=True)
 
     if not orphaned_filenames:
         return result

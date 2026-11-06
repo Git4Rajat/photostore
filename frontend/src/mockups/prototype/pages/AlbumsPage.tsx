@@ -18,6 +18,7 @@ import { useStore } from '../store';
 import PhotoGrid from '../components/PhotoGrid';
 import ScrollSentinel from '../components/ScrollSentinel';
 import { Spinner, SelectionBar } from '../components/bits';
+import { plural } from '../../../utils/format';
 import { BottomSheet } from '../components/BottomSheet';
 import { ThumbSizeControl, useTileSize } from '../components/controls';
 import { confirmDialog, promptDialog } from '../../../components/shared/dialogs';
@@ -330,7 +331,7 @@ export const AlbumsPage: React.FC = () => {
                         )}
                         <span className="pt-album-row-meta">
                             <b>{a.name}</b>
-                            <span>{a.photoCount} photos</span>
+                            <span>{plural(a.photoCount, 'photo')}</span>
                         </span>
                     </button>
                 );
@@ -380,7 +381,7 @@ export const AlbumsPage: React.FC = () => {
                             <div>
                                 <h1 className="pt-page-title">{album.name}</h1>
                                 <p className="pt-page-sub">
-                                    {album.photoCount} photos ·{' '}
+                                    {plural(album.photoCount, 'photo')} ·{' '}
                                     <button type="button" className="pt-linkish" onClick={() => void renameAlbumPrompt()}>Rename</button>
                                     {' · '}
                                     <button type="button" className="pt-linkish danger" onClick={() => void confirmDeleteAlbum()}>Delete</button>
