@@ -1,0 +1,16 @@
+{
+  "captured_at": "2026-11-06T10:38:46.828803+00:00",
+  "head": "49d151d009ce1cde91887d9f31ec8924a5f30ceb",
+  "source_sha256": {
+    "backend/clustering_checkpoint.py": "6bb9274c9e8ccdfe4af2dcfdf0affca5b7fa9a8cc8d238329809eb4d46106e4b",
+    "backend/wave_assignment.py": "703e87e913c25098fe0dd360a05aa8357276d5e2e5bb3600b59516e6f23d84ef",
+    "backend/wave_assignment_files.py": "e0aedfc4b41da40f42e6c0b6f6519d98271e6f8bab491ea89b5de98cc9aba59f",
+    "backend/wave_assignment_resume.py": "4f1afe8899f689c4f754d2d13a57bd566cdba8d3df2e9b1b487c027b859c02bb",
+    "backend/clustering_runtime.py": "5ae7e80fd105f23c34dbaf081655dde1d21a1a2bafa657a0d39c9d47962c0a2e",
+    "backend/clustering_index.py": "08d993d333b3e0ef7899421dc2aa482a1a362a25f819117f4533e52a8cd8dbb7",
+    "backend/faiss_assignment.py": "8ac2d5fc9990a1d71f6ec5a0d2f624b173e8297165da4a3481de8c41eba51999",
+    "backend/automatic_index_updates.py": "55c2a6801f4451d4eb363c6d5912a3a27e181877958f6174f2807c68880f21df",
+    "backend/scripts/benchmark_clustering_scale.py": "1df586b8a4c0b095a95752103491cf4b113cacd9a16d500564e9e1a6fa40da73"
+  },
+  "note": "Final source captured before fixed sliced matrix; verify unchanged after series."
+}
