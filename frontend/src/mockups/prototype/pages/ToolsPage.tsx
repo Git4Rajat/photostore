@@ -106,12 +106,16 @@ const ToolsPage: React.FC = () => {
     const [verifyResult, setVerifyResult] = useState<VerifyFaceIndexResult | null>(null);
     const [verifyLoading, setVerifyLoading] = useState(false);
     const [indexStatus, setIndexStatus] = useState<IndexStatusMap>({});
+    // False until the first status response, so a cold indexer reads as
+    // "checking" instead of claiming every index is "not built".
+    const [indexStatusLoaded, setIndexStatusLoaded] = useState(false);
     const [rebuildingIndex, setRebuildingIndex] = useState<string | null>(null);
 
     const loadIndexStatus = async () => {
         try {
             const res = await getTools<{ indexes?: IndexStatusMap }>('/api/tools/indexes/status');
             setIndexStatus(res?.indexes ?? {});
+            setIndexStatusLoaded(true);
         } catch {
             // Keep the last known status rather than clearing it on a transient failure.
         }
@@ -399,8 +403,9 @@ const ToolsPage: React.FC = () => {
                     <div className="pt-queue-grid">
                         {Object.entries(INDEX_KIND_LABELS).map(([kind, label]) => {
                             const status = indexStatus[kind];
-                            const badgeLabel = !status || !status.ready ? 'not built' : status.dirty ? 'dirty' : 'ready';
-                            const badgeClass = !status || !status.ready ? 'warn' : status.dirty ? 'warn' : '';
+                            const checking = !indexStatusLoaded;
+                            const badgeLabel = checking ? 'checking' : !status || !status.ready ? 'not built' : status.dirty ? 'dirty' : 'ready';
+                            const badgeClass = checking ? '' : !status || !status.ready ? 'warn' : status.dirty ? 'warn' : '';
                             return (
                                 <div key={kind} className="card-glass pt-queue-card">
                                     <div className="pt-queue-title">{label}</div>
