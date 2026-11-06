@@ -33,6 +33,8 @@ from upload_waves import digest
 from table_reads import read_entities
 from wave_policy import source_change
 
+JOURNAL_PAYLOAD_BYTES = 60_000
+
 
 def encoded(value):
     def timestamp(item):
@@ -110,7 +112,7 @@ class WaveAssignmentJournal:
     @processing_diagnostics.wave_phase('journal_write')
     def put(self, key, payload):
         body = encoded(payload)
-        if len(body.encode('utf-16-le')) > 60_000:
+        if len(body.encode('utf-16-le')) > JOURNAL_PAYLOAD_BYTES:
             raise ValueError('Assignment journal row exceeds byte budget')
         row = self.store._row(self.prefix + key, payload=body, digest=digest(payload))
         def write():
@@ -153,6 +155,7 @@ class WaveAssignmentJournal:
             for row in self.rows('baseline'):
                 workspace.put('candidates', row['faceId'], row)
             for row in self.rows('person'):
+                row = self._restore_person(row, binding)
                 workspace.put('people', row['RowKey'], row)
             if self._description(workspace, binding) != header:
                 raise ValueError('Frozen assignment manifest coverage mismatch')
@@ -204,11 +207,56 @@ class WaveAssignmentJournal:
         for row in workspace.rows('candidates'):
             self.put('baseline!' + digest(row['faceId']), row)
         for row in workspace.rows('people'):
-            self.put('person!' + digest(row['RowKey']), row)
+            self._freeze_person(row, binding)
         header = self._description(workspace, binding)
         # Publish only after all referenced rows are durable. No decisions yet.
         self.put('manifest', header)
         return header
+
+    def _freeze_person(self, row, binding):
+        key = 'person!' + digest(row['RowKey'])
+        if (not isinstance(binding, dict) or binding.get('algorithm') != COMPACT_ALGORITHM
+                or len(encoded(row).encode('utf-16-le')) <= JOURNAL_PAYLOAD_BYTES):
+            self.put(key, row)
+            return
+        membership = row.get('faceIds')
+        if not isinstance(membership, str) or len(membership.encode('utf-16-le')) > 65536:
+            raise ValueError('Frozen person membership exceeds storage budget')
+        # Preserve exact original text, including whitespace/escaping: the
+        # frozen manifest digest covers the entire original person row.
+        parts = [membership[i:i + 1000] for i in range(0, len(membership), 1000)]
+        for number, part in enumerate(parts):
+            self.check()
+            self.put(f'personmembers!{digest(row["RowKey"])}!{number:04d}',
+                     dict(personId=row['RowKey'], part=number, data=part))
+        self.put(key, dict(snapshotFormat='person-members-v1',
+            person={k: v for k, v in row.items() if k != 'faceIds'},
+            membershipParts=len(parts), membershipDigest=digest(membership)))
+
+    def _restore_person(self, payload, binding):
+        if 'RowKey' in payload:
+            return payload  # Original journals and small v2 snapshots.
+        if (not isinstance(binding, dict) or binding.get('algorithm') != COMPACT_ALGORITHM
+                or payload.get('snapshotFormat') != 'person-members-v1'):
+            raise ValueError('Unsupported frozen person encoding')
+        person = dict(payload['person'])
+        count = payload.get('membershipParts')
+        if type(count) is not int or not 1 <= count <= 64 or 'faceIds' in person:
+            raise ValueError('Invalid frozen person membership parts')
+        parts = []
+        for number in range(count):
+            self.check()
+            part = self.get(f'personmembers!{digest(person["RowKey"])}!{number:04d}')
+            if (part is None or part.get('personId') != person['RowKey']
+                    or part.get('part') != number or not isinstance(part.get('data'), str)
+                    or len(part['data']) > 1000):
+                raise ValueError('Missing or invalid frozen person membership part')
+            parts.append(part['data'])
+        membership = ''.join(parts)
+        if (len(membership.encode('utf-16-le')) > 65536
+                or digest(membership) != payload.get('membershipDigest')):
+            raise ValueError('Frozen person membership digest mismatch')
+        return dict(person, faceIds=membership)
 
     @staticmethod
     def _description(workspace, binding):
@@ -241,6 +289,27 @@ def _runtime_rows(workspace, guard):
     for row in workspace.rows('candidates'):
         guard.check()
         yield row
+
+
+LEGACY_ALGORITHM = 'canonical-faiss-v1'
+COMPACT_ALGORITHM = 'canonical-faiss-v2-membership-delta'
+MEMBERSHIP_DELTA = 'append-face-v1'
+
+
+def _compact_decision(decision):
+    if decision['outcome'] == 'assigned':
+        decision = dict(decision, membershipMode=MEMBERSHIP_DELTA,
+                        person={k: v for k, v in decision['person'].items() if k != 'faceIds'})
+    return decision
+
+
+def _membership_mode(decision):
+    mode = decision.get('membershipMode')
+    if mode not in (None, MEMBERSHIP_DELTA):
+        raise ValueError('Unsupported assignment membership encoding')
+    if mode is not None and decision['outcome'] == 'assigned' and 'faceIds' in decision['person']:
+        raise ValueError('Compact assignment contains a membership snapshot')
+    return mode
 
 
 @processing_diagnostics.wave_phase('matching')
@@ -331,6 +400,7 @@ def _apply(assigner, library, face, decision, decision_id, guard, wave_id, obser
     # admission and coverage reservations, but do not schedule independent
     # maintenance before/after every face/person mutation. Scope only this
     # materialization call; foreground callers keep their ordinary policy.
+    mode = _membership_mode(decision)
     if decision['outcome'] == 'excluded':
         return
     # Reuse the curation witness with its genuine ETag. A later face edit
@@ -371,6 +441,8 @@ def _apply(assigner, library, face, decision, decision_id, guard, wave_id, obser
         if not decision['newPerson']:
             raise ValueError('Matched person was deleted; refusing resurrection')
         person_row = dict(decision['person'], assignmentOrigin=wave_id)
+        if mode == MEMBERSHIP_DELTA:
+            person_row['faceIds'] = assigner._membership({}, face['RowKey'])
     else:
         if decision['newPerson'] and person.get('assignmentOrigin') != wave_id:
             raise ValueError('New person identity collides with another writer')
@@ -398,6 +470,7 @@ def _apply(assigner, library, face, decision, decision_id, guard, wave_id, obser
 
 @processing_diagnostics.wave_phase('runtime_update')
 def _replay(workspace, runtime, decision, guard):
+    mode = _membership_mode(decision)
     candidate = decision.get('candidate')
     if candidate is None:
         return
@@ -418,7 +491,13 @@ def _replay(workspace, runtime, decision, guard):
             runtime.upsert(candidate['faceId'], candidate['personId'], candidate['embedding'],
                            candidate['tier'], candidate['embeddingVersion'])
         workspace.put('candidates', candidate['faceId'], candidate)
-    workspace.put('people', decision['personId'], decision['person'])
+    person = decision['person']
+    if mode == MEMBERSHIP_DELTA:
+        previous = workspace.get('people', decision['personId'])
+        if previous is None and not decision['newPerson']:
+            raise ValueError('Compact assignment lost its frozen person baseline')
+        person = dict(person, faceIds=FaissAssigner._membership(previous or {}, decision['faceId']))
+    workspace.put('people', decision['personId'], person)
 
 
 @contextmanager
@@ -448,7 +527,7 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
     config = assigner.config
     binding = dict(libraryId=store.library, waveId=wave['waveId'],
         frozenRevision=wave['frozenRevision'], manifestDigest=wave['manifestDigest'],
-        algorithm='canonical-faiss-v1', threshold=config.threshold, margin=config.margin,
+        algorithm=COMPACT_ALGORITHM, threshold=config.threshold, margin=config.margin,
         candidates=config.candidates, nprobe=config.nprobe, deltaLimit=config.delta_limit,
         threads=config.threads, indexConfig=asdict(config.index_config))
     # Keep the existing library assignment lease/lock: legacy assignments cannot
@@ -473,6 +552,13 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
                 with processing_diagnostics.wave_phase_scope('journal_open'):
                     journal = resources.enter_context(assignment_journal(store, wave['waveId'], check,
                         share=assigner.config.checkpoint_dir if local_journal else None, local=directory))
+                # Continue existing captures in their original format. A v2
+                # binding makes older workers fail closed instead of ignoring
+                # compact membership deltas during replay/rollback.
+                recorded = journal.get('manifest') or journal.get('capture')
+                if (recorded is not None and isinstance(recorded.get('binding'), dict)
+                        and recorded['binding'].get('algorithm') == LEGACY_ALGORITHM):
+                    binding['algorithm'] = LEGACY_ALGORITHM
                 from wave_assignment_resume import restore, save
                 with processing_diagnostics.wave_phase_scope('resume_restore'):
                     resumed = restore(journal, workspace, binding, directory, config)
@@ -506,6 +592,8 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
                             decision = journal.decision(position)
                             if decision is None:
                                 decision = _decide(assigner, store.library, face, workspace, runtime, guard)
+                                if binding['algorithm'] == COMPACT_ALGORITHM:
+                                    decision = _compact_decision(decision)
                                 decision.update(manifestId=digest(header), position=position, previousDigest=chain)
                                 journal.put(f'decision!{position:012d}', decision)
                             if (decision['faceId'] != face['RowKey'] or decision['inputDigest'] != digest(face)

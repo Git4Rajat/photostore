@@ -375,20 +375,25 @@ def _validate_database(db, manifest):
         _require(np.isfinite(vector).all() and abs(float(np.linalg.norm(vector)) - 1) < 1e-4)
         _require(type(rev) is int and rev > 0 and dirty in (0, 1))
     # Every live face must be reachable via its current revision and compatibility.
-    _require(db.execute('''SELECT COUNT(*) FROM faces f WHERE
-        (dirty=0 AND NOT EXISTS (SELECT 1 FROM base_slots s WHERE
-         s.face_id=f.face_id AND s.revision=f.revision AND s.tier=f.tier AND
-         s.version=f.version AND s.dimension=f.dimension)) OR
-        (dirty=1 AND NOT EXISTS (SELECT 1 FROM delta_slots s WHERE
-         s.face_row=f.id AND s.revision=f.revision AND s.tier=f.tier AND
-         s.version=f.version AND s.dimension=f.dimension))''').fetchone()[0] == 0)
+    # Slot tables are keyed by compatibility/slot, not face identity. Correlated
+    # NOT EXISTS scans those tables once per face on a restored database. Set
+    # differences preserve the same reachability check without quadratic work
+    # or adding persistent indexes to old checkpoint formats.
+    _require(db.execute('''SELECT face_id, revision, tier, version, dimension
+        FROM faces WHERE dirty=0 EXCEPT
+        SELECT face_id, revision, tier, version, dimension FROM base_slots''').fetchone() is None)
+    _require(db.execute('''SELECT id, revision, tier, version, dimension
+        FROM faces WHERE dirty=1 EXCEPT
+        SELECT face_row, revision, tier, version, dimension FROM delta_slots''').fetchone() is None)
 
 
 def _load_index(path, group, runtime):
     # All network reads/checksums finished before native deserialization. Native
     # parse failures here are corruption, not disguised SMB availability errors.
     try:
-        index = ci.faiss.read_index(str(path))
+        # FAISS does not persist the disabled-precompute runtime policy. Skip
+        # automatic table allocation while loading, then restore it explicitly.
+        index = ci.faiss.read_index(str(path), ci.faiss.IO_FLAG_SKIP_PRECOMPUTE_TABLE)
     except RuntimeError as exc:
         raise CorruptCheckpoint('Invalid native index') from exc
     expected = ci.faiss.IndexFlatIP if group['type'] == 'flat' else ci.faiss.IndexIVFPQ
@@ -399,8 +404,9 @@ def _load_index(path, group, runtime):
         _require(index.nlist == group['nlist'] and index.pq.M == group['pq_m'] and
                  index.pq.nbits == group['pq_bits'] and index.quantizer.is_trained and
                  index.quantizer.d == index.d and index.quantizer.ntotal == index.nlist and
-                 index.quantizer.metric_type == ci.faiss.METRIC_INNER_PRODUCT and
-                 index.use_precomputed_table == -1)
+                 index.quantizer.metric_type == ci.faiss.METRIC_INNER_PRODUCT)
+        _require(index.precomputed_table.size() == 0)
+        index.use_precomputed_table = -1
         index.nprobe = min(index.nlist, runtime.nprobe)
     return index
 
