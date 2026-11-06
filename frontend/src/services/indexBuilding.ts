@@ -14,7 +14,6 @@ import { getTools } from './apiClient';
  */
 
 type Listener = () => void;
-type IndexKind = 'sort' | 'lexical' | 'albums' | 'people';
 
 interface IndexDetail {
   ready: boolean;

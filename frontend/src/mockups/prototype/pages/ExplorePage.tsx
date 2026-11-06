@@ -61,7 +61,7 @@ const PlainShelf: React.FC<{ title: string; children: React.ReactNode }> = ({ ti
  * Albums, Recently added), each built from data the library already has. Every
  * card deep-links into the relevant view.
  */
-export const ExplorePage: React.FC = () => {
+const ExplorePage: React.FC = () => {
     const {
         places, things, people, peopleHasMore, loadMorePeople, albums, photos, exploreLoading, peopleLoading, navigate, openViewer,
         fetchExplore, fetchPeople, fetchAlbums,

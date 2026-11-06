@@ -10,7 +10,7 @@ import { reportIndexBuilding } from '../services/indexBuilding';
 import { preloadLocalIndexes } from '../services/preloadLocalIndexes';
 import { startMediaTokenAutoRefresh } from '../services/mediaToken';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { get, getUpload, post, postTools, postUpload, resolveApiUrl } from '../services/apiClient';
+import { get, getUpload, postTools, postUpload, resolveApiUrl } from '../services/apiClient';
 import { heartbeatWaveSession, quiesceWaveShadowSession, discardWaveShadowSession, stopWaveShadowSession, registerWaveItemsBatch, waveIdentityFor, ensureOpened as ensureWaveShadowSessionAdmitted, finalizeWaveShadowSession, resolveWaveShadowFile, acknowledgeWaveFinalizedFile, cancelQueuedWaveSelection } from '../services/uploadWaveSync';
 import { hashLargeFile, LARGE_FILE_HASH_THRESHOLD } from '../utils/largeFileHash';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
@@ -621,7 +621,7 @@ const MAX_FAILED_FILE_PREVIEWS = 50;
 // faster at the cost of higher CPU/GPU/memory use. Opt-in and persisted.
 const BROWSER_PROCESSING_TURBO_KEY = 'keepsake.browserProcessingTurbo';
 
-export const isBrowserProcessingTurboEnabled = (): boolean => {
+const isBrowserProcessingTurboEnabled = (): boolean => {
     try {
         return window.localStorage.getItem(BROWSER_PROCESSING_TURBO_KEY) === '1';
     } catch {
@@ -640,7 +640,7 @@ export const isBrowserProcessingTurboEnabled = (): boolean => {
 // machine -- useful for draining a large backlog overnight. The ramp is
 // capped separately (and lower on low-memory devices) and backs itself off
 // if it turns out to be too aggressive for this specific machine.
-export const getBrowserProcessingConcurrency = (): number => {
+const getBrowserProcessingConcurrency = (): number => {
     if (!isBrowserProcessingTurboEnabled()) {
         return 1;
     }
@@ -712,7 +712,7 @@ const BROWSER_PROCESSING_HEARTBEAT_INTERVAL_MS = 1000;
 // Debounced the same way: only finalize after a real quiet period with no new
 // completions.
 const BROWSER_PROCESSING_FINALIZE_QUIET_MS = 15000;
-export const browserProcessingActionSteps: Record<BrowserProcessingAction, string[]> = {
+const browserProcessingActionSteps: Record<BrowserProcessingAction, string[]> = {
     preview: ['preview'],
     thumbnails: ['thumbnail'],
     exif: ['exif'],
@@ -725,7 +725,7 @@ export const browserProcessingActionSteps: Record<BrowserProcessingAction, strin
 // On-device AI steps that require the user to have loaded browser AI. Until then
 // only baseline steps (thumbnail, exif, map geocode) run; these stay pending so
 // they can be backfilled once the model is loaded.
-export const BROWSER_AI_GATED_STEPS = new Set(['ocr', 'ai_vision', 'face']);
+const BROWSER_AI_GATED_STEPS = new Set(['ocr', 'ai_vision', 'face']);
 const ALL_BROWSER_PROCESSING_STEPS = ['preview', 'thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face'];
 
 // Restrict the steps a processing pass may run to what the current model state allows.

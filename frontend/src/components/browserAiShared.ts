@@ -1,7 +1,6 @@
 import type {
     BrowserAiModelState,
     BrowserAiModelUiStatus,
-    BrowserAiNetworkGate,
     UploadProfile,
 } from '../types/browserProcessing';
 
@@ -36,7 +35,7 @@ export const UPLOAD_STOPPED_ERROR = 'upload_stopped_by_user';
 // destinations pending at once), a second session's count would silently
 // clobber the first's here, and resuming the first would read a mismatched
 // id and start over at 0 attempts instead of carrying its real count.
-export const UPLOAD_SESSION_RETRY_ATTEMPTS_KEY = 'photostore.upload.session.retryAttempts.v1';
+const UPLOAD_SESSION_RETRY_ATTEMPTS_KEY = 'photostore.upload.session.retryAttempts.v1';
 export const MAX_UPLOAD_RETRY_ATTEMPTS = 3;
 
 export const readUploadRetryAttemptCount = (storage: Storage, sessionId: string): number => {
@@ -149,42 +148,6 @@ export const getBrowserAiUnsupportedReason = (): string | null => {
     }
     return null;
 };
-
-export const getBrowserAiNetworkGate = (): BrowserAiNetworkGate => {
-    if (typeof navigator === 'undefined') {
-        return {
-            allowed: false,
-            reason: 'network_info_unavailable',
-            detail: 'Browser AI network checks are unavailable.',
-            hasNetworkInfo: false,
-        };
-    }
-    if (!navigator.onLine) {
-        return {
-            allowed: false,
-            reason: 'offline',
-            detail: 'Browser is offline.',
-            hasNetworkInfo: true,
-        };
-    }
-    const connection = (navigator as Navigator & { connection?: { saveData?: boolean; effectiveType?: string } }).connection;
-    if (connection?.saveData) {
-        return {
-            allowed: false,
-            reason: 'save_data_enabled',
-            detail: 'Save-Data is enabled.',
-            hasNetworkInfo: true,
-        };
-    }
-    return {
-        allowed: true,
-        reason: null,
-        detail: 'Browser AI network access is available.',
-        hasNetworkInfo: Boolean(connection),
-    };
-};
-
-export const isBrowserAiAutoLoadAllowed = () => getBrowserAiNetworkGate().allowed;
 
 export const isBrowserAiNetworkRetryReason = (reason: unknown): boolean => (
     reason === 'offline'

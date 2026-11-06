@@ -82,7 +82,7 @@ interface PeopleDiagnostic {
 }
 
 /** Tools — live pipeline health + a bulk re-run row + recovery/history. */
-export const ToolsPage: React.FC = () => {
+const ToolsPage: React.FC = () => {
     const { toast, route, navigate } = useStore();
     const {
         activeJobs, clusteringActive, clusteringStatusLabel, ipworkActive, ipworkStatusLabel,

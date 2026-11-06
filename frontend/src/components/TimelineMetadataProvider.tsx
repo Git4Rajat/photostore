@@ -34,7 +34,7 @@ const getFetchErrorMessage = (err: unknown): string => {
 // session (and again on library switch), and holds it in memory for the
 // lifetime of the tab. This is the single source of truth the zoomable
 // timeline renders from -- it must never be re-fetched on zoom/pan/hover.
-export const TimelineMetadataProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+const TimelineMetadataProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     const [summary, setSummary] = useState<TimelineSummary | null>(null);
     const [status, setStatus] = useState<TimelineMetadataStatus>('idle');
     const [error, setError] = useState<string | null>(null);

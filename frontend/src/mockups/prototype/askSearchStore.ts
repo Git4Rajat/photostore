@@ -39,7 +39,7 @@ export const mapSearchResult = (b: BackendPhoto): Photo => {
 };
 
 // Results arrive a screenful at a time and keep loading as the user scrolls.
-export const SEARCH_PAGE_LIMIT = 120;
+const SEARCH_PAGE_LIMIT = 120;
 // A new library's search database is built on the server; poll for up to ~2 minutes.
 const SEARCH_BUILD_RETRIES = 12;
 const SEARCH_BUILD_RETRY_MS = 10000;

@@ -16,7 +16,7 @@ const initialsFor = (value: string): string => {
 };
 
 /** Sharing — shared-library members, pending invites, and library settings. */
-export const SharingPage: React.FC = () => {
+const SharingPage: React.FC = () => {
     const {
         members, pendingInvites, libraryName, isOwner, maxMembers, membersLoading,
         reloadMembers, fetchMembers, invite, revokeInvite, removeMember, renameLibrary, toast,

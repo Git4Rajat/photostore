@@ -29,7 +29,7 @@ export interface ViewerSession {
 const ViewerSessionContext = createContext<ViewerSession | null>(null);
 const ViewerSessionPublishContext = createContext<((session: ViewerSession | null) => void) | null>(null);
 
-export const ViewerSessionProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+const ViewerSessionProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     const [session, setSession] = useState<ViewerSession | null>(null);
     const publishViewerSession = useCallback((next: ViewerSession | null) => setSession(next), []);
     return (

@@ -1,7 +1,7 @@
 import { classifyApiError } from '../../services/apiError';
 
 /** What actually came of a Tools action, for the toast and the History row. */
-export type ActionOutcome = 'success' | 'partial' | 'failed';
+type ActionOutcome = 'success' | 'partial' | 'failed';
 export interface ActionResult { outcome: ActionOutcome; message: string; detail?: string; }
 
 /** Body of the queue-style admin repair routes (dedupe, rebuilds, vector index, ...). */
@@ -14,7 +14,7 @@ export interface BackfillBatch {
 }
 export interface BackfillTotals { queued: number; skipped: number; failed: number; batches: number; }
 
-export const BACKFILL_CONFIRM = 'BACKFILL_ALL_PHOTOS';
+const BACKFILL_CONFIRM = 'BACKFILL_ALL_PHOTOS';
 // Each request visits at most 10 photos; this only stops a runaway loop.
 export const BACKFILL_MAX_BATCHES = 5000;
 

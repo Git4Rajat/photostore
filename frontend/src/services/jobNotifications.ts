@@ -62,7 +62,7 @@ export const TOASTABLE_JOB_KINDS = new Set(['recluster', 'find_faces', 'cluster'
 // blind to clustering happening on the worker.
 export const CLUSTERING_JOB_KINDS = new Set(['cluster', 'recluster', 'find_faces']);
 
-export const isClusteringJob = (job: JobStatusRecord): boolean => CLUSTERING_JOB_KINDS.has(job.kind);
+const isClusteringJob = (job: JobStatusRecord): boolean => CLUSTERING_JOB_KINDS.has(job.kind);
 
 // Human label for the in-progress clustering indicator, given the in-flight jobs.
 // Grouping (initial cluster / recluster) is the dominant signal; "find more
@@ -83,7 +83,7 @@ export const clusteringActivityLabel = (jobs: JobStatusRecord[]): string => {
 // around pollJobStatusesOnce) to avoid one toast per file on a bulk upload.
 // That left no global signal that server-side processing was happening at
 // all — this label backs a standalone indicator for exactly that gap.
-export const isIpworkJob = (job: JobStatusRecord): boolean => job.kind === 'ipwork';
+const isIpworkJob = (job: JobStatusRecord): boolean => job.kind === 'ipwork';
 
 // Returns '' when no ipwork job is in flight. /api/jobs/status caps its
 // response at 50 rows, so a large backlog can't be counted reliably from this

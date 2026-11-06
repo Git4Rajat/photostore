@@ -22,7 +22,7 @@ import { chunk, measureGridCapacity, pageSizeForCapacity, runWithLimit } from '.
 import faceService from '../../services/faceService';
 import * as library from '../../services/libraryClient';
 import type { LibraryMember, PendingInvite } from '../../services/libraryClient';
-import type { PersonFace, PersonSummary } from '../../types/people';
+import type { PersonFace } from '../../types/people';
 import { isNamedLabel } from '../../utils/people';
 import type { Photo as BackendPhoto } from '../../types/uiTypes';
 import type {
@@ -228,20 +228,6 @@ const facesToPhotos = (faces: PersonFace[]): Photo[] => {
     return out;
 };
 
-const mapPerson = (p: PersonSummary): Person => {
-    const cover = p.representativeFace;
-    const coverUrl = cover?.thumbnailUrl
-        || (cover?.faceId ? `/api/faces/crop/${encodeURIComponent(cover.faceId)}` : undefined);
-    return {
-        id: p.personId,
-        name: p.name && p.name.trim() ? p.name : null,
-        swatch: swatchFor(p.personId),
-        photoIds: [],
-        coverThumbnailUrl: coverUrl,
-        faceCount: p.faceCount,
-    };
-};
-
 interface ExploreGroup {
     label: string;
     count: number;
@@ -281,7 +267,7 @@ interface ViewerState {
 
 export type MediaFilter = 'all' | 'photo' | 'video';
 
-export interface GalleryFilters {
+interface GalleryFilters {
     rating: number;
     likedOnly: boolean;
 }

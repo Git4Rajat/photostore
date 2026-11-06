@@ -42,7 +42,7 @@ const formatDateJumpLabel = (value: string): string => {
 };
 
 /** Gallery — the populated grid + drag-and-drop upload + the empty first-run state. */
-export const GalleryPage: React.FC = () => {
+const GalleryPage: React.FC = () => {
     const {
         photos, navigate, selectMany, photosLoading, hasMorePhotos,
         loadMorePhotos, reloadPhotos, totalPhotos, mediaFilter, setMediaFilter, galleryFilters, setGalleryRating, setGalleryLikedOnly, jumpToGalleryDate, captureRange, setCaptureRange, timeline,

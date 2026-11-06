@@ -20,7 +20,7 @@ export const computeGridCapacity = ({ columns, tileWidth, gap, viewportHeight }:
 
 export const MIN_PAGE_SIZE = 60;
 export const MAX_PAGE_SIZE = 600;
-export const SCREENS_PER_PAGE = 3;
+const SCREENS_PER_PAGE = 3;
 
 /** Page size = a few screens' worth of tiles, clamped to sane bounds. */
 export const pageSizeForCapacity = (capacity: number, screens = SCREENS_PER_PAGE): number => (

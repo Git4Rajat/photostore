@@ -4,8 +4,6 @@ import { Link } from 'react-router-dom';
 import { PhotoIcon, UsersIcon, WrenchScrewdriverIcon } from '@heroicons/react/24/outline';
 import type { PhotoPersonLink } from '../../types/uiTypes';
 
-export type { PhotoPersonLink };
-
 interface ClusterQuickActionProps {
     people: PhotoPersonLink[];
 }

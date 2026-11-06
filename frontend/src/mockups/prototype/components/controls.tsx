@@ -6,7 +6,7 @@ import { ZoomOut as MagnifyingGlassMinusIcon, ZoomIn as MagnifyingGlassPlusIcon 
 // the same way (previously only the Gallery had it).
 export const TILE_STEP = 30;
 export const TILE_RANGE = { min: 72, max: 260 };
-export const TILE_DEFAULT = 120;
+const TILE_DEFAULT = 120;
 
 // Per-view size bounds. Photo grids share the default range; the Workbench
 // tiles carry a step-badge footer, so they use a larger floor/ceiling.

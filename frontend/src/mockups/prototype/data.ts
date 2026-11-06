@@ -7,7 +7,7 @@ import type { SwatchKey } from './types';
 const SWATCHES: SwatchKey[] = ['s1', 's2', 's3', 's4', 's5', 's6', 's7', 's8'];
 const pick = <T,>(arr: T[], i: number): T => arr[i % arr.length];
 
-export const PLACES: Place[] = [
+const PLACES: Place[] = [
     { id: 'lisbon', name: 'Lisbon', swatch: 's2' },
     { id: 'porto', name: 'Porto', swatch: 's5' },
     { id: 'home', name: 'Home', swatch: 's6' },
@@ -15,7 +15,7 @@ export const PLACES: Place[] = [
     { id: 'tokyo', name: 'Tokyo', swatch: 's4' },
 ];
 
-export const THINGS: ThingTag[] = [
+const THINGS: ThingTag[] = [
     { id: 'beach', name: 'Beach', count: 61, swatch: 's2' },
     { id: 'birthday', name: 'Birthday', count: 18, swatch: 's3' },
     { id: 'dog', name: 'Dog', count: 94, swatch: 's7' },
@@ -31,7 +31,7 @@ const THING_NAMES = THINGS.map((t) => t.name.toLowerCase());
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep'];
 
 // People (some named, some unnamed clusters).
-export const PEOPLE: Person[] = [
+const PEOPLE: Person[] = [
     { id: 'priya', name: 'Priya', swatch: 's6', photoIds: [] },
     { id: 'liam', name: 'Liam', swatch: 's2', photoIds: [] },
     { id: 'mom', name: 'Mom', swatch: 's3', photoIds: [] },
@@ -41,7 +41,7 @@ export const PEOPLE: Person[] = [
 ];
 
 // 48 photos, deterministically spread across people / places / tags / years.
-export const PHOTOS: Photo[] = Array.from({ length: 48 }, (_, i) => {
+const PHOTOS: Photo[] = Array.from({ length: 48 }, (_, i) => {
     const swatch = pick(SWATCHES, i);
     const year = 2020 + (i % 4);
     const placeId = i % 5 === 0 ? null : pick(PLACE_IDS, i);

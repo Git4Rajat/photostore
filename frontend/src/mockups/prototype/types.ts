@@ -97,14 +97,6 @@ export interface ThingTag {
     coverThumbnailUrl?: string;
 }
 
-export interface ActivityItem {
-    id: string;
-    label: string;
-    when: string;
-    actor: 'you' | 'auto';
-    undoable: boolean;
-}
-
 export interface Suggestion {
     id: string;
     text: string;

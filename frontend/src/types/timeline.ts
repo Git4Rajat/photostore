@@ -1,14 +1,10 @@
 // Mirrors backend/timeline_metadata.py's build_timeline_summary() response.
-export interface TimelineDayBucket {
-    count: number;
-}
-
-export interface TimelineMonthBucket {
+interface TimelineMonthBucket {
     count: number;
     days: Record<string, number>; // "01".."31" -> count
 }
 
-export interface TimelineYearBucket {
+interface TimelineYearBucket {
     count: number;
     months: Record<string, TimelineMonthBucket>; // "01".."12"
 }

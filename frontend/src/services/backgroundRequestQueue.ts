@@ -130,7 +130,3 @@ export function enqueueBackgroundRequest<T>(
         void pump();
     });
 }
-
-// Test/debug only -- current queue depth (items not yet started or
-// requeued after a retryable failure).
-export const _backgroundRequestQueueLength = (): number => queue.length;

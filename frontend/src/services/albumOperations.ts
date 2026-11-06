@@ -134,7 +134,7 @@ const persistDelete = (tombstone: AlbumDeleteTombstone | undefined, scope: strin
     } catch { /* memory fallback already updated by caller */ }
 };
 
-export const albumOperationScope = sessionScope;
+const albumOperationScope = sessionScope;
 
 const newToken = (): string => `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 

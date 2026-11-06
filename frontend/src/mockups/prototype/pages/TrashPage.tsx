@@ -6,7 +6,7 @@ import { TileThumbnail } from '../components/PhotoGrid';
 import { confirmDialog } from '../../../components/shared/dialogs';
 
 /** Recently Deleted — restore individually or all, or purge for good. */
-export const TrashPage: React.FC = () => {
+const TrashPage: React.FC = () => {
     const {
         trash, trashLoading, reloadTrash, restorePhotos, restoreAllTrash, purgePhoto, purgeAllTrash,
         albumTrash, albumTrashLoading, reloadAlbumTrash, restoreAlbum, purgeAlbum,

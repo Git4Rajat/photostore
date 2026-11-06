@@ -142,7 +142,7 @@ const listPersonNames = async (q?: string) => {
     return { persons, total: persons.length };
 };
 
-export interface PersonRosterEntry {
+interface PersonRosterEntry {
     personId: string;
     name: string;
     isNamed: boolean;
@@ -353,4 +353,3 @@ export default {
     declineSuggestion,
 };
 
-export type { SuggestedFace, FindFacesResponse };

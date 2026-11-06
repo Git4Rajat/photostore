@@ -19,7 +19,7 @@ import { useStore } from '../store';
  * button scrolls out of view with the page, so this is the only always-reachable
  * way to cancel a selection once the user has scrolled away from the top.
  */
-export const CommandBar: React.FC = () => {
+const CommandBar: React.FC = () => {
     const { selection, ratePhotos, deletePhotos, removePhotosFromAlbum, route, navigate, toast, clearSelection } = useStore();
     const openAlbumId = route.page === 'albums' ? route.params.albumId : undefined;
     const [albumOpen, setAlbumOpen] = useState(false);

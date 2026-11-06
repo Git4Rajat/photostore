@@ -23,7 +23,7 @@ const getStack = (): HTMLDivElement => {
     return stack;
 };
 
-export interface ToastAction {
+interface ToastAction {
     label: string;
     onClick: () => void;
 }
