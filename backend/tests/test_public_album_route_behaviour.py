@@ -134,6 +134,10 @@ class TestAccessCode:
     def test_download_needs_the_code_when_there_is_no_grant(self, share):
         assert share['client'].post('/public/albums/tok/download', data={}).status_code == 401
 
+    def test_download_accepts_get_and_applies_the_same_code_gate(self, share):
+        # A browser that blocks the download popup can turn the form submission into a GET.
+        assert share['client'].get('/public/albums/tok/download?filenames=%5B%22a.jpg%22%5D').status_code == 401
+
 
 class TestPublicMedia:
     @pytest.fixture(autouse=True)

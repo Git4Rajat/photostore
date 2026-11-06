@@ -554,7 +554,10 @@ const PublicAlbumPage: React.FC = () => {
             if (filenamesInput) {
                 filenamesInput.value = selectedCount > 0 ? JSON.stringify(files.map((photo) => photo.filename)) : '';
             }
-            form.target = popupName;
+            // No popup (blocked, or this browser doesn't create one): a download response is an
+            // attachment, so submitting into the current tab leaves the page where it is, whereas
+            // targeting a window that was never created can fail outright.
+            form.target = popup ? popupName : '_self';
             form.submit();
         } catch (err) {
             writeToPopup(popup, "Couldn't start the download.", 'Close this tab and try again from the album.');
