@@ -1,4 +1,4 @@
-export interface PhotoPersonLink {
+interface PhotoPersonLink {
     personId: string;
     name: string;
 }

@@ -32,11 +32,6 @@ export interface AppNotification {
     uploadSessionId?: string;
 }
 
-export interface FilterOptions {
-    minRating: number;
-    minLikes: number;
-}
-
 type PersistedUploadFileStatus = 'pending' | 'uploading' | 'finalizing' | 'done' | 'failed';
 
 export interface PersistedUploadFile {

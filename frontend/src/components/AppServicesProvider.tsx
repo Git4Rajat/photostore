@@ -124,16 +124,16 @@ const IPWORK_PROCESSING_FINALIZE_QUIET_MS = 40000;
 const BROWSER_AI_LOAD_MAX_RETRIES = 2;
 const browserAiLoadRetryDelayMs = (attempt: number) => Math.min(1500 * attempt, 4000);
 
-type PhotoGalleryRuntime = typeof import('./PhotoGallery');
+type BrowserProcessingRuntime = typeof import('./browserProcessingRuntime');
 type BlockBlobClientCtor = typeof import('@azure/storage-blob')['BlockBlobClient'];
 
-let photoGalleryRuntimePromise: Promise<typeof import('./PhotoGallery')> | null = null;
+let browserProcessingRuntimePromise: Promise<typeof import('./browserProcessingRuntime')> | null = null;
 let blockBlobClientCtorPromise: Promise<BlockBlobClientCtor> | null = null;
-const loadPhotoGalleryRuntime = () => {
-    if (!photoGalleryRuntimePromise) {
-        photoGalleryRuntimePromise = import('./PhotoGallery');
+const loadBrowserProcessingRuntime = () => {
+    if (!browserProcessingRuntimePromise) {
+        browserProcessingRuntimePromise = import('./browserProcessingRuntime');
     }
-    return photoGalleryRuntimePromise;
+    return browserProcessingRuntimePromise;
 };
 
 const loadBlockBlobClient = () => {
@@ -143,28 +143,28 @@ const loadBlockBlobClient = () => {
     return blockBlobClientCtorPromise;
 };
 
-const withPhotoGalleryRuntime = async <T,>(select: (runtime: PhotoGalleryRuntime) => Promise<T> | T): Promise<T> => (
-    select(await loadPhotoGalleryRuntime())
+const withBrowserProcessingRuntime = async <T,>(select: (runtime: BrowserProcessingRuntime) => Promise<T> | T): Promise<T> => (
+    select(await loadBrowserProcessingRuntime())
 );
 
-const dataUrlToBlob = (dataUrl: string) => withPhotoGalleryRuntime((runtime) => runtime.dataUrlToBlob(dataUrl));
-const idbDelete = (key: string) => withPhotoGalleryRuntime((runtime) => runtime.idbDelete(key));
-const idbGet = (key: string) => withPhotoGalleryRuntime((runtime) => runtime.idbGet(key));
-const idbPut = (key: string, value: Blob | File | FileSystemFileHandle) => withPhotoGalleryRuntime((runtime) => runtime.idbPut(key, value));
-const readBlobArrayBuffer = (blob: Blob | File) => withPhotoGalleryRuntime((runtime) => runtime.readBlobArrayBuffer(blob));
-const runBrowserProcessing = (...args: Parameters<PhotoGalleryRuntime['runBrowserProcessing']>) => (
-    withPhotoGalleryRuntime((runtime) => runtime.runBrowserProcessing(...args))
+const dataUrlToBlob = (dataUrl: string) => withBrowserProcessingRuntime((runtime) => runtime.dataUrlToBlob(dataUrl));
+const idbDelete = (key: string) => withBrowserProcessingRuntime((runtime) => runtime.idbDelete(key));
+const idbGet = (key: string) => withBrowserProcessingRuntime((runtime) => runtime.idbGet(key));
+const idbPut = (key: string, value: Blob | File | FileSystemFileHandle) => withBrowserProcessingRuntime((runtime) => runtime.idbPut(key, value));
+const readBlobArrayBuffer = (blob: Blob | File) => withBrowserProcessingRuntime((runtime) => runtime.readBlobArrayBuffer(blob));
+const runBrowserProcessing = (...args: Parameters<BrowserProcessingRuntime['runBrowserProcessing']>) => (
+    withBrowserProcessingRuntime((runtime) => runtime.runBrowserProcessing(...args))
 );
-const sha256ArrayBuffer = (buffer: ArrayBuffer) => withPhotoGalleryRuntime((runtime) => runtime.sha256ArrayBuffer(buffer));
-const acquireBrowserAiModel = (onProgress?: (stage: BrowserAiLoadStage) => void) => withPhotoGalleryRuntime(
+const sha256ArrayBuffer = (buffer: ArrayBuffer) => withBrowserProcessingRuntime((runtime) => runtime.sha256ArrayBuffer(buffer));
+const acquireBrowserAiModel = (onProgress?: (stage: BrowserAiLoadStage) => void) => withBrowserProcessingRuntime(
     (runtime) => runtime.acquireBrowserAiModel(onProgress) as Promise<SharedBrowserAiModelState>,
 );
 const createBrowserThumbnail = (source: Blob | File, rotationDegrees?: number) => (
-    withPhotoGalleryRuntime((runtime) => runtime.createBrowserThumbnail(source, rotationDegrees))
+    withBrowserProcessingRuntime((runtime) => runtime.createBrowserThumbnail(source, rotationDegrees))
 );
-const preloadNativeFaceModels = () => withPhotoGalleryRuntime((runtime) => runtime.preloadNativeFaceModels());
-const createPersistentBrowserAiWorker = () => withPhotoGalleryRuntime((runtime) => runtime.createPersistentBrowserAiWorker());
-type BrowserAiWorkerHandle = ReturnType<PhotoGalleryRuntime['createPersistentBrowserAiWorker']>;
+const preloadNativeFaceModels = () => withBrowserProcessingRuntime((runtime) => runtime.preloadNativeFaceModels());
+const createPersistentBrowserAiWorker = () => withBrowserProcessingRuntime((runtime) => runtime.createPersistentBrowserAiWorker());
+type BrowserAiWorkerHandle = ReturnType<BrowserProcessingRuntime['createPersistentBrowserAiWorker']>;
 
 const fetchProcessingBlob = async (url: string): Promise<Blob> => {
     const resolvedUrl = resolveApiUrl(url);
@@ -2657,7 +2657,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         file,
                         `browser-${filename}`,
                         performance.now(),
-                        browserAiModelStateRef.current as Parameters<PhotoGalleryRuntime['runBrowserProcessing']>[3],
+                        browserAiModelStateRef.current as Parameters<BrowserProcessingRuntime['runBrowserProcessing']>[3],
                         {
                             clientProcessing: {},
                             clientProcessingReport: [],
@@ -3706,7 +3706,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                             file,
                             `browser-${filename}`,
                             processingStartedAt,
-                            browserAiModelStateRef.current as Parameters<PhotoGalleryRuntime['runBrowserProcessing']>[3],
+                            browserAiModelStateRef.current as Parameters<BrowserProcessingRuntime['runBrowserProcessing']>[3],
                             { clientProcessing: {}, clientProcessingReport: [] },
                             { thumbnailRotationDegrees: 0, faceRotationDegrees: 0, convertedPreview, requestedSteps: kickoffRequestedSteps },
                         );

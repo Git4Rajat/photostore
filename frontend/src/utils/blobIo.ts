@@ -1,8 +1,8 @@
 /**
  * Small blob/ArrayBuffer conversion helpers used by the client-side upload
- * processing pipeline. Extracted from PhotoGallery.tsx -- re-exported there
+ * processing pipeline. Extracted from browserProcessingRuntime.tsx -- re-exported there
  * so AppServicesProvider's `withPhotoGalleryRuntime` lazy-import boundary
- * (`typeof import('./PhotoGallery')`) keeps resolving dataUrlToBlob/
+ * (`typeof import('./browserProcessingRuntime')`) keeps resolving dataUrlToBlob/
  * readBlobArrayBuffer/sha256ArrayBuffer.
  */
 
