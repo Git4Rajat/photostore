@@ -1116,11 +1116,17 @@ def photos_sort_index():
         # this field entirely) is treated as current, not stale, to avoid pointlessly
         # rebuilding every pre-existing manifest on this deploy's first read.
         app._trigger_indexer_rebuild(user_id, reason='schema-upgrade', scope='light')
+    delta_seq = int(sort_summary.get('delta_seq') or 0)
+    if delta_seq and not storage_utils.sort_index_deltas_present(user_id, delta_seq):
+        # The manifest outlived its correction slips (a rebuild removed them).
+        # Serving their URLs would 404 in every browser; rebuild and let the
+        # client use the legacy listing until the fresh base is published.
+        app._trigger_indexer_rebuild(user_id, reason='sort-delta-missing', scope='light')
+        return app.jsonify({'available': False})
     try:
         container_name, blob_name = app.get_sort_index_blob_location(user_id)
         index_url, expires_at = app._create_stable_read_sas_url(container_name, blob_name)
         delta_urls = []
-        delta_seq = int(sort_summary.get('delta_seq') or 0)
         if delta_seq:
             for seq in range(1, delta_seq + 1):
                 delta_name = storage_utils._sort_index_delta_blob_name(user_id, seq)
