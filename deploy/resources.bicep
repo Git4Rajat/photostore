@@ -76,9 +76,12 @@ param clusterFileShareQuotaGiB int = 100
 @maxValue(0)
 param clusterMinReplicas int = 0
 
-@description('Required: run index maintenance on the indexer sidecar; cluster only forwards legacy index messages.')
+@description('Required: use a dedicated index-maintenance consumer; cluster only forwards legacy index messages.')
 @allowed([true])
 param dedicatedIndexWorker bool = true
+
+@description('Scale the index maintenance worker independently from the Tools API; false retains the legacy sidecar topology.')
+param separateIndexWorker bool = true
 
 @description('Enable qualified wave execution after certificate seeding; fresh installs use deploy/fresh_wave.py.')
 param enableWaveExecution bool = true
@@ -133,6 +136,7 @@ var webAppName = '${appName}-web'
 var clusterAppName = '${appName}-cluster'
 var visionAppName = '${appName}-vision'
 var indexerAppName = '${appName}-indexer'
+var indexWorkerAppName = '${appName}-index-worker'
 var uploadAppName = '${appName}-upload'
 var recoveryAppName = '${appName}-recovery'
 var archiveAppName = '${appName}-archive'
@@ -985,6 +989,42 @@ resource core 'Microsoft.App/containerApps@2025-01-01' = {
   ]
 }
 
+var indexMaintenanceScaleRules = [
+          {
+            name: 'index-maintenance-queue'
+            custom: {
+              type: 'azure-queue'
+              metadata: {
+                accountName: storageAccountName
+                queueName: 'photostore-index-maintenance'
+                queueLength: '1'
+                // Claimed messages remain work until ACK, including long builds.
+                queueLengthStrategy: 'all'
+              }
+              identity: 'system'
+            }
+          }
+          {
+            // Delayed wakeups (coalescing / dedup-idle wait / retry backoff --
+            // see INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME) are never actively
+            // held, only waiting out a schedule, so 'visibleonly' correctly
+            // reports empty while they wait -- same fix shape as
+            // clustering-deferred-queue (see docs/benchmarks/cluster-false-starts-20261030.md).
+            name: 'index-maintenance-deferred-queue'
+            custom: {
+              type: 'azure-queue'
+              metadata: {
+                accountName: storageAccountName
+                queueName: 'photostore-index-maintenance-deferred'
+                queueLength: '1'
+                queueLengthStrategy: 'visibleonly'
+              }
+              identity: 'system'
+            }
+          }
+
+]
+
 // 2026-09-15: first real service split (see backend-cpu-optimization-2026-09
 // memory's coupling map -- tools/workbench action-history logging was the
 // least-entangled route group, touching only its own table, no shared
@@ -1029,7 +1069,7 @@ resource indexer 'Microsoft.App/containerApps@2025-01-01' = {
             { volumeName: 'index-cache', mountPath: '/mnt/photostore/shared' }
           ]
           // Keep API threads separate from the worker's memory/CPU budget.
-          // Together the two containers retain the previous 2 CPU/4Gi total.
+          // Separate scaling avoids reserving the worker for API-only requests.
           resources: {
             cpu: dedicatedIndexWorker ? json('0.5') : json('2.0')
             memory: dedicatedIndexWorker ? '1Gi' : '4Gi'
@@ -1048,7 +1088,7 @@ resource indexer 'Microsoft.App/containerApps@2025-01-01' = {
             { name: 'ACS_CONNECTION_STRING', secretRef: 'acs-connection-string' }
           ])
         }
-      ], dedicatedIndexWorker ? [
+      ], dedicatedIndexWorker && !separateIndexWorker ? [
         {
           name: 'index-maintenance'
           image: coreImage
@@ -1066,6 +1106,7 @@ resource indexer 'Microsoft.App/containerApps@2025-01-01' = {
             { name: 'INDEX_BUILD_WORK_DIR', value: '/mnt/photostore/shared/index-build' }
             { name: 'SEARCH_DB_DIR', value: '/tmp/photostore-index-search' }
             { name: 'SEARCH_DB_MAX_CACHE_MB', value: '3500' }
+            { name: 'SEARCH_DB_SQLITE_CACHE_KB', value: '4096' }
             { name: 'VECTOR_INDEX_PRIME_ON_STARTUP', value: 'false' }
             { name: 'OWNER_PASSWORD', secretRef: 'owner-password' }
             { name: 'SESSION_SECRET', secretRef: 'session-secret' }
@@ -1094,40 +1135,7 @@ resource indexer 'Microsoft.App/containerApps@2025-01-01' = {
               }
             }
           }
-        ], dedicatedIndexWorker ? [
-          {
-            name: 'index-maintenance-queue'
-            custom: {
-              type: 'azure-queue'
-              metadata: {
-                accountName: storageAccountName
-                queueName: 'photostore-index-maintenance'
-                queueLength: '1'
-                // Claimed messages remain work until ACK, including long builds.
-                queueLengthStrategy: 'all'
-              }
-              identity: 'system'
-            }
-          }
-          {
-            // Delayed wakeups (coalescing / dedup-idle wait / retry backoff --
-            // see INDEX_MAINTENANCE_DEFERRED_QUEUE_NAME) are never actively
-            // held, only waiting out a schedule, so 'visibleonly' correctly
-            // reports empty while they wait -- same fix shape as
-            // clustering-deferred-queue (see docs/benchmarks/cluster-false-starts-20261030.md).
-            name: 'index-maintenance-deferred-queue'
-            custom: {
-              type: 'azure-queue'
-              metadata: {
-                accountName: storageAccountName
-                queueName: 'photostore-index-maintenance-deferred'
-                queueLength: '1'
-                queueLengthStrategy: 'visibleonly'
-              }
-              identity: 'system'
-            }
-          }
-        ] : [])
+        ], dedicatedIndexWorker && !separateIndexWorker ? indexMaintenanceScaleRules : [])
       }
     }
   }
@@ -1135,6 +1143,66 @@ resource indexer 'Microsoft.App/containerApps@2025-01-01' = {
   dependsOn: [
     workerCheckpointStorage
   ]
+}
+
+
+// No ingress or HTTP scaler: Tools browsing cannot activate this allocation.
+resource indexWorker 'Microsoft.App/containerApps@2025-01-01' = if (dedicatedIndexWorker && separateIndexWorker) {
+  name: indexWorkerAppName
+  location: location
+  identity: { type: 'SystemAssigned' }
+  properties: {
+    managedEnvironmentId: managedEnvironment.id
+    configuration: {
+      secrets: [
+        { name: 'owner-password', value: adminPassword }
+        { name: 'session-secret', value: sessionSecret }
+        { name: 'acs-connection-string', value: acsConnectionString }
+      ]
+    }
+    template: {
+      revisionSuffix: deployRevisionTag
+      terminationGracePeriodSeconds: 180
+      containers: [
+        {
+          name: 'index-maintenance'
+          image: coreImage
+          resources: {
+            cpu: json('1.5')
+            memory: '3Gi'
+          }
+          volumeMounts: [
+            { volumeName: 'index-cache', mountPath: '/mnt/photostore/shared' }
+          ]
+          env: concat(backendEnv, [
+            { name: 'APP_ROLE', value: 'index-worker' }
+            { name: 'UPLOAD_WAVE_DEPLOYMENT_ID', value: coreImage }
+            { name: 'INDEX_DISK_CACHE_DIR', value: '/mnt/photostore/shared/index-cache' }
+            { name: 'INDEX_BUILD_WORK_DIR', value: '/mnt/photostore/shared/index-build' }
+            { name: 'SEARCH_DB_DIR', value: '/tmp/photostore-index-search' }
+            { name: 'SEARCH_DB_MAX_CACHE_MB', value: '3500' }
+            { name: 'SEARCH_DB_SQLITE_CACHE_KB', value: '4096' }
+            { name: 'VECTOR_INDEX_PRIME_ON_STARTUP', value: 'false' }
+            { name: 'OWNER_PASSWORD', secretRef: 'owner-password' }
+            { name: 'SESSION_SECRET', secretRef: 'session-secret' }
+            { name: 'ACS_CONNECTION_STRING', secretRef: 'acs-connection-string' }
+          ])
+        }
+
+      ]
+      volumes: [
+        { name: 'index-cache', storageType: 'AzureFile', storageName: 'faiss-checkpoints' }
+      ]
+      scale: {
+        minReplicas: 0
+        maxReplicas: 1
+        cooldownPeriod: 60
+        pollingInterval: 30
+        rules: indexMaintenanceScaleRules
+      }
+    }
+  }
+  dependsOn: [workerCheckpointStorage]
 }
 
 // 2026-09-16: third service split -- admin (Tools/Workbench recovery actions:
@@ -1973,6 +2041,18 @@ resource indexerStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01
   }
 ]
 
+resource indexWorkerStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+  for roleId in storageRoleIds: if (dedicatedIndexWorker && separateIndexWorker) {
+    name: guid(storage.id, indexWorkerAppName, roleId)
+    scope: storage
+    properties: {
+      roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
+      principalId: indexWorker!.identity.principalId
+      principalType: 'ServicePrincipal'
+    }
+  }
+]
+
 resource uploadStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
   for roleId in storageRoleIds: {
     name: guid(storage.id, upload.id, roleId)
@@ -2011,12 +2091,12 @@ resource archiveStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01
 
 // Core negotiates subscriptions without waking indexer. Retain indexer's grant
 // for publishing and negotiation by older browser bundles; cluster also publishes.
-resource indexPushRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for appRole in ['indexer', 'cluster', 'core']: if (enableIndexPush) {
+resource indexPushRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for appRole in ['indexer', 'cluster', 'core', 'index-worker']: if (enableIndexPush && (appRole != 'index-worker' || (dedicatedIndexWorker && separateIndexWorker))) {
   name: guid(indexPush!.id, appRole, 'index-events-owner')
   scope: indexPush
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '12cf5a90-567b-43ae-8102-96cf46c7d9b4')
-    principalId: appRole == 'indexer' ? indexer.identity.principalId : appRole == 'core' ? core.identity.principalId : cluster.identity.principalId
+    principalId: appRole == 'index-worker' ? indexWorker!.identity.principalId : appRole == 'indexer' ? indexer.identity.principalId : appRole == 'core' ? core.identity.principalId : cluster.identity.principalId
     principalType: 'ServicePrincipal'
   }
 }]

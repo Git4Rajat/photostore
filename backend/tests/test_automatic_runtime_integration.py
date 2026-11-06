@@ -258,8 +258,8 @@ def test_actual_worker_publishes_sqlite_summaries_without_compaction(leased, mon
         monkeypatch.setattr(app, 'store_' + kind + '_summary',
             lambda user, value, kind=kind: published.append((kind, user, value)))
         monkeypatch.setattr(app, 'load_' + kind + '_summary',
-            lambda user, kind=kind: next(value for stored, owner, value in reversed(published)
-                                       if stored == kind and owner == user))
+            lambda user, kind=kind: next((value for stored, owner, value in reversed(published)
+                                        if stored == kind and owner == user), None))
     work = index_work.WorkStore(runtime.jobs)
     key = work.request('A', 'search')
     app._run_index_maintenance_payload(dict(userId='A', scope='search', jobId='job', maintenanceKey=key))
@@ -323,7 +323,7 @@ def test_quiesced_purge_hash_failure_cannot_finish_and_remains_retryable(leased,
     assert set(hashes.rows) == {('other', 'hash')}
 
 
-def test_worker_gc_runs_after_claim_release_with_shared_live_lock(leased, monkeypatch):
+def test_periodic_gc_runs_after_claim_release_with_shared_live_lock(leased, monkeypatch):
     runtime, _ = leased
     monkeypatch.setenv('APP_ROLE', 'index-worker')
     work = index_work.WorkStore(runtime.jobs)
@@ -339,6 +339,8 @@ def test_worker_gc_runs_after_claim_release_with_shared_live_lock(leased, monkey
         return {'status': 'complete', 'deleted': 0}
     monkeypatch.setattr(gc, 'cleanup_user_index_artifacts', collect)
     app._run_index_maintenance_payload(dict(userId='A', scope='vector', jobId='job', maintenanceKey=key))
+    assert observed == []  # Successful edits no longer force a GC survey.
+    app._cleanup_completed_index_artifacts('A')
     assert observed == ['A']
 
 
