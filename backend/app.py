@@ -8641,6 +8641,20 @@ def _save_album_entity(entity: Dict) -> None:
     _mark_album_dirty(entity)
 
 
+def _save_album_entity_if_unchanged(entity: Dict) -> bool:
+    """Save ``entity`` only if the row still has the ETag it was loaded with.
+    False means another writer got there first (nothing was written)."""
+    if albums_table_client is None:
+        return True
+    try:
+        albums_table_client.update_entity(
+            entity, etag=entity.metadata['etag'], match_condition=MatchConditions.IfNotModified)
+    except ResourceModifiedError:
+        return False
+    _mark_album_dirty(entity)
+    return True
+
+
 def _update_album_entity_with_retry(
     user_id: str, album_id: str, mutate_fn: Callable[[Dict], Optional[Dict]], *, max_attempts: int = 5,
 ) -> Optional[Dict]:
