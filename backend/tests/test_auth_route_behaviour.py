@@ -1,3 +1,4 @@
+import hashlib
 """Auth routes: config, password login/throttle, change/forgot/reset password, Entra exchange."""
 import pytest
 
@@ -106,7 +107,9 @@ class TestLogin:
         unknown = http.post(self.URL, json={'email': 'who@example.com', 'password': 'nope'})
         assert wrong.status_code == unknown.status_code == 401
         assert wrong.json == unknown.json
-        assert throttle['failures'] == ['login-throttle:me@example.com', 'login-throttle:who@example.com']
+        bucket = hashlib.sha256(b'who@example.com').hexdigest()[:2]
+        # Unknown emails share one of 256 buckets so guessing addresses can't grow the table.
+        assert throttle['failures'] == ['login-throttle:me@example.com', f'login-throttle:unknown:{bucket}']
 
     def test_throttled_email_is_rejected_even_with_the_right_password(self, http, store, throttle):
         throttle['allowed'] = False

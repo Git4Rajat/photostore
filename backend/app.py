@@ -2139,9 +2139,24 @@ def _album_grant_cookie_name(token: str) -> str:
     return f'{_ALBUM_GRANT_COOKIE_PREFIX}{digest}'
 
 
-def _sign_album_grant(token: str, access_code: str) -> str:
-    message = f'{token}:{access_code}'.encode('utf-8')
-    return hmac.new(_ALBUM_GRANT_SECRET.encode('utf-8'), message, hashlib.sha256).hexdigest()
+ALBUM_GRANT_TTL_SECONDS = 60 * 60 * 6
+
+
+def _sign_album_grant(token: str, access_code: str, expires_at: Optional[int] = None) -> str:
+    """Cookie value ``<expiry>.<hmac>``; the expiry is covered by the signature so a
+    captured cookie can't outlive its window."""
+    if expires_at is None:
+        expires_at = int(time.time()) + ALBUM_GRANT_TTL_SECONDS
+    message = f'{token}:{access_code}:{expires_at}'.encode('utf-8')
+    digest = hmac.new(_ALBUM_GRANT_SECRET.encode('utf-8'), message, hashlib.sha256).hexdigest()
+    return f'{int(expires_at)}.{digest}'
+
+
+def _album_media_cache_control(entity: Dict, max_age: int) -> str:
+    """Code-protected albums must not land in shared caches, where the next
+    visitor would be served the media without presenting a grant."""
+    scope = 'private' if _album_access_code(entity) else 'public'
+    return f'{scope}, max-age={max_age}'
 
 
 def _album_grant_valid(entity: Dict, token: str) -> bool:
@@ -2150,9 +2165,11 @@ def _album_grant_valid(entity: Dict, token: str) -> bool:
     if not access_code:
         return True
     provided = str(request.cookies.get(_album_grant_cookie_name(token), '') or '')
-    if not provided:
+    expiry_text, _, _ = provided.partition('.')
+    if not expiry_text.isdigit() or int(expiry_text) < time.time():
         return False
-    return hmac.compare_digest(provided.encode('utf-8'), _sign_album_grant(token, access_code).encode('utf-8'))
+    expected = _sign_album_grant(token, access_code, int(expiry_text))
+    return hmac.compare_digest(provided.encode('utf-8'), expected.encode('utf-8'))
 
 
 def _album_access_code_gate(entity: Dict, token: str, provided: str):
@@ -9464,6 +9481,30 @@ def _apply_security_headers(response):
             'Strict-Transport-Security', 'max-age=31536000; includeSubDomains'
         )
     return response
+
+
+# Body-size caps by content type. Upload chunks (octet-stream) are bounded by the
+# upload routes themselves; JSON is never legitimately large, and the auth
+# endpoints are reachable without a token.
+MAX_JSON_BODY_BYTES = int(os.getenv('MAX_JSON_BODY_BYTES', str(16 * 1024 * 1024)))
+MAX_AUTH_BODY_BYTES = int(os.getenv('MAX_AUTH_BODY_BYTES', str(64 * 1024)))
+
+
+@app.before_request
+def _limit_json_body_size():
+    length = request.content_length
+    if length is None or request.method not in ('POST', 'PUT', 'PATCH'):
+        return None
+    path = request.path
+    if path.startswith(('/auth/', '/api/auth/', '/public/', '/api/library/invite')):
+        limit = MAX_AUTH_BODY_BYTES
+    elif request.mimetype == 'application/json':
+        limit = MAX_JSON_BODY_BYTES
+    else:
+        return None
+    if length > limit:
+        return jsonify({'error': 'Request body too large'}), 413
+    return None
 
 
 @app.before_request

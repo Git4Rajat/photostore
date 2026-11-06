@@ -37,6 +37,13 @@ COPY data/ ./data/
 COPY entrypoint.sh ./
 RUN chmod +x /app/entrypoint.sh
 
+# Run as an unprivileged user: this container parses untrusted images/video
+# (ffmpeg, exiftool, libraw), so a parser exploit should not land as root.
+RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin photostore \
+    && chown -R photostore:photostore /app
+ENV HOME=/home/photostore
+USER 10001
+
 # Expose port (Flask default is 5000). 5001 is the gunicorn-master-owned
 # health sidecar (see gunicorn.conf.py's on_starting) -- stays up independent
 # of whether app worker threads are saturated.

@@ -149,7 +149,7 @@ def public_thumbnail(token: str, filename: str):
             'thumbnail',
             blob_name_to_serve,
             content_type=content_type,
-            cache_control='public, max-age=3600',
+            cache_control=app._album_media_cache_control(entity, 3600),
             content_length=props.get('size'),
         )
     except Exception as exc:
@@ -188,7 +188,7 @@ def public_image(token: str, filename: str):
             'image',
             blob_name_to_serve,
             content_type=content_type,
-            cache_control='public, max-age=3600',
+            cache_control=app._album_media_cache_control(entity, 3600),
             content_length=content_length,
             download_filename=safe_name,
         )
@@ -224,7 +224,7 @@ def public_photo_share_preview(token: str, filename: str):
         image_bytes = app.download_media_bytes('image', blob_name)
         preview_bytes = app.convert_image_to_jpeg(image_bytes, safe_name)
         resp = app.Response(preview_bytes, mimetype='image/jpeg')
-        resp.headers['Cache-Control'] = 'public, max-age=86400'
+        resp.headers['Cache-Control'] = app._album_media_cache_control(entity, 86400)
         return resp
     except Exception as exc:
         if app._is_missing_media_error(exc):
@@ -249,7 +249,7 @@ def public_preview(token: str, filename: str):
         owner_id = str(entity.get('PartitionKey') or '')
         cached_blob_name = app.resolve_physical_blob_name(owner_id, safe_name, 'image') if owner_id else safe_name
         try:
-            cached = app._stream_cached_preview(safe_name, cache_control='public, max-age=3600', blob_name=cached_blob_name,
+            cached = app._stream_cached_preview(safe_name, cache_control=app._album_media_cache_control(entity, 3600), blob_name=cached_blob_name,
                                                 metadata=app._get_metadata_entity(owner_id, safe_name))
         except Exception:
             app.app.logger.exception('Failed to stream cached public preview for %s', safe_name)
@@ -277,7 +277,7 @@ def public_preview(token: str, filename: str):
         if not preview_bytes or (app._filename_requires_backend_preview(safe_name) and not app._looks_like_jpeg(preview_bytes)):
             return app.jsonify(app._preview_failure_payload(safe_name)), 422
         resp = app.Response(preview_bytes, mimetype='image/jpeg')
-        resp.headers['Cache-Control'] = 'public, max-age=3600'
+        resp.headers['Cache-Control'] = app._album_media_cache_control(entity, 3600)
         return resp
     except Exception as exc:
         if app._is_missing_media_error(exc):
@@ -329,7 +329,7 @@ def public_raw_full_preview(token: str, filename: str):
         }), 404
 
     resp = app.Response(preview_bytes, mimetype='image/jpeg')
-    resp.headers['Cache-Control'] = 'public, max-age=3600'
+    resp.headers['Cache-Control'] = app._album_media_cache_control(entity, 3600)
     return resp
 
 @public_bp.route('/public/albums/<token>/download-check', methods=['GET'])

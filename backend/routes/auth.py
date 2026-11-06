@@ -33,14 +33,23 @@ def auth_login():
     password = str(data.get('password', '') or '')
     if not email_in or not password:
         return app.jsonify({'error': 'Email and password are required.'}), 400
-    # Brute-force protection is scoped per email so one targeted account can't
-    # lock everyone else out of a shared deployment.
-    throttle_row = f'login-throttle:{email_in}'
-    if not app.password_auth.login_attempt_allowed(app.config_table_client, throttle_row):
-        return app.jsonify({'error': 'Too many attempts. Please wait and try again.'}), 429
     account = app.library_store.get_user_by_email(email_in) if app.library_store else None
     stored_hash = str((account or {}).get('passwordHash') or '')
-    if not account or not stored_hash or not app.password_auth.verify_password(password, stored_hash):
+    # Brute-force protection is scoped per account so one targeted account can't
+    # lock everyone else out. Unknown emails share a small fixed set of buckets
+    # (256) instead of each getting a row, so an attacker can't grow the table
+    # without bound by guessing addresses.
+    if account:
+        throttle_row = f'login-throttle:{email_in}'
+    else:
+        bucket = app.hashlib.sha256(email_in.encode('utf-8')).hexdigest()[:2]
+        throttle_row = f'login-throttle:unknown:{bucket}'
+    if not app.password_auth.login_attempt_allowed(app.config_table_client, throttle_row):
+        return app.jsonify({'error': 'Too many attempts. Please wait and try again.'}), 429
+    # Always run one scrypt verify so response time doesn't reveal whether the
+    # account exists.
+    verified = app.password_auth.verify_password(password, stored_hash or app.password_auth.DUMMY_PASSWORD_HASH)
+    if not account or not stored_hash or not verified:
         app.password_auth.record_login_failure(app.config_table_client, row_key=throttle_row)
         return app.jsonify({'error': 'Incorrect email or password.'}), 401
     app.password_auth.record_login_success(app.config_table_client, throttle_row)

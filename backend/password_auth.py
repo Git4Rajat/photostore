@@ -85,6 +85,10 @@ def verify_password(password: str, encoded: str) -> bool:
     return hmac.compare_digest(candidate, expected)
 
 
+# Verified against when no real hash exists, to equalise login timing.
+DUMMY_PASSWORD_HASH = hash_password(secrets.token_urlsafe(16))
+
+
 # ---------------------------------------------------------------------------
 # Owner credential storage
 # ---------------------------------------------------------------------------
