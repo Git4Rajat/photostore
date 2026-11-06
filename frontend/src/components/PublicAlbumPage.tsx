@@ -12,8 +12,10 @@ import { useBackendRecoveryRetry } from '../services/useBackendRecoveryRetry';
 import { getBackendStatusSnapshot } from '../services/backendStatus';
 import { showToast } from '../services/toast';
 import { useDragSelect } from '../services/useDragSelect';
+import { useCollapseOnScroll } from '../services/useCollapseOnScroll';
 import PhotoViewer, { getMainMediaPath } from './shared/PhotoViewer';
 import { FloatingSelectButton } from '../mockups/prototype/components/FloatingSelectButton';
+import { ScrollToTopButton } from '../mockups/prototype/components/ScrollToTopButton';
 import { Logo, LogoLockup } from './shared/Logo';
 import { EmptyState } from './shared/EmptyState';
 import { ErrorState } from './shared/ErrorState';
@@ -157,6 +159,9 @@ const PublicAlbumPage: React.FC = () => {
     // The scrollable region is the app-shell body (overflow-y:auto), not the
     // document -- so scroll save/restore below targets this element, not window.
     const bodyRef = useRef<HTMLDivElement | null>(null);
+    // The header is a fixed-height row above the scroll area, so on a phone it kept ~64px of the
+    // screen for the whole scroll. It slides away while scrolling down and returns on any upward scroll.
+    const headerCollapsed = useCollapseOnScroll(bodyRef);
     // bufferReady gates the initial grid reveal; bufferPercent keeps updating
     // past that point so the ongoing background prefetch can still surface a
     // running percentage (see the meta line below) until it finishes.
@@ -595,7 +600,7 @@ const PublicAlbumPage: React.FC = () => {
             <div className="mock-stage">
                 <div className="mock-viewport">
                     <div className="mock-app">
-                        <header className="ios-header pt-public-header">
+                        <header className={`ios-header pt-public-header${headerCollapsed ? ' is-collapsed' : ''}`}>
                             <LogoLockup size={30} className="ios-header-wordmark" />
                             <span className="pt-public-tag">Shared album</span>
                         </header>
@@ -809,7 +814,10 @@ const PublicAlbumPage: React.FC = () => {
                             )}
                         </div>
                         {!loading && !error && !codeRequired && photos.length > 0 && (
-                            <FloatingSelectButton selectMode={selectMode} onToggle={() => { if (selectMode) { exitSelectMode(); } else { setSelectMode(true); } }} />
+                            <>
+                                <ScrollToTopButton />
+                                <FloatingSelectButton selectMode={selectMode} onToggle={() => { if (selectMode) { exitSelectMode(); } else { setSelectMode(true); } }} />
+                            </>
                         )}
                     </div>
                 </div>

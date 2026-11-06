@@ -791,6 +791,16 @@
     .pt-public-shell .mock-body { padding-bottom: clamp(12px, 3vw, 20px); }
 }
 
+/* Collapse the header out of the layout while scrolling down (PublicAlbumPage): total row height
+   is margin-top 8 + 48 + margin-bottom 8, so -56px of top margin takes it to zero. */
+.pt-public-header { transition: margin-top 0.22s ease, opacity 0.18s ease; }
+.pt-public-header.is-collapsed { margin-top: -56px; opacity: 0; pointer-events: none; }
+/* The floating buttons assume the app's mobile tab bar sits under them; this page has none. */
+@container (max-width: 620px) {
+    .pt-public-shell .pt-scroll-top,
+    .pt-public-shell .pt-float-select { bottom: calc(20px + env(safe-area-inset-bottom)); }
+}
+
 .pt-public-grid { --pt-tile-min: 128px; margin-bottom: 8px; }
 /* Unlike the app's PhotoGrid (mock-swatch gradient behind every tile), these
    tiles are just the served thumbnail -- give them a neutral fill so a
