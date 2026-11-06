@@ -113,7 +113,6 @@ def test_indexer_role_serves_only_tools_routes():
         # Opt-in shadow-wave diagnostic (disabled by default via
         # UPLOAD_WAVE_SHADOW_ENABLED) -- see docs/indexing-clustering-
         # target-state.md step 3, "validate real uploads in shadow mode".
-        '/api/tools/waves/shadow/<wave>/compare',
         # Manual counterparts to the automatic release/flush triggers.
         '/api/tools/ipwork/release',
         '/api/tools/cluster/flush',
@@ -157,7 +156,6 @@ def test_recovery_role_serves_only_admin_routes():
     assert non_static  # non-empty
     assert all(p.startswith(('/admin', '/api/admin')) for p in non_static)
     assert '/api/admin/people/dedupe-faces' in non_static
-    assert '/api/admin/jobs/status' in non_static
 
 
 def test_archive_role_serves_only_library_and_public_routes():

@@ -2888,58 +2888,6 @@ def _build_user_vector_index_file(user_id: str, source_version: str, workdir: st
         positions.close()
 
 
-def _merge_user_vector_index_snapshot(
-    user_id: str, existing: VectorIndexSnapshot, dirty_filenames: Set[str], source_version: str,
-) -> Optional[VectorIndexSnapshot]:
-    """Incremental counterpart to _build_user_vector_index_snapshot: instead of
-    re-scanning and re-embedding the whole partition, only re-fetch/re-embed
-    the filenames known to have changed (dirty_filenames) and merge them into
-    the existing snapshot. Point-reads are used instead of a partition scan
-    since the dirty set is expected to be small relative to the library."""
-    metadata_table_client = _CTX.get('metadata_table_client')
-    if metadata_table_client is None:
-        return None
-    photo_embeddings_compatible = vision_utils.get_text_embedding_dimension() == PHOTO_EMBEDDING_DIMENSION
-    by_filename: Dict[str, np.ndarray] = dict(zip(existing.row_keys, existing.embeddings))
-
-    def _refresh_one(filename: str) -> Tuple[str, Optional[np.ndarray]]:
-        try:
-            row = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
-        except Exception:
-            return filename, None
-        if str(row.get('processing_state') or '').strip().lower() == 'deleted':
-            return filename, None
-        embedding_row = get_photo_embeddings(user_id, filename) or row
-        return filename, _compute_photo_vector(filename, row, embedding_row, photo_embeddings_compatible)
-
-    if dirty_filenames:
-        with ThreadPoolExecutor(max_workers=min(_INDEX_MERGE_CONCURRENCY, max(1, len(dirty_filenames)))) as executor:
-            for filename, vector in executor.map(_refresh_one, dirty_filenames):
-                if vector is None:
-                    by_filename.pop(filename, None)
-                else:
-                    by_filename[filename] = vector
-
-    if not by_filename:
-        return VectorIndexSnapshot(
-            user_id=str(user_id),
-            source_version=source_version,
-            embedding_version=existing.embedding_version,
-            updated_at=source_version,
-            row_keys=[],
-            embeddings=np.zeros((0, 0), dtype=np.float32),
-        )
-    row_keys = list(by_filename.keys())
-    embeddings = np.vstack([by_filename[k] for k in row_keys]).astype(np.float32, copy=False)
-    return VectorIndexSnapshot(
-        user_id=str(user_id),
-        source_version=source_version,
-        embedding_version=existing.embedding_version,
-        updated_at=source_version,
-        row_keys=row_keys,
-        embeddings=embeddings,
-    )
-
 
 @catalog_publisher
 def refresh_user_vector_index(
@@ -6708,21 +6656,6 @@ def _load_access_index_blob(user_id: str) -> Optional[LexicalIndexSnapshot]:
         return None
 
 
-def _serialize_access_index(snapshot: LexicalIndexSnapshot) -> bytes:
-    payload = {
-        'userId': snapshot.user_id,
-        'sourceVersion': snapshot.source_version,
-        'schemaVersion': snapshot.schema_version,
-        'updatedAt': snapshot.updated_at,
-        'rowCount': len(snapshot.rows),
-        'rows': snapshot.rows,
-    }
-    with perf_instrumentation.span('index.serialize', rows=len(snapshot.rows)):
-        raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), default=str).encode('utf-8')
-        out = gzip.compress(raw, compresslevel=6)
-    perf_instrumentation.log_event('index_serialized', rows=len(snapshot.rows), raw_mb=round(len(raw) / 1048576, 1), gz_mb=round(len(out) / 1048576, 1))
-    return out
-
 
 def _access_index_row(entity: Dict) -> Optional[Dict[str, object]]:
     filename = str(entity.get('RowKey') or '').strip()
@@ -9013,12 +8946,6 @@ def vector_search_candidates(user_id: str, query_embedding: List[float], top_k: 
     return results
 
 
-def prime_user_vector_index(user_id: str) -> None:
-    try:
-        get_user_vector_index(user_id)
-    except Exception:
-        pass
-
 
 def get_or_create_metadata(user_id: str, filename: str) -> Dict:
     _require_context()
@@ -9383,22 +9310,6 @@ def _client_source_provenance(value) -> Dict:
             provenance[field] = min(parsed, 10 * 1024 * 1024 * 1024 if field.endswith('Bytes') else 100000)
     return provenance
 
-
-def _thumbnail_matches_source(source_bytes: bytes, thumbnail_bytes: bytes, source_kind: str) -> bool:
-    if not source_bytes or not thumbnail_bytes:
-        return False
-    expected_source = source_bytes
-    if str(source_kind or '').strip() == 'raw_embedded_jpeg':
-        preview = extract_raw_preview_bytes(source_bytes)
-        if not preview:
-            return False
-        expected_source = preview
-    try:
-        expected_thumbnail = compute_file_hash(create_thumbnail_data(expected_source))
-        actual_thumbnail = compute_file_hash(thumbnail_bytes)
-    except Exception:
-        return False
-    return expected_thumbnail == actual_thumbnail
 
 
 def _filename_extension(filename: str) -> str:

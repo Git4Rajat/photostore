@@ -17,7 +17,6 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
-    "face:calibrate": "node scripts/calibrate-face-folder.mjs",
     "postinstall": "node -e \"const fs=require('fs'); const path=require('path'); const target=path.join(process.cwd(),'node_modules','protobufjs','cli','node_modules','underscore','underscore-min.js'); fs.mkdirSync(path.dirname(target),{recursive:true}); fs.writeFileSync(target,'module.exports = {};\\n');\""
   },
   "dependencies": {

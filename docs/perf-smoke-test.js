@@ -155,10 +155,8 @@
   const ids1 = await call('photos idsOnly (select all, 5000)', 'GET', `${API}/api/photos?sort=name&idsOnly=1&limit=5000&offset=0`);
   if (ids1.json && ids1.json.hasMore) await call('photos idsOnly page 2', 'GET', `${API}/api/photos?sort=name&idsOnly=1&limit=5000&offset=5000`);
   await call('photos sort=rating', 'GET', `${API}/api/photos?sort=rating&limit=48&offset=0&directMedia=1`);
-  await call('photos filter rating>=3', 'GET', `${API}/api/photos/filter?minRating=3&limit=48&offset=0`);
   await call('timeline', 'GET', `${API}/api/photos/timeline`);
   await call('explore', 'GET', `${API}/api/explore`);
-  await call('processing-status', 'GET', `${API}/api/photos/processing-status`);
 
   const photos = ((p1.json && p1.json.photos) || []);
   const names = photos.map((p) => p.filename).filter(Boolean);

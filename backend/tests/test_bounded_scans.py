@@ -105,16 +105,6 @@ def test_trash_membership_scan_transfers_only_trashed_rows_and_the_page_is_read_
     assert "processing_state eq 'deleted'" in query and 'deletedAt' in kwargs['select'] and 'photoEmbedding' not in kwargs['select']
 
 
-def test_corrupted_uploads_filters_on_the_server_and_projects(monkeypatch):
-    table = _RecordingTable(lambda: iter([{'RowKey': 'bad.jpg', 'verification_status': 'failed', 'verification_error': 'decode error'}]))
-    _install(monkeypatch, table)
-    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
-    payload = _call(upload.list_corrupted_uploads, '/api/uploads/corrupted')
-    assert 'bad.jpg' in str(payload)
-    query, kwargs = table.calls[0]
-    assert "verification_status eq 'failed'" in query and 'corrupted eq true' in query
-    assert 'verification_error' in kwargs['select'] and 'ocrText' not in kwargs['select']
-
 
 def test_smart_albums_stream_a_narrow_projection(monkeypatch):
     rows = [{'RowKey': f'p{i}.jpg', 'locationCity': 'Paris', 'locationCountry': 'France', 'uploadDate': '2020-01-01T00:00:00+00:00'}

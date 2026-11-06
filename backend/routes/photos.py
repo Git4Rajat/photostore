@@ -400,47 +400,6 @@ def proxy_raw_full_preview(filename: str):
     response.headers['Cache-Control'] = 'private, max-age=3600'
     return response
 
-@photos_bp.route('/api/photos/cover/<path:filename>', methods=['GET'])
-def proxy_cover(filename: str):
-    """Serve a face cover crop from the 'cover' container.
-
-    Cover blobs are named '<sha256(user_id)[:16]>/<face_id>.jpg' (see face_crop),
-    so the filename here is a two-segment blob path, not a photo filename. We
-    validate the user-hash prefix against the caller so covers can't be read
-    across accounts, then stream the bytes.
-    """
-    user_id, error = app._require_user_id()
-    if error:
-        return error
-
-    parts = filename.split('/')
-    if len(parts) != 2:
-        return app.jsonify({'error': 'Invalid cover path'}), 400
-    user_hash, leaf = parts
-    expected_hash = app.hashlib.sha256(user_id.encode('utf-8')).hexdigest()[:16]
-    if user_hash != expected_hash:
-        return app.jsonify({'error': 'Not found'}), 404
-    if not app._is_safe_path_segment(leaf):
-        return app.jsonify({'error': 'Invalid cover path'}), 400
-    safe_leaf = leaf
-
-    cover_blob = f'{user_hash}/{safe_leaf}'
-    try:
-        props = app.get_media_properties('cover', cover_blob)
-        content_type = props.get('content_type') or 'image/jpeg'
-        return app._stream_media_response(
-            'cover',
-            cover_blob,
-            content_type=content_type,
-            cache_control='private, max-age=3600',
-            content_length=props.get('size'),
-        )
-    except Exception as e:
-        if '404' in str(e) or 'ResourceNotFound' in str(e) or 'does not exist' in str(e).lower():
-            return app.jsonify({'error': 'File not found in storage'}), 404
-        print(f"Unexpected error serving cover for {cover_blob}: {str(e)}", flush=True)
-        return app.jsonify({'error': 'Failed to retrieve cover'}), 503
-
 @photos_bp.route('/photos', methods=['GET'])
 @photos_bp.route('/photos/', methods=['GET'])
 @photos_bp.route('/api/photos', methods=['GET'])
@@ -589,45 +548,6 @@ def photo_date_position():
         search_db.report_failure(db, exc)
         return app.jsonify({'error': 'Unable to read photo metadata.', 'retryable': True}), 503
     return app.jsonify({'offset': offset, 'filename': filename, 'total': total})
-
-@photos_bp.route('/photos/processing-status', methods=['GET'])
-@photos_bp.route('/photos/processing-status/', methods=['GET'])
-@photos_bp.route('/api/photos/processing-status', methods=['GET'])
-@photos_bp.route('/api/photos/processing-status/', methods=['GET'])
-def photos_processing_status():
-    """Point-lookup refresh for the gallery's processing-status poller
-    (PhotoGallery.tsx) -- lets the "processing on server" tile icon update
-    without re-fetching/relisting the whole page. Bounded to a small explicit
-    filename list, not a scan."""
-    user_id, error = app._require_user_id()
-    if error:
-        return error
-    raw_filenames = app.request.args.get('filenames', '')
-    filenames = [
-        f for f in (app._validate_media_filename(name.strip()) for name in raw_filenames.split(',') if name.strip()) if f
-    ][:100]
-    statuses: app.Dict[str, app.Dict] = {}
-    for filename in filenames:
-        entity = app._get_metadata_entity(user_id, filename)
-        if entity is None or entity.get('processing_state') == 'deleted':
-            continue
-        statuses[filename] = {
-            'preview': entity.get('preview_status'),
-            'thumbnail': entity.get('thumbnail_status'),
-            'exif': entity.get('exif_status'),
-            'ocr': entity.get('ocr_status'),
-            'face': entity.get('face_status'),
-            'aiVision': entity.get('ai_vision_status'),
-            'mapDetection': entity.get('map_detection_status'),
-            'activeWorker': app._active_processing_worker(entity),
-        }
-        # Additive: why each non-'done' step ended where it did, so a
-        # 'failed'/'no_data' tile is self-explaining instead of needing a
-        # server-side dig. Omitted entirely when nothing to report.
-        reasons = app._processing_step_reasons(entity)
-        if reasons:
-            statuses[filename]['reasons'] = reasons
-    return app.jsonify({'statuses': statuses})
 
 @photos_bp.route('/photos/lookup/<path:filename>', methods=['GET'])
 @photos_bp.route('/photos/lookup/<path:filename>/', methods=['GET'])
@@ -1054,16 +974,6 @@ def search_photos():
         response_payload['indexPartial'] = True   # first build still running: more photos will appear
     return app.jsonify(response_payload)
 
-@photos_bp.route('/api/photos/search-index', methods=['GET'])
-def photos_search_index():
-    # Retired: search runs on the backend (/api/photos/search over the SQLite
-    # search database), so browsers no longer download a search index. Kept as a
-    # cheap stub so already-open/cached clients stop quietly instead of erroring.
-    user_id, error = app._require_user_id()
-    if error:
-        return error
-    return app.jsonify({'available': False, 'retired': True})
-
 @photos_bp.route('/api/photos/sort-index', methods=['GET'])
 def photos_sort_index():
     # Hands the browser a direct SAS URL to the per-user sort-index blob
@@ -1206,43 +1116,6 @@ def photos_index_status():
                 queues[label] = f'error: {type(exc).__name__}'
         payload['diagnostics'] = {'processingMode': app.PROCESSING_MODE, 'queues': queues}
     return app.jsonify(payload)
-
-@photos_bp.route('/photos/metadata', methods=['POST'])
-@photos_bp.route('/photos/metadata/', methods=['POST'])
-@photos_bp.route('/api/photos/metadata', methods=['POST'])
-@photos_bp.route('/api/photos/metadata/', methods=['POST'])
-def photos_metadata():
-    user_id, error = app._require_user_id()
-    if error:
-        return error
-
-    data = app.request.get_json(silent=True) or {}
-    filenames = data.get('filenames', [])
-    if not isinstance(filenames, list):
-        return app.jsonify({'error': 'Invalid request'}), 400
-
-    metadata = {}
-    for filename in filenames:
-        safe_name = app._validate_media_filename(filename)
-        if not safe_name:
-            metadata[filename] = {'error': 'Invalid filename'}
-            continue
-
-        row = app._get_metadata_entity(user_id, safe_name)
-        if not row:
-            metadata[filename] = {'error': 'Not found'}
-            continue
-
-        try:
-            props = app.get_media_properties('image', app._blob_name_from_metadata(row, safe_name))
-            metadata[filename] = {
-                'size': props.get('size'),
-                'lastModified': props.get('last_modified').isoformat() if props.get('last_modified') else None,
-            }
-        except Exception:
-            metadata[filename] = {'error': 'Not found'}
-
-    return app.jsonify(metadata)
 
 def _parse_filenames_request():
     """Shared body parsing for the trash-family endpoints: {filenames: [...]}
@@ -1691,57 +1564,4 @@ def get_photo_metadata(filename: str):
         })
     except Exception as e:
         app.app.logger.exception('get_photo_metadata failed')
-        return app.jsonify({'error': 'Internal server error'}), 500
-
-@photos_bp.route('/photos/filter', methods=['GET'])
-@photos_bp.route('/photos/filter/', methods=['GET'])
-@photos_bp.route('/api/photos/filter', methods=['GET'])
-@photos_bp.route('/api/photos/filter/', methods=['GET'])
-def filter_photos():
-    user_id, error = app._require_user_id()
-    if error:
-        return error
-
-    try:
-        min_rating = int(app.request.args.get('minRating', 0))
-        min_likes = int(app.request.args.get('minLikes', 0))
-        latitude = app.request.args.get('latitude', '')
-        longitude = app.request.args.get('longitude', '')
-        radius_km = float(app.request.args.get('radius', 0))
-        offset = int(app.request.args.get('offset', 0))
-        limit = int(app.request.args.get('limit', 24))
-    except ValueError:
-        return app.jsonify({'error': 'Invalid filter parameters'}), 400
-
-    capture_start, capture_end = app._parse_capture_range_args()
-
-    db = app._open_library_db(user_id)
-    if db is None:
-        if _library_has_metadata_rows(user_id) is False:
-            return app.jsonify({'photos': [], 'total': 0, 'offset': offset, 'limit': limit})
-        return app.jsonify({'photos': [], 'total': 0, 'offset': offset, 'limit': limit, 'indexBuilding': True})
-
-    try:
-        # Rating/likes/date/location filtering + ordering (rating -> likes ->
-        # recency -> filename, stable across loads) run as SQL over the local
-        # database; photos with unusable coordinates pass the location filter.
-        user_lat = user_lon = None
-        if latitude and longitude:
-            try:
-                user_lat, user_lon = float(latitude), float(longitude)
-            except ValueError:
-                user_lat = user_lon = None
-        filenames, total = db.filter_page(
-            min_rating=min_rating, min_likes=min_likes, offset=offset, limit=limit,
-            capture_start_day=app._day_ordinal(capture_start), capture_end_day=app._day_ordinal(capture_end),
-            latitude=user_lat, longitude=user_lon, radius_degrees=radius_km * 0.01,
-        )
-        fetched = app._get_metadata_entities(user_id, filenames)
-        pairs = [(name, fetched[name]) for name in filenames if fetched.get(name) and fetched[name].get('processing_state') != 'deleted']
-        pid_to_name, _ = app._load_people_name_index(user_id)
-        photos = app._build_photo_summaries_page(user_id, pairs, pid_to_name)
-
-        return app.jsonify({'photos': photos, 'total': total, 'offset': offset, 'limit': limit})
-    except Exception as e:
-        app.app.logger.exception('filter_photos failed')
         return app.jsonify({'error': 'Internal server error'}), 500

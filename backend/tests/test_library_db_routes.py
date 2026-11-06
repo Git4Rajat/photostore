@@ -13,7 +13,7 @@ import pytest
 import app
 import ordering_utils
 import search_db
-from routes.photos import filter_photos, list_photos, photo_date_position
+from routes.photos import list_photos, photo_date_position
 from tests.fakes import FakeTable
 
 
@@ -144,23 +144,14 @@ def test_list_route_drops_photos_deleted_since_the_index_was_built(monkeypatch, 
     assert first[0] not in names and len(names) == 2
 
 
-def test_filter_route_uses_sql_and_reports_total(monkeypatch, built):
-    db, rows = built
-    _wire(monkeypatch, db)
-    payload = _get(filter_photos, '/api/photos/filter?minRating=3&minLikes=1&offset=0&limit=5')
-    expected = _reference_filter(rows, 3, 1)
-    assert payload['total'] == len(expected)
-    assert [p['filename'] for p in payload['photos']] == expected[:5]
 
-
-def test_list_and_filter_report_index_building_when_no_database_yet(monkeypatch):
+def test_list_reports_index_building_when_no_database_yet(monkeypatch):
     table = FakeTable()
     table.upsert_entity({'PartitionKey': 'owner', 'RowKey': 'p1.jpg'})
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
     monkeypatch.setattr(app, '_open_library_db', lambda uid: None)
     monkeypatch.setattr(app, 'metadata_table_client', table)
     assert _get(list_photos, '/api/photos')['indexBuilding'] is True
-    assert _get(filter_photos, '/api/photos/filter')['indexBuilding'] is True
 
 
 def test_missing_database_routes_settle_empty_library_without_building(monkeypatch):
@@ -169,37 +160,11 @@ def test_missing_database_routes_settle_empty_library_without_building(monkeypat
     monkeypatch.setattr(app, 'metadata_table_client', FakeTable())
 
     listed = _get(list_photos, '/api/photos')
-    filtered = _get(filter_photos, '/api/photos/filter?offset=3&limit=9')
     positioned = _get(photo_date_position, '/api/photos/date-position?date=2026-10-08')
 
     assert listed == {'photos': [], 'total': 0}
-    assert filtered == {'photos': [], 'total': 0, 'offset': 3, 'limit': 9}
     assert positioned == {'offset': 0, 'filename': '', 'total': 0}
 
-
-def test_on_this_day_picks_the_best_past_year_from_sql(monkeypatch, tmp_path):
-    now = datetime.now(timezone.utc)
-    def row(i, year):
-        return {'RowKey': f'p{i}.jpg', 'uploadDate': f'{year:04d}-{now.month:02d}-{now.day:02d}T08:00:00+00:00'}
-    rows = [row(1, 2019), row(2, 2019), row(3, 2019), row(4, 2021), {'RowKey': 'today.jpg', 'uploadDate': now.isoformat()}]
-    path = str(tmp_path / 'otd.sqlite')
-    search_db.build_database(rows, path)
-    monkeypatch.setattr(search_db, 'open_database', lambda uid, **k: search_db.SearchDatabase(path))
-    monkeypatch.setattr(app, '_cached_metadata_list_rows_for_user', lambda *a, **k: (_ for _ in ()).throw(AssertionError('no listing')))
-    suggestion = app._compute_on_this_day_suggestion('owner')
-    assert suggestion['id'] == f'on_this_day:2019-{now.month:02d}-{now.day:02d}' and '3 photos' in suggestion['subtitle']
-    monkeypatch.setattr(search_db, 'open_database', lambda uid, **k: None)
-    assert app._compute_on_this_day_suggestion('owner') is None
-
-
-def test_typeahead_completes_places_from_the_database_vocabulary(monkeypatch, tmp_path):
-    path = str(tmp_path / 't.sqlite')
-    search_db.build_database([{'RowKey': 'a.jpg', 'locationCity': 'Lisbon', 'locationCountry': 'Portugal', 'uploadDate': '2020-01-01T00:00:00+00:00'}], path)
-    monkeypatch.setattr(search_db, 'open_database', lambda uid, **k: search_db.SearchDatabase(path))
-    monkeypatch.setattr(app, '_load_people_name_index', lambda uid: ({'p1': 'Liam'}, {}))
-    monkeypatch.setattr(app, '_cached_metadata_list_rows_for_user', lambda *a, **k: (_ for _ in ()).throw(AssertionError('no listing')))
-    labels = {(s['type'], s['label']) for s in app._search_typeahead_suggestions('owner', 'li')}
-    assert ('person', 'Liam') in labels and ('place', 'Lisbon') in labels
 
 
 def test_point_reads_mode_never_uses_the_or_filter_query(monkeypatch):

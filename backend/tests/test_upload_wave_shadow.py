@@ -3,11 +3,11 @@ import json
 from unittest.mock import Mock
 
 import pytest
-from azure.core.exceptions import AzureError, ResourceNotFoundError
+from azure.core.exceptions import AzureError
 
 import app
-from upload_waves import Conflict, ShadowWaves
-from upload_wave_shadow import STEPS, compare_against_legacy, observe_source, reconcile_page, resolve_source, source_identity
+from upload_waves import ShadowWaves
+from upload_wave_shadow import STEPS, observe_source, reconcile_page, resolve_source, source_identity
 from tests.test_upload_waves import AtomicTable, close, finish_scan
 
 
@@ -233,41 +233,7 @@ def test_client_complete_flag_does_not_settle_pending_source(api):
     assert client.post(ROOT + '/' + wave + '/evaluate', json={'complete': True}).json['state'] == 'processing'
 
 
-def test_compare_against_legacy_reports_counts_and_barrier_wait(source_world):
-    store, table, wave, _ = source_world
-    store.clock = lambda: 1000.0
-    reconcile_page(store, wave, table, table, lambda *a: [])
-    finish_scan(store, wave)
-    result = compare_against_legacy(store, wave)
-    assert result['waveId'] == wave and result['state'] == 'ready'
-    assert result['memberCount'] == 1 and result['settledMemberCount'] == 1
-    # source_world's row has no real processingRevision, so source_identity
-    # falls back to the legacy hash proxy -- unqualified evidence.
-    assert result['qualifiedMemberCount'] == 0
-    assert result['barrierAt'] == 1000.0
-    assert result['extraWaitSecondsMin'] == result['extraWaitSecondsMax'] == 0.0
 
-
-def test_compare_against_legacy_reports_qualified_members_and_nonzero_wait(source_world):
-    store, table, wave, member = source_world
-    table.rows['library-A', 'original.jpg']['processingRevision'] = member['processingRevision']
-    observed_at = [100.0]
-    store.clock = lambda: observed_at[0]
-    reconcile_page(store, wave, table, table, lambda *a: [])
-    observed_at[0] = 142.0
-    finish_scan(store, wave)
-    result = compare_against_legacy(store, wave)
-    assert result['qualifiedMemberCount'] == 1
-    assert result['barrierAt'] == 142.0
-    assert result['extraWaitSecondsMin'] == result['extraWaitSecondsMax'] == 42.0
-
-
-def test_compare_against_legacy_rejects_unknown_or_foreign_wave(source_world):
-    store, table, wave, _ = source_world
-    with pytest.raises(Conflict):
-        compare_against_legacy(store, 'no-such-wave')
-    with pytest.raises(Conflict):
-        compare_against_legacy(ShadowWaves(table, 'library-B'), wave)
 
 
 @pytest.fixture
@@ -285,22 +251,6 @@ def test_compare_route_disabled_returns_404(tools_api, monkeypatch):
     monkeypatch.delenv('UPLOAD_WAVE_SHADOW_ENABLED')
     assert client.get('/api/tools/waves/shadow/some-wave/compare').status_code == 404
 
-
-def test_compare_route_returns_diagnostic_for_a_ready_wave(tools_api):
-    client, table, _ = tools_api
-    store = ShadowWaves(table, 'library-A')
-    row = store.open_session('p', 1)
-    store.register('p', [{'itemId': 'i', 'filename': 'a.jpg'}])
-    resolved = store.resolve('p', 'i', outcome='accepted', photo_id='photo-1',
-                             processing_revision='rev-1', filename='a.jpg', required_steps=['face'])
-    close(store, 'p', resolved)
-    wave = row['waveId']
-    store.observe(wave, 'photo-1', 'rev-1', outcome='settled', evidence_id='e')
-    finish_scan(store, wave)
-    response = client.get(f'/api/tools/waves/shadow/{wave}/compare')
-    assert response.status_code == 200
-    assert response.json['waveId'] == wave and response.json['state'] == 'ready'
-    assert response.headers['Cache-Control'] == 'no-store'
 
 
 def test_compare_route_cannot_read_another_librarys_wave(tools_api):

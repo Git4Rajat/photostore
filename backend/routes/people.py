@@ -16,31 +16,6 @@ import app
 
 people_bp = Blueprint('people', __name__)
 
-@people_bp.route('/api/persons/cluster', methods=['POST'])
-def trigger_clustering():
-    try:
-        user_id, error = app._require_user_id()
-        if error:
-            return error
-        if not app._people_features_available():
-            return app.jsonify({'error': 'People features not configured'}), 503
-        data = app.request.get_json(silent=True) or {}
-        eps, min_samples = app._resolve_people_cluster_job_params(data.get('eps', app.PEOPLE_CLUSTER_EPS), data.get('minSamples', 2))
-        queued = app._enqueue_clustering_job(
-            user_id,
-            job_type='people_cluster',
-            payload={'eps': eps, 'minSamples': min_samples},
-        )
-        response = app._clustering_queue_response(queued, eps=eps, minSamples=min_samples)
-        if queued.get('status') == 'unavailable':
-            return app.jsonify(response), 503
-        if queued.get('status') == 'failed':
-            return app.jsonify(response), 500
-        return app.jsonify(response)
-    except Exception as exc:
-        app.app.logger.exception('People clustering endpoint failed')
-        return app.jsonify({'error': 'People clustering failed'}), 500
-
 @people_bp.route('/api/persons/index', methods=['GET'])
 def people_index():
     # Hands the browser a direct SAS URL to the per-user people-index blob
@@ -1168,41 +1143,13 @@ def people_diagnostic():
                     rejected_faces, suspicious_faces, stale_embedding_version_faces, no_embedding_faces,
                 ) if accepted_faces == 0
                 else 'Clustering queue not available; check BROWSER_ONLY_PROCESSING.' if not clustering_available
-                else f'Trigger clustering with POST /api/people/assign-unclustered or POST /api/people/recluster (with repair confirmation).' if unassigned_faces > 0 or len(people) == 0
+                else 'Trigger clustering with POST /api/people/assign-unclustered.' if unassigned_faces > 0 or len(people) == 0
                 else f'All {accepted_faces} faces already assigned to people.'
             ),
         })
     except Exception as exc:
         app.app.logger.exception('People diagnostic failed')
         return app.jsonify({'error': 'Diagnostic failed'}), 500
-
-@people_bp.route('/people/recluster', methods=['POST'])
-@people_bp.route('/api/people/recluster', methods=['POST'])
-def recluster_people():
-    try:
-        user_id, error = app._require_user_id()
-        if error:
-            return error
-        if not app._people_features_available():
-            return app.jsonify({'error': 'People features not configured'}), 503
-        data = app.request.get_json(silent=True) or {}
-        if data.get('repair') is not True or data.get('confirm') != 'RECLUSTER_REPAIR':
-            return app.jsonify({'error': 'repair confirmation required', 'code': 'protected_repair_required'}), 403
-        queued = app._enqueue_clustering_job(
-            user_id,
-            force=False,
-            job_type='people_recluster',
-            allow_reassign_confirmed=app._coerce_bool(data.get('allowReassignConfirmed', False)),
-        )
-        response = app._clustering_queue_response(queued)
-        if queued.get('status') == 'unavailable':
-            return app.jsonify(response), 503
-        if queued.get('status') == 'failed':
-            return app.jsonify(response), 500
-        return app.jsonify(response)
-    except Exception as exc:
-        app.app.logger.exception('People recluster route failed')
-        return app.jsonify({'error': 'People recluster failed'}), 500
 
 @people_bp.route('/api/people/assign-unclustered', methods=['POST'])
 @people_bp.route('/people/assign-unclustered', methods=['POST'])

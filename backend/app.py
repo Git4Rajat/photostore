@@ -584,16 +584,6 @@ CONFIG_TABLE = os.getenv('CONFIG_TABLE', 'photostoreconfig')
 # replicas — set it explicitly (a Container App secret) in production.
 SESSION_SECRET = os.getenv('SESSION_SECRET', '') or secrets.token_hex(32)
 SESSION_TTL_SECONDS = int(os.getenv('SESSION_TTL_SECONDS', str(30 * 24 * 3600)))
-# Server-side /photos/search is FROZEN by default (2026-09-30). It loads the
-# full per-user lexical index into this process to score candidates and runs a
-# CLIP text-embedding encode inline -- genuinely heavy work that repeatedly
-# OOM-ed the 1Gi backend. Client-side search (localSearchIndex.ts, which
-# downloads the same lexical blob and runs the identical lexical + CLIP scoring
-# in the browser) is the real search path; the server route was only ever a
-# fallback for before the client index finished downloading. Frozen to a cheap
-# empty result instead of doing that work on the backend. Set
-# SERVER_SEARCH_ENABLED=1 to re-enable (only on a backend tier sized for it).
-SERVER_SEARCH_ENABLED = os.getenv('SERVER_SEARCH_ENABLED', '0').strip().lower() in ('1', 'true', 'yes', 'on')
 # Base URL of the web app, used to build password-reset links in emails.
 PUBLIC_APP_BASE_URL = os.getenv('PUBLIC_APP_BASE_URL', '').strip() or SPA_BASE_URL
 # Base URL of the 'archive' role (public_bp lives there, not on 'core' -- see
@@ -2395,13 +2385,6 @@ def _thumbnail_url_from_metadata(metadata: Dict, filename: str) -> str:
         return ''
     return make_media_url(filename, 'thumbnail', blob_name=_derivative_blob_from_metadata(metadata, filename, 'thumbnail'))
 
-
-def _private_photo_media_urls(filename: str, metadata: Optional[Dict] = None) -> Dict[str, str]:
-    blob_name = _blob_name_from_metadata(metadata, filename)
-    return {
-        'url': make_media_url(filename, 'image', blob_name=blob_name),
-        'thumbnailUrl': make_media_url(filename, 'thumbnail', blob_name=_derivative_blob_from_metadata(metadata, filename, 'thumbnail')),
-    }
 
 
 def _photo_people_list(metadata: Dict, pid_to_name: Optional[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -4404,32 +4387,6 @@ def _enqueue_processing_steps(
     return results
 
 
-def _count_processing_statuses(user_id: str, steps: List[str]) -> Dict[str, Dict[str, int]]:
-    counts = {step: {'queued': 0, 'pending': 0, 'running': 0, 'failed': 0, 'no_data': 0} for step in steps}
-    if metadata_table_client is None:
-        return counts
-    try:
-        max_rows = int(os.getenv('PROCESSING_STATUS_MAX_ROWS', '1000'))
-        fields = [f'{step}_status' for step in steps]
-        rows_iter = metadata_table_client.query_entities(
-            f"PartitionKey eq '{_escape_odata(user_id)}'",
-            select=fields,
-        )
-    except Exception:
-        return counts
-    try:
-        for idx, row in enumerate(rows_iter):
-            if idx >= max_rows:
-                break
-            for step in steps:
-                field = f'{step}_status'
-                status = str(row.get(field) or '').lower()
-                if status in counts[step]:
-                    counts[step][status] += 1
-    except Exception:
-        return counts
-    return counts
-
 
 # Short-TTL cache + coalescing for full metadata scans. Listing endpoints
 # (/photos, search, filter, …) each scan the user's entire metadata partition;
@@ -6043,21 +6000,6 @@ def _dedupe_face_ids_preserving_order(face_ids: List[str]) -> List[str]:
     return list(dict.fromkeys([str(face_id) for face_id in face_ids if face_id]))
 
 
-def _remove_filename_from_albums(user_id: str, filename: str) -> None:
-    if albums_table_client is None:
-        return
-    try:
-        rows = list(albums_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
-    except Exception:
-        rows = []
-    for row in rows:
-        if not album_store.remove(row, [filename]):
-            continue
-        try:
-            albums_table_client.upsert_entity(row)
-        except Exception:
-            pass
-
 
 def _prepare_existing_people_match(existing_people: Optional[List[Dict]], np=None) -> Dict[str, object]:
     if not existing_people:
@@ -6987,118 +6929,6 @@ def _create_people_repair_snapshot(
         })
     return snapshot_id
 
-
-def _load_people_repair_snapshot(user_id: str, snapshot_id: str) -> Optional[Dict]:
-    if merge_table_client is None or not snapshot_id:
-        return None
-    try:
-        manifest = merge_table_client.get_entity(partition_key=user_id, row_key=snapshot_id)
-    except Exception:
-        return None
-    if not str(manifest.get('kind') or '').endswith('_snapshot'):
-        return None
-    try:
-        chunk_count = int(manifest.get('chunkCount') or 0)
-    except Exception:
-        chunk_count = 0
-    parts = []
-    for index in range(chunk_count):
-        try:
-            chunk = merge_table_client.get_entity(partition_key=user_id, row_key=f'{snapshot_id}:chunk:{index}')
-            parts.append(str(chunk.get('payload') or ''))
-        except Exception:
-            return None
-    try:
-        return json.loads(''.join(parts))
-    except Exception:
-        return None
-
-
-def _restore_people_repair_snapshot(user_id: str, snapshot_id: str) -> Dict:
-    payload = _load_people_repair_snapshot(user_id, snapshot_id)
-    if payload is None:
-        return {'success': False, 'error': 'snapshot not found'}
-
-    try:
-        for row in person_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"):
-            person_table_client.delete_entity(partition_key=user_id, row_key=row.get('RowKey'))
-    except Exception:
-        pass
-
-    restored_people = 0
-    for row in payload.get('people') or []:
-        if row.get('PartitionKey') == user_id and row.get('RowKey'):
-            try:
-                person_table_client.upsert_entity(row)
-                restored_people += 1
-            except Exception:
-                pass
-
-    snapshot_faces = {
-        str(row.get('RowKey')): row
-        for row in (payload.get('faces') or [])
-        if row.get('PartitionKey') == user_id and row.get('RowKey')
-    }
-    restored_faces = 0
-    try:
-        current_faces = list(face_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
-    except Exception:
-        current_faces = []
-    seen_face_ids = set()
-    for face in current_faces:
-        face_id = str(face.get('RowKey') or '')
-        if face_id:
-            seen_face_ids.add(face_id)
-        snapshot_face = snapshot_faces.get(face_id)
-        if snapshot_face:
-            for key in ('personId', 'confirmedByUser', 'confidence'):
-                if key in snapshot_face:
-                    face[key] = snapshot_face[key]
-                else:
-                    face.pop(key, None)
-            restored_faces += 1
-        else:
-            face.pop('personId', None)
-            face.pop('confirmedByUser', None)
-        try:
-            face_table_client.upsert_entity(face)
-        except Exception:
-            pass
-    for face_id, snapshot_face in snapshot_faces.items():
-        if face_id in seen_face_ids:
-            continue
-        try:
-            face_table_client.upsert_entity(snapshot_face)
-            restored_faces += 1
-        except Exception:
-            pass
-
-    metadata_people = {
-        str(row.get('RowKey')): row.get('peopleIds', '[]')
-        for row in (payload.get('metadata') or [])
-        if row.get('PartitionKey') == user_id and row.get('RowKey')
-    }
-    restored_metadata = 0
-    try:
-        current_metadata = list(metadata_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
-    except Exception:
-        current_metadata = []
-    for metadata in current_metadata:
-        row_key = str(metadata.get('RowKey') or '')
-        metadata['peopleIds'] = metadata_people.get(row_key, json.dumps([]))
-        try:
-            metadata_table_client.upsert_entity(metadata)
-            restored_metadata += 1
-        except Exception:
-            pass
-
-    return {
-        'success': True,
-        'snapshotId': snapshot_id,
-        'restoredPeople': restored_people,
-        'restoredFaces': restored_faces,
-        'restoredMetadata': restored_metadata,
-    }
 
 
 def _build_people_recluster_plan(user_id: str, *, allow_reassign_confirmed: bool = False) -> Dict:
@@ -8320,17 +8150,6 @@ def _people_features_available() -> bool:
     return face_table_client is not None and person_table_client is not None and merge_table_client is not None
 
 
-def _pick_merge_target(candidate_a: Dict, candidate_b: Dict) -> Dict:
-    name_a = str(candidate_a.get('name') or '').strip()
-    name_b = str(candidate_b.get('name') or '').strip()
-    if bool(name_a) != bool(name_b):
-        return candidate_a if name_a else candidate_b
-    count_a = int(candidate_a.get('faceCount') or 0)
-    count_b = int(candidate_b.get('faceCount') or 0)
-    if count_a != count_b:
-        return candidate_a if count_a > count_b else candidate_b
-    return candidate_a if str(candidate_a.get('personId')) <= str(candidate_b.get('personId')) else candidate_b
-
 
 FACE_SUMMARY_COLUMNS = [
     'RowKey',
@@ -9346,136 +9165,6 @@ storage_utils_module.PEOPLE_EMBEDDING_MODEL_VERSION_HOOK = lambda: FACE_CLUSTER_
 SUGGESTION_UNNAMED_FACE_THRESHOLD = int(os.getenv('SUGGESTION_UNNAMED_FACE_THRESHOLD', '10'))
 
 
-def _compute_unnamed_person_suggestion(user_id: str) -> Optional[Dict]:
-    """Cheapest possible version of list_persons' Phase A pass
-    (routes/people.py:58-112) -- no per-page thumbnail minting, no
-    pagination, just enough to pick one candidate: the unnamed person with
-    the most active faces, above SUGGESTION_UNNAMED_FACE_THRESHOLD."""
-    try:
-        rows, face_by_id = _scan_person_and_face_rows(user_id)
-    except Exception:
-        return None
-    best_person_id = None
-    best_count = 0
-    for row in rows:
-        person_id = str(row.get('RowKey') or '')
-        if not person_id or _person_entity_is_named(row):
-            continue
-        try:
-            face_ids = json.loads(row.get('faceIds', '[]') or '[]')
-        except Exception:
-            face_ids = []
-        active_count = 0
-        for fid in face_ids:
-            face = face_by_id.get(str(fid))
-            if face is None:
-                continue
-            if _face_is_rejected(face) or not _face_is_owned_by_person(face, person_id):
-                continue
-            active_count += 1
-        if active_count > best_count:
-            best_count = active_count
-            best_person_id = person_id
-    if best_person_id is None or best_count < SUGGESTION_UNNAMED_FACE_THRESHOLD:
-        return None
-    return {
-        'id': f'unnamed_person:{best_person_id}',
-        'type': 'unnamed_person',
-        'title': f"{best_count} photos of someone you haven't named",
-        'subtitle': 'Name them so they show up in search and albums.',
-        'actionLabel': 'Name them',
-        'actionHref': f'/people/{best_person_id}',
-    }
-
-
-def _compute_on_this_day_suggestion(user_id: str) -> Optional[Dict]:
-    """Picks whichever past year has the most photos captured on today's
-    month/day -- a GROUP BY over the library's local SQLite database (flat
-    memory), not a pass over a loaded listing."""
-    import search_db
-    try:
-        db = search_db.open_database(user_id)
-    except Exception:
-        return None
-    if db is None:
-        return None
-    today = datetime.now(timezone.utc)
-    matches_by_year: Dict[int, int] = db.on_this_day(today.month, today.day, today.year)
-    if not matches_by_year:
-        return None
-    best_year = max(matches_by_year, key=lambda y: matches_by_year[y])
-    count = matches_by_year[best_year]
-    date_str = f'{best_year:04d}-{today.month:02d}-{today.day:02d}'
-    return {
-        'id': f'on_this_day:{date_str}',
-        'type': 'on_this_day',
-        'title': f'On this day, {best_year}',
-        'subtitle': f"{count} photo{'s' if count != 1 else ''} from {best_year}",
-        'actionLabel': 'View',
-        'actionHref': f'/?captureStart={date_str}&captureEnd={date_str}',
-    }
-
-
-def _search_typeahead_suggestions(user_id: str, partial: str, limit: int = 5) -> List[Dict]:
-    """Live chip disambiguation while typing in Ask -- prefix match (not the
-    full whole-word logic /photos/search uses) against known person names and
-    location terms, so "Li" resolves toward "Lisbon"/"Liam" before the user
-    even hits enter. Location terms are sourced from the already-cached
-    listing (_cached_metadata_list_rows_for_user), not a fresh scan, so this
-    stays cheap on every keystroke."""
-    partial_norm = _normalize_search_phrase(partial)
-    if not partial_norm:
-        return []
-    results: List[Dict] = []
-    seen_labels = set()
-
-    pid_to_name, _ = _load_people_name_index(user_id)
-    for name in sorted(set(pid_to_name.values())):
-        if len(results) >= limit:
-            return results
-        if name in seen_labels:
-            continue
-        if _normalize_search_phrase(name).startswith(partial_norm):
-            results.append({'type': 'person', 'label': name})
-            seen_labels.add(name)
-
-    if len(results) < limit:
-        # Place vocabulary lives in the library's SQLite database (built once per
-        # index build) -- no loaded listing, so this stays cheap per keystroke.
-        try:
-            import search_db
-            db = search_db.open_database(user_id)
-            location_terms = db.location_terms() if db is not None else []
-        except Exception:
-            location_terms = []
-        for term in location_terms:
-            if len(results) >= limit:
-                break
-            if len(term) < 3 or not term.startswith(partial_norm):
-                continue
-            display = _smart_album_title(term)
-            if display in seen_labels:
-                continue
-            results.append({'type': 'place', 'label': display})
-            seen_labels.add(display)
-
-    return results
-
-
-def _compute_suggestions(user_id: str) -> List[Dict]:
-    """Ordered by priority -- the frontend shows only the first one, per the
-    "at most one nudge per session" restraint. Trip/burst detection
-    deliberately isn't here yet -- no home-location or multi-day-windowing
-    concept exists anywhere in this codebase today, that's new algorithmic
-    work for a future pass, not a fit for this lightweight endpoint."""
-    suggestions = []
-    on_this_day = _compute_on_this_day_suggestion(user_id)
-    if on_this_day:
-        suggestions.append(on_this_day)
-    unnamed_person = _compute_unnamed_person_suggestion(user_id)
-    if unnamed_person:
-        suggestions.append(unnamed_person)
-    return suggestions
 
 
 def _public_album_share_meta(entity: Optional[Dict], token: str) -> Dict[str, str]:
@@ -18423,7 +18112,6 @@ from routes.tools import tools_bp
 from routes.admin import admin_bp
 from routes.system import system_bp
 from routes.explore import explore_bp
-from routes.suggestions import suggestions_bp
 from routes.index_events import index_events_bp
 from routes.upload_sessions import upload_sessions_bp
 
@@ -18469,7 +18157,7 @@ else:
     # same-origin /health on core specifically wasn't worth it for zero
     # real memory/CPU savings. people_bp joined this role 2026-10-08; library
     # management joined 2026-11-02, leaving operations/public on archive.
-    for _bp in (auth_bp, photos_bp, albums_bp, system_bp, explore_bp, suggestions_bp, people_bp, library_bp, index_events_bp, upload_sessions_bp):
+    for _bp in (auth_bp, photos_bp, albums_bp, system_bp, explore_bp, people_bp, library_bp, index_events_bp, upload_sessions_bp):
         app.register_blueprint(_bp)
 
 # Every role answers /health (system_bp only exists on the core role; upload has its own), so the
