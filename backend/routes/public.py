@@ -6,11 +6,58 @@ as app.<name> throughout, matching the exact late-binding lookup semantics
 the code relied on when these functions lived in app.py directly, so
 test-time monkeypatching of app.<name> globals still works unchanged).
 """
+import threading
+import time
+from collections import OrderedDict
+
 from flask import Blueprint
 
 import app
 
 public_bp = Blueprint('public', __name__)
+
+# share-preview is unauthenticated and downloads + re-encodes a full original, so
+# bound the work: a small TTL cache of finished previews (crawlers re-fetch the
+# same image repeatedly) and a cap on conversions running at once.
+_SHARE_PREVIEW_CACHE_MAX_BYTES = 32 * 1024 * 1024
+_SHARE_PREVIEW_CACHE_TTL_SECONDS = 600
+_SHARE_PREVIEW_MAX_CONCURRENT = 2
+_share_preview_cache = OrderedDict()
+_share_preview_cache_bytes = 0
+_share_preview_cache_lock = threading.Lock()
+_share_preview_slots = threading.BoundedSemaphore(_SHARE_PREVIEW_MAX_CONCURRENT)
+
+
+def _share_preview_cache_get(key):
+    with _share_preview_cache_lock:
+        item = _share_preview_cache.get(key)
+        if item is None:
+            return None
+        stored_at, data = item
+        if time.monotonic() - stored_at > _SHARE_PREVIEW_CACHE_TTL_SECONDS:
+            _share_preview_evict(key)
+            return None
+        _share_preview_cache.move_to_end(key)
+        return data
+
+
+def _share_preview_evict(key):
+    global _share_preview_cache_bytes
+    item = _share_preview_cache.pop(key, None)
+    if item is not None:
+        _share_preview_cache_bytes -= len(item[1])
+
+
+def _share_preview_cache_put(key, data):
+    global _share_preview_cache_bytes
+    if len(data) > _SHARE_PREVIEW_CACHE_MAX_BYTES // 4:
+        return
+    with _share_preview_cache_lock:
+        _share_preview_evict(key)
+        _share_preview_cache[key] = (time.monotonic(), data)
+        _share_preview_cache_bytes += len(data)
+        while _share_preview_cache_bytes > _SHARE_PREVIEW_CACHE_MAX_BYTES and _share_preview_cache:
+            _share_preview_evict(next(iter(_share_preview_cache)))
 
 @public_bp.route('/public/album/<token>', methods=['GET'])
 def public_album_share_page(token: str):
@@ -221,8 +268,19 @@ def public_photo_share_preview(token: str, filename: str):
     try:
         owner_id = str(entity.get('PartitionKey') or '')
         blob_name = app.resolve_physical_blob_name(owner_id, safe_name, 'image') if owner_id else safe_name
-        image_bytes = app.download_media_bytes('image', blob_name)
-        preview_bytes = app.convert_image_to_jpeg(image_bytes, safe_name)
+        cache_key = (owner_id, blob_name)
+        preview_bytes = _share_preview_cache_get(cache_key)
+        if preview_bytes is None:
+            if not _share_preview_slots.acquire(blocking=False):
+                resp = app.jsonify({'error': 'Preview is busy, retry shortly'})
+                resp.headers['Retry-After'] = '5'
+                return resp, 503
+            try:
+                image_bytes = app.download_media_bytes('image', blob_name)
+                preview_bytes = app.convert_image_to_jpeg(image_bytes, safe_name)
+            finally:
+                _share_preview_slots.release()
+            _share_preview_cache_put(cache_key, preview_bytes)
         resp = app.Response(preview_bytes, mimetype='image/jpeg')
         resp.headers['Cache-Control'] = app._album_media_cache_control(entity, 86400)
         return resp

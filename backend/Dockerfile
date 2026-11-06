@@ -1,5 +1,5 @@
 # Dockerfile for Flask backend (Azure Container Apps)
-FROM mirror.gcr.io/library/python:3.11-slim
+FROM mirror.gcr.io/library/python:3.11-slim@sha256:65bd3d9f1d7fa268dd1909973ba7eb4bdf41f6dcf2cfbe76ba9528b170f3fd79
 
 # Keep container build logs clean when pip runs as root in Docker layers.
 ENV PIP_ROOT_USER_ACTION=ignore \

@@ -224,3 +224,21 @@ class TestDownload:
         self.blobs.clear()
         response = share['client'].post('/public/albums/tok/download', json={})
         assert response.status_code == 404 and response.json['error'] == 'No files could be downloaded'
+
+
+def test_share_preview_cache_is_bounded_and_expires(monkeypatch):
+    from routes import public
+    monkeypatch.setattr(public, '_SHARE_PREVIEW_CACHE_MAX_BYTES', 100)
+    public._share_preview_cache.clear()
+    public._share_preview_cache_bytes = 0
+    public._share_preview_cache_put(('a', 'x'), b'1' * 20)
+    public._share_preview_cache_put(('a', 'y'), b'2' * 20)
+    assert public._share_preview_cache_get(('a', 'x')) == b'1' * 20
+    public._share_preview_cache_put(('a', 'z'), b'3' * 20)
+    public._share_preview_cache_put(('a', 'w'), b'4' * 20)
+    public._share_preview_cache_put(('a', 'v'), b'5' * 20)
+    assert public._share_preview_cache_bytes <= 100
+    assert public._share_preview_cache_put(('a', 'big'), b'6' * 90) is None
+    assert public._share_preview_cache_get(('a', 'big')) is None
+    monkeypatch.setattr(public, '_SHARE_PREVIEW_CACHE_TTL_SECONDS', -1)
+    assert public._share_preview_cache_get(('a', 'v')) is None
