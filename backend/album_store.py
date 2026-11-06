@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import os
-import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Tuple
 
@@ -117,7 +116,6 @@ _MEMBERS = None
 # holding 10,000+ names is ~0.7 MB that every add/remove rewrites and every index rebuild, photo delete and
 # page read has to fetch and parse. Members rows are touched only for the photos that change.
 INLINE_MAX_PHOTOS = int(os.getenv('ALBUM_INLINE_MAX_PHOTOS', '2000'))
-_MEMBER_LOCK = threading.Lock()
 _BATCH = 100
 _EXISTS_CHUNK = 15            # Table Storage allows 15 comparisons in one filter
 _POOL = 8
