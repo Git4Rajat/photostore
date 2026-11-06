@@ -41,7 +41,7 @@ on:
         default: true
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -202,3 +202,26 @@ jobs:
           echo "Download wave-release.json and follow deploy/fresh-wave.md for a new sandbox." >> "$GITHUB_STEP_SUMMARY"
           echo "The artifact binds all three immutable images and the exact wave capability ID." >> "$GITHUB_STEP_SUMMARY"
           echo "For an existing same-protocol library, follow deploy/upgrade-wave.md; no cleanup or re-upload is required." >> "$GITHUB_STEP_SUMMARY"
+
+  # Point the one-click "Deploy to Azure" defaults at this release's immutable
+  # image digests (not :latest), so a new deploy never auto-upgrades later.
+  pin-deploy-defaults:
+    needs: wave-release
+    if: inputs.publish_latest && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: wave-release
+      - name: Pin template image defaults to release digests
+        run: |
+          python3 deploy/pin_images.py wave-release.json
+          rm wave-release.json
+          if git diff --quiet; then echo "Defaults already pinned."; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Pin Deploy to Azure image defaults to release digests"
+          git push

@@ -47,13 +47,13 @@ param emailDataLocation string = 'Europe'
 ])
 param processingMode string = 'backend'
 
-@description('Public core API image. Defaults to :latest for one-click "Deploy to Azure" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run (e.g. :20260806-153045) instead of :latest, so scale-to-zero cold-start restarts keep pulling the exact image you tested rather than whatever :latest has drifted to.')
+@description('Public core API image. Defaults to an immutable @sha256 digest (rewritten by the publish workflow after each qualified release), never :latest, so installs never auto-upgrade. To upgrade an EXISTING deployment, override with the new release digest.')
 param coreImage string = 'ghcr.io/git4rajat/photostore-backend:latest'
 
-@description('Public web (frontend) image. Defaults to :latest for one-click "Deploy to Azure" installs. When upgrading an EXISTING deployment, override with the immutable date-time tag from the publish workflow run instead of :latest, for the same reason as coreImage above.')
+@description('Public web (frontend) image. Defaults to an immutable @sha256 digest, never :latest, same as coreImage above.')
 param webImage string = 'ghcr.io/git4rajat/photostore-frontend:latest'
 
-@description('Public vision (server-side image processing) image. Only pulled/deployed when processingMode is "backend" or "both". Same :latest-vs-pinned-tag guidance as coreImage applies when upgrading an existing deployment.')
+@description('Public vision (server-side image processing) image. Only pulled/deployed when processingMode is "backend" or "both". Same digest-pinning guidance as coreImage applies.')
 param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker:latest'
 
 @description('Quota in GiB for the dedicated clustering FAISS checkpoint SMB share. Local SQLite/work files remain on ephemeral storage.')

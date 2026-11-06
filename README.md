@@ -1,5 +1,21 @@
 # Keepsake
 
+**Your own private photo library, running entirely in your Azure subscription.**
+
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2FGit4Rajat%2Fphotostore%2Fmain%2Fdeploy%2Fazuredeploy.json/createUIDefinitionUri/https%3A%2F%2Fraw.githubusercontent.com%2FGit4Rajat%2Fphotostore%2Fmain%2Fdeploy%2FcreateUiDefinition.json)
+
+## Prerequisites
+
+- **An Azure subscription** where you can deploy at subscription scope (Owner, or Contributor plus permission to create a resource group). The template creates its own resource group (`<appName>-rg` by default), so there's nothing to set up first.
+- **A login email and password** — you choose them in the deploy form; this is how you sign in. No app registrations or admin consent needed.
+- **A working email address** — used for password-reset links and for inviting other members (sent through Azure Communication Services, provisioned for you).
+- **Public container images** — the button pulls prebuilt images from GHCR, so the [Publish images workflow](.github/workflows/publish-images.yml) must have run and the packages must be set to **Public** (relevant if you fork the project).
+- **A modern browser** to use the app. Nothing needs to be installed locally.
+
+For a fresh, wave-enabled library use the [Azure CLI fresh-deployment guide](deploy/fresh-wave.md) instead of the portal button.
+
+## Features
+
 Keepsake is your own private photo library — a place to upload, browse, and
 rediscover your photos without handing them to a big-tech cloud. It runs
 entirely in *your* Azure subscription, so your memories stay yours.
@@ -9,10 +25,6 @@ fast-loading previews, reads text and locations off your pictures, tags what's
 in them, recognizes the people who show up again and again, and lets you search
 your whole library in plain language. You organize the rest into albums — by
 hand or automatically — and share them with a link.
-
-It's open source and self-hostable, licensed under [AGPL-3.0](LICENSE).
-
-## What you can do
 
 - **Browse & upload** your whole library in a fast, responsive gallery, with
   automatic thumbnails and support for both photos and videos.
@@ -33,7 +45,7 @@ Much of the heavy lifting (thumbnails, text extraction, tagging, face
 detection) happens right in your browser, so your photos aren't shipped off to
 a third-party AI service to be understood.
 
-## The main pages
+## Deep dive
 
 ### 📸 Gallery — your whole library
 
@@ -104,107 +116,12 @@ People page you can:
 All face detection and clustering runs in your browser, so faces are recognized
 without sending your photos to an outside service.
 
-## Deploy your own (one click, no coding)
-
-[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2FGit4Rajat%2Fphotostore%2Fmain%2Fdeploy%2Fazuredeploy.json/createUIDefinitionUri/https%3A%2F%2Fraw.githubusercontent.com%2FGit4Rajat%2Fphotostore%2Fmain%2Fdeploy%2FcreateUiDefinition.json)
-
-This provisions the whole app into your own Azure subscription from prebuilt
-public container images — no build step required. The template lives at
-[`deploy/`](deploy/) (`main.bicep` → compiled `azuredeploy.json`).
-
-For a **fresh wave-enabled library**, use the
-[Azure CLI fresh-deployment guide](deploy/fresh-wave.md). It pins all three
-images, seeds the durable capability certificate before owner-library creation,
-then enables execution and enrollment. The portal button does not run that
-bootstrap sequence.
-
-**Updating images on a wave-active deployment is not supported.** Each
-wave-owned library's capability is permanently bound, at enrollment, to the
-exact image digest running on every role (`wave_policy.require_capability` —
-"Library ownership cannot be rebound"). Redeploying `coreImage`, `webImage`,
-or `visionImage` on an existing deployment — even an ordinary bug-fix bump,
-not a deliberate wave change — immediately and permanently fails every
-in-flight wave's next vision/cluster/index attempt with a generic "This app
-deployment is not qualified" conflict, since the deployed image no longer
-matches the sealed certificate. There is currently no tool to re-certify or
-migrate an existing, populated deployment onto new images (`fresh_wave.py`
-explicitly refuses to run against an existing resource group, so it can't be
-reused for this). Until such a tool exists, treat a wave-enabled deployment's
-images as fixed: the only supported way to pick up new code is a fresh
-install via `fresh-wave.md`, not an in-place image update.
-
-The template deploys at **subscription scope** and **creates its own resource
-group** (`<appName>-rg` by default), so you're only asked for a subscription,
-a region, and a few details — no need to pick or create a resource group first.
-
-### Choosing where AI processing runs
-
-OCR, face detection, vision tagging, and geo/reverse-geocoding can each run
-**in your browser**, **on the server** (the default), or **both**. Pick this
-in the deploy form's "Photo processing" dropdown (`processingMode` parameter):
-
-| Mode | What happens |
-| --- | --- |
-| **In your browser** | Legacy processing mode: everything runs client-side. Requires a reasonably capable device; nothing runs until you click "Load browser AI." |
-| **On the server** (default) | The browser skips this AI work. A new `ipworker` container app processes every upload instead — better for low-power/mobile devices, and it's the only mode that lets you bulk-reprocess an existing library from the **Tools** page (see below) without a browser tab open. Costs more to run (`ipworker` needs meaningfully more CPU/memory than the rest of the deployment) and only scales up when there's work queued. Required for wave-owned libraries. |
-| **Both** | Browser and server both attempt each step; whichever finishes first for a given photo wins, the other is discarded. Roughly doubles compute cost per step — useful mainly for comparing the two paths, not a typical choice. |
-
-`ipworker` pulls a separate public image, `ghcr.io/git4rajat/photostore-ipworker:latest`
-(also gated behind the [Publish images workflow](.github/workflows/publish-images.yml)
-being run and set to Public in GHCR, same as the backend/frontend images
-above). It's only deployed at all when you choose "On the server" or "Both" —
-in browser mode, no `ipworker` container app is created.
-
-You can change this later by re-running the deployment with a different
-`processingMode` value (Azure Portal → your resource group → Deployments →
-Redeploy, or `az deployment group create` with the updated parameter).
-
-### Sign-in — just set an email and password
-
-In the deploy form you set a **login email** and **password**. That's your
-sign-in — no Microsoft account, app registrations, or admin consent required.
-When the deployment finishes, open the app URL and log in.
-
-- **Forgot your password?** Use "Forgot password?" on the login screen. A reset
-  link is emailed to you via Azure Communication Services (provisioned by the
-  template with an Azure-managed sender domain — no DNS setup). Reset emails may
-  land in your spam folder.
-- **Break-glass reset:** you can always reset by updating the `owner-password`
-  secret on the `<appName>-backend` Container App in the Azure Portal.
-- **Change your password** anytime from inside the app.
-- **Your email is your sign-in identity.** Set the login **email** (`OWNER_EMAIL`)
-  in the deploy form — password-mode sign-in is by email + password, so an empty
-  email leaves the owner unable to log in. If you deployed without one, set
-  `OWNER_EMAIL` on the `<appName>-backend` Container App and restart; the account
-  reconciles to that address on the next boot.
-
-### Sharing your library
-
-From the **Sharing** tab you can invite other people by email. Choose whether
-they **join your library** (they see the same photos, as an equal member — up to
-15 people including you) or **start their own** fresh library. Invitees get an
-email link (valid 72 hours) to set a password and sign in. Only the library
-owner can invite or remove members; any member can leave, and switching between
-libraries you belong to happens from the same tab. (Sharing requires the reset
-email transport above to be configured, since invites are delivered by email.)
-
-> **Advanced: Microsoft Entra SSO.** Prefer enterprise single sign-on instead of
-> a password? Deploy, then run [`deploy/setup-auth.sh`](deploy/setup-auth.sh) in
-> [Azure Cloud Shell](https://portal.azure.com) to create Entra app
-> registrations and switch the app to `AUTH_MODE=entra`. This requires rights to
-> register apps and grant admin consent in your directory.
-
-> **Note:** the button pulls the public images
-> `ghcr.io/git4rajat/photostore-backend:latest` and `-frontend:latest`. These
-> must be published (via the [Publish images workflow](.github/workflows/publish-images.yml))
-> and set to **Public** in GHCR before a deploy can succeed.
-
-## How to use the app
+### How to use the app
 
 This is a quick, task-by-task guide to getting the most out of Keepsake once
 you're signed in.
 
-### Uploading photos
+#### Uploading photos
 
 1. Go to the **Gallery** and click **Upload**.
 2. Pick one or more photos or videos (you can drag them in).
@@ -216,7 +133,7 @@ you're signed in.
 Processing (thumbnails, text, tags, faces, location) keeps running after upload —
 you don't have to wait on it. Check progress any time on the **Tools** page.
 
-### What the icons mean
+#### What the icons mean
 
 You'll see the same icons throughout the gallery and on individual photos:
 
@@ -235,7 +152,7 @@ You'll see the same icons throughout the gallery and on individual photos:
   runs](#choosing-where-ai-processing-runs)). Shows while `ipworker` is
   actively working on that photo; disappears once it finishes.
 
-### Filtering the gallery
+#### Filtering the gallery
 
 Use the filter controls at the top of the Gallery to narrow things down:
 
@@ -247,7 +164,7 @@ Use the filter controls at the top of the Gallery to narrow things down:
 
 Filters combine, so you can, for example, show only liked videos rated 4+.
 
-### Working with People
+#### Working with People
 
 The **People** page groups faces that belong to the same person into a cluster
 of face crops. From here you can:
@@ -264,26 +181,7 @@ of face crops. From here you can:
   reject something that isn't really a face.
 - **Search people** by name to jump straight to someone.
 
-#### Tuning how aggressively faces get merged
-
-Whether two face crops end up in the same person cluster is controlled by a
-preset on the backend (`PEOPLE_CLUSTER_PRESET` env var, default `strictest`):
-
-| Preset | Same-person link threshold | Behavior |
-| --- | --- | --- |
-| `strictest` (default) | cosine similarity ≥ 0.80 | Only very confident matches merge — favors leaving similar-looking people as separate clusters over wrongly merging them. |
-| `strict` | ≥ 0.76 | Slightly looser than strictest, still errs toward false negatives. |
-| `balanced` | ≥ 0.72 | Middle ground — this is the setting that best matched real calibration data in testing. |
-| `loose` | ≥ 0.66 | Merges more readily, tolerating more variation in lighting/angle, at higher risk of fusing two different people. |
-
-Switching preset (e.g. to `balanced` for more auto-merging) is just an env var
-change on the backend and worker — no code change or redeploy of new code
-needed. See `_resolve_people_cluster_config` in `backend/app.py` for the full
-threshold table and the calibration script
-(`backend/scripts/calibrate_face_thresholds.py`) used to derive these numbers
-from real face-embedding data.
-
-### Using the Tools page (and re-running AI actions)
+#### Using the Tools page (and re-running AI actions)
 
 The **Tools** page shows every processing stage each photo goes through:
 
@@ -309,7 +207,7 @@ where AI processing runs](#choosing-where-ai-processing-runs)), re-running a
 stage here also queues it to `ipworker` — this is how you bulk-reprocess an
 existing library server-side, with no browser tab needing to stay open.
 
-### Working with Albums
+#### Working with Albums
 
 Albums are collections you build on top of your library.
 
@@ -339,7 +237,7 @@ Albums are collections you build on top of your library.
 **Search within an album** by name, minimum rating, or liked-only to find a
 specific shot fast, and **download** the whole album (or a selection) as a batch.
 
-### Sharing an album
+#### Sharing an album
 
 1. Open the album you want to share.
 2. Choose **Share** to create a **public link**.
@@ -349,8 +247,128 @@ specific shot fast, and **download** the whole album (or a selection) as a batch
 
 To stop sharing, open the album's share settings and revoke the link.
 
-### Changing your password
+#### Changing your password
 
 You can change your password any time from inside the app (see your account
 settings). Forgot it? Use **Forgot password?** on the login screen to get a
 reset link by email — check your spam folder if it doesn't arrive.
+
+## Technical information
+
+### How deployment works
+
+This provisions the whole app into your own Azure subscription from prebuilt
+public container images — no build step required. The template lives at
+[`deploy/`](deploy/) (`main.bicep` → compiled `azuredeploy.json`).
+
+For a **fresh wave-enabled library**, use the
+[Azure CLI fresh-deployment guide](deploy/fresh-wave.md). It pins all three
+images, seeds the durable capability certificate before owner-library creation,
+then enables execution and enrollment. The portal button does not run that
+bootstrap sequence.
+
+The template deploys at **subscription scope** and **creates its own resource
+group** (`<appName>-rg` by default), so you're only asked for a subscription,
+a region, and a few details — no need to pick or create a resource group first.
+
+### Image updates on wave-active deployments
+
+**Updating images on a wave-active deployment is not supported.** Each
+wave-owned library's capability is permanently bound, at enrollment, to the
+exact image digest running on every role (`wave_policy.require_capability` —
+"Library ownership cannot be rebound"). Redeploying `coreImage`, `webImage`,
+or `visionImage` on an existing deployment — even an ordinary bug-fix bump,
+not a deliberate wave change — immediately and permanently fails every
+in-flight wave's next vision/cluster/index attempt with a generic "This app
+deployment is not qualified" conflict, since the deployed image no longer
+matches the sealed certificate. There is currently no tool to re-certify or
+migrate an existing, populated deployment onto new images (`fresh_wave.py`
+explicitly refuses to run against an existing resource group, so it can't be
+reused for this). Until such a tool exists, treat a wave-enabled deployment's
+images as fixed: the only supported way to pick up new code is a fresh
+install via `fresh-wave.md`, not an in-place image update.
+
+### Choosing where AI processing runs
+
+OCR, face detection, vision tagging, and geo/reverse-geocoding can each run
+**in your browser**, **on the server** (the default), or **both**. Pick this
+in the deploy form's "Photo processing" dropdown (`processingMode` parameter):
+
+| Mode | What happens |
+| --- | --- |
+| **In your browser** | Legacy processing mode: everything runs client-side. Requires a reasonably capable device; nothing runs until you click "Load browser AI." |
+| **On the server** (default) | The browser skips this AI work. A new `ipworker` container app processes every upload instead — better for low-power/mobile devices, and it's the only mode that lets you bulk-reprocess an existing library from the **Tools** page (see below) without a browser tab open. Costs more to run (`ipworker` needs meaningfully more CPU/memory than the rest of the deployment) and only scales up when there's work queued. Required for wave-owned libraries. |
+| **Both** | Browser and server both attempt each step; whichever finishes first for a given photo wins, the other is discarded. Roughly doubles compute cost per step — useful mainly for comparing the two paths, not a typical choice. |
+
+`ipworker` pulls a separate public image, `ghcr.io/git4rajat/photostore-ipworker` (digest-pinned)
+(also gated behind the [Publish images workflow](.github/workflows/publish-images.yml)
+being run and set to Public in GHCR, same as the backend/frontend images
+above). It's only deployed at all when you choose "On the server" or "Both" —
+in browser mode, no `ipworker` container app is created.
+
+You can change this later by re-running the deployment with a different
+`processingMode` value (Azure Portal → your resource group → Deployments →
+Redeploy, or `az deployment group create` with the updated parameter).
+
+### Sign-in — just set an email and password
+
+In the deploy form you set a **login email** and **password**. That's your
+sign-in — no Microsoft account, app registrations, or admin consent required.
+When the deployment finishes, open the app URL and log in.
+
+- **Forgot your password?** Use "Forgot password?" on the login screen. A reset
+  link is emailed to you via Azure Communication Services (provisioned by the
+  template with an Azure-managed sender domain — no DNS setup). Reset emails may
+  land in your spam folder.
+- **Break-glass reset:** you can always reset by updating the `owner-password`
+  secret on the `<appName>-backend` Container App in the Azure Portal.
+- **Change your password** anytime from inside the app.
+- **Your email is your sign-in identity.** Set the login **email** (`OWNER_EMAIL`)
+  in the deploy form — password-mode sign-in is by email + password, so an empty
+  email leaves the owner unable to log in. If you deployed without one, set
+  `OWNER_EMAIL` on the `<appName>-backend` Container App and restart; the account
+  reconciles to that address on the next boot.
+
+### Library sharing and members
+
+From the **Sharing** tab you can invite other people by email. Choose whether
+they **join your library** (they see the same photos, as an equal member — up to
+15 people including you) or **start their own** fresh library. Invitees get an
+email link (valid 72 hours) to set a password and sign in. Only the library
+owner can invite or remove members; any member can leave, and switching between
+libraries you belong to happens from the same tab. (Sharing requires the reset
+email transport above to be configured, since invites are delivered by email.)
+
+**Advanced: Microsoft Entra SSO.** Prefer enterprise single sign-on instead of
+a password? Deploy, then run [`deploy/setup-auth.sh`](deploy/setup-auth.sh) in
+[Azure Cloud Shell](https://portal.azure.com) to create Entra app
+registrations and switch the app to `AUTH_MODE=entra`. This requires rights to
+register apps and grant admin consent in your directory.
+
+### Container images
+
+The button pulls the public images
+`ghcr.io/git4rajat/photostore-backend`, `-frontend` and `-ipworker`, pinned by
+immutable `@sha256` digest (the Publish workflow rewrites the template
+defaults after each qualified release), so a deployment never auto-upgrades. These
+must be published (via the [Publish images workflow](.github/workflows/publish-images.yml))
+and set to **Public** in GHCR before a deploy can succeed.
+
+### Tuning how aggressively faces get merged
+
+Whether two face crops end up in the same person cluster is controlled by a
+preset on the backend (`PEOPLE_CLUSTER_PRESET` env var, default `strictest`):
+
+| Preset | Same-person link threshold | Behavior |
+| --- | --- | --- |
+| `strictest` (default) | cosine similarity ≥ 0.80 | Only very confident matches merge — favors leaving similar-looking people as separate clusters over wrongly merging them. |
+| `strict` | ≥ 0.76 | Slightly looser than strictest, still errs toward false negatives. |
+| `balanced` | ≥ 0.72 | Middle ground — this is the setting that best matched real calibration data in testing. |
+| `loose` | ≥ 0.66 | Merges more readily, tolerating more variation in lighting/angle, at higher risk of fusing two different people. |
+
+Switching preset (e.g. to `balanced` for more auto-merging) is just an env var
+change on the backend and worker — no code change or redeploy of new code
+needed. See `_resolve_people_cluster_config` in `backend/app.py` for the full
+threshold table and the calibration script
+(`backend/scripts/calibrate_face_thresholds.py`) used to derive these numbers
+from real face-embedding data.
