@@ -791,10 +791,24 @@
     .pt-public-shell .mock-body { padding-bottom: clamp(12px, 3vw, 20px); }
 }
 
-/* Collapse the header out of the layout while scrolling down (PublicAlbumPage): total row height
-   is margin-top 8 + 48 + margin-bottom 8, so -56px of top margin takes it to zero. */
-.pt-public-header { transition: margin-top 0.22s ease, opacity 0.18s ease; }
-.pt-public-header.is-collapsed { margin-top: -56px; opacity: 0; pointer-events: none; }
+/* Collapse the header out of the layout while scrolling down (PublicAlbumPage). Margin, padding,
+   border and max-height all go to zero, so the row's height drops to nothing whatever it is (48px
+   on a phone, 52px on a tablet) instead of relying on a fixed offset. */
+.pt-public-header {
+  max-height: 120px;
+  transition: max-height 0.22s ease, margin 0.22s ease, padding 0.22s ease, opacity 0.18s ease;
+}
+.pt-public-shell .pt-public-header.is-collapsed {
+  max-height: 0;
+  margin-top: 0;
+  margin-bottom: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+  border-width: 0;
+  opacity: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
 /* The floating buttons assume the app's mobile tab bar sits under them; this page has none. */
 @container (max-width: 620px) {
     .pt-public-shell .pt-scroll-top,
