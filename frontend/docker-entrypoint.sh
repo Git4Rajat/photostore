@@ -84,7 +84,7 @@ EOF
 # wildcard rather than just huggingface.co.
 # Scope Azure Blob Storage to this deployment's account when it is known
 # (STORAGE_ACCOUNT_NAME); the wildcard lets script exfiltrate to any account.
-if [ -n "$STORAGE_ACCOUNT_NAME" ]; then
+if [ -n "${STORAGE_ACCOUNT_NAME:-}" ]; then
   BLOB_HOST="https://${STORAGE_ACCOUNT_NAME}.blob.core.windows.net"
 else
   BLOB_HOST="https://*.blob.core.windows.net"
