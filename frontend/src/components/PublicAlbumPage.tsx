@@ -750,6 +750,15 @@ const PublicAlbumPage: React.FC = () => {
                                                         loading="lazy"
                                                         draggable={false}
                                                         style={tileRotationStyle(photo)}
+                                                        onError={(e) => {
+                                                            // Direct storage URL missed (thumbnail not at that blob yet):
+                                                            // retry once through the API proxy, which resolves the real
+                                                            // blob and serves a placeholder instead of a broken image.
+                                                            const img = e.currentTarget;
+                                                            if (!token || img.dataset.proxied) { return; }
+                                                            img.dataset.proxied = '1';
+                                                            img.src = resolveApiUrl(`/public/photos/${encodeURIComponent(token)}/thumbnail/${encodeURIComponent(photo.filename)}`);
+                                                        }}
                                                     />
                                                     {isVideo && (
                                                         <span className="pt-tile-video" aria-hidden="true">

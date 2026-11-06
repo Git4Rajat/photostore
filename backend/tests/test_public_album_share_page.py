@@ -171,6 +171,18 @@ def test_public_photo_urls_sets_raw_full_preview_url_only_for_raw_files():
     assert jpeg_urls['rawFullPreviewUrl'] == ''
 
 
+def test_public_photo_urls_signs_thumbnail_under_its_derivative_blob(monkeypatch):
+    signed = []
+    monkeypatch.setattr(app, '_create_stable_read_sas_url',
+                        lambda container, blob, **k: (signed.append((container, blob)) or f'sas/{container}/{blob}', None))
+
+    urls = app._public_photo_urls('tok123', 'a.jpg', blob_name='anon-id', thumbnail_blob='lib/anon-id/r1/thumbnail/h.jpg')
+
+    assert (app.BLOB_IMAGE_CONTAINER, 'anon-id') in signed
+    assert (app.BLOB_THUMBNAIL_CONTAINER, 'lib/anon-id/r1/thumbnail/h.jpg') in signed
+    assert urls['thumbnailUrl'].endswith('lib/anon-id/r1/thumbnail/h.jpg')
+
+
 def test_public_album_route_includes_raw_full_preview_url(monkeypatch):
     entity = _entity(filenames='["IMG_0001.CR3", "IMG_0002.jpg"]')
     monkeypatch.setattr(app, '_find_public_album_by_token', lambda token: entity)

@@ -37,7 +37,7 @@ def share(monkeypatch):
                         lambda owner, names: {n: state['meta'].get(n, {}) for n in names})
     monkeypatch.setattr(app, '_validate_media_filename', lambda n: n if n.endswith('.jpg') else None)
     monkeypatch.setattr(app, '_public_photo_urls',
-                        lambda token, name, blob_name=None: {'url': f'/img/{name}', 'thumbnailUrl': f'/th/{name}'})
+                        lambda token, name, blob_name=None, thumbnail_blob=None: {'url': f'/img/{name}', 'thumbnailUrl': f'/th/{name}'})
     monkeypatch.setattr(app, 'resolve_physical_blob_name', lambda owner, name, kind: 'blob-' + name)
     monkeypatch.setattr(password_auth, 'login_attempt_allowed', lambda table, row_key=None: state['throttle_ok'])
     monkeypatch.setattr(password_auth, 'record_login_failure', lambda table, row_key=None, **k: state['failures'].append(row_key))

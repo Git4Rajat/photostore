@@ -9367,7 +9367,8 @@ def _find_public_album_by_token(token: str) -> Optional[Dict]:
     return row
 
 
-def _public_photo_urls(token: str, filename: str, blob_name: Optional[str] = None) -> Dict[str, str]:
+def _public_photo_urls(token: str, filename: str, blob_name: Optional[str] = None,
+                       thumbnail_blob: Optional[str] = None) -> Dict[str, str]:
     # The shrunk preview is the default lightbox image for every non-video photo now
     # (see getMainMediaPath in PhotoViewer.tsx), not just RAW/HEIC/JXL. previewUrl must
     # therefore be populated here for every image, or the frontend falls back to its
@@ -9394,7 +9395,9 @@ def _public_photo_urls(token: str, filename: str, blob_name: Optional[str] = Non
     except Exception:
         image_url = f'/public/photos/{token}/image/{filename}'
     try:
-        thumbnail_url, _ = _create_stable_read_sas_url(BLOB_THUMBNAIL_CONTAINER, physical_name)
+        # The thumbnail may live under a derivative name (artifact receipt), not the
+        # original's physical name -- signing the latter yields a 404 blob URL.
+        thumbnail_url, _ = _create_stable_read_sas_url(BLOB_THUMBNAIL_CONTAINER, thumbnail_blob or physical_name)
     except Exception:
         thumbnail_url = f'/public/photos/{token}/thumbnail/{filename}'
     return {

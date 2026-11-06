@@ -71,7 +71,12 @@ def public_album(token: str):
         metadata = metadata_by_name.get(name) if owner_id else {}
         if (metadata or {}).get('processing_state') == 'deleted':
             continue
-        urls = app._public_photo_urls(token, name, blob_name=app._blob_name_from_metadata(metadata, name))
+        physical = app._blob_name_from_metadata(metadata, name)
+        try:
+            thumbnail_blob = app._derivative_blob_from_metadata(metadata, name, 'thumbnail', physical=physical)
+        except ValueError:
+            thumbnail_blob = None  # invalid receipt: the proxy route reports/handles it
+        urls = app._public_photo_urls(token, name, blob_name=physical, thumbnail_blob=thumbnail_blob)
         photos.append({
             'filename': name,
             'url': urls['url'],
