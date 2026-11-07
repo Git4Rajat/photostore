@@ -1,4 +1,4 @@
-FROM mirror.gcr.io/library/node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS build
+FROM mirror.gcr.io/library/node:22-alpine@sha256:0e1754758c2df4cfa3e68d59e2e1b7374bb7fd9ea6328eaaacf15cc934af8202 AS build
 
 # Keep CI/ACR logs focused on real build failures.
 ENV NPM_CONFIG_UPDATE_NOTIFIER=false \
