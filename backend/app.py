@@ -244,6 +244,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 worker_logger = logging.getLogger(__name__)
 import album_store
+import share_snapshot
 import perf_instrumentation
 import table_scan
 import storage_utils as storage_utils_module
@@ -2276,8 +2277,10 @@ def _album_entity_to_payload(entity: Dict, cover_thumbnail_url: Optional[str] = 
         # lives on the 'archive' role, not this ('core') role -- see
         # ARCHIVE_PUBLIC_BASE_URL -- so it must not be built from this
         # process's own request.host_url.
-        base = ARCHIVE_PUBLIC_BASE_URL or request.host_url.rstrip('/')
-        public_url = f"{base.rstrip('/')}/public/album/{token}"
+        public_url = share_snapshot.public_url(entity, token)
+        if not public_url:
+            base = ARCHIVE_PUBLIC_BASE_URL or request.host_url.rstrip('/')
+            public_url = f"{base.rstrip('/')}/public/album/{token}"
     deleted_at = str(entity.get('deletedAt') or '')
     payload = {
         'id': entity.get('RowKey'),
@@ -8679,6 +8682,11 @@ def _album_filenames(entity: Dict) -> List[str]:
 
 
 def _mark_album_dirty(entity: Dict) -> None:
+    _mark_album_dirty_index(entity)
+    _sync_share_snapshot(entity)
+
+
+def _mark_album_dirty_index(entity: Dict) -> None:
     partition_key = str(entity.get('PartitionKey') or '')
     touch_user_albums_index_state(partition_key)
     row_key = str(entity.get('RowKey') or '')
@@ -8700,6 +8708,170 @@ def _mark_album_dirty(entity: Dict) -> None:
                 worker_logger.warning('Album index enqueue unavailable for %s; dirty row retained for recovery', partition_key)
         except Exception:
             worker_logger.warning('Album index enqueue failed for %s; dirty row retained for recovery', partition_key, exc_info=True)
+
+
+SHARE_SNAPSHOT_JOB_TYPE = 'share_snapshot'
+# Coalesces a burst of edits (adding photos one by one) into one rebuild.
+SHARE_SNAPSHOT_DEBOUNCE_SECONDS = int(os.getenv('SHARE_SNAPSHOT_DEBOUNCE_SECONDS', '20'))
+
+
+def _share_snapshot_container():
+    if blob_service_client is None:
+        return None
+    return blob_service_client.get_container_client(share_snapshot.WEB_CONTAINER)
+
+
+def _enqueue_share_snapshot(action: str, user_id: str = '', album_id: str = '', token: str = '', delay: int = 0) -> bool:
+    if not share_snapshot.enabled() or clustering_queue_client is None:
+        return False
+    job_id = f'share-snapshot:{uuid.uuid4().hex}'
+    message = {'jobId': job_id, 'correlationId': job_id, 'user_id': user_id, 'type': SHARE_SNAPSHOT_JOB_TYPE,
+               'action': action, 'albumId': album_id, 'token': token}
+    try:
+        body = json.dumps(message, separators=(',', ':'))
+        if delay > 0:
+            clustering_queue_client.send_message(body, visibility_timeout=delay)
+        else:
+            clustering_queue_client.send_message(body)
+        return True
+    except Exception:
+        worker_logger.warning('Share snapshot %s enqueue failed for album %s', action, album_id, exc_info=True)
+        return False
+
+
+def _revoke_share_snapshot(token: str, user_id: str = '', album_id: str = '') -> None:
+    """Take a snapshot's page and manifest down now (two blob deletes) and queue the removal of the
+    rest, so unsharing is not at the mercy of the worker waking up."""
+    if not token or not share_snapshot.enabled():
+        return
+    container = _share_snapshot_container()
+    if container is not None:
+        try:
+            share_snapshot.revoke_page(container, token)
+        except Exception:
+            worker_logger.warning('Share snapshot revoke failed for album %s', album_id, exc_info=True)
+    _enqueue_share_snapshot('delete', user_id, album_id, token)
+
+
+def _sync_share_snapshot(entity: Dict) -> None:
+    """Called after every album mutation: (re)build the snapshot for an eligible public album,
+    otherwise remove any snapshot it still has."""
+    if not share_snapshot.enabled():
+        return
+    try:
+        user_id, album_id = str(entity.get('PartitionKey') or ''), str(entity.get('RowKey') or '')
+        if not user_id or not album_id:
+            return
+        if share_snapshot.eligible(entity) and not _coerce_bool(entity.get('deleted')):
+            _enqueue_share_snapshot('build', user_id, album_id, delay=SHARE_SNAPSHOT_DEBOUNCE_SECONDS)
+        else:
+            stale = str(entity.get('shareSnapshotToken') or '')
+            if stale:
+                _revoke_share_snapshot(stale, user_id, album_id)
+    except Exception:
+        worker_logger.warning('Share snapshot sync failed', exc_info=True)
+
+
+def _share_snapshot_photos(entity: Dict) -> Tuple[List['share_snapshot.Photo'], int]:
+    owner_id = str(entity.get('PartitionKey') or '')
+    names, total = album_store.page(entity, 0, share_snapshot.PREVIEW_LIMIT + 50)   # slack for deleted rows
+    metadata_by_name = _get_metadata_entities(owner_id, names) if names else {}
+    photos: List[share_snapshot.Photo] = []
+    for name in names:
+        metadata = metadata_by_name.get(name)
+        if (metadata or {}).get('processing_state') == 'deleted':
+            continue
+        physical = _blob_name_from_metadata(metadata, name)
+        try:
+            thumb_blob = _derivative_blob_from_metadata(metadata, name, 'thumbnail', physical=physical)
+        except ValueError:
+            thumb_blob = None
+        etag = str(((getattr(metadata, 'metadata', None) or {}).get('etag')) or '')
+        version = hashlib.sha1(f'{physical}|{thumb_blob}|{etag}'.encode('utf-8')).hexdigest()[:16]
+        video = is_video_file(name)
+
+        def read_thumbnail(blob=thumb_blob):
+            return download_media_bytes('thumbnail', blob) if blob else None
+
+        def read_preview(name=name, physical=physical):
+            try:
+                cached = download_media_bytes('thumbnail', _preview_cache_blob_name(physical))
+                if cached and _looks_like_jpeg(cached):
+                    return cached
+            except Exception:
+                pass
+            converted = convert_image_to_jpeg(download_media_bytes('image', physical), name)
+            return converted if converted and _looks_like_jpeg(converted) else None
+
+        photos.append(share_snapshot.Photo(
+            name, version=version, is_video=video,
+            rotation=_normalize_rotation((metadata or {}).get('rotation', 0)),
+            thumbnail_rotation=_thumbnail_rotation_from_metadata(metadata),
+            read_thumbnail=read_thumbnail, read_preview=None if video else read_preview))
+        if len(photos) >= share_snapshot.PREVIEW_LIMIT:
+            break
+    return photos, total
+
+
+def _set_share_snapshot_marker(entity: Dict, token: str, built_at: str) -> None:
+    """Record (or clear) which token has a snapshot. Merges just these fields and marks only the
+    albums index dirty -- going through _save_album_entity would re-queue another build."""
+    if albums_table_client is None:
+        return
+    albums_table_client.update_entity(
+        {'PartitionKey': entity['PartitionKey'], 'RowKey': entity['RowKey'],
+         'shareSnapshotToken': token, 'shareSnapshotAt': built_at}, mode=UpdateMode.MERGE)
+    _mark_album_dirty_index(entity)
+
+
+def _run_share_snapshot_job(payload: Dict) -> None:
+    container = _share_snapshot_container()
+    if container is None:
+        return
+    user_id, album_id = str(payload.get('user_id') or ''), str(payload.get('albumId') or '')
+    if payload.get('action') == 'delete':
+        token = str(payload.get('token') or '')
+        removed = share_snapshot.delete(container, token)
+        entity = _load_album_entity(user_id, album_id) if user_id and album_id else None
+        if entity and str(entity.get('shareSnapshotToken') or '') == token:
+            _set_share_snapshot_marker(entity, '', '')
+        worker_logger.info('share snapshot deleted: album=%s files=%d', album_id, removed)
+        return
+    entity = _load_album_entity(user_id, album_id)
+    if not entity or not share_snapshot.eligible(entity) or _coerce_bool(entity.get('deleted')):
+        stale = str((entity or {}).get('shareSnapshotToken') or '')
+        if stale:
+            share_snapshot.delete(container, stale)
+            _set_share_snapshot_marker(entity, '', '')
+        return
+    token = str(entity.get('publicToken') or '')
+    previous = str(entity.get('shareSnapshotToken') or '')
+    if previous and previous != token:
+        share_snapshot.delete(container, previous)
+    photos, total = _share_snapshot_photos(entity)
+    name = str(entity.get('name') or '').strip() or 'Shared album'
+    meta = {
+        'title': name,
+        'description': f'{total} photo{"s" if total != 1 else ""} shared on Keepsake.',
+        'image': f"{SPA_BASE_URL.rstrip('/')}/og-image.png" if SPA_BASE_URL else '',
+        'image_is_fallback': 'true',
+    }
+    summary = share_snapshot.build(entity, container, photos, total, meta, ARCHIVE_PUBLIC_BASE_URL, SPA_BASE_URL)
+    # The share may have been revoked while this ran; if so, don't leave the files behind.
+    fresh = _load_album_entity(user_id, album_id)
+    if not fresh or not share_snapshot.eligible(fresh) or str(fresh.get('publicToken') or '') != token:
+        share_snapshot.delete(container, token)
+        return
+    _set_share_snapshot_marker(fresh, token, datetime.now(timezone.utc).isoformat())
+    worker_logger.info('share snapshot built: album=%s cached=%d total=%d removed=%d',
+                       album_id, summary['cached'], summary['total'], summary['removed'])
+
+
+def _sweep_expired_share_snapshots() -> int:
+    if not share_snapshot.enabled():
+        return 0
+    container = _share_snapshot_container()
+    return len(share_snapshot.sweep_expired(container)) if container is not None else 0
 
 
 def _save_album_entity(entity: Dict) -> None:
@@ -8781,6 +8953,7 @@ def _store_album_token_index(token: str, user_id: str, album_id: str) -> None:
 
 
 def _delete_album_token_index(token: str) -> None:
+    _revoke_share_snapshot(token)
     if album_token_index_table_client is None or not token:
         return
     try:
@@ -13841,6 +14014,9 @@ def _ipwork_sweep_loop() -> None:
                         'tag-embedding sweep: %d/%d librar(y/ies) have a usable index',
                         tag_embedding_stats['indexesAvailable'], tag_embedding_stats['librariesChecked'],
                     )
+                expired_snapshots = _timed_ipwork_sweep_phase('share_snapshot_expiry', _sweep_expired_share_snapshots)
+                if expired_snapshots:
+                    worker_logger.info('share snapshot sweep: removed %d expired snapshot(s)', expired_snapshots)
                 trash_stats = _timed_ipwork_sweep_phase('trash_purge', _run_trash_purge_sweep)
                 if trash_stats['photosPurged'] or trash_stats['albumsPurged']:
                     worker_logger.info(
@@ -15440,6 +15616,8 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
     if payload.get('type') == 'processing_artifact_cleanup':
         from processing_cleanup import run_artifact_cleanup
         return run_artifact_cleanup(payload)
+    if payload.get('type') == SHARE_SNAPSHOT_JOB_TYPE:
+        return _run_share_snapshot_job(payload)
     from wave_policy import legacy_message_suppressed
     if legacy_message_suppressed(jobs_table_client,user_id,payload):
         return

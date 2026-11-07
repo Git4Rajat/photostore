@@ -22,6 +22,7 @@ import { Logo, LogoLockup } from './shared/Logo';
 import { EmptyState } from './shared/EmptyState';
 import { ErrorState } from './shared/ErrorState';
 import { isVideoFilename } from '../utils/photoDisplay';
+import { photoFromDeepLink } from '../utils/publicAlbumDeepLink';
 
 interface PublicPhoto {
     filename: string;
@@ -232,6 +233,19 @@ const PublicAlbumPage: React.FC = () => {
         openedViewerIndexRef.current = index;
         setViewerIndex(index);
     }, []);
+
+    // Arriving from the static share page: reopen the photo the visitor had open there, once.
+    const deepLinkHandledRef = useRef(false);
+    useEffect(() => {
+        if (deepLinkHandledRef.current || !bufferReady || photos.length === 0) {
+            return;
+        }
+        deepLinkHandledRef.current = true;
+        const index = photoFromDeepLink(window.location.search, photos.length);
+        if (index !== null) {
+            openViewerAt(index);
+        }
+    }, [bufferReady, photos.length, openViewerAt]);
 
     const loadPublicAlbum = useCallback(async (code: string = '', nextOffset = 0, append = false) => {
             if (!token) {

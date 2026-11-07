@@ -55,6 +55,7 @@ from exif_utils import extract_exif_from_bytes, extract_gps_decimal_from_exif
 from ordering_utils import metadata_capture_datetime, parse_iso_date
 from search_utils import AI_TAG_MIN_CONFIDENCE, MAX_TAGS_STORED, PERSON_SCORE_THRESHOLD, build_semantic_layers, build_semantic_text, curate_tag_records, effective_tags, is_sensitive_auto_tag_label, normalize_tags, visible_tags
 import album_store
+import share_snapshot
 import index_files
 import table_scan
 import maps_utils
@@ -7155,8 +7156,9 @@ def _album_share_fields(row: Dict) -> Dict[str, object]:
     is_expired = bool(expires_dt and datetime.now(timezone.utc) > expires_dt)
     public_url = ''
     if is_public and token and not is_expired:
+        public_url = share_snapshot.public_url(row, token)
         base = os.getenv('ARCHIVE_PUBLIC_BASE_URL', '').strip()
-        if base:
+        if not public_url and base:
             public_url = f"{base.rstrip('/')}/public/album/{token}"
     return {
         'isPublic': is_public and not is_expired,
