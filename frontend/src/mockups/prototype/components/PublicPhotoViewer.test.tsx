@@ -2,6 +2,7 @@ import React from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
 import PublicPhotoViewer from './PublicPhotoViewer';
+import { resolveApiUrl } from '../../../services/apiClient';
 
 const photos = [
     { filename: 'a.jpg', url: 'https://x/a.jpg', previewUrl: 'https://x/a-preview.jpg', rawFullPreviewUrl: 'https://x/a-full.jpg' },
@@ -36,5 +37,12 @@ describe('PublicPhotoViewer', () => {
         rerender(<PublicPhotoViewer photos={photos} index={2} onClose={vi.fn()} onIndexChange={vi.fn()} />);
         expect(document.querySelector('video')?.getAttribute('src')).toBe('https://x/c.mp4');
         expect(screen.queryByLabelText('Full resolution')).toBeNull();
+    });
+
+    it('resolves relative /public URLs against the API host instead of the page origin', () => {
+        const rel = [{ filename: 'r.jpg', url: '/public/photos/t/r.jpg', previewUrl: '/public/photos/t/preview/r.jpg' }];
+        render(<PublicPhotoViewer photos={rel} index={0} onClose={vi.fn()} onIndexChange={vi.fn()} />);
+        expect(resolveApiUrl('/public/photos/t/preview/r.jpg')).not.toBe('');
+        expect(screen.getByAltText('r.jpg').getAttribute('src')).toBe(resolveApiUrl('/public/photos/t/preview/r.jpg'));
     });
 });
