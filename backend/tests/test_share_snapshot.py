@@ -193,3 +193,10 @@ def test_page_is_self_contained_with_a_hash_pinned_csp():
 def test_page_embeds_config_safely():
     html = page.render({'title': 't'}, token='</script><script>alert(1)', spa_url='https://w', archive_url='https://a', image='')
     assert '</script><script>alert(1)' not in html
+
+
+def test_page_offers_download_of_the_album_and_of_each_photo():
+    html = page.render({'title': 't'}, token='tok', spa_url='https://w', archive_url='https://a.example', image='')
+    assert 'id="dlAll"' in html and 'id="lbDl"' in html
+    script = html.split('<script>')[1].split('</script>')[0]
+    assert "'/public/albums/'" in script and "'/public/photos/'" in script and "'/image/'" in script

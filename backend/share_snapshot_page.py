@@ -41,6 +41,8 @@ h1{margin:12px 0 4px;font-size:24px}
 .lb .x{top:12px;right:12px}.lb .p{left:12px;top:50%;margin-top:-22px}.lb .n{right:12px;top:50%;margin-top:-22px}
 .lb .cap{position:absolute;left:0;right:0;bottom:0;padding:12px 16px;background:linear-gradient(transparent,rgba(0,0,0,.7));text-align:center;font-size:13px}
 .lb .cap a{color:#4da2ff;font-weight:600;text-decoration:none}
+.lb .dl{position:absolute;top:12px;right:68px;width:auto;height:44px;border-radius:22px;padding:0 16px;font-size:14px;display:flex;align-items:center;color:#fff;text-decoration:none;background:rgba(30,30,36,.75)}
+.lb .dl[hidden]{display:none}
 .msg{padding:48px 0;text-align:center;color:#b8b8c2}
 """
 
@@ -53,6 +55,10 @@ _JS = """
   function fullUrl(i) {
     var u = C.spa + '/public/album/' + encodeURIComponent(C.token);
     return i >= 0 ? u + '?photo=' + i : u;
+  }
+  function originalUrl(name) {
+    return C.archive + '/public/photos/' + encodeURIComponent(C.token) + '/image/' +
+      name.split('/').map(encodeURIComponent).join('/');
   }
   function takeOver(i) {
     if (taken) return;
@@ -149,6 +155,9 @@ _JS = """
       var q = manifest.photos[j];
       if (q && q.p) (new Image()).src = q.p;
     });
+    var dl = $('lbDl');
+    dl.href = originalUrl(p.n);
+    dl.hidden = false;
     $('lbClose').focus();
   }
   function step(d) {
@@ -178,6 +187,7 @@ _JS = """
     sx = null;
     if (Math.abs(dx) > 50) step(dx < 0 ? 1 : -1);
   });
+  $('dlAll').href = C.archive + '/public/albums/' + encodeURIComponent(C.token) + '/download';
   $('full').addEventListener('click', function (e) { e.preventDefault(); takeOver(current); });
 
   fetch('manifest.json', { cache: 'no-cache' })
@@ -247,12 +257,12 @@ def render(meta: Dict[str, str], *, token: str, spa_url: str, archive_url: str, 
         f'<meta name="twitter:title" content="{title}" /><meta name="twitter:description" content="{description}" />'
         f'<meta name="twitter:image" content="{image_attr}" />'
         f'<style>{_CSS}</style></head><body>'
-        '<header><span class="brand">Keepsake</span><a id="full" class="full" href="#">Open full album</a></header>'
+        '<header><span class="brand">Keepsake</span><span><a id="dlAll" class="full" href="#" target="_blank" rel="noopener">Download all</a> &nbsp; <a id="full" class="full" href="#">Open full album</a></span></header>'
         f'<main><h1 id="title">{title}</h1><p id="sub" class="sub">{description}</p>'
         '<div id="status" class="status"><span class="spin" aria-hidden="true"></span><span id="statusText">Opening shared album…</span></div>'
         '<div id="grid" class="grid"></div></main>'
         '<div id="lb" class="lb" role="dialog" aria-modal="true" aria-label="Photo viewer" hidden>'
-        '<img id="lbImg" alt="" /><button id="lbClose" class="x" type="button" aria-label="Close">×</button>'
+        '<img id="lbImg" alt="" /><a id="lbDl" class="dl" href="#" target="_blank" rel="noopener" hidden>Download</a><button id="lbClose" class="x" type="button" aria-label="Close">×</button>'
         '<button id="lbPrev" class="p" type="button" aria-label="Previous">‹</button>'
         '<button id="lbNext" class="n" type="button" aria-label="Next">›</button>'
         '<div id="lbCap" class="cap"></div></div>'
