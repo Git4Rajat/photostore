@@ -86,6 +86,11 @@
   display: none;
 }
 
+/* The app shell is sized by its container, not the window: keep the top nav
+   visible above the 620px container breakpoint even when the window media
+   query in index.css (<=720px) would hide it, so one of the two navs always shows. */
+.mock-app .ios-tabs { display: flex; }
+
 @container (max-width: 620px) {
   .mock-app .ios-tabs { display: none; }
   .mock-body { padding-bottom: calc(64px + env(safe-area-inset-bottom)); } /* clear the fixed tabbar */

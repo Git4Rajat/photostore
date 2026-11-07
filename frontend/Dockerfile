@@ -1,4 +1,4 @@
-FROM mirror.gcr.io/library/node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS build
+FROM mirror.gcr.io/library/node:22-alpine@sha256:0e1754758c2df4cfa3e68d59e2e1b7374bb7fd9ea6328eaaacf15cc934af8202 AS build
 
 # Keep CI/ACR logs focused on real build failures.
 ENV NPM_CONFIG_UPDATE_NOTIFIER=false \
@@ -67,7 +67,7 @@ RUN mkdir -p build/decoder-licenses && \
     cp decoder-source.txt build/decoder-licenses/
 RUN chmod -R a+rX build/models
 
-FROM mirror.gcr.io/library/nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+FROM mirror.gcr.io/library/nginx:1.31-alpine@sha256:713fc2ebfd92e8217db451477182ee91944b123d2b1ee9fd5a8c6e91ca6c3a11
 
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY security-headers.conf /etc/nginx/security-headers.conf

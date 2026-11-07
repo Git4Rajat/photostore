@@ -16,6 +16,7 @@ import { useCollapseOnScroll } from '../services/useCollapseOnScroll';
 import PhotoViewer, { getMainMediaPath } from './shared/PhotoViewer';
 import { FloatingSelectButton } from '../mockups/prototype/components/FloatingSelectButton';
 import { ScrollToTopButton } from '../mockups/prototype/components/ScrollToTopButton';
+import { ThumbSizeControl, useTileSize } from '../mockups/prototype/components/controls';
 import { Logo, LogoLockup } from './shared/Logo';
 import { EmptyState } from './shared/EmptyState';
 import { ErrorState } from './shared/ErrorState';
@@ -159,6 +160,7 @@ const PublicAlbumPage: React.FC = () => {
     const [viewerIndex, setViewerIndex] = useState<number | null>(null);
     const [selectedPhotos, setSelectedPhotos] = useState<Set<string>>(new Set());
     const [selectMode, setSelectMode] = useState<boolean>(false);
+    const [tileSize, setTileSize] = useTileSize('photostore.publicAlbumTileSize', { default: 128 });
     const [downloading, setDownloading] = useState<boolean>(false);
     const downloadFormRef = useRef<HTMLFormElement | null>(null);
     // The scrollable region is the app-shell body (overflow-y:auto), not the
@@ -623,6 +625,7 @@ const PublicAlbumPage: React.FC = () => {
                                         </p>
                                     </div>
                                     <div className="pt-toolbar-actions">
+                                        <ThumbSizeControl value={tileSize} onChange={setTileSize} />
                                         {selectMode ? (
                                             <>
                                                 <button type="button" className="btn" onClick={toggleSelectAll}>
@@ -737,7 +740,10 @@ const PublicAlbumPage: React.FC = () => {
 
                             {!loading && !error && bufferReady && photos.length > 0 && viewerIndex === null && (
                                 <div>
-                                    <div className={`pt-grid pt-public-grid${selectMode ? ' select-mode' : ''}`}>
+                                    <div
+                                        className={`pt-grid pt-public-grid${selectMode ? ' select-mode' : ''}`}
+                                        style={{ ['--pt-tile-min' as string]: `${tileSize}px` } as React.CSSProperties}
+                                    >
                                         {photos.map((photo, index) => {
                                             const isSelected = selectedPhotos.has(photo.filename);
                                             const isVideo = isVideoFilename(photo.filename);
