@@ -71,7 +71,12 @@ def public_album(token: str):
         metadata = metadata_by_name.get(name) if owner_id else {}
         if (metadata or {}).get('processing_state') == 'deleted':
             continue
-        urls = app._public_photo_urls(token, name, blob_name=app._blob_name_from_metadata(metadata, name))
+        physical = app._blob_name_from_metadata(metadata, name)
+        try:
+            thumbnail_blob = app._derivative_blob_from_metadata(metadata, name, 'thumbnail', physical=physical)
+        except ValueError:
+            thumbnail_blob = None  # invalid receipt: the proxy route reports/handles it
+        urls = app._public_photo_urls(token, name, blob_name=physical, thumbnail_blob=thumbnail_blob)
         photos.append({
             'filename': name,
             'url': urls['url'],
@@ -349,13 +354,18 @@ def public_album_download_check(token: str):
         return app.jsonify({'error': 'Not found'}), 404
     return app.jsonify({'ok': True})
 
-@public_bp.route('/public/albums/<token>/download', methods=['POST'])
+@public_bp.route('/public/albums/<token>/download', methods=['GET', 'POST'])
 def public_album_download(token: str):
+    # GET is accepted as well as the form POST: a browser that blocks the download popup can
+    # downgrade a targeted form submission to a plain navigation, which used to answer 405.
     entity = app._find_public_album_by_token(token)
     if not entity or not app._coerce_bool(entity.get('isPublic', False)) or app._album_is_expired(entity):
         return app.jsonify({'error': 'Not found'}), 404
 
-    data = app.request.form.to_dict(flat=True) if app.request.form else (app.request.get_json(silent=True) or {})
+    if app.request.method == 'GET':
+        data = app.request.args.to_dict(flat=True)
+    else:
+        data = app.request.form.to_dict(flat=True) if app.request.form else (app.request.get_json(silent=True) or {})
     provided = (data.get('accessCode') or '').strip()
     gate = app._album_access_code_gate(entity, token, provided)
     if gate is not None:

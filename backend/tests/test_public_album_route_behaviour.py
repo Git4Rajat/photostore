@@ -37,7 +37,7 @@ def share(monkeypatch):
                         lambda owner, names: {n: state['meta'].get(n, {}) for n in names})
     monkeypatch.setattr(app, '_validate_media_filename', lambda n: n if n.endswith('.jpg') else None)
     monkeypatch.setattr(app, '_public_photo_urls',
-                        lambda token, name, blob_name=None: {'url': f'/img/{name}', 'thumbnailUrl': f'/th/{name}'})
+                        lambda token, name, blob_name=None, thumbnail_blob=None: {'url': f'/img/{name}', 'thumbnailUrl': f'/th/{name}'})
     monkeypatch.setattr(app, 'resolve_physical_blob_name', lambda owner, name, kind: 'blob-' + name)
     monkeypatch.setattr(password_auth, 'login_attempt_allowed', lambda table, row_key=None: state['throttle_ok'])
     monkeypatch.setattr(password_auth, 'record_login_failure', lambda table, row_key=None, **k: state['failures'].append(row_key))
@@ -133,6 +133,10 @@ class TestAccessCode:
 
     def test_download_needs_the_code_when_there_is_no_grant(self, share):
         assert share['client'].post('/public/albums/tok/download', data={}).status_code == 401
+
+    def test_download_accepts_get_and_applies_the_same_code_gate(self, share):
+        # A browser that blocks the download popup can turn the form submission into a GET.
+        assert share['client'].get('/public/albums/tok/download?filenames=%5B%22a.jpg%22%5D').status_code == 401
 
 
 class TestPublicMedia:
