@@ -64,8 +64,8 @@ def page_url(token: str) -> str:
 
 def public_url(row: Dict, token: str) -> str:
     """The snapshot page URL once it has been built for this token, else ''."""
-    if not enabled() or not token:
-        return ''
+    if not enabled() or not token or not eligible(row):
+        return ''   # e.g. a code was just added: the page is being taken down, so never hand it out
     if str(row.get('shareSnapshotToken') or '') != token or not str(row.get('shareSnapshotAt') or ''):
         return ''
     return page_url(token)

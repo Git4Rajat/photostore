@@ -51,7 +51,7 @@ const randomCode = () => {
 export const AlbumsPage: React.FC = () => {
     const {
         albums, albumsLoading, route, navigate, openAlbum, isAlbumMissing, isAlbumOpenFailed, isAlbumOpenTerminal, albumPhotosById, isAlbumPhotosLoading, loadMoreAlbumPhotos, albumPhotosHasMore,
-        createAlbum, autoCreateAlbum, renameAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum, toast,
+        createAlbum, autoCreateAlbum, renameAlbum, deleteAlbum, deleteAlbums, shareAlbum, refreshAlbumShareLink, revokeAlbum, toast,
         selectMode: photoSelectMode, setSelectMode: setPhotoSelectMode, fetchAlbums,
     } = useStore();
 
@@ -119,9 +119,11 @@ export const AlbumsPage: React.FC = () => {
     const awaitingLink = Boolean(album?.isPublic && !album.publicUrl && album.publicUrlPending);
     useEffect(() => {
         if (!awaitingLink) return;
-        const timer = window.setInterval(() => { void fetchAlbums(true); }, 3000);
+        const id = album?.id;
+        if (!id) return;
+        const timer = window.setInterval(() => { void refreshAlbumShareLink(id); }, 3000);
         return () => window.clearInterval(timer);
-    }, [awaitingLink, fetchAlbums]);
+    }, [awaitingLink, album?.id, refreshAlbumShareLink]);
 
     // Fetch the active album's photos whenever the selection changes, unless
     // this album's first page is already cached from a prior visit -- and

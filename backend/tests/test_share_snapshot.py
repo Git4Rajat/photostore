@@ -73,9 +73,9 @@ def test_disabled_without_a_web_url(monkeypatch):
 
 
 def test_public_url_only_once_built_for_this_token():
-    assert ss.public_url({}, 'tok') == ''
-    assert ss.public_url({'shareSnapshotToken': 'old', 'shareSnapshotAt': 'x'}, 'tok') == ''
-    assert ss.public_url({'shareSnapshotToken': 'tok', 'shareSnapshotAt': 'x'}, 'tok') == \
+    assert ss.public_url(entity(), 'tok') == ''
+    assert ss.public_url(entity(shareSnapshotToken='old', shareSnapshotAt='x'), 'tok') == ''
+    assert ss.public_url(entity(shareSnapshotToken='tok', shareSnapshotAt='x'), 'tok') == \
         'https://acct.z6.web.core.windows.net/s/tok/'
 
 
@@ -209,3 +209,9 @@ def test_link_is_pending_only_briefly_and_only_for_unprotected_unbuilt_shares():
     assert not ss.pending(entity(updatedAt=(now - timedelta(seconds=ss.PENDING_SECONDS + 5)).isoformat()), 'tok')
     assert not ss.pending(entity(updatedAt=now.isoformat(), accessCode='scrypt$hash'), 'tok')
     assert not ss.pending({**fresh, 'shareSnapshotToken': 'tok', 'shareSnapshotAt': 'x'}, 'tok')
+
+
+def test_static_link_is_not_handed_out_once_a_code_is_added():
+    built = {'shareSnapshotToken': 'tok', 'shareSnapshotAt': 'x'}
+    assert ss.public_url(entity(**built), 'tok')
+    assert ss.public_url(entity(accessCode='scrypt$hash', **built), 'tok') == ''

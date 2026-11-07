@@ -420,6 +420,8 @@ interface Store {
     deleteAlbum: (id: string) => void;
     deleteAlbums: (ids: string[]) => void;
     shareAlbum: (id: string, opts: { expiresInDays: number; accessCode?: string }) => Promise<void>;
+    /** Re-reads one album's share link (used while a link is still being prepared). */
+    refreshAlbumShareLink: (id: string) => Promise<void>;
     revokeAlbum: (id: string) => Promise<void>;
 
     // people (server-backed)
@@ -2163,6 +2165,15 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }
     }, [toast]);
 
+    const refreshAlbumShareLink = useCallback(async (id: string) => {
+        try {
+            const r = await get<{ isPublic?: boolean; publicUrl?: string; publicUrlPending?: boolean; hasAccessCode?: boolean }>(`/albums/${encodeURIComponent(id)}/share`);
+            setAlbums((prev) => prev.map((a) => (a.id === id
+                ? { ...a, isPublic: r.isPublic ?? a.isPublic, publicUrl: r.publicUrl || undefined, publicUrlPending: r.publicUrlPending || undefined, hasAccessCode: r.hasAccessCode ?? a.hasAccessCode }
+                : a)));
+        } catch { /* try again on the next tick */ }
+    }, []);
+
     const revokeAlbum = useCallback(async (id: string) => {
         if (hasAlbumDeleteTombstone(id, pendingEditScope())) return;
         try {
@@ -2848,6 +2859,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             deleteAlbum,
             deleteAlbums,
             shareAlbum,
+            refreshAlbumShareLink,
             revokeAlbum,
             peopleLoading, peopleTotal, peopleUnnamedTotal, peopleHasMore, peopleUnavailable, loadMorePeople, searchPeople,
             reloadPeople,
@@ -2884,7 +2896,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             restorePhotos, restoreAllTrash, purgePhoto, purgeAllTrash, reloadTrash,
             reloadAlbumTrash, restoreAlbum, purgeAlbum,
             albumsLoading, reloadAlbums, fetchAlbums, openAlbum, isAlbumMissing, isAlbumOpenFailed, isAlbumOpenTerminal, albumPhotosById, isAlbumPhotosLoading, loadMoreAlbumPhotos, albumPhotosTotal, albumPhotosHasMore,
-            createAlbum, autoCreateAlbum, renameAlbum, addPhotosToAlbum, removePhotosFromAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum,
+            createAlbum, autoCreateAlbum, renameAlbum, addPhotosToAlbum, removePhotosFromAlbum, deleteAlbum, deleteAlbums, shareAlbum, refreshAlbumShareLink, revokeAlbum,
             peopleLoading, peopleTotal, peopleUnnamedTotal, peopleHasMore, peopleUnavailable, loadMorePeople, searchPeople, reloadPeople, fetchPeople, openPerson, personPhotosById, personPhotosTotal, personPhotosHasMore, loadMorePersonPhotos, personPhotosLoading,
             renamePerson, mergePeople, mergePeopleBatch, deletePerson, deletePeopleBatch, applyExternalPeopleRemoval, reloadMembers, fetchMembers, invite, revokeInvite,
             removeMember, renameLibrary, toast, dismissToast,

@@ -8773,6 +8773,9 @@ def _sync_share_snapshot(entity: Dict) -> None:
             stale = str(entity.get('shareSnapshotToken') or '')
             if stale:
                 _revoke_share_snapshot(stale, user_id, album_id)
+                # Forget it now, or the old static link keeps being handed out until the delete job runs.
+                _set_share_snapshot_marker(entity, '', '')
+                entity['shareSnapshotToken'] = entity['shareSnapshotAt'] = ''
     except Exception:
         worker_logger.warning('Share snapshot sync failed', exc_info=True)
 
