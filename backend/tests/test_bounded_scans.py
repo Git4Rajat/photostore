@@ -96,6 +96,7 @@ def test_trash_membership_scan_transfers_only_trashed_rows_and_the_page_is_read_
     _install(monkeypatch, table)
     monkeypatch.setattr(app, 'trash_index_table_client', None)     # no index table -> the scan path
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
+    monkeypatch.setattr(app, '_require_library_owner_id', lambda *a, **k: ('owner', None))
     monkeypatch.setattr(app, '_load_people_name_index', lambda uid: ({}, {}))
     monkeypatch.setattr(app, '_get_metadata_entities', lambda uid, names: {n: {'RowKey': n, 'processing_state': 'deleted', 'deletedAt': '2026-01-01T00:00:00+00:00'} for n in names})
     monkeypatch.setattr(app, '_build_photo_summaries_page', lambda uid, items, names: [{'filename': n} for n, _ in items])
@@ -112,6 +113,7 @@ def test_smart_albums_stream_a_narrow_projection(monkeypatch):
     table = _RecordingTable(lambda: iter(rows))
     _install(monkeypatch, table)
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
+    monkeypatch.setattr(app, '_require_library_owner_id', lambda *a, **k: ('owner', None))
     monkeypatch.setattr(app, '_albums_table_available', lambda: True)
     saved = []
     monkeypatch.setattr(app, 'albums_table_client', types.SimpleNamespace(query_entities=lambda q: []))
@@ -126,6 +128,7 @@ def test_admin_backfill_streams_two_columns_and_skips_trashed(monkeypatch):
     table = _RecordingTable(lambda: iter([{'RowKey': 'a.jpg'}, {'RowKey': 'b.jpg', 'processing_state': 'deleted'}]))
     _install(monkeypatch, table)
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('owner', None))
+    monkeypatch.setattr(app, '_require_library_owner_id', lambda *a, **k: ('owner', None))
     queued = []
     monkeypatch.setattr(app, 'PROCESSING_MODE', 'browser')
     monkeypatch.setattr(app, '_enqueue_processing_steps', lambda uid, name, steps, force=False: queued.append(name) or {step: {'status': 'queued'} for step in steps})

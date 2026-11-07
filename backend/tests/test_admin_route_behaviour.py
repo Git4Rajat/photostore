@@ -8,7 +8,7 @@ import app
 
 @pytest.fixture
 def http(monkeypatch):
-    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('u1', None))
+    monkeypatch.setattr(app, '_require_library_owner_id', lambda *a, **k: ('u1', None))
     monkeypatch.setattr(app, '_people_features_available', lambda: True)
     monkeypatch.setattr(app, '_library_cut_over_to_waves', lambda user_id: False)
     app.app.config['PROPAGATE_EXCEPTIONS'] = True
@@ -317,3 +317,11 @@ class TestWaveOwnedLibrary:
     def test_other_repair_routes_are_unaffected(self, http, repair_jobs):
         response = http.post('/api/admin/people/dedupe-faces', json={'repair': True, 'confirm': 'DEDUPE_FACES'})
         assert response.status_code == 200 and repair_jobs == [('u1', 'dedupe_faces', True)]
+
+
+def test_library_members_who_are_not_owners_cannot_run_repair_tools(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(app, '_require_library_context', lambda **k: ('member', 'lib1', None))
+    monkeypatch.setattr(app, 'library_store', SimpleNamespace(is_owner=lambda account, library: False))
+    response = app.app.test_client().post('/api/admin/people/dedupe-faces', json={'repair': True, 'confirm': 'DEDUPE_FACES'})
+    assert response.status_code == 403

@@ -17,8 +17,6 @@ def health_check():
     return app.jsonify({
         'status': 'healthy',
         'service': 'photo-store-api',
-        'storage_account': app.account_name,
-        'uses_managed_identity': app.credential is not None,
     })
 
 @system_bp.route('/geocode/reverse', methods=['GET'])
@@ -50,6 +48,9 @@ def geocode_reverse():
 @system_bp.route('/api/performance/throughput', methods=['GET'])
 @system_bp.route('/api/performance/throughput/', methods=['GET'])
 def performance_throughput():
+    _user_id, error = app._require_user_id()
+    if error:
+        return error
     return app.jsonify(app._get_throughput_metrics())
 
 # jobs_status moved to routes/tools.py (APP_ROLE=indexer) 2026-10-01: polled

@@ -1,5 +1,6 @@
 """Attempt-local, byte-bounded planning buffers; never source authority."""
 from collections import OrderedDict, deque
+import io
 import os
 import pickle
 import sqlite3
@@ -26,8 +27,26 @@ def encode(row):
     return pickle.dumps((dict(row), dict(getattr(row, 'metadata', {}))), protocol=5)
 
 
+# Rows are plain Table entities (primitives, datetimes, Edm wrappers). Refuse to
+# resolve any other global so a tampered buffer file can't run code on load.
+_ALLOWED_GLOBALS = {
+    ('builtins', 'set'), ('builtins', 'frozenset'), ('builtins', 'bytearray'), ('builtins', 'complex'),
+    ('collections', 'OrderedDict'),
+    ('datetime', 'datetime'), ('datetime', 'date'), ('datetime', 'time'), ('datetime', 'timedelta'), ('datetime', 'timezone'),
+    ('decimal', 'Decimal'), ('uuid', 'UUID'),
+    ('azure.data.tables._entity', 'EntityProperty'), ('azure.data.tables._entity', 'EdmType'),
+}
+
+
+class _RowUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if (module, name) not in _ALLOWED_GLOBALS:
+            raise pickle.UnpicklingError(f'Disallowed type in Vision buffer: {module}.{name}')
+        return super().find_class(module, name)
+
+
 def decode(data):
-    return Snapshot(*pickle.loads(data))
+    return Snapshot(*_RowUnpickler(io.BytesIO(data)).load())
 
 
 class LocalRows:

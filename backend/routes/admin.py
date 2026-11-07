@@ -68,7 +68,7 @@ def recover_source_reservations():
 @admin_bp.route('/api/admin/people/dedupe-faces', methods=['POST'])
 @admin_bp.route('/admin/people/dedupe-faces', methods=['POST'])
 def admin_dedupe_faces():
-    user_id, error = app._require_user_id()
+    user_id, error = app._require_library_owner_id()
     if error:
         return error
     if not app._people_features_available():
@@ -83,7 +83,7 @@ def admin_dedupe_faces():
 @admin_bp.route('/api/admin/people/suppress-suspicious-faces', methods=['POST'])
 @admin_bp.route('/admin/people/suppress-suspicious-faces', methods=['POST'])
 def admin_suppress_suspicious_faces():
-    user_id, error = app._require_user_id()
+    user_id, error = app._require_library_owner_id()
     if error:
         return error
     if not app._people_features_available():
@@ -102,7 +102,7 @@ def admin_unblock_low_confidence_faces():
     the current (lowered) threshold. Run this after lowering
     FACE_LOW_CONFIDENCE_REJECT_BELOW to bring previously-rejected faces back
     into clustering."""
-    user_id, error = app._require_user_id()
+    user_id, error = app._require_library_owner_id()
     if error:
         return error
     if not app._people_features_available():
@@ -117,7 +117,7 @@ def admin_unblock_low_confidence_faces():
 @admin_bp.route('/api/admin/people/rebuild-photo-people-index', methods=['POST'])
 @admin_bp.route('/admin/people/rebuild-photo-people-index', methods=['POST'])
 def admin_rebuild_photo_people_index():
-    user_id, error = app._require_user_id()
+    user_id, error = app._require_library_owner_id()
     if error:
         return error
     if not app._people_features_available():
@@ -133,7 +133,7 @@ def admin_rebuild_photo_people_index():
 @admin_bp.route('/admin/vector-index/rebuild', methods=['POST'])
 def admin_rebuild_vector_index():
     try:
-        user_id, error = app._require_user_id()
+        user_id, error = app._require_library_owner_id()
         if error:
             return error
         if not app._people_features_available():
@@ -154,7 +154,7 @@ def admin_rebuild_vector_index():
 @admin_bp.route('/api/admin/people/repair-stale-memberships', methods=['POST'])
 @admin_bp.route('/admin/people/repair-stale-memberships', methods=['POST'])
 def admin_repair_stale_people_memberships():
-    user_id, error = app._require_user_id()
+    user_id, error = app._require_library_owner_id()
     if error:
         return error
     if not app._people_features_available():
@@ -189,7 +189,7 @@ def admin_backfill_photos():
     while enqueueing an entire library. Table rows are ordered by RowKey
     within the user's partition, so a strict keyset cursor avoids rescanning.
     """
-    user_id, error = app._require_user_id()
+    user_id, error = app._require_library_owner_id()
     if error:
         return error
     refused = _refuse_wave_owned_reprocess(user_id)
@@ -285,7 +285,7 @@ def admin_verify_face_index():
     makes is strictly fixing the lookup to match what the face table already
     says, the same thing the normal amortized path does for unknown rows.
     """
-    user_id, error = app._require_user_id()
+    user_id, error = app._require_library_owner_id()
     if error:
         return error
     if not app._people_features_available():
@@ -314,7 +314,7 @@ def admin_purge_orphaned_photo_data():
 
     Requires ``repair: true, confirm: 'PURGE_ORPHANED_PHOTO_DATA'`` in the body
     to execute; omit ``confirm`` (or pass ``dryRun: true``) to preview only."""
-    user_id, error = app._require_user_id()
+    user_id, error = app._require_library_owner_id()
     if error:
         return error
     data = app.request.get_json(silent=True) or {}

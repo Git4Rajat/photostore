@@ -409,6 +409,10 @@ def _extract_ffmpeg_preview_from_path(path: str) -> Optional[bytes]:
         '-hide_banner',
         '-loglevel',
         'error',
+        # Untrusted media: a crafted playlist/container must not make ffmpeg open
+        # network or other non-file inputs.
+        '-protocol_whitelist',
+        'file',
         '-i',
         path,
         '-frames:v',
@@ -572,7 +576,7 @@ def extract_video_frame_jpeg(video_bytes: bytes, filename: str = '') -> Optional
         for seek in ('1', '0'):
             try:
                 result = subprocess.run(
-                    [ffmpeg, '-y', '-ss', seek, '-i', source_path, '-frames:v', '1', '-q:v', '3', frame_path],
+                    [ffmpeg, '-y', '-protocol_whitelist', 'file', '-ss', seek, '-i', source_path, '-frames:v', '1', '-q:v', '3', frame_path],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     timeout=VIDEO_THUMBNAIL_TIMEOUT_SECONDS,

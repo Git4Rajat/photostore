@@ -31,7 +31,7 @@ From the repository root, set the password without putting it in shell history:
 read -r -s -p 'New owner password: ' PHOTOSTORE_ADMIN_PASSWORD
 export PHOTOSTORE_ADMIN_PASSWORD
 python3 deploy/fresh_wave.py \
-  --subscription c14d0e72-4b72-429d-bf2a-8cede087b9a8 \
+  --subscription <subscription-id> \
   --resource-group forenklaprep1-dev-rg \
   --app-name forenklaprep1-dev \
   --location westeurope \

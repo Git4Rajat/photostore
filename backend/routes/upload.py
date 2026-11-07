@@ -245,7 +245,8 @@ def init_upload():
             try:
                 anonymous_blob_name = timed_call('tracking', app.reserve_pending_anonymous_blob, user_id, filename, expected_hash or None)
             except Exception:
-                app.app.logger.debug('Failed to reserve anonymous blob name for %s', filename)
+                app.app.logger.exception('Failed to reserve anonymous blob name for %s', filename)
+                return app.jsonify({'error': 'Upload reservation failed'}), 503
 
     blob_url = None
     expires_at = None
@@ -381,8 +382,7 @@ def init_upload_batch():
             )
         except Exception:
             app.app.logger.exception('Batch upload-tracking reservation failed for %s files', len(valid))
-            if getattr(g,'wave_upload',None) is not None:
-                return app.jsonify(error='Live upload reservations require retry'),503
+            return app.jsonify(error='Upload reservation failed'), 503
 
     results = []
     for p in parsed:
@@ -391,8 +391,8 @@ def init_upload_batch():
             continue
         filename = p['filename']
         anonymous_blob_name = anonymous_blob_names.get(filename)
-        if p['benchmark_fields'] and not anonymous_blob_name:
-            results.append({'index': p['index'], 'filename': filename, 'error': 'Isolated upload reservation failed'})
+        if not anonymous_blob_name:
+            results.append({'index': p['index'], 'filename': filename, 'error': 'Upload reservation failed'})
             continue
         try:
             blob_url, expires_at = timed_call('sas_creation', app._create_direct_upload_blob_url, anonymous_blob_name or filename)
@@ -531,7 +531,7 @@ def finalize_direct_upload():
     # for files that lose that race. Falls back to the row lookup for
     # sessions that predate this field (durable + replica-safe, so it still
     # works even when finalize lands on a different replica than init).
-    anonymous_blob_name = app._validate_client_blob_name(data.get('blobName')) or timed_call('name_resolution', app.read_pending_anonymous_blob, user_id, filename)
+    anonymous_blob_name = app._owned_client_blob_name(data.get('blobName'), user_id) or timed_call('name_resolution', app.read_pending_anonymous_blob, user_id, filename)
     blob_to_check = anonymous_blob_name or filename
 
     try:
@@ -746,7 +746,7 @@ def finalize_upload_batch():
 
         # See the matching comment in finalize_direct_upload above -- same
         # same-filename-collision race, same fix.
-        anonymous_blob_name = app._validate_client_blob_name(item.get('blobName')) or timed_call('name_resolution', app.read_pending_anonymous_blob, user_id, filename)
+        anonymous_blob_name = app._owned_client_blob_name(item.get('blobName'), user_id) or timed_call('name_resolution', app.read_pending_anonymous_blob, user_id, filename)
         blob_to_check = anonymous_blob_name or filename
         try:
             props = timed_call('blob_check', lambda: app.blob_service_client.get_blob_client(container=app.BLOB_IMAGE_CONTAINER, blob=blob_to_check).get_blob_properties())

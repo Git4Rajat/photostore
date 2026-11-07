@@ -30,6 +30,8 @@ import time
 from typing import Dict, Optional
 
 import jwt
+from azure.core import MatchConditions
+from azure.core.exceptions import ResourceExistsError, ResourceModifiedError
 
 # The single identity every password-mode request resolves to.
 OWNER_USER_ID = 'owner'
@@ -81,6 +83,10 @@ def verify_password(password: str, encoded: str) -> bool:
         n=n, r=r, p=p, dklen=len(expected),
     )
     return hmac.compare_digest(candidate, expected)
+
+
+# Verified against when no real hash exists, to equalise login timing.
+DUMMY_PASSWORD_HASH = hash_password(secrets.token_urlsafe(16))
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +159,7 @@ def issue_session_token(
         'iat': now,
         'exp': now + int(ttl_seconds),
         'mode': mode,
+        'jti': secrets.token_hex(8),
     }
     return jwt.encode(payload, secret, algorithm=_SESSION_ALGO)
 
@@ -253,26 +260,39 @@ def record_login_failure(
     growing window (capped). The counter resets once failures stop for a while
     so a legitimate user is never permanently locked out.
     """
-    now = int(time.time())
-    try:
-        entity = table_client.get_entity(partition_key=_AUTH_PARTITION, row_key=row_key)
-    except Exception:
-        entity = {'PartitionKey': _AUTH_PARTITION, 'RowKey': row_key}
-    last_fail = int(entity.get('lastFailAt', 0) or 0)
-    prev = int(entity.get('failCount', 0) or 0)
-    if now - last_fail > int(reset_window_seconds):
-        prev = 0
-    fail_count = prev + 1
-    entity['failCount'] = fail_count
-    entity['lastFailAt'] = now
-    if fail_count > int(free_attempts):
-        over = fail_count - int(free_attempts)
-        lock = min(int(base_lock_seconds) * (2 ** (over - 1)), int(max_lock_seconds))
-        entity['lockedUntil'] = now + int(lock)
-    try:
-        table_client.upsert_entity(entity)
-    except Exception:
-        pass
+    # Optimistic concurrency: a plain read-modify-write loses increments when
+    # attempts arrive in parallel, which would let a burst slip past the lockout.
+    for _ in range(6):
+        now = int(time.time())
+        etag = None
+        try:
+            entity = table_client.get_entity(partition_key=_AUTH_PARTITION, row_key=row_key)
+            etag = getattr(entity, 'metadata', {}).get('etag') if hasattr(entity, 'metadata') else None
+        except Exception:
+            entity = {'PartitionKey': _AUTH_PARTITION, 'RowKey': row_key}
+        last_fail = int(entity.get('lastFailAt', 0) or 0)
+        prev = int(entity.get('failCount', 0) or 0)
+        if now - last_fail > int(reset_window_seconds):
+            prev = 0
+        fail_count = prev + 1
+        entity['failCount'] = fail_count
+        entity['lastFailAt'] = now
+        if fail_count > int(free_attempts):
+            over = min(fail_count - int(free_attempts), 20)
+            lock = min(int(base_lock_seconds) * (2 ** (over - 1)), int(max_lock_seconds))
+            entity['lockedUntil'] = now + int(lock)
+        try:
+            if etag:
+                table_client.update_entity(entity, etag=etag, match_condition=MatchConditions.IfNotModified)
+            elif hasattr(table_client, 'create_entity') and last_fail == 0 and prev == 0:
+                table_client.create_entity(entity)
+            else:
+                table_client.upsert_entity(entity)
+            return
+        except (ResourceModifiedError, ResourceExistsError):
+            continue
+        except Exception:
+            return
 
 
 def record_login_success(table_client, row_key: str = _LOGIN_THROTTLE_ROW) -> None:

@@ -228,3 +228,40 @@ class TestDownload:
         self.blobs.clear()
         response = share['client'].post('/public/albums/tok/download', json={})
         assert response.status_code == 404 and response.json['error'] == 'No files could be downloaded'
+
+
+def test_share_preview_cache_is_bounded_and_expires(monkeypatch):
+    from routes import public
+    monkeypatch.setattr(public, '_SHARE_PREVIEW_CACHE_MAX_BYTES', 100)
+    public._share_preview_cache.clear()
+    public._share_preview_cache_bytes = 0
+    public._share_preview_cache_put(('a', 'x'), b'1' * 20)
+    public._share_preview_cache_put(('a', 'y'), b'2' * 20)
+    assert public._share_preview_cache_get(('a', 'x')) == b'1' * 20
+    public._share_preview_cache_put(('a', 'z'), b'3' * 20)
+    public._share_preview_cache_put(('a', 'w'), b'4' * 20)
+    public._share_preview_cache_put(('a', 'v'), b'5' * 20)
+    assert public._share_preview_cache_bytes <= 100
+    assert public._share_preview_cache_put(('a', 'big'), b'6' * 90) is None
+    assert public._share_preview_cache_get(('a', 'big')) is None
+    monkeypatch.setattr(public, '_SHARE_PREVIEW_CACHE_TTL_SECONDS', -1)
+    assert public._share_preview_cache_get(('a', 'v')) is None
+
+
+def test_access_code_matching_supports_hashed_and_legacy_plaintext():
+    hashed = app._hash_album_access_code('correct horse')
+    assert hashed.startswith('scrypt$') and 'correct horse' not in hashed
+    assert app._album_access_code_matches(hashed, 'correct horse')
+    assert not app._album_access_code_matches(hashed, 'wrong code')
+    assert app._album_access_code_matches('legacy-code', 'legacy-code')
+    assert not app._album_access_code_matches('legacy-code', 'légacy-code')
+
+
+def test_api_responses_carry_baseline_headers_and_authenticated_json_is_not_cached():
+    client = app.app.test_client()
+    unauth = client.get('/health')
+    assert unauth.headers['Content-Security-Policy'] == "default-src 'none'; frame-ancestors 'none'"
+    assert 'Permissions-Policy' in unauth.headers
+    assert 'Cache-Control' not in unauth.headers
+    authed = client.get('/health', headers={'Authorization': 'Bearer x'})
+    assert authed.headers['Cache-Control'] == 'no-store'

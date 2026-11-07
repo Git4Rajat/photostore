@@ -6,9 +6,19 @@ as app.<name> throughout, matching the exact late-binding lookup semantics
 the code relied on when these functions lived in app.py directly, so
 test-time monkeypatching of app.<name> globals still works unchanged).
 """
+from concurrent.futures import ThreadPoolExecutor
+
 from flask import Blueprint
 
 import app
+
+_background = ThreadPoolExecutor(max_workers=2, thread_name_prefix='auth-bg')
+
+MAX_PASSWORD_LENGTH = 256  # bounds scrypt input from unauthenticated callers
+
+
+def _dispatch_background(fn):
+    _background.submit(fn)
 
 auth_bp = Blueprint('auth', __name__)
 
@@ -33,17 +43,37 @@ def auth_login():
     password = str(data.get('password', '') or '')
     if not email_in or not password:
         return app.jsonify({'error': 'Email and password are required.'}), 400
-    # Brute-force protection is scoped per email so one targeted account can't
-    # lock everyone else out of a shared deployment.
-    throttle_row = f'login-throttle:{email_in}'
-    if not app.password_auth.login_attempt_allowed(app.config_table_client, throttle_row):
-        return app.jsonify({'error': 'Too many attempts. Please wait and try again.'}), 429
+    if len(password) > MAX_PASSWORD_LENGTH:
+        return app.jsonify({'error': 'Incorrect email or password.'}), 401
     account = app.library_store.get_user_by_email(email_in) if app.library_store else None
     stored_hash = str((account or {}).get('passwordHash') or '')
-    if not account or not stored_hash or not app.password_auth.verify_password(password, stored_hash):
-        app.password_auth.record_login_failure(app.config_table_client, row_key=throttle_row)
+    # Brute-force protection is scoped per account so one targeted account can't
+    # lock everyone else out. Unknown emails share a small fixed set of buckets
+    # (256) instead of each getting a row, so an attacker can't grow the table
+    # without bound by guessing addresses.
+    if account:
+        account_row = f'login-throttle:{email_in}'
+    else:
+        bucket = app.hashlib.sha256(email_in.encode('utf-8')).hexdigest()[:2]
+        account_row = f'login-throttle:unknown:{bucket}'
+    # Two limits: a strict one per (account, client address) that stops a single
+    # source quickly without letting it lock the real owner out from elsewhere,
+    # and a loose account-wide one that still bounds a distributed guess.
+    client_ip = app.request.remote_addr or ''
+    ip_digest = app.hashlib.sha256(client_ip.encode('utf-8')).hexdigest()[:16]
+    ip_row = f'{account_row}:ip:{ip_digest}'
+    if not (app.password_auth.login_attempt_allowed(app.config_table_client, ip_row)
+            and app.password_auth.login_attempt_allowed(app.config_table_client, account_row)):
+        return app.jsonify({'error': 'Too many attempts. Please wait and try again.'}), 429
+    # Always run one scrypt verify so response time doesn't reveal whether the
+    # account exists.
+    verified = app.password_auth.verify_password(password, stored_hash or app.password_auth.DUMMY_PASSWORD_HASH)
+    if not account or not stored_hash or not verified:
+        app.password_auth.record_login_failure(app.config_table_client, row_key=ip_row)
+        app.password_auth.record_login_failure(app.config_table_client, row_key=account_row, free_attempts=30)
         return app.jsonify({'error': 'Incorrect email or password.'}), 401
-    app.password_auth.record_login_success(app.config_table_client, throttle_row)
+    app.password_auth.record_login_success(app.config_table_client, ip_row)
+    app.password_auth.record_login_success(app.config_table_client, account_row)
     uid = str(account.get('RowKey'))
     email = str(account.get('email') or email_in)
     library_id = app.library_store.get_current_library(uid) if app.library_store else uid
@@ -93,6 +123,8 @@ def auth_change_password():
     new_password = str(data.get('newPassword', '') or '')
     if len(new_password) < 8:
         return app.jsonify({'error': 'New password must be at least 8 characters.'}), 400
+    if len(new_password) > MAX_PASSWORD_LENGTH:
+        return app.jsonify({'error': f'New password must be at most {MAX_PASSWORD_LENGTH} characters.'}), 400
     account = app.library_store.get_user(account_id) if app.library_store else None
     stored_hash = str((account or {}).get('passwordHash') or '')
     if not account or not stored_hash or not app.password_auth.verify_password(current, stored_hash):
@@ -105,6 +137,37 @@ def auth_change_password():
     token = app._issue_session_for(account_id, library_id=library_id, email=str(account.get('email') or ''), mode='password')
     return app.jsonify({'status': 'ok', 'token': token, 'expiresIn': app.SESSION_TTL_SECONDS})
 
+@auth_bp.route('/auth/logout', methods=['POST'])
+@auth_bp.route('/api/auth/logout', methods=['POST'])
+def auth_logout():
+    """Revoke this session's token server-side (other devices stay signed in)."""
+    guard = app._password_mode_guard()
+    if guard:
+        return guard
+    account_id, _library_id, error = app._require_library_context(require_auth=True)
+    if error:
+        return error
+    payload, _ = app._resolve_session_payload(True)
+    if app.library_store and payload and payload.get('jti'):
+        app.library_store.revoke_session(account_id, str(payload['jti']), int(payload.get('exp') or 0))
+    return app.jsonify({'status': 'ok'})
+
+
+@auth_bp.route('/auth/logout-all', methods=['POST'])
+@auth_bp.route('/api/auth/logout-all', methods=['POST'])
+def auth_logout_all():
+    """Sign out every device: bumping the token version voids all sessions."""
+    guard = app._password_mode_guard()
+    if guard:
+        return guard
+    account_id, _library_id, error = app._require_library_context(require_auth=True)
+    if error:
+        return error
+    if app.library_store:
+        app.library_store.bump_token_version(account_id)
+    return app.jsonify({'status': 'ok'})
+
+
 @auth_bp.route('/auth/forgot', methods=['POST'])
 @auth_bp.route('/api/auth/forgot', methods=['POST'])
 def auth_forgot():
@@ -116,16 +179,25 @@ def auth_forgot():
     data = app.request.get_json(silent=True) or {}
     email_in = app.library_utils.normalize_email(data.get('email'))
     generic = app.jsonify({'status': 'ok'})
-    if not app.email_utils.is_configured() or not email_in or app.library_store is None:
+    if not email_in:
         return generic
+    # Do the lookup and the (slow) mail send off the request thread so response
+    # time is the same whether or not the address has an account.
+    _dispatch_background(lambda: _send_reset_link(email_in))
+    return generic
+
+
+def _send_reset_link(email_in):
+    if not app.email_utils.is_configured() or app.library_store is None:
+        return
     account = app.library_store.get_user_by_email(email_in)
     if not account:
-        return generic
+        return
     account_id = str(account.get('RowKey'))
     # Throttle the unauthenticated send path (per account) so it can't be used to
-    # email-bomb a user or burn ACS email quota. Still return the same 200.
+    # email-bomb a user or burn ACS email quota.
     if not app.library_store.reset_email_allowed(account_id):
-        return generic
+        return
     try:
         raw_token = app.library_store.create_reset_token(account_id, ttl_seconds=3600)
         base = (app.PUBLIC_APP_BASE_URL or '').rstrip('/')
@@ -133,7 +205,6 @@ def auth_forgot():
         app.email_utils.send_password_reset_email(str(account.get('email') or email_in), reset_url)
     except Exception as exc:
         app.app.logger.warning('Password reset email failed: %s', exc)
-    return generic
 
 @auth_bp.route('/auth/reset', methods=['POST'])
 @auth_bp.route('/api/auth/reset', methods=['POST'])
@@ -146,6 +217,8 @@ def auth_reset():
     new_password = str(data.get('newPassword', '') or '')
     if len(new_password) < 8:
         return app.jsonify({'error': 'New password must be at least 8 characters.'}), 400
+    if len(new_password) > MAX_PASSWORD_LENGTH:
+        return app.jsonify({'error': f'New password must be at most {MAX_PASSWORD_LENGTH} characters.'}), 400
     user_id = app.library_store.consume_reset_token(token) if app.library_store else None
     if not user_id:
         return app.jsonify({'error': 'This reset link is invalid or has expired. Please request a new one.'}), 400

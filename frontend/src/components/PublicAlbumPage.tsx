@@ -133,9 +133,14 @@ const writeToPopup = (popup: Window | null, heading: string, detail: string): vo
         + 'font:15px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#333;background:#fafafa;'
         + 'text-align:center;padding:24px;box-sizing:border-box}'
         + 'p{margin:4px 0}p:first-child{font-weight:600}</style></head>'
-        + `<body><div><p>${heading}</p><p>${detail}</p></div></body></html>`,
+        + '<body><div><p id="h"></p><p id="d"></p></div></body></html>',
     );
     popup.document.close();
+    // textContent, never interpolated markup: heading/detail may carry server text.
+    const headingEl = popup.document.getElementById('h');
+    const detailEl = popup.document.getElementById('d');
+    if (headingEl) headingEl.textContent = heading;
+    if (detailEl) detailEl.textContent = detail;
 };
 
 const PublicAlbumPage: React.FC = () => {

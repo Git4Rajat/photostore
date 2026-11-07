@@ -165,6 +165,20 @@ export const login = async (email: string, password: string): Promise<void> => {
 };
 
 export const logout = (): void => {
+    // Revoke the session server-side too, so a copied token stops working. Best
+    // effort: signing out locally must never wait on or fail because of the network.
+    const token = getToken();
+    if (token) {
+        try {
+            void fetch(url('/auth/logout'), {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${token}` },
+                keepalive: true,
+            }).catch(() => undefined);
+        } catch {
+            // ignore: fall through to the local sign-out
+        }
+    }
     clearToken();
     // Drop the previous account's cached library data so the next sign-in
     // starts clean, and forget the email hint -- keeping it pre-filled the

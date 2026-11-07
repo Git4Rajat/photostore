@@ -20,7 +20,7 @@ Keep the artifact for the currently deployed release as well.
 
 ```bash
 python3 deploy/upgrade_wave.py \
-  --subscription c14d0e72-4b72-429d-bf2a-8cede087b9a8 \
+  --subscription <subscription-id> \
   --resource-group forenklaprep1-dev-rg \
   --app-name forenklaprep1-dev \
   --previous-release /absolute/path/to/current/wave-release.json \

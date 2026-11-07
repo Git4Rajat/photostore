@@ -1,3 +1,4 @@
+import hashlib
 """Auth routes: config, password login/throttle, change/forgot/reset password, Entra exchange."""
 import pytest
 
@@ -99,14 +100,19 @@ class TestLogin:
         body = http.post(self.URL, json={'email': ' ME@Example.com ', 'password': 'correct horse'}).json
         assert body['token'] == 'tok:u1:lib-u1:password' and body['email'] == 'me@example.com'
         assert body['expiresIn'] == app.SESSION_TTL_SECONDS
-        assert throttle['successes'] == ['login-throttle:me@example.com'] and throttle['failures'] == []
+        assert throttle['successes'][-1] == 'login-throttle:me@example.com' and throttle['failures'] == []
+        assert throttle['successes'][0].startswith('login-throttle:me@example.com:ip:')
 
     def test_wrong_password_and_unknown_email_are_indistinguishable_and_recorded(self, http, store, throttle):
         wrong = http.post(self.URL, json={'email': 'me@example.com', 'password': 'nope'})
         unknown = http.post(self.URL, json={'email': 'who@example.com', 'password': 'nope'})
         assert wrong.status_code == unknown.status_code == 401
         assert wrong.json == unknown.json
-        assert throttle['failures'] == ['login-throttle:me@example.com', 'login-throttle:who@example.com']
+        bucket = hashlib.sha256(b'who@example.com').hexdigest()[:2]
+        # Unknown emails share one of 256 buckets so guessing addresses can't grow the table.
+        accounts = [row for row in throttle['failures'] if ':ip:' not in row]
+        assert accounts == ['login-throttle:me@example.com', f'login-throttle:unknown:{bucket}']
+        assert len(throttle['failures']) == 4  # one per-address and one account-wide row for each attempt
 
     def test_throttled_email_is_rejected_even_with_the_right_password(self, http, store, throttle):
         throttle['allowed'] = False
@@ -147,6 +153,11 @@ class TestChangePassword:
 
 class TestForgotPassword:
     URL = '/api/auth/forgot'
+
+    @pytest.fixture(autouse=True)
+    def run_background_inline(self, monkeypatch):
+        from routes import auth as auth_routes
+        monkeypatch.setattr(auth_routes, '_dispatch_background', lambda fn: fn())
 
     @pytest.fixture
     def mail(self, monkeypatch):
@@ -237,3 +248,9 @@ class TestEntraExchange:
 
 def test_exchange_is_unavailable_outside_entra_mode(http, store):
     assert http.post('/api/auth/exchange', headers={'Authorization': 'Bearer t'}).status_code == 400
+
+
+def test_overlong_passwords_are_rejected_before_hashing(http, monkeypatch):
+    monkeypatch.setattr(app, 'AUTH_MODE', 'password')
+    assert http.post('/api/auth/login', json={'email': 'a@b.c', 'password': 'x' * 257}).status_code == 401
+    assert http.post('/api/auth/reset', json={'token': 't', 'newPassword': 'x' * 257}).status_code == 400

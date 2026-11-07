@@ -1,4 +1,5 @@
 """Deploy pinned overlays to the authorized dev apps, preserving other config."""
+import os
 import json
 from pathlib import Path
 import re
@@ -8,7 +9,7 @@ import time
 
 import requests
 
-SUBSCRIPTION = 'c14d0e72-4b72-429d-bf2a-8cede087b9a8'
+SUBSCRIPTION = os.environ['AZURE_SUBSCRIPTION_ID']
 GROUP = 'forenkladev-rg'
 BACKEND = 'ghcr.io/git4rajat/photostore-backend@sha256:762f814c90bc4c01e2bca02bb11adae783c9f663f75935e7da669c5910364d49'
 VISION = 'ghcr.io/git4rajat/photostore-ipworker@sha256:4cf28c370bc32e549e346c2c6a2f4cb02ddb1d69e82135c1e60742a200802079'

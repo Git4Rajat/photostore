@@ -40,13 +40,17 @@ on:
         required: false
         default: true
 
+# Least privilege: jobs that need more (publish: packages, pin-deploy-defaults:
+# contents write) declare it themselves.
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     # Gate 1: only listed admins may trigger a real run. Adjust the list to your
     # repo admins. This is belt-and-suspenders on top of the `publish`
     # Environment's required-reviewers approval gate.
@@ -83,7 +87,7 @@ jobs:
             lfs: false
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: ${{ matrix.lfs }}
 
@@ -102,7 +106,7 @@ jobs:
       # Use the buildkit container driver; the default docker driver can fail the
       # push to GHCR with "unknown blob".
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
           driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
 
@@ -111,7 +115,7 @@ jobs:
       # a classic PAT (scopes: write:packages, read:packages, delete:packages)
       # stored as the GHCR_PAT secret; fall back to GITHUB_TOKEN if unset.
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -119,7 +123,7 @@ jobs:
 
       - name: Build and push
         id: image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
@@ -147,7 +151,7 @@ jobs:
               name=name, image=os.environ['RELEASE_IMAGE'], sourceCommit=os.environ['RELEASE_SOURCE'])))
           PYTHON
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: wave-image-${{ matrix.name }}
           path: release-images/*.json
@@ -165,14 +169,16 @@ jobs:
     needs: publish
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: wave-image-*
           path: release-images
           merge-multiple: true
+      # pytest is deliberately absent from the production image, so install it
+      # (into the container's user site, not the image) just for this check.
       - name: Qualify wave code in the exact backend image
         run: |
           BACKEND_IMAGE=$(python3 -c "import json; print(json.load(open('release-images/backend.json'))['image'])")
@@ -181,7 +187,8 @@ jobs:
             -v "$PWD/backend/tests:/app/tests:ro" \
             -v "$PWD/backend/scripts:/app/scripts:ro" \
             -v "$PWD/deploy:/deploy:ro" \
-            "$BACKEND_IMAGE" -c 'python -m pytest tests/test_wave*.py tests/test_upload_wave*.py tests/test_fresh_wave*.py tests/test_execution_lease.py tests/test_processing_artifacts.py tests/test_processing_failure_capsules.py tests/test_clustering_checkpoint.py tests/test_queue_scale_patch.py tests/test_apply_client_processing_recovery.py tests/test_maintenance_efficiency.py tests/test_person_label_indexes.py tests/test_periodic_index_artifact_recovery.py tests/test_index_maintenance_worker.py tests/test_people_index.py tests/test_summary_database_integration.py tests/test_metadata_write_concurrency.py tests/test_search_db*.py tests/test_index_source_reads.py tests/test_lexical_incremental.py tests/test_people_embedding_incremental.py -q'
+            "$BACKEND_IMAGE" -c 'pip install --user -q pytest==9.2.0 && python -m pytest tests/test_wave*.py tests/test_upload_wave*.py tests/test_fresh_wave*.py tests/test_execution_lease.py tests/test_processing_artifacts.py tests/test_processing_failure_capsules.py tests/test_clustering_checkpoint.py tests/test_queue_scale_patch.py tests/test_apply_client_processing_recovery.py tests/test_maintenance_efficiency.py tests/test_person_label_indexes.py tests/test_periodic_index_artifact_recovery.py tests/test_index_maintenance_worker.py tests/test_people_index.py tests/test_summary_database_integration.py tests/test_metadata_write_concurrency.py tests/test_search_db*.py tests/test_index_source_reads.py tests/test_lexical_incremental.py tests/test_people_embedding_incremental.py -q'
+      # Same as above: requirements.txt no longer ships pytest into this image.
       - name: Qualify Vision queue ownership and OCR in the exact Vision image
         run: |
           VISION_IMAGE=$(python3 -c "import json; print(json.load(open('release-images/ipworker.json'))['image'])")
@@ -190,10 +197,10 @@ jobs:
             -v "$PWD/backend/tests:/app/tests:ro" \
             -v "$PWD/backend/scripts:/app/scripts:ro" \
             -v "$PWD/deploy:/deploy:ro" \
-            "$VISION_IMAGE" -c 'python -m pytest tests/test_ipworker*.py tests/test_ipwork_ocr.py tests/test_tag_index_queue_maintenance.py tests/test_index_barrier_retry.py tests/test_automatic_runtime_integration.py tests/test_apply_client_processing_recovery.py tests/test_processing_failure_capsules.py -q'
+            "$VISION_IMAGE" -c 'pip install --user -q pytest==9.2.0 && python -m pytest tests/test_ipworker*.py tests/test_ipwork_ocr.py tests/test_tag_index_queue_maintenance.py tests/test_index_barrier_retry.py tests/test_automatic_runtime_integration.py tests/test_apply_client_processing_recovery.py tests/test_processing_failure_capsules.py -q'
       - name: Create tested release contract
         run: python3 deploy/wave_release.py --image-dir release-images --source "${{ github.sha }}" --output wave-release.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: wave-release
           path: wave-release.json
@@ -209,11 +216,13 @@ jobs:
     needs: wave-release
     if: inputs.publish_latest && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: wave-release
       - name: Pin template image defaults to release digests

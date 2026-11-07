@@ -291,6 +291,17 @@ resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01'
         }
       ]
     }
+    // Soft delete: a deleted or overwritten blob/container stays recoverable for
+    // two weeks, so a bug or a compromised credential can't destroy photos
+    // irreversibly.
+    deleteRetentionPolicy: {
+      enabled: true
+      days: 14
+    }
+    containerDeleteRetentionPolicy: {
+      enabled: true
+      days: 14
+    }
     // Powers the blob lifecycle policy below: without this, tierToCool/tierToCold
     // can only key off last-modification time (effectively upload date), which
     // would age out an original a user still opens regularly.
@@ -700,6 +711,7 @@ resource core 'Microsoft.App/containerApps@2025-01-01' = {
     configuration: {
       ingress: {
         external: true
+        allowInsecure: false
         targetPort: 5000
         transport: 'auto'
         traffic: [
@@ -1046,6 +1058,7 @@ resource indexer 'Microsoft.App/containerApps@2025-01-01' = {
     configuration: {
       ingress: {
         external: true
+        allowInsecure: false
         targetPort: 5000
         transport: 'auto'
         traffic: [
@@ -1226,6 +1239,7 @@ resource recovery 'Microsoft.App/containerApps@2025-01-01' = {
     configuration: {
       ingress: {
         external: true
+        allowInsecure: false
         targetPort: 5000
         transport: 'auto'
         traffic: [
@@ -1326,6 +1340,7 @@ resource archive 'Microsoft.App/containerApps@2025-01-01' = {
     configuration: {
       ingress: {
         external: true
+        allowInsecure: false
         targetPort: 5000
         transport: 'auto'
         traffic: [
@@ -1439,6 +1454,7 @@ resource upload 'Microsoft.App/containerApps@2025-01-01' = {
     configuration: {
       ingress: {
         external: true
+        allowInsecure: false
         targetPort: 5000
         transport: 'auto'
         traffic: [
@@ -1545,6 +1561,7 @@ resource web 'Microsoft.App/containerApps@2025-01-01' = {
     configuration: {
       ingress: {
         external: true
+        allowInsecure: false
         targetPort: 80
         transport: 'auto'
         traffic: [
@@ -1568,6 +1585,8 @@ resource web 'Microsoft.App/containerApps@2025-01-01' = {
             { name: 'APP_CONFIG_RECOVERY_API_BASE_URL', value: 'https://${recovery.properties.configuration.ingress.fqdn}' }
             { name: 'APP_CONFIG_ARCHIVE_API_BASE_URL', value: 'https://${archive.properties.configuration.ingress.fqdn}' }
             { name: 'APP_CONFIG_SPA_BASE_URL', value: webUrl }
+            // Lets the web container's CSP allow only this storage account instead of *.blob.core.windows.net.
+            { name: 'STORAGE_ACCOUNT_NAME', value: storageAccountName }
             { name: 'APP_CONFIG_AUTH_MODE', value: 'password' }
             // Without this, the frontend's docker-entrypoint.sh defaults
             // processingMode to 'browser' regardless of what this deployment

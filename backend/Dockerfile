@@ -1,5 +1,5 @@
 # Dockerfile for Flask backend (Azure Container Apps)
-FROM mirror.gcr.io/library/python:3.11-slim
+FROM mirror.gcr.io/library/python:3.11-slim@sha256:65bd3d9f1d7fa268dd1909973ba7eb4bdf41f6dcf2cfbe76ba9528b170f3fd79
 
 # Keep container build logs clean when pip runs as root in Docker layers.
 ENV PIP_ROOT_USER_ACTION=ignore \
@@ -26,8 +26,9 @@ WORKDIR /app
 
 # Copy requirements and install
 COPY requirements.txt ./
-COPY requirements-clustering.txt ./
-RUN pip install -r requirements.txt -r requirements-clustering.txt
+# Hash-locked closure (see scripts/lock-requirements.sh): a tampered or
+# substituted release fails the install instead of running in the image.
+RUN pip install --require-hashes --no-deps -r requirements.txt
 
 # Copy runtime Python modules used by app.py
 COPY *.py ./
@@ -36,6 +37,13 @@ COPY scripts/backfill_invitation_index.py ./scripts/backfill_invitation_index.py
 COPY data/ ./data/
 COPY entrypoint.sh ./
 RUN chmod +x /app/entrypoint.sh
+
+# Run as an unprivileged user: this container parses untrusted images/video
+# (ffmpeg, exiftool, libraw), so a parser exploit should not land as root.
+RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin photostore \
+    && chown -R photostore:photostore /app
+ENV HOME=/home/photostore
+USER 10001
 
 # Expose port (Flask default is 5000). 5001 is the gunicorn-master-owned
 # health sidecar (see gunicorn.conf.py's on_starting) -- stays up independent

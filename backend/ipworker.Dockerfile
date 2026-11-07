@@ -54,8 +54,9 @@ RUN python /tmp/install_exiftool.py && rm /tmp/install_exiftool.py
 
 WORKDIR /app
 
-COPY backend/requirements.txt backend/requirements-ipworker.txt ./
-RUN pip install -r requirements.txt -r requirements-ipworker.txt
+COPY backend/requirements-ipworker.txt ./
+# Full hash-locked closure (backend + ipworker deps); see backend/scripts/lock-requirements.sh.
+RUN pip install --require-hashes --no-deps --extra-index-url https://download.pytorch.org/whl/cpu -r requirements-ipworker.txt
 
 # Runtime Python modules -- shared backend/*.py (app.py, storage_utils.py,
 # exif_utils.py, maps_utils.py, vision_utils.py, ...) plus the ipworker-only

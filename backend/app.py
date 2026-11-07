@@ -571,7 +571,9 @@ SPA_BASE_URL = os.getenv('SPA_BASE_URL', '').strip()
 AZURE_AD_TENANT_ID = os.getenv('AZURE_AD_TENANT_ID', '').strip()
 AZURE_AD_CLIENT_ID = os.getenv('AZURE_AD_CLIENT_ID', '').strip()
 AZURE_AD_API_AUDIENCE = os.getenv('AZURE_AD_API_AUDIENCE', '').strip()
-AUTH_REQUIRED = os.getenv('AUTH_REQUIRED', 'false').lower() in ('1', 'true', 'yes')
+# Fail closed: unauthenticated requests are only mapped to the local 'owner' user
+# when AUTH_REQUIRED=false is set explicitly (local development).
+AUTH_REQUIRED = os.getenv('AUTH_REQUIRED', 'true').lower() in ('1', 'true', 'yes')
 # Auth mode: 'password' (single-owner email + password, the simple self-host default)
 # or 'entra' (Microsoft Entra SSO, for advanced/enterprise deployments).
 AUTH_MODE = os.getenv('AUTH_MODE', 'password').strip().lower()
@@ -583,7 +585,7 @@ CONFIG_TABLE = os.getenv('CONFIG_TABLE', 'photostoreconfig')
 # value so the app still runs, but sessions then invalidate on restart / across
 # replicas — set it explicitly (a Container App secret) in production.
 SESSION_SECRET = os.getenv('SESSION_SECRET', '') or secrets.token_hex(32)
-SESSION_TTL_SECONDS = int(os.getenv('SESSION_TTL_SECONDS', str(30 * 24 * 3600)))
+SESSION_TTL_SECONDS = int(os.getenv('SESSION_TTL_SECONDS', str(14 * 24 * 3600)))
 # Base URL of the web app, used to build password-reset links in emails.
 PUBLIC_APP_BASE_URL = os.getenv('PUBLIC_APP_BASE_URL', '').strip() or SPA_BASE_URL
 # Base URL of the 'archive' role (public_bp lives there, not on 'core' -- see
@@ -2119,13 +2121,37 @@ def _album_is_expired(entity: Dict) -> bool:
 # Secret used to sign short-lived access grants for code-protected public albums so that
 # the media routes (loaded as <img src>, which cannot carry the access code) can verify
 # the visitor already cleared the code check. Falls back to a per-process random secret,
-# which simply means outstanding grants are invalidated on restart.
-_ALBUM_GRANT_SECRET = (
-    os.getenv('ALBUM_GRANT_SECRET', '').strip()
-    or secrets.token_hex(32)
-)
+# which simply means outstanding grants are invalidated on restart (when neither
+# ALBUM_GRANT_SECRET nor SESSION_SECRET is set).
+def _derive_album_grant_secret() -> str:
+    explicit = os.getenv('ALBUM_GRANT_SECRET', '').strip()
+    if explicit:
+        return explicit
+    # Derive from the configured session secret so every replica agrees (a random
+    # per-process value made grants fail whenever a request hit another replica)
+    # without needing a second secret to provision.
+    configured = os.getenv('SESSION_SECRET', '').strip()
+    if configured:
+        return hmac.new(configured.encode('utf-8'), b'album-grant-v1', hashlib.sha256).hexdigest()
+    return secrets.token_hex(32)
+
+
+_ALBUM_GRANT_SECRET = _derive_album_grant_secret()
 _ALBUM_GRANT_COOKIE_PREFIX = 'album_grant_'
-MIN_ALBUM_ACCESS_CODE_LENGTH = 4
+MIN_ALBUM_ACCESS_CODE_LENGTH = 6
+
+
+def _hash_album_access_code(code: str) -> str:
+    """Stored form of a new access code (scrypt, never the plaintext)."""
+    return password_auth.hash_password(code)
+
+
+def _album_access_code_matches(stored: str, provided: str) -> bool:
+    # Codes saved before hashing was introduced are still plaintext; they keep
+    # working and are replaced by a hash the next time the owner re-shares.
+    if stored.startswith('scrypt$'):
+        return password_auth.verify_password(provided, stored)
+    return hmac.compare_digest(stored.encode('utf-8'), provided.encode('utf-8'))
 
 
 def _album_access_code(entity: Dict) -> str:
@@ -2137,9 +2163,24 @@ def _album_grant_cookie_name(token: str) -> str:
     return f'{_ALBUM_GRANT_COOKIE_PREFIX}{digest}'
 
 
-def _sign_album_grant(token: str, access_code: str) -> str:
-    message = f'{token}:{access_code}'.encode('utf-8')
-    return hmac.new(_ALBUM_GRANT_SECRET.encode('utf-8'), message, hashlib.sha256).hexdigest()
+ALBUM_GRANT_TTL_SECONDS = 60 * 60 * 6
+
+
+def _sign_album_grant(token: str, access_code: str, expires_at: Optional[int] = None) -> str:
+    """Cookie value ``<expiry>.<hmac>``; the expiry is covered by the signature so a
+    captured cookie can't outlive its window."""
+    if expires_at is None:
+        expires_at = int(time.time()) + ALBUM_GRANT_TTL_SECONDS
+    message = f'{token}:{access_code}:{expires_at}'.encode('utf-8')
+    digest = hmac.new(_ALBUM_GRANT_SECRET.encode('utf-8'), message, hashlib.sha256).hexdigest()
+    return f'{int(expires_at)}.{digest}'
+
+
+def _album_media_cache_control(entity: Dict, max_age: int) -> str:
+    """Code-protected albums must not land in shared caches, where the next
+    visitor would be served the media without presenting a grant."""
+    scope = 'private' if _album_access_code(entity) else 'public'
+    return f'{scope}, max-age={max_age}'
 
 
 def _album_grant_valid(entity: Dict, token: str) -> bool:
@@ -2148,9 +2189,11 @@ def _album_grant_valid(entity: Dict, token: str) -> bool:
     if not access_code:
         return True
     provided = str(request.cookies.get(_album_grant_cookie_name(token), '') or '')
-    if not provided:
+    expiry_text, _, _ = provided.partition('.')
+    if not expiry_text.isdigit() or int(expiry_text) < time.time():
         return False
-    return hmac.compare_digest(provided, _sign_album_grant(token, access_code))
+    expected = _sign_album_grant(token, access_code, int(expiry_text))
+    return hmac.compare_digest(provided.encode('utf-8'), expected.encode('utf-8'))
 
 
 def _album_access_code_gate(entity: Dict, token: str, provided: str):
@@ -2170,7 +2213,7 @@ def _album_access_code_gate(entity: Dict, token: str, provided: str):
     if not password_auth.login_attempt_allowed(config_table_client, row_key):
         retry_after = password_auth.seconds_until_unlocked(config_table_client, row_key)
         return jsonify({'codeRequired': True, 'retryAfterSeconds': retry_after}), 429
-    if provided and hmac.compare_digest(access_code, provided):
+    if provided and _album_access_code_matches(access_code, provided):
         password_auth.record_login_success(config_table_client, row_key)
         return None
     if provided:
@@ -2690,6 +2733,10 @@ def _require_library_context(require_auth: bool = False):
         current_ver = int(account.get('tokenVersion', 1) or 1)
         if int(token_ver) != current_ver:
             return None, None, (jsonify({'error': 'Session expired. Please sign in again.'}), 401)
+    # Per-session revocation (explicit sign-out): the token's jti is listed on
+    # the account until the token would have expired anyway.
+    if account is not None and library_store is not None and library_store.session_revoked(account, payload.get('jti')):
+        return None, None, (jsonify({'error': 'Session expired. Please sign in again.'}), 401)
 
     library_id = str(payload.get('lib') or user_id).strip() or user_id
 
@@ -2755,6 +2802,18 @@ def _resolve_user_role(user_id: str) -> str:
     if user_id and str(user_id).strip().lower() in ADMIN_USER_IDS:
         return 'admin'
     return ''
+
+
+def _require_library_owner_id(require_auth: bool = False):
+    """Like _require_user_id (returns the active library id) but only for the
+    library's owner. Repair/rebuild/purge tools act on the whole library, so a
+    shared-library member must not be able to run them."""
+    account_id, library_id, error = _require_library_context(require_auth=require_auth)
+    if error:
+        return None, error
+    if library_store is not None and not library_store.is_owner(account_id, library_id):
+        return None, (jsonify({'error': 'Only the library owner can do that.'}), 403)
+    return library_id, None
 
 
 def _require_admin(require_auth: bool = True):
@@ -9368,7 +9427,11 @@ def _find_public_album_by_token(token: str) -> Optional[Dict]:
         # actually valid but predates this index (pre-backfill).
         _delete_album_token_index(token)
     # Fallback: unscoped scan, for tokens created before this index existed and
-    # not yet covered by the backfill script.
+    # not yet covered by backfill_album_token_index.py. Off by default: this
+    # endpoint is unauthenticated, so every random token would otherwise cost a
+    # full albums-table scan.
+    if os.getenv('ALBUM_TOKEN_SCAN_FALLBACK', 'false').lower() not in ('1', 'true', 'yes'):
+        return None
     safe = _escape_odata(token)
     try:
         rows = list(albums_table_client.query_entities(f"publicToken eq '{safe}'"))
@@ -9468,6 +9531,17 @@ def _apply_security_headers(response):
     response.headers.setdefault('X-Frame-Options', 'DENY')
     response.headers.setdefault('Referrer-Policy', 'strict-origin-when-cross-origin')
     response.headers.setdefault('Cross-Origin-Resource-Policy', 'same-site')
+    response.headers.setdefault('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=()')
+    mimetype = (response.mimetype or '').lower()
+    if mimetype != 'text/html':
+        # The API serves data, never documents: forbid script/frames outright so a
+        # response that is ever rendered directly can't execute anything.
+        response.headers.setdefault('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'")
+        # Authenticated JSON can hold personal data; keep it out of shared and
+        # disk caches unless the route chose a caching policy (or ETag) itself.
+        if (mimetype == 'application/json' and request.headers.get('Authorization')
+                and 'Cache-Control' not in response.headers and 'ETag' not in response.headers):
+            response.headers['Cache-Control'] = 'no-store'
     # Only advertise HSTS over genuinely secure (HTTPS) requests so local http
     # development is unaffected.
     if request.is_secure:
@@ -9475,6 +9549,81 @@ def _apply_security_headers(response):
             'Strict-Transport-Security', 'max-age=31536000; includeSubDomains'
         )
     return response
+
+
+# Body-size caps by content type. Upload chunks (octet-stream) are bounded by the
+# upload routes themselves; JSON is never legitimately large, and the auth
+# endpoints are reachable without a token.
+MAX_JSON_BODY_BYTES = int(os.getenv('MAX_JSON_BODY_BYTES', str(16 * 1024 * 1024)))
+MAX_AUTH_BODY_BYTES = int(os.getenv('MAX_AUTH_BODY_BYTES', str(64 * 1024)))
+
+
+@app.before_request
+def _limit_json_body_size():
+    length = request.content_length
+    if length is None or request.method not in ('POST', 'PUT', 'PATCH'):
+        return None
+    path = request.path
+    if path.startswith(('/auth/', '/api/auth/', '/public/', '/api/library/invite')):
+        limit = MAX_AUTH_BODY_BYTES
+    elif request.mimetype == 'application/json':
+        limit = MAX_JSON_BODY_BYTES
+    else:
+        return None
+    if length > limit:
+        return jsonify({'error': 'Request body too large'}), 413
+    return None
+
+
+# Per-client-IP request budgets for the routes reachable without a session.
+# Counters are per replica and in memory (fixed one-minute window, bounded), so
+# this is a backstop against scripted hammering, not an exact global quota; the
+# login/invite throttles stay the authority for credential guessing.
+_ANON_LIMIT_WINDOW_SECONDS = 60
+_ANON_LIMITS = (
+    (('/auth/', '/api/auth/'), 'auth', int(os.getenv('ANON_AUTH_RATE_PER_MINUTE', '40'))),
+    (('/public/', '/api/public/'), 'public', int(os.getenv('ANON_PUBLIC_RATE_PER_MINUTE', '1500'))),
+)
+_ANON_MAX_TRACKED = 20000
+_anon_counters: Dict[str, list] = {}
+_anon_lock = threading.Lock()
+
+
+def _anon_rate_limited(path: str, ip: str, now: Optional[float] = None) -> Optional[int]:
+    """Return seconds until the window resets when ``ip`` is over budget, else None."""
+    for prefixes, bucket, limit in _ANON_LIMITS:
+        if limit > 0 and path.startswith(prefixes):
+            break
+    else:
+        return None
+    now = time.time() if now is None else now
+    key = f'{bucket}:{ip}'
+    with _anon_lock:
+        entry = _anon_counters.get(key)
+        if entry is None or now - entry[0] >= _ANON_LIMIT_WINDOW_SECONDS:
+            if len(_anon_counters) >= _ANON_MAX_TRACKED:
+                for stale in [k for k, v in _anon_counters.items() if now - v[0] >= _ANON_LIMIT_WINDOW_SECONDS]:
+                    del _anon_counters[stale]
+                if len(_anon_counters) >= _ANON_MAX_TRACKED:
+                    return None  # fail open rather than grow without bound
+            entry = _anon_counters[key] = [now, 0]
+        entry[1] += 1
+        if entry[1] > limit:
+            return max(1, int(_ANON_LIMIT_WINDOW_SECONDS - (now - entry[0])))
+    return None
+
+
+@app.before_request
+def _limit_anonymous_request_rate():
+    if request.method == 'OPTIONS':
+        return None
+    retry = _anon_rate_limited(request.path, request.remote_addr or '', None)
+    if retry is None:
+        return None
+    resp = jsonify({'error': 'Too many requests. Please slow down.'})
+    resp.status_code = 429
+    resp.headers['Retry-After'] = str(retry)
+    return resp
 
 
 @app.before_request
@@ -13169,6 +13318,14 @@ def _validate_client_blob_name(value: object) -> Optional[str]:
     return candidate if _ANONYMOUS_BLOB_NAME_RE.match(candidate) else None
 
 
+def _owned_client_blob_name(value: object, library_id: str) -> Optional[str]:
+    """_validate_client_blob_name plus proof the name was reserved for ``library_id``."""
+    candidate = _validate_client_blob_name(value)
+    if candidate and not storage_utils_module.blob_name_belongs_to_library(library_id, candidate):
+        return None
+    return candidate
+
+
 BROWSER_PROCESSING_STATUS_FIELDS = (
     ('thumbnail_status', 'thumbnail'),
     ('exif_status', 'exif'),
@@ -13720,7 +13877,7 @@ def _claim_processing_lease_response(
         # silently overwrite a different, already-correct photo's thumbnail blob
         # (the image itself is untouched since that upload path already uses the
         # client-echoed blobName; only this thumbnail-claim path still had the gap).
-        physical_name = _validate_client_blob_name(client_blob_name) or _resolve_media_blob_name(user_id, filename)
+        physical_name = _owned_client_blob_name(client_blob_name, user_id) or _resolve_media_blob_name(user_id, filename)
         from processing_completion import completion_capture_enabled
         if completion_capture_enabled():
             from processing_artifacts import staging_name

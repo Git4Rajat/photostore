@@ -45,7 +45,7 @@ def upload_env(monkeypatch, caplog):
     monkeypatch.setattr(app, '_library_cleanup_block_reason', clock.action(3))
     monkeypatch.setattr(app, '_cleanup_failed_upload', clock.action(5))
     monkeypatch.setattr(app, 'reset_upload_tracking_and_reserve_blob', clock.action(7, 'blob'))
-    monkeypatch.setattr(app, 'reset_upload_tracking_and_reserve_blobs_batch', clock.action(7, {}))
+    monkeypatch.setattr(app, 'reset_upload_tracking_and_reserve_blobs_batch', clock.action(7, {'private.jpg': 'blob'}))
     monkeypatch.setattr(app, '_create_direct_upload_blob_url', clock.action(11, ('https://secret/?sig=credential', 'expiry')))
     monkeypatch.setattr(app, '_create_direct_thumbnail_upload_blob_url', clock.action(13, ('https://thumbnail/?sig=credential', 'expiry')))
     monkeypatch.setattr(app, 'read_pending_anonymous_blob', clock.action(5, 'blob'))

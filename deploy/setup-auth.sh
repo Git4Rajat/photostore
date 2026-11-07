@@ -16,7 +16,13 @@
 #   2. Paste ONE of the following:
 #
 #        curl -sSL https://raw.githubusercontent.com/Git4Rajat/photostore/main/deploy/setup-auth.sh -o setup-auth.sh
+#        less setup-auth.sh          # read it first: it runs with your Azure rights
 #        bash setup-auth.sh
+#
+#      This script creates app registrations and grants consent in your tenant,
+#      so download it as a file and review it before running (never pipe it
+#      straight into bash). To run exactly the version you deployed, replace
+#      "main" in the URL with that release's tag or commit SHA.
 #
 #      The script finds your Photostore deployment automatically. If you have
 #      more than one, it will ask which resource group to use, or pass it:
