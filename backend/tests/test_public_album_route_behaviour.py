@@ -265,3 +265,48 @@ def test_api_responses_carry_baseline_headers_and_authenticated_json_is_not_cach
     assert 'Cache-Control' not in unauth.headers
     authed = client.get('/health', headers={'Authorization': 'Bearer x'})
     assert authed.headers['Cache-Control'] == 'no-store'
+
+
+# --- link expiry, with the real (unmocked) expiry check on the real field --------------------
+
+PAST = '2000-01-01T00:00:00+00:00'
+
+
+def _expires_in(seconds):
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+
+
+@pytest.mark.parametrize('path,method', [
+    ('/api/public/albums/tok', 'get'),
+    ('/public/albums/tok/download-check', 'get'),
+    ('/public/albums/tok/download', 'post'),
+    ('/public/photos/tok/thumbnail/a.jpg', 'get'),
+    ('/public/photos/tok/image/a.jpg', 'get'),
+    ('/public/photos/tok/preview/a.jpg', 'get'),
+    ('/public/photos/tok/raw-full-preview/a.jpg', 'get'),
+    ('/public/photos/tok/share-preview/a.jpg', 'get'),
+])
+def test_expired_public_link_is_404_on_every_public_route(share, path, method):
+    share['entity']['publicExpiresAt'] = PAST
+    assert getattr(share['client'], method)(path).status_code == 404
+
+
+def test_link_works_until_it_expires(share):
+    share['entity']['publicExpiresAt'] = _expires_in(3600)
+    assert share['client'].get('/api/public/albums/tok').status_code == 200
+    share['entity']['publicExpiresAt'] = _expires_in(-1)
+    assert share['client'].get('/api/public/albums/tok').status_code == 404
+
+
+def test_empty_or_unparseable_expiry_means_no_expiry(share):
+    for value in ('', None, 'not-a-date'):
+        share['entity']['publicExpiresAt'] = value
+        assert share['client'].get('/api/public/albums/tok').status_code == 200
+
+
+def test_expired_link_share_page_reveals_nothing_about_the_album(share):
+    share['entity']['publicExpiresAt'] = PAST
+    share['entity']['name'] = 'Secret Holiday'
+    body = share['client'].get('/public/album/tok').get_data(as_text=True)
+    assert 'Secret Holiday' not in body and 'no longer available' in body
