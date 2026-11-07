@@ -2270,6 +2270,7 @@ def _album_entity_to_payload(entity: Dict, cover_thumbnail_url: Optional[str] = 
     has_access_code = bool(str(entity.get('accessCode', '')).strip())
     is_expired = _album_is_expired(entity)
     public_url = ''
+    url_pending = False
     if is_public and token and not is_expired:
         # Points at the share page's /public/album/<token> route (not directly
         # at the SPA) so link-preview bots see the album's real name/thumbnail;
@@ -2278,7 +2279,8 @@ def _album_entity_to_payload(entity: Dict, cover_thumbnail_url: Optional[str] = 
         # ARCHIVE_PUBLIC_BASE_URL -- so it must not be built from this
         # process's own request.host_url.
         public_url = share_snapshot.public_url(entity, token)
-        if not public_url:
+        url_pending = not public_url and share_snapshot.pending(entity, token)
+        if not public_url and not url_pending:
             base = ARCHIVE_PUBLIC_BASE_URL or request.host_url.rstrip('/')
             public_url = f"{base.rstrip('/')}/public/album/{token}"
     deleted_at = str(entity.get('deletedAt') or '')
@@ -2291,6 +2293,7 @@ def _album_entity_to_payload(entity: Dict, cover_thumbnail_url: Optional[str] = 
         'membersPaged': table_backed,
         'isPublic': is_public and not is_expired,
         'publicUrl': public_url,
+        'publicUrlPending': url_pending,
         'publicExpiresAt': entity.get('publicExpiresAt') or '',
         'hasAccessCode': has_access_code,
         'isExpired': is_expired,
@@ -8763,7 +8766,9 @@ def _sync_share_snapshot(entity: Dict) -> None:
         if not user_id or not album_id:
             return
         if share_snapshot.eligible(entity) and not _coerce_bool(entity.get('deleted')):
-            _enqueue_share_snapshot('build', user_id, album_id, delay=SHARE_SNAPSHOT_DEBOUNCE_SECONDS)
+            # The first build is what the share screen is waiting on; later edits are debounced.
+            first = str(entity.get('shareSnapshotToken') or '') != str(entity.get('publicToken') or '')
+            _enqueue_share_snapshot('build', user_id, album_id, delay=0 if first else SHARE_SNAPSHOT_DEBOUNCE_SECONDS)
         else:
             stale = str(entity.get('shareSnapshotToken') or '')
             if stale:

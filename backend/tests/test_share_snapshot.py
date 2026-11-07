@@ -200,3 +200,12 @@ def test_page_offers_download_of_the_album_and_of_each_photo():
     assert 'id="dlAll"' in html and 'id="lbDl"' in html
     script = html.split('<script>')[1].split('</script>')[0]
     assert "'/public/albums/'" in script and "'/public/photos/'" in script and "'/image/'" in script
+
+
+def test_link_is_pending_only_briefly_and_only_for_unprotected_unbuilt_shares():
+    now = datetime.now(timezone.utc)
+    fresh = entity(updatedAt=now.isoformat())
+    assert ss.pending(fresh, 'tok')
+    assert not ss.pending(entity(updatedAt=(now - timedelta(seconds=ss.PENDING_SECONDS + 5)).isoformat()), 'tok')
+    assert not ss.pending(entity(updatedAt=now.isoformat(), accessCode='scrypt$hash'), 'tok')
+    assert not ss.pending({**fresh, 'shareSnapshotToken': 'tok', 'shareSnapshotAt': 'x'}, 'tok')

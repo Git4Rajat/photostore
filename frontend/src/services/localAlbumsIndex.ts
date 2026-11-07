@@ -24,6 +24,8 @@ export interface AlbumIndexRow {
     filenames?: string[];
     isPublic: boolean;
     publicUrl: string;
+    /** True while a just-shared link waits for its static snapshot; publicUrl is empty until then. */
+    publicUrlPending?: boolean;
     publicExpiresAt: string;
     hasAccessCode: boolean;
     isExpired: boolean;
@@ -114,6 +116,7 @@ const normalizeRows = (raw: Record<string, unknown>[]): AlbumIndexRow[] => raw
         filenames: Array.isArray(row.filenames) ? row.filenames.filter((f): f is string => typeof f === 'string') : [],
         isPublic: Boolean(row.isPublic),
         publicUrl: typeof row.publicUrl === 'string' ? row.publicUrl : '',
+        publicUrlPending: Boolean(row.publicUrlPending),
         publicExpiresAt: typeof row.publicExpiresAt === 'string' ? row.publicExpiresAt : '',
         hasAccessCode: Boolean(row.hasAccessCode),
         isExpired: Boolean(row.isExpired),

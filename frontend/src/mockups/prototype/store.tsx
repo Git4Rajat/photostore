@@ -1222,6 +1222,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 coverThumbnailUrl: r.coverFilename ? covers.get(r.coverFilename) || undefined : undefined,
                 isPublic: r.isPublic,
                 publicUrl: r.publicUrl || undefined,
+                publicUrlPending: r.publicUrlPending || undefined,
                 publicExpiresAt: r.publicExpiresAt || undefined,
                 hasAccessCode: r.hasAccessCode,
                 isExpired: r.isExpired,
@@ -2167,7 +2168,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         try {
             const res = await post<{ album?: Album }>(`/albums/${encodeURIComponent(id)}/revoke`, {});
             setAlbums((prev) => prev.map((a) => (a.id === id
-                ? { ...a, ...(res?.album ?? {}), isPublic: false, publicUrl: undefined }
+                ? { ...a, ...(res?.album ?? {}), isPublic: false, publicUrl: undefined, publicUrlPending: undefined }
                 : a)));
             invalidateLocalAlbumsIndex();
         } catch {

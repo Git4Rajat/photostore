@@ -71,6 +71,10 @@ def public_url(row: Dict, token: str) -> str:
     return page_url(token)
 
 
+# How long a freshly shared link may wait for its snapshot before falling back to the archive link.
+PENDING_SECONDS = _int_env('SHARE_SNAPSHOT_PENDING_SECONDS', 60)
+
+
 def _parse_iso(value: str) -> Optional[datetime]:
     try:
         parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
@@ -228,3 +232,13 @@ def sweep_expired(container) -> List[str]:
             delete(container, token)
             removed.append(token)
     return removed
+
+
+def pending(row: Dict, token: str) -> bool:
+    """True while a just-shared link is waiting for its snapshot, so the UI can show 'Preparing link'
+    instead of an archive link that would change a moment later. Bounded: after PENDING_SECONDS the
+    archive link is used, so a stuck build never leaves a share without a link."""
+    if not enabled() or not token or public_url(row, token) or not eligible(row):
+        return False
+    updated = _parse_iso(str(row.get('updatedAt') or ''))
+    return bool(updated and (datetime.now(timezone.utc) - updated).total_seconds() < PENDING_SECONDS)
