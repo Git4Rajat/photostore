@@ -40,7 +40,12 @@ const SMART_ALBUM_RULES: Array<{ id: string; label: string; description: string;
     { id: 'tag-object', label: 'By tag/object', description: 'AI tags and detected objects', Icon: TagIcon },
 ];
 
-const randomCode = () => Math.random().toString(16).slice(2, 6).toUpperCase();
+// Must stay at or above the server's MIN_ALBUM_ACCESS_CODE_LENGTH (6), or the share request is rejected.
+const randomCode = () => {
+    const bytes = new Uint8Array(4);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('').toUpperCase();
+};
 
 /** Albums — list first on mobile, detail view on larger screens. */
 export const AlbumsPage: React.FC = () => {
