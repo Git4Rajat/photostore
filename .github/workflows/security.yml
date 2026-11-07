@@ -1,7 +1,9 @@
 name: Security checks
 
-# Dependency vulnerability audits and static analysis. Read-only; never
-# publishes anything. Dependabot (.github/dependabot.yml) opens the update PRs.
+# Dependency vulnerability audits. Read-only; never publishes anything.
+# Dependabot (.github/dependabot.yml) opens the update PRs. Static analysis is
+# CodeQL's repository "default setup" (Settings -> Code security); a CodeQL job
+# here would be rejected while that is enabled.
 on:
   pull_request:
   push:
@@ -33,18 +35,3 @@ jobs:
           node-version: '22'
       - working-directory: frontend
         run: npm audit --audit-level=high
-
-  codeql:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      security-events: write
-    strategy:
-      matrix:
-        language: [python, javascript-typescript]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
-        with:
-          languages: ${{ matrix.language }}
-      - uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
