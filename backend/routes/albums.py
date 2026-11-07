@@ -522,21 +522,6 @@ def autocreate_albums():
         'message': 'No new matching smart album could be created for this rule.',
     })
 
-@albums_bp.route('/albums/<album_id>/share', methods=['GET'])
-@albums_bp.route('/api/albums/<album_id>/share', methods=['GET'])
-def get_album_share(album_id: str):
-    """Just the share link fields, read straight from the album row (not the lagging index), so the
-    share screen can wait for a link that is still being prepared without reloading the list."""
-    user_id, error = app._require_user_id()
-    if error:
-        return error
-    entity = app._load_album_entity(user_id, album_id) if app._albums_table_available() else None
-    if not entity or app._coerce_bool(entity.get('deleted')):
-        return app.jsonify({'error': 'Album not found'}), 404
-    payload = app._album_entity_to_payload(entity)
-    return app.jsonify({k: payload.get(k) for k in ('isPublic', 'publicUrl', 'publicUrlPending', 'hasAccessCode', 'isExpired')})
-
-
 @albums_bp.route('/albums/<album_id>/share', methods=['POST'])
 @albums_bp.route('/api/albums/<album_id>/share', methods=['POST'])
 def share_album(album_id: str):
@@ -583,6 +568,7 @@ def share_album(album_id: str):
 
     entity['updatedAt'] = app.datetime.now(app.timezone.utc).isoformat()
     app._save_album_entity(entity)
+    app._publish_share_snapshot_shell(entity)
     return app.jsonify({'album': app._album_entity_to_payload(entity)})
 
 @albums_bp.route('/albums/<album_id>/revoke', methods=['POST'])

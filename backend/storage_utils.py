@@ -7155,17 +7155,14 @@ def _album_share_fields(row: Dict) -> Dict[str, object]:
     expires_dt = parse_iso_date(expires_at_raw) if expires_at_raw else None
     is_expired = bool(expires_dt and datetime.now(timezone.utc) > expires_dt)
     public_url = ''
-    url_pending = False
     if is_public and token and not is_expired:
         public_url = share_snapshot.public_url(row, token)
-        url_pending = not public_url and share_snapshot.pending(row, token)
         base = os.getenv('ARCHIVE_PUBLIC_BASE_URL', '').strip()
-        if not public_url and not url_pending and base:
+        if not public_url and base:
             public_url = f"{base.rstrip('/')}/public/album/{token}"
     return {
         'isPublic': is_public and not is_expired,
         'publicUrl': public_url,
-        'publicUrlPending': url_pending,
         'publicExpiresAt': expires_at_raw,
         'hasAccessCode': bool(str(row.get('accessCode', '')).strip()),
         'isExpired': is_expired,

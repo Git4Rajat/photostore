@@ -2270,7 +2270,6 @@ def _album_entity_to_payload(entity: Dict, cover_thumbnail_url: Optional[str] = 
     has_access_code = bool(str(entity.get('accessCode', '')).strip())
     is_expired = _album_is_expired(entity)
     public_url = ''
-    url_pending = False
     if is_public and token and not is_expired:
         # Points at the share page's /public/album/<token> route (not directly
         # at the SPA) so link-preview bots see the album's real name/thumbnail;
@@ -2279,8 +2278,7 @@ def _album_entity_to_payload(entity: Dict, cover_thumbnail_url: Optional[str] = 
         # ARCHIVE_PUBLIC_BASE_URL -- so it must not be built from this
         # process's own request.host_url.
         public_url = share_snapshot.public_url(entity, token)
-        url_pending = not public_url and share_snapshot.pending(entity, token)
-        if not public_url and not url_pending:
+        if not public_url:
             base = ARCHIVE_PUBLIC_BASE_URL or request.host_url.rstrip('/')
             public_url = f"{base.rstrip('/')}/public/album/{token}"
     deleted_at = str(entity.get('deletedAt') or '')
@@ -2293,7 +2291,6 @@ def _album_entity_to_payload(entity: Dict, cover_thumbnail_url: Optional[str] = 
         'membersPaged': table_backed,
         'isPublic': is_public and not is_expired,
         'publicUrl': public_url,
-        'publicUrlPending': url_pending,
         'publicExpiresAt': entity.get('publicExpiresAt') or '',
         'hasAccessCode': has_access_code,
         'isExpired': is_expired,
@@ -8832,6 +8829,37 @@ def _set_share_snapshot_marker(entity: Dict, token: str, built_at: str) -> None:
     _mark_album_dirty_index(entity)
 
 
+def _share_snapshot_meta(entity: Dict, total: int) -> Dict[str, str]:
+    return {
+        'title': str(entity.get('name') or '').strip() or 'Shared album',
+        'description': f'{total} photo{"s" if total != 1 else ""} shared on Keepsake.',
+        'image': f"{SPA_BASE_URL.rstrip('/')}/og-image.png" if SPA_BASE_URL else '',
+        'image_is_fallback': 'true',
+    }
+
+
+def _publish_share_snapshot_shell(entity: Dict) -> None:
+    """Right after an album is shared: publish the static link at once (page + empty manifest, two small
+    blob writes) so the link the user copies is the final one. The queued build backfills the photos."""
+    if not share_snapshot.enabled() or not share_snapshot.eligible(entity):
+        return
+    token = str(entity.get('publicToken') or '')
+    if str(entity.get('shareSnapshotToken') or '') == token and entity.get('shareSnapshotAt'):
+        return
+    container = _share_snapshot_container()
+    if container is None:
+        return
+    try:
+        total = album_store.count(entity)
+        if share_snapshot.write_shell(entity, container, _share_snapshot_meta(entity, total), total,
+                                      ARCHIVE_PUBLIC_BASE_URL, SPA_BASE_URL):
+            built_at = datetime.now(timezone.utc).isoformat()
+            _set_share_snapshot_marker(entity, token, built_at)
+            entity['shareSnapshotToken'], entity['shareSnapshotAt'] = token, built_at
+    except Exception:
+        worker_logger.warning('Share snapshot shell failed for album %s', entity.get('RowKey'), exc_info=True)
+
+
 def _run_share_snapshot_job(payload: Dict) -> None:
     container = _share_snapshot_container()
     if container is None:
@@ -8857,13 +8885,7 @@ def _run_share_snapshot_job(payload: Dict) -> None:
     if previous and previous != token:
         share_snapshot.delete(container, previous)
     photos, total = _share_snapshot_photos(entity)
-    name = str(entity.get('name') or '').strip() or 'Shared album'
-    meta = {
-        'title': name,
-        'description': f'{total} photo{"s" if total != 1 else ""} shared on Keepsake.',
-        'image': f"{SPA_BASE_URL.rstrip('/')}/og-image.png" if SPA_BASE_URL else '',
-        'image_is_fallback': 'true',
-    }
+    meta = _share_snapshot_meta(entity, total)
     summary = share_snapshot.build(entity, container, photos, total, meta, ARCHIVE_PUBLIC_BASE_URL, SPA_BASE_URL)
     # The share may have been revoked while this ran; if so, don't leave the files behind.
     fresh = _load_album_entity(user_id, album_id)

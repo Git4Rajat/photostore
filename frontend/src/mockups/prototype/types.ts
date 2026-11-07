@@ -63,8 +63,6 @@ export interface Album {
     coverThumbnailUrl?: string;
     isPublic?: boolean;
     publicUrl?: string;
-    /** The share link is still being prepared (publicUrl is empty until it is ready). */
-    publicUrlPending?: boolean;
     publicExpiresAt?: string;
     hasAccessCode?: boolean;
     isExpired?: boolean;

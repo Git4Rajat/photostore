@@ -10,12 +10,18 @@ import share_snapshot as ss
 import share_snapshot_page as page
 
 
+class ExistsError(Exception):
+    pass
+
+
 class FakeContainer:
     def __init__(self):
         self.blobs = {}   # name -> (bytes, metadata, content_settings)
         self.uploads = []
 
     def upload_blob(self, name, data, overwrite=True, metadata=None, content_settings=None):
+        if not overwrite and name in self.blobs:
+            raise ExistsError('BlobAlreadyExists')
         self.uploads.append(name)
         self.blobs[name] = (data, dict(metadata or {}), content_settings)
 
@@ -202,16 +208,33 @@ def test_page_offers_download_of_the_album_and_of_each_photo():
     assert "'/public/albums/'" in script and "'/public/photos/'" in script and "'/image/'" in script
 
 
-def test_link_is_pending_only_briefly_and_only_for_unprotected_unbuilt_shares():
-    now = datetime.now(timezone.utc)
-    fresh = entity(updatedAt=now.isoformat())
-    assert ss.pending(fresh, 'tok')
-    assert not ss.pending(entity(updatedAt=(now - timedelta(seconds=ss.PENDING_SECONDS + 5)).isoformat()), 'tok')
-    assert not ss.pending(entity(updatedAt=now.isoformat(), accessCode='scrypt$hash'), 'tok')
-    assert not ss.pending({**fresh, 'shareSnapshotToken': 'tok', 'shareSnapshotAt': 'x'}, 'tok')
-
-
 def test_static_link_is_not_handed_out_once_a_code_is_added():
     built = {'shareSnapshotToken': 'tok', 'shareSnapshotAt': 'x'}
     assert ss.public_url(entity(**built), 'tok')
     assert ss.public_url(entity(accessCode='scrypt$hash', **built), 'tok') == ''
+
+
+def test_shell_publishes_page_and_an_empty_manifest_without_assets():
+    c = FakeContainer()
+    assert ss.write_shell(entity(), c, META, 7, 'https://archive.example', 'https://web.example')
+    assert set(c.blobs) == {'s/tok/manifest.json', 's/tok/index.html'}
+    manifest = json.loads(c.blobs['s/tok/manifest.json'][0])
+    assert manifest['building'] is True and manifest['total'] == 7 and manifest['photos'] == []
+
+
+def test_shell_never_overwrites_a_finished_build_and_the_build_replaces_the_shell():
+    c = FakeContainer()
+    build(c, [photo('a.jpg')])
+    assert ss.write_shell(entity(), c, META, 1, 'https://archive.example', 'https://web.example')
+    assert 'building' not in json.loads(c.blobs['s/tok/manifest.json'][0])
+    c2 = FakeContainer()
+    ss.write_shell(entity(), c2, META, 1, 'https://archive.example', 'https://web.example')
+    build(c2, [photo('a.jpg')])
+    done = json.loads(c2.blobs['s/tok/manifest.json'][0])
+    assert 'building' not in done and done['cached'] == 1
+
+
+def test_page_polls_for_the_build_and_hands_over_while_it_runs():
+    html = page.render({'title': 't'}, token='tok', spa_url='https://w', archive_url='https://a', image='')
+    script = html.split('<script>')[1].split('</script>')[0]
+    assert 'm.building' in script and 'waitForBuild' in script

@@ -204,11 +204,35 @@ _JS = """
         $('grid').appendChild(d);
         return;
       }
+      if (m.building) { waitForBuild(m); return; }
       manifest = m;
       render();
       maybeTakeOver();
     })
     .catch(function () { takeOver(-1); });
+
+  // A just-shared album has a page but no photos yet: show what we know and poll until they are cached.
+  // The real app takes over if it wakes first (total > cached), so the visitor never waits on the build.
+  function waitForBuild(m) {
+    $('title').textContent = m.name || 'Shared album';
+    $('sub').textContent = m.total + ' photo' + (m.total === 1 ? '' : 's') + ' \\u00b7 Read-only';
+    $('statusText').textContent = 'Preparing photos\\u2026';
+    manifest = m;
+    maybeTakeOver();
+    var timer = setInterval(function () {
+      if (taken) { clearInterval(timer); return; }
+      fetch('manifest.json', { cache: 'no-cache' })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (next) {
+          if (!next || next.building || taken) return;
+          clearInterval(timer);
+          manifest = next;
+          render();
+          maybeTakeOver();
+        })
+        .catch(function () {});
+    }, 3000);
+  }
 }());
 """
 

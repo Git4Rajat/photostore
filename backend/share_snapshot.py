@@ -71,10 +71,6 @@ def public_url(row: Dict, token: str) -> str:
     return page_url(token)
 
 
-# How long a freshly shared link may wait for its snapshot before falling back to the archive link.
-PENDING_SECONDS = _int_env('SHARE_SNAPSHOT_PENDING_SECONDS', 180)
-
-
 def _parse_iso(value: str) -> Optional[datetime]:
     try:
         parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
@@ -189,6 +185,30 @@ def build(entity: Dict, container, photos: Iterable[Photo], total: int, meta: Di
     return {'cached': len(entries), 'total': total, 'removed': len(stale)}
 
 
+def write_shell(entity: Dict, container, meta: Dict[str, str], total: int, archive_url: str, spa_url: str) -> bool:
+    """Publish the link immediately: the page plus a manifest with no photos yet and ``building`` set.
+    The page shows the title and count and polls the manifest; build() backfills the photos later.
+    Never overwrites an existing manifest, so it cannot clobber a build that got there first."""
+    token = str(entity.get('publicToken') or '')
+    if not token:
+        return False
+    base = prefix(token)
+    manifest = {'v': SCHEMA, 'name': meta.get('title', ''), 'total': total, 'cached': 0, 'building': True,
+                'expiresAt': str(entity.get('publicExpiresAt') or ''), 'photos': []}
+    page = share_snapshot_page.render(meta, token=token, spa_url=spa_url, archive_url=archive_url,
+                                      image=meta.get('image', ''), image_is_fallback=bool(meta.get('image_is_fallback')))
+    try:
+        container.upload_blob(base + MANIFEST, json.dumps(manifest, separators=(',', ':')).encode('utf-8'), overwrite=False,
+                              content_settings=_content_settings('application/json', 'no-cache'))
+    except Exception as exc:
+        if 'Exists' in type(exc).__name__ or 'already exists' in str(exc).lower():
+            return True   # a build (or an earlier shell) is already there
+        raise
+    container.upload_blob(base + INDEX, page.encode('utf-8'), overwrite=True,
+                          content_settings=_content_settings('text/html; charset=utf-8', 'no-cache'))
+    return True
+
+
 def _delete(container, name: str) -> None:
     try:
         container.delete_blob(name)
@@ -233,12 +253,3 @@ def sweep_expired(container) -> List[str]:
             removed.append(token)
     return removed
 
-
-def pending(row: Dict, token: str) -> bool:
-    """True while a just-shared link is waiting for its snapshot, so the UI can show 'Preparing link'
-    instead of an archive link that would change a moment later. Bounded: after PENDING_SECONDS the
-    archive link is used, so a stuck build never leaves a share without a link."""
-    if not enabled() or not token or public_url(row, token) or not eligible(row):
-        return False
-    updated = _parse_iso(str(row.get('updatedAt') or ''))
-    return bool(updated and (datetime.now(timezone.utc) - updated).total_seconds() < PENDING_SECONDS)

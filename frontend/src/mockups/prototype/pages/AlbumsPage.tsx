@@ -51,7 +51,7 @@ const randomCode = () => {
 export const AlbumsPage: React.FC = () => {
     const {
         albums, albumsLoading, route, navigate, openAlbum, isAlbumMissing, isAlbumOpenFailed, isAlbumOpenTerminal, albumPhotosById, isAlbumPhotosLoading, loadMoreAlbumPhotos, albumPhotosHasMore,
-        createAlbum, autoCreateAlbum, renameAlbum, deleteAlbum, deleteAlbums, shareAlbum, refreshAlbumShareLink, revokeAlbum, toast,
+        createAlbum, autoCreateAlbum, renameAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum, toast,
         selectMode: photoSelectMode, setSelectMode: setPhotoSelectMode, fetchAlbums,
     } = useStore();
 
@@ -113,17 +113,6 @@ export const AlbumsPage: React.FC = () => {
         return () => controller.abort();
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [albumResolving, explicitAlbumId]);
-
-    // A freshly shared link is "Preparing link…" until its static snapshot is built; poll until it appears
-    // (the server stops reporting it pending after about a minute and falls back to the archive link).
-    const awaitingLink = Boolean(album?.isPublic && !album.publicUrl && album.publicUrlPending);
-    useEffect(() => {
-        if (!awaitingLink) return;
-        const id = album?.id;
-        if (!id) return;
-        const timer = window.setInterval(() => { void refreshAlbumShareLink(id); }, 3000);
-        return () => window.clearInterval(timer);
-    }, [awaitingLink, album?.id, refreshAlbumShareLink]);
 
     // Fetch the active album's photos whenever the selection changes, unless
     // this album's first page is already cached from a prior visit -- and
@@ -282,7 +271,6 @@ export const AlbumsPage: React.FC = () => {
     }
 
     const url = album.publicUrl ?? '';
-    const linkPending = Boolean(album.isPublic && !url && album.publicUrlPending);
     const copy = () => {
         if (!url) return;
         setCopied(true);
@@ -419,9 +407,6 @@ export const AlbumsPage: React.FC = () => {
                                             {EXPIRY_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
                                         </select>
                                     </div>
-                                    {linkPending && (
-                                        <div className="share-row"><span className="share-url">Preparing link…</span></div>
-                                    )}
                                     {url && (
                                         <div className="share-row">
                                             <span className="share-url">{url}</span>
