@@ -1,3 +1,5 @@
 # Test-only dependencies; deliberately not installed in the production image.
--r requirements.txt
-pytest
+# Install the hash-locked runtime set first, then this file without hash checks:
+#   pip install --require-hashes -r requirements.txt
+#   pip install -r requirements-dev.txt
+pytest==9.2.0

@@ -86,7 +86,7 @@ def normalized_vector(value):
 def _require_faiss() -> None:
     if faiss is None:
         raise RuntimeError(
-            "faiss-cpu is not installed. Install backend/requirements-clustering.txt "
+            "faiss-cpu is not installed. Install backend/requirements.txt (hash-locked; includes faiss-cpu) "
             "to use clustering_index.py -- it's deliberately kept out of the main "
             "backend/ipworker images (see that file's comment)."
         )

@@ -26,8 +26,9 @@ WORKDIR /app
 
 # Copy requirements and install
 COPY requirements.txt ./
-COPY requirements-clustering.txt ./
-RUN pip install -r requirements.txt -r requirements-clustering.txt
+# Hash-locked closure (see scripts/lock-requirements.sh): a tampered or
+# substituted release fails the install instead of running in the image.
+RUN pip install --require-hashes --no-deps -r requirements.txt
 
 # Copy runtime Python modules used by app.py
 COPY *.py ./
