@@ -51,6 +51,10 @@ const clamp = (value: number, min: number, max: number) => Math.max(min, Math.mi
 const PLAYBACK_RATES = [0.25, 0.5, 1, 1.25, 1.5, 2] as const;
 const TOUCH_PAN_START_THRESHOLD = 8;
 const PRELOAD_NEIGHBOR_COUNT = 5;
+// Signed-URL resolution window around the active photo (see the access-batch effect).
+const ACCESS_WINDOW_AHEAD = 150;
+const ACCESS_WINDOW_BEHIND = 50;
+const ACCESS_WINDOW_REFILL_MARGIN = 25;
 const normalizeRotation = (value?: number | null) => {
     const rotation = Number(value || 0) % 360;
     return rotation < 0 ? rotation + 360 : rotation;
@@ -268,6 +272,8 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
     // Paths already resolved (or in-flight) via the scoped access-batch mechanism, kept
     // across navigation so we never re-request a signed URL we already hold.
     const scopedResolvedRef = useRef<Set<string>>(new Set());
+    const scopedWindowRef = useRef<{ lo: number; hi: number; total: number } | null>(null);
+    const warmedScopedRef = useRef<Set<string>>(new Set());
     const filmstripRef = useRef<HTMLDivElement | null>(null);
     const filmstripItemRefs = useRef<Record<number, HTMLButtonElement | null>>({});
     const filmstripHasCenteredRef = useRef(false);
@@ -351,33 +357,52 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
         if (!activePhoto || !shouldProtect) {
             setScopedMediaUrls({});
             scopedResolvedRef.current.clear();
+            scopedWindowRef.current = null;
+            warmedScopedRef.current.clear();
             return undefined;
         }
 
-        // Resolve the active photo's media plus each neighbor's main media through the
-        // scoped access-batch endpoint. Neighbors are resolved (and their bytes warmed)
-        // ahead of time and cached across navigation, so moving to a preloaded photo
-        // reuses an already-signed, already-fetched URL instead of re-downloading it.
-        const targets: Array<{ path: string; filename: string }> = [];
-        const pushTarget = (path: string | undefined, filename: string) => {
+        // Signed URLs are resolved a whole window at a time -- one access-batch call
+        // per media kind for ACCESS_WINDOW_AHEAD + ACCESS_WINDOW_BEHIND photos -- and
+        // cached across navigation. Stepping through the lightbox then costs no backend
+        // calls until the active photo gets within ACCESS_WINDOW_REFILL_MARGIN of the
+        // window's edge, when the next window is requested. (Resolving only a few
+        // neighbours made every next/previous step mint its own signed URLs.)
+        const window_ = scopedWindowRef.current;
+        const needsWindow = !window_
+            || window_.total !== photos.length
+            || index === null
+            || index < window_.lo + ACCESS_WINDOW_REFILL_MARGIN && window_.lo > 0
+            || index > window_.hi - ACCESS_WINDOW_REFILL_MARGIN && window_.hi < photos.length - 1;
+        const lo = index === null ? 0 : Math.max(0, index - ACCESS_WINDOW_BEHIND);
+        const hi = index === null ? 0 : Math.min(photos.length - 1, index + ACCESS_WINDOW_AHEAD);
+
+        const targets: Array<{ path: string; filename: string; warm: boolean }> = [];
+        const pushTarget = (path: string | undefined, filename: string, warm: boolean) => {
             if (typeof path === 'string' && path.length > 0 && !path.startsWith('http')) {
-                targets.push({ path, filename });
+                targets.push({ path, filename, warm });
             }
         };
-        pushTarget(primaryMediaPath, activePhoto.filename);
-        pushTarget(activePhoto.thumbnailUrl, activePhoto.filename);
-        pushTarget(activePhoto.previewUrl, activePhoto.filename);
+        // The active photo is always covered, even when the window is already resolved.
+        pushTarget(primaryMediaPath, activePhoto.filename, true);
+        pushTarget(activePhoto.thumbnailUrl, activePhoto.filename, true);
+        pushTarget(activePhoto.previewUrl, activePhoto.filename, true);
         // The original is never pre-signed/warmed here, even for the active photo:
         // the lightbox shows the shrunk preview (primaryMediaPath) by default for
         // every photo now, and the original is only ever fetched on an explicit
         // "full resolution" request (see the FR button below) -- warming it
         // automatically just because the lightbox opened would defeat that.
-        previewPreloadIndexes.forEach((photoIndex) => {
-            const neighbor = photos[photoIndex];
-            if (neighbor && !isVideoFilename(neighbor.filename || '')) {
-                pushTarget(getMainMediaPath(neighbor, !shouldProtect), neighbor.filename);
+        if (needsWindow) {
+            for (let photoIndex = lo; photoIndex <= hi; photoIndex += 1) {
+                const candidate = photos[photoIndex];
+                if (!candidate || isVideoFilename(candidate.filename || '')) {
+                    continue;
+                }
+                pushTarget(getMainMediaPath(candidate, !shouldProtect), candidate.filename, false);
+                pushTarget(candidate.thumbnailUrl, candidate.filename, false);
             }
-        });
+            scopedWindowRef.current = { lo, hi, total: photos.length };
+        }
 
         const seen = new Set<string>();
         const pending = targets.filter(({ path }) => {
@@ -397,34 +422,47 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
         // photo the user has already navigated away from.
         let runCurrent = true;
         void (async () => {
-            const entries = await Promise.all(pending.map(async ({ path, filename }) => {
+            // One request per media kind, carrying every filename of that kind.
+            const byKind = new Map<'image' | 'preview' | 'thumbnail', typeof pending>();
+            pending.forEach((target) => {
+                const kind = getAccessKindForPath(target.path);
+                byKind.set(kind, [...(byKind.get(kind) || []), target]);
+            });
+            const entries = (await Promise.all(Array.from(byKind, async ([kind, group]) => {
+                let urls: Record<string, unknown> = {};
+                let batchError = '';
                 try {
                     const result = await post('/api/photos/access-batch', {
-                        kind: getAccessKindForPath(path),
-                        filenames: [filename],
+                        kind,
+                        filenames: Array.from(new Set(group.map(({ filename }) => filename))),
                     });
-                    const url = typeof result?.urls?.[filename] === 'string' ? result.urls[filename] : '';
+                    urls = (result && typeof result.urls === 'object' && result.urls) || {};
+                } catch (err) {
+                    batchError = err instanceof Error ? err.message : '';
+                }
+                return Promise.all(group.map(async ({ path, filename, warm }) => {
+                    const url = typeof urls[filename] === 'string' ? urls[filename] as string : '';
                     if (!url) {
-                        return { path, url: '', error: '' };
+                        return { path, url: '', error: batchError };
                     }
                     if (isProtectedProxyPath(url)) {
-                        const objectUrl = await fetchProtectedBlobUrl(url);
-                        objectUrlsRef.current.push(objectUrl);
-                        return { path, url: objectUrl, error: '' };
-                    }
-                    // Direct signed storage URL: warm the bytes so the eventual <img src>
-                    // (identical URL string) is served from cache without a visible reload.
-                    try {
-                        const img = new Image();
-                        img.src = url;
-                    } catch {
-                        /* image warming is best-effort */
+                        // Proxied (non-SAS) media is a full download per photo, so only
+                        // the photos actually about to be shown are fetched; the rest are
+                        // released and resolved when they come into range.
+                        if (!warm) {
+                            return { path, url: '', error: '' };
+                        }
+                        try {
+                            const objectUrl = await fetchProtectedBlobUrl(url);
+                            objectUrlsRef.current.push(objectUrl);
+                            return { path, url: objectUrl, error: '' };
+                        } catch (err) {
+                            return { path, url: '', error: err instanceof Error ? err.message : '' };
+                        }
                     }
                     return { path, url, error: '' };
-                } catch (err) {
-                    return { path, url: '', error: err instanceof Error ? err.message : '' };
-                }
-            }));
+                }));
+            }))).flat();
             // Always commit, even if this run was superseded by fast navigation. The
             // paths were already claimed in scopedResolvedRef (so they won't be
             // re-requested), and scopedMediaUrls is a path-keyed cache merged into prior
@@ -449,7 +487,32 @@ const PhotoViewer: React.FC<PhotoViewerProps> = ({ photos, index, onClose, onInd
         return () => {
             runCurrent = false;
         };
-    }, [activePhoto, primaryMediaPath, shouldProtect, previewPreloadIndexes, photos]);
+    }, [activePhoto, primaryMediaPath, shouldProtect, index, photos]);
+
+    // Warm the bytes of just the nearest neighbours' previews (not the whole resolved
+    // window) so the next/previous photo is served from cache without a visible reload.
+    // This is browser-cache work only; it makes no backend calls.
+    useEffect(() => {
+        if (!shouldProtect) {
+            return;
+        }
+        previewPreloadIndexes.forEach((photoIndex) => {
+            const neighbor = photos[photoIndex];
+            if (!neighbor || isVideoFilename(neighbor.filename || '')) {
+                return;
+            }
+            const url = scopedMediaUrls[getMainMediaPath(neighbor, !shouldProtect)];
+            if (typeof url === 'string' && /^https?:\/\//i.test(url) && !warmedScopedRef.current.has(url)) {
+                warmedScopedRef.current.add(url);
+                try {
+                    const img = new Image();
+                    img.src = url;
+                } catch {
+                    /* image warming is best-effort */
+                }
+            }
+        });
+    }, [previewPreloadIndexes, scopedMediaUrls, photos, shouldProtect]);
 
     const downloadCurrentPhoto = useCallback(async () => {
         if (!activePhoto) {
