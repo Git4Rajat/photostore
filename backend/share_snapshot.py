@@ -72,7 +72,7 @@ def public_url(row: Dict, token: str) -> str:
 
 
 # How long a freshly shared link may wait for its snapshot before falling back to the archive link.
-PENDING_SECONDS = _int_env('SHARE_SNAPSHOT_PENDING_SECONDS', 60)
+PENDING_SECONDS = _int_env('SHARE_SNAPSHOT_PENDING_SECONDS', 180)
 
 
 def _parse_iso(value: str) -> Optional[datetime]:
