@@ -58,13 +58,13 @@ param processingMode string = 'backend'
 param browserUploadPreparation bool = true
 
 @description('Public core API image. Defaults to an immutable @sha256 digest (rewritten by the publish workflow after each qualified release), never :latest, so installs never auto-upgrade. To upgrade an EXISTING deployment, override with the new release digest.')
-param coreImage string = 'ghcr.io/git4rajat/photostore-backend@sha256:f6cd2f05f9525945573ef170f31be89c3fb848624910893ae2c69b94b1acdec3'
+param coreImage string = 'ghcr.io/git4rajat/photostore-backend@sha256:2d5624a60d914c3aed96c5f894dba0b803be805904120e21cc6f5aa126d84c8d'
 
 @description('Public web (frontend) image. Defaults to an immutable @sha256 digest, never :latest, same as coreImage above.')
-param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:308a4bde6acb3f753c78c505a7776525be7c719b8aa7c1b8b214cbcdd5c5f13e'
+param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:321615da851cd9440782e5e1194623c7ad2f06f2ba4b6b6593e972333185f26b'
 
 @description('Public vision (server-side image processing) image. Only pulled/deployed when processingMode is "backend" or "both". Separate from coreImage (unlike the clustering `cluster` role, which reuses it) because vision needs torch/open_clip/onnxruntime/opencv/mediapipe/tesseract -- multiple GB of extra weight that would slow every core/cluster cold start if bundled into their shared image. Same digest-pinning guidance as coreImage applies.')
-param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker@sha256:403588f0cc85888599eb4704b5a208444f6fb9a36c3ca7496d68689853c2faee'
+param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker@sha256:d7bc246dcd7a47cc56eb0a8846164a60180bf59b029302d34e8cf690fb24066c'
 
 @description('Quota in GiB for the dedicated clustering FAISS checkpoint SMB share. Local SQLite/work files remain on ephemeral storage.')
 @minValue(1)
