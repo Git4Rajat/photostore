@@ -14,6 +14,9 @@ export interface PublicViewerPhoto {
     rotation?: number;
 }
 
+// The page is served relative (/public/...) URLs; the <img>/<video> must hit the API host.
+const resolveSrc = (url?: string): string => (!url ? '' : url.startsWith('http') ? url : resolveApiUrl(url));
+
 /** The shared album's lightbox: the Gallery viewer's chrome (see ViewerShell)
  *  over a read-only, signed-URL photo list -- no store, no auth, no rating,
  *  albums or delete. Media comes straight from the URLs the page was served. */
@@ -36,21 +39,21 @@ const PublicPhotoViewer: React.FC<{
     useEffect(() => {
         [photos[index - 1], photos[index + 1]].forEach((p) => {
             const src = p && !isVideoFilename(p.filename) ? (p.previewUrl || p.url) : '';
-            if (src) { const img = new Image(); img.src = src; }
+            if (src) { const img = new Image(); img.src = resolveSrc(src); }
         });
     }, [photos, index]);
 
     const isVideo = Boolean(photo && isVideoFilename(photo.filename));
     const mainSrc = useMemo(() => {
         if (!photo) return '';
-        if (fullRes) return photo.rawFullPreviewUrl || photo.url;
-        return photo.previewUrl || photo.url || photo.thumbnailUrl || '';
+        if (fullRes) return resolveSrc(photo.rawFullPreviewUrl || photo.url);
+        return resolveSrc(photo.previewUrl || photo.url || photo.thumbnailUrl);
     }, [photo, fullRes]);
 
     const download = useCallback(async () => {
         if (!photo?.url) return;
         try {
-            const response = await fetch(resolveApiUrl(photo.url), { mode: 'cors', credentials: 'omit' });
+            const response = await fetch(resolveSrc(photo.url), { mode: 'cors', credentials: 'omit' });
             if (!response.ok) throw new Error(String(response.status));
             const objectUrl = URL.createObjectURL(await response.blob());
             const anchor = document.createElement('a');
@@ -80,7 +83,7 @@ const PublicPhotoViewer: React.FC<{
             onClose={onClose}
             onStep={onStep}
             media={{ url: mainSrc, loading: false, progress: 0 }}
-            videoSrc={isVideo ? photo.url : undefined}
+            videoSrc={isVideo ? resolveSrc(photo.url) : undefined}
             fullRes={fullRes}
             onToggleFullRes={() => setFullRes((v) => !v)}
             showFullResControl={!isVideo}
