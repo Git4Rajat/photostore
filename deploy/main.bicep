@@ -48,13 +48,13 @@ param emailDataLocation string = 'Europe'
 param processingMode string = 'backend'
 
 @description('Public core API image. Defaults to an immutable @sha256 digest (rewritten by the publish workflow after each qualified release), never :latest, so installs never auto-upgrade. To upgrade an EXISTING deployment, override with the new release digest.')
-param coreImage string = 'ghcr.io/git4rajat/photostore-backend@sha256:50ddba6e6c96aef5ba7eda923bcf6168522a06b7e00b9404ad1dbf16e4cbd90b'
+param coreImage string = 'ghcr.io/git4rajat/photostore-backend@sha256:ef26299472c755451ff7346dbf21d2aec841e235b017f06193685f5e65d76540'
 
 @description('Public web (frontend) image. Defaults to an immutable @sha256 digest, never :latest, same as coreImage above.')
-param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:f673346220c70dbdcf349dcb2a5306dcc96af30b7eff4fd249c032832d3bec37'
+param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:11f91a71560761d7b0b5c78f08183bee53a71ea69c9bf7caf729dfc22f0e05d3'
 
 @description('Public vision (server-side image processing) image. Only pulled/deployed when processingMode is "backend" or "both". Same digest-pinning guidance as coreImage applies.')
-param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker@sha256:85703696aad576d9c0546b9f7f5778ae57f284407666555c71b72971fe92dd01'
+param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker@sha256:7bf04508016de5fbccce20bbce32ef1fc45806f9d07a5ae28338708003a19c34'
 
 @description('Quota in GiB for the dedicated clustering FAISS checkpoint SMB share. Local SQLite/work files remain on ephemeral storage.')
 @minValue(1)
