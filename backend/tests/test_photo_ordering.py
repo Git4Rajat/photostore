@@ -166,6 +166,29 @@ def test_capture_falls_back_to_client_last_modified_before_upload_date():
     assert ordering_utils.metadata_capture_datetime(dataset['downloaded.jpg']).year == 2019
 
 
+def test_capture_parser_supports_mediainfo_dash_utc_dates_for_video():
+    # Regression: browser-read videos store "2025-01-27 22:37:42 UTC"; the
+    # colon-only parser dropped these to the clientLastModified fallback, so
+    # new uploads sorted at the file's modified date instead of capture date.
+    dataset = {
+        'old.mov': {'exifData': _exif('2022-08-04 15:49:57 UTC'), 'clientLastModified': '2026-10-14T20:00:00+00:00'},
+        'new.mp4': {'exifData': _exif('2025-01-27 22:37:42 UTC'), 'clientLastModified': '2026-10-14T20:00:00+00:00'},
+    }
+    ordered = ordering_utils.order_photo_entries(list(dataset.keys()), dataset, 'capture')
+    assert ordered == ['new.mp4', 'old.mov']
+    assert ordering_utils.metadata_capture_datetime(dataset['old.mov']).year == 2022
+
+
+def test_placeholder_1904_video_date_falls_through():
+    row = {
+        'exifData': json.dumps({'CreateDate': '1904-01-01 00:33:24 UTC'}),
+        'clientLastModified': '2026-10-14T18:55:53+00:00',
+    }
+    assert ordering_utils.metadata_capture_datetime(row).year == 2026
+    row['exifData'] = json.dumps({'CreateDate': '1904-01-01 00:33:24 UTC', 'MediaCreateDate': '2024-03-02 10:00:00 UTC'})
+    assert ordering_utils.metadata_capture_datetime(row).year == 2024
+
+
 def test_client_last_modified_ignored_when_missing_or_invalid():
     for row in ({}, {'clientLastModified': ''}, {'clientLastModified': 'not-a-date'}):
         row_with_upload = {**row, 'uploadDate': '2026-01-05T09:00:00+00:00'}

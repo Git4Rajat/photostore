@@ -73,33 +73,42 @@ def parse_capture_date(exif_data: Dict[str, str]) -> Optional[datetime]:
     """Extract the capture time from EXIF fields, or None when absent."""
     if not exif_data:
         return None
-    raw = (
-        exif_data.get('DateTimeOriginal')
-        or exif_data.get('DateTime')
-        # QuickTime's "CreationDate" (com.apple.quicktime.creationdate) is
-        # checked ahead of the container-level CreateDate/MediaCreateDate/
-        # TrackCreateDate atoms: those get silently rewritten to the
-        # export/transfer time whenever a video is re-saved, shared, or
-        # re-encoded (AirDrop, WhatsApp, "Save Video", etc.), while
-        # CreationDate is the local-time-with-offset field iOS writes and
-        # is what Photos.app itself displays -- it survives that far more
-        # reliably.
-        or exif_data.get('CreationDate')
-        or exif_data.get('CreateDate')
-        or exif_data.get('MediaCreateDate')
-        or exif_data.get('TrackCreateDate')
-        or ''
-    )
-    if not raw:
-        return None
-    raw = str(raw).strip()
+    # QuickTime's "CreationDate" (com.apple.quicktime.creationdate) is
+    # checked ahead of the container-level CreateDate/MediaCreateDate/
+    # TrackCreateDate atoms: those get silently rewritten to the
+    # export/transfer time whenever a video is re-saved, shared, or
+    # re-encoded (AirDrop, WhatsApp, "Save Video", etc.), while
+    # CreationDate is the local-time-with-offset field iOS writes and
+    # is what Photos.app itself displays -- it survives that far more
+    # reliably.
+    for key in (
+        'DateTimeOriginal', 'DateTime', 'CreationDate',
+        'CreateDate', 'MediaCreateDate', 'TrackCreateDate',
+    ):
+        parsed = _parse_capture_value(exif_data.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+# Container atoms with no clock set store seconds since the 1904 QuickTime
+# epoch, which mediainfo reports as e.g. "1904-01-01 00:33:24 UTC". Anything
+# before this is a placeholder, not a capture date.
+_MIN_PLAUSIBLE_CAPTURE_YEAR = 1970
+
+
+def _parse_capture_value(value: object) -> Optional[datetime]:
+    raw = str(value or '').strip()
     if not raw:
         return None
 
     # exiftool variants can include timezone offsets and/or fractional seconds,
     # e.g. "2024:01:02 10:00:00+05:30" or
-    # "2024:01:02 10:00:00.123456+00:00".
-    if raw.endswith('Z'):
+    # "2024:01:02 10:00:00.123456+00:00". The browser's mediainfo video reader
+    # emits dash dates with a trailing "UTC", e.g. "2025-01-27 22:37:42 UTC".
+    if raw.endswith(' UTC'):
+        raw = f"{raw[:-4]}+00:00"
+    elif raw.endswith('Z'):
         raw = f"{raw[:-1]}+00:00"
 
     for fmt in (
@@ -107,14 +116,20 @@ def parse_capture_date(exif_data: Dict[str, str]) -> Optional[datetime]:
         '%Y:%m:%d %H:%M:%S%z',
         '%Y:%m:%d %H:%M:%S.%f',
         '%Y:%m:%d %H:%M:%S.%f%z',
+        '%Y-%m-%d %H:%M:%S',
+        '%Y-%m-%d %H:%M:%S%z',
+        '%Y-%m-%d %H:%M:%S.%f',
+        '%Y-%m-%d %H:%M:%S.%f%z',
     ):
         try:
             parsed = datetime.strptime(raw, fmt)
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed
         except Exception:
             continue
+        if parsed.year < _MIN_PLAUSIBLE_CAPTURE_YEAR:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
     return None
 
 
