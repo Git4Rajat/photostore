@@ -52,7 +52,7 @@
 }
 .pt-scroll-top.visible { opacity: 1; transform: translateY(0) scale(1); pointer-events: auto; }
 .pt-scroll-top:hover { background: var(--lg-surface-strong); }
-@container (max-width: 620px) {
+@container (max-width: 805px) {
   /* Clear the fixed mobile tabbar (64px + its own safe-area padding). */
   .pt-scroll-top { bottom: calc(64px + env(safe-area-inset-bottom) + 16px); }
 }
@@ -87,7 +87,7 @@
 .pt-float-select.visible { opacity: 1; transform: translateY(0) scale(1); pointer-events: auto; }
 .pt-float-select:hover { background: var(--lg-surface-strong); }
 .pt-float-select.active { background: var(--accent, var(--lg-surface-strong)); }
-@container (max-width: 620px) {
+@container (max-width: 805px) {
   .pt-float-select { bottom: calc(64px + env(safe-area-inset-bottom) + 16px); }
 }
 
@@ -810,7 +810,7 @@
   pointer-events: none;
 }
 /* The floating buttons assume the app's mobile tab bar sits under them; this page has none. */
-@container (max-width: 620px) {
+@container (max-width: 805px) {
     .pt-public-shell .pt-scroll-top,
     .pt-public-shell .pt-float-select { bottom: calc(20px + env(safe-area-inset-bottom)); }
 }
