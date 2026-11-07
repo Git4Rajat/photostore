@@ -10,6 +10,12 @@ if [ "${UPLOAD_WAVE_BOOTSTRAP_PENDING:-false}" = "true" ] && \
     exec python -u -c 'import signal, threading; ready=threading.Event(); signal.signal(signal.SIGTERM, lambda *_: ready.set()); signal.signal(signal.SIGINT, lambda *_: ready.set()); print("Wave bootstrap pending; worker intake blocked.", flush=True); ready.wait()'
 fi
 
+# The archive role serves the share page that hands visitors to the web app. Wake
+# web now, in parallel with this boot, instead of after the page finally loads.
+if [ "${ROLE}" = "archive" ] && [ -n "${SPA_BASE_URL:-}" ]; then
+    python -c "import sys, urllib.request as u; u.urlopen(sys.argv[1].rstrip('/') + '/health', timeout=30).read()" "${SPA_BASE_URL}" >/dev/null 2>&1 &
+fi
+
 echo "EXIF runtime version=$(exiftool -ver)"
 
 if [ "${ROLE}" = "wave-recovery" ]; then
