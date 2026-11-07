@@ -13,7 +13,8 @@ import { getBackendStatusSnapshot } from '../services/backendStatus';
 import { showToast } from '../services/toast';
 import { useDragSelect } from '../services/useDragSelect';
 import { useCollapseOnScroll } from '../services/useCollapseOnScroll';
-import PhotoViewer, { getMainMediaPath } from './shared/PhotoViewer';
+import { getMainMediaPath } from './shared/PhotoViewer';
+import PublicPhotoViewer from '../mockups/prototype/components/PublicPhotoViewer';
 import { FloatingSelectButton } from '../mockups/prototype/components/FloatingSelectButton';
 import { ScrollToTopButton } from '../mockups/prototype/components/ScrollToTopButton';
 import { ThumbSizeControl, useTileSize } from '../mockups/prototype/components/controls';
@@ -835,12 +836,11 @@ const PublicAlbumPage: React.FC = () => {
             </div>
 
             {viewerIndex !== null && (
-                <PhotoViewer
+                <PublicPhotoViewer
                     photos={photos}
                     index={viewerIndex}
                     onClose={() => setViewerIndex(null)}
                     onIndexChange={setViewerIndex}
-                    useProtectedMedia={false}
                 />
             )}
         </div>
