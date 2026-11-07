@@ -67,7 +67,7 @@ RUN mkdir -p build/decoder-licenses && \
     cp decoder-source.txt build/decoder-licenses/
 RUN chmod -R a+rX build/models
 
-FROM mirror.gcr.io/library/nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+FROM mirror.gcr.io/library/nginx:1.31-alpine@sha256:713fc2ebfd92e8217db451477182ee91944b123d2b1ee9fd5a8c6e91ca6c3a11
 
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY security-headers.conf /etc/nginx/security-headers.conf
