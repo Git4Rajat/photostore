@@ -585,7 +585,7 @@ CONFIG_TABLE = os.getenv('CONFIG_TABLE', 'photostoreconfig')
 # value so the app still runs, but sessions then invalidate on restart / across
 # replicas — set it explicitly (a Container App secret) in production.
 SESSION_SECRET = os.getenv('SESSION_SECRET', '') or secrets.token_hex(32)
-SESSION_TTL_SECONDS = int(os.getenv('SESSION_TTL_SECONDS', str(30 * 24 * 3600)))
+SESSION_TTL_SECONDS = int(os.getenv('SESSION_TTL_SECONDS', str(14 * 24 * 3600)))
 # Base URL of the web app, used to build password-reset links in emails.
 PUBLIC_APP_BASE_URL = os.getenv('PUBLIC_APP_BASE_URL', '').strip() or SPA_BASE_URL
 # Base URL of the 'archive' role (public_bp lives there, not on 'core' -- see
@@ -2733,6 +2733,10 @@ def _require_library_context(require_auth: bool = False):
         current_ver = int(account.get('tokenVersion', 1) or 1)
         if int(token_ver) != current_ver:
             return None, None, (jsonify({'error': 'Session expired. Please sign in again.'}), 401)
+    # Per-session revocation (explicit sign-out): the token's jti is listed on
+    # the account until the token would have expired anyway.
+    if account is not None and library_store is not None and library_store.session_revoked(account, payload.get('jti')):
+        return None, None, (jsonify({'error': 'Session expired. Please sign in again.'}), 401)
 
     library_id = str(payload.get('lib') or user_id).strip() or user_id
 
@@ -9552,6 +9556,57 @@ def _limit_json_body_size():
     if length > limit:
         return jsonify({'error': 'Request body too large'}), 413
     return None
+
+
+# Per-client-IP request budgets for the routes reachable without a session.
+# Counters are per replica and in memory (fixed one-minute window, bounded), so
+# this is a backstop against scripted hammering, not an exact global quota; the
+# login/invite throttles stay the authority for credential guessing.
+_ANON_LIMIT_WINDOW_SECONDS = 60
+_ANON_LIMITS = (
+    (('/auth/', '/api/auth/'), 'auth', int(os.getenv('ANON_AUTH_RATE_PER_MINUTE', '40'))),
+    (('/public/', '/api/public/'), 'public', int(os.getenv('ANON_PUBLIC_RATE_PER_MINUTE', '1500'))),
+)
+_ANON_MAX_TRACKED = 20000
+_anon_counters: Dict[str, list] = {}
+_anon_lock = threading.Lock()
+
+
+def _anon_rate_limited(path: str, ip: str, now: Optional[float] = None) -> Optional[int]:
+    """Return seconds until the window resets when ``ip`` is over budget, else None."""
+    for prefixes, bucket, limit in _ANON_LIMITS:
+        if limit > 0 and path.startswith(prefixes):
+            break
+    else:
+        return None
+    now = time.time() if now is None else now
+    key = f'{bucket}:{ip}'
+    with _anon_lock:
+        entry = _anon_counters.get(key)
+        if entry is None or now - entry[0] >= _ANON_LIMIT_WINDOW_SECONDS:
+            if len(_anon_counters) >= _ANON_MAX_TRACKED:
+                for stale in [k for k, v in _anon_counters.items() if now - v[0] >= _ANON_LIMIT_WINDOW_SECONDS]:
+                    del _anon_counters[stale]
+                if len(_anon_counters) >= _ANON_MAX_TRACKED:
+                    return None  # fail open rather than grow without bound
+            entry = _anon_counters[key] = [now, 0]
+        entry[1] += 1
+        if entry[1] > limit:
+            return max(1, int(_ANON_LIMIT_WINDOW_SECONDS - (now - entry[0])))
+    return None
+
+
+@app.before_request
+def _limit_anonymous_request_rate():
+    if request.method == 'OPTIONS':
+        return None
+    retry = _anon_rate_limited(request.path, request.remote_addr or '', None)
+    if retry is None:
+        return None
+    resp = jsonify({'error': 'Too many requests. Please slow down.'})
+    resp.status_code = 429
+    resp.headers['Retry-After'] = str(retry)
+    return resp
 
 
 @app.before_request

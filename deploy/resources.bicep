@@ -711,6 +711,7 @@ resource core 'Microsoft.App/containerApps@2025-01-01' = {
     configuration: {
       ingress: {
         external: true
+        allowInsecure: false
         targetPort: 5000
         transport: 'auto'
         traffic: [
@@ -1057,6 +1058,7 @@ resource indexer 'Microsoft.App/containerApps@2025-01-01' = {
     configuration: {
       ingress: {
         external: true
+        allowInsecure: false
         targetPort: 5000
         transport: 'auto'
         traffic: [
@@ -1237,6 +1239,7 @@ resource recovery 'Microsoft.App/containerApps@2025-01-01' = {
     configuration: {
       ingress: {
         external: true
+        allowInsecure: false
         targetPort: 5000
         transport: 'auto'
         traffic: [
@@ -1337,6 +1340,7 @@ resource archive 'Microsoft.App/containerApps@2025-01-01' = {
     configuration: {
       ingress: {
         external: true
+        allowInsecure: false
         targetPort: 5000
         transport: 'auto'
         traffic: [
@@ -1450,6 +1454,7 @@ resource upload 'Microsoft.App/containerApps@2025-01-01' = {
     configuration: {
       ingress: {
         external: true
+        allowInsecure: false
         targetPort: 5000
         transport: 'auto'
         traffic: [
@@ -1556,6 +1561,7 @@ resource web 'Microsoft.App/containerApps@2025-01-01' = {
     configuration: {
       ingress: {
         external: true
+        allowInsecure: false
         targetPort: 80
         transport: 'auto'
         traffic: [

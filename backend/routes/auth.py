@@ -137,6 +137,37 @@ def auth_change_password():
     token = app._issue_session_for(account_id, library_id=library_id, email=str(account.get('email') or ''), mode='password')
     return app.jsonify({'status': 'ok', 'token': token, 'expiresIn': app.SESSION_TTL_SECONDS})
 
+@auth_bp.route('/auth/logout', methods=['POST'])
+@auth_bp.route('/api/auth/logout', methods=['POST'])
+def auth_logout():
+    """Revoke this session's token server-side (other devices stay signed in)."""
+    guard = app._password_mode_guard()
+    if guard:
+        return guard
+    account_id, _library_id, error = app._require_library_context(require_auth=True)
+    if error:
+        return error
+    payload, _ = app._resolve_session_payload(True)
+    if app.library_store and payload and payload.get('jti'):
+        app.library_store.revoke_session(account_id, str(payload['jti']), int(payload.get('exp') or 0))
+    return app.jsonify({'status': 'ok'})
+
+
+@auth_bp.route('/auth/logout-all', methods=['POST'])
+@auth_bp.route('/api/auth/logout-all', methods=['POST'])
+def auth_logout_all():
+    """Sign out every device: bumping the token version voids all sessions."""
+    guard = app._password_mode_guard()
+    if guard:
+        return guard
+    account_id, _library_id, error = app._require_library_context(require_auth=True)
+    if error:
+        return error
+    if app.library_store:
+        app.library_store.bump_token_version(account_id)
+    return app.jsonify({'status': 'ok'})
+
+
 @auth_bp.route('/auth/forgot', methods=['POST'])
 @auth_bp.route('/api/auth/forgot', methods=['POST'])
 def auth_forgot():

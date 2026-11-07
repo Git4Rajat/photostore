@@ -388,6 +388,39 @@ class LibraryStore:
         self.users.upsert_entity(entity)
         return current + 1
 
+    # -- per-session revocation (explicit sign-out) --------------------------
+    _MAX_REVOKED_SESSIONS = 200
+
+    @staticmethod
+    def _revoked_sessions(entity: Dict) -> Dict[str, int]:
+        import json
+        try:
+            raw = json.loads(str((entity or {}).get('revokedSessions') or '{}'))
+        except (TypeError, ValueError):
+            return {}
+        return {str(k): int(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+
+    def session_revoked(self, entity: Dict, jti) -> bool:
+        return bool(jti) and str(jti) in self._revoked_sessions(entity)
+
+    def revoke_session(self, user_id: str, jti: str, expires_at: int) -> bool:
+        """Record a session id as signed out until its token's natural expiry."""
+        import json
+        entity = self.get_user(user_id)
+        if not entity or not jti:
+            return False
+        now = int(time.time())
+        live = {k: v for k, v in self._revoked_sessions(entity).items() if v > now}
+        live[str(jti)] = int(expires_at)
+        if len(live) > self._MAX_REVOKED_SESSIONS:
+            # Oldest-expiring entries go first; they are the nearest to lapsing.
+            live = dict(sorted(live.items(), key=lambda kv: kv[1])[-self._MAX_REVOKED_SESSIONS:])
+        entity['revokedSessions'] = json.dumps(live)
+        entity['PartitionKey'] = _USER_PK
+        entity['RowKey'] = str(user_id)
+        self.users.upsert_entity(entity)
+        return True
+
     # -- password reset (per user, single-use, hashed at rest) ----------------
     def create_reset_token(self, user_id: str, *, ttl_seconds: int = 3600) -> str:
         raw = secrets.token_urlsafe(32)

@@ -93,3 +93,12 @@ def _no_manifest_cache_in_tests(monkeypatch):
     """Tests publish new manifests and expect the next read to see them."""
     import search_db
     monkeypatch.setattr(search_db, 'MANIFEST_TTL_SECONDS', 0)
+
+
+@pytest.fixture(autouse=True)
+def _reset_anonymous_rate_limit_counters():
+    """Tests all call from 127.0.0.1; don't let one test's requests spend another's budget."""
+    import app
+    app._anon_counters.clear()
+    yield
+    app._anon_counters.clear()

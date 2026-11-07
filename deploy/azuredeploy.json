@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.37.4.10188",
-      "templateHash": "16643165623047397997"
+      "templateHash": "379651098610874497"
     }
   },
   "parameters": {
@@ -249,7 +249,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.37.4.10188",
-              "templateHash": "9450722756310471318"
+              "templateHash": "412089746300647831"
             }
           },
           "parameters": {
@@ -811,6 +811,7 @@
                 "configuration": {
                   "ingress": {
                     "external": true,
+                    "allowInsecure": false,
                     "targetPort": 5000,
                     "transport": "auto",
                     "traffic": [
@@ -923,6 +924,7 @@
                 "configuration": {
                   "ingress": {
                     "external": true,
+                    "allowInsecure": false,
                     "targetPort": 5000,
                     "transport": "auto",
                     "traffic": [
@@ -1058,6 +1060,7 @@
                 "configuration": {
                   "ingress": {
                     "external": true,
+                    "allowInsecure": false,
                     "targetPort": 5000,
                     "transport": "auto",
                     "traffic": [
@@ -1132,6 +1135,7 @@
                 "configuration": {
                   "ingress": {
                     "external": true,
+                    "allowInsecure": false,
                     "targetPort": 5000,
                     "transport": "auto",
                     "traffic": [
@@ -1220,6 +1224,7 @@
                 "configuration": {
                   "ingress": {
                     "external": true,
+                    "allowInsecure": false,
                     "targetPort": 5000,
                     "transport": "auto",
                     "traffic": [
@@ -1292,6 +1297,7 @@
                 "configuration": {
                   "ingress": {
                     "external": true,
+                    "allowInsecure": false,
                     "targetPort": 80,
                     "transport": "auto",
                     "traffic": [

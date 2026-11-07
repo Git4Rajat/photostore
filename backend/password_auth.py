@@ -159,6 +159,7 @@ def issue_session_token(
         'iat': now,
         'exp': now + int(ttl_seconds),
         'mode': mode,
+        'jti': secrets.token_hex(8),
     }
     return jwt.encode(payload, secret, algorithm=_SESSION_ALGO)
 
