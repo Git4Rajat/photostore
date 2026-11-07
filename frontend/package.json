@@ -38,7 +38,7 @@
     "mediainfo.js": "0.3.8",
     "onnxruntime-web": "^1.27.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1",
+    "react-dom": "^19.3.1",
     "react-router-dom": "^7.18.5",
     "tesseract.js": "^2.1.5"
   },
@@ -53,7 +53,7 @@
     "@eslint/js": "^10.0.1",
     "@testing-library/react": "^16.3.3",
     "@types/react": "^18.3.1",
-    "@types/react-dom": "^18.3.1",
+    "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^5.0.0",
     "eslint": "^10.10.0",
     "eslint-plugin-react-hooks": "^7.1.1",
