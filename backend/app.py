@@ -1636,15 +1636,28 @@ def _init_storage_clients():
         _ensure_fns.append(upload_sessions_table_client.create_table)
     if index_maintenance_queue_client is not None:
         _ensure_fns.append(index_maintenance_queue_client.create_queue)
+    _ensure_blocking_fns = []
     if AUTH_MODE == 'password':
-        _ensure_fns.append(lambda: config_table_client.create_table())
-    with ThreadPoolExecutor(max_workers=len(_ensure_fns)) as _ensure_pool:
-        _ensure_futures = [_ensure_pool.submit(fn) for fn in _ensure_fns]
-        for _fut in _ensure_futures:
-            try:
-                _fut.result()
-            except Exception as exc:
-                app.logger.debug('Table/queue ensure skipped: %s', exc)
+        _ensure_blocking_fns.append(lambda: config_table_client.create_table())
+
+    def _run_ensure(fns):
+        with ThreadPoolExecutor(max_workers=len(fns)) as _ensure_pool:
+            _ensure_futures = [_ensure_pool.submit(fn) for fn in fns]
+            for _fut in _ensure_futures:
+                try:
+                    _fut.result()
+                except Exception as exc:
+                    app.logger.debug('Table/queue ensure skipped: %s', exc)
+
+    if os.getenv('APP_ROLE', 'core').strip().lower() == 'archive':
+        # The archive role serves the public share page: a visitor waits on its
+        # cold start. The tables/queues are provisioned by core's boot, so don't
+        # make the first request wait on ~15 "already exists" round-trips.
+        threading.Thread(target=_run_ensure, args=(_ensure_fns,), name='storage-ensure', daemon=True).start()
+    else:
+        _ensure_blocking_fns.extend(_ensure_fns)
+    if _ensure_blocking_fns:
+        _run_ensure(_ensure_blocking_fns)
 
     library_store = library_utils.LibraryStore(
         users_table=users_table_client,
