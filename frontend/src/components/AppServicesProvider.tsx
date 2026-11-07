@@ -129,16 +129,32 @@ type BlockBlobClientCtor = typeof import('@azure/storage-blob')['BlockBlobClient
 
 let browserProcessingRuntimePromise: Promise<typeof import('./browserProcessingRuntime')> | null = null;
 let blockBlobClientCtorPromise: Promise<BlockBlobClientCtor> | null = null;
+
+// After a deploy the content-hashed chunks of the previous build are gone, so a page
+// opened before it fails to import them ("Failed to fetch dynamically imported
+// module: <url>"). Say what actually happened instead of surfacing the raw URL, and
+// drop the cached rejection so a later attempt (after a refresh) is not poisoned.
+const STALE_BUILD_MESSAGE = 'The app was updated while this page was open. Refresh the page and try again.';
+const isStaleChunkError = (error: unknown) => /dynamically imported module|Importing a module script failed|error loading dynamically imported module/i
+    .test(String((error as Error)?.message || error || ''));
+const toStaleBuildError = (error: unknown) => (isStaleChunkError(error) ? new Error(STALE_BUILD_MESSAGE) : error);
+
 const loadBrowserProcessingRuntime = () => {
     if (!browserProcessingRuntimePromise) {
-        browserProcessingRuntimePromise = import('./browserProcessingRuntime');
+        browserProcessingRuntimePromise = import('./browserProcessingRuntime').catch((error) => {
+            browserProcessingRuntimePromise = null;
+            throw toStaleBuildError(error);
+        });
     }
     return browserProcessingRuntimePromise;
 };
 
 const loadBlockBlobClient = () => {
     if (!blockBlobClientCtorPromise) {
-        blockBlobClientCtorPromise = import('@azure/storage-blob').then((module) => module.BlockBlobClient);
+        blockBlobClientCtorPromise = import('@azure/storage-blob').then((module) => module.BlockBlobClient).catch((error) => {
+            blockBlobClientCtorPromise = null;
+            throw toStaleBuildError(error);
+        });
     }
     return blockBlobClientCtorPromise;
 };
