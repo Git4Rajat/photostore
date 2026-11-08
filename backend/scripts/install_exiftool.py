@@ -10,7 +10,7 @@ from urllib.request import urlopen
 
 VERSION = '13.55'
 SHA256 = '5c9d422ad128fab728aacc5cc0aa77095d14cde74931389dd961d3d720e6b316'
-URL = f'https://github.com/exiftool/exiftool/archive/refs/tags/{VERSION}.tar.gz'
+URL = f'https://codeload.github.com/exiftool/exiftool/tar.gz/refs/tags/{VERSION}'
 
 
 def _download(attempts=5):
