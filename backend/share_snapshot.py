@@ -264,7 +264,9 @@ def _delete(container, name: str) -> None:
     try:
         container.delete_blob(name)
     except Exception as exc:  # already gone is the normal case
-        if 'BlobNotFound' not in type(exc).__name__ and 'not found' not in str(exc).lower():
+        gone = ('NotFound' in type(exc).__name__ or 'BlobNotFound' in str(exc)
+                or 'not found' in str(exc).lower() or 'does not exist' in str(exc).lower())
+        if not gone:
             logger.warning('share snapshot: delete %s failed', name, exc_info=True)
 
 

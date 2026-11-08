@@ -280,3 +280,16 @@ def test_page_prefers_the_real_ui_bundle_and_falls_back_to_plain_view():
     script = html.split('<script>')[1].split('</script>')[0]
     assert "/app/current.json" in script and 's.onerror = function () { root.remove(); legacy(); }' in script
     assert '.catch(legacy)' in script
+
+
+def test_delete_ignores_azure_style_missing_blob(caplog):
+    class ResourceNotFoundError(Exception):
+        pass
+
+    class Container:
+        def delete_blob(self, name):
+            raise ResourceNotFoundError('The specified blob does not exist.\nErrorCode:BlobNotFound')
+
+    with caplog.at_level('WARNING'):
+        share_snapshot._delete(Container(), 's/x/index.html')
+    assert not caplog.records
