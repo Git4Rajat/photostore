@@ -462,7 +462,7 @@ var backendEnv = [
   // storage seeds the certificate for these two images (see backend/wave_bootstrap.py auto_seed).
   { name: 'UPLOAD_WAVE_CORE_IMAGE', value: coreImage }
   { name: 'UPLOAD_WAVE_VISION_IMAGE', value: visionImage }
-  { name: 'UPLOAD_WAVE_AUTO_BOOTSTRAP', value: (enableNewWaveLibraries && !waveBootstrapPending && empty(waveCapabilityId)) ? 'true' : 'false' }
+  { name: 'UPLOAD_WAVE_AUTO_BOOTSTRAP', value: (enableNewWaveLibraries && !waveBootstrapPending) ? 'true' : 'false' }
 
   { name: 'INDEX_EVENTS_ENDPOINT', value: enableIndexPush ? 'https://${indexPush!.properties.hostName}' : '' }
   { name: 'INDEX_MAINTENANCE_QUEUE_NAME', value: 'photostore-index-maintenance' }
