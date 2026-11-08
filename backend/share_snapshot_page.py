@@ -102,6 +102,12 @@ _JS = """
     $('statusText').textContent = more ? 'Loading all ' + manifest.total + ' photos\\u2026' : '';
     if (!more) $('status').hidden = true;
     var grid = $('grid');
+    if (!manifest.photos.length && !more) {
+      var e = document.createElement('div');
+      e.className = 'msg';
+      e.textContent = 'This album has no photos yet.';
+      grid.appendChild(e);
+    }
     manifest.photos.forEach(function (p, i) {
       if (!p.t) return;
       var b = document.createElement('button');
@@ -112,6 +118,7 @@ _JS = """
       img.loading = 'lazy';
       img.decoding = 'async';
       img.alt = '';
+      img.onerror = function () { b.remove(); };
       img.src = p.t;
       var tr = tileRotation(p);
       if (tr) img.style.transform = tr;
@@ -219,8 +226,10 @@ _JS = """
     $('statusText').textContent = 'Preparing photos\\u2026';
     manifest = m;
     maybeTakeOver();
+    var started = Date.now();
     var timer = setInterval(function () {
       if (taken) { clearInterval(timer); return; }
+      if (Date.now() - started > 120000) { clearInterval(timer); takeOver(-1); return; }
       fetch('manifest.json', { cache: 'no-cache' })
         .then(function (r) { return r.ok ? r.json() : null; })
         .then(function (next) {
@@ -284,7 +293,8 @@ def render(meta: Dict[str, str], *, token: str, spa_url: str, archive_url: str, 
         '<header><span class="brand">Keepsake</span><span><a id="dlAll" class="full" href="#" target="_blank" rel="noopener">Download all</a> &nbsp; <a id="full" class="full" href="#">Open full album</a></span></header>'
         f'<main><h1 id="title">{title}</h1><p id="sub" class="sub">{description}</p>'
         '<div id="status" class="status"><span class="spin" aria-hidden="true"></span><span id="statusText">Opening shared album…</span></div>'
-        '<div id="grid" class="grid"></div></main>'
+        '<div id="grid" class="grid"></div>'
+        f'<noscript><p class="msg">Turn on JavaScript to view this album, or <a href="{html.escape(spa + "/public/album/" + token, quote=True)}">open the full album</a>.</p></noscript></main>'
         '<div id="lb" class="lb" role="dialog" aria-modal="true" aria-label="Photo viewer" hidden>'
         '<img id="lbImg" alt="" /><a id="lbDl" class="dl" href="#" target="_blank" rel="noopener" hidden>Download</a><button id="lbClose" class="x" type="button" aria-label="Close">×</button>'
         '<button id="lbPrev" class="p" type="button" aria-label="Previous">‹</button>'

@@ -238,3 +238,12 @@ def test_page_polls_for_the_build_and_hands_over_while_it_runs():
     html = page.render({'title': 't'}, token='tok', spa_url='https://w', archive_url='https://a', image='')
     script = html.split('<script>')[1].split('</script>')[0]
     assert 'm.building' in script and 'waitForBuild' in script
+
+
+def test_page_handles_failures_gracefully():
+    html = page.render({'title': 't'}, token='tok', spa_url='https://w', archive_url='https://a', image='')
+    script = html.split('<script>')[1].split('</script>')[0]
+    assert 'img.onerror = function () { b.remove(); }' in script      # a missing thumbnail leaves no broken tile
+    assert 'This album has no photos yet.' in script
+    assert '120000' in script                                          # a stuck build hands over to the real app
+    assert '<noscript>' in html and 'https://w/public/album/tok' in html
