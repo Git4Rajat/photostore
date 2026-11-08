@@ -48,13 +48,13 @@ param emailDataLocation string = 'Europe'
 param processingMode string = 'backend'
 
 @description('Public core API image. Defaults to an immutable @sha256 digest (rewritten by the publish workflow after each qualified release), never :latest, so installs never auto-upgrade. To upgrade an EXISTING deployment, override with the new release digest.')
-param coreImage string = 'ghcr.io/git4rajat/photostore-backend@sha256:eb6d6aef454edec29f09914fc47b941349b80ab12cd3b212361c093419bb87eb'
+param coreImage string = 'ghcr.io/git4rajat/photostore-backend@sha256:18e981bac338872cc75659cfc40a6464fe1fa0fa86f8e6b909018864b6377821'
 
 @description('Public web (frontend) image. Defaults to an immutable @sha256 digest, never :latest, same as coreImage above.')
-param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:716da0aa071b887e9467f7c5c9776212bd9cb4b3e8e794763e27a888b7c6cf7f'
+param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:2d22c790c60dc0b3eeca3aac89fae06420d411fcd98537db60171d045291de56'
 
 @description('Public vision (server-side image processing) image. Only pulled/deployed when processingMode is "backend" or "both". Same digest-pinning guidance as coreImage applies.')
-param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker@sha256:adb1a667d291346521f5864db607eff7b45de6d63f62cdf409d53b1de89283c3'
+param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker@sha256:41ef1fab3e24a7e164b218369f06fe444e010ea4fba8cefe746fe4f5e9c0c8b6'
 
 @description('Quota in GiB for the dedicated clustering FAISS checkpoint SMB share. Local SQLite/work files remain on ephemeral storage.')
 @minValue(1)
@@ -80,7 +80,7 @@ param enableWaveExecution bool = true
 @description('Enroll newly created empty libraries only. Existing libraries never change ownership.')
 param enableNewWaveLibraries bool = true
 @description('Exact-image capability ID. Fresh wave activation requires the seeded release certificate; never leave empty.')
-param waveCapabilityId string = 'd10d764cfea3a0601a5535923ead133ebd9fe677c74a8089a92c776bd0d527be'
+param waveCapabilityId string = '8124b7f28e28b4edc3273c4616bc74bfb1bfa3b8e8e16da5be9d013925b69889'
 param waveBootstrapPending bool = false
 
 @description('Provision managed WebSocket notifications when library indexes are published.')
