@@ -1678,6 +1678,8 @@ resource cluster 'Microsoft.App/containerApps@2025-01-01' = {
           ]
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'cluster' }
+            // The share-snapshot job writes the static page's archive API origin (full-resolution and download links).
+            { name: 'ARCHIVE_PUBLIC_BASE_URL', value: 'https://${archive.properties.configuration.ingress.fqdn}' }
             { name: 'UPLOAD_WAVE_DEPLOYMENT_ID', value: coreImage }
             { name: 'PEOPLE_FAISS_WORK_DIR', value: '/var/lib/photostore/faiss-work' }
             { name: 'PEOPLE_FAISS_CHECKPOINT_DIR', value: '/mnt/photostore/faiss-checkpoints' }
