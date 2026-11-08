@@ -25,7 +25,7 @@ import {
 } from 'lucide-react';
 import { LogoLockup } from '../../components/shared/Logo';
 import Loading from '../../components/shared/Loading';
-import { CachedGalleryPreview, useHomeSnapshot } from './components/CachedGalleryPreview';
+import { CachedGalleryPreview, PreviewUntilGallery, useHomeSnapshot } from './components/CachedGalleryPreview';
 import { HomeSnapshotSaver } from './components/HomeSnapshotSaver';
 import { AppServicesProvider, useAppServices } from '../../components/AppServicesProvider';
 import { formatBytes } from '../../components/browserAiShared';
@@ -325,6 +325,7 @@ const AppShellGate: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
     return (
         <StoreProvider>
             <Shell onSignOut={onSignOut} />
+            <PreviewUntilGallery snapshot={snapshot} />
             <HomeSnapshotSaver />
         </StoreProvider>
     );

@@ -14,13 +14,17 @@ export const HomeSnapshotSaver = (): null => {
     const top = photos.slice(0, HOME_SNAPSHOT_LIMIT);
     const urls = usePhotoThumbnails(top);
     const lastSavedAt = useRef(0);
+    const lastSavedCount = useRef(0);
     const key = top.map((p) => p.filename).join('|');
 
     useEffect(() => {
-        if (top.length < 12 || Date.now() - lastSavedAt.current < MIN_INTERVAL_MS) return undefined;
+        // Re-save when it has been a while, or when scrolling has loaded more of the top than the last save held.
+        const grew = top.length > lastSavedCount.current && lastSavedCount.current < HOME_SNAPSHOT_LIMIT;
+        if (top.length < 12 || (!grew && Date.now() - lastSavedAt.current < MIN_INTERVAL_MS)) return undefined;
         const timer = window.setTimeout(() => {
             if (document.visibilityState !== 'visible' || navigator.onLine === false) return;
             lastSavedAt.current = Date.now();
+            lastSavedCount.current = top.length;
             void homeSnapshot.save(top, urls);
         }, SETTLE_MS);
         return () => window.clearTimeout(timer);

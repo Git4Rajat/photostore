@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { LogoLockup } from '../../../components/shared/Logo';
 import { homeSnapshot, type HomeSnapshot } from '../../../services/homeSnapshot';
+import { useStore } from '../store';
 import { useTileSize } from './controls';
 
 /**
@@ -64,6 +65,25 @@ export const CachedGalleryPreview: React.FC<{ snapshot: HomeSnapshot }> = ({ sna
                     </div>
                 </div>
             </div>
+        </div>
+    );
+};
+
+/**
+ * Keeps the cached gallery on screen after the real app mounts, until the real gallery has photos (or a few
+ * seconds pass), so the grid never blinks empty between the preview and the first loaded page.
+ */
+export const PreviewUntilGallery: React.FC<{ snapshot: HomeSnapshot | null | undefined }> = ({ snapshot }) => {
+    const { photos } = useStore();
+    const [expired, setExpired] = useState(false);
+    useEffect(() => {
+        const timer = window.setTimeout(() => setExpired(true), 6000);
+        return () => window.clearTimeout(timer);
+    }, []);
+    if (!snapshot || expired || photos.length > 0) return null;
+    return (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 40, background: 'var(--bg, #0c0c0e)' }}>
+            <CachedGalleryPreview snapshot={snapshot} />
         </div>
     );
 };
