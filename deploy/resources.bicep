@@ -58,13 +58,13 @@ param processingMode string = 'backend'
 param browserUploadPreparation bool = true
 
 @description('Public core API image. Defaults to an immutable @sha256 digest (rewritten by the publish workflow after each qualified release), never :latest, so installs never auto-upgrade. To upgrade an EXISTING deployment, override with the new release digest.')
-param coreImage string = 'ghcr.io/git4rajat/photostore-backend@sha256:18e981bac338872cc75659cfc40a6464fe1fa0fa86f8e6b909018864b6377821'
+param coreImage string = 'ghcr.io/git4rajat/photostore-backend@sha256:04bbc15ba4399707f02d5446634a4401ea739e89c1df2394fa75c6d71dd816a7'
 
 @description('Public web (frontend) image. Defaults to an immutable @sha256 digest, never :latest, same as coreImage above.')
-param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:2d22c790c60dc0b3eeca3aac89fae06420d411fcd98537db60171d045291de56'
+param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:677fe8b6a929cfb53a8f962dbb8ea3fa9de85a6398e5d38548c6233f1b467d07'
 
 @description('Public vision (server-side image processing) image. Only pulled/deployed when processingMode is "backend" or "both". Separate from coreImage (unlike the clustering `cluster` role, which reuses it) because vision needs torch/open_clip/onnxruntime/opencv/mediapipe/tesseract -- multiple GB of extra weight that would slow every core/cluster cold start if bundled into their shared image. Same digest-pinning guidance as coreImage applies.')
-param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker@sha256:41ef1fab3e24a7e164b218369f06fe444e010ea4fba8cefe746fe4f5e9c0c8b6'
+param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker@sha256:7b9ec111ae8a99923fafa4bbf6f9ec7f44e63ee6872dc978d133afaaf76458dd'
 
 @description('Quota in GiB for the dedicated clustering FAISS checkpoint SMB share. Local SQLite/work files remain on ephemeral storage.')
 @minValue(1)
@@ -88,7 +88,7 @@ param enableWaveExecution bool = true
 @description('Enroll newly created empty libraries only. Existing libraries never change ownership.')
 param enableNewWaveLibraries bool = true
 @description('Exact-image capability ID. Fresh wave activation requires the seeded release certificate; never leave empty.')
-param waveCapabilityId string = '8124b7f28e28b4edc3273c4616bc74bfb1bfa3b8e8e16da5be9d013925b69889'
+param waveCapabilityId string = 'dee3346ea5e4d96f3a7350d4b1dd89bd2b3158729990cb175d7f3aa310748eab'
 
 @description('Fresh-install preparation only: block upload intake and run certificate seeding as a manual recovery job. Activate only after that job succeeds.')
 param waveBootstrapPending bool = false
