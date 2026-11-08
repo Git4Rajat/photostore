@@ -293,3 +293,11 @@ def test_delete_ignores_azure_style_missing_blob(caplog):
     with caplog.at_level('WARNING'):
         ss._delete(Container(), 's/x/index.html')
     assert not caplog.records
+
+
+def test_loader_drops_the_plain_view_once_the_real_ui_loads():
+    html = page.render({'title': 't'}, token='tok', spa_url='https://w', archive_url='https://a', image='')
+    script = html.split('<script>')[1].split('</script>')[0]
+    onload = script.split('s.onload = function () {')[1].split('};')[0]
+    for needle in ("'header'", "'main'", "'#lb'", "head > style"):
+        assert needle in onload

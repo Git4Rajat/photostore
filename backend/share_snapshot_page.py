@@ -263,10 +263,14 @@ _JS = """
     s.type = 'module';
     s.src = '/app/' + a.version + '/' + a.entry;
     s.onload = function () {
-      document.querySelector('header').hidden = true;
-      document.querySelector('main').hidden = true;
-      var lb = document.getElementById('lb');
-      if (lb) lb.remove();
+      // The real UI has its own header and layout: drop the plain view entirely.
+      ['header', 'main', '#lb'].forEach(function (sel) {
+        var el = document.querySelector(sel);
+        if (el && !root.contains(el)) el.remove();
+      });
+      // Its element selectors (header, main, h1, *) would otherwise restyle the real UI.
+      var legacyCss = document.querySelector('head > style');
+      if (legacyCss) legacyCss.remove();
     };
     s.onerror = function () { root.remove(); legacy(); };
     document.head.appendChild(s);
