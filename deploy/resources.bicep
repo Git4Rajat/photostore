@@ -115,6 +115,9 @@ param deployRevisionTag string = toLower(uniqueString(newGuid()))
 @description('Name of an existing Log Analytics workspace (in this resource group) to send Container Apps logs to. Leave blank (the one-click-deploy default) for no log destination -- opt in only where you have provisioned a workspace, since it is a separate billable resource.')
 param logAnalyticsWorkspaceName string = ''
 
+@description('Create a Log Analytics workspace (<appName>-logs, 30-day retention, pay-per-GB) and send Container Apps logs to it. Ignored when logAnalyticsWorkspaceName names an existing workspace.')
+param enableLogAnalytics bool = true
+
 @description('Serve shared albums from a static snapshot on the storage account first. Requires the storage static website to be enabled (deploy/enable-share-snapshot.sh).')
 param enableShareSnapshot bool = true
 
@@ -444,15 +447,25 @@ resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09
   name: logAnalyticsWorkspaceName
 }
 
+var createLogWorkspace = enableLogAnalytics && empty(logAnalyticsWorkspaceName)
+resource createdLogWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = if (createLogWorkspace) {
+  name: '${appName}-logs'
+  location: location
+  properties: {
+    sku: { name: 'PerGB2018' }
+    retentionInDays: 30
+  }
+}
+
 resource managedEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' = {
   name: environmentName
   location: location
-  properties: empty(logAnalyticsWorkspaceName) ? {} : {
+  properties: (empty(logAnalyticsWorkspaceName) && !createLogWorkspace) ? {} : {
     appLogsConfiguration: {
       destination: 'log-analytics'
       logAnalyticsConfiguration: {
-        customerId: logAnalyticsWorkspace.properties.customerId
-        sharedKey: logAnalyticsWorkspace.listKeys().primarySharedKey
+        customerId: empty(logAnalyticsWorkspaceName) ? createdLogWorkspace.properties.customerId : logAnalyticsWorkspace.properties.customerId
+        sharedKey: empty(logAnalyticsWorkspaceName) ? createdLogWorkspace.listKeys().primarySharedKey : logAnalyticsWorkspace.listKeys().primarySharedKey
       }
     }
   }
