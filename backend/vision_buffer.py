@@ -35,6 +35,8 @@ _ALLOWED_GLOBALS = {
     ('datetime', 'datetime'), ('datetime', 'date'), ('datetime', 'time'), ('datetime', 'timedelta'), ('datetime', 'timezone'),
     ('decimal', 'Decimal'), ('uuid', 'UUID'),
     ('azure.data.tables._entity', 'EntityProperty'), ('azure.data.tables._entity', 'EdmType'),
+    # Datetime columns come back from azure-data-tables as this datetime subclass.
+    ('azure.data.tables._deserialize', 'TablesEntityDatetime'),
 }
 
 
@@ -186,7 +188,7 @@ class MemberWindow:
         self.keys = deque()
         self.done = self.last_fetch = False
 
-    def page(self, after):
+    def page(self, after, reloaded=False):
         if not self.keys:
             with metrics.timer('vision_member_fetch', count_name='vision_member_fetch_calls'):
                 rows = self.store._page(self.prefix, after, size=self.fetch_size)
@@ -215,7 +217,9 @@ class MemberWindow:
                 self.keys.clear()
                 self.rows.clear()
                 metrics.add(member_buffer_reloads=1)
-                return self.page(after)
+                if reloaded:
+                    raise
+                return self.page(after, reloaded=True)
             self.rows.pop(key)
         self.rows.flush()
         self.done = self.last_fetch and not self.keys

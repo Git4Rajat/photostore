@@ -16186,11 +16186,17 @@ def _poll_clustering_queue_once(
     consumer it came from. Missing clients and publication failures retain
     the source message for retry instead of discarding the only copy.
     """
-    messages = list(queue_client.receive_messages(
-        messages_per_page=1,
-        max_messages=1,
-        visibility_timeout=CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS,
-    ))
+    try:
+        messages = list(queue_client.receive_messages(
+            messages_per_page=1,
+            max_messages=1,
+            visibility_timeout=CLUSTERING_WORKER_VISIBILITY_TIMEOUT_SECONDS,
+        ))
+    except ResourceNotFoundError:
+        # The worker's startup creation can lose the race with a fresh deployment's storage permissions
+        # (it swallows the error); create the queue now so polling recovers on its own.
+        queue_client.create_queue()
+        return False
     if not messages:
         processing_diagnostics.count(_queue_worker_role(), 'empty_receives')
         return False
