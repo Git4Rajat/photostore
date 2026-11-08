@@ -47,6 +47,11 @@ def auth_login():
         return app.jsonify({'error': 'Incorrect email or password.'}), 401
     account = app.library_store.get_user_by_email(email_in) if app.library_store else None
     stored_hash = str((account or {}).get('passwordHash') or '')
+    if (not account or not stored_hash) and email_in == app.library_utils.normalize_email(app.OWNER_EMAIL):
+        # The owner's first-boot seeding may have lost a race with storage permissions; try again.
+        app.retry_owner_bootstrap()
+        account = app.library_store.get_user_by_email(email_in) if app.library_store else None
+        stored_hash = str((account or {}).get('passwordHash') or '')
     # Brute-force protection is scoped per account so one targeted account can't
     # lock everyone else out. Unknown emails share a small fixed set of buckets
     # (256) instead of each getting a row, so an attacker can't grow the table
