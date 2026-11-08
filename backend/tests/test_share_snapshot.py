@@ -291,5 +291,5 @@ def test_delete_ignores_azure_style_missing_blob(caplog):
             raise ResourceNotFoundError('The specified blob does not exist.\nErrorCode:BlobNotFound')
 
     with caplog.at_level('WARNING'):
-        share_snapshot._delete(Container(), 's/x/index.html')
+        ss._delete(Container(), 's/x/index.html')
     assert not caplog.records
