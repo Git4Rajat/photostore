@@ -5,6 +5,7 @@ import io
 from pathlib import Path
 import subprocess
 import tarfile
+import time
 from urllib.request import urlopen
 
 VERSION = '13.55'
@@ -12,12 +13,23 @@ SHA256 = '5c9d422ad128fab728aacc5cc0aa77095d14cde74931389dd961d3d720e6b316'
 URL = f'https://github.com/exiftool/exiftool/archive/refs/tags/{VERSION}.tar.gz'
 
 
+def _download(attempts=5):
+    # GitHub's archive endpoint intermittently answers 5xx; retry before failing the image build.
+    for attempt in range(1, attempts + 1):
+        try:
+            with urlopen(URL, timeout=60) as response:
+                return response.read(32 * 1024 * 1024 + 1)
+        except OSError:
+            if attempt == attempts:
+                raise
+            time.sleep(5 * attempt)
+
+
 def install(prefix, bin_dir, archive=None):
     if archive:
         data = Path(archive).read_bytes()
     else:
-        with urlopen(URL, timeout=60) as response:
-            data = response.read(32 * 1024 * 1024 + 1)
+        data = _download()
     if len(data) > 32 * 1024 * 1024 or hashlib.sha256(data).hexdigest() != SHA256:
         raise ValueError('ExifTool archive checksum mismatch')
     root = f'exiftool-{VERSION}/'
