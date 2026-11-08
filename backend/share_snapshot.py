@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Callable, Dict, Iterable, List, Optional
 
+import home_facade
 import share_snapshot_page
 
 logger = logging.getLogger(__name__)
@@ -201,6 +202,25 @@ def _http_get(url: str, timeout: int = 60) -> bytes:
         return response.read()
 
 
+FACADE_INDEX = 'index.html'
+
+
+def _ensure_facade(container, spa_url: str) -> None:
+    """Keep the data-free front-door page (home_facade) at the static website root; rewrites only on change."""
+    try:
+        page = home_facade.render(spa_url).encode('utf-8')
+        try:
+            if container.download_blob(FACADE_INDEX).readall() == page:
+                return
+        except Exception:
+            pass   # not published yet
+        container.upload_blob(FACADE_INDEX, page, overwrite=True,
+                              content_settings=_content_settings('text/html; charset=utf-8', 'no-cache'))
+        logger.info('share snapshot: published the front-door page')
+    except Exception:
+        logger.warning('share snapshot: front-door page not published', exc_info=True)
+
+
 def ensure_app(container, spa_url: str, fetch: Callable[[str], bytes] = _http_get) -> str:
     """Copy the slim shared-album bundle from the web app (/static-album/) into the static website under
     app/<version>/, then point app/current.json at it. Idempotent and cheap once done (re-checked every
@@ -211,6 +231,7 @@ def ensure_app(container, spa_url: str, fetch: Callable[[str], bytes] = _http_ge
         return ''
     if time.time() - _app_checked_at < _APP_RECHECK_SECONDS:
         return _app_version
+    _ensure_facade(container, spa_url)
     base = spa_url.rstrip('/') + '/static-album/'
     try:
         info = json.loads(fetch(base + 'app-files.json'))

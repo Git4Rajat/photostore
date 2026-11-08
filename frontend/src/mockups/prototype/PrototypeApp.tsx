@@ -25,6 +25,8 @@ import {
 } from 'lucide-react';
 import { LogoLockup } from '../../components/shared/Logo';
 import Loading from '../../components/shared/Loading';
+import { CachedGalleryPreview, useHomeSnapshot } from './components/CachedGalleryPreview';
+import { HomeSnapshotSaver } from './components/HomeSnapshotSaver';
 import { AppServicesProvider, useAppServices } from '../../components/AppServicesProvider';
 import { formatBytes } from '../../components/browserAiShared';
 import { NotificationBell } from '../../components/AppServiceIndicators';
@@ -314,12 +316,16 @@ const UploadPausedBanner: React.FC = () => {
 // check that avoids a cold account's pages all firing concurrent full scans.
 const AppShellGate: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
     const { libraryIndexReady } = useAppServices();
+    const snapshot = useHomeSnapshot();
     if (libraryIndexReady !== true) {
-        return <Loading label="Loading Keepsake…" />;
+        // A return visit shows the last gallery from this device while the backend wakes.
+        if (snapshot === undefined) return null;
+        return snapshot ? <CachedGalleryPreview snapshot={snapshot} /> : <Loading label="Loading Keepsake…" />;
     }
     return (
         <StoreProvider>
             <Shell onSignOut={onSignOut} />
+            <HomeSnapshotSaver />
         </StoreProvider>
     );
 };
