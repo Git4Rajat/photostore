@@ -115,6 +115,9 @@ param deployRevisionTag string = toLower(uniqueString(newGuid()))
 @description('Name of an existing Log Analytics workspace (in this resource group) to send Container Apps logs to. Leave blank (the one-click-deploy default) for no log destination -- opt in only where you have provisioned a workspace, since it is a separate billable resource.')
 param logAnalyticsWorkspaceName string = ''
 
+@description('Serve shared albums from a static snapshot on the storage account first. Requires the storage static website to be enabled (deploy/enable-share-snapshot.sh).')
+param enableShareSnapshot bool = false
+
 @description('Enable a blob lifecycle policy that auto-tiers full-resolution originals ("images/" container) and cached previews ("thumbnails/preview/") down to Cool then Cold as they go unviewed, to cut storage cost on libraries that mostly hold older, rarely-opened photos. Keyed off last-access time (not upload date), so a photo someone keeps revisiting stays Hot. Small thumbnails and album covers are deliberately excluded -- they are read on every gallery/album page load, so the per-operation cost of a cooler tier would outweigh the storage savings.')
 param enableBlobLifecycleManagement bool = true
 
@@ -480,6 +483,8 @@ var backendEnv = [
   { name: 'ACS_SENDER_ADDRESS', value: acsSenderAddress }
   { name: 'PUBLIC_APP_BASE_URL', value: webUrl }
   { name: 'SPA_BASE_URL', value: webUrl }
+  // The storage static-website origin that serves shared-album snapshots; empty disables the feature.
+  { name: 'SHARE_SNAPSHOT_WEB_URL', value: enableShareSnapshot ? storage.properties.primaryEndpoints.web : '' }
   { name: 'AZURE_SUBSCRIPTION_ID', value: subscription().subscriptionId }
   // BROWSER_ONLY_PROCESSING no longer exists as its own setting -- app.py
   // derives it from PROCESSING_MODE (browser-only iff PROCESSING_MODE ==
@@ -1673,6 +1678,8 @@ resource cluster 'Microsoft.App/containerApps@2025-01-01' = {
           ]
           env: concat(backendEnv, [
             { name: 'APP_ROLE', value: 'cluster' }
+            // The share-snapshot job writes the static page's archive API origin (full-resolution and download links).
+            { name: 'ARCHIVE_PUBLIC_BASE_URL', value: 'https://${archive.properties.configuration.ingress.fqdn}' }
             { name: 'UPLOAD_WAVE_DEPLOYMENT_ID', value: coreImage }
             { name: 'PEOPLE_FAISS_WORK_DIR', value: '/var/lib/photostore/faiss-work' }
             { name: 'PEOPLE_FAISS_CHECKPOINT_DIR', value: '/mnt/photostore/faiss-checkpoints' }

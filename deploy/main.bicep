@@ -89,6 +89,9 @@ param enableIndexPush bool = false
 @description('Name of an existing Log Analytics workspace (in this resource group) to send Container Apps console/system logs to. Leave blank (the one-click-deploy default) for no log destination. Required on every redeploy of an EXISTING environment that already has this wired up -- the managedEnvironment resource replaces its properties wholesale, so omitting this on a redeploy silently disconnects logging even if it was set up out-of-band or by a previous deploy.')
 param logAnalyticsWorkspaceName string = ''
 
+@description('Serve shared albums from a static snapshot on the storage account first (instant first paint while the app wakes). Needs the storage static website enabled once -- run deploy/enable-share-snapshot.sh -- otherwise leave off.')
+param enableShareSnapshot bool = false
+
 // Create the resource group that will hold everything.
 resource rg 'Microsoft.Resources/resourceGroups@2024-03-01' = {
   name: resourceGroupName
@@ -119,6 +122,7 @@ module app 'resources.bicep' = {
     waveCapabilityId: waveCapabilityId
     waveBootstrapPending: waveBootstrapPending
     logAnalyticsWorkspaceName: logAnalyticsWorkspaceName
+    enableShareSnapshot: enableShareSnapshot
   }
 }
 

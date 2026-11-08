@@ -22,6 +22,7 @@ import { Logo, LogoLockup } from './shared/Logo';
 import { EmptyState } from './shared/EmptyState';
 import { ErrorState } from './shared/ErrorState';
 import { isVideoFilename } from '../utils/photoDisplay';
+import { photoFromDeepLink } from '../utils/publicAlbumDeepLink';
 
 interface PublicPhoto {
     filename: string;
@@ -145,7 +146,9 @@ const writeToPopup = (popup: Window | null, heading: string, detail: string): vo
     if (detailEl) detailEl.textContent = detail;
 };
 
-const PublicAlbumPage: React.FC = () => {
+/** `fullAlbumUrl` is set only by the static snapshot page: there, album-wide download (a zip of the
+ *  originals) belongs to the real app, so the toolbar links to it instead of offering select/download. */
+const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) => {
     const { token } = useParams();
     const [loading, setLoading] = useState<boolean>(true);
     const [error, setError] = useState<string>('');
@@ -232,6 +235,19 @@ const PublicAlbumPage: React.FC = () => {
         openedViewerIndexRef.current = index;
         setViewerIndex(index);
     }, []);
+
+    // Arriving from the static share page: reopen the photo the visitor had open there, once.
+    const deepLinkHandledRef = useRef(false);
+    useEffect(() => {
+        if (deepLinkHandledRef.current || !bufferReady || photos.length === 0) {
+            return;
+        }
+        deepLinkHandledRef.current = true;
+        const index = photoFromDeepLink(window.location.search, photos.length);
+        if (index !== null) {
+            openViewerAt(index);
+        }
+    }, [bufferReady, photos.length, openViewerAt]);
 
     const loadPublicAlbum = useCallback(async (code: string = '', nextOffset = 0, append = false) => {
             if (!token) {
@@ -621,13 +637,16 @@ const PublicAlbumPage: React.FC = () => {
                                         <p className="pt-page-sub">
                                             {countLabel}
                                             <span> · Read-only</span>
+                                            {fullAlbumUrl && <span> · Open the full album to download</span>}
                                             {selectMode && selectedCount > 0 && <span> · {selectedCount} selected</span>}
                                             {bufferReady && bufferPercent < 100 && <span> · Caching {bufferPercent}%</span>}
                                         </p>
                                     </div>
                                     <div className="pt-toolbar-actions">
                                         <ThumbSizeControl value={tileSize} onChange={setTileSize} />
-                                        {selectMode ? (
+                                        {fullAlbumUrl ? (
+                                            <a className="btn mock-cta" href={fullAlbumUrl}>Open full album</a>
+                                        ) : selectMode ? (
                                             <>
                                                 <button type="button" className="btn" onClick={toggleSelectAll}>
                                                     {allSelected ? 'Clear' : 'Select all'}
@@ -828,7 +847,7 @@ const PublicAlbumPage: React.FC = () => {
                         {!loading && !error && !codeRequired && photos.length > 0 && (
                             <>
                                 <ScrollToTopButton />
-                                <FloatingSelectButton selectMode={selectMode} onToggle={() => { if (selectMode) { exitSelectMode(); } else { setSelectMode(true); } }} />
+                                {!fullAlbumUrl && <FloatingSelectButton selectMode={selectMode} onToggle={() => { if (selectMode) { exitSelectMode(); } else { setSelectMode(true); } }} />}
                             </>
                         )}
                     </div>

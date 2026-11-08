@@ -395,6 +395,67 @@ def public_raw_full_preview(token: str, filename: str):
     resp.headers['Cache-Control'] = app._album_media_cache_control(entity, 3600)
     return resp
 
+# Photos read ahead while the previous one is being zipped; bounds memory to roughly this many originals.
+_ZIP_READ_AHEAD = 4
+
+
+class _ZipSink:
+    """Write-only, non-seekable target so ZipFile streams (data descriptors) instead of seeking back."""
+
+    def __init__(self) -> None:
+        self._chunks: list = []
+        self._pos = 0
+
+    def write(self, data) -> int:
+        self._chunks.append(bytes(data))
+        self._pos += len(data)
+        return len(data)
+
+    def tell(self) -> int:
+        return self._pos
+
+    def flush(self) -> None:
+        return None
+
+    def drain(self) -> bytes:
+        out = b''.join(self._chunks)
+        self._chunks.clear()
+        return out
+
+
+def _chain_first(first, rest):
+    yield first
+    yield from rest
+
+
+def _prefetched_originals(names, read):
+    """Yield (name, bytes) in order, reading a few photos ahead in threads; unreadable ones are skipped."""
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+
+    pool = ThreadPoolExecutor(max_workers=_ZIP_READ_AHEAD, thread_name_prefix='album-zip')
+    pending: deque = deque()
+    queue = iter(names)
+    try:
+        def fill() -> None:
+            while len(pending) < _ZIP_READ_AHEAD:
+                name = next(queue, None)
+                if name is None:
+                    return
+                pending.append((name, pool.submit(read, name)))
+
+        fill()
+        while pending:
+            name, future = pending.popleft()
+            fill()
+            try:
+                yield name, future.result()
+            except Exception as exc:
+                print(f"Skipping {name} while creating public album download: {str(exc)}", flush=True)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
 @public_bp.route('/public/albums/<token>/download-check', methods=['GET'])
 def public_album_download_check(token: str):
     """Cheap reachability/validity probe the frontend calls before submitting
@@ -447,55 +508,37 @@ def public_album_download(token: str):
     if not selected:
         selected = app._album_filenames(entity)
 
-    # Build the archive on a temp file on disk rather than in a BytesIO. A whole
-    # album buffered in RAM (and previously copied a second time for the
-    # Response body) could exceed the container's memory limit and OOM-kill the
-    # replica. Spooling to disk keeps peak memory to roughly one photo at a time
-    # (the bytes returned by download_media_bytes), and the response is streamed
-    # straight off disk, then the temp file is removed once the stream drains.
-    tmp = app.tempfile.NamedTemporaryFile(prefix='album-', suffix='.zip', delete=False)
-    tmp_path = tmp.name
-    written_count = 0
-    try:
-        owner_id = str(entity.get('PartitionKey') or '')
-        with app.zipfile.ZipFile(tmp, 'w', compression=app.zipfile.ZIP_DEFLATED) as zip_file:
-            for name in selected:
-                try:
-                    # Read from the physical (anonymous) blob, but keep the original
-                    # filename as the entry name so users get familiar names.
-                    blob_name = app.resolve_physical_blob_name(owner_id, name, 'image') if owner_id else name
-                    data_bytes = app.download_media_bytes('image', blob_name)
-                    zip_file.writestr(name, data_bytes)
-                    written_count += 1
-                except Exception as exc:
-                    print(f"Skipping {name} while creating public album download: {str(exc)}", flush=True)
-        tmp.close()
-    except Exception:
-        try:
-            tmp.close()
-        finally:
-            app._remove_file_quietly(tmp_path)
-        raise
+    # Stream the archive as it is built instead of spooling it to disk first: the first byte goes out
+    # immediately (a big album can't hit the ingress request timeout or the replica's small scratch
+    # disk) and photos are read a few at a time rather than one after another.
+    owner_id = str(entity.get('PartitionKey') or '')
 
-    if written_count == 0:
-        app._remove_file_quietly(tmp_path)
+    def read_original(name: str) -> bytes:
+        # Read from the physical (anonymous) blob, but keep the original filename as the entry name.
+        blob_name = app.resolve_physical_blob_name(owner_id, name, 'image') if owner_id else name
+        return app.download_media_bytes('image', blob_name)
+
+    originals = _prefetched_originals(selected, read_original)
+    first = next(originals, None)
+    if first is None:
+        originals.close()
         return app.jsonify({'error': 'No files could be downloaded'}), 404
 
-    zip_size = app.os.path.getsize(tmp_path)
-
-    def _stream_and_cleanup():
+    def _stream_zip():
+        sink = _ZipSink()
         try:
-            with open(tmp_path, 'rb') as fh:
-                while True:
-                    chunk = fh.read(256 * 1024)
-                    if not chunk:
-                        break
-                    yield chunk
+            # Photos are already compressed, so store them: deflating only burns CPU.
+            with app.zipfile.ZipFile(sink, 'w', compression=app.zipfile.ZIP_STORED) as zip_file:
+                for name, data_bytes in _chain_first(first, originals):
+                    zip_file.writestr(name, data_bytes)
+                    yield sink.drain()
+            yield sink.drain()
         finally:
-            app._remove_file_quietly(tmp_path)
+            originals.close()
 
-    resp = app.Response(app.stream_with_context(_stream_and_cleanup()), mimetype='application/zip')
-    resp.headers['Content-Length'] = str(zip_size)
+    resp = app.Response(app.stream_with_context(_stream_zip()), mimetype='application/zip')
     resp.headers['Content-Disposition'] = f'attachment; filename=public-album-{token}.zip'
     resp.headers['Cache-Control'] = 'no-store'
+    # Proxies must not buffer the body, or the first byte is only sent once the whole zip is built.
+    resp.headers['X-Accel-Buffering'] = 'no'
     return resp

@@ -568,6 +568,7 @@ def share_album(album_id: str):
 
     entity['updatedAt'] = app.datetime.now(app.timezone.utc).isoformat()
     app._save_album_entity(entity)
+    app._publish_share_snapshot_shell(entity)
     return app.jsonify({'album': app._album_entity_to_payload(entity)})
 
 @albums_bp.route('/albums/<album_id>/revoke', methods=['POST'])

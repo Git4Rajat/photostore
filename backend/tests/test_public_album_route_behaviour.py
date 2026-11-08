@@ -310,3 +310,25 @@ def test_expired_link_share_page_reveals_nothing_about_the_album(share):
     share['entity']['name'] = 'Secret Holiday'
     body = share['client'].get('/public/album/tok').get_data(as_text=True)
     assert 'Secret Holiday' not in body and 'no longer available' in body
+
+
+class TestStreamingZipHelpers:
+    def test_originals_come_back_in_order_and_unreadable_ones_are_skipped(self):
+        from routes import public
+        blobs = {f'p{i}.jpg': b'x' * i for i in range(1, 12)}
+        names = list(blobs) + ['gone.jpg']
+        got = list(public._prefetched_originals(names, lambda n: blobs[n]))
+        assert [n for n, _ in got] == list(blobs)
+
+    def test_zip_is_written_to_a_non_seekable_sink_in_pieces(self):
+        from routes import public
+        sink = public._ZipSink()
+        pieces = []
+        with zipfile.ZipFile(sink, 'w', compression=zipfile.ZIP_STORED) as z:
+            for name in ('a.jpg', 'b.jpg'):
+                z.writestr(name, b'data-' + name.encode())
+                pieces.append(sink.drain())
+        pieces.append(sink.drain())
+        assert pieces[0], 'the first photo is emitted before the archive is finished'
+        archive = zipfile.ZipFile(io.BytesIO(b''.join(pieces)))
+        assert archive.namelist() == ['a.jpg', 'b.jpg'] and archive.testzip() is None
