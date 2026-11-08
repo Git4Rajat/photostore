@@ -58,13 +58,13 @@ param processingMode string = 'backend'
 param browserUploadPreparation bool = true
 
 @description('Public core API image. Defaults to an immutable @sha256 digest (rewritten by the publish workflow after each qualified release), never :latest, so installs never auto-upgrade. To upgrade an EXISTING deployment, override with the new release digest.')
-param coreImage string = 'ghcr.io/git4rajat/photostore-backend@sha256:e2730d52332d4472c067682f77444e538ee103f289ddec435ca697760cbc47c4'
+param coreImage string = 'ghcr.io/git4rajat/photostore-backend@sha256:760511d7270e341458647a1d15d3b30dab2cba1fb057004cc739c098172f0b37'
 
 @description('Public web (frontend) image. Defaults to an immutable @sha256 digest, never :latest, same as coreImage above.')
-param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:ff522b303dba1c68a3652c398b50380ce4876648d32f270ab0aceaf85bb34b5d'
+param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:f3e8fb8697de34a22eb5235b0e1872ecd1f189ca4113f69a016efaccc3f9bef2'
 
 @description('Public vision (server-side image processing) image. Only pulled/deployed when processingMode is "backend" or "both". Separate from coreImage (unlike the clustering `cluster` role, which reuses it) because vision needs torch/open_clip/onnxruntime/opencv/mediapipe/tesseract -- multiple GB of extra weight that would slow every core/cluster cold start if bundled into their shared image. Same digest-pinning guidance as coreImage applies.')
-param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker@sha256:89e63ca12d6f6a906fdbcffe8e2f7758f9e9fe008ce3ee54b719c7f82f28d4f6'
+param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker@sha256:a6e9a13b9ffe26de67a6f3b61deb29f70444c00ef6ff79e7ba55c4f9035e4b55'
 
 @description('Quota in GiB for the dedicated clustering FAISS checkpoint SMB share. Local SQLite/work files remain on ephemeral storage.')
 @minValue(1)
