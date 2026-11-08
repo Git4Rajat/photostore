@@ -4,7 +4,7 @@ It shows the app's chrome and a skeleton grid within a fraction of a second -- b
 awake -- while it wakes the web app and every API the app talks to (read from the web app's own env.js),
 then hands over to the real app. It holds no account or library data, so it is safe on a public site; the
 real app (and its login) stays on its own origin, so nobody is logged out. Optional ``?to=/path`` keeps a
-deep link. A page-level CSP (meta) allows only its own inline script/style by hash plus the web origin's env.js.
+deep link. A page-level CSP (meta) allows only its own inline script by hash, its own origin's bundle, and the web origin's env.js.
 """
 from __future__ import annotations
 
@@ -67,6 +67,32 @@ _JS = """
   // Hand over as soon as the web app answers; never wait on the (slower) APIs, the app covers that itself.
   web.then(go);
   setTimeout(go, 20000);
+  // Upgrade to the app's own header and gallery frame (the shared-album bundle, published alongside the
+  // share pages). The plain page above stays if it is not there yet or fails to load.
+  fetch('/app/current.json', { cache: 'no-cache' })
+    .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+    .then(function (a) {
+      window.__HOME__ = true;
+      var root = document.createElement('div');
+      root.id = 'root';
+      (a.css || []).forEach(function (f) {
+        var l = document.createElement('link');
+        l.rel = 'stylesheet';
+        l.href = '/app/' + a.version + '/' + f;
+        document.head.appendChild(l);
+      });
+      var m = document.createElement('script');
+      m.type = 'module';
+      m.src = '/app/' + a.version + '/' + a.entry;
+      m.onload = function () {
+        ['header', 'main'].forEach(function (sel) { var el = document.querySelector(sel); if (el) el.remove(); });
+        var plain = document.querySelector('head > style');
+        if (plain) plain.remove();
+      };
+      document.body.appendChild(root);
+      document.head.appendChild(m);
+    })
+    .catch(function () {});
 }());
 """
 
@@ -85,9 +111,11 @@ def render(spa_url: str) -> str:
     script = _JS.replace('__SPA__', json.dumps(spa).replace('</', '<\\/'))
     csp = '; '.join([
         "default-src 'none'",
-        f"script-src {_hash(script)} {spa}",
-        f"style-src {_hash(_CSS)}",
-        "connect-src https:",
+        f"script-src {_hash(script)} {spa} 'self'",
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' data: blob:",
+        "font-src 'self' data:",
+        "connect-src 'self' https:",
         "base-uri 'none'",
         "form-action 'none'",
     ])

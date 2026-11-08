@@ -335,3 +335,12 @@ def test_front_door_is_published_once_and_only_rewritten_on_change(monkeypatch):
         raise OSError('down')
     ss.ensure_app(container, 'https://other.example', fetch=down)
     assert container.uploads.count('index.html') == 2          # spa changed: rewritten even though the bundle fetch failed
+
+
+def test_front_door_upgrades_to_the_real_ui_bundle_but_keeps_the_plain_page_as_fallback():
+    import home_facade
+    html = home_facade.render('https://web.example')
+    script = html.split('<script>')[1].split('</script>')[0]
+    assert "fetch('/app/current.json'" in script and 'window.__HOME__ = true' in script
+    assert script.rstrip().endswith('}());') and '.catch(function () {});' in script   # a missing bundle is not an error
+    assert "script-src" in html and "'self'" in html and 'class="grid"' in html       # plain skeleton still rendered

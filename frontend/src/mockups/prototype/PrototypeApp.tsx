@@ -24,6 +24,7 @@ import {
     Sparkles as SparklesIconSolid,
 } from 'lucide-react';
 import { LogoLockup } from '../../components/shared/Logo';
+import { NAV_ITEMS } from './components/HomeChrome';
 import Loading from '../../components/shared/Loading';
 import { CachedGalleryPreview, PreviewUntilGallery, useHomeSnapshot } from './components/CachedGalleryPreview';
 import { HomeSnapshotSaver } from './components/HomeSnapshotSaver';
@@ -94,15 +95,7 @@ const isResetPasswordPath = (): boolean =>
 const isConfirmLibraryCleanPath = (): boolean =>
     typeof window !== 'undefined' && window.location.pathname === '/confirm-library-clean';
 
-const NAV: { id: PageId; label: string }[] = [
-    { id: 'ask', label: 'Ask' },
-    { id: 'gallery', label: 'Gallery' },
-    { id: 'albums', label: 'Albums' },
-    { id: 'people', label: 'People' },
-    { id: 'explore', label: 'Explore' },
-    { id: 'tools', label: 'Tools' },
-    { id: 'sharing', label: 'Sharing' },
-];
+const NAV: { id: PageId; label: string }[] = [...NAV_ITEMS];
 // The phone tab bar holds 5 primary destinations; the remaining ones live
 // behind a "More" tab (HIG: fold overflow beyond 5 tabs into More rather than
 // dropping those destinations, which previously left Tools/Sharing unreachable
