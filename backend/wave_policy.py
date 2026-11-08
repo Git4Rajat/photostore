@@ -86,6 +86,18 @@ def configuration_ready():
             ('UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED','PROCESSING_GENERATION_ENFORCEMENT_ENABLED')))
 
 
+def capability_id(env=os.environ):
+    """The certificate this deployment must hold. Normally the operator-supplied UPLOAD_WAVE_CAPABILITY_ID.
+    One-click portal deployments (UPLOAD_WAVE_AUTO_BOOTSTRAP) leave it empty and it is derived from the two
+    pinned images every role is given, so all roles agree; each role still has to be running the image the
+    certificate records for it (see the deployment-identity check in ``ready``)."""
+    explicit=env.get('UPLOAD_WAVE_CAPABILITY_ID','')
+    if explicit or env.get('UPLOAD_WAVE_AUTO_BOOTSTRAP')!='true':return explicit
+    core,vision=env.get('UPLOAD_WAVE_CORE_IMAGE',''),env.get('UPLOAD_WAVE_VISION_IMAGE','')
+    if not (core and vision):return ''
+    return digest([PROTOCOL,{role:vision if role=='vision' else core for role in ROLES}])
+
+
 def certify(table, deployments):
     """Operator supplies independently qualified immutable image IDs for every role.
     No automatic certification from an environment flag or a worker heartbeat.
@@ -123,7 +135,7 @@ def require_capability(store,role,*,allow_cleanup=False):
     if (os.getenv('UPLOAD_WAVE_BOOTSTRAP_PENDING','').lower()=='true'
             or not configuration_ready() or proof.get('protocol')!=PROTOCOL
             or not _supported_certificate_roles(builds) or digest([PROTOCOL,builds])!=policy['capabilityId']
-            or os.getenv('UPLOAD_WAVE_CAPABILITY_ID','')!=policy['capabilityId']
+            or capability_id()!=policy['capabilityId']
             or not os.getenv('UPLOAD_WAVE_DEPLOYMENT_ID','')
             or builds.get(role)!=os.getenv('UPLOAD_WAVE_DEPLOYMENT_ID')):
         raise Conflict('This app deployment is not qualified for the library wave protocol')
@@ -139,7 +151,7 @@ def enroll_new(table,library,metadata=None):
     query="PartitionKey eq '"+library.replace("'","''")+"'"
     if next(iter(metadata.query_entities(query,results_per_page=1)),None) is not None:
         raise Conflict('Wave enrollment requires a new empty library')
-    certificate=os.getenv('UPLOAD_WAVE_CAPABILITY_ID','')
+    certificate=capability_id()
     if not re.fullmatch(r'[a-f0-9]{64}',certificate):
         raise RuntimeError('A valid wave capability ID is required before enrollment')
     try:proof=table.get_entity(CAPABILITIES,certificate)

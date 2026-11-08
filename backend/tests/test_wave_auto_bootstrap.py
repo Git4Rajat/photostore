@@ -22,9 +22,12 @@ CORE = 'ghcr.io/o/photostore-backend@sha256:' + 'a' * 64
 VISION = 'ghcr.io/o/photostore-ipworker@sha256:' + 'b' * 64
 
 
+EXPECTED = digest([PROTOCOL, wave_bootstrap.deployment_contract(CORE, VISION)])
+
+
 def env(**extra):
-    base = {'UPLOAD_WAVE_AUTO_BOOTSTRAP': 'true', 'UPLOAD_WAVE_DEPLOYMENT_ID': CORE, 'UPLOAD_WAVE_VISION_IMAGE': VISION}
-    base['UPLOAD_WAVE_CAPABILITY_ID'] = digest([PROTOCOL, wave_bootstrap.deployment_contract(CORE, VISION)])
+    base = {'UPLOAD_WAVE_AUTO_BOOTSTRAP': 'true', 'UPLOAD_WAVE_CORE_IMAGE': CORE, 'UPLOAD_WAVE_VISION_IMAGE': VISION}
+    base['UPLOAD_WAVE_CAPABILITY_ID'] = ''
     base.update(extra)
     return base
 
@@ -51,7 +54,7 @@ def test_existing_matching_certificate_is_a_noop(monkeypatch):
             return Table()
 
     monkeypatch.setattr(wave_bootstrap, 'seed', lambda *a: pytest.fail('must not reseed'))
-    assert wave_bootstrap.auto_seed(Service(), e) == e['UPLOAD_WAVE_CAPABILITY_ID']
+    assert wave_bootstrap.auto_seed(Service(), e) == EXPECTED
 
 
 def test_missing_certificate_seeds_on_fresh_storage(monkeypatch):
@@ -67,4 +70,16 @@ def test_missing_certificate_seeds_on_fresh_storage(monkeypatch):
 
     seen = {}
     monkeypatch.setattr(wave_bootstrap, 'seed', lambda svc, d, exp: seen.update(exp=exp) or exp)
-    assert wave_bootstrap.auto_seed(Service(), e) == e['UPLOAD_WAVE_CAPABILITY_ID'] == seen['exp']
+    assert wave_bootstrap.auto_seed(Service(), e) == EXPECTED == seen['exp']
+
+
+def test_every_role_derives_the_same_certificate_from_the_shared_images():
+    import wave_policy
+    core_env, vision_env = env(UPLOAD_WAVE_DEPLOYMENT_ID=CORE), env(UPLOAD_WAVE_DEPLOYMENT_ID=VISION)
+    assert wave_policy.capability_id(core_env) == wave_policy.capability_id(vision_env) == EXPECTED
+
+
+def test_an_explicit_capability_is_never_overridden():
+    import wave_policy
+    assert wave_policy.capability_id(env(UPLOAD_WAVE_CAPABILITY_ID='d' * 64)) == 'd' * 64
+    assert wave_policy.capability_id(env(UPLOAD_WAVE_AUTO_BOOTSTRAP='false')) == ''

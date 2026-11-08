@@ -8,7 +8,7 @@ import os
 import re
 import time
 from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
-from wave_policy import ROLES, PROTOCOL, CAPABILITIES, certify
+from wave_policy import ROLES, PROTOCOL, CAPABILITIES, certify, capability_id
 from upload_waves import digest
 
 
@@ -44,15 +44,16 @@ def seed(service, deployments, expected):
 
 
 def auto_seed(service, env=os.environ):
-    """One-click portal deployment: the template pins every image and the capability ID, so the template
-    itself is the operator's qualified contract. Seeds that certificate on first boot, and only on
-    never-used storage (``seed`` refuses any existing library data). Does nothing unless the template asked
-    for it via UPLOAD_WAVE_AUTO_BOOTSTRAP, and is a no-op once the certificate exists."""
+    """One-click portal deployment: the template pins the core and Vision images and hands them to every
+    role, and a brand-new library has nothing to protect, so the first boot seeds the certificate for those
+    images -- only on never-used storage (``seed`` refuses any existing library data). Does nothing unless the
+    template asked for it via UPLOAD_WAVE_AUTO_BOOTSTRAP, and is a no-op once the certificate exists. An
+    explicit UPLOAD_WAVE_CAPABILITY_ID must still match the images."""
     if env.get('UPLOAD_WAVE_AUTO_BOOTSTRAP') != 'true':
         return ''
-    expected = env.get('UPLOAD_WAVE_CAPABILITY_ID', '')
-    deployments = deployment_contract(env.get('UPLOAD_WAVE_DEPLOYMENT_ID', ''), env.get('UPLOAD_WAVE_VISION_IMAGE', ''))
-    if digest([PROTOCOL, deployments]) != expected:
+    deployments = deployment_contract(env.get('UPLOAD_WAVE_CORE_IMAGE', ''), env.get('UPLOAD_WAVE_VISION_IMAGE', ''))
+    expected = digest([PROTOCOL, deployments])
+    if env.get('UPLOAD_WAVE_CAPABILITY_ID') not in (None, '', expected):
         raise ValueError('Template capability ID does not match its pinned images')
     try:
         proof = service.get_table_client('photojobs').get_entity(CAPABILITIES, expected)
