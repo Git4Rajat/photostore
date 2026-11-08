@@ -114,6 +114,18 @@ class TestLogin:
         assert accounts == ['login-throttle:me@example.com', f'login-throttle:unknown:{bucket}']
         assert len(throttle['failures']) == 4  # one per-address and one account-wide row for each attempt
 
+    def test_owner_login_retries_a_first_boot_seeding_that_lost_the_storage_permission_race(self, http, store, throttle, monkeypatch):
+        monkeypatch.setattr(app, 'OWNER_EMAIL', 'Owner@Example.com')
+        calls = []
+        monkeypatch.setattr(app, 'retry_owner_bootstrap', lambda: (calls.append(1), store.add_user('owner', 'owner@example.com', 'correct horse')))
+        body = http.post(self.URL, json={'email': 'owner@example.com', 'password': 'correct horse'}).json
+        assert calls == [1] and body['token'] == 'tok:owner:lib-owner:password'
+
+    def test_other_unknown_emails_do_not_trigger_the_owner_retry(self, http, store, throttle, monkeypatch):
+        monkeypatch.setattr(app, 'OWNER_EMAIL', 'owner@example.com')
+        monkeypatch.setattr(app, 'retry_owner_bootstrap', lambda: pytest.fail('must not retry'))
+        assert http.post(self.URL, json={'email': 'who@example.com', 'password': 'x'}).status_code == 401
+
     def test_throttled_email_is_rejected_even_with_the_right_password(self, http, store, throttle):
         throttle['allowed'] = False
         response = http.post(self.URL, json={'email': 'me@example.com', 'password': 'correct horse'})

@@ -1380,6 +1380,33 @@ def _prime_vector_indexes_on_startup() -> None:
     thread.start()
 
 
+def _wave_table_service():
+    """Table service for the wave certificate seed. Built here, not via _ensure_table_service_client, which is
+    defined after the boot code that calls this runs."""
+    if STORAGE_CONNECTION_STRING:
+        return TableServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
+    return TableServiceClient(endpoint=f'https://{account_name}.table.core.windows.net', credential=credential)
+
+
+_owner_retry_at = 0.0
+
+
+def retry_owner_bootstrap() -> None:
+    """Seed the owner credential and account again, at most every 30 s. A fresh deployment's first boot can run
+    before its storage role assignments take effect, which leaves no owner credential; without this every
+    login would be refused until the app next restarts."""
+    global _owner_retry_at
+    if AUTH_MODE != 'password' or time.monotonic() - _owner_retry_at < 30:
+        return
+    _owner_retry_at = time.monotonic()
+    try:
+        if password_auth.seed_owner_if_missing(config_table_client, OWNER_EMAIL, OWNER_PASSWORD):
+            app.logger.info('Seeded initial owner credential for %s on retry', OWNER_EMAIL or '(no email)')
+    except Exception as exc:
+        app.logger.warning('Owner credential seeding retry failed: %s', exc)
+    _bootstrap_owner_account()
+
+
 def _bootstrap_owner_account() -> None:
     """Idempotently mirror the seeded password-mode owner into the account and
     library tables, giving them ``user_id == library_id == OWNER_USER_ID``.
@@ -1394,7 +1421,7 @@ def _bootstrap_owner_account() -> None:
     try:
         if os.getenv('UPLOAD_WAVE_AUTO_BOOTSTRAP') == 'true':
             import wave_bootstrap
-            wave_bootstrap.auto_seed(_ensure_table_service_client())
+            wave_bootstrap.auto_seed(_wave_table_service())
         cred = password_auth.get_owner_credential(config_table_client) or {}
         # Prefer an explicitly-configured OWNER_EMAIL so an operator can set it
         # after the fact to recover login-by-email; fall back to the seeded value.
