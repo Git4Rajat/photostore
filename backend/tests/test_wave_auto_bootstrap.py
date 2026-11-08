@@ -61,7 +61,7 @@ def test_missing_certificate_seeds_on_fresh_storage(monkeypatch):
             return Table()
 
     seen = {}
-    monkeypatch.setattr(wave_bootstrap, 'seed', lambda svc, d, exp: seen.update(exp=exp) or exp)
+    monkeypatch.setattr(wave_bootstrap, 'seed', lambda svc, d, exp, **kw: seen.update(exp=exp) or exp)
     assert wave_bootstrap.auto_seed(Service(), e) == EXPECTED == seen['exp']
 
 
@@ -75,3 +75,25 @@ def test_an_explicit_capability_is_never_overridden():
     import wave_policy
     assert wave_policy.capability_id(env(UPLOAD_WAVE_CAPABILITY_ID='d' * 64)) == 'd' * 64
     assert wave_policy.capability_id(env(UPLOAD_WAVE_AUTO_BOOTSTRAP='false')) == ''
+
+
+def test_auto_seed_tolerates_an_empty_library_row_but_the_manual_seed_does_not():
+    import json
+
+    class Table:
+        def __init__(self, rows): self.rows = rows
+        def query_entities(self, query, results_per_page=1): return iter(self.rows)
+        def get_entity(self, pk, rk): raise wave_bootstrap.ResourceNotFoundError()
+        def create_entity(self, row): pass
+
+    class Service:
+        tables = {'photolibraries': [{'PartitionKey': 'owner'}], 'photometadata': [], 'photojobs': []}
+        def get_table_client(self, name): return Table(self.tables.get(name, []))
+        def create_table_if_not_exists(self, name): return Table([])
+
+    deployments = wave_bootstrap.deployment_contract(CORE, VISION)
+    with pytest.raises(RuntimeError):
+        wave_bootstrap.seed(Service(), deployments, EXPECTED)
+    Service.tables['photometadata'] = [{'PartitionKey': 'owner'}]
+    with pytest.raises(RuntimeError):
+        wave_bootstrap.seed(Service(), deployments, EXPECTED, allow_empty_libraries=True)
