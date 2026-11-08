@@ -89,8 +89,8 @@ param enableIndexPush bool = false
 @description('Name of an existing Log Analytics workspace (in this resource group) to send Container Apps console/system logs to. Leave blank (the one-click-deploy default) for no log destination. Required on every redeploy of an EXISTING environment that already has this wired up -- the managedEnvironment resource replaces its properties wholesale, so omitting this on a redeploy silently disconnects logging even if it was set up out-of-band or by a previous deploy.')
 param logAnalyticsWorkspaceName string = ''
 
-@description('Serve shared albums from a static snapshot on the storage account first (instant first paint while the app wakes). Needs the storage static website enabled once -- run deploy/enable-share-snapshot.sh -- otherwise leave off.')
-param enableShareSnapshot bool = false
+@description('Serve shared albums from a static snapshot on the storage account first (instant first paint while the app wakes). The deployment switches the storage static website on by itself (a small one-off script); turn this off to skip that and use the web app URL directly.')
+param enableShareSnapshot bool = true
 
 // Create the resource group that will hold everything.
 resource rg 'Microsoft.Resources/resourceGroups@2024-03-01' = {
@@ -128,6 +128,9 @@ module app 'resources.bicep' = {
 
 @description('URL of the deployed Photostore web app.')
 output appUrl string = app.outputs.appUrl
+
+@description('Address to give users: the static front door when share snapshots are enabled, otherwise the web app URL.')
+output homeUrl string = app.outputs.homeUrl
 
 @description('URL of the core API.')
 output apiUrl string = app.outputs.apiUrl

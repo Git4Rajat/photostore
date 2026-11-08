@@ -261,7 +261,7 @@ def test_ensure_app_copies_the_bundle_once_and_points_current_at_it(monkeypatch)
         return served['/' + url.split('//', 1)[1].split('/', 1)[1]]
     c = FakeContainer()
     assert ss.ensure_app(c, 'https://web.example', fetch) == 'v9'
-    assert set(c.blobs) == {'app/v9/assets/m.js', 'app/v9/assets/m.css', 'app/current.json'}
+    assert set(c.blobs) == {'app/v9/assets/m.js', 'app/v9/assets/m.css', 'app/current.json', 'index.html'}
     assert json.loads(c.blobs['app/current.json'][0]) == {'version': 'v9', 'entry': 'assets/m.js', 'css': ['assets/m.css']}
     n = len(calls)
     assert ss.ensure_app(c, 'https://web.example', fetch) == 'v9' and len(calls) == n   # cached, no refetch
@@ -301,3 +301,46 @@ def test_loader_drops_the_plain_view_once_the_real_ui_loads():
     onload = script.split('s.onload = function () {')[1].split('};')[0]
     for needle in ("'header'", "'main'", "'#lb'", "head > style"):
         assert needle in onload
+
+
+def test_front_door_page_is_data_free_and_hands_over_to_the_web_app():
+    import home_facade
+    html = home_facade.render('https://web.example/')
+    assert 'Opening your library' in html and "location.replace(SPA + to)" in html
+    assert 'https://web.example' in html and 'default-src \'none\'' in html
+    script = html.split('<script>')[1].split('</script>')[0]
+    assert home_facade._hash(script) in html          # the inline script is pinned by hash
+    assert 'photos' not in script.lower()             # nothing library-shaped lives on the public site
+
+
+def test_front_door_only_follows_same_site_paths():
+    import home_facade
+    script = home_facade.render('https://web.example').split('<script>')[1].split('</script>')[0]
+    assert "p.charAt(0) === '/' && p.charAt(1) !== '/'" in script
+
+
+def test_front_door_is_published_once_and_only_rewritten_on_change(monkeypatch):
+    container = FakeContainer()
+    files = {'https://web.example/static-album/app-files.json': json.dumps(
+        {'version': 'v1', 'entry': 'assets/a.js', 'css': [], 'files': ['assets/a.js']}).encode(),
+        'https://web.example/static-album/assets/a.js': b'js'}
+    monkeypatch.setattr(ss, '_app_checked_at', 0.0)
+    ss.ensure_app(container, 'https://web.example', fetch=lambda u: files[u])
+    assert container.uploads.count('index.html') == 1
+    monkeypatch.setattr(ss, '_app_checked_at', 0.0)
+    ss.ensure_app(container, 'https://web.example', fetch=lambda u: files[u])
+    assert container.uploads.count('index.html') == 1          # identical page: no rewrite
+    monkeypatch.setattr(ss, '_app_checked_at', 0.0)
+    def down(url):
+        raise OSError('down')
+    ss.ensure_app(container, 'https://other.example', fetch=down)
+    assert container.uploads.count('index.html') == 2          # spa changed: rewritten even though the bundle fetch failed
+
+
+def test_front_door_upgrades_to_the_real_ui_bundle_but_keeps_the_plain_page_as_fallback():
+    import home_facade
+    html = home_facade.render('https://web.example')
+    script = html.split('<script>')[1].split('</script>')[0]
+    assert "fetch('/app/current.json'" in script and 'window.__HOME__ = true' in script
+    assert script.rstrip().endswith('}());') and '.catch(function () {});' in script   # a missing bundle is not an error
+    assert "script-src" in html and "'self'" in html and 'class="grid"' in html       # plain skeleton still rendered

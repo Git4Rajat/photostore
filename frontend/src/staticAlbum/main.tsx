@@ -6,6 +6,7 @@ import '../mockups/mockups.css';
 import '../mockups/prototype/prototype.css';
 import { wrapExtrasAdapter } from '../services/apiClient';
 import PublicAlbumPage from '../components/PublicAlbumPage';
+import { mountHome } from './home';
 import { snapshotAdapter, type SnapshotManifest } from './snapshotAdapter';
 
 /**
@@ -30,7 +31,9 @@ const ping = (url: string): Promise<void> => new Promise((resolve) => {
     attempt();
 });
 
-if (cfg && root) {
+if (root && (window as unknown as { __HOME__?: boolean }).__HOME__) {
+    mountHome(root);
+} else if (cfg && root) {
     let manifest: SnapshotManifest | null = null;
     wrapExtrasAdapter(snapshotAdapter(cfg.base, cfg.token, (m) => { manifest = m; }));
 

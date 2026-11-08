@@ -24,7 +24,10 @@ import {
     Sparkles as SparklesIconSolid,
 } from 'lucide-react';
 import { LogoLockup } from '../../components/shared/Logo';
+import { NAV_ITEMS } from './components/HomeChrome';
 import Loading from '../../components/shared/Loading';
+import { CachedGalleryPreview, PreviewUntilGallery, useHomeSnapshot } from './components/CachedGalleryPreview';
+import { HomeSnapshotSaver } from './components/HomeSnapshotSaver';
 import { AppServicesProvider, useAppServices } from '../../components/AppServicesProvider';
 import { formatBytes } from '../../components/browserAiShared';
 import { NotificationBell } from '../../components/AppServiceIndicators';
@@ -92,15 +95,7 @@ const isResetPasswordPath = (): boolean =>
 const isConfirmLibraryCleanPath = (): boolean =>
     typeof window !== 'undefined' && window.location.pathname === '/confirm-library-clean';
 
-const NAV: { id: PageId; label: string }[] = [
-    { id: 'ask', label: 'Ask' },
-    { id: 'gallery', label: 'Gallery' },
-    { id: 'albums', label: 'Albums' },
-    { id: 'people', label: 'People' },
-    { id: 'explore', label: 'Explore' },
-    { id: 'tools', label: 'Tools' },
-    { id: 'sharing', label: 'Sharing' },
-];
+const NAV: { id: PageId; label: string }[] = [...NAV_ITEMS];
 // The phone tab bar holds 5 primary destinations; the remaining ones live
 // behind a "More" tab (HIG: fold overflow beyond 5 tabs into More rather than
 // dropping those destinations, which previously left Tools/Sharing unreachable
@@ -314,12 +309,17 @@ const UploadPausedBanner: React.FC = () => {
 // check that avoids a cold account's pages all firing concurrent full scans.
 const AppShellGate: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
     const { libraryIndexReady } = useAppServices();
+    const snapshot = useHomeSnapshot();
     if (libraryIndexReady !== true) {
-        return <Loading label="Loading Keepsake…" />;
+        // A return visit shows the last gallery from this device while the backend wakes.
+        if (snapshot === undefined) return null;
+        return snapshot ? <CachedGalleryPreview snapshot={snapshot} /> : <Loading label="Loading Keepsake…" />;
     }
     return (
         <StoreProvider>
             <Shell onSignOut={onSignOut} />
+            <PreviewUntilGallery snapshot={snapshot} />
+            <HomeSnapshotSaver />
         </StoreProvider>
     );
 };
