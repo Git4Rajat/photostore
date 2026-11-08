@@ -244,7 +244,7 @@ resource snapshotSetupIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities
 
 resource snapshotSetupRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for roleId in [
   '17d1049b-9a84-46fb-8f53-869881c3d3ab' // Storage Account Contributor: change blob service properties
-  'ba92f5b4-2d11-453d-a403-e96b7ce1d0e5' // Storage Blob Data Contributor: create $web
+  roleBlobContributor // Storage Blob Data Contributor: create $web
 ]: if (enableShareSnapshot) {
   scope: storage
   name: guid(storage.id, snapshotSetupIdentity.id, roleId)
