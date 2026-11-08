@@ -92,7 +92,7 @@ param logAnalyticsWorkspaceName string = ''
 @description('Create a Log Analytics workspace and send Container Apps logs to it (off by default). Ignored when logAnalyticsWorkspaceName names an existing workspace.')
 param enableLogAnalytics bool = false
 
-@description('Serve shared albums from a static snapshot on the storage account first (instant first paint while the app wakes). The deployment switches the storage static website on by itself (a small one-off script); turn this off to skip that and use the web app URL directly.')
+@description('Serve shared albums from a static snapshot on the storage account first (instant first paint while the app wakes). The worker switches the storage static website on by itself the first time a share is created; turn this off to skip that and use the web app URL directly.')
 param enableShareSnapshot bool = true
 
 // Create the resource group that will hold everything.
