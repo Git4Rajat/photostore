@@ -19,16 +19,19 @@ def deployment_contract(core, vision):
     return {role: vision if role == 'vision' else core for role in ROLES}
 
 
-def seed(service, deployments, expected):
+def seed(service, deployments, expected, allow_empty_libraries=False):
     if set(deployments) != set(ROLES) or digest([PROTOCOL, deployments]) != expected:
         raise ValueError('Bootstrap capability does not match the selected role images')
     # A fresh run may resume after certificate creation, but never over data or
     # prior ownership. Metadata/library tables may not exist on the first start.
-    for name, query in (
+    checks = (
         ('photometadata', "PartitionKey ne ''"),
         ('photolibraries', "PartitionKey ne ''"),
         ('photojobs', "PartitionKey ge 'upload-wave-shadow-' and PartitionKey lt 'upload-wave-shadow-~'"),
-    ):
+    )
+    # A library row with no photos and no wave policy (e.g. the owner row a half-finished first boot left
+    # behind) has nothing to protect; the photo and wave-policy checks still apply.
+    for name, query in (checks[:1] + checks[2:] if allow_empty_libraries else checks):
         try:
             row = next(iter(service.get_table_client(name).query_entities(query, results_per_page=1)), None)
         except ResourceNotFoundError:
@@ -61,7 +64,7 @@ def auto_seed(service, env=os.environ):
             return expected
     except ResourceNotFoundError:
         pass
-    return seed(service, deployments, expected)
+    return seed(service, deployments, expected, allow_empty_libraries=True)
 
 
 def main():
