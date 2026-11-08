@@ -37,7 +37,7 @@ if (cfg && root) {
     createRoot(root).render(
         <React.StrictMode>
             <MemoryRouter initialEntries={[`/public/album/${encodeURIComponent(cfg.token)}`]}>
-                <Routes><Route path="/public/album/:token" element={<PublicAlbumPage />} /></Routes>
+                <Routes><Route path="/public/album/:token" element={<PublicAlbumPage fullAlbumUrl={`${cfg.spa}/public/album/${encodeURIComponent(cfg.token)}`} />} /></Routes>
             </MemoryRouter>
         </React.StrictMode>,
     );

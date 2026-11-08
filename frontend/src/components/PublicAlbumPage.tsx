@@ -146,7 +146,9 @@ const writeToPopup = (popup: Window | null, heading: string, detail: string): vo
     if (detailEl) detailEl.textContent = detail;
 };
 
-const PublicAlbumPage: React.FC = () => {
+/** `fullAlbumUrl` is set only by the static snapshot page: there, album-wide download (a zip of the
+ *  originals) belongs to the real app, so the toolbar links to it instead of offering select/download. */
+const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) => {
     const { token } = useParams();
     const [loading, setLoading] = useState<boolean>(true);
     const [error, setError] = useState<string>('');
@@ -641,7 +643,9 @@ const PublicAlbumPage: React.FC = () => {
                                     </div>
                                     <div className="pt-toolbar-actions">
                                         <ThumbSizeControl value={tileSize} onChange={setTileSize} />
-                                        {selectMode ? (
+                                        {fullAlbumUrl ? (
+                                            <a className="btn mock-cta" href={fullAlbumUrl}>Open full album</a>
+                                        ) : selectMode ? (
                                             <>
                                                 <button type="button" className="btn" onClick={toggleSelectAll}>
                                                     {allSelected ? 'Clear' : 'Select all'}
@@ -842,7 +846,7 @@ const PublicAlbumPage: React.FC = () => {
                         {!loading && !error && !codeRequired && photos.length > 0 && (
                             <>
                                 <ScrollToTopButton />
-                                <FloatingSelectButton selectMode={selectMode} onToggle={() => { if (selectMode) { exitSelectMode(); } else { setSelectMode(true); } }} />
+                                {!fullAlbumUrl && <FloatingSelectButton selectMode={selectMode} onToggle={() => { if (selectMode) { exitSelectMode(); } else { setSelectMode(true); } }} />}
                             </>
                         )}
                     </div>
