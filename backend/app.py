@@ -1392,6 +1392,9 @@ def _bootstrap_owner_account() -> None:
     if library_store is None or AUTH_MODE != 'password' or os.getenv('UPLOAD_WAVE_BOOTSTRAP_PENDING','').lower()=='true':
         return
     try:
+        if os.getenv('UPLOAD_WAVE_AUTO_BOOTSTRAP') == 'true':
+            import wave_bootstrap
+            wave_bootstrap.auto_seed(_ensure_table_service_client())
         cred = password_auth.get_owner_credential(config_table_client) or {}
         # Prefer an explicitly-configured OWNER_EMAIL so an operator can set it
         # after the fact to recover login-by-email; fall back to the seeded value.

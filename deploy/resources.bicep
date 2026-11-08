@@ -458,6 +458,11 @@ var backendEnv = [
   { name: 'UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED', value: (enableWaveExecution || enableNewWaveLibraries) ? 'true' : 'false' }
   { name: 'PROCESSING_GENERATION_ENFORCEMENT_ENABLED', value: (enableWaveExecution || enableNewWaveLibraries) ? 'true' : 'false' }
   { name: 'UPLOAD_WAVE_CAPABILITY_ID', value: waveCapabilityId }
+  // One-click deployments: a brand-new library has nothing to protect, so the first boot on never-used
+  // storage seeds the certificate for these two images (see backend/wave_bootstrap.py auto_seed).
+  { name: 'UPLOAD_WAVE_CORE_IMAGE', value: coreImage }
+  { name: 'UPLOAD_WAVE_VISION_IMAGE', value: visionImage }
+  { name: 'UPLOAD_WAVE_AUTO_BOOTSTRAP', value: (enableNewWaveLibraries && !waveBootstrapPending && empty(waveCapabilityId)) ? 'true' : 'false' }
 
   { name: 'INDEX_EVENTS_ENDPOINT', value: enableIndexPush ? 'https://${indexPush!.properties.hostName}' : '' }
   { name: 'INDEX_MAINTENANCE_QUEUE_NAME', value: 'photostore-index-maintenance' }
