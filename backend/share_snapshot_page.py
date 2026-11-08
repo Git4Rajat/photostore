@@ -266,6 +266,8 @@ _JS = """
     s.onload = function () {
       document.querySelector('header').hidden = true;
       document.querySelector('main').hidden = true;
+      var lb = document.getElementById('lb');
+      if (lb) lb.remove();
     };
     s.onerror = function () { root.remove(); legacy(); };
     document.head.appendChild(s);
