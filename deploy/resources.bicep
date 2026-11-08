@@ -2130,6 +2130,9 @@ resource indexPushRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
 @description('Open this URL in your browser to use Photostore.')
 output appUrl string = webUrl
 
+@description('Address to give users: the always-on front door on the static website when share snapshots are enabled (shows the app at once while it wakes), otherwise the web app itself.')
+output homeUrl string = enableShareSnapshot ? storage.properties.primaryEndpoints.web : webUrl
+
 @description('Core API URL.')
 output apiUrl string = 'https://${core.properties.configuration.ingress.fqdn}'
 

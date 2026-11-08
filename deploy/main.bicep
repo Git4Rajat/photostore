@@ -129,6 +129,9 @@ module app 'resources.bicep' = {
 @description('URL of the deployed Photostore web app.')
 output appUrl string = app.outputs.appUrl
 
+@description('Address to give users: the static front door when share snapshots are enabled, otherwise the web app URL.')
+output homeUrl string = app.outputs.homeUrl
+
 @description('URL of the core API.')
 output apiUrl string = app.outputs.apiUrl
 
