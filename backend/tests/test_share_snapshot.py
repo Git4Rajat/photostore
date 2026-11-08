@@ -201,11 +201,11 @@ def test_page_embeds_config_safely():
     assert '</script><script>alert(1)' not in html
 
 
-def test_page_offers_download_of_the_album_and_of_each_photo():
+def test_page_sends_album_download_to_the_full_album_and_keeps_per_photo_download():
     html = page.render({'title': 't'}, token='tok', spa_url='https://w', archive_url='https://a.example', image='')
-    assert 'id="dlAll"' in html and 'id="lbDl"' in html
+    assert 'id="dlAll"' not in html and 'Open full album to download' in html and 'id="lbDl"' in html
     script = html.split('<script>')[1].split('</script>')[0]
-    assert "'/public/albums/'" in script and "'/public/photos/'" in script and "'/image/'" in script
+    assert "'/public/albums/'" not in script and "'/public/photos/'" in script and "'/image/'" in script
 
 
 def test_static_link_is_not_handed_out_once_a_code_is_added():

@@ -190,7 +190,6 @@ _JS = """
     sx = null;
     if (Math.abs(dx) > 50) step(dx < 0 ? 1 : -1);
   });
-  $('dlAll').href = C.archive + '/public/albums/' + encodeURIComponent(C.token) + '/download';
   $('full').addEventListener('click', function (e) { e.preventDefault(); takeOver(current); });
 
   function legacy() {
@@ -225,7 +224,7 @@ _JS = """
   function waitForBuild(m) {
     $('title').textContent = m.name || 'Shared album';
     $('sub').textContent = m.total + ' photo' + (m.total === 1 ? '' : 's') + ' \\u00b7 Read-only';
-    $('statusText').textContent = 'Preparing photos\\u2026';
+    $('statusText').textContent = 'Preparing photos\\u2026 Open the full album to download.';
     manifest = m;
     maybeTakeOver();
     var started = Date.now();
@@ -326,7 +325,7 @@ def render(meta: Dict[str, str], *, token: str, spa_url: str, archive_url: str, 
         f'<meta name="twitter:title" content="{title}" /><meta name="twitter:description" content="{description}" />'
         f'<meta name="twitter:image" content="{image_attr}" />'
         f'<style>{_CSS}</style></head><body>'
-        '<header><span class="brand">Keepsake</span><span><a id="dlAll" class="full" href="#" target="_blank" rel="noopener">Download all</a> &nbsp; <a id="full" class="full" href="#">Open full album</a></span></header>'
+        '<header><span class="brand">Keepsake</span><span><a id="full" class="full" href="#">Open full album to download</a></span></header>'
         f'<main><h1 id="title">{title}</h1><p id="sub" class="sub">{description}</p>'
         '<div id="status" class="status"><span class="spin" aria-hidden="true"></span><span id="statusText">Opening shared album…</span></div>'
         '<div id="grid" class="grid"></div>'

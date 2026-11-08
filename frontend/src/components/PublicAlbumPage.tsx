@@ -637,6 +637,7 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
                                         <p className="pt-page-sub">
                                             {countLabel}
                                             <span> · Read-only</span>
+                                            {fullAlbumUrl && <span> · Open the full album to download</span>}
                                             {selectMode && selectedCount > 0 && <span> · {selectedCount} selected</span>}
                                             {bufferReady && bufferPercent < 100 && <span> · Caching {bufferPercent}%</span>}
                                         </p>
