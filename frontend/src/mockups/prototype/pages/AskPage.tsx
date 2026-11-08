@@ -135,6 +135,8 @@ const AskPage: React.FC = () => {
     };
 
     const hasQuery = query.trim().length > 0;
+    // Typing doesn't search; until Enter runs it, any count below belongs to an older query (or to none).
+    const awaitingEnter = hasQuery && !searching && query.trim() !== ask.activeQuery;
 
     return (
         <div>
@@ -209,15 +211,17 @@ const AskPage: React.FC = () => {
                     <div className="pt-menu-label">
                         {searching
                             ? (indexBuilding ? 'Preparing your library for search — this can take a minute…' : 'Searching…')
-                            : `${total.toLocaleString()} result${total === 1 ? '' : 's'}`}
+                            : awaitingEnter
+                                ? 'Press Enter to search'
+                                : `${total.toLocaleString()} result${total === 1 ? '' : 's'}`}
                     </div>
-                    {!searching && rankedWindow !== null && total > rankedWindow && (
+                    {!searching && !awaitingEnter && rankedWindow !== null && total > rankedWindow && (
                         <p className="pt-page-sub">Best matches first; after the top {rankedWindow.toLocaleString()} the rest are newest first.</p>
                     )}
                     {indexBuilding && !searching && (
                         <p className="pt-page-sub">Your library’s search is still being prepared — try again in a minute.</p>
                     )}
-                    <PhotoGrid photos={results} emptyHint={searching ? '' : 'No photos match that search.'} />
+                    <PhotoGrid photos={results} emptyHint={searching || awaitingEnter ? '' : 'No photos match that search.'} />
                     {hasMore && <div ref={sentinelRef} className="pt-scroll-sentinel" aria-hidden="true" />}
                     {loadingMore && <p className="pt-page-sub">Loading more…</p>}
                 </>
