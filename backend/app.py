@@ -8725,6 +8725,26 @@ def _share_snapshot_container():
     return blob_service_client.get_container_client(share_snapshot.WEB_CONTAINER)
 
 
+_static_website_checked = False
+
+
+def _ensure_static_website() -> None:
+    """Switch the storage account's static website on (it creates $web) if it is off, once per process.
+    The template cannot do this, so the worker does it with its Storage Account Contributor role."""
+    global _static_website_checked
+    if _static_website_checked or blob_service_client is None:
+        return
+    try:
+        if not blob_service_client.get_service_properties().get('static_website', {}).get('enabled'):
+            from azure.storage.blob import StaticWebsite
+            blob_service_client.set_service_properties(static_website=StaticWebsite(
+                enabled=True, index_document='index.html', error_document404_path='404.html'))
+            worker_logger.info('Share snapshot: enabled the storage static website')
+        _static_website_checked = True
+    except Exception:
+        worker_logger.warning('Share snapshot: could not enable the static website', exc_info=True)
+
+
 def _enqueue_share_snapshot(action: str, user_id: str = '', album_id: str = '', token: str = '', delay: int = 0) -> bool:
     if not share_snapshot.enabled() or clustering_queue_client is None:
         return False
@@ -8888,6 +8908,7 @@ def _run_share_snapshot_job(payload: Dict) -> None:
     previous = str(entity.get('shareSnapshotToken') or '')
     if previous and previous != token:
         share_snapshot.delete(container, previous)
+    _ensure_static_website()
     try:
         share_snapshot.ensure_app(container, SPA_BASE_URL)
     except Exception:

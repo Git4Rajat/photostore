@@ -236,54 +236,6 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   }
 }
 
-// Shared-album snapshots and the static front door are served from the storage account's static website.
-// Switching it on is a data-plane setting that ARM cannot express, so a one-off deployment script does it
-// (idempotent; re-runs on every deployment). The script's own working share lives on the worker-cache
-// account, the only one with shared keys enabled; the main account keeps them off.
-resource snapshotSetupIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = if (enableShareSnapshot) {
-  name: '${appName}-snapshot-setup'
-  location: location
-}
-
-resource snapshotSetupRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for roleId in [
-  '17d1049b-9a84-46fb-8f53-869881c3d3ab' // Storage Account Contributor: change blob service properties
-  roleBlobContributor // Storage Blob Data Contributor: create $web
-]: if (enableShareSnapshot) {
-  scope: storage
-  name: guid(storage.id, snapshotSetupIdentity.id, roleId)
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
-    principalId: snapshotSetupIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-  }
-}]
-
-resource enableStaticWebsite 'Microsoft.Resources/deploymentScripts@2023-08-01' = if (enableShareSnapshot) {
-  name: '${appName}-enable-static-website'
-  location: location
-  kind: 'AzureCLI'
-  identity: {
-    type: 'UserAssigned'
-    userAssignedIdentities: { '${snapshotSetupIdentity.id}': {} }
-  }
-  dependsOn: [ snapshotSetupRoles ]
-  properties: {
-    azCliVersion: '2.64.0'
-    retentionInterval: 'PT1H'
-    timeout: 'PT15M'
-    cleanupPreference: 'OnSuccess'
-    storageAccountSettings: {
-      storageAccountName: workerCacheStorage.name
-      storageAccountKey: workerCacheStorage.listKeys().keys[0].value
-    }
-    environmentVariables: [
-      { name: 'ACCOUNT', value: storage.name }
-    ]
-    // New role assignments can take a few minutes to take effect, so retry.
-    scriptContent: 'for i in 1 2 3 4 5 6 7 8 9 10; do az login --identity --allow-no-subscriptions >/dev/null 2>&1; az storage blob service-properties update --account-name "$ACCOUNT" --auth-mode login --static-website --index-document index.html --404-document 404.html >/dev/null 2>&1 && exit 0; sleep 30; done; echo "could not enable the static website" >&2; exit 1'
-  }
-}
-
 resource workerCacheStorage 'Microsoft.Storage/storageAccounts@2025-06-01' = {
   name: workerCacheStorageAccountName
   location: location
@@ -2100,6 +2052,18 @@ resource clusterStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01
     }
   }
 ]
+
+// The worker switches the storage static website on itself (a data-plane setting ARM cannot express), which
+// needs account-level rights beyond the data roles above.
+resource clusterStaticWebsiteRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (enableShareSnapshot) {
+  name: guid(storage.id, cluster.id, '17d1049b-9a84-46fb-8f53-869881c3d3ab')
+  scope: storage
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '17d1049b-9a84-46fb-8f53-869881c3d3ab') // Storage Account Contributor
+    principalId: cluster.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
 
 resource visionStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
   for roleId in storageRoleIds: if (deployVision) {

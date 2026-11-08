@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.37.4.10188",
-      "templateHash": "9017561862783528367"
+      "templateHash": "4863317647403561309"
     }
   },
   "parameters": {
@@ -176,7 +176,7 @@
       "type": "bool",
       "defaultValue": true,
       "metadata": {
-        "description": "Serve shared albums from a static snapshot on the storage account first (instant first paint while the app wakes). The deployment switches the storage static website on by itself (a small one-off script); turn this off to skip that and use the web app URL directly."
+        "description": "Serve shared albums from a static snapshot on the storage account first (instant first paint while the app wakes). The worker switches the storage static website on by itself the first time a share is created; turn this off to skip that and use the web app URL directly."
       }
     }
   },
@@ -269,7 +269,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.37.4.10188",
-              "templateHash": "18348794623774223671"
+              "templateHash": "9317536508190822330"
             }
           },
           "parameters": {
@@ -609,70 +609,6 @@
                 "defaultToOAuthAuthentication": true,
                 "allowSharedKeyAccess": false
               }
-            },
-            {
-              "condition": "[parameters('enableShareSnapshot')]",
-              "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
-              "apiVersion": "2023-01-31",
-              "name": "[format('{0}-snapshot-setup', parameters('appName'))]",
-              "location": "[parameters('location')]"
-            },
-            {
-              "copy": {
-                "name": "snapshotSetupRoles",
-                "count": "[length(createArray('17d1049b-9a84-46fb-8f53-869881c3d3ab', variables('roleBlobContributor')))]"
-              },
-              "condition": "[parameters('enableShareSnapshot')]",
-              "type": "Microsoft.Authorization/roleAssignments",
-              "apiVersion": "2022-04-01",
-              "scope": "[format('Microsoft.Storage/storageAccounts/{0}', variables('storageAccountName'))]",
-              "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-snapshot-setup', parameters('appName'))), createArray('17d1049b-9a84-46fb-8f53-869881c3d3ab', variables('roleBlobContributor'))[copyIndex()])]",
-              "properties": {
-                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', createArray('17d1049b-9a84-46fb-8f53-869881c3d3ab', variables('roleBlobContributor'))[copyIndex()])]",
-                "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-snapshot-setup', parameters('appName'))), '2023-01-31').principalId]",
-                "principalType": "ServicePrincipal"
-              },
-              "dependsOn": [
-                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-snapshot-setup', parameters('appName')))]",
-                "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
-              ]
-            },
-            {
-              "condition": "[parameters('enableShareSnapshot')]",
-              "type": "Microsoft.Resources/deploymentScripts",
-              "apiVersion": "2023-08-01",
-              "name": "[format('{0}-enable-static-website', parameters('appName'))]",
-              "location": "[parameters('location')]",
-              "kind": "AzureCLI",
-              "identity": {
-                "type": "UserAssigned",
-                "userAssignedIdentities": {
-                  "[format('{0}', resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-snapshot-setup', parameters('appName'))))]": {}
-                }
-              },
-              "properties": {
-                "azCliVersion": "2.64.0",
-                "retentionInterval": "PT1H",
-                "timeout": "PT15M",
-                "cleanupPreference": "OnSuccess",
-                "storageAccountSettings": {
-                  "storageAccountName": "[variables('workerCacheStorageAccountName')]",
-                  "storageAccountKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('workerCacheStorageAccountName')), '2025-06-01').keys[0].value]"
-                },
-                "environmentVariables": [
-                  {
-                    "name": "ACCOUNT",
-                    "value": "[variables('storageAccountName')]"
-                  }
-                ],
-                "scriptContent": "for i in 1 2 3 4 5 6 7 8 9 10; do az login --identity --allow-no-subscriptions >/dev/null 2>&1; az storage blob service-properties update --account-name \"$ACCOUNT\" --auth-mode login --static-website --index-document index.html --404-document 404.html >/dev/null 2>&1 && exit 0; sleep 30; done; echo \"could not enable the static website\" >&2; exit 1"
-              },
-              "dependsOn": [
-                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-snapshot-setup', parameters('appName')))]",
-                "snapshotSetupRoles",
-                "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]",
-                "[resourceId('Microsoft.Storage/storageAccounts', variables('workerCacheStorageAccountName'))]"
-              ]
             },
             {
               "type": "Microsoft.Storage/storageAccounts",
@@ -1738,6 +1674,22 @@
               "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), resourceId('Microsoft.App/containerApps', variables('clusterAppName')), variables('storageRoleIds')[copyIndex()])]",
               "properties": {
                 "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('storageRoleIds')[copyIndex()])]",
+                "principalId": "[reference(resourceId('Microsoft.App/containerApps', variables('clusterAppName')), '2025-01-01', 'full').identity.principalId]",
+                "principalType": "ServicePrincipal"
+              },
+              "dependsOn": [
+                "[resourceId('Microsoft.App/containerApps', variables('clusterAppName'))]",
+                "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+              ]
+            },
+            {
+              "condition": "[parameters('enableShareSnapshot')]",
+              "type": "Microsoft.Authorization/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "scope": "[format('Microsoft.Storage/storageAccounts/{0}', variables('storageAccountName'))]",
+              "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), resourceId('Microsoft.App/containerApps', variables('clusterAppName')), '17d1049b-9a84-46fb-8f53-869881c3d3ab')]",
+              "properties": {
+                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '17d1049b-9a84-46fb-8f53-869881c3d3ab')]",
                 "principalId": "[reference(resourceId('Microsoft.App/containerApps', variables('clusterAppName')), '2025-01-01', 'full').identity.principalId]",
                 "principalType": "ServicePrincipal"
               },
