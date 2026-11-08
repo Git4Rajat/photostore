@@ -1,18 +1,10 @@
 import os
 import sys
-import types
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-azure_core = types.ModuleType('azure.core.exceptions')
-class _NF(Exception): pass
-class _HR(Exception): pass
-class _EX(Exception): pass
-azure_core.ResourceNotFoundError, azure_core.HttpResponseError, azure_core.ResourceExistsError = _NF, _HR, _EX
-for name in ('azure', 'azure.core'):
-    sys.modules.setdefault(name, types.ModuleType(name))
-sys.modules['azure.core.exceptions'] = azure_core
+pytest.importorskip('azure.core.exceptions')   # runs in the backend image, where the Azure SDK is installed
 
 import wave_bootstrap  # noqa: E402
 from wave_policy import PROTOCOL  # noqa: E402
