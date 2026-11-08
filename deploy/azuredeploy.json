@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.37.4.10188",
-      "templateHash": "12398989191289567457"
+      "templateHash": "3918858844784038628"
     }
   },
   "parameters": {
@@ -167,9 +167,9 @@
     },
     "enableLogAnalytics": {
       "type": "bool",
-      "defaultValue": true,
+      "defaultValue": false,
       "metadata": {
-        "description": "Create a Log Analytics workspace and send Container Apps logs to it (on by default). Ignored when logAnalyticsWorkspaceName names an existing workspace."
+        "description": "Create a Log Analytics workspace and send Container Apps logs to it (off by default). Ignored when logAnalyticsWorkspaceName names an existing workspace."
       }
     },
     "enableShareSnapshot": {
@@ -269,7 +269,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.37.4.10188",
-              "templateHash": "2032374663475752710"
+              "templateHash": "15522514172467492553"
             }
           },
           "parameters": {
@@ -452,7 +452,7 @@
             },
             "enableLogAnalytics": {
               "type": "bool",
-              "defaultValue": true,
+              "defaultValue": false,
               "metadata": {
                 "description": "Create a Log Analytics workspace (<appName>-logs, 30-day retention, pay-per-GB) and send Container Apps logs to it. Ignored when logAnalyticsWorkspaceName names an existing workspace."
               }

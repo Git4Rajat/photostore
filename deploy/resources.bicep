@@ -116,7 +116,7 @@ param deployRevisionTag string = toLower(uniqueString(newGuid()))
 param logAnalyticsWorkspaceName string = ''
 
 @description('Create a Log Analytics workspace (<appName>-logs, 30-day retention, pay-per-GB) and send Container Apps logs to it. Ignored when logAnalyticsWorkspaceName names an existing workspace.')
-param enableLogAnalytics bool = true
+param enableLogAnalytics bool = false
 
 @description('Serve shared albums from a static snapshot on the storage account first. Requires the storage static website to be enabled (deploy/enable-share-snapshot.sh).')
 param enableShareSnapshot bool = true
