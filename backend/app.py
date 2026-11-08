@@ -1923,6 +1923,10 @@ if _ALLOW_LOCALHOST_ORIGINS:
     })
 if SPA_BASE_URL:
     DEFAULT_ALLOWED_ORIGINS.add(SPA_BASE_URL.rstrip('/'))
+# The static share pages call the archive API (download-check, access-code unlock) from the snapshot origin.
+_SHARE_SNAPSHOT_ORIGIN = os.getenv('SHARE_SNAPSHOT_WEB_URL', '').strip().rstrip('/')
+if _SHARE_SNAPSHOT_ORIGIN:
+    DEFAULT_ALLOWED_ORIGINS.add(_SHARE_SNAPSHOT_ORIGIN)
 
 
 def _origin_is_allowed(origin: str) -> bool:
