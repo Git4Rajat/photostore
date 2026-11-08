@@ -43,6 +43,26 @@ def seed(service, deployments, expected):
     return identity
 
 
+def auto_seed(service, env=os.environ):
+    """One-click portal deployment: the template pins every image and the capability ID, so the template
+    itself is the operator's qualified contract. Seeds that certificate on first boot, and only on
+    never-used storage (``seed`` refuses any existing library data). Does nothing unless the template asked
+    for it via UPLOAD_WAVE_AUTO_BOOTSTRAP, and is a no-op once the certificate exists."""
+    if env.get('UPLOAD_WAVE_AUTO_BOOTSTRAP') != 'true':
+        return ''
+    expected = env.get('UPLOAD_WAVE_CAPABILITY_ID', '')
+    deployments = deployment_contract(env.get('UPLOAD_WAVE_DEPLOYMENT_ID', ''), env.get('UPLOAD_WAVE_VISION_IMAGE', ''))
+    if digest([PROTOCOL, deployments]) != expected:
+        raise ValueError('Template capability ID does not match its pinned images')
+    try:
+        proof = service.get_table_client('photojobs').get_entity(CAPABILITIES, expected)
+        if proof.get('protocol') == PROTOCOL and json.loads(proof['deployments']) == deployments:
+            return expected
+    except ResourceNotFoundError:
+        pass
+    return seed(service, deployments, expected)
+
+
 def main():
     from azure.identity import ManagedIdentityCredential
     from azure.data.tables import TableServiceClient
