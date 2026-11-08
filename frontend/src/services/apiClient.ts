@@ -1,3 +1,4 @@
+import axios, { type AxiosAdapter } from 'axios';
 import { getRuntimeConfig } from '../config/appConfig';
 import { createHttpClient, requestJson, type RequestConfig } from './httpClient';
 import { configureBackendStatus } from './backendStatus';
@@ -131,5 +132,10 @@ export const postUpload = async <T = any, D = unknown>(url: string, data: D, con
 export const getTools = async <T = any>(url: string, config?: Parameters<typeof indexerClient.get>[1]) => requestJson<T>(indexerClient, 'get', url, undefined, config);
 export const postTools = async <T = any, D = unknown>(url: string, data: D, config?: RequestConfig) => requestJson<T>(indexerClient, 'post', url, data, config);
 export const postAdmin = async <T = any, D = unknown>(url: string, data: D) => requestJson<T>(recoveryClient, 'post', url, data);
+/** Lets the static share page answer the public-album read itself (from its snapshot manifest) and pass every other call through. */
+export const wrapExtrasAdapter = (wrap: (next: AxiosAdapter) => AxiosAdapter): void => {
+    archiveClient.defaults.adapter = wrap(axios.getAdapter(archiveClient.defaults.adapter));
+};
+
 export const getExtras = async <T = any>(url: string, config?: Parameters<typeof archiveClient.get>[1]) => requestJson<T>(archiveClient, 'get', url, undefined, config);
 export const postExtras = async <T = any, D = unknown>(url: string, data: D, config?: Parameters<typeof archiveClient.post>[2]) => requestJson<T>(archiveClient, 'post', url, data, config);

@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
 import os
+import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Callable, Dict, Iterable, List, Optional
@@ -183,6 +186,54 @@ def build(entity: Dict, container, photos: Iterable[Photo], total: int, meta: Di
     for name in stale:
         _delete(container, name)
     return {'cached': len(entries), 'total': total, 'removed': len(stale)}
+
+
+APP_PREFIX = 'app/'
+APP_POINTER = APP_PREFIX + 'current.json'
+_APP_RECHECK_SECONDS = 600
+_app_checked_at = 0.0
+_app_version = ''
+
+
+def _http_get(url: str, timeout: int = 60) -> bytes:
+    request = urllib.request.Request(url, headers={'User-Agent': 'keepsake-share-snapshot'})
+    with urllib.request.urlopen(request, timeout=timeout) as response:   # nosec: URL is the operator's own SPA origin
+        return response.read()
+
+
+def ensure_app(container, spa_url: str, fetch: Callable[[str], bytes] = _http_get) -> str:
+    """Copy the slim shared-album bundle from the web app (/static-album/) into the static website under
+    app/<version>/, then point app/current.json at it. Idempotent and cheap once done (re-checked every
+    10 minutes per process). Returns the version, or '' when it is not available -- the snapshot page then
+    uses its built-in plain-JS view instead."""
+    global _app_checked_at, _app_version
+    if not spa_url:
+        return ''
+    if time.time() - _app_checked_at < _APP_RECHECK_SECONDS:
+        return _app_version
+    base = spa_url.rstrip('/') + '/static-album/'
+    try:
+        info = json.loads(fetch(base + 'app-files.json'))
+        version = str(info['version'])
+        try:
+            current = json.loads(container.download_blob(APP_POINTER).readall())
+        except Exception:
+            current = {}
+        if current.get('version') != version:
+            folder = f'{APP_PREFIX}{version}/'
+            for name in info['files']:
+                content_type = mimetypes.guess_type(name)[0] or 'application/octet-stream'
+                container.upload_blob(folder + name, fetch(base + name), overwrite=True,
+                                      content_settings=_content_settings(content_type, 'public, max-age=31536000, immutable'))
+            pointer = {'version': version, 'entry': info['entry'], 'css': info.get('css', [])}
+            container.upload_blob(APP_POINTER, json.dumps(pointer).encode('utf-8'), overwrite=True,
+                                  content_settings=_content_settings('application/json', 'no-cache'))
+            logger.info('share snapshot: published app bundle %s (%d files)', version, len(info['files']))
+        _app_checked_at, _app_version = time.time(), version
+        return version
+    except Exception:
+        logger.warning('share snapshot: app bundle not published', exc_info=True)
+        return ''
 
 
 def write_shell(entity: Dict, container, meta: Dict[str, str], total: int, archive_url: str, spa_url: str) -> bool:

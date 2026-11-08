@@ -185,7 +185,7 @@ def test_page_is_self_contained_with_a_hash_pinned_csp():
                        archive_url='https://archive.example', image='https://i/p.jpg')
     assert '<b>' not in html.split('<title>')[1].split('</title>')[0]
     csp = unescape(html.split('Content-Security-Policy" content="')[1].split('" />')[0])
-    assert "script-src 'sha256-" in csp and "style-src 'sha256-" in csp
+    assert "script-src 'self' 'sha256-" in csp and "style-src 'self' 'sha256-" in csp
     assert "connect-src 'self' https://web.example https://archive.example" in csp
     assert 'unsafe-inline' not in csp and 'unsafe-eval' not in csp
     script = html.split('<script>')[1].split('</script>')[0]
@@ -247,3 +247,36 @@ def test_page_handles_failures_gracefully():
     assert 'This album has no photos yet.' in script
     assert '120000' in script                                          # a stuck build hands over to the real app
     assert '<noscript>' in html and 'https://w/public/album/tok' in html
+
+
+def test_ensure_app_copies_the_bundle_once_and_points_current_at_it(monkeypatch):
+    monkeypatch.setattr(ss, '_app_checked_at', 0.0)
+    served = {'/static-album/app-files.json': json.dumps({'version': 'v9', 'entry': 'assets/m.js', 'css': ['assets/m.css'],
+                                                          'files': ['assets/m.js', 'assets/m.css']}).encode(),
+              '/static-album/assets/m.js': b'js', '/static-album/assets/m.css': b'css'}
+    calls = []
+
+    def fetch(url):
+        calls.append(url)
+        return served['/' + url.split('//', 1)[1].split('/', 1)[1]]
+    c = FakeContainer()
+    assert ss.ensure_app(c, 'https://web.example', fetch) == 'v9'
+    assert set(c.blobs) == {'app/v9/assets/m.js', 'app/v9/assets/m.css', 'app/current.json'}
+    assert json.loads(c.blobs['app/current.json'][0]) == {'version': 'v9', 'entry': 'assets/m.js', 'css': ['assets/m.css']}
+    n = len(calls)
+    assert ss.ensure_app(c, 'https://web.example', fetch) == 'v9' and len(calls) == n   # cached, no refetch
+
+
+def test_ensure_app_failure_is_not_fatal(monkeypatch):
+    monkeypatch.setattr(ss, '_app_checked_at', 0.0)
+
+    def boom(url):
+        raise OSError('web app down')
+    assert ss.ensure_app(FakeContainer(), 'https://web.example', boom) == ''
+
+
+def test_page_prefers_the_real_ui_bundle_and_falls_back_to_plain_view():
+    html = page.render({'title': 't'}, token='tok', spa_url='https://w', archive_url='https://a', image='')
+    script = html.split('<script>')[1].split('</script>')[0]
+    assert "/app/current.json" in script and 's.onerror = function () { root.remove(); legacy(); }' in script
+    assert '.catch(legacy)' in script

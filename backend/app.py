@@ -8884,6 +8884,10 @@ def _run_share_snapshot_job(payload: Dict) -> None:
     previous = str(entity.get('shareSnapshotToken') or '')
     if previous and previous != token:
         share_snapshot.delete(container, previous)
+    try:
+        share_snapshot.ensure_app(container, SPA_BASE_URL)
+    except Exception:
+        worker_logger.warning('Share snapshot app bundle check failed', exc_info=True)
     photos, total = _share_snapshot_photos(entity)
     meta = _share_snapshot_meta(entity, total)
     summary = share_snapshot.build(entity, container, photos, total, meta, ARCHIVE_PUBLIC_BASE_URL, SPA_BASE_URL)

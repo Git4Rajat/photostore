@@ -85,10 +85,6 @@ _JS = """
       }());
     });
   }
-  Promise.all([ping(C.spa + '/health'), ping(C.archive + '/health')]).then(function () {
-    ready = true;
-    maybeTakeOver();
-  });
 
   function tileRotation(p) {
     var rem = (((p.rot || 0) - (p.trot || 0)) % 360 + 360) % 360;
@@ -197,6 +193,11 @@ _JS = """
   $('dlAll').href = C.archive + '/public/albums/' + encodeURIComponent(C.token) + '/download';
   $('full').addEventListener('click', function (e) { e.preventDefault(); takeOver(current); });
 
+  function legacy() {
+  Promise.all([ping(C.spa + '/health'), ping(C.archive + '/health')]).then(function () {
+    ready = true;
+    maybeTakeOver();
+  });
   fetch('manifest.json', { cache: 'no-cache' })
     .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
     .then(function (m) {
@@ -217,6 +218,7 @@ _JS = """
       maybeTakeOver();
     })
     .catch(function () { takeOver(-1); });
+  }
 
   // A just-shared album has a page but no photos yet: show what we know and poll until they are cached.
   // The real app takes over if it wakes first (total > cached), so the visitor never waits on the build.
@@ -242,6 +244,36 @@ _JS = """
         .catch(function () {});
     }, 3000);
   }
+
+  // Preferred view: the real shared-album UI, loaded from this static site (see ensure_app in
+  // share_snapshot.py). If it is not published yet, or fails to load, the plain view above is used.
+  function rich(a) {
+    var base = new URL('./', location.href).href;
+    window.__SNAPSHOT__ = { token: C.token, spa: C.spa, archive: C.archive, base: base };
+    window.__APP_CONFIG__ = { apiBaseUrl: C.archive, uploadBaseUrl: C.archive, archiveApiBaseUrl: C.archive, spaBaseUrl: C.spa };
+    var root = document.createElement('div');
+    root.id = 'root';
+    document.body.appendChild(root);
+    (a.css || []).forEach(function (f) {
+      var l = document.createElement('link');
+      l.rel = 'stylesheet';
+      l.href = '/app/' + a.version + '/' + f;
+      document.head.appendChild(l);
+    });
+    var s = document.createElement('script');
+    s.type = 'module';
+    s.src = '/app/' + a.version + '/' + a.entry;
+    s.onload = function () {
+      document.querySelector('header').hidden = true;
+      document.querySelector('main').hidden = true;
+    };
+    s.onerror = function () { root.remove(); legacy(); };
+    document.head.appendChild(s);
+  }
+  fetch('/app/current.json', { cache: 'no-cache' })
+    .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+    .then(rich)
+    .catch(legacy);
 }());
 """
 
@@ -268,9 +300,11 @@ def render(meta: Dict[str, str], *, token: str, spa_url: str, archive_url: str, 
     script = _JS.replace('__CONFIG__', _script_json({'token': token, 'spa': spa, 'archive': archive}))
     csp = '; '.join([
         "default-src 'none'",
-        f"script-src {_hash(script)}",
-        f"style-src {_hash(_CSS)}",
-        "img-src 'self' data:",
+        f"script-src 'self' {_hash(script)}",
+        f"style-src 'self' {_hash(_CSS)}",
+        "img-src 'self' data: blob: " + ' '.join(o for o in (spa, archive) if o),
+        "media-src 'self' blob: " + ' '.join(o for o in (spa, archive) if o),
+        "font-src 'self' data:",
         "connect-src 'self' " + ' '.join(o for o in (spa, archive) if o),
         "base-uri 'none'",
         "form-action 'none'",
