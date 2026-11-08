@@ -24,7 +24,7 @@
 param appName string = 'photostore'
 
 @description('Communication Services resource name. Override if the default name is already globally reserved.')
-param communicationServiceName string = '${appName}-comm'
+param communicationServiceName string = '${appName}-comm-${take(uniqueString(resourceGroup().id), 6)}'
 
 @description('Azure region for all resources. Defaults to the resource group location.')
 param location string = resourceGroup().location

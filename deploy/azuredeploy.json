@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.37.4.10188",
-      "templateHash": "3918858844784038628"
+      "templateHash": "9017561862783528367"
     }
   },
   "parameters": {
@@ -269,7 +269,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.37.4.10188",
-              "templateHash": "15522514172467492553"
+              "templateHash": "18348794623774223671"
             }
           },
           "parameters": {
@@ -284,7 +284,7 @@
             },
             "communicationServiceName": {
               "type": "string",
-              "defaultValue": "[format('{0}-comm', parameters('appName'))]",
+              "defaultValue": "[format('{0}-comm-{1}', parameters('appName'), take(uniqueString(resourceGroup().id), 6))]",
               "metadata": {
                 "description": "Communication Services resource name. Override if the default name is already globally reserved."
               }
