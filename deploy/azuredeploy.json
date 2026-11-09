@@ -80,21 +80,21 @@
     },
     "coreImage": {
       "type": "string",
-      "defaultValue": "ghcr.io/git4rajat/photostore-backend@sha256:abec29254e391a71c36d366cdf2766fbc174283dd98715f1c918307a1f1afa7f",
+      "defaultValue": "ghcr.io/git4rajat/photostore-backend@sha256:635838a9e82ef1b86f8a331a56c2dbc3d3f66ee1371a5c166969269f58472d3d",
       "metadata": {
         "description": "Public core API image. Defaults to an immutable @sha256 digest (rewritten by the publish workflow after each qualified release), never :latest, so installs never auto-upgrade. To upgrade an EXISTING deployment, override with the new release digest."
       }
     },
     "webImage": {
       "type": "string",
-      "defaultValue": "ghcr.io/git4rajat/photostore-frontend@sha256:b65ba6192493d562035201590f23e55c0cdb176d2472858a1ca70a817419db08",
+      "defaultValue": "ghcr.io/git4rajat/photostore-frontend@sha256:3810c416053d71f1f8b1dc17a7e62aa5462243ccee3e6663d710b482d4bed847",
       "metadata": {
         "description": "Public web (frontend) image. Defaults to an immutable @sha256 digest, never :latest, same as coreImage above."
       }
     },
     "visionImage": {
       "type": "string",
-      "defaultValue": "ghcr.io/git4rajat/photostore-ipworker@sha256:4429fbbbd77ae26f83f2da231e5a784569b4d38a5cb5916dd89fa5be20428e8d",
+      "defaultValue": "ghcr.io/git4rajat/photostore-ipworker@sha256:af9d977ac3f1ffc302bd0cd8f169c6b1915bb158e081d685eeb1de9b6dcdbc6b",
       "metadata": {
         "description": "Public vision (server-side image processing) image. Only pulled/deployed when processingMode is \"backend\" or \"both\". Same digest-pinning guidance as coreImage applies."
       }
@@ -150,7 +150,7 @@
     },
     "waveCapabilityId": {
       "type": "string",
-      "defaultValue": "68564e22b48a21907a06ae276629f849eda0cb6923dad2c270b53e92f39e98cf",
+      "defaultValue": "ca81e0aa7a51e2661cc0cc4e234099fdc21b4e8367b1415e9b10540804ae5f37",
       "metadata": {
         "description": "Exact-image capability ID. Fresh wave activation requires the seeded release certificate; never leave empty."
       }
@@ -164,7 +164,7 @@
     },
     "waveSourceCommit": {
       "type": "string",
-      "defaultValue": "625a05d938b7ef1808f1577aab2a90d3d97303d7",
+      "defaultValue": "d6237aac195ad7153570580b79d2cd40a6e4c7e8",
       "metadata": {
         "description": "Source commit of the pinned release (set by the release pin job)."
       }
@@ -428,21 +428,21 @@
             },
             "coreImage": {
               "type": "string",
-              "defaultValue": "ghcr.io/git4rajat/photostore-backend@sha256:abec29254e391a71c36d366cdf2766fbc174283dd98715f1c918307a1f1afa7f",
+              "defaultValue": "ghcr.io/git4rajat/photostore-backend@sha256:635838a9e82ef1b86f8a331a56c2dbc3d3f66ee1371a5c166969269f58472d3d",
               "metadata": {
                 "description": "Public core API image. Defaults to an immutable @sha256 digest (rewritten by the publish workflow after each qualified release), never :latest, so installs never auto-upgrade. To upgrade an EXISTING deployment, override with the new release digest."
               }
             },
             "webImage": {
               "type": "string",
-              "defaultValue": "ghcr.io/git4rajat/photostore-frontend@sha256:b65ba6192493d562035201590f23e55c0cdb176d2472858a1ca70a817419db08",
+              "defaultValue": "ghcr.io/git4rajat/photostore-frontend@sha256:3810c416053d71f1f8b1dc17a7e62aa5462243ccee3e6663d710b482d4bed847",
               "metadata": {
                 "description": "Public web (frontend) image. Defaults to an immutable @sha256 digest, never :latest, same as coreImage above."
               }
             },
             "visionImage": {
               "type": "string",
-              "defaultValue": "ghcr.io/git4rajat/photostore-ipworker@sha256:4429fbbbd77ae26f83f2da231e5a784569b4d38a5cb5916dd89fa5be20428e8d",
+              "defaultValue": "ghcr.io/git4rajat/photostore-ipworker@sha256:af9d977ac3f1ffc302bd0cd8f169c6b1915bb158e081d685eeb1de9b6dcdbc6b",
               "metadata": {
                 "description": "Public vision (server-side image processing) image. Only pulled/deployed when processingMode is \"backend\" or \"both\". Separate from coreImage (unlike the clustering `cluster` role, which reuses it) because vision needs torch/open_clip/onnxruntime/opencv/mediapipe/tesseract -- multiple GB of extra weight that would slow every core/cluster cold start if bundled into their shared image. Same digest-pinning guidance as coreImage applies."
               }
@@ -498,7 +498,7 @@
             },
             "waveCapabilityId": {
               "type": "string",
-              "defaultValue": "68564e22b48a21907a06ae276629f849eda0cb6923dad2c270b53e92f39e98cf",
+              "defaultValue": "ca81e0aa7a51e2661cc0cc4e234099fdc21b4e8367b1415e9b10540804ae5f37",
               "metadata": {
                 "description": "Exact-image capability ID. Fresh wave activation requires the seeded release certificate; never leave empty."
               }
@@ -512,7 +512,7 @@
             },
             "waveSourceCommit": {
               "type": "string",
-              "defaultValue": "625a05d938b7ef1808f1577aab2a90d3d97303d7",
+              "defaultValue": "d6237aac195ad7153570580b79d2cd40a6e4c7e8",
               "metadata": {
                 "description": "Source commit of the pinned release (set by the release pin job)."
               }
