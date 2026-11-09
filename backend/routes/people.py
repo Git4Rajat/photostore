@@ -142,10 +142,17 @@ def get_person(person_id: str):
     # people list numbers unnamed clusters itself, so this just reports a neutral label and writes nothing.
     name = str(person.get('name', '') or '').strip() or 'Unnamed'
 
-    try:
-        face_ids = app.json.loads(person.get('faceIds', '[]'))
-    except Exception:
-        face_ids = []
+    # A person with overflow shards is one person: the shards' faces are listed with the first row's, and
+    # each face is checked against the row that owns it.
+    owner_by_face = {}
+    for row_id in app._person_group_ids(user_id, person_id):
+        try:
+            row = person if row_id == person_id else app.person_table_client.get_entity(partition_key=user_id, row_key=row_id)
+            for fid in app.json.loads(row.get('faceIds', '[]')):
+                owner_by_face.setdefault(str(fid), row_id)
+        except Exception:
+            continue
+    face_ids = list(owner_by_face)
 
     # Optional paging: ?offset=&limit= returns that window of the person's faces (best faces first),
     # so a person with tens of thousands of photos opens on its first screenful. Without ``limit``
@@ -178,7 +185,7 @@ def get_person(person_id: str):
         if face is None:
             continue
         try:
-            if app._face_is_rejected(face) or not app._face_is_owned_by_person(face, person_id):
+            if app._face_is_rejected(face) or not app._face_is_owned_by_person(face, owner_by_face.get(fid, person_id)):
                 continue
         except Exception:
             continue
@@ -228,7 +235,8 @@ def get_person_photos(person_id: str):
         limit = max(1, min(500, int(app.request.args.get('limit', 120))))
     except ValueError:
         return app.jsonify({'error': 'Invalid paging parameters.'}), 400
-    names = person_photos.ranked_filenames(user_id, person_id, app.person_members_table_client, app.face_table_client)
+    names = person_photos.ranked_filenames(user_id, person_id, app.person_members_table_client, app.face_table_client,
+                                             group_ids=app._person_group_ids(user_id, person_id))
     window = names[offset:offset + limit]
     return app.jsonify({'filenames': window, 'total': len(names), 'offset': offset, 'hasMore': offset + len(window) < len(names)})
 
@@ -335,6 +343,11 @@ def label_person(person_id: str):
     person = _save_person_label(user_id, person_id, name)
     if person is None:
         return app.jsonify({'error': 'Not found'}), 404
+    for shard_id in app._person_shard_ids(user_id, person_id):
+        try:
+            _save_person_label(user_id, shard_id, name)       # the group shares one name (also for name search)
+        except Exception:
+            app.app.logger.warning('Could not label overflow person %s', shard_id, exc_info=True)
     app._apply_live_album_rename(user_id, person_id, name)
     queued = app.publish_person_label_intent(user_id, person_id, person)
     return app.jsonify({'success': True, 'personId': person_id, 'name': name, 'autoAssignedFaces': 0,
@@ -696,7 +709,10 @@ def merge_persons(person_id: str):
     if not isinstance(merge_ids, list):
         return app.jsonify({'error': 'mergeIds must be a list'}), 400
 
-    core = app._merge_persons_core(user_id, person_id, merge_ids)
+    try:
+        core = app._merge_persons_core(user_id, person_id, merge_ids)
+    except app.PersonMergeUnsupported as error:
+        return app.jsonify({'error': str(error)}), 409
     if core is None:
         return app.jsonify({'error': 'base person not found'}), 404
     merge_id = core['mergeId']
@@ -776,7 +792,11 @@ def merge_persons_batch():
         if not target_id or not isinstance(source_ids, list) or not source_ids:
             results.append({'targetPersonId': target_id, 'success': False, 'error': 'invalid pair'})
             continue
-        core = app._merge_persons_core(user_id, target_id, source_ids, face_summary=face_summary)
+        try:
+            core = app._merge_persons_core(user_id, target_id, source_ids, face_summary=face_summary)
+        except app.PersonMergeUnsupported as error:
+            results.append({'targetPersonId': target_id, 'success': False, 'error': str(error)})
+            continue
         if core is None:
             results.append({'targetPersonId': target_id, 'success': False, 'error': 'base person not found'})
             continue
@@ -849,6 +869,32 @@ def undo_merge(merge_id: str):
     base = payload.get('base') or {}
     merged = payload.get('merged') or []
     face_map = payload.get('faceMap') or {}
+    if payload.get('mode') == 'group':
+        # A group merge only re-tagged person rows (no face or membership moved): put the saved rows back.
+        for row in ([base] if base.get('RowKey') else []) + [m for m in merged if m.get('RowKey')]:
+            app.person_table_client.upsert_entity(row)
+        restored_ids = [str(row['RowKey']) for row in ([base] if base.get('RowKey') else []) + merged if row.get('RowKey')]
+        face_ids = []
+        for row in merged:
+            try:
+                face_ids.extend(str(fid) for fid in app.json.loads(row.get('faceIds', '[]') or '[]'))
+            except Exception:
+                pass
+        app._rebuild_metadata_faces_for_filenames(user_id, app._filenames_for_face_ids(user_id, face_ids))
+        app._resync_person_rule_albums_for_many(user_id, restored_ids)
+        app.mark_people_dirty(user_id, restored_ids)
+        try:
+            app.touch_user_people_index_state(user_id)
+        except Exception:
+            app.app.logger.warning('Could not dirty People index after undo %s', merge_id, exc_info=True)
+        try:
+            app.merge_table_client.delete_entity(partition_key=user_id, row_key=merge_id)
+        except Exception:
+            pass
+        if blob_name:
+            app._delete_blob_if_present(app.BLOB_MERGE_PAYLOADS_CONTAINER, blob_name)
+        return app.jsonify({'success': True, 'mergeId': merge_id})
+
     affected_face_ids = set(str(fid) for fid in face_map.keys())
     try:
         affected_face_ids.update(str(fid) for fid in app.json.loads(base.get('faceIds', '[]') or '[]'))
