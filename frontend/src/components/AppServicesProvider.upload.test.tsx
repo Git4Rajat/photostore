@@ -1228,7 +1228,8 @@ describe('browser upload selection and startup', () => {
         fireEvent.click(view.getByText('Upload'));
         await advance(46000);
         fireEvent(view.container.querySelector('input[type="file"]')!, new Event('cancel'));
-        expect(mocks.toast).toHaveBeenCalledWith(expect.stringContaining('No files were received'), { timeout: 8000 });
+        expect(mocks.toast).not.toHaveBeenCalled();
+        expect(services.notifications.some(n => n.details.includes('No files were received'))).toBe(true);
         expect(initFiles()).toHaveLength(0);
     });
 });

@@ -1,4 +1,5 @@
 import { schedulePendingEditsReconciliation, subscribeSourceEdits } from '../../services/reconcilePendingEdits';
+import { publishNotification } from '../../services/notificationSink';
 import { applyPendingEdits, beginPendingEdit, confirmPendingEdit, rollbackPendingEdit, pendingEditScope, pendingEditReadTokens, pendingPeopleEnrichmentIds, hasSourceConfirmation, savePendingEdits, applyPendingPhotoCollection } from '../../services/pendingEdits';
 import { onIndexReady, reportIndexBuilding } from '../../services/indexBuilding';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
@@ -1062,6 +1063,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     const toast = useCallback(
         (message: string, actionLabel?: string, onAction?: () => void, tone: 'info' | 'error' = 'info') => {
+            // Always mirrored into the notification panel; only action toasts
+            // (Undo/Retry) still pop up when a panel is present.
+            const inPanel = publishNotification(message);
+            if (inPanel && !actionLabel) return;
             const id = nextId();
             setToasts((prev) => [...prev, { id, message, actionLabel, onAction, tone }]);
             toastTimers.current[id] = window.setTimeout(() => {

@@ -6,6 +6,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { BellIcon, TrashIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { formatMegabytesPerSecond } from './browserAiShared';
+import { formatNotificationTime } from '../services/notificationTime';
 import { useAppServices } from './AppServicesProvider';
 
 export const NotificationBell: React.FC = () => {
@@ -94,7 +95,13 @@ export const NotificationBell: React.FC = () => {
                                     className={`notification-item ${notification.unread ? 'unread' : ''}`}
                                 >
                                     <p className="notification-title">{notification.title}</p>
-                                    <p className="notification-details">{notification.details}</p>
+                                    {notification.details && <p className="notification-details">{notification.details}</p>}
+                                    <time
+                                        className="notification-time"
+                                        dateTime={new Date(notification.timestamp).toISOString()}
+                                    >
+                                        {formatNotificationTime(notification.timestamp)}
+                                    </time>
                                     {notification.uploadSessionId && (
                                         <button type="button" className="btn btn-soft" disabled={uploadActive}
                                             onClick={() => void retryPersistedUploadSession(notification.uploadSessionId)}>

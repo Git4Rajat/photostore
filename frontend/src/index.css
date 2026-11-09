@@ -2696,3 +2696,10 @@ video.photo-preview-media.is-loading {
 .btn-soft.danger:disabled {
   opacity: 0.5;
 }
+
+.notification-time {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}

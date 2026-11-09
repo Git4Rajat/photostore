@@ -53,7 +53,7 @@ import { plural } from '../utils/format';
 import { shouldSuppressLeaseWarning } from '../utils/processingLease';
 import { BackgroundKeepAlive } from '../services/backgroundKeepAlive';
 import { getUnattendedConcurrencyBonus, reportBrowserProcessingOutcome } from '../services/unattendedProcessingScaler';
-import { showToast } from '../services/toast';
+import { setNotificationSink } from '../services/notificationSink';
 import { publishLibraryChange } from '../services/libraryChanges';
 import { fetchKnownUploadHashes, requestUploadHashRefresh, type UploadEndReason } from '../services/uploadKnownHashes';
 import { perf } from '../services/perf';
@@ -81,7 +81,6 @@ import {
     ipworkActivityLabel,
     JOB_NOTIFY_WINDOW_MS,
     TERMINAL_JOB_STATUSES,
-    TOASTABLE_JOB_KINDS,
     CLUSTERING_JOB_KINDS,
     type JobStatusRecord,
 } from '../services/jobNotifications';
@@ -1338,6 +1337,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         )));
     }, []);
 
+    // Popup-style feedback (showToast, the prototype store's toast) is mirrored
+    // into the panel through this sink so nothing is popup-only.
+    useEffect(() => setNotificationSink((title, details) => { addNotification(title, details); }), [addNotification]);
+
     // --- Background job completion notifier ---------------------------------
     // Long-running worker jobs (reclustering, "find more faces", library
     // cleanup, preview generation) record their lifecycle server-side. While Tools
@@ -1408,9 +1411,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (pending.length === 1) {
             const only = pending[0];
             addNotification(only.title, only.detail);
-            showToast(only.detail ? `${only.title} — ${only.detail}` : only.title, {
-                variant: only.failed ? 'error' : 'default',
-            });
             return;
         }
         const failedCount = pending.filter((entry) => entry.failed).length;
@@ -1418,7 +1418,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             ? `Finished ${pending.length} background people updates (${failedCount} failed).`
             : `Finished ${pending.length} background people updates.`;
         addNotification('People grouping finished', summary);
-        showToast(summary, { variant: failedCount > 0 ? 'error' : 'default' });
     }, [addNotification]);
 
     // Pushes the flush out to CLUSTER_FLUSH_QUIET_MS from now. Called each time
@@ -1532,12 +1531,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         indexNotificationTimesRef.current.set(group, timestamp);
                     }
                     addNotification(job.title, detail, undefined, group);
-                    if (TOASTABLE_JOB_KINDS.has(job.kind)) {
-                        showToast(detail ? `${job.title} — ${detail}` : job.title, {
-                            variant: job.status === 'failed' ? 'error' : 'default',
-                            dedupeKey: `job:${job.jobId}`,
-                        });
-                    }
                 }
             }
             if (changed) {
@@ -1886,9 +1879,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const setUploadError = useCallback((message: string | null) => {
         uploadErrorHandlerRef.current?.(message);
         if (message) {
-            showToast(message, { variant: 'error' });
+            addNotification('Upload error', message);
         }
-    }, []);
+    }, [addNotification]);
 
     const invalidatePhotoCache = useCallback(() => {
         try {
@@ -4873,7 +4866,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // stuck pendingUploadSession silently blocks every subsequent
             // Upload click with no other feedback -- this is the exact "I
             // picked files and nothing happened" dead end reported live.
-            showToast(message, { variant: 'error' });
+            addNotification('Upload blocked', message);
             return;
         }
         // isResumingUploadRef, not just `uploading` -- see the comment on the
@@ -5173,7 +5166,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (uploadStartInProgressRef.current) {
             const message = 'Wait for the current upload preparation to finish before selecting more files.';
             addNotification('Upload already starting', message);
-            showToast(message, { variant: 'error' });
             return;
         }
         // While actively uploading, skip the warm-up poll (the backend is
@@ -5206,7 +5198,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     localStorage.setItem(MOBILE_SELECTION_TIP_STORAGE_KEY, '1');
                     const tipMessage = `For reliable uploads on this device, select up to ${MAX_MOBILE_SELECTION_SIZE.toLocaleString()} photos at a time (a couple thousand is even safer). After tapping Add, the picker can take a couple of minutes to close on its own for large selections -- that's normal, don't tap Add again, just wait.`;
                     addNotification('Large libraries: select in batches', tipMessage);
-                    showToast(tipMessage, { timeout: 8000 });
                 }
             } catch {
                 // Private-browsing/quota errors just mean this one-time tip
@@ -5346,7 +5337,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 const message = 'The photo picker closed without selecting anything. This can happen with very large '
                     + 'selections on iPhone/iPad -- try again with a smaller batch (around 1,500-2,000 photos at a time).';
                 addNotification('Selection didn\'t come through', message);
-                showToast(message, { variant: 'error', timeout: 8000 });
             }
         }
         if (selectedFiles.length > 0) {
@@ -5473,12 +5463,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             perf.recordSpan('upload.picker.cancel', openedAt === null ? 0 : Date.now() - openedAt, { rows: 0 });
             // A cancel can also mean native acquisition failed; do not label it as an upload error.
             if (openedAt !== null && Date.now() - openedAt > PICKER_LIKELY_FAILED_THRESHOLD_MS) {
-                showToast('No files were received from the picker. If you selected files, try selecting them again.', { timeout: 8000 });
+                addNotification('No files received', 'No files were received from the picker. If you selected files, try selecting them again.');
             }
         };
         input.addEventListener('cancel', onCancel);
         return () => input.removeEventListener('cancel', onCancel);
-    }, [stopUploadWarmup]);
+    }, [addNotification, stopUploadWarmup]);
 
     // Drain queued folder/batch selections (queuedUploadBatchesRef) once the
     // active session is fully clear -- i.e. it finished cleanly and isn't
