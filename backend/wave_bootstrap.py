@@ -64,7 +64,35 @@ def auto_seed(service, env=os.environ):
             return expected
     except ResourceNotFoundError:
         pass
+    if upgrade_existing(service, deployments, expected, env):
+        return expected
     return seed(service, deployments, expected, allow_empty_libraries=True)
+
+
+def upgrade_existing(service, deployments, expected, env=os.environ):
+    """Same-protocol image change over an enrolled library. The release pin job lists the earlier
+    certificates this release was qualified to replace (UPLOAD_WAVE_COMPATIBLE_CAPABILITIES) and its source
+    commit; when every library is bound to one of them, run the same preserving migration deploy/upgrade_wave.py
+    does (certify the new images, rebind each policy with an audit receipt). Anything else -- unknown binding,
+    several earlier releases, no listed predecessors -- is left to the explicit operator path. Raises
+    UpgradeBusy while work is still leased; the next owner-bootstrap retry tries again."""
+    compatible = {c for c in env.get('UPLOAD_WAVE_COMPATIBLE_CAPABILITIES', '').split(',')
+                  if re.fullmatch(r'[a-f0-9]{64}', c)}
+    commit = env.get('UPLOAD_WAVE_SOURCE_COMMIT', '')
+    if not compatible or not re.fullmatch(r'[a-f0-9]{40}', commit):
+        return False
+    import wave_upgrade
+    table = service.get_table_client('photojobs')
+    bound = {row['capabilityId'] for row in wave_upgrade.library_policies(table)}
+    if not bound or not bound <= compatible:
+        return False
+    if len(bound) > 1:
+        raise RuntimeError('Libraries are bound to several earlier releases; use deploy/upgrade_wave.py')
+    previous = next(iter(bound))
+    wave_upgrade.migrate(table, service.get_table_client('photometadata'), deployments, previous=previous,
+                         target=expected, upgrade_id='auto-' + previous[:16] + '-' + expected[:16],
+                         source_commit=commit)
+    return True
 
 
 def main():

@@ -81,6 +81,10 @@ param enableWaveExecution bool = true
 param enableNewWaveLibraries bool = true
 @description('Exact-image capability ID. Fresh wave activation requires the seeded release certificate; never leave empty.')
 param waveCapabilityId string = '1002611277e07e88ab905b291a13d8c55b5b8577fb28aac90edd9aea9f01c291'
+@description('Earlier release certificates this release may replace in place (set by the release pin job).')
+param waveCompatibleCapabilities string = ''
+@description('Source commit of the pinned release (set by the release pin job).')
+param waveSourceCommit string = ''
 param waveBootstrapPending bool = false
 
 @description('Provision managed WebSocket notifications when library indexes are published.')
@@ -123,6 +127,8 @@ module app 'resources.bicep' = {
     enableWaveExecution: enableWaveExecution
     enableNewWaveLibraries: enableNewWaveLibraries
     waveCapabilityId: waveCapabilityId
+    waveCompatibleCapabilities: waveCompatibleCapabilities
+    waveSourceCommit: waveSourceCommit
     waveBootstrapPending: waveBootstrapPending
     logAnalyticsWorkspaceName: logAnalyticsWorkspaceName
     enableLogAnalytics: enableLogAnalytics

@@ -28,3 +28,30 @@ def test_checked_in_templates_still_match_the_pin_patterns():
     for name in ('main.bicep', 'resources.bicep', 'azuredeploy.json'):
         text = (ROOT / 'deploy' / name).read_text()
         assert pin_images.pin(text, IMAGES, CAP).count(CAP) >= 1, name
+
+
+OLD, OLDER, COMMIT = 'c' * 64, 'd' * 64, 'e' * 40
+BICEP = ("param waveCapabilityId string = '{}'\nparam waveCompatibleCapabilities string = '{}'\n"
+         "param waveSourceCommit string = ''\n")
+
+
+def test_an_upgradable_release_lists_the_previous_certificates_it_replaces():
+    text = pin_images.pin(BICEP.format(OLD, OLDER), IMAGES, CAP, COMMIT, upgradable=True)
+    assert f"waveCompatibleCapabilities string = '{OLD},{OLDER}'" in text
+    assert f"waveSourceCommit string = '{COMMIT}'" in text
+    assert f"waveCapabilityId string = '{CAP}'" in text
+    # re-pinning the same release never lists a certificate as compatible with itself
+    again = pin_images.pin(text, IMAGES, CAP, COMMIT, upgradable=True)
+    assert f"waveCompatibleCapabilities string = '{OLD},{OLDER}'" in again
+
+
+def test_a_release_not_qualified_for_upgrades_keeps_the_compatible_list():
+    text = pin_images.pin(BICEP.format(OLD, OLDER), IMAGES, CAP, COMMIT, upgradable=False)
+    assert f"waveCompatibleCapabilities string = '{OLDER}'" in text
+
+
+def test_compatible_list_is_capped():
+    ids = ','.join(format(i, 'x') * 64 for i in range(1, 15))
+    text = pin_images.pin(BICEP.format(OLD, ids), IMAGES, CAP, COMMIT, upgradable=True)
+    listed = text.split("waveCompatibleCapabilities string = '")[1].split("'")[0].split(',')
+    assert len(listed) == pin_images.MAX_COMPATIBLE and listed[0] == OLD
