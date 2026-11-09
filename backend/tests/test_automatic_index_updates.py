@@ -741,3 +741,79 @@ def test_wave_scopes_exclude_vector_but_still_accept_it_for_in_flight_waves():
     import wave_catalog
     assert 'vector' not in wave_catalog.SCOPES
     assert 'vector' in wave_catalog.ACCEPTED_SCOPES
+
+
+def test_stale_reservation_is_reaped_and_forces_full_build(runtime, monkeypatch):
+    stale = runtime.store.begin('A', 'lexical_artifact', ['photo1'], owner='dead-pod')
+    fresh = runtime.store.begin('A', 'lexical_artifact', ['photo2'], owner='live-pod')
+    row = runtime.store.reservations('A', 'lexical_artifact')
+    old = next(r for r in row if r['reservationId'] == stale)
+    runtime.store.table.upsert_entity(dict(old, startedAt=old['startedAt'] - 3 * 3600))
+
+    # The live writer still blocks the build, but the dead one is gone.
+    with pytest.raises(automatic.SourceBusy):
+        runtime.store.capture('A', 'lexical_artifact')
+    assert [r['reservationId'] for r in runtime.store.reservations('A', 'lexical_artifact')] == [fresh]
+    control = runtime.store.control('A', 'lexical_artifact')
+    assert control['active'] == 1 and control['fullRequired'] is True
+
+    runtime.store.finish('A', 'lexical_artifact', reservation_id=fresh)
+    captured = runtime.store.capture('A', 'lexical_artifact')
+    assert set(captured.ids) == {'photo1', 'photo2'}
+
+
+def test_fresh_reservation_is_not_reaped_and_reaping_can_be_disabled(runtime, monkeypatch):
+    res = runtime.store.begin('A', 'vector', ['photo1'])
+    assert runtime.store.reap_stale_reservations('A', 'vector') == []
+    old = runtime.store.reservations('A', 'vector')[0]
+    runtime.store.table.upsert_entity(dict(old, startedAt=old['startedAt'] - 10 * 3600))
+    monkeypatch.setattr(automatic, 'STALE_RESERVATION_SECONDS', 0)
+    with pytest.raises(automatic.SourceBusy):
+        runtime.store.capture('A', 'vector')
+    assert runtime.store.control('A', 'vector')['active'] == 1
+    assert [r['reservationId'] for r in runtime.store.reservations('A', 'vector')] == [res]
+
+
+def _age_reservation(runtime, kind, reservation_id, seconds):
+    row = next(r for r in runtime.store.reservations('A', kind) if r['reservationId'] == reservation_id)
+    runtime.store.table.upsert_entity(dict(row, startedAt=row['startedAt'] - seconds))
+
+
+def test_late_finish_of_reaped_writer_does_not_decrement_again(runtime):
+    dead = runtime.store.begin('A', 'lexical_artifact', ['photo1'], owner='slow-pod')
+    other = runtime.store.begin('A', 'lexical_artifact', ['photo2'], owner='live-pod')
+    _age_reservation(runtime, 'lexical_artifact', dead, 3 * 3600)
+    assert len(runtime.store.reap_stale_reservations('A', 'lexical_artifact')) == 1
+    before = runtime.store.control('A', 'lexical_artifact')
+    assert before['active'] == 1
+
+    runtime.store.finish('A', 'lexical_artifact', reservation_id=dead)  # must not raise or decrement
+
+    after = runtime.store.control('A', 'lexical_artifact')
+    assert after['active'] == 1 and after['revision'] != before['revision']
+    assert [r['reservationId'] for r in runtime.store.reservations('A', 'lexical_artifact')] == [other]
+    with pytest.raises(automatic.SourceBusy):
+        runtime.store.capture('A', 'lexical_artifact')
+    runtime.store.finish('A', 'lexical_artifact', reservation_id=other)
+    assert runtime.store.control('A', 'lexical_artifact')['active'] == 0
+
+
+def test_late_finish_of_sole_reaped_writer_does_not_raise_unbalanced(runtime):
+    dead = runtime.store.begin('A', 'vector', ['photo1'])
+    _age_reservation(runtime, 'vector', dead, 3 * 3600)
+    runtime.store.reap_stale_reservations('A', 'vector')
+    runtime.store.finish('A', 'vector', reservation_id=dead)
+    assert runtime.store.control('A', 'vector')['active'] == 0
+
+
+def test_reaped_markers_are_collected_after_grace(runtime):
+    dead = runtime.store.begin('A', 'vector', ['photo1'])
+    _age_reservation(runtime, 'vector', dead, 3 * 3600)
+    import time
+    reaped_at = time.time()
+    runtime.store.reap_stale_reservations('A', 'vector', now=reaped_at)
+    pk = automatic.partition('A', 'vector')
+    assert runtime.store.table.get_entity(pk, f'res-{dead}').get('reapedAt')
+    runtime.store.reap_stale_reservations('A', 'vector', now=reaped_at + 2 * 86400 + 10)
+    with pytest.raises(Exception):
+        runtime.store.table.get_entity(pk, f'res-{dead}')

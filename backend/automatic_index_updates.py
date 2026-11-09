@@ -57,6 +57,11 @@ KINDS = ('vector', 'people_embedding', 'tag_embedding', 'lexical_artifact', 'has
 CONTROL = '!coverage'
 VERSION = 1
 LIMIT = 4096
+# A reservation that has not been closed for this long belongs to a writer that
+# died (scale-down, rollout, crash) and would otherwise block every artifact
+# build for the library forever. 0 disables reaping (operator recovery only).
+STALE_RESERVATION_SECONDS = int(os.getenv('INDEX_STALE_RESERVATION_SECONDS', '7200'))
+REAPED_MARKER_GRACE_SECONDS = 86400
 # Per-kind bound on a certified incremental ID set; larger sets take the full path.
 KIND_ID_CAPS = {'vector': 4096, 'people_embedding': 4096, 'lexical_artifact': 4096,
                 'tag_embedding': 512, 'hash': 512}
@@ -369,7 +374,8 @@ class CoverageStore:
         if reservation_id is None:
             try:
                 raw_rows = self.table.query_entities(f"PartitionKey eq '{pk}' and RowKey ne '{CONTROL}'")
-                res_rows = [r for r in raw_rows if str(r.get('RowKey', '')).startswith('res-')]
+                res_rows = [r for r in raw_rows if str(r.get('RowKey', '')).startswith('res-')
+                            and not r.get('reapedAt')]
                 if res_rows:
                     reservation_id = res_rows[0].get('reservationId')
             except Exception:
@@ -378,7 +384,30 @@ class CoverageStore:
         extra_ops = []
         if reservation_id:
             res_key = f'res-{reservation_id}'
-            extra_ops = [('delete', dict(PartitionKey=pk, RowKey=res_key))]
+            try:
+                res_row = self.table.get_entity(pk, res_key)
+            except ResourceNotFoundError:
+                res_row = None
+            if res_row is not None:
+                # Match on the ETag we read: if the reaper claims the row between
+                # this read and the commit, the transaction fails instead of
+                # decrementing a count the reaper already released.
+                options = dict(etag=etag(res_row), match_condition=MatchConditions.IfNotModified)
+                extra_ops = [('delete', dict(PartitionKey=pk, RowKey=res_key), options)]
+                if res_row.get('reapedAt'):
+                    # The reaper already released this reservation's count; only
+                    # drop the marker and bump the revision so in-flight builds
+                    # can't certify without this writer's changes.
+                    def acknowledge(row):
+                        row['fullRequired'] = bool(row.get('fullRequired') or failed)
+                    try:
+                        self._change(user, kind, acknowledge, extra_ops=extra_ops)
+                    except Exception as error:
+                        if not (isinstance(error, ResourceNotFoundError) or getattr(error, 'status_code', None) == 404):
+                            raise
+                    return
+            else:
+                extra_ops = [('delete', dict(PartitionKey=pk, RowKey=res_key))]
 
         def complete(row):
             if int(row.get('active') or 0) <= 0:
@@ -400,12 +429,67 @@ class CoverageStore:
         try:
             raw_rows = self.table.query_entities(
                 f"PartitionKey eq '{pk}' and RowKey ne '{CONTROL}'")
-            return [dict(r) for r in raw_rows if str(r.get('RowKey', '')).startswith('res-')]
+            return [dict(r) for r in raw_rows
+                    if str(r.get('RowKey', '')).startswith('res-') and not r.get('reapedAt')]
         except Exception:
             return []
 
+    def reap_stale_reservations(self, user, kind, *, max_age=None, now=None):
+        """Release reservations whose writer is long gone; the next build is forced full.
+
+        Each reap is one transaction that stamps ``reapedAt`` on the reservation
+        row (ETag-guarded) and decrements ``active``. The marker stays so a
+        writer that is in fact alive can see its count was already released in
+        finish() instead of decrementing again; markers are garbage-collected
+        after a grace period.
+        """
+        max_age = STALE_RESERVATION_SECONDS if max_age is None else max_age
+        if max_age <= 0:
+            return []
+        now = time.time() if now is None else now
+        pk = partition(user, kind)
+
+        def reap(row):
+            row['active'] = max(0, int(row.get('active') or 0) - 1)
+            row.update(fullRequired=True, base='', coveredRevision='')
+
+        reaped = []
+        for res in self.reservations(user, kind):
+            if now - float(res.get('startedAt') or 0) <= max_age:
+                continue
+            try:
+                current = self.table.get_entity(pk, res['RowKey'])
+                if current.get('reapedAt'):
+                    continue
+                self._change(user, kind, reap, extra_ops=[
+                    ('update', dict(current, reapedAt=now), _cas(current))])
+            except ResourceModifiedError:
+                continue  # the writer finished (or another reaper won) meanwhile
+            except Exception as error:
+                if isinstance(error, ResourceNotFoundError) or getattr(error, 'status_code', None) == 404:
+                    continue
+                raise
+            reaped.append({key: res.get(key) for key in
+                           ('reservationId', 'owner', 'operation', 'startedAt', 'idsCount')})
+        if reaped:
+            LOG.warning('Reaped stale source reservations for library=%r kind=%s: %s', user, kind, reaped)
+        self._collect_reaped_markers(pk, now, max(REAPED_MARKER_GRACE_SECONDS, 4 * max_age))
+        return reaped
+
+    def _collect_reaped_markers(self, pk, now, grace):
+        try:
+            rows = self.table.query_entities(f"PartitionKey eq '{pk}' and RowKey ne '{CONTROL}'")
+            for row in rows:
+                if (str(row.get('RowKey', '')).startswith('res-') and row.get('reapedAt')
+                        and now - float(row['reapedAt']) > grace):
+                    self.table.delete_entity(pk, row['RowKey'])
+        except Exception:
+            LOG.debug('Reaped-marker collection skipped', exc_info=True)
+
     def capture(self, user, kind):
         row = self.ensure(user, kind)
+        if row.get('active') and self.reap_stale_reservations(user, kind):
+            row = self.ensure(user, kind)
         if row.get('active'):
             raise SourceBusy(f'Active {kind} source intent for {user}')
         pk = row['PartitionKey']
