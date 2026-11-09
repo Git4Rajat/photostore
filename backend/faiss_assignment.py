@@ -635,14 +635,23 @@ class FaissAssigner:
         return validate
 
     @staticmethod
-    def _membership(person, face_id):
+    def _encoded_membership(person, face_id):
         ids = json.loads(person.get('faceIds') or '[]')
         if not isinstance(ids, list) or any(not isinstance(fid, str) for fid in ids):
             raise ValueError('Invalid legacy person faceIds')
         if face_id not in ids:
             ids.append(face_id)
-        encoded = json.dumps(ids, ensure_ascii=True, separators=(',', ':'))
+        return json.dumps(ids, ensure_ascii=True, separators=(',', ':'))
+
+    @staticmethod
+    def _membership_fits(person, face_id):
         # Azure Tables strings are UTF-16; ASCII JSON also bounds UTF-8 usage.
+        encoded = FaissAssigner._encoded_membership(person, face_id)
+        return len(encoded.encode('utf-16-le')) <= _LEGACY_MEMBERSHIP_BYTES
+
+    @staticmethod
+    def _membership(person, face_id):
+        encoded = FaissAssigner._encoded_membership(person, face_id)
         if len(encoded.encode('utf-16-le')) > _LEGACY_MEMBERSHIP_BYTES:
             raise ValueError('Legacy person faceIds exceeds 60 KiB; refusing truncation')
         return encoded
@@ -664,6 +673,12 @@ class FaissAssigner:
                 if person is None:
                     raise RuntimeError('Matched person disappeared before persistence')
             else:
+                person = None
+            # A person's membership list lives in one table column (64 KiB). A match whose list is full would
+            # fail every later wave, so such a face starts a new person instead (the user can merge them).
+            if person is not None and not self._membership_fits(person, face_id):
+                person = None
+            if person is None:
                 is_new = True
                 person = {'PartitionKey': user_id, 'RowKey': deterministic_id, 'name': '',
                           'createdAt': datetime.now(timezone.utc).isoformat(), 'faceIds': '[]'}
