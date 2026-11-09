@@ -29,13 +29,14 @@ param communicationServiceName string = '${appName}-comm-${take(uniqueString(res
 @description('Azure region for all resources. Defaults to the resource group location.')
 param location string = resourceGroup().location
 
+@description('Upgrade an existing deployment in place: no owner login is seeded (the values it would use come from the existing deployment, see existing.bicep).')
+param upgradeExisting bool = false
 @description('Your login email. Used to sign in and to receive password-reset emails.')
-param adminEmail string
+param adminEmail string = ''
 
 @description('Your login password (at least 8 characters). You can change it later inside the app.')
-@minLength(8)
 @secure()
-param adminPassword string
+param adminPassword string = ''
 
 @description('Where Azure Communication Services stores email data. Pick the option closest to you.')
 @allowed([
@@ -153,6 +154,9 @@ var archiveAppName = '${appName}-archive'
 // Only deploy vision (and grant it storage access) when the deployment
 // actually needs it -- in 'browser' mode (the default) it would just sit
 // scaled to zero forever, so skip provisioning it at all.
+// Secrets cannot be empty or read back; in upgrade mode this is never used (OWNER_SEED_DISABLED).
+var ownerPasswordSecret = upgradeExisting ? 'upgrade-${uniqueString(resourceGroup().id, appName)}' : adminPassword
+
 var deployVision = processingMode != 'browser'
 
 // Built-in role definition IDs for storage data-plane access.
@@ -504,6 +508,7 @@ var backendEnv = [
   { name: 'AUTH_REQUIRED', value: 'true' }
   { name: 'AUTH_MODE', value: 'password' }
   { name: 'OWNER_EMAIL', value: adminEmail }
+  { name: 'OWNER_SEED_DISABLED', value: upgradeExisting ? 'true' : 'false' }
   { name: 'ACS_SENDER_ADDRESS', value: acsSenderAddress }
   { name: 'PUBLIC_APP_BASE_URL', value: webUrl }
   { name: 'SPA_BASE_URL', value: webUrl }
@@ -748,7 +753,7 @@ resource core 'Microsoft.App/containerApps@2025-01-01' = {
         ]
       }
       secrets: [
-        { name: 'owner-password', value: adminPassword }
+        { name: 'owner-password', value: ownerPasswordSecret }
         { name: 'session-secret', value: sessionSecret }
         { name: 'acs-connection-string', value: acsConnectionString }
       ]
@@ -1095,7 +1100,7 @@ resource indexer 'Microsoft.App/containerApps@2025-01-01' = {
         ]
       }
       secrets: [
-        { name: 'owner-password', value: adminPassword }
+        { name: 'owner-password', value: ownerPasswordSecret }
         { name: 'session-secret', value: sessionSecret }
         { name: 'acs-connection-string', value: acsConnectionString }
       ]
@@ -1197,7 +1202,7 @@ resource indexWorker 'Microsoft.App/containerApps@2025-01-01' = if (dedicatedInd
     managedEnvironmentId: managedEnvironment.id
     configuration: {
       secrets: [
-        { name: 'owner-password', value: adminPassword }
+        { name: 'owner-password', value: ownerPasswordSecret }
         { name: 'session-secret', value: sessionSecret }
         { name: 'acs-connection-string', value: acsConnectionString }
       ]
@@ -1276,7 +1281,7 @@ resource recovery 'Microsoft.App/containerApps@2025-01-01' = {
         ]
       }
       secrets: [
-        { name: 'owner-password', value: adminPassword }
+        { name: 'owner-password', value: ownerPasswordSecret }
         { name: 'session-secret', value: sessionSecret }
         { name: 'acs-connection-string', value: acsConnectionString }
       ]
@@ -1377,7 +1382,7 @@ resource archive 'Microsoft.App/containerApps@2025-01-01' = {
         ]
       }
       secrets: [
-        { name: 'owner-password', value: adminPassword }
+        { name: 'owner-password', value: ownerPasswordSecret }
         { name: 'session-secret', value: sessionSecret }
         { name: 'acs-connection-string', value: acsConnectionString }
       ]
@@ -1491,7 +1496,7 @@ resource upload 'Microsoft.App/containerApps@2025-01-01' = {
         ]
       }
       secrets: [
-        { name: 'owner-password', value: adminPassword }
+        { name: 'owner-password', value: ownerPasswordSecret }
         { name: 'session-secret', value: sessionSecret }
         { name: 'acs-connection-string', value: acsConnectionString }
       ]

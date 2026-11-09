@@ -45,7 +45,7 @@
         "visible": "[equals(basics('mode'),'upgrade')]",
         "options": {
           "icon": "Info",
-          "text": "Pick the app ending in -core from your existing Keepsake. Your photos and library are kept. Wait until no upload is running, because the update restarts the apps. Re-enter your login email and password: an existing login is kept as it is."
+          "text": "Pick the app ending in -core from your existing Keepsake. Your photos and library are kept, and your login, email settings and photo processing stay as they are. Wait until no upload is running, because the update restarts the apps."
         }
       },
       {
@@ -84,7 +84,8 @@
           "required": true,
           "regex": "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$",
           "validationMessage": "Enter a valid email address."
-        }
+        },
+        "visible": "[not(equals(basics('mode'),'upgrade'))]"
       },
       {
         "name": "adminPassword",
@@ -101,7 +102,8 @@
         },
         "options": {
           "hideConfirmation": false
-        }
+        },
+        "visible": "[not(equals(basics('mode'),'upgrade'))]"
       },
       {
         "name": "emailDataLocation",
@@ -129,7 +131,8 @@
               "value": "United Kingdom"
             }
           ]
-        }
+        },
+        "visible": "[not(equals(basics('mode'),'upgrade'))]"
       },
       {
         "name": "processingMode",
@@ -153,17 +156,19 @@
               "value": "both"
             }
           ]
-        }
+        },
+        "visible": "[not(equals(basics('mode'),'upgrade'))]"
       }
     ],
     "steps": [],
     "outputs": {
       "appName": "[if(equals(basics('mode'),'upgrade'), replace(basics('existing').name,'-core',''), basics('appName'))]",
-      "adminEmail": "[basics('adminEmail')]",
-      "adminPassword": "[basics('adminPassword')]",
-      "emailDataLocation": "[basics('emailDataLocation')]",
-      "processingMode": "[basics('processingMode')]",
-      "location": "[if(equals(basics('mode'),'upgrade'), basics('existing').location, location())]"
+      "adminEmail": "[if(equals(basics('mode'),'upgrade'), '', basics('adminEmail'))]",
+      "adminPassword": "[if(equals(basics('mode'),'upgrade'), '', basics('adminPassword'))]",
+      "emailDataLocation": "[if(equals(basics('mode'),'upgrade'), 'Europe', basics('emailDataLocation'))]",
+      "processingMode": "[if(equals(basics('mode'),'upgrade'), 'backend', basics('processingMode'))]",
+      "location": "[if(equals(basics('mode'),'upgrade'), basics('existing').location, location())]",
+      "upgradeExisting": "[equals(basics('mode'),'upgrade')]"
     }
   }
 }
