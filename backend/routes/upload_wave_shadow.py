@@ -269,6 +269,26 @@ def register_routes(blueprint):
         from wave_health import status
         return status(store, wave)
 
+    @blueprint.route('/upload/waves/live/attention', methods=['GET'])
+    @endpoint
+    def wave_attention(store, data):
+        """Unfinished waves (not collecting, complete or cancelled) with their health, so the Tools page can
+        show which ones are failed or blocked and offer a stage retry. Bounded: a few pages, 25 results."""
+        from wave_health import status
+        waves, after = [], ''
+        for _ in range(10):
+            rows = store._page('wave!', after)
+            if not rows:
+                break
+            after = rows[-1]['RowKey']
+            for row in rows:
+                if row.get('state') in ('collecting', 'complete', 'cancelled'):
+                    continue
+                waves.append(_public(status(store, row['RowKey'][len('wave!'):])))
+                if len(waves) >= 25:
+                    return dict(waves=waves, truncated=True)
+        return dict(waves=waves, truncated=False)
+
     @blueprint.route('/upload/waves/live/<wave>/failures', methods=['GET'])
     @endpoint
     def wave_failure_review(store, data, wave):

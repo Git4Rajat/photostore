@@ -6,7 +6,7 @@
     "config": {
       "isWizard": false,
       "basics": {
-        "description": "Deploy Photostore into your own Azure subscription. Set a login email and password below \u2014 that is your sign-in, no Microsoft account or app registration required.",
+        "description": "Deploy Photostore into your own Azure subscription. Set a login email and password below \u2014 that is your sign-in, no Microsoft account or app registration required. When the deployment finishes, open its Outputs tab: appUrl is your login page and homepage.",
         "location": {
           "label": "Region",
           "toolTip": "Azure region for the resource group and all resources.",

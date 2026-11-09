@@ -16,6 +16,10 @@
 
 The portal button deploys a fully featured library: the owner library is created for your email and wave uploads are enabled. The [Azure CLI fresh-deployment guide](deploy/fresh-wave.md) is only needed for advanced, scripted installs.
 
+## After deploying
+
+When the deployment finishes, open it in the Azure portal and go to **Outputs**. **`appUrl`** is your login page and homepage — open it and sign in with the email and password you chose. Bookmark it. (If share snapshots are enabled, **`homeUrl`** is the address to give to people you share with.) You can reopen **Outputs** any time from the resource group's **Settings → Deployments** page.
+
 ## Upgrading
 
 Run the **Deploy to Azure** button again against your existing deployment. The template is incremental, so it updates the container images in place and keeps your photos and library.

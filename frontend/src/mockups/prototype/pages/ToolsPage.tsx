@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Maximize2 as ArrowsPointingOutIcon, Info as InformationCircleIcon } from 'lucide-react';
 import { useStore } from '../store';
 import WorkbenchGrid from '../components/WorkbenchGrid';
+import StuckWavesCard from '../components/StuckWavesCard';
 import { Spinner } from '../components/bits';
 import { useAppServices } from '../../../components/AppServicesProvider';
 import type { BrowserProcessingAction } from '../../../components/AppServicesProvider';
@@ -525,6 +526,7 @@ const ToolsPage: React.FC = () => {
                         <span>Hide faces flagged as likely false detections from clustering and people counts.</span>
                         <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('Suppress suspicious faces', '/api/admin/people/suppress-suspicious-faces', { repair: true, dryRun: false, confirm: 'SUPPRESS_SUSPICIOUS_FACES' })}>Suppress</button>
                     </div>
+                    <StuckWavesCard onMessage={(message, error) => toast(message, undefined, undefined, error ? 'error' : undefined)} />
                     <div className="card-glass pt-recover-card">
                         <strong>Purge orphaned photo data</strong>
                         <span>Remove leftover rows/blobs for photos that no longer exist in the library.</span>
