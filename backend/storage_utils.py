@@ -7639,6 +7639,12 @@ _PEOPLE_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
 _PEOPLE_INDEX_FACE_LOOKUP_CONCURRENCY = 16
 
 
+def _sort_people_rows(rows: List[Dict[str, object]]) -> None:
+    """Named clusters first (RowKey order), then unnamed clusters by photo count, largest first, so the
+    biggest unlabelled groups -- the ones worth naming -- lead. The sort is stable: ties keep RowKey order."""
+    rows.sort(key=lambda r: (0, 0) if r.get('isNamed') else (1, -int(r.get('faceCount') or 0)))
+
+
 def _people_index_json_blob_name(user_id: str) -> str:
     return f'{_vector_index_blob_key(user_id)}-people.json.gz'
 
@@ -7996,9 +8002,7 @@ def _people_index_rows_from_scan(
             'updatedAt': source_version,
         })
 
-    # Named clusters first, ties preserve RowKey (query) order -- mirrors
-    # list_persons's stable sort.
-    trimmed_rows.sort(key=lambda r: 0 if r['isNamed'] else 1)
+    _sort_people_rows(trimmed_rows)
 
     return LexicalIndexSnapshot(
         user_id=str(user_id),
@@ -8092,7 +8096,7 @@ def _incremental_people_index_snapshot(
         if row.get('autoName'):
             row['name'] = f'Unnamed {counter}'
             counter += 1
-    rows.sort(key=lambda r: 0 if r.get('isNamed') else 1)
+    _sort_people_rows(rows)
     return LexicalIndexSnapshot(
         user_id=str(user_id), source_version=source_version, schema_version=_PEOPLE_INDEX_SCHEMA_VERSION,
         updated_at=source_version, rows=rows,
@@ -8167,7 +8171,7 @@ def _incremental_people_index_snapshot_by_ids(
             row = {**row, 'name': f'Unnamed {counter}'}
             merged_rows[index] = row
             counter += 1
-    merged_rows.sort(key=lambda row: 0 if row.get('isNamed') else 1)
+    _sort_people_rows(merged_rows)
 
     return LexicalIndexSnapshot(
         user_id=str(user_id),
