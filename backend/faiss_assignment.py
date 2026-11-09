@@ -676,12 +676,17 @@ class FaissAssigner:
                 person = None
             # A person's membership list lives in one table column (64 KiB). A match whose list is full would
             # fail every later wave, so such a face starts a new person instead (the user can merge them).
+            group_id = ''
             if person is not None and not self._membership_fits(person, face_id):
+                # The shard joins the full person's group so the People list shows them as one person.
+                group_id = str(person.get('groupId') or person['RowKey'])
                 person = None
             if person is None:
                 is_new = True
                 person = {'PartitionKey': user_id, 'RowKey': deterministic_id, 'name': '',
                           'createdAt': datetime.now(timezone.utc).isoformat(), 'faceIds': '[]'}
+                if group_id:
+                    person['groupId'] = group_id
         return dict(person), is_new
 
     def assign(self, user_id, filename, face_ids, *, _guard=None,
