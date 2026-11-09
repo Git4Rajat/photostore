@@ -45,4 +45,24 @@ describe('PublicPhotoViewer', () => {
         expect(resolveApiUrl('/public/photos/t/preview/r.jpg')).not.toBe('');
         expect(screen.getByAltText('r.jpg').getAttribute('src')).toBe(resolveApiUrl('/public/photos/t/preview/r.jpg'));
     });
+
+    it('swaps a video that fails before loading for a download fallback, but keeps a player that errors mid-stream', () => {
+        const { rerender } = render(<PublicPhotoViewer photos={photos} index={2} onClose={vi.fn()} onIndexChange={vi.fn()} />);
+        const video = document.querySelector('video') as HTMLVideoElement;
+        expect(screen.queryByLabelText('Zoom in')).toBeNull();
+
+        Object.defineProperty(video, 'readyState', { value: HTMLMediaElement.HAVE_METADATA, configurable: true });
+        fireEvent.error(video);
+        expect(document.querySelector('video')).not.toBeNull();
+
+        Object.defineProperty(video, 'readyState', { value: 0, configurable: true });
+        fireEvent.error(video);
+        expect(document.querySelector('video')).toBeNull();
+        expect(screen.getByText(/can.t be played in your browser/)).toBeTruthy();
+        expect(screen.getByText('Download original')).toBeTruthy();
+
+        // Stepping to another photo clears the failure.
+        rerender(<PublicPhotoViewer photos={photos} index={0} onClose={vi.fn()} onIndexChange={vi.fn()} />);
+        expect(screen.queryByText(/can.t be played in your browser/)).toBeNull();
+    });
 });

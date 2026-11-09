@@ -231,7 +231,7 @@ def public_image(token: str, filename: str):
     try:
         try:
             props = app.get_media_properties('image', blob_name_to_serve)
-            content_type = props.get('content_type') or 'image/jpeg'
+            content_type = app._media_content_type(props.get('content_type'), safe_name)
             content_length = props.get('size')
         except Exception:
             content_type = 'image/jpeg'

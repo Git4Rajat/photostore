@@ -1,7 +1,7 @@
 import {getFileExtension} from '../utils/photoDisplay';
 import {VIDEO_MAX_SOURCE_BYTES} from '../utils/videoMetadata';
 import {embeddedVideoJpegs} from '../utils/videoEmbeddedThumbnail';
-import {generateUploadThumbnail, uploadDerivativeSize, UPLOAD_THUMBNAIL_MAX_EDGE, type UploadDerivative} from '../utils/uploadDerivatives';
+import {generateUploadThumbnail, stampVideoThumbnail, uploadDerivativeSize, UPLOAD_THUMBNAIL_MAX_EDGE, type UploadDerivative} from '../utils/uploadDerivatives';
 
 export const VIDEO_MAX_FRAME_PIXELS = 40_000_000;
 const aborted = () => new DOMException('Video preparation aborted', 'AbortError');
@@ -42,7 +42,7 @@ async function nativeVideoThumbnail(file: File, signal: AbortSignal): Promise<Up
         const context = canvas.getContext('2d') as OffscreenCanvasRenderingContext2D | null;
         if (!context) throw new Error('Video canvas unavailable');
         context.drawImage(video, 0, 0, width, height);
-        return await generateUploadThumbnail(canvas);
+        return await generateUploadThumbnail(stampVideoThumbnail(canvas));
     } finally {
         video.pause(); video.removeAttribute('src'); video.load(); URL.revokeObjectURL(url);
     }
@@ -100,7 +100,7 @@ export async function wasmVideoThumbnail(file: File, signal: AbortSignal): Promi
             catch { continue; } // Successful seek may reach EOF without producing a frame.
             if (!(bytes instanceof Uint8Array) || !bytes.length) continue;
             const pixels = await createImageBitmap(new Blob([bytes], {type: 'image/jpeg'}));
-            try { return await generateUploadThumbnail(pixels); } finally { pixels.close(); }
+            try { return await generateUploadThumbnail(stampVideoThumbnail(pixels)); } finally { pixels.close(); }
         }
         throw new Error('Video decode unsupported');
     } finally { signal.removeEventListener('abort', abort); ffmpeg.terminate(); }
@@ -117,7 +117,7 @@ export async function prepareVideoThumbnail(file: File, signal: AbortSignal): Pr
             pixels = await createImageBitmap(image.blob);
             if (signal.aborted) throw aborted();
             if (pixels.width <= 0 || pixels.height <= 0 || pixels.width * pixels.height > VIDEO_MAX_FRAME_PIXELS) continue;
-            const thumbnail = await generateUploadThumbnail(pixels);
+            const thumbnail = await generateUploadThumbnail(stampVideoThumbnail(pixels));
             if (signal.aborted) throw aborted();
             return {thumbnail, runtime: 'embedded_video_jpeg', readBytes: image.readBytes, readCalls: image.readCalls};
         } catch {

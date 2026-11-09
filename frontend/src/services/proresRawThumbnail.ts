@@ -1,4 +1,4 @@
-import {generateUploadThumbnail, type UploadDerivative} from '../utils/uploadDerivatives';
+import {generateUploadThumbnail, stampVideoThumbnail, type UploadDerivative} from '../utils/uploadDerivatives';
 
 export type VideoThumbnail = UploadDerivative & {readBytes?: number; readCalls?: number};
 
@@ -29,7 +29,7 @@ export async function proresRawThumbnail(file: File, signal: AbortSignal): Promi
         const pixels = await createImageBitmap(new Blob([result.bytes], {type: 'image/jpeg'}));
         try {
             if (pixels.width < 1 || pixels.height < 1 || Math.max(pixels.width, pixels.height) > 120) throw new Error('Invalid video derivative');
-            const thumbnail = await generateUploadThumbnail(pixels);
+            const thumbnail = await generateUploadThumbnail(stampVideoThumbnail(pixels));
             if (signal.aborted) throw new DOMException('Video preparation aborted', 'AbortError');
             return {...thumbnail, readBytes: result.readBytes, readCalls: result.readCalls};
         } finally { pixels.close(); }

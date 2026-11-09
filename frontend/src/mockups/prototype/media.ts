@@ -7,7 +7,7 @@ import { resolveMediaAccessUrls } from '../../services/mediaAccessCache';
 import { getCachedSortThumb } from '../../services/localSortIndex';
 import { getCachedMediaToken, getMediaToken, imageUrlForBlob, previewUrlForBlob, thumbnailUrlForBlob } from '../../services/mediaToken';
 import { isHttpUrl, shouldFetchScopedThumbnail } from '../../components/shared/PhotoTile';
-import { isRawFilename } from '../../utils/photoDisplay';
+import { isRawFilename, isVideoFilename } from '../../utils/photoDisplay';
 import type { Photo } from './types';
 
 // Image resolution for the prototype's tiles and viewer. Deliberately thin:
@@ -343,6 +343,64 @@ export function useMainMedia(photo?: Photo | null, fullRes = false): MainMediaSt
     }, [filename, fullRes]); // eslint-disable-line react-hooks/exhaustive-deps
 
     return { url, loading, progress, status };
+}
+
+export interface VideoSourceState {
+    /** Streamable URL of the original; the browser range-reads it, nothing is downloaded up front. */
+    src: string | undefined;
+    /** Direct thumbnail URL for the player's poster (no fetch, no blob URL). */
+    poster: string | undefined;
+    /** True once the original can't be played (unsupported codec/container, or the URL stays rejected). */
+    failed: boolean;
+    /** Call from the <video> onError. */
+    reportError: () => void;
+}
+
+/** Direct URL of a video's original for a <video> element. */
+export function useVideoSource(photo?: Photo | null): VideoSourceState {
+    const [src, setSrc] = useState<string | undefined>(undefined);
+    const [poster, setPoster] = useState<string | undefined>(undefined);
+    const [failed, setFailed] = useState(false);
+    const retriedRef = useRef(false);
+    const filename = photo && isVideoFilename(photo.filename) ? photo.filename : undefined;
+
+    useEffect(() => {
+        retriedRef.current = false;
+        setSrc(undefined);
+        setPoster(undefined);
+        setFailed(false);
+        if (!filename) return;
+        let active = true;
+        void accessUrl('thumbnail', filename).then((url) => { if (active) setPoster(url || undefined); }).catch(() => {});
+        void accessUrl('image', filename).then((url) => { if (active) setSrc(url || undefined); }).catch(() => {});
+        return () => { active = false; };
+    }, [filename]);
+
+    // A <video> error carries no HTTP status, so probe the URL: a rejected token (401/403) is
+    // worth one refresh; anything else (an undecodable codec such as ProRes or MXF) is final.
+    const reportError = () => {
+        if (!filename || !src) return;
+        const current = src;
+        void (async () => {
+            try {
+                const probe = await fetch(current, { headers: { Range: 'bytes=0-0' } });
+                if ((probe.status === 401 || probe.status === 403) && !retriedRef.current) {
+                    retriedRef.current = true;
+                    await getMediaToken(true);
+                    const refreshed = await accessUrl('image', filename);
+                    if (refreshed && refreshed !== current) {
+                        setSrc(refreshed);
+                        return;
+                    }
+                }
+            } catch {
+                // fall through to failed
+            }
+            setFailed(true);
+        })();
+    };
+
+    return { src, poster, failed, reportError };
 }
 
 // Shape of GET /api/photos/<filename>/metadata, trimmed to the fields the

@@ -38,6 +38,11 @@ export interface ViewerShellProps {
     media: ViewerMedia;
     /** When set the stage plays this instead of showing an image. */
     videoSrc?: string;
+    /** Called when the <video> errors. When given, the caller owns failure via `videoFailed`; otherwise the first error is final. */
+    onVideoError?: () => void;
+    videoFailed?: boolean;
+    /** Poster for the player; falls back to the stage image. */
+    videoPoster?: string;
     fullRes: boolean;
     onToggleFullRes: () => void;
     showFullResControl: boolean;
@@ -54,7 +59,7 @@ export interface ViewerShellProps {
  *  with a photo (rate, album, delete, info) is supplied by the caller. */
 const ViewerShell: React.FC<ViewerShellProps> = ({
     photoKey, filename, title, index, count, initialRotation = 0, onRotate, onClose, onStep,
-    media, videoSrc, fullRes, onToggleFullRes, showFullResControl, onDownloadOriginal, info, bar,
+    media, videoSrc, onVideoError, videoFailed: videoFailedProp, videoPoster, fullRes, onToggleFullRes, showFullResControl, onDownloadOriginal, info, bar,
 }) => {
     const { url: mainSrc, loading: fullResLoading, progress: fullResProgress, status: mediaStatus } = media;
     const [rotation, setRotation] = useState(0);
@@ -97,6 +102,9 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
     // onError, not as a network error. Treated like the hook's 'unavailable'.
     const [decodeFailed, setDecodeFailed] = useState(false);
     useEffect(() => { setDecodeFailed(false); }, [mainSrc]);
+    const [videoErrored, setVideoErrored] = useState(false);
+    useEffect(() => { setVideoErrored(false); }, [videoSrc, photoKey]);
+    const videoFailed = onVideoError ? Boolean(videoFailedProp) : videoErrored;
     const swipeRef = useRef<{ x: number; y: number } | null>(null);
 
     const photoRef = useRef<HTMLDivElement>(null);
@@ -402,8 +410,34 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
                         onMouseLeave={() => { panRef.current = null; }}
                         style={{ cursor: zoomed ? 'grab' : 'default' }}
                     >
-                        {videoSrc ? (
-                            <video className="pt-viewer-img" src={videoSrc} poster={mainSrc || undefined} controls playsInline preload="metadata" />
+                        {videoSrc && !videoFailed ? (
+                            // Click/double-click belong to the player's own controls, not the
+                            // stage's tools toggle and zoom gestures.
+                            <video
+                                key={videoSrc}
+                                className="pt-viewer-img"
+                                src={videoSrc}
+                                poster={videoPoster || mainSrc || undefined}
+                                controls
+                                playsInline
+                                preload="metadata"
+                                onClick={(e) => e.stopPropagation()}
+                                onDoubleClick={(e) => e.stopPropagation()}
+                                // Only an error before metadata loaded means "can't play this"; a later one (a seek
+                                // past truncated data, a dropped connection) leaves the native player to recover.
+                                onError={(e) => {
+                                    if (e.currentTarget.readyState >= HTMLMediaElement.HAVE_METADATA) return;
+                                    if (onVideoError) onVideoError(); else setVideoErrored(true);
+                                }}
+                            />
+                        ) : videoSrc ? (
+                            <div className="pt-viewer-unavailable">
+                                <p>This video can’t be played in your browser.</p>
+                                <button type="button" onClick={onDownloadOriginal}>
+                                    <DownloadIcon size={16} aria-hidden="true" />
+                                    Download original
+                                </button>
+                            </div>
                         ) : mainSrc && !decodeFailed ? (
                             <img
                                 className="pt-viewer-img"
@@ -443,6 +477,7 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
                 </div>
 
                 {/* Floating zoom / rotate / full-res controls over the stage. */}
+                {!videoSrc && (
                 <div className="pt-viewer-tools" role="toolbar" aria-label="Image controls">
                     <button type="button" onClick={() => zoomBy(-ZOOM_STEP)} disabled={zoom <= ZOOM_MIN} aria-label="Zoom out"><MagnifyingGlassMinusIcon /></button>
                     <span className="pt-viewer-zoom-label">{Math.round(zoom * 100)}%</span>
@@ -482,6 +517,7 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
                         </>
                     )}
                 </div>
+                )}
 
                 {info}
             </div>

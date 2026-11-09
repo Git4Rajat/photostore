@@ -4,6 +4,7 @@ import hmac
 import html
 import io
 import json
+import mimetypes
 import os
 import random
 import re
@@ -58,6 +59,7 @@ from image_utils import (
     BROWSER_UNVIEWABLE_EXTENSIONS,
     RAW_EXTENSIONS_CINEMA,
     RAW_EXTENSIONS_RAWPY,
+    VIDEO_EXTENSIONS,
     allowed_file,
     convert_image_to_jpeg,
     crop_face_thumbnail,
@@ -10937,7 +10939,30 @@ def _stream_media_response(
     if not blob_service_client or not container_name:
         raise RuntimeError(f'{kind} storage is not configured')
     blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
-    downloader = blob_client.download_blob(max_concurrency=1)
+
+    # Browsers play and seek <video> through Range requests (Safari refuses to play
+    # without them), so honour a single byte range with a 206 instead of always
+    # replaying the whole blob.
+    status = 200
+    offset, length = None, None
+    range_header = request.headers.get('Range')
+    if range_header:
+        if content_length is None:
+            content_length = blob_client.get_blob_properties().size
+        parsed = _parse_byte_range(range_header, int(content_length))
+        if parsed == 'unsatisfiable':
+            resp = Response(status=416)
+            resp.headers['Content-Range'] = f'bytes */{int(content_length)}'
+            resp.headers['Accept-Ranges'] = 'bytes'
+            return resp
+        if parsed:
+            status = 206
+            offset, length = parsed[0], parsed[1] - parsed[0] + 1
+
+    if offset is None:
+        downloader = blob_client.download_blob(max_concurrency=1)
+    else:
+        downloader = blob_client.download_blob(offset=offset, length=length, max_concurrency=1)
 
     def _iter_chunks():
         for chunk in downloader.chunks():
@@ -10946,9 +10971,14 @@ def _stream_media_response(
 
     resp = Response(
         stream_with_context(_iter_chunks()),
+        status=status,
         mimetype=(content_type or 'application/octet-stream'),
     )
-    if content_length is not None:
+    resp.headers['Accept-Ranges'] = 'bytes'
+    if status == 206:
+        resp.headers['Content-Range'] = f'bytes {offset}-{offset + length - 1}/{int(content_length)}'
+        resp.headers['Content-Length'] = str(length)
+    elif content_length is not None:
         try:
             resp.headers['Content-Length'] = str(max(0, int(content_length)))
         except Exception:
@@ -10957,6 +10987,43 @@ def _stream_media_response(
     if download_filename:
         resp.headers['Content-Disposition'] = _download_content_disposition(download_filename)
     return resp
+
+
+def _parse_byte_range(header: str, total: int):
+    """Parse a single ``bytes=start-end`` range against ``total``.
+
+    Returns ``(start, end)`` inclusive, ``'unsatisfiable'``, or ``None`` when the
+    header should be ignored (unsupported unit or multiple ranges) and the full
+    body served.
+    """
+    match = re.fullmatch(r'\s*bytes=(\d*)-(\d*)\s*', header or '')
+    if not match:
+        return None
+    first, last = match.groups()
+    if not first and not last:
+        return None
+    if not first:
+        suffix = int(last)
+        if suffix == 0 or total == 0:
+            return 'unsatisfiable'
+        return max(0, total - suffix), total - 1
+    start = int(first)
+    end = min(int(last), total - 1) if last else total - 1
+    if start >= total or end < start:
+        return 'unsatisfiable'
+    return start, end
+
+
+def _media_content_type(stored: Optional[str], filename: str, default: str = 'image/jpeg') -> str:
+    """Stored blob content type, replaced by a filename-derived one for videos
+    uploaded as generic/absent types so the <video> element gets a usable MIME."""
+    stored = (stored or '').strip()
+    if stored and stored != 'application/octet-stream':
+        return stored
+    if filename and filename.rsplit('.', 1)[-1].lower() in VIDEO_EXTENSIONS:
+        guessed = mimetypes.guess_type(filename)[0]
+        return guessed or 'video/mp4'
+    return stored or default
 
 
 def _looks_like_jpeg(data: bytes) -> bool:

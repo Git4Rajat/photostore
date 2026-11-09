@@ -825,8 +825,6 @@
    mode (the tile only renders it then), matching iOS Photos' shared albums. */
 .pt-public-grid .pt-tile-check { opacity: 0.92; pointer-events: auto; }
 
-.pt-tile-video { position: absolute; top: 8px; right: 8px; color: #fff; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.5)); pointer-events: none; }
-.pt-tile-video svg { width: 22px; height: 22px; display: block; }
 /* When select mode brings the top-left checkbox in, nudge the video badge down
    so the two never overlap on a portrait clip. */
 .pt-public-grid.select-mode .pt-tile-video { top: auto; bottom: 8px; }

@@ -2,8 +2,7 @@ import React from 'react';
 import { get, resolveApiUrl } from '../../services/apiClient';
 import { isAuthEnabled } from '../../services/authClient';
 import { useEffect, useRef, useState } from 'react';
-import { PlayCircleIcon } from '@heroicons/react/24/solid';
-import { isVideoFilename, requiresBackendPreview } from '../../utils/photoDisplay';
+import { requiresBackendPreview } from '../../utils/photoDisplay';
 import { useLongPress } from '../../services/useLongPress';
 
 interface TilePhoto {
@@ -194,13 +193,6 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
         ? { transform: `rotate(${remainingRotation}deg) scale(${remainingRotation % 180 === 0 ? 1 : 0.74})` }
         : undefined;
 
-    const isVideo = isVideoFilename(photo.filename);
-    const videoOverlay = isVideo ? (
-        <span className="photo-video-overlay" aria-hidden="true">
-            <PlayCircleIcon className="photo-video-overlay-icon" />
-        </span>
-    ) : null;
-
     // Reset the fade when the source changes to a URL we haven't already
     // painted; catch already-cached images whose load event may have fired
     // before the handler was attached.
@@ -241,7 +233,6 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
                     onError={markLoaded}
                     onClick={onMediaClick}
                 />
-                {videoOverlay}
                 {mediaOverlay}
             </span>
 
