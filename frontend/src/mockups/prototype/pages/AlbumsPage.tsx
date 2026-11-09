@@ -178,10 +178,22 @@ export const AlbumsPage: React.FC = () => {
     };
 
     const handleCreate = async (thenRename = false) => {
-        const id = await createAlbum('New album');
+        // Ask for the name first so cancelling doesn't leave a stray "New album".
+        let name = 'New album';
+        if (thenRename) {
+            const entered = await promptDialog({
+                title: 'New album',
+                label: 'Album name',
+                defaultValue: 'New album',
+                placeholder: 'e.g. Summer trip',
+                confirmLabel: 'Create',
+            });
+            if (entered === null) return;
+            name = entered.trim() || 'New album';
+        }
+        const id = await createAlbum(name);
         if (!id) return;
         navigate('albums', { albumId: id });
-        if (thenRename) await renameAlbumPrompt(id, 'New album');
     };
 
     const handleSmartCreate = async (rule: string) => {
