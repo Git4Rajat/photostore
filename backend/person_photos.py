@@ -49,19 +49,24 @@ def attributes_for_face(face: Dict) -> Dict[str, object]:
 
 def invalidate(user_id: str, person_id: str) -> None:
     with _LOCK:
-        _CACHE.pop((user_id, person_id), None)
+        for key in [k for k in _CACHE if k[0] == user_id and person_id in k[1].split('|')]:
+            _CACHE.pop(key, None)
 
 
-def ranked_filenames(user_id: str, person_id: str, members_table, face_table, *, use_cache: bool = True) -> List[str]:
-    """Every distinct photo of the person, best face first (confirmed, then confidence, then name)."""
-    key = (user_id, person_id)
+def ranked_filenames(user_id: str, person_id: str, members_table, face_table, *, use_cache: bool = True,
+                     group_ids=None) -> List[str]:
+    """Every distinct photo of the person, best face first (confirmed, then confidence, then name).
+    ``group_ids`` lists the person's overflow rows as well; their photos are ranked together."""
+    owners = list(group_ids) if group_ids else [person_id]
+    key = (user_id, '|'.join(owners))
     now = time.monotonic()
     if use_cache:
         with _LOCK:
             hit = _CACHE.get(key)
         if hit and now - hit[0] < CACHE_TTL_SECONDS:
             return hit[1]
-    rows = [dict(r) for r in members_table.query_entities(f"PartitionKey eq '{_quote(person_id)}'")]
+    rows = [dict(r, _owner=owner) for owner in owners
+            for r in members_table.query_entities(f"PartitionKey eq '{_quote(owner)}'")]
     missing = [r for r in rows if not r.get('filename')]
     if missing and face_table is not None:
         def hydrate(row: Dict) -> Optional[Dict]:
@@ -69,11 +74,11 @@ def ranked_filenames(user_id: str, person_id: str, members_table, face_table, *,
                 face = face_table.get_entity(partition_key=user_id, row_key=str(row['RowKey']))
             except Exception:
                 return None
-            if str(face.get('personId') or '') != person_id:
+            if str(face.get('personId') or '') != row['_owner']:
                 return None                                   # no longer this person's face
             attrs = attributes_for_face(face)
             try:
-                members_table.upsert_entity({'PartitionKey': person_id, 'RowKey': row['RowKey'], **attrs}, mode='merge')
+                members_table.upsert_entity({'PartitionKey': row['_owner'], 'RowKey': row['RowKey'], **attrs}, mode='merge')
             except Exception:
                 pass                                          # still usable this time; retried next open
             return attrs

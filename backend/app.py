@@ -3019,7 +3019,7 @@ def _semantic_embedding_for_row(
 # Every person column EXCEPT repEmbedding. A repEmbedding is a 512-float JSON string
 # (~5-8KB); holding it for tens of thousands of clusters is hundreds of MB per
 # cached copy, and the People list/roster/name-lookup routes never read it.
-PERSON_LIGHT_COLUMNS = ['PartitionKey', 'RowKey', 'name', 'faceIds', 'createdAt', 'declinedFaceSuggestions']
+PERSON_LIGHT_COLUMNS = ['PartitionKey', 'RowKey', 'name', 'faceIds', 'createdAt', 'declinedFaceSuggestions', 'groupId']
 _person_light_scan_cache = _UserScanCache(PEOPLE_SCAN_CACHE_TTL_SECONDS)
 
 
@@ -3058,6 +3058,46 @@ def _cached_person_rows_for_user(user_id: str, *, with_embeddings: bool = True) 
             return []
 
     return _person_scan_cache.get(user_id, _fetch)
+
+
+def _person_shard_ids(user_id: str, person_id: str) -> List[str]:
+    """Ids of the overflow rows tagged ``groupId == person_id`` (see faiss_assignment.choose_person): a person
+    whose membership list filled its table column spills further faces into these. Read fresh, not from the
+    scan cache, so a just-created shard is never missed."""
+    if person_table_client is None:
+        return []
+    try:
+        rows = person_table_client.query_entities(
+            f"PartitionKey eq '{_escape_odata(user_id)}' and groupId eq '{_escape_odata(person_id)}'",
+            select=['RowKey'])
+        return sorted(str(row['RowKey']) for row in rows if row.get('RowKey') and row['RowKey'] != person_id)
+    except Exception:
+        return []
+
+
+def _person_group_ids(user_id: str, person_id: str) -> List[str]:
+    """The person's own row id first, then its overflow shards (usually none)."""
+    return [person_id, *_person_shard_ids(user_id, person_id)]
+
+
+class PersonMergeUnsupported(Exception):
+    """A merge that involves a person with overflow shards, or whose result would not fit a person row."""
+
+
+def _check_person_merge_supported(user_id: str, rows: List[Dict]) -> None:
+    from faiss_assignment import FaissAssigner
+    face_ids: set = set()
+    for row in rows:
+        person_id = str(row.get('RowKey') or '')
+        if str(row.get('groupId') or '') or _person_shard_ids(user_id, person_id):
+            raise PersonMergeUnsupported(
+                'This person has more photos than one record can hold, so it can\'t be merged yet.')
+        try:
+            face_ids.update(str(fid) for fid in json.loads(row.get('faceIds', '[]') or '[]'))
+        except Exception:
+            pass
+    if not FaissAssigner._membership_fits({'faceIds': json.dumps(sorted(face_ids))}, ''):
+        raise PersonMergeUnsupported('The merged person would have too many photos for one record.')
 
 
 def _load_people_name_index(user_id: str) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
@@ -12725,6 +12765,8 @@ def _merge_persons_core(
             merged_snapshots.append(dict(person_table_client.get_entity(partition_key=user_id, row_key=mid)))
         except Exception:
             continue
+
+    _check_person_merge_supported(user_id, [base_snapshot, *merged_snapshots])
 
     merge_payload_blob_name = f'{user_id}/{merge_id}.json'
 
