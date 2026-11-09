@@ -580,7 +580,8 @@ AUTH_REQUIRED = os.getenv('AUTH_REQUIRED', 'true').lower() in ('1', 'true', 'yes
 AUTH_MODE = os.getenv('AUTH_MODE', 'password').strip().lower()
 # Single-owner password-mode configuration.
 OWNER_EMAIL = os.getenv('OWNER_EMAIL', '').strip()
-OWNER_PASSWORD = os.getenv('OWNER_PASSWORD', '')
+# An in-place upgrade (template upgradeExisting) never seeds a login; its secret is a placeholder.
+OWNER_PASSWORD = '' if os.getenv('OWNER_SEED_DISABLED') == 'true' else os.getenv('OWNER_PASSWORD', '')
 CONFIG_TABLE = os.getenv('CONFIG_TABLE', 'photostoreconfig')
 # Secret used to sign stateless session tokens. Falls back to a per-process random
 # value so the app still runs, but sessions then invalidate on restart / across
