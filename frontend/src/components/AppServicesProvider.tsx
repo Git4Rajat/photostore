@@ -1341,7 +1341,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
     // Popup-style feedback (showToast, the prototype store's toast) is mirrored
     // into the panel through this sink so nothing is popup-only.
-    useEffect(() => setNotificationSink((title, details) => { addNotification(title, details); }), [addNotification]);
+    useEffect(() => setNotificationSink((title, details, action) => {
+        const id = addNotification(title, details);
+        if (action) {
+            setNotifications((prev) => prev.map((n) => (n.id === id ? { ...n, action } : n)));
+        }
+    }), [addNotification]);
 
     // --- Background job completion notifier ---------------------------------
     // Long-running worker jobs (reclustering, "find more faces", library

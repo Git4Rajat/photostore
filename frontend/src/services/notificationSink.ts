@@ -4,7 +4,12 @@
 // publishes through publishNotification so it also lands in the panel (and
 // bumps the unread badge).
 
-export type NotificationSink = (title: string, details: string) => void;
+export interface NotificationAction {
+    label: string;
+    onClick: () => void;
+}
+
+export type NotificationSink = (title: string, details: string, action?: NotificationAction) => void;
 
 let sink: NotificationSink | null = null;
 
@@ -20,12 +25,12 @@ export const setNotificationSink = (next: NotificationSink | null): (() => void)
 export const hasNotificationSink = (): boolean => sink !== null;
 
 // Returns true when a panel accepted the notification.
-export const publishNotification = (title: string, details = ''): boolean => {
+export const publishNotification = (title: string, details = '', action?: NotificationAction): boolean => {
     if (!sink) {
         return false;
     }
     try {
-        sink(title, details);
+        sink(title, details, action);
         return true;
     } catch {
         return false;

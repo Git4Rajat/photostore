@@ -13,12 +13,21 @@ describe('notification routing', () => {
         expect(publishNotification('x')).toBe(false);
     });
 
-    it('routes plain toasts into the panel and still previews them', () => {
+    it('routes toasts to the bell preview and panel instead of a DOM popup', () => {
         const sink = vi.fn();
         setNotificationSink(sink);
         showToast('Saved to panel', { dedupeKey: 'plain-1' });
-        expect(sink).toHaveBeenCalledWith('Saved to panel', '');
-        expect(document.querySelector('.app-toast')).not.toBeNull();
+        expect(sink).toHaveBeenCalledWith('Saved to panel', '', undefined);
+        expect(document.querySelector('.app-toast')).toBeNull();
+    });
+
+    it('passes the action through so the preview can offer it', () => {
+        const sink = vi.fn();
+        setNotificationSink(sink);
+        const onClick = vi.fn();
+        showToast('Deleted', { dedupeKey: 'action-1', action: { label: 'Undo', onClick } });
+        expect(sink).toHaveBeenCalledWith('Deleted', '', { label: 'Undo', onClick });
+        expect(document.querySelector('.app-toast')).toBeNull();
     });
 
     it('skips the panel entry when the caller already added one', () => {
@@ -26,15 +35,7 @@ describe('notification routing', () => {
         setNotificationSink(sink);
         showToast('Already in panel', { dedupeKey: 'nopanel-1', panel: false });
         expect(sink).not.toHaveBeenCalled();
-        expect(document.querySelector('.app-toast')).not.toBeNull();
-    });
-
-    it('mirrors action toasts into the panel and keeps the popup with its action', () => {
-        const sink = vi.fn();
-        setNotificationSink(sink);
-        showToast('Deleted', { dedupeKey: 'action-1', action: { label: 'Undo', onClick: () => {} } });
-        expect(sink).toHaveBeenCalledTimes(1);
-        expect(document.querySelector('.app-toast__action')).not.toBeNull();
+        expect(document.querySelector('.app-toast')).toBeNull();
     });
 
     it('falls back to the popup when no panel exists', () => {

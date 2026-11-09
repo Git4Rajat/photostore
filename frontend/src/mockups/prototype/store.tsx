@@ -1063,8 +1063,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     const toast = useCallback(
         (message: string, actionLabel?: string, onAction?: () => void, tone: 'info' | 'error' = 'info') => {
-            // Previewed as a popup and also recorded in the notification panel.
-            publishNotification(message);
+            // With a panel mounted, the bell previews it and the panel records it.
+            if (publishNotification(message, '', actionLabel && onAction ? { label: actionLabel, onClick: onAction } : undefined)) return;
             const id = nextId();
             setToasts((prev) => [...prev, { id, message, actionLabel, onAction, tone }]);
             toastTimers.current[id] = window.setTimeout(() => {

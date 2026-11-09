@@ -2,7 +2,7 @@
 // Styling lives in index.css (.app-toast*) so it follows light/dark mode;
 // this module only manages the DOM lifecycle. Multiple toasts stack.
 
-import { publishNotification } from './notificationSink';
+import { hasNotificationSink, publishNotification } from './notificationSink';
 
 let toastStack: HTMLDivElement | null = null;
 
@@ -56,10 +56,14 @@ export const showToast = (message: string, optionsOrTimeout: number | ToastOptio
     }
     recentMessages.set(dedupeKey, now);
 
-    // Every toast is previewed as a popup and also recorded in the notification
-    // panel (when one is mounted), so nothing is popup-only.
-    if (options.panel !== false) {
-        publishNotification(message);
+    // With a notification panel mounted, the bell shows the preview (and the
+    // entry lives in the panel); the DOM popup is only the fallback for pages
+    // without one (e.g. the public album page).
+    if (hasNotificationSink()) {
+        if (options.panel !== false) {
+            publishNotification(message, '', options.action);
+        }
+        return;
     }
 
     try {

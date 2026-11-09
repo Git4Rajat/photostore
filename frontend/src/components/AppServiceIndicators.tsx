@@ -7,6 +7,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { BellIcon, TrashIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import { formatMegabytesPerSecond } from './browserAiShared';
 import { formatNotificationTime } from '../services/notificationTime';
+import type { AppNotification } from '../types/browserProcessing';
 import { useAppServices } from './AppServicesProvider';
 
 export const NotificationBell: React.FC = () => {
@@ -20,6 +21,39 @@ export const NotificationBell: React.FC = () => {
     } = useAppServices();
     const [showNotifications, setShowNotifications] = useState<boolean>(false);
     const wrapRef = useRef<HTMLDivElement | null>(null);
+
+    // Every new notification previews under the bell for a few seconds, the same
+    // way for all of them. Progress entries update constantly, so they're skipped.
+    const [preview, setPreview] = useState<AppNotification | null>(null);
+    const lastPreviewedRef = useRef<string | null>(null);
+    useEffect(() => {
+        const latest = notifications.reduce<AppNotification | null>(
+            (best, n) => (!n.progress && n.unread && (!best || n.timestamp > best.timestamp) ? n : best), null);
+        const key = latest ? `${latest.id}:${latest.timestamp}` : null;
+        if (lastPreviewedRef.current === null) {
+            lastPreviewedRef.current = key ?? '';
+            return;
+        }
+        if (!latest || key === lastPreviewedRef.current) {
+            return;
+        }
+        lastPreviewedRef.current = key;
+        if (!showNotifications) {
+            setPreview(latest);
+        }
+    }, [notifications, showNotifications]);
+    useEffect(() => {
+        if (!preview) {
+            return undefined;
+        }
+        const timer = window.setTimeout(() => setPreview(null), preview.action ? 8000 : 5000);
+        return () => window.clearTimeout(timer);
+    }, [preview]);
+    useEffect(() => {
+        if (showNotifications) {
+            setPreview(null);
+        }
+    }, [showNotifications]);
 
     const closeNotifications = useCallback(() => {
         setShowNotifications(false);
@@ -167,6 +201,26 @@ export const NotificationBell: React.FC = () => {
                 <BellIcon className="toolbar-icon" />
                 {unreadCount > 0 && <span className="notification-badge">{unreadCount}</span>}
             </button>
+            {preview && !showNotifications && (
+                <div className="notification-preview card-glass" role="status" aria-live="polite">
+                    <p className="notification-title">{preview.title}</p>
+                    {preview.details && <p className="notification-details">{preview.details}</p>}
+                    <time className="notification-time" dateTime={new Date(preview.timestamp).toISOString()}>
+                        {formatNotificationTime(preview.timestamp)}
+                    </time>
+                    {preview.action && (
+                        <button
+                            type="button"
+                            className="btn btn-soft"
+                            onClick={() => {
+                                try { preview.action?.onClick(); } finally { setPreview(null); }
+                            }}
+                        >
+                            {preview.action.label}
+                        </button>
+                    )}
+                </div>
+            )}
             {overlay}
         </div>
     );
