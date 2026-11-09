@@ -137,3 +137,46 @@ def test_a_group_merge_adopts_the_name_of_the_largest_named_source(merge_env):
 def test_merging_into_a_shard_is_refused(merge_env):
     with pytest.raises(app.PersonMergeUnsupported):
         app._merge_persons_core('u1', 'S', ['B'])
+
+
+def test_marking_a_shard_face_not_a_face_uses_the_row_that_owns_it(monkeypatch):
+    persons, faces, members = _world(monkeypatch)
+    monkeypatch.setattr(app, '_rebuild_metadata_faces_for_filenames', lambda *a, **k: {})
+    monkeypatch.setattr(app, '_resync_person_rule_albums', lambda *a, **k: None)
+    response = app.app.test_client().post('/api/persons/A/not-face', json={'faceId': 'f3'})
+    assert response.status_code == 200, response.get_json()
+    assert ('u1', 'S') not in persons.rows          # the shard's only face left, so the empty row went with it
+    assert json.loads(persons.get_entity('u1', 'A')['faceIds']) == ['f1', 'f2']
+
+
+def test_deleting_a_grouped_person_deletes_its_shards(monkeypatch):
+    persons, faces, members = _world(monkeypatch)
+    monkeypatch.setattr(app, '_rebuild_metadata_faces_for_filenames', lambda *a, **k: {})
+    monkeypatch.setattr(app, '_resync_person_rule_albums', lambda *a, **k: None)
+    monkeypatch.setattr(app, '_remove_person_member', lambda *a, **k: None)
+    app._person_light_scan_cache.invalidate('u1')
+    result = app._delete_person_cluster('u1', 'A')
+    assert result['deleted'] and result['facesUpdated'] == 3
+    assert ('u1', 'A') not in persons.rows and ('u1', 'S') not in persons.rows and ('u1', 'B') in persons.rows
+    assert all(faces.get_entity('u1', fid).get('rejected') for fid in ('f1', 'f2', 'f3'))
+
+
+def test_group_roots_map_each_shard_to_its_first_person(monkeypatch):
+    persons, faces, members = _world(monkeypatch)
+    persons.upsert_entity({**persons.get_entity('u1', 'A'), 'name': 'Asha'})
+    persons.upsert_entity({**persons.get_entity('u1', 'S'), 'name': 'Asha'})
+    app._person_light_scan_cache.invalidate('u1')
+    assert app._person_group_roots('u1') == {'S': 'A'}
+
+
+def test_a_photos_people_ids_name_the_first_person_for_a_shard_face(monkeypatch):
+    persons, faces, members = _world(monkeypatch)
+    metadata = FakeTable()
+    metadata.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'f3.jpg', 'faces': '[]', 'faceCount': 0, 'peopleIds': '[]'})
+    monkeypatch.setattr(app, 'metadata_table_client', metadata)
+    monkeypatch.setattr(app, 'get_face_ids_for_filename', lambda uid, fn: ['f3'])
+    updates = []
+    monkeypatch.setattr(app, '_update_metadata_entity_fields', lambda uid, fn, fields, **kw: updates.append(fields))
+    app._person_light_scan_cache.invalidate('u1')
+    app._rebuild_metadata_faces_for_filename('u1', 'f3.jpg', searchable_person_index={'S': 'Asha', 'A': 'Asha'})
+    assert updates and json.loads(updates[0]['peopleIds']) == ['A']

@@ -3080,6 +3080,30 @@ def _person_group_ids(user_id: str, person_id: str) -> List[str]:
     return [person_id, *_person_shard_ids(user_id, person_id)]
 
 
+def _person_group_roots(user_id: str) -> Dict[str, str]:
+    """{shard row id: first person's id} for every overflow shard (from the short-TTL scan cache)."""
+    roots: Dict[str, str] = {}
+    for row in _cached_person_rows_for_user(user_id, with_embeddings=False):
+        group_id = str(row.get('groupId') or '')
+        person_id = str(row.get('RowKey') or '')
+        if group_id and person_id and group_id != person_id:
+            roots[person_id] = group_id
+    return roots
+
+
+def _group_row_for_face(user_id: str, person_id: str, face_id: str) -> str:
+    """The row of ``person_id``'s group that actually owns the face (the person's own row when it is not a
+    grouped person's face). The UI addresses a group by its first person's id."""
+    shards = _person_shard_ids(user_id, person_id)
+    if not shards or face_table_client is None:
+        return person_id
+    try:
+        owner = str(face_table_client.get_entity(partition_key=user_id, row_key=face_id).get('personId') or '')
+    except Exception:
+        return person_id
+    return owner if owner in shards else person_id
+
+
 class PersonMergeUnsupported(Exception):
     """The merge target is itself an overflow shard, so it can't be merged into."""
 
@@ -7576,10 +7600,13 @@ def _rebuild_metadata_faces_for_filename(
     rows = sorted([row for row in rows if not _face_is_rejected(row)], key=lambda row: str(row.get('RowKey') or ''))
     faces_payload = [_face_payload_for_metadata(str(row.get('RowKey') or ''), row) for row in rows if row.get('RowKey')]
     people_ids = []
+    group_roots = _person_group_roots(user_id)
     for row in rows:
         person_id = str(row.get('personId') or '').strip()
-        if person_id and person_id in searchable_person_index and person_id not in people_ids:
-            people_ids.append(person_id)
+        if person_id and person_id in searchable_person_index:
+            person_id = group_roots.get(person_id, person_id)     # a shard's face counts for its group
+            if person_id not in people_ids:
+                people_ids.append(person_id)
     try:
         before_people_ids = [str(pid) for pid in json.loads(metadata.get('peopleIds', '[]') or '[]')]
     except Exception:
@@ -12725,13 +12752,29 @@ def make_media_url(filename: str, kind: str = 'thumbnail', blob_name: Optional[s
     return make_proxy_url(filename, kind)
 
 
-def _delete_person_cluster(user_id: str, person_id: str, *, rebuild_metadata: bool = True) -> Dict:
+def _delete_person_cluster(user_id: str, person_id: str, *, rebuild_metadata: bool = True,
+                          _shards: bool = True) -> Dict:
     if person_table_client is None:
         return {'deleted': False, 'facesUpdated': 0, 'filenames': []}
     try:
         person = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
     except Exception:
         return {'deleted': False, 'facesUpdated': 0, 'filenames': []}
+    if _shards:
+        # A grouped person is one person: its overflow rows go with it.
+        # From the 20 s scan cache, not a fresh query: a bulk delete runs this once per selected person.
+        shard_ids = sorted(sid for sid, root in _person_group_roots(user_id).items() if root == person_id)
+        if shard_ids:
+            result = _delete_person_cluster(user_id, person_id, rebuild_metadata=False, _shards=False)
+            names = set(result['filenames'])
+            updated = int(result['facesUpdated'])
+            for shard_id in shard_ids:
+                shard = _delete_person_cluster(user_id, shard_id, rebuild_metadata=False, _shards=False)
+                names.update(shard['filenames'])
+                updated += int(shard['facesUpdated'])
+            if rebuild_metadata:
+                _rebuild_metadata_faces_for_filenames(user_id, names)
+            return {'deleted': result['deleted'], 'facesUpdated': updated, 'filenames': sorted(names)}
     try:
         face_ids = json.loads(person.get('faceIds', '[]') or '[]')
     except Exception:
@@ -13042,6 +13085,7 @@ PEOPLE_MERGE_BATCH_MAX = 50
 
 
 def _mark_face_not_a_face(user_id: str, person_id: str, face_id: str) -> Dict:
+    person_id = _group_row_for_face(user_id, person_id, face_id)
     try:
         person = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
     except Exception:
@@ -13187,6 +13231,7 @@ def _delete_faces_bulk(user_id: str, face_ids: List[str]) -> Dict:
 def _split_face_into_new_person(user_id: str, person_id: str, face_id: str) -> Dict:
     if person_table_client is None or face_table_client is None:
         return {'success': False, 'error': 'People features not configured', 'status': 503}
+    person_id = _group_row_for_face(user_id, person_id, face_id)
     try:
         person = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
     except Exception:
