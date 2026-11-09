@@ -15,7 +15,7 @@ const SETTLE_MS = 150;
  * behaviour. Select state belongs to the host page (the store's global select mode in
  * the app, local state on the public album page), so it is passed in.
  */
-export const FloatingSelectButton: React.FC<{ selectMode: boolean; onToggle: () => void; suppressed?: boolean }> = ({ selectMode, onToggle, suppressed = false }) => {
+export const FloatingSelectButton: React.FC<{ selectMode: boolean; onToggle: () => void; suppressed?: boolean; noun?: string }> = ({ selectMode, onToggle, suppressed = false, noun = 'photos' }) => {
     const [visible, setVisible] = useState(false);
     const settleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -33,7 +33,7 @@ export const FloatingSelectButton: React.FC<{ selectMode: boolean; onToggle: () 
                 return;
             }
             // Only offer it where there is something to select on the current page.
-            settleTimer.current = setTimeout(() => setVisible(Boolean(container.querySelector('.pt-grid'))), SETTLE_MS);
+            settleTimer.current = setTimeout(() => setVisible(Boolean(container.querySelector('.pt-grid, .pt-people-grid'))), SETTLE_MS);
         };
         container.addEventListener('scroll', onScroll, { passive: true });
         return () => {
@@ -47,7 +47,7 @@ export const FloatingSelectButton: React.FC<{ selectMode: boolean; onToggle: () 
     // `suppressed`: another control already occupies this corner (the app's bottom selection bar,
     // which has its own close button, covers it once something is selected).
     const shown = visible && !suppressed;
-    const label = selectMode ? 'Done selecting' : 'Select photos';
+    const label = selectMode ? 'Done selecting' : `Select ${noun}`;
     return (
         <button
             type="button"

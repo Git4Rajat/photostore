@@ -5,6 +5,7 @@ import { Swatch, Spinner, SelectionBar } from '../components/bits';
 import { ThumbSizeControl, useTileSize } from '../components/controls';
 import PhotoGrid from '../components/PhotoGrid';
 import ScrollSentinel from '../components/ScrollSentinel';
+import { FloatingSelectButton } from '../components/FloatingSelectButton';
 import { useProtectedBlobUrls } from '../../../services/imageClient';
 import { confirmDialog } from '../../../components/shared/dialogs';
 import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
@@ -133,6 +134,14 @@ export const PeoplePage: React.FC = () => {
                 })}
             </div>
             {peopleHasMore && <ScrollSentinel onVisible={loadMorePeople} deps={people.length} />}
+            {people.length > 1 && (
+                <FloatingSelectButton
+                    selectMode={selectMode}
+                    onToggle={() => (selectMode ? exitSelectMode() : setSelectMode(true))}
+                    suppressed={selectedIds.length > 0}
+                    noun="people"
+                />
+            )}
             {selectMode && selectedIds.length > 0 && (
                 <SelectionBar count={selectedIds.length} onClear={exitSelectMode} label="People selection actions">
                     <button
