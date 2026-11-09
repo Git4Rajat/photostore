@@ -101,3 +101,15 @@ def test_decode_round_trips_entity_values():
     import vision_buffer
     row = {'a': 1, 'b': b'x', 'c': datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc), 'd': {1, 2}}
     assert dict(vision_buffer.decode(vision_buffer.encode(row))) == row
+
+
+def test_datetime_columns_from_the_tables_sdk_round_trip_through_the_buffer():
+    """azure-data-tables returns datetime columns as TablesEntityDatetime; the restricted unpickler must accept it."""
+    import datetime
+    import pytest
+    pytest.importorskip('azure.data.tables')
+    from azure.data.tables._deserialize import TablesEntityDatetime
+    import vision_buffer
+    value = TablesEntityDatetime(2026, 1, 2, 3, 4, 5, tzinfo=datetime.timezone.utc)
+    restored = vision_buffer.decode(vision_buffer.encode({'PartitionKey': 'p', 'RowKey': 'r', 'when': value}))
+    assert restored['when'] == value
