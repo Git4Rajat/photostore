@@ -22,13 +22,14 @@ param resourceGroupName string = '${appName}-rg'
 @description('Azure region for the resource group and all resources.')
 param location string = deployment().location
 
+@description('Upgrade an existing deployment in place; login email, email data location and processing mode are taken from it.')
+param upgradeExisting bool = false
 @description('Your login email. Used to sign in and to receive password-reset emails.')
-param adminEmail string
+param adminEmail string = ''
 
 @description('Your login password (at least 8 characters). You can change it later inside the app.')
-@minLength(8)
 @secure()
-param adminPassword string
+param adminPassword string = ''
 
 @description('Where Azure Communication Services stores email data. Pick the option closest to you.')
 @allowed([
@@ -105,6 +106,15 @@ resource rg 'Microsoft.Resources/resourceGroups@2024-03-01' = {
   location: location
 }
 
+// Upgrade mode: read what the existing deployment already has instead of asking again.
+module existing 'existing.bicep' = if (upgradeExisting) {
+  name: 'photostore-existing'
+  scope: rg
+  params: {
+    appName: appName
+  }
+}
+
 // Deploy all Photostore resources into the group above.
 module app 'resources.bicep' = {
   name: 'photostore-resources'
@@ -112,10 +122,11 @@ module app 'resources.bicep' = {
   params: {
     appName: appName
     location: location
-    adminEmail: adminEmail
+    upgradeExisting: upgradeExisting
+    adminEmail: upgradeExisting ? existing!.outputs.ownerEmail : adminEmail
     adminPassword: adminPassword
-    emailDataLocation: emailDataLocation
-    processingMode: processingMode
+    emailDataLocation: upgradeExisting ? any(existing!.outputs.emailDataLocation) : emailDataLocation
+    processingMode: upgradeExisting ? any(existing!.outputs.processingMode) : processingMode
     coreImage: coreImage
     webImage: webImage
     visionImage: visionImage
