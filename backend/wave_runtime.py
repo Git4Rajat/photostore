@@ -465,6 +465,11 @@ def consume(payload,*,deadline=None,progress=None):
         # page lost a race. Persistent no-progress contention still exhausts.
         progressing = float(current.get('lastProgressAt') or 0) > float(wave.get('lastProgressAt') or 0)
         delay = min(30, 2 ** min(claim.attempt, 5))
+        # While uploads are still opening waves in this library, intake writes keep winning the shared control
+        # and partition rows, so a 30s retry just loses again and burns the attempt budget. Wait longer then.
+        control = store._get('control') or {}
+        if control.get('collectingWaveId') and control['collectingWaveId'] != wave_id:
+            delay = min(120, 15 * 2 ** min(claim.attempt, 3))
         work.release(claim, deferred=progressing, reset_attempts=progressing,
                      retry_delay=delay, retry_reason='coordination_conflict')
         relay_current(work, store, current, send_stage)
