@@ -13,15 +13,23 @@ describe('notification routing', () => {
         expect(publishNotification('x')).toBe(false);
     });
 
-    it('routes plain toasts into the panel without a popup', () => {
+    it('routes plain toasts into the panel and still previews them', () => {
         const sink = vi.fn();
         setNotificationSink(sink);
         showToast('Saved to panel', { dedupeKey: 'plain-1' });
         expect(sink).toHaveBeenCalledWith('Saved to panel', '');
-        expect(document.querySelector('.app-toast')).toBeNull();
+        expect(document.querySelector('.app-toast')).not.toBeNull();
     });
 
-    it('mirrors action toasts into the panel and keeps the popup for the action', () => {
+    it('skips the panel entry when the caller already added one', () => {
+        const sink = vi.fn();
+        setNotificationSink(sink);
+        showToast('Already in panel', { dedupeKey: 'nopanel-1', panel: false });
+        expect(sink).not.toHaveBeenCalled();
+        expect(document.querySelector('.app-toast')).not.toBeNull();
+    });
+
+    it('mirrors action toasts into the panel and keeps the popup with its action', () => {
         const sink = vi.fn();
         setNotificationSink(sink);
         showToast('Deleted', { dedupeKey: 'action-1', action: { label: 'Undo', onClick: () => {} } });

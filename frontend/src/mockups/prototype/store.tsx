@@ -1063,10 +1063,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     const toast = useCallback(
         (message: string, actionLabel?: string, onAction?: () => void, tone: 'info' | 'error' = 'info') => {
-            // Always mirrored into the notification panel; only action toasts
-            // (Undo/Retry) still pop up when a panel is present.
-            const inPanel = publishNotification(message);
-            if (inPanel && !actionLabel) return;
+            // Previewed as a popup and also recorded in the notification panel.
+            publishNotification(message);
             const id = nextId();
             setToasts((prev) => [...prev, { id, message, actionLabel, onAction, tone }]);
             toastTimers.current[id] = window.setTimeout(() => {

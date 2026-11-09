@@ -37,6 +37,8 @@ export interface ToastOptions {
     // When set, identical keys within a short window are suppressed. Defaults to
     // the message text.
     dedupeKey?: string;
+    // Set false when the caller already added its own panel entry.
+    panel?: boolean;
 }
 
 // Accepts either a bare timeout (back-compat) or a full options object.
@@ -54,12 +56,10 @@ export const showToast = (message: string, optionsOrTimeout: number | ToastOptio
     }
     recentMessages.set(dedupeKey, now);
 
-    // Every toast also lands in the notification panel. When a panel is
-    // present, only toasts carrying an action (Undo/Retry) still pop up, since
-    // the action must be reachable right away; the rest are panel-only.
-    const inPanel = publishNotification(message);
-    if (inPanel && !options.action) {
-        return;
+    // Every toast is previewed as a popup and also recorded in the notification
+    // panel (when one is mounted), so nothing is popup-only.
+    if (options.panel !== false) {
+        publishNotification(message);
     }
 
     try {
