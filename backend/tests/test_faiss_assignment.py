@@ -1029,17 +1029,26 @@ def test_local_write_failure_invalidates_and_retry_rebuilds(monkeypatch):
     assert len(h.faces.queries) == 2 and len(h.people.rows) == 1
 
 
-def test_legacy_membership_overflow_fails_before_any_authoritative_write():
+def test_full_person_starts_a_new_person_instead_of_failing():
     h = Harness()
     huge_ids = ['x' * 31000, 'a']
     before = h.person('alice', huge_ids)
     h.face('a', person='alice')
     h.face('new')
-    with pytest.raises(ValueError, match='60 KiB'):
-        h.assign('new')
+    assignments, created = h.assign('new')
+    deterministic = h.assigner.person_id('u', 'new')
+    assert assignments == {'new': deterministic} and created == {deterministic}
     assert h.people.rows['u', 'alice'] == before
-    assert h.faces.rows['u', 'new']['personId'] == '' and not h.members.rows
-    assert not any(event in ('person', 'face', 'member') for event in h.events)
+    assert h.faces.rows['u', 'new']['personId'] == deterministic
+
+
+def test_legacy_membership_writer_still_refuses_to_truncate():
+    from faiss_assignment import FaissAssigner
+    person = {'faceIds': '["' + 'x' * 31000 + '"]'}
+    assert not FaissAssigner._membership_fits(person, 'a')
+    with pytest.raises(ValueError, match='60 KiB'):
+        FaissAssigner._membership(person, 'a')
+    assert FaissAssigner._membership_fits({'faceIds': '["a"]'}, 'b')
 
 
 @pytest.mark.parametrize('value', ['not json', '{}', '[true,0]', '["1",0]',
