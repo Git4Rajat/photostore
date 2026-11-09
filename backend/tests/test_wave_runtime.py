@@ -228,6 +228,23 @@ def test_coordination_contention_queues_short_retry_and_exhausts_existing_budget
     assert len(sent) == 5
 
 
+def test_coordination_contention_backs_off_longer_while_another_wave_collects(monkeypatch, vision_dispatch):
+    from upload_waves import MutationContention
+    store, work, wave, token, payload, sent = vision_dispatch
+    control = store._required('control')
+    store.table.submit_transaction([store._change(control, dict(control, collectingWaveId='another-wave'))])
+    def conflict(*args, **kwargs):
+        raise MutationContention('Concurrent wave mutation')
+    monkeypatch.setattr(runtime, 'run_vision_release', conflict)
+    now = [1000.0]
+    work.clock = lambda: now[0]
+    for attempt, delay in enumerate([30, 60, 120, 120, 120], 1):
+        assert runtime.consume(payload) == 'done'
+        assert work._get(token)['attempts'] == attempt
+        assert sent[-1][3] == delay
+        now[0] += delay + 1
+
+
 def test_progress_resets_vision_dispatch_failures_between_pages(monkeypatch, vision_dispatch):
     store, work, wave, token, payload, sent = vision_dispatch
     now = [1000.0]
