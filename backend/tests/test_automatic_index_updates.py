@@ -741,3 +741,34 @@ def test_wave_scopes_exclude_vector_but_still_accept_it_for_in_flight_waves():
     import wave_catalog
     assert 'vector' not in wave_catalog.SCOPES
     assert 'vector' in wave_catalog.ACCEPTED_SCOPES
+
+
+def test_stale_reservation_is_reaped_and_forces_full_build(runtime, monkeypatch):
+    stale = runtime.store.begin('A', 'lexical_artifact', ['photo1'], owner='dead-pod')
+    fresh = runtime.store.begin('A', 'lexical_artifact', ['photo2'], owner='live-pod')
+    row = runtime.store.reservations('A', 'lexical_artifact')
+    old = next(r for r in row if r['reservationId'] == stale)
+    runtime.store.table.upsert_entity(dict(old, startedAt=old['startedAt'] - 3 * 3600))
+
+    # The live writer still blocks the build, but the dead one is gone.
+    with pytest.raises(automatic.SourceBusy):
+        runtime.store.capture('A', 'lexical_artifact')
+    assert [r['reservationId'] for r in runtime.store.reservations('A', 'lexical_artifact')] == [fresh]
+    control = runtime.store.control('A', 'lexical_artifact')
+    assert control['active'] == 1 and control['fullRequired'] is True
+
+    runtime.store.finish('A', 'lexical_artifact', reservation_id=fresh)
+    captured = runtime.store.capture('A', 'lexical_artifact')
+    assert set(captured.ids) == {'photo1', 'photo2'}
+
+
+def test_fresh_reservation_is_not_reaped_and_reaping_can_be_disabled(runtime, monkeypatch):
+    res = runtime.store.begin('A', 'vector', ['photo1'])
+    assert runtime.store.reap_stale_reservations('A', 'vector') == []
+    old = runtime.store.reservations('A', 'vector')[0]
+    runtime.store.table.upsert_entity(dict(old, startedAt=old['startedAt'] - 10 * 3600))
+    monkeypatch.setattr(automatic, 'STALE_RESERVATION_SECONDS', 0)
+    with pytest.raises(automatic.SourceBusy):
+        runtime.store.capture('A', 'vector')
+    assert runtime.store.control('A', 'vector')['active'] == 1
+    assert [r['reservationId'] for r in runtime.store.reservations('A', 'vector')] == [res]

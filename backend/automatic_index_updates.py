@@ -57,6 +57,10 @@ KINDS = ('vector', 'people_embedding', 'tag_embedding', 'lexical_artifact', 'has
 CONTROL = '!coverage'
 VERSION = 1
 LIMIT = 4096
+# A reservation that has not been closed for this long belongs to a writer that
+# died (scale-down, rollout, crash) and would otherwise block every artifact
+# build for the library forever. 0 disables reaping (operator recovery only).
+STALE_RESERVATION_SECONDS = int(os.getenv('INDEX_STALE_RESERVATION_SECONDS', '7200'))
 # Per-kind bound on a certified incremental ID set; larger sets take the full path.
 KIND_ID_CAPS = {'vector': 4096, 'people_embedding': 4096, 'lexical_artifact': 4096,
                 'tag_embedding': 512, 'hash': 512}
@@ -404,8 +408,44 @@ class CoverageStore:
         except Exception:
             return []
 
+    def reap_stale_reservations(self, user, kind, *, max_age=None, now=None):
+        """Close reservations whose writer is long gone; the next build is forced full.
+
+        Each reap is one transaction (delete the reservation row + decrement
+        ``active``), so a writer that finishes concurrently either wins the
+        delete (we skip) or loses it (its own finish() then finds no row).
+        """
+        max_age = STALE_RESERVATION_SECONDS if max_age is None else max_age
+        if max_age <= 0:
+            return []
+        now = time.time() if now is None else now
+        pk = partition(user, kind)
+
+        def reap(row):
+            row['active'] = max(0, int(row.get('active') or 0) - 1)
+            row.update(fullRequired=True, base='', coveredRevision='')
+
+        reaped = []
+        for res in self.reservations(user, kind):
+            if now - float(res.get('startedAt') or 0) <= max_age:
+                continue
+            try:
+                self._change(user, kind, reap,
+                             extra_ops=[('delete', dict(PartitionKey=pk, RowKey=res['RowKey']))])
+            except Exception as error:
+                if isinstance(error, ResourceNotFoundError) or getattr(error, 'status_code', None) == 404:
+                    continue
+                raise
+            reaped.append({key: res.get(key) for key in
+                           ('reservationId', 'owner', 'operation', 'startedAt', 'idsCount')})
+        if reaped:
+            LOG.warning('Reaped stale source reservations for library=%r kind=%s: %s', user, kind, reaped)
+        return reaped
+
     def capture(self, user, kind):
         row = self.ensure(user, kind)
+        if row.get('active') and self.reap_stale_reservations(user, kind):
+            row = self.ensure(user, kind)
         if row.get('active'):
             raise SourceBusy(f'Active {kind} source intent for {user}')
         pk = row['PartitionKey']
