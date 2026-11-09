@@ -55,6 +55,47 @@ export async function generateUploadThumbnail(source: Source): Promise<UploadDer
     return result;
 }
 
+// Draws a small "VIDEO" pill in the bottom-left corner of a thumbnail-sized frame so video tiles are
+// recognisable everywhere the thumbnail is shown. Returns a canvas for generateUploadThumbnail; a stamp
+// failure falls back to the plain frame rather than failing the upload.
+export function stampVideoThumbnail(source: Source): Source {
+    try {
+        const {width, height} = uploadDerivativeSize(source.width, source.height, UPLOAD_THUMBNAIL_MAX_EDGE);
+        const canvas = new OffscreenCanvas(width, height);
+        const context = canvas.getContext('2d') as OffscreenCanvasRenderingContext2D | null;
+        if (!context) return source;
+        context.imageSmoothingEnabled = true;
+        context.imageSmoothingQuality = 'high';
+        context.drawImage(source, 0, 0, width, height);
+        const fontSize = Math.max(8, Math.round(height * 0.14));
+        const pad = Math.max(3, Math.round(height * 0.05));
+        context.font = `600 ${fontSize}px system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif`;
+        context.textBaseline = 'alphabetic';
+        const metrics = context.measureText('VIDEO');
+        const textHeight = metrics.actualBoundingBoxAscent + metrics.actualBoundingBoxDescent;
+        const boxWidth = Math.ceil(metrics.width + pad * 2);
+        const boxHeight = Math.ceil(textHeight + pad * 2);
+        const x = pad;
+        const y = height - boxHeight - pad;
+        if (boxWidth + pad * 2 > width || boxHeight + pad * 2 > height) return source;
+        const radius = boxHeight / 2;
+        context.fillStyle = 'rgba(0, 0, 0, 0.67)';
+        context.beginPath();
+        context.moveTo(x + radius, y);
+        context.arcTo(x + boxWidth, y, x + boxWidth, y + boxHeight, radius);
+        context.arcTo(x + boxWidth, y + boxHeight, x, y + boxHeight, radius);
+        context.arcTo(x, y + boxHeight, x, y, radius);
+        context.arcTo(x, y, x + boxWidth, y, radius);
+        context.closePath();
+        context.fill();
+        context.fillStyle = 'rgba(255, 255, 255, 0.94)';
+        context.fillText('VIDEO', x + pad, y + pad + metrics.actualBoundingBoxAscent);
+        return canvas;
+    } catch {
+        return source;
+    }
+}
+
 // Call only after native decoding; dimensions must match that decoded image.
 export async function eligibleUploadJpeg(source: Blob, width: number, height: number): Promise<boolean> {
     if (![width, height].every(value => Number.isInteger(value) && value > 0)

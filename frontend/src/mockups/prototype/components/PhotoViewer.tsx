@@ -9,7 +9,7 @@ import { Menu, Stars } from './bits';
 import { AddToAlbumMenu } from './AddToAlbumMenu';
 import ViewerShell from './ViewerShell';
 import { useStore, isVideoFilename } from '../store';
-import { useMainMedia, downloadPhoto, fetchPhotoMetadata, preloadMediaAccessUrls } from '../media';
+import { useMainMedia, useVideoSource, downloadPhoto, fetchPhotoMetadata, preloadMediaAccessUrls } from '../media';
 import type { PhotoMetadata } from '../media';
 
 const dash = (value?: string | number): string => {
@@ -122,7 +122,8 @@ const PhotoViewer: React.FC = () => {
         return () => { active = false; };
     }, [showInfo, photo, meta]);
 
-    const media = useMainMedia(photo, fullRes);
+    const media = useMainMedia(photo && isVideoFilename(photo.filename) ? null : photo, fullRes);
+    const video = useVideoSource(photo);
 
     if (!viewer) return null;
     if (!photo) return null;
@@ -146,6 +147,10 @@ const PhotoViewer: React.FC = () => {
             onClose={closeViewer}
             onStep={viewerStep}
             media={{ url: media.url, loading: media.loading, progress: media.progress, status: media.status }}
+            videoSrc={video.src}
+            onVideoError={video.reportError}
+            videoFailed={video.failed}
+            videoPoster={video.poster}
             fullRes={fullRes}
             onToggleFullRes={() => setFullRes((v) => !v)}
             showFullResControl={!isVideo}

@@ -326,7 +326,7 @@ def proxy_image(filename: str):
     try:
         try:
             props = app.get_media_properties('image', blob_name_to_serve)
-            content_type = props.get('content_type') or 'image/jpeg'
+            content_type = app._media_content_type(props.get('content_type'), safe_name)
         except Exception as e:
             # File doesn't exist or can't be accessed
             if '404' in str(e) or 'ResourceNotFound' in str(e) or 'does not exist' in str(e).lower():
