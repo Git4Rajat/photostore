@@ -2,6 +2,8 @@
 // Styling lives in index.css (.app-toast*) so it follows light/dark mode;
 // this module only manages the DOM lifecycle. Multiple toasts stack.
 
+import { publishNotification } from './notificationSink';
+
 let toastStack: HTMLDivElement | null = null;
 
 // Remember the last few messages briefly so a burst of identical failures
@@ -51,6 +53,14 @@ export const showToast = (message: string, optionsOrTimeout: number | ToastOptio
         return;
     }
     recentMessages.set(dedupeKey, now);
+
+    // Every toast also lands in the notification panel. When a panel is
+    // present, only toasts carrying an action (Undo/Retry) still pop up, since
+    // the action must be reachable right away; the rest are panel-only.
+    const inPanel = publishNotification(message);
+    if (inPanel && !options.action) {
+        return;
+    }
 
     try {
         const el = document.createElement('div');
