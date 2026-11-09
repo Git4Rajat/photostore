@@ -8,7 +8,7 @@ import {
 
 export type UploadPreparationResult = {
     status: 'generated'; preview?: UploadDerivative; thumbnail: UploadDerivative;
-    runtime?: 'embedded_video_jpeg' | 'native_video' | 'ffmpeg_wasm'; readBytes?: number; readCalls?: number;
+    runtime?: 'embedded_video_jpeg' | 'webcodecs_video' | 'native_video' | 'ffmpeg_wasm'; readBytes?: number; readCalls?: number;
 } | {status: 'fallback'; reason: string; failureReason?: string};
 
 type PreparationWorker = Pick<Worker, 'postMessage' | 'terminate' | 'onmessage' | 'onerror'>;
@@ -106,7 +106,7 @@ export class UploadAssetPreparer {
     // transient contention rather than a deterministic decode/format problem.
     private retryOrFinish(job: Job, result: UploadPreparationResult): void {
         if (job.settled) return;
-        if (result.status === 'fallback' && !job.retried && RETRYABLE_FAILURE_REASONS.has(result.failureReason ?? '')) {
+        if (result.status === 'fallback' && !job.retried && !isVideoFilename(job.file.name) && RETRYABLE_FAILURE_REASONS.has(result.failureReason ?? '')) {
             job.retried = true;
             clearTimeout(job.timer);
             if (job.worker) discardUploadWorker(job.worker);

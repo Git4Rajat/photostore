@@ -50,7 +50,7 @@ def bounded_report(value):
             clean['target'] = raw['target']
         if asset == 'preview' and type(raw.get('passthrough')) is bool:
             clean['passthrough'] = raw['passthrough']
-        if type(raw.get('runtime')) is str and raw['runtime'] in {'embedded_video_jpeg', 'native_video', 'ffmpeg_wasm', 'mediainfo_wasm'}:
+        if type(raw.get('runtime')) is str and raw['runtime'] in {'embedded_video_jpeg', 'webcodecs_video', 'native_video', 'ffmpeg_wasm', 'mediainfo_wasm'}:
             clean['runtime'] = raw['runtime']
         for field in ('generationReason', 'uploadReason'):
             if type(raw.get(field)) is str and raw[field] in REASONS:
