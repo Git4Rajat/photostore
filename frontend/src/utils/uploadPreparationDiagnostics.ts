@@ -13,7 +13,7 @@ export interface AssetPreparationDiagnostic {
     queueMs?: number;
     httpStatus?: number;
     attempts?: number;
-    runtime?: 'embedded_video_jpeg' | 'native_video' | 'ffmpeg_wasm' | 'mediainfo_wasm';
+    runtime?: 'embedded_video_jpeg' | 'webcodecs_video' | 'native_video' | 'ffmpeg_wasm' | 'mediainfo_wasm';
     readBytes?: number;
     readCalls?: number;
 }

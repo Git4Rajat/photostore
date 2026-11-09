@@ -106,8 +106,42 @@ export async function wasmVideoThumbnail(file: File, signal: AbortSignal): Promi
     } finally { signal.removeEventListener('abort', abort); ffmpeg.terminate(); }
 }
 
+const WEBCODECS_BUDGET_MS = 6000;
+
+// Demuxes only the container index and the first keyframe (a few Blob.slice
+// reads) and decodes it with the platform's hardware decoder via WebCodecs.
+// Tens of milliseconds instead of waiting on a <video> element or FFmpeg WASM.
+async function webCodecsVideoThumbnail(file: File, signal: AbortSignal): Promise<UploadDerivative> {
+    if (signal.aborted) throw aborted();
+    if (typeof VideoDecoder === 'undefined') throw new Error('Video decode unsupported');
+    const {Input, BlobSource, ALL_FORMATS, CanvasSink} = await import('mediabunny');
+    const input = new Input({source: new BlobSource(file), formats: ALL_FORMATS});
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    const stop = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('Video decode unsupported')), WEBCODECS_BUDGET_MS);
+        onAbort = () => reject(aborted());
+        signal.addEventListener('abort', onAbort, {once: true});
+    });
+    const work = (async () => {
+        const track = await input.getPrimaryVideoTrack();
+        if (!track || !await track.canDecode()) throw new Error('Video decode unsupported');
+        if (track.displayWidth * track.displayHeight > VIDEO_MAX_FRAME_PIXELS) throw new Error('Video resource guard');
+        const start = await track.getFirstTimestamp();
+        const duration = await track.computeDuration();
+        const sink = new CanvasSink(track, {...(track.displayWidth >= track.displayHeight ? {width: UPLOAD_THUMBNAIL_MAX_EDGE} : {height: UPLOAD_THUMBNAIL_MAX_EDGE}), poolSize: 1});
+        const frame = await sink.getCanvas(start + Math.min(1, Math.max(0, duration - start) * .1));
+        if (!frame) throw new Error('Video decode unsupported');
+        const pixels = await createImageBitmap(frame.canvas);
+        try { return await generateUploadThumbnail(stampVideoThumbnail(pixels)); } finally { pixels.close(); }
+    })();
+    work.catch(() => undefined);
+    try { return await Promise.race([work, stop]); }
+    finally { clearTimeout(timer); signal.removeEventListener('abort', onAbort!); input.dispose(); }
+}
+
 export async function prepareVideoThumbnail(file: File, signal: AbortSignal): Promise<{
-    thumbnail: UploadDerivative; runtime: 'embedded_video_jpeg' | 'native_video' | 'ffmpeg_wasm'; readBytes?: number; readCalls?: number;
+    thumbnail: UploadDerivative; runtime: 'embedded_video_jpeg' | 'webcodecs_video' | 'native_video' | 'ffmpeg_wasm'; readBytes?: number; readCalls?: number;
 }> {
     if (signal.aborted) throw aborted();
     if (file.size <= 0 || file.size > VIDEO_MAX_SOURCE_BYTES) throw new Error('Video resource guard');
@@ -123,6 +157,11 @@ export async function prepareVideoThumbnail(file: File, signal: AbortSignal): Pr
         } catch {
             if (signal.aborted) throw aborted();
         } finally { pixels?.close(); }
+    }
+    try { return {thumbnail: await webCodecsVideoThumbnail(file, signal), runtime: 'webcodecs_video'}; }
+    catch (error) {
+        if (signal.aborted) throw aborted();
+        if (error instanceof Error && error.message.includes('resource guard')) throw error;
     }
     try { return {thumbnail: await nativeVideoThumbnail(file, signal), runtime: 'native_video'}; }
     catch (error) {
