@@ -4,6 +4,8 @@
 
 [![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2FGit4Rajat%2Fphotostore%2Fmain%2Fdeploy%2Fazuredeploy.json/createUIDefinitionUri/https%3A%2F%2Fraw.githubusercontent.com%2FGit4Rajat%2Fphotostore%2Fmain%2Fdeploy%2FcreateUiDefinition.json)
 
+**Already deployed?** [Upgrade to the latest release](#upgrading) with the same button, using your existing resource group and app name.
+
 ## Prerequisites
 
 - **An Azure subscription** where you can deploy at subscription scope (Owner, or Contributor plus permission to create a resource group). The template creates its own resource group (`<appName>-rg` by default), so there's nothing to set up first.
@@ -12,7 +14,19 @@
 - **Public container images** — the button pulls prebuilt images from GHCR, so the [Publish images workflow](.github/workflows/publish-images.yml) must have run and the packages must be set to **Public** (relevant if you fork the project).
 - **A modern browser** to use the app. Nothing needs to be installed locally.
 
-For a fresh, wave-enabled library use the [Azure CLI fresh-deployment guide](deploy/fresh-wave.md) instead of the portal button.
+The portal button deploys a fully featured library: the owner library is created for your email and wave uploads are enabled. The [Azure CLI fresh-deployment guide](deploy/fresh-wave.md) is only needed for advanced, scripted installs.
+
+## Upgrading
+
+Run the **Deploy to Azure** button again against your existing deployment. The template is incremental, so it updates the container images in place and keeps your photos and library.
+
+[![Upgrade](https://img.shields.io/badge/Upgrade-Keepsake-0078D4?logo=microsoftazure&logoColor=white)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2FGit4Rajat%2Fphotostore%2Fmain%2Fdeploy%2Fazuredeploy.json/createUIDefinitionUri/https%3A%2F%2Fraw.githubusercontent.com%2FGit4Rajat%2Fphotostore%2Fmain%2Fdeploy%2FcreateUiDefinition.json)
+
+- Use the **same subscription, region and app name** as the original deployment.
+- Re-enter your email and password. An existing login is kept as it is; the password you type here does not replace it.
+- Wait until no upload is running. The update restarts the apps, which interrupts uploads in progress.
+- Everyone is signed out once, because the session secret is regenerated.
+- A library from an earlier release is moved to the new release automatically when that release lists it as compatible. Otherwise the apps report the library as not qualified for wave uploads, and you upgrade it with [`deploy/upgrade_wave.py`](deploy/upgrade-wave.md).
 
 ## Features
 
