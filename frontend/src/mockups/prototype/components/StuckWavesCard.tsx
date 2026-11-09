@@ -7,6 +7,8 @@ interface WaveHealth {
     reason?: string;
     stage?: string | null;
     dispatchAttempts?: number;
+    ownerActive?: boolean;
+    noProgressSeconds?: number;
     blockedByWaveId?: string;
 }
 interface AttentionWave {
@@ -17,11 +19,16 @@ interface AttentionWave {
 }
 interface Attention { waves: AttentionWave[]; truncated?: boolean }
 
-// Only a wave whose current stage gave up (or never got queued) can be retried; the server also refuses
-// while a worker still owns the stage.
+// A wave can be retried when its current stage gave up or was never queued, or when no worker owns it and it
+// has made no progress for a while (e.g. attempts used up but nothing queued). The server also refuses the
+// retry while a worker still owns the stage.
+export const IDLE_RETRY_SECONDS = 600;
 export const canRetry = (wave: AttentionWave): boolean => {
     const health = wave.health;
-    return !!health?.stage && (health.state === 'failed' || health.reason === 'dispatch_missing');
+    if (!health?.stage) return false;
+    if (health.state === 'failed' || health.reason === 'dispatch_missing') return true;
+    return health.state === 'pending' && health.ownerActive === false
+        && (health.noProgressSeconds ?? 0) >= IDLE_RETRY_SECONDS;
 };
 
 export const describeWave = (wave: AttentionWave): string => {
@@ -29,6 +36,7 @@ export const describeWave = (wave: AttentionWave): string => {
     if (health.state === 'failed') return `Failed in ${health.stage || 'a stage'} after ${health.dispatchAttempts ?? 0} attempts`;
     if (health.state === 'blocked') return `Waiting for an earlier wave (${health.blockedByWaveId || 'unknown'}) to publish`;
     if (health.reason === 'dispatch_missing') return `Not queued for ${health.stage || 'its stage'}`;
+    if (canRetry(wave)) return `Idle in ${health.stage} for ${Math.round((health.noProgressSeconds ?? 0) / 60)} min with no worker`;
     if (health.state === 'processing') return `Running ${health.stage || ''}`.trim();
     return `Queued for ${health.stage || 'its next stage'}`;
 };

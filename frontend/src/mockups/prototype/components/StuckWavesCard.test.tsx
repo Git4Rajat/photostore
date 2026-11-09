@@ -7,6 +7,10 @@ describe('StuckWavesCard helpers', () => {
         expect(canRetry({ state: 'ready', health: { state: 'pending', reason: 'dispatch_missing', stage: 'cluster' } })).toBe(true);
         expect(canRetry({ state: 'ready', health: { state: 'blocked', stage: 'cluster', blockedByWaveId: 'w1' } })).toBe(false);
         expect(canRetry({ state: 'processing', health: { state: 'processing', stage: 'vision' } })).toBe(false);
+        const idle = { state: 'processing_pending', health: { state: 'pending', reason: 'dispatch_pending', stage: 'vision', ownerActive: false } };
+        expect(canRetry({ ...idle, health: { ...idle.health, noProgressSeconds: 3600 } })).toBe(true);
+        expect(canRetry({ ...idle, health: { ...idle.health, noProgressSeconds: 60 } })).toBe(false);
+        expect(canRetry({ ...idle, health: { ...idle.health, noProgressSeconds: 3600, ownerActive: true } })).toBe(false);
     });
 
     it('explains blocked and failed waves', () => {
