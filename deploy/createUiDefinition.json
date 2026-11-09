@@ -6,7 +6,7 @@
     "config": {
       "isWizard": false,
       "basics": {
-        "description": "Deploy Photostore into your own Azure subscription. Set a login email and password below — that is your sign-in, no Microsoft account or app registration required.",
+        "description": "Deploy Photostore into your own Azure subscription. Set a login email and password below \u2014 that is your sign-in, no Microsoft account or app registration required.",
         "location": {
           "label": "Region",
           "toolTip": "Azure region for the resource group and all resources.",
@@ -19,6 +19,50 @@
     },
     "basics": [
       {
+        "name": "mode",
+        "type": "Microsoft.Common.OptionsGroup",
+        "label": "Deployment type",
+        "defaultValue": "New install",
+        "toolTip": "New install creates a fresh library. Upgrade updates an existing Keepsake in place and keeps its photos.",
+        "constraints": {
+          "required": true,
+          "allowedValues": [
+            {
+              "label": "New install",
+              "value": "new"
+            },
+            {
+              "label": "Upgrade existing",
+              "value": "upgrade"
+            }
+          ]
+        },
+        "visible": true
+      },
+      {
+        "name": "upgradeInfo",
+        "type": "Microsoft.Common.InfoBox",
+        "visible": "[equals(basics('mode'),'upgrade')]",
+        "options": {
+          "icon": "Info",
+          "text": "Pick the app ending in -core from your existing Keepsake. Your photos and library are kept. Wait until no upload is running, because the update restarts the apps. Re-enter your login email and password: an existing login is kept as it is."
+        }
+      },
+      {
+        "name": "existing",
+        "type": "Microsoft.Solutions.ResourceSelector",
+        "label": "Existing Keepsake (pick the -core app)",
+        "visible": "[equals(basics('mode'),'upgrade')]",
+        "toolTip": "Choose the container app named <app name>-core.",
+        "resourceType": "Microsoft.App/containerApps",
+        "options": {
+          "filter": {
+            "subscription": "onBasics",
+            "location": "all"
+          }
+        }
+      },
+      {
         "name": "appName",
         "type": "Microsoft.Common.TextBox",
         "label": "App name",
@@ -27,8 +71,9 @@
         "constraints": {
           "required": true,
           "regex": "^[a-z0-9]{3,17}$",
-          "validationMessage": "Use 3–17 lowercase letters and numbers only."
-        }
+          "validationMessage": "Use 3\u201317 lowercase letters and numbers only."
+        },
+        "visible": "[not(equals(basics('mode'),'upgrade'))]"
       },
       {
         "name": "adminEmail",
@@ -67,10 +112,22 @@
         "constraints": {
           "required": true,
           "allowedValues": [
-            { "label": "United States", "value": "United States" },
-            { "label": "Europe", "value": "Europe" },
-            { "label": "Australia", "value": "Australia" },
-            { "label": "United Kingdom", "value": "United Kingdom" }
+            {
+              "label": "United States",
+              "value": "United States"
+            },
+            {
+              "label": "Europe",
+              "value": "Europe"
+            },
+            {
+              "label": "Australia",
+              "value": "Australia"
+            },
+            {
+              "label": "United Kingdom",
+              "value": "United Kingdom"
+            }
           ]
         }
       },
@@ -83,21 +140,30 @@
         "constraints": {
           "required": true,
           "allowedValues": [
-            { "label": "In your browser (legacy mode)", "value": "browser" },
-            { "label": "On the server (vision container, default)", "value": "backend" },
-            { "label": "Both (race, first result wins)", "value": "both" }
+            {
+              "label": "In your browser (legacy mode)",
+              "value": "browser"
+            },
+            {
+              "label": "On the server (vision container, default)",
+              "value": "backend"
+            },
+            {
+              "label": "Both (race, first result wins)",
+              "value": "both"
+            }
           ]
         }
       }
     ],
     "steps": [],
     "outputs": {
-      "appName": "[basics('appName')]",
+      "appName": "[if(equals(basics('mode'),'upgrade'), replace(basics('existing').name,'-core',''), basics('appName'))]",
       "adminEmail": "[basics('adminEmail')]",
       "adminPassword": "[basics('adminPassword')]",
       "emailDataLocation": "[basics('emailDataLocation')]",
       "processingMode": "[basics('processingMode')]",
-      "location": "[location()]"
+      "location": "[if(equals(basics('mode'),'upgrade'), basics('existing').location, location())]"
     }
   }
 }
