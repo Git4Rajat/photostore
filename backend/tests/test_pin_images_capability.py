@@ -1,6 +1,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('pin_images', ROOT / 'deploy' / 'pin_images.py')
@@ -55,3 +56,50 @@ def test_compatible_list_is_capped():
     text = pin_images.pin(BICEP.format(OLD, ids), IMAGES, CAP, COMMIT, upgradable=True)
     listed = text.split("waveCompatibleCapabilities string = '")[1].split("'")[0].split(',')
     assert len(listed) == pin_images.MAX_COMPATIBLE and listed[0] == OLD
+
+
+JSON = ('"waveCapabilityId": {{\n      "type": "string",\n      "defaultValue": "{cap}",\n    }},\n'
+        '"waveCompatibleCapabilities": {{\n      "type": "string",\n      "defaultValue": "{compat}",\n    }},\n'
+        '"waveSourceCommit": {{\n      "type": "string",\n      "defaultValue": "",\n    }},\n')
+RELEASE = {'images': IMAGES, 'capabilityId': CAP, 'sourceCommit': COMMIT, 'protocol': 'library-wave-v1',
+           'upgradeProtocol': 'library-wave-v1'}
+
+
+def templates(bicep_compat=OLDER, json_compat=OLDER):
+    return {'main.bicep': BICEP.format(OLD, bicep_compat), 'resources.bicep': BICEP.format(OLD, bicep_compat),
+            'azuredeploy.json': JSON.format(cap=OLD, compat=json_compat)}
+
+
+def test_the_compiled_template_gets_the_predecessor_list_too():
+    # Regression: the compiled template (what the Deploy to Azure button deploys) used to be rewritten with an
+    # empty predecessor list because only Bicep syntax was parsed, so the library never migrated.
+    text = pin_images.pin(JSON.format(cap=OLD, compat=OLDER), IMAGES, CAP, COMMIT, upgradable=True)
+    assert pin_images.declared(text, 'compatible') == [f'{OLD},{OLDER}']
+    assert pin_images.declared(text, 'capability') == [CAP]
+
+
+def test_every_template_gets_the_same_chain_from_the_bicep_source():
+    pinned = pin_images.pin_all(templates(json_compat=''), RELEASE)
+    for name, text in pinned.items():
+        assert pin_images.declared(text, 'compatible') == [f'{OLD},{OLDER}'], name
+        assert pin_images.declared(text, 'capability') == [CAP], name
+        assert pin_images.declared(text, 'commit') == [COMMIT], name
+
+
+def test_inconsistent_templates_fail_the_pin_instead_of_being_committed():
+    stale = templates(json_compat='')
+    not_upgradable = {**RELEASE, 'upgradeProtocol': None}
+    with pytest.raises(ValueError, match='templates disagree'):
+        pin_images.pin_all(stale, not_upgradable)
+    with pytest.raises(ValueError, match='not declared'):
+        pin_images.check_consistent({'main.bicep': BICEP.format(OLD, OLDER), 'azuredeploy.json': '{}'})
+
+
+def test_checked_in_templates_agree_and_list_a_predecessor():
+    texts = {name: (ROOT / 'deploy' / name).read_text() for name in pin_images.TARGETS}
+    pin_images.check_consistent(texts)
+    capability = pin_images.declared(texts['main.bicep'], 'capability')[0]
+    compatible = pin_images.declared(texts['main.bicep'], 'compatible')[0].split(',')
+    assert compatible != [''] and capability not in compatible
+    for text in texts.values():
+        assert pin_images.declared(text, 'compatible') == [','.join(compatible)] * len(pin_images.declared(text, 'compatible'))

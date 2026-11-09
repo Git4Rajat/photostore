@@ -7,6 +7,15 @@ assignment and publication receipts, and existing catalogs. No cleanup or
 re-upload is needed. It does not migrate incompatible protocol/schema changes.
 The release author must preserve the meaning of existing persisted records.
 
+## Automatic upgrade through the template
+
+Redeploying the pinned **Deploy to Azure** template over an existing library normally upgrades it with no
+manual step: the release pin job writes the earlier certificates into `waveCompatibleCapabilities` (kept
+identical in `main.bicep`, `resources.bicep` and `azuredeploy.json`, which `pin_images.py` now verifies), and
+the first core boot rebinds a library bound to any of them. If every role answers uploads with "This app
+deployment is not qualified for the library wave protocol", check that `UPLOAD_WAVE_COMPATIBLE_CAPABILITIES` on
+the apps lists the certificate your library is bound to; if it cannot, use `upgrade_wave.py` below.
+
 ## Qualify and prepare
 
 Commit the change and run **Publish public container images** on that commit,
