@@ -2703,3 +2703,27 @@ video.photo-preview-media.is-loading {
   color: var(--muted);
   font-size: 11px;
 }
+
+.notification-preview {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: min(300px, 92vw);
+  padding: 10px 12px;
+  z-index: 60;
+  border-radius: var(--r-lg);
+  background: var(--lg-surface-strong);
+  border: 1px solid var(--lg-edge);
+  box-shadow: var(--lg-shadow-floating);
+}
+
+@media (max-width: 640px) {
+  .notification-preview {
+    position: fixed;
+    top: 64px;
+    right: 10px;
+    left: 10px;
+    width: auto;
+    z-index: 80;
+  }
+}

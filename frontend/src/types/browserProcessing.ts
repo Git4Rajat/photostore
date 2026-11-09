@@ -30,6 +30,8 @@ export interface AppNotification {
     unread: boolean;
     progress?: UploadProgress;
     uploadSessionId?: string;
+    // Ephemeral (in-memory) button shown on the preview, e.g. Undo or Retry.
+    action?: { label: string; onClick: () => void };
 }
 
 type PersistedUploadFileStatus = 'pending' | 'uploading' | 'finalizing' | 'done' | 'failed';

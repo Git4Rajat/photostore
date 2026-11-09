@@ -2,7 +2,7 @@
 // Styling lives in index.css (.app-toast*) so it follows light/dark mode;
 // this module only manages the DOM lifecycle. Multiple toasts stack.
 
-import { publishNotification } from './notificationSink';
+import { hasNotificationSink, publishNotification } from './notificationSink';
 
 let toastStack: HTMLDivElement | null = null;
 
@@ -37,6 +37,8 @@ export interface ToastOptions {
     // When set, identical keys within a short window are suppressed. Defaults to
     // the message text.
     dedupeKey?: string;
+    // Set false when the caller already added its own panel entry.
+    panel?: boolean;
 }
 
 // Accepts either a bare timeout (back-compat) or a full options object.
@@ -54,11 +56,13 @@ export const showToast = (message: string, optionsOrTimeout: number | ToastOptio
     }
     recentMessages.set(dedupeKey, now);
 
-    // Every toast also lands in the notification panel. When a panel is
-    // present, only toasts carrying an action (Undo/Retry) still pop up, since
-    // the action must be reachable right away; the rest are panel-only.
-    const inPanel = publishNotification(message);
-    if (inPanel && !options.action) {
+    // With a notification panel mounted, the bell shows the preview (and the
+    // entry lives in the panel); the DOM popup is only the fallback for pages
+    // without one (e.g. the public album page).
+    if (hasNotificationSink()) {
+        if (options.panel !== false) {
+            publishNotification(message, '', options.action);
+        }
         return;
     }
 
