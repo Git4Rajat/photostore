@@ -869,6 +869,32 @@ def undo_merge(merge_id: str):
     base = payload.get('base') or {}
     merged = payload.get('merged') or []
     face_map = payload.get('faceMap') or {}
+    if payload.get('mode') == 'group':
+        # A group merge only re-tagged person rows (no face or membership moved): put the saved rows back.
+        for row in ([base] if base.get('RowKey') else []) + [m for m in merged if m.get('RowKey')]:
+            app.person_table_client.upsert_entity(row)
+        restored_ids = [str(row['RowKey']) for row in ([base] if base.get('RowKey') else []) + merged if row.get('RowKey')]
+        face_ids = []
+        for row in merged:
+            try:
+                face_ids.extend(str(fid) for fid in app.json.loads(row.get('faceIds', '[]') or '[]'))
+            except Exception:
+                pass
+        app._rebuild_metadata_faces_for_filenames(user_id, app._filenames_for_face_ids(user_id, face_ids))
+        app._resync_person_rule_albums_for_many(user_id, restored_ids)
+        app.mark_people_dirty(user_id, restored_ids)
+        try:
+            app.touch_user_people_index_state(user_id)
+        except Exception:
+            app.app.logger.warning('Could not dirty People index after undo %s', merge_id, exc_info=True)
+        try:
+            app.merge_table_client.delete_entity(partition_key=user_id, row_key=merge_id)
+        except Exception:
+            pass
+        if blob_name:
+            app._delete_blob_if_present(app.BLOB_MERGE_PAYLOADS_CONTAINER, blob_name)
+        return app.jsonify({'success': True, 'mergeId': merge_id})
+
     affected_face_ids = set(str(fid) for fid in face_map.keys())
     try:
         affected_face_ids.update(str(fid) for fid in app.json.loads(base.get('faceIds', '[]') or '[]'))

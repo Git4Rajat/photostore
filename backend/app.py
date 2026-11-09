@@ -3081,23 +3081,88 @@ def _person_group_ids(user_id: str, person_id: str) -> List[str]:
 
 
 class PersonMergeUnsupported(Exception):
-    """A merge that involves a person with overflow shards, or whose result would not fit a person row."""
+    """The merge target is itself an overflow shard, so it can't be merged into."""
 
 
-def _check_person_merge_supported(user_id: str, rows: List[Dict]) -> None:
+def _merge_needs_group_mode(user_id: str, rows: List[Dict]) -> bool:
+    """True when a plain merge (faces rewritten into the target's one membership list) is not possible: a
+    person involved has overflow shards, or the combined list would not fit one row (60 KiB). Such merges
+    re-tag the source rows into the target's group instead (see _merge_persons_group)."""
     from faiss_assignment import FaissAssigner
+    base = rows[0]
+    if str(base.get('groupId') or ''):
+        raise PersonMergeUnsupported('Open this person from the People list and merge again.')
     face_ids: set = set()
+    grouped = False
     for row in rows:
-        person_id = str(row.get('RowKey') or '')
-        if str(row.get('groupId') or '') or _person_shard_ids(user_id, person_id):
-            raise PersonMergeUnsupported(
-                'This person has more photos than one record can hold, so it can\'t be merged yet.')
+        if str(row.get('groupId') or '') or _person_shard_ids(user_id, str(row.get('RowKey') or '')):
+            grouped = True
         try:
             face_ids.update(str(fid) for fid in json.loads(row.get('faceIds', '[]') or '[]'))
         except Exception:
             pass
-    if not FaissAssigner._membership_fits({'faceIds': json.dumps(sorted(face_ids))}, ''):
-        raise PersonMergeUnsupported('The merged person would have too many photos for one record.')
+    return grouped or not FaissAssigner._membership_fits({'faceIds': json.dumps(sorted(face_ids))}, '')
+
+
+def _merge_persons_group(user_id: str, person_id: str, merge_ids: List, base: Dict, merged_snapshots: List[Dict]) -> Dict:
+    """Merge by re-tagging: every row of each merged person (its own and its shards) joins the target's group
+    and takes the group's name. No face or membership row moves, so nothing can overflow, and undo only has
+    to put the saved rows back. The People list, detail, photos and rename already treat a group as one person."""
+    group_ids = set(_person_group_ids(user_id, person_id))
+    retag: List[Dict] = []
+    seen = set(group_ids)
+    for snapshot in merged_snapshots:
+        for row_id in [str(snapshot['RowKey']), *_person_shard_ids(user_id, str(snapshot['RowKey']))]:
+            if row_id in seen:
+                continue
+            seen.add(row_id)
+            try:
+                retag.append(dict(person_table_client.get_entity(partition_key=user_id, row_key=row_id)))
+            except Exception:
+                continue
+
+    def _named(row: Dict) -> bool:
+        name = str(row.get('name') or '').strip()
+        return bool(name) and not _is_unnamed_name(name)
+
+    def _count(row: Dict) -> int:
+        try:
+            return len(json.loads(row.get('faceIds', '[]') or '[]'))
+        except Exception:
+            return 0
+
+    group_name = str(base.get('name') or '').strip()
+    if not _named(base):
+        candidates = [row for row in retag if _named(row)]
+        group_name = str(max(candidates, key=_count)['name']).strip() if candidates else group_name
+
+    def _restorable(row: Dict) -> Dict:
+        return dict(row, groupId=str(row.get('groupId') or ''))   # '' clears the tag on undo (upsert merges)
+
+    snapshots = [_restorable(row) for row in retag]
+    merge_id = str(uuid.uuid4())
+    blob_name = f'{user_id}/{merge_id}.json'
+    payload = {'base': _restorable(base), 'merged': snapshots, 'faceMap': {}, 'mode': 'group'}
+    upload_file_to_blob(BLOB_MERGE_PAYLOADS_CONTAINER, blob_name, json.dumps(payload).encode('utf-8'), 'application/json')
+    merge_table_client.upsert_entity({
+        'PartitionKey': user_id, 'RowKey': merge_id, 'targetPersonId': person_id,
+        'mergedIds': json.dumps(merge_ids), 'targetName': group_name,
+        'mergedNames': json.dumps([str(row.get('name')) for row in snapshots if row.get('name')]),
+        'payloadBlobName': blob_name, 'createdAt': datetime.now(timezone.utc).isoformat(),
+    })
+    # The record is durable before any row changes, so a crash part-way can always be undone.
+    for row in retag:
+        person_table_client.upsert_entity({'PartitionKey': user_id, 'RowKey': row['RowKey'],
+                                           'groupId': person_id, 'name': group_name}, mode='merge')
+    if group_name != str(base.get('name') or '').strip():
+        _update_person_entity(user_id, person_id, {'name': group_name})
+    touched = [row for row in retag if str(row.get('name') or '').strip() != group_name]
+    if touched:
+        face_ids = [str(fid) for row in touched for fid in json.loads(row.get('faceIds', '[]') or '[]')]
+        _rebuild_metadata_faces_for_filenames(user_id, _filenames_for_face_ids(user_id, face_ids))
+    _resync_person_rule_albums_for_many(user_id, [str(m) for m in merge_ids])
+    _resync_person_rule_albums(user_id, person_id)
+    return {'mergeId': merge_id}
 
 
 def _load_people_name_index(user_id: str) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
@@ -12766,7 +12831,8 @@ def _merge_persons_core(
         except Exception:
             continue
 
-    _check_person_merge_supported(user_id, [base_snapshot, *merged_snapshots])
+    if _merge_needs_group_mode(user_id, [base_snapshot, *merged_snapshots]):
+        return _merge_persons_group(user_id, person_id, merge_ids, base_snapshot, merged_snapshots)
 
     merge_payload_blob_name = f'{user_id}/{merge_id}.json'
 
