@@ -6,6 +6,7 @@ import os
 import re
 import uuid
 import json
+import logging
 import weakref
 
 from azure.core.exceptions import ResourceNotFoundError, ResourceExistsError
@@ -138,6 +139,11 @@ def require_capability(store,role,*,allow_cleanup=False):
             or capability_id()!=policy['capabilityId']
             or not os.getenv('UPLOAD_WAVE_DEPLOYMENT_ID','')
             or builds.get(role)!=os.getenv('UPLOAD_WAVE_DEPLOYMENT_ID')):
+        logging.getLogger(__name__).error(
+            'Wave capability rejected for role %s: library policy=%s, deployment capability=%s, certificate roles ok=%s, '
+            'deployment id matches certificate=%s, bootstrap pending=%s',
+            role, policy.get('capabilityId'), capability_id(), _supported_certificate_roles(builds),
+            builds.get(role)==os.getenv('UPLOAD_WAVE_DEPLOYMENT_ID'), os.getenv('UPLOAD_WAVE_BOOTSTRAP_PENDING',''))
         raise Conflict('This app deployment is not qualified for the library wave protocol')
     if policy.get('cleanupState') and not allow_cleanup:raise Conflict('Library cleanup is in progress')
 

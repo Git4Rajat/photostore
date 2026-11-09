@@ -150,3 +150,16 @@ def test_without_predecessors_or_commit_nothing_is_migrated(monkeypatch):
     assert wave_bootstrap.auto_seed(_service(), env()) == 'seeded'
     assert wave_bootstrap.auto_seed(_service(), env(UPLOAD_WAVE_COMPATIBLE_CAPABILITIES=PREVIOUS)) == 'seeded'
     assert calls == []
+
+
+def test_an_unlisted_library_binding_is_reported_with_the_fix(monkeypatch):
+    _patch_bound(monkeypatch, ['9' * 64])
+
+    def refuse(*a, **k):
+        raise RuntimeError('Fresh wave bootstrap refused: existing library data or ownership')
+    monkeypatch.setattr(wave_bootstrap, 'seed', refuse)
+    with pytest.raises(RuntimeError) as info:
+        wave_bootstrap.auto_seed(_service(), _upgrade_env())
+    message = str(info.value)
+    assert 'refused' in message and 'UPLOAD_WAVE_COMPATIBLE_CAPABILITIES' in message and EXPECTED in message
+    assert 'upgrade_wave.py' in message

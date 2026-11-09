@@ -157,7 +157,7 @@
     },
     "waveCompatibleCapabilities": {
       "type": "string",
-      "defaultValue": "",
+      "defaultValue": "68564e22b48a21907a06ae276629f849eda0cb6923dad2c270b53e92f39e98cf,5d5c957f3e7f80d710ab8cc91c900769b5c804283b0a754d4583c1b80463be89,dc76fc9d58f4bc7a83dec4fd9f81871b0df520a973c7ee3426a50b0fda2e46e2,1002611277e07e88ab905b291a13d8c55b5b8577fb28aac90edd9aea9f01c291",
       "metadata": {
         "description": "Earlier release certificates this release may replace in place (set by the release pin job)."
       }
@@ -505,7 +505,7 @@
             },
             "waveCompatibleCapabilities": {
               "type": "string",
-              "defaultValue": "",
+              "defaultValue": "68564e22b48a21907a06ae276629f849eda0cb6923dad2c270b53e92f39e98cf,5d5c957f3e7f80d710ab8cc91c900769b5c804283b0a754d4583c1b80463be89,dc76fc9d58f4bc7a83dec4fd9f81871b0df520a973c7ee3426a50b0fda2e46e2,1002611277e07e88ab905b291a13d8c55b5b8577fb28aac90edd9aea9f01c291",
               "metadata": {
                 "description": "Earlier release certificates this release may replace in place (set by the release pin job)."
               }

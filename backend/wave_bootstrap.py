@@ -66,7 +66,16 @@ def auto_seed(service, env=os.environ):
         pass
     if upgrade_existing(service, deployments, expected, env):
         return expected
-    return seed(service, deployments, expected, allow_empty_libraries=True)
+    try:
+        return seed(service, deployments, expected, allow_empty_libraries=True)
+    except RuntimeError as error:
+        if 'existing library data' not in str(error):
+            raise
+        raise RuntimeError(
+            f'{error}. This release (certificate {expected}) cannot take over the existing library: its current '
+            'certificate must be listed in UPLOAD_WAVE_COMPATIBLE_CAPABILITIES (the release pin job writes it into '
+            'the Deploy to Azure template; listed now: '
+            f"{env.get('UPLOAD_WAVE_COMPATIBLE_CAPABILITIES') or 'nothing'}), or run deploy/upgrade_wave.py.") from error
 
 
 def upgrade_existing(service, deployments, expected, env=os.environ):
