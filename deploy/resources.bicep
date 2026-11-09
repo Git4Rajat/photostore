@@ -90,6 +90,10 @@ param enableNewWaveLibraries bool = true
 @description('Exact-image capability ID. Fresh wave activation requires the seeded release certificate; never leave empty.')
 param waveCapabilityId string = '1002611277e07e88ab905b291a13d8c55b5b8577fb28aac90edd9aea9f01c291'
 
+@description('Earlier release certificates this release may replace in place (set by the release pin job).')
+param waveCompatibleCapabilities string = ''
+@description('Source commit of the pinned release (set by the release pin job).')
+param waveSourceCommit string = ''
 @description('Fresh-install preparation only: block upload intake and run certificate seeding as a manual recovery job. Activate only after that job succeeds.')
 param waveBootstrapPending bool = false
 
@@ -458,6 +462,8 @@ var backendEnv = [
   { name: 'UPLOAD_WAVE_SOURCE_COMPLETION_ENABLED', value: (enableWaveExecution || enableNewWaveLibraries) ? 'true' : 'false' }
   { name: 'PROCESSING_GENERATION_ENFORCEMENT_ENABLED', value: (enableWaveExecution || enableNewWaveLibraries) ? 'true' : 'false' }
   { name: 'UPLOAD_WAVE_CAPABILITY_ID', value: waveCapabilityId }
+  { name: 'UPLOAD_WAVE_COMPATIBLE_CAPABILITIES', value: waveCompatibleCapabilities }
+  { name: 'UPLOAD_WAVE_SOURCE_COMMIT', value: waveSourceCommit }
   // One-click deployments: a brand-new library has nothing to protect, so the first boot on never-used
   // storage seeds the certificate for these two images (see backend/wave_bootstrap.py auto_seed).
   { name: 'UPLOAD_WAVE_CORE_IMAGE', value: coreImage }
