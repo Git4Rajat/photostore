@@ -8766,7 +8766,8 @@ def _ensure_static_website() -> None:
     if _static_website_checked or blob_service_client is None:
         return
     try:
-        if not blob_service_client.get_service_properties().get('static_website', {}).get('enabled'):
+        website = blob_service_client.get_service_properties().get('static_website')
+        if not getattr(website, 'enabled', False):
             from azure.storage.blob import StaticWebsite
             blob_service_client.set_service_properties(static_website=StaticWebsite(
                 enabled=True, index_document='index.html', error_document404_path='404.html'))
