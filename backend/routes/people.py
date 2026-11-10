@@ -482,12 +482,13 @@ def confirm_face(person_id: str):
     except Exception:
         return app.jsonify({'error': 'face not found'}), 404
 
+    owner_id = app._owner_row_for_new_face(user_id, person_id, face_id)   # an overflow row when the person is full
     old_person_id = face.get('personId')
-    if old_person_id and old_person_id != person_id:
+    if old_person_id and old_person_id != owner_id:
         app._remove_face_from_person(user_id, str(old_person_id), face_id)
-    app._remove_face_from_other_people(user_id, face_id, person_id)
-    app._add_face_to_person(user_id, person_id, face_id)
-    face['personId'] = person_id
+    app._remove_face_from_other_people(user_id, face_id, owner_id)
+    app._add_face_to_person(user_id, owner_id, face_id)
+    face['personId'] = owner_id
     face['confirmedByUser'] = True
     face['reviewStatus'] = 'confirmed'
     face['rejected'] = False
@@ -589,12 +590,13 @@ def accept_suggested_faces(person_id: str):
         face = fetched_faces.get(face_id)
         if face is None:
             continue
+        owner_id = app._owner_row_for_new_face(user_id, person_id, face_id)   # an overflow row when the person is full
         old_person_id = str(face.get('personId') or '')
-        if old_person_id and old_person_id != person_id:
+        if old_person_id and old_person_id != owner_id:
             app._remove_face_from_person(user_id, old_person_id, face_id)
-        app._remove_face_from_other_people(user_id, face_id, person_id)
-        app._add_face_to_person(user_id, person_id, face_id)
-        face['personId'] = person_id
+        app._remove_face_from_other_people(user_id, face_id, owner_id)
+        app._add_face_to_person(user_id, owner_id, face_id)
+        face['personId'] = owner_id
         face['confirmedByUser'] = True
         face['reviewStatus'] = 'confirmed'
         face['rejected'] = False

@@ -6186,6 +6186,44 @@ def _remove_face_from_other_people(
     return {'removed': removed, 'deletedPeople': deleted_people, 'touchedPeople': touched_people}
 
 
+def _owner_row_for_new_face(user_id: str, person_id: str, face_id: str) -> str:
+    """The row that should hold ``face_id`` when the user puts it in ``person_id``: the person's own row while
+    its membership list has room, else a row of the same group with room, else a new overflow row (tagged with
+    the group, named like it). Callers add the face to, and point the face at, the returned row."""
+    from faiss_assignment import FaissAssigner
+    try:
+        person = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
+    except Exception:
+        return person_id
+    root = str(person.get('groupId') or person_id)
+    rows = []
+    for row_id in _person_group_ids(user_id, root):
+        try:
+            rows.append(dict(person if row_id == person_id else
+                             person_table_client.get_entity(partition_key=user_id, row_key=row_id)))
+        except Exception:
+            continue
+    for row in rows:
+        try:
+            if face_id in json.loads(row.get('faceIds', '[]') or '[]'):
+                return str(row['RowKey'])
+        except Exception:
+            continue
+    for row in rows:
+        if FaissAssigner._membership_fits(row, face_id):
+            return str(row['RowKey'])
+    face = {}
+    try:
+        face = face_table_client.get_entity(partition_key=user_id, row_key=face_id)
+    except Exception:
+        pass
+    root_row = next((row for row in rows if str(row['RowKey']) == root), person)
+    shard_id = _create_person_entity(user_id, [], _face_embedding_from_entity(face), name=str(root_row.get('name') or ''))
+    person_table_client.upsert_entity({'PartitionKey': user_id, 'RowKey': shard_id, 'groupId': root}, mode='merge')
+    _invalidate_people_scan_cache(user_id)
+    return shard_id
+
+
 def _add_face_to_person(
     user_id: str,
     person_id: str,
