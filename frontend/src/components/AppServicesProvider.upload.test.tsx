@@ -529,17 +529,26 @@ describe('browser upload selection and startup', () => {
         expect(services.uploading).toBe(false);
     });
 
-    it('defers image preparation until after original finalization', async () => {
+    it('prepares a photo in flight and finalizes it with its assets, also in backend mode', async () => {
         mocks.preparationEnabled = true;
+        mocks.processingMode = 'backend';
+        let resolvePreparation!: (value: unknown) => void;
+        mocks.prepared.mockImplementation(() => new Promise(resolve => { resolvePreparation = resolve; }));
         select(filesFor(1));
         await advance(1000);
+        // The original transfers without waiting for its preview/thumbnail.
         expect(mocks.transferred).toHaveBeenCalledTimes(1);
         expect(mocks.committed).not.toHaveBeenCalled();
         expect(mocks.uploaded).toHaveBeenCalledTimes(1);
-        expect(mocks.prepared).not.toHaveBeenCalled();
-        expect(initFiles()[0].includePreview).toBeUndefined();
-        expect(initFiles()[0].includeMetadata).toBeUndefined();
-        expect(finalizedFiles()[0]).toMatchObject({blobName: 'blob-original-0.heic'});
+        expect(mocks.prepared).toHaveBeenCalledTimes(1);
+        expect(initFiles()[0]).toMatchObject({includePreview: true, includeMetadata: true});
+        expect(finalizedFiles()).toHaveLength(0);
+        const prepared = {clientProcessing: {preview: {alreadyUploaded: true}, thumbnail: {alreadyUploaded: true}},
+            clientMetadata: {version: 1, bytes: 400, sha256: 'b'.repeat(64), sourceSha256: 'a'.repeat(64)},
+            preparationReport: {version: 1, elapsedMs: 200, assets: {preview: {target: true, generation: 'generated', upload: 'uploaded'}}}};
+        await act(async () => { resolvePreparation(prepared); });
+        await advance(1000);
+        expect(finalizedFiles()[0]).toMatchObject({...prepared, blobName: 'blob-original-0.heic'});
         const batchId = finalizedFiles()[0].uploadBatchId;
         expect(batchId).toMatch(/^[0-9a-f-]{36}$/);
         await advance(3000);
