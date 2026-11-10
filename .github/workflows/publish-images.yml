@@ -130,6 +130,15 @@ jobs:
           push: true
           provenance: false
           platforms: linux/amd64
+          # Reuse unchanged layers (apt, pip/npm installs, model-weight
+          # downloads) across runs instead of re-downloading every package.
+          # Vendoring them in git isn't an option: the Git LFS budget is
+          # exhausted and torch's wheel exceeds GitHub's 100 MB file limit.
+          # Registry cache, not type=gha: the ipworker layers alone outgrow
+          # the 10 GB Actions cache. mode=max also keeps the frontend's
+          # build-stage layers (node_modules, weights).
+          cache-from: type=registry,ref=ghcr.io/${{ steps.owner.outputs.owner }}/photostore-${{ matrix.name }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ steps.owner.outputs.owner }}/photostore-${{ matrix.name }}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
           tags: |
             ${{ inputs.publish_latest && format('ghcr.io/{0}/photostore-{1}:latest', steps.owner.outputs.owner, matrix.name) || '' }}
             ghcr.io/${{ steps.owner.outputs.owner }}/photostore-${{ matrix.name }}:${{ github.sha }}
