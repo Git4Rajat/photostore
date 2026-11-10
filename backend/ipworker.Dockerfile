@@ -12,7 +12,7 @@
 # because this also bundles the frontend's browser-ai model files so ipworker
 # never depends on the frontend container being reachable at runtime:
 #   docker build -f backend/ipworker.Dockerfile .
-FROM mirror.gcr.io/library/python:3.15-slim
+FROM mirror.gcr.io/library/python:3.13-slim
 
 ENV PIP_ROOT_USER_ACTION=ignore \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
