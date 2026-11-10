@@ -56,17 +56,11 @@ WORKDIR /app
 
 COPY backend/requirements-ipworker.txt ./
 # Full hash-locked closure (backend + ipworker deps); see backend/scripts/lock-requirements.sh.
-RUN pip install --require-hashes --no-deps --extra-index-url https://download.pytorch.org/whl/cpu -r requirements-ipworker.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --require-hashes --no-deps --extra-index-url https://download.pytorch.org/whl/cpu -r requirements-ipworker.txt
 
-# Runtime Python modules -- shared backend/*.py (app.py, storage_utils.py,
-# exif_utils.py, maps_utils.py, vision_utils.py, ...) plus the ipworker-only
-# ipwork_*.py step processors, all in the same directory/import namespace.
-COPY backend/*.py ./
-COPY backend/routes/ ./routes/
-COPY backend/data/ ./data/
-COPY backend/entrypoint.sh ./
-RUN chmod +x /app/entrypoint.sh
-
+# Weight downloads sit above the source COPYs below so a code-only change
+# reuses these cached layers instead of re-fetching ~270 MB per build.
 # Same .onnx weights the frontend ships (frontend/public/models/browser-ai),
 # bundled at build time rather than fetched at runtime.
 # TEMPORARY (2026-08-12): normally these are COPYed straight from the
@@ -91,6 +85,15 @@ COPY frontend/public/models/browser-ai/vocab/tag-vocabulary.v1.json /app/vocab/t
 RUN curl -sL -o /app/models/face_landmarker.task \
     https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task \
     && test -s /app/models/face_landmarker.task
+
+# Runtime Python modules -- shared backend/*.py (app.py, storage_utils.py,
+# exif_utils.py, maps_utils.py, vision_utils.py, ...) plus the ipworker-only
+# ipwork_*.py step processors, all in the same directory/import namespace.
+COPY backend/*.py ./
+COPY backend/routes/ ./routes/
+COPY backend/data/ ./data/
+COPY backend/entrypoint.sh ./
+RUN chmod +x /app/entrypoint.sh
 
 ENV FLASK_APP=app.py
 ENV APP_ROLE=vision

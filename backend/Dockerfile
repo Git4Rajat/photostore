@@ -28,7 +28,10 @@ WORKDIR /app
 COPY requirements.txt ./
 # Hash-locked closure (see scripts/lock-requirements.sh): a tampered or
 # substituted release fails the install instead of running in the image.
-RUN pip install --require-hashes --no-deps -r requirements.txt
+# The cache mount keeps pip's download cache out of the image and lets local
+# rebuilds skip re-downloading wheels when requirements.txt changes.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --require-hashes --no-deps -r requirements.txt
 
 # Copy runtime Python modules used by app.py
 COPY *.py ./

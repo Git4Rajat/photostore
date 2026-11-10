@@ -9,25 +9,32 @@ ENV NPM_CONFIG_UPDATE_NOTIFIER=false \
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm ci --no-audit --no-fund
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --no-audit --no-fund
+
+# TEMPORARY (2026-08-12): the repo's Git LFS budget is exceeded, so CI
+# checks these two files out with lfs:false (real bytes never materialize --
+# only the ~130 B pointer stub does). Fetch the real binaries from a GitHub
+# Release mirror instead. Downloaded here, ahead of `COPY . ./`, so the
+# ~270 MB layer stays cached across source-only changes; copied over the
+# pointer stubs below. Revert once the LFS budget resets: drop this apk add,
+# the download RUN and the cp RUN below, and flip lfs:true back on in
+# publish-images.yml. node:22-alpine doesn't ship curl, so install it first.
+RUN apk add --no-cache curl
+# Verify the downloaded weights against pinned digests (fail the build on a
+# swapped or corrupted release asset). Update both when the weights change.
+RUN mkdir -p /lfs-weights && cd /lfs-weights && \
+    curl -fsSL -o adaface.onnx \
+        https://github.com/Git4Rajat/photostore/releases/download/model-weights-lfs-workaround/adaface-model.onnx && \
+    curl -fsSL -o yolo-face.onnx \
+        https://github.com/Git4Rajat/photostore/releases/download/model-weights-lfs-workaround/yolo-face-model.onnx && \
+    echo "5235574d2dbd891e12834070eec84b54ffe51197a329d4042ba552d1ba4e94d3  adaface.onnx" | sha256sum -c - && \
+    echo "fd27189bfe5750a017648445700473459a6d02e7c3b0a3bfd8a54af77dd3b046  yolo-face.onnx" | sha256sum -c -
 
 COPY . ./
 RUN node scripts/sync-browser-ai-runtime.mjs
-# TEMPORARY (2026-08-12): the repo's Git LFS budget is exceeded, so CI
-# checks these two files out with lfs:false (real bytes never materialize --
-# only the ~130 B pointer stub does). Overwrite with the real binaries from
-# a GitHub Release mirror instead. Revert once the LFS budget resets: drop
-# this apk add + the two curl RUN lines below, and flip lfs:true back on in
-# publish-images.yml. node:20-alpine doesn't ship curl, so install it first.
-RUN apk add --no-cache curl
-RUN curl -fsSL -o public/models/browser-ai/models/adaface/model.onnx \
-    https://github.com/Git4Rajat/photostore/releases/download/model-weights-lfs-workaround/adaface-model.onnx
-RUN curl -fsSL -o public/models/browser-ai/models/yolo-face/model.onnx \
-    https://github.com/Git4Rajat/photostore/releases/download/model-weights-lfs-workaround/yolo-face-model.onnx
-# Verify the downloaded weights against pinned digests (fail the build on a
-# swapped or corrupted release asset). Update both when the weights change.
-RUN echo "5235574d2dbd891e12834070eec84b54ffe51197a329d4042ba552d1ba4e94d3  public/models/browser-ai/models/adaface/model.onnx" | sha256sum -c - && \
-    echo "fd27189bfe5750a017648445700473459a6d02e7c3b0a3bfd8a54af77dd3b046  public/models/browser-ai/models/yolo-face/model.onnx" | sha256sum -c -
+RUN cp /lfs-weights/adaface.onnx public/models/browser-ai/models/adaface/model.onnx && \
+    cp /lfs-weights/yolo-face.onnx public/models/browser-ai/models/yolo-face/model.onnx
 RUN chmod -R a+rX public/models
 RUN test -f public/models/browser-ai/models/adaface/model.onnx && \
     test -f public/models/browser-ai/models/adaface/LICENSE && \
