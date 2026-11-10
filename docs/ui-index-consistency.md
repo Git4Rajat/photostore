@@ -83,7 +83,7 @@ The existing job poller remains the recovery path for notification loss or deplo
 
 ## Deployment
 
-The Bicep and generated ARM template add optional `enableIndexPush`, default **false**. Setting it to true provisions one Standard Web PubSub unit and assigns the resource-scoped Web PubSub Service Owner data role to indexer and cluster identities. The indexer API and its worker share the indexer identity. Backend containers receive `INDEX_EVENTS_ENDPOINT`; no service access key is exposed to the browser. The frontend runtime CSP retains the managed WebSocket origin with and without a configured API URL.
+The Bicep and generated ARM template add optional `enableIndexPush`, default **true**. Setting it to true provisions one Standard Web PubSub unit and assigns the resource-scoped Web PubSub Service Owner data role to indexer and cluster identities. The indexer API and its worker share the indexer identity. Backend containers receive `INDEX_EVENTS_ENDPOINT`; no service access key is exposed to the browser. The frontend runtime CSP retains the managed WebSocket origin with and without a configured API URL.
 
 Deploy the backend reconciliation endpoint before the updated frontend; source verification retains saved receipts if the endpoint is temporarily unavailable during rollout. To activate true push, deploy the updated backend and frontend images and infrastructure with `enableIndexPush=true`. Updating only the images leaves polling as the refresh mechanism. No live Azure resources were deployed for this change. Local Bicep compilation succeeded with the repository's existing Storage/Log Analytics warnings; it is not live Azure validation.
 

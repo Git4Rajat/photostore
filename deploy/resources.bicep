@@ -100,7 +100,7 @@ param waveBootstrapPending bool = false
 
 
 @description('Enable managed WebSocket index-ready notifications. Adds a Web PubSub Standard unit; polling remains the fallback.')
-param enableIndexPush bool = false
+param enableIndexPush bool = true
 
 @description('Secret used to sign login sessions. Always auto-generated fresh at deploy time -- intentionally not persisted. Every deployment therefore signs out all existing sessions (by design: simplest and safest default). What matters is that every app which validates these tokens restarts on the SAME new value together -- see revisionSuffix below -- so a login right after a deploy finishes always works.')
 @secure()
