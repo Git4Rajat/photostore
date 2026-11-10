@@ -3108,6 +3108,9 @@ class PersonMergeUnsupported(Exception):
     """The merge target is itself an overflow shard, so it can't be merged into."""
 
 
+GROUP_MERGE_MIN_FACES = int(os.environ.get('GROUP_MERGE_MIN_FACES', '150'))
+
+
 def _merge_needs_group_mode(user_id: str, rows: List[Dict]) -> bool:
     """True when a plain merge (faces rewritten into the target's one membership list) is not possible: a
     person involved has overflow shards, or the combined list would not fit one row (60 KiB). Such merges
@@ -3125,7 +3128,29 @@ def _merge_needs_group_mode(user_id: str, rows: List[Dict]) -> bool:
             face_ids.update(str(fid) for fid in json.loads(row.get('faceIds', '[]') or '[]'))
         except Exception:
             pass
-    return grouped or not FaissAssigner._membership_fits({'faceIds': json.dumps(sorted(face_ids))}, '')
+    if grouped or not FaissAssigner._membership_fits({'faceIds': json.dumps(sorted(face_ids))}, ''):
+        return True
+    # A plain merge rewrites every moved face and membership row, so its cost (and the chance the request is
+    # cut off at the ingress limit part-way) grows with the faces moved. Re-tagging costs a few row writes.
+    moved = 0
+    for row in rows[1:]:
+        try:
+            moved += len(json.loads(row.get('faceIds', '[]') or '[]'))
+        except Exception:
+            pass
+    return moved >= GROUP_MERGE_MIN_FACES
+
+
+def _apply_person_names(user_id: str, names: Dict[str, str]) -> None:
+    """Give each person row its name through the label path (source write plus recoverable publication intent)."""
+    from routes.people import _save_person_label
+    for row_id, name in names.items():
+        try:
+            person = _save_person_label(user_id, row_id, name)
+            if person is not None:
+                publish_person_label_intent(user_id, row_id, person)
+        except Exception:
+            worker_logger.warning('Could not label person %s', row_id, exc_info=True)
 
 
 def _merge_persons_group(user_id: str, person_id: str, merge_ids: List, base: Dict, merged_snapshots: List[Dict]) -> Dict:
@@ -3177,13 +3202,14 @@ def _merge_persons_group(user_id: str, person_id: str, merge_ids: List, base: Di
     # The record is durable before any row changes, so a crash part-way can always be undone.
     for row in retag:
         person_table_client.upsert_entity({'PartitionKey': user_id, 'RowKey': row['RowKey'],
-                                           'groupId': person_id, 'name': group_name}, mode='merge')
+                                           'groupId': person_id}, mode='merge')
+    # Names reach the photos' metadata through the same recoverable label intent a rename uses (the index
+    # worker rewrites the affected photos), not inside this request: that per-photo work is what made big
+    # merges outlive the 240 s ingress limit.
+    renames = {str(row['RowKey']): group_name for row in retag if str(row.get('name') or '').strip() != group_name}
     if group_name != str(base.get('name') or '').strip():
-        _update_person_entity(user_id, person_id, {'name': group_name})
-    touched = [row for row in retag if str(row.get('name') or '').strip() != group_name]
-    if touched:
-        face_ids = [str(fid) for row in touched for fid in json.loads(row.get('faceIds', '[]') or '[]')]
-        _rebuild_metadata_faces_for_filenames(user_id, _filenames_for_face_ids(user_id, face_ids))
+        renames[person_id] = group_name
+    _apply_person_names(user_id, renames)
     _resync_person_rule_albums_for_many(user_id, [str(m) for m in merge_ids])
     _resync_person_rule_albums(user_id, person_id)
     return {'mergeId': merge_id}

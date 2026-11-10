@@ -180,3 +180,49 @@ def test_a_photos_people_ids_name_the_first_person_for_a_shard_face(monkeypatch)
     app._person_light_scan_cache.invalidate('u1')
     app._rebuild_metadata_faces_for_filename('u1', 'f3.jpg', searchable_person_index={'S': 'Asha', 'A': 'Asha'})
     assert updates and json.loads(updates[0]['peopleIds']) == ['A']
+
+
+def _person_with(persons, pid, count, name=''):
+    persons.upsert_entity({'PartitionKey': 'u1', 'RowKey': pid, 'name': name,
+                           'faceIds': json.dumps([f'{pid}{i}' for i in range(count)])})
+
+
+def test_a_big_merge_that_still_fits_one_row_is_done_by_retagging(merge_env, monkeypatch):
+    persons, faces, blobs = merge_env
+    monkeypatch.setattr(app, 'GROUP_MERGE_MIN_FACES', 150)
+    _person_with(persons, 'P', 20, 'Pia')
+    _person_with(persons, 'Q', 150)
+    assert app._merge_persons_core('u1', 'P', ['Q'])['mergeId']
+    assert persons.get_entity('u1', 'Q')['groupId'] == 'P'          # kept as a row of P's group
+    assert len(json.loads(persons.get_entity('u1', 'P')['faceIds'])) == 20
+
+
+def test_a_small_merge_still_moves_the_faces(merge_env, monkeypatch):
+    persons, faces, blobs = merge_env
+    monkeypatch.setattr(app, 'GROUP_MERGE_MIN_FACES', 150)
+    _person_with(persons, 'P', 20)
+    _person_with(persons, 'Q', 149)
+    _person_with(persons, 'R', 150)
+    rows = lambda *ids: [persons.get_entity('u1', pid) for pid in ids]
+    assert app._merge_needs_group_mode('u1', rows('P', 'Q')) is False
+    assert app._merge_needs_group_mode('u1', rows('P', 'R')) is True
+
+
+def test_a_group_merge_does_not_rewrite_photo_metadata_inside_the_request(merge_env, monkeypatch):
+    persons, faces, blobs = merge_env
+    inline = []
+    monkeypatch.setattr(app, '_rebuild_metadata_faces_for_filenames', lambda *a, **k: inline.append(a) or {})
+    persons.upsert_entity({**persons.get_entity('u1', 'S'), 'name': 'Asha'})
+    app._merge_persons_core('u1', 'B', ['A'])
+    assert inline == []
+    for pid in ('A', 'S', 'B'):
+        assert persons.get_entity('u1', pid)['name'] == 'Asha'
+    assert persons.get_entity('u1', 'A')['labelPending']             # the worker publishes the new name
+
+
+def test_undo_restores_names_through_the_label_path_too(merge_env):
+    persons, faces, blobs = merge_env
+    persons.upsert_entity({**persons.get_entity('u1', 'A'), 'name': 'Anu'})
+    merge_id = app._merge_persons_core('u1', 'B', ['A'])['mergeId']
+    assert app.app.test_client().post(f'/api/persons/merge/{merge_id}/undo').status_code == 200
+    assert persons.get_entity('u1', 'A')['name'] == 'Anu'
