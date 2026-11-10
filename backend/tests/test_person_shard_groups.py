@@ -314,3 +314,29 @@ def test_refresh_adds_overflow_rows_clustering_created(merge_env):
     app._refresh_group_pointers('u1')
     assert json.loads(persons.get_entity('u1', 'A')['shardIds']) == ['S', 'S2']
     assert app._refresh_group_pointers('u1') == {}
+
+
+def test_faces_that_do_not_fit_move_to_overflow_rows_the_group_owns(merge_env, monkeypatch):
+    persons, faces, blobs = merge_env
+    members = app.person_members_table_client
+    persons.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'FULL', 'name': 'Fay', 'faceIds': '[]'})
+    ids = [f'g{i:03d}' for i in range(5)]
+    for fid in ids:
+        faces.upsert_entity({'PartitionKey': 'u1', 'RowKey': fid, 'filename': f'{fid}.jpg', 'personId': 'FULL',
+                             'confidence': 1.0, 'rejected': False, 'embedding': json.dumps([0.1, 0.2])})
+        members.upsert_entity({'PartitionKey': 'FULL', 'RowKey': fid, 'filename': f'{fid}.jpg'})
+    monkeypatch.setattr(app, 'OVERFLOW_ROW_FACES', 2)
+    monkeypatch.setattr(app, '_batch_upsert_entities',
+                        lambda table, rows, **k: [table.upsert_entity(r, mode='merge') for r in rows])
+    monkeypatch.setattr(app, '_sync_person_members', lambda entity: [
+        members.upsert_entity({'PartitionKey': entity['RowKey'], 'RowKey': f, 'filename': f'{f}.jpg'})
+        for f in json.loads(entity['faceIds'])])
+    monkeypatch.setattr(app, '_remove_person_member', lambda pid, fid: members.delete_entity('' + pid, fid))
+    made = app._move_faces_to_overflow_rows('u1', 'FULL', ids)
+    assert len(made) == 3
+    assert sorted(f for sid in made for f in json.loads(persons.get_entity('u1', sid)['faceIds'])) == ids
+    assert {faces.get_entity('u1', f)['personId'] for f in ids} == set(made)
+    assert all(persons.get_entity('u1', sid)['groupId'] == 'FULL' and persons.get_entity('u1', sid)['name'] == 'Fay'
+               for sid in made)
+    assert json.loads(persons.get_entity('u1', 'FULL')['shardIds']) == sorted(made)
+    assert app._person_group_ids('u1', 'FULL') == ['FULL', *sorted(made)]

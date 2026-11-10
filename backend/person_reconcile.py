@@ -51,9 +51,12 @@ def missing_face_ids(person_id: str, person_row: Dict, members_table,
 def reconcile_people(user_id: str, person_rows: Iterable[Dict], members_table,
                      load_faces: Callable[[List[str]], Dict[str, Dict]], is_rejected: Callable[[Dict], bool],
                      add_face_ids: Callable[[str, List[str]], None], *, dry_run: bool = True,
-                     should_stop: Optional[Callable[[], bool]] = None) -> Dict:
+                     should_stop: Optional[Callable[[], bool]] = None,
+                     place_overflow: Optional[Callable[[str, List[str]], List[str]]] = None) -> Dict:
     """Check each person row; unless ``dry_run``, write back the repaired ``faceIds``. A person whose repaired
-    list would not fit one column is reported under ``overflow`` and left alone. ``add_face_ids`` must union
+    list would not fit one column is reported under ``overflow``; ``place_overflow(person_id, face_ids)`` then
+    moves those faces onto overflow rows of the person (returning their ids) unless this is a dry run, and
+    without it the person is left alone. ``add_face_ids`` must union
     into the live row (a face added meanwhile must survive). ``should_stop`` lets a caller
     bound the run; ``lastChecked`` is then the RowKey to resume after."""
     repaired, overflow, checked, last = [], [], 0, ''
@@ -68,7 +71,10 @@ def reconcile_people(user_id: str, person_rows: Iterable[Dict], members_table,
             continue
         merged = [str(face_id) for face_id in json.loads(row.get('faceIds') or '[]')] + extra
         if not fits(merged):
-            overflow.append(dict(personId=person_id, missing=len(extra)))
+            entry = dict(personId=person_id, name=str(row.get('name') or ''), missing=len(extra))
+            if place_overflow and not dry_run:
+                entry['rows'] = place_overflow(person_id, extra)
+            overflow.append(entry)
             continue
         if not dry_run:
             add_face_ids(person_id, extra)

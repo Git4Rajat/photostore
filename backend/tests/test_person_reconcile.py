@@ -52,7 +52,7 @@ def test_overflow_is_reported_not_written():
     ids = [f'{i:036d}' for i in range(900)]                      # ~ the size of a full row already
     extra = {f'x{i:035d}': {'personId': 'p'} for i in range(700)}
     result, added = run([person('p', ids)], {'p': ids + list(extra)}, extra, dry_run=False)
-    assert added == [] and result['overflow'] == [dict(personId='p', missing=700)]
+    assert added == [] and result['overflow'] == [dict(personId='p', name='', missing=700)]
 
 
 def test_stops_and_reports_where_to_resume():
@@ -60,3 +60,22 @@ def test_stops_and_reports_where_to_resume():
     seen = []
     result, _ = run(rows, {}, {}, should_stop=lambda: len(seen.append(1) or seen) > 2)
     assert result['complete'] is False and result['lastChecked'] == 'b' and result['checked'] == 2
+
+
+def test_a_full_person_gets_its_extra_faces_moved_to_overflow_rows():
+    ids = [f'{i:036d}' for i in range(900)]
+    extra = {f'x{i:035d}': {'personId': 'p'} for i in range(700)}
+    placed = []
+    result, added = run([person('p', ids, 'Pia')], {'p': ids + list(extra)}, extra, dry_run=False,
+                        place_overflow=lambda pid, faces: placed.append((pid, len(faces))) or ['shard1'])
+    assert added == [] and placed == [('p', 700)]
+    assert result['overflow'] == [dict(personId='p', name='Pia', missing=700, rows=['shard1'])]
+
+
+def test_a_dry_run_reports_overflow_without_moving_anything():
+    ids = [f'{i:036d}' for i in range(900)]
+    extra = {f'x{i:035d}': {'personId': 'p'} for i in range(700)}
+    placed = []
+    result, _ = run([person('p', ids)], {'p': ids + list(extra)}, extra,
+                    place_overflow=lambda *a: placed.append(a) or [])
+    assert placed == [] and result['overflow'][0]['missing'] == 700

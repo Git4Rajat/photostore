@@ -491,9 +491,10 @@ def reconcile_people_faces():
     result = person_reconcile.reconcile_people(
         user_id, person_rows(), app.person_members_table_client,
         lambda ids: app._load_face_rows_by_ids(user_id, ids), app._face_is_rejected, add_face_ids,
-        dry_run=not apply_changes, should_stop=lambda: time.monotonic() > deadline)
-    if apply_changes and result['repaired']:
-        app.mark_people_dirty(user_id, [row['personId'] for row in result['repaired']])
+        dry_run=not apply_changes, should_stop=lambda: time.monotonic() > deadline,
+        place_overflow=lambda person_id, face_ids: app._move_faces_to_overflow_rows(user_id, person_id, face_ids))
+    if apply_changes and (result['repaired'] or result['overflow']):
+        app.mark_people_dirty(user_id, [row['personId'] for row in result['repaired'] + result['overflow']])
     if result['complete']:
         # Overflow rows clustering created but the first person's pointer does not list yet.
         result['pointersAdded'] = len(app._refresh_group_pointers(user_id, dry_run=not apply_changes))
