@@ -109,6 +109,7 @@ def test_indexer_role_serves_only_tools_routes():
         '/api/tools/indexes/recover-pending',
         '/api/tools/index-events/negotiate',
         '/api/tools/pending-edits/reconcile',
+        '/api/tools/people/reconcile-faces',
         '/api/tools/indexes/maintenance/<scope>',
         # Opt-in shadow-wave diagnostic (disabled by default via
         # UPLOAD_WAVE_SHADOW_ENABLED) -- see docs/indexing-clustering-

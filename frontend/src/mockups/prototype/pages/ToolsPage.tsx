@@ -339,6 +339,26 @@ const ToolsPage: React.FC = () => {
         }
     };
 
+    const repairPersonFaceCounts = async () => {
+        setBusy(true);
+        let fixed = 0;
+        try {
+            let after = '';
+            for (;;) {
+                const slice = await postTools<{ complete: boolean; lastChecked: string; repaired: unknown[] }>(
+                    '/api/tools/people/reconcile-faces', { apply: true, after });
+                fixed += slice.repaired.length;
+                if (slice.complete) break;
+                after = slice.lastChecked;
+            }
+            toast(fixed ? `Repaired ${fixed} ${fixed === 1 ? 'person' : 'people'}` : 'Every person’s face list is already correct');
+        } catch {
+            toast(fixed ? `Repaired ${fixed}, then stopped — run it again` : 'Couldn’t repair person face counts', undefined, undefined, 'error');
+        } finally {
+            setBusy(false);
+        }
+    };
+
     const runVerifyFaceIndex = async () => {
         const filenames = verifyInput.split(/[\n,]/).map((f) => f.trim()).filter(Boolean);
         if (!filenames.length) return;
@@ -525,6 +545,11 @@ const ToolsPage: React.FC = () => {
                         <strong>Suppress suspicious faces</strong>
                         <span>Hide faces flagged as likely false detections from clustering and people counts.</span>
                         <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('Suppress suspicious faces', '/api/admin/people/suppress-suspicious-faces', { repair: true, dryRun: false, confirm: 'SUPPRESS_SUSPICIOUS_FACES' })}>Suppress</button>
+                    </div>
+                    <div className="card-glass pt-recover-card">
+                        <strong>Repair person face counts</strong>
+                        <span>Add back faces that belong to a person but are missing from its count, for example after a merge that timed out.</span>
+                        <button type="button" className="btn" disabled={busy} onClick={() => void repairPersonFaceCounts()}>Repair</button>
                     </div>
                     <StuckWavesCard onMessage={(message, error) => toast(message, undefined, undefined, error ? 'error' : undefined)} />
                     <div className="card-glass pt-recover-card">
