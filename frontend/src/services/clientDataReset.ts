@@ -22,6 +22,8 @@ const LIBRARY_IDB_DATABASES = [
     'photostore-upload-db',
     'photostore-library-export',
     'photostore-home-snapshot',
+    'photostore-thumb-cache',
+    'photostore-notification-history',
 ];
 
 // Exact localStorage keys holding account/library-scoped data.

@@ -4,6 +4,7 @@ import { isAuthEnabled } from '../../services/authClient';
 import { useEffect, useRef, useState } from 'react';
 import { requiresBackendPreview } from '../../utils/photoDisplay';
 import { useLongPress } from '../../services/useLongPress';
+import { loadThumbnailObjectUrl, peekThumbnailObjectUrl, storeThumbnail } from '../../services/thumbnailBlobCache';
 
 interface TilePhoto {
     filename: string;
@@ -133,9 +134,35 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
                 : (resolvedAccessUrl || PLACEHOLDER_THUMBNAIL))
             : (scopedThumbnailUrl || PLACEHOLDER_THUMBNAIL))
         : fallbackThumbnailUrl;
+    // Persistent bytes (IndexedDB) for this filename, when a signed remote URL
+    // would otherwise be downloaded again. Keyed to the remote URL it was
+    // resolved for so a changed source never shows a stale blob.
+    const cacheEligible = isHttpUrl(resolvedThumbnailUrl);
+    const [cachedThumb, setCachedThumb] = useState<{ remote: string; local: string } | null>(() => {
+        const local = cacheEligible ? peekThumbnailObjectUrl(photo.filename, resolvedThumbnailUrl) : null;
+        return local ? { remote: resolvedThumbnailUrl, local } : null;
+    });
+    const displayThumbnailUrl = cachedThumb && cachedThumb.remote === resolvedThumbnailUrl
+        ? cachedThumb.local
+        : resolvedThumbnailUrl;
     // Seed as already-loaded when this exact URL has painted before (in this
     // tile or any other) -- see paintedThumbnailUrls above.
     const [imgLoaded, setImgLoaded] = useState(() => Boolean(resolvedThumbnailUrl && paintedThumbnailUrls.has(resolvedThumbnailUrl)));
+
+    useEffect(() => {
+        if (!cacheEligible) {
+            return undefined;
+        }
+        let active = true;
+        void loadThumbnailObjectUrl(photo.filename, resolvedThumbnailUrl).then((local) => {
+            if (active && local) {
+                setCachedThumb({ remote: resolvedThumbnailUrl, local });
+            }
+        });
+        return () => {
+            active = false;
+        };
+    }, [cacheEligible, photo.filename, resolvedThumbnailUrl]);
 
     useEffect(() => {
         if (useBatchedAccess) {
@@ -217,6 +244,13 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
             paintedThumbnailUrls.add(resolvedThumbnailUrl);
         }
     };
+    // Only a network paint (not an object-URL one) should seed the store.
+    const handleLoad = () => {
+        markLoaded();
+        if (cacheEligible && displayThumbnailUrl === resolvedThumbnailUrl) {
+            storeThumbnail(photo.filename, resolvedThumbnailUrl);
+        }
+    };
 
     return (
         <div className={classes} style={style} onClick={onCardClick} data-tile-id={photo.filename} {...longPressHandlers}>
@@ -224,12 +258,12 @@ const PhotoTile: React.FC<PhotoTileProps> = ({
                 {!imgLoaded && <span className="photo-media-skeleton" aria-hidden="true" />}
                 <img
                     ref={imgElRef}
-                    src={resolvedThumbnailUrl || undefined}
+                    src={displayThumbnailUrl || undefined}
                     alt={photo.filename}
                     className={`${mediaClassName} photo-media--fade${imgLoaded ? ' is-loaded' : ''}`}
                     style={mediaStyle}
                     loading="lazy"
-                    onLoad={markLoaded}
+                    onLoad={handleLoad}
                     onError={markLoaded}
                     onClick={onMediaClick}
                 />
