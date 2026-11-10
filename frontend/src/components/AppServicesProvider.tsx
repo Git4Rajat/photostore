@@ -55,6 +55,13 @@ import { BackgroundKeepAlive } from '../services/backgroundKeepAlive';
 import { getUnattendedConcurrencyBonus, reportBrowserProcessingOutcome } from '../services/unattendedProcessingScaler';
 import { showToast } from '../services/toast';
 import { setNotificationSink } from '../services/notificationSink';
+import {
+    loadNotificationHistory,
+    saveNotificationHistory,
+    pruneNotificationHistory,
+    mergeNotificationHistory,
+    MAX_NOTIFICATION_HISTORY,
+} from '../services/notificationHistory';
 import { publishLibraryChange } from '../services/libraryChanges';
 import { fetchKnownUploadHashes, requestUploadHashRefresh, type UploadEndReason } from '../services/uploadKnownHashes';
 import { perf } from '../services/perf';
@@ -1327,7 +1334,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             unread: true,
             progress,
         };
-        setNotifications((prev) => [created, ...prev.filter(notification => notification.id !== id)].slice(0, 40));
+        setNotifications((prev) => [created, ...prev.filter(notification => notification.id !== id)].slice(0, MAX_NOTIFICATION_HISTORY));
         return id;
     }, []);
 
@@ -1338,6 +1345,35 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 : notification
         )));
     }, []);
+
+    // Notification history survives reloads (IndexedDB, scoped to the session's
+    // account/library). Hydrate once, then mirror every change. Saving waits
+    // for hydration so the initial empty list can't overwrite stored history.
+    const notificationHistoryScopeRef = useRef<string | null>(null);
+    useEffect(() => {
+        let disposed = false;
+        const scope = sessionScope();
+        void (async () => {
+            const history = await loadNotificationHistory(scope);
+            if (disposed) return;
+            notificationHistoryScopeRef.current = scope;
+            if (history.length > 0) {
+                setNotifications((live) => mergeNotificationHistory(live, history));
+            } else {
+                // Nothing stored, but live items added before hydration finished
+                // still need their first save.
+                setNotifications((live) => [...live]);
+            }
+            void pruneNotificationHistory();
+        })();
+        return () => { disposed = true; };
+    }, []);
+    useEffect(() => {
+        const scope = notificationHistoryScopeRef.current;
+        if (scope === null || scope !== sessionScope()) return undefined;
+        const timer = window.setTimeout(() => { void saveNotificationHistory(scope, notifications); }, 500);
+        return () => window.clearTimeout(timer);
+    }, [notifications]);
 
     // Popup-style feedback (showToast, the prototype store's toast) is mirrored
     // into the panel through this sink so nothing is popup-only.
@@ -1832,7 +1868,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         title: 'Previous upload closed after inactivity',
                         details: `${notice.affectedCount} files did not finish. Completed photos are saved. Retry unfinished files if they are still available on this device.`,
                         timestamp: notice.closedAt * 1000, unread: true,
-                    }, ...previous].slice(0, 40));
+                    }, ...previous].slice(0, MAX_NOTIFICATION_HISTORY));
                 }
                 // Only outstanding cleanup gets bounded follow-up calls while
                 // a person is using the page. Healthy sessions create no timer.
