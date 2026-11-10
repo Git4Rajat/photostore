@@ -482,12 +482,13 @@ def confirm_face(person_id: str):
     except Exception:
         return app.jsonify({'error': 'face not found'}), 404
 
+    owner_id = app._owner_row_for_new_face(user_id, person_id, face_id)   # an overflow row when the person is full
     old_person_id = face.get('personId')
-    if old_person_id and old_person_id != person_id:
+    if old_person_id and old_person_id != owner_id:
         app._remove_face_from_person(user_id, str(old_person_id), face_id)
-    app._remove_face_from_other_people(user_id, face_id, person_id)
-    app._add_face_to_person(user_id, person_id, face_id)
-    face['personId'] = person_id
+    app._remove_face_from_other_people(user_id, face_id, owner_id)
+    app._add_face_to_person(user_id, owner_id, face_id)
+    face['personId'] = owner_id
     face['confirmedByUser'] = True
     face['reviewStatus'] = 'confirmed'
     face['rejected'] = False
@@ -589,12 +590,13 @@ def accept_suggested_faces(person_id: str):
         face = fetched_faces.get(face_id)
         if face is None:
             continue
+        owner_id = app._owner_row_for_new_face(user_id, person_id, face_id)   # an overflow row when the person is full
         old_person_id = str(face.get('personId') or '')
-        if old_person_id and old_person_id != person_id:
+        if old_person_id and old_person_id != owner_id:
             app._remove_face_from_person(user_id, old_person_id, face_id)
-        app._remove_face_from_other_people(user_id, face_id, person_id)
-        app._add_face_to_person(user_id, person_id, face_id)
-        face['personId'] = person_id
+        app._remove_face_from_other_people(user_id, face_id, owner_id)
+        app._add_face_to_person(user_id, owner_id, face_id)
+        face['personId'] = owner_id
         face['confirmedByUser'] = True
         face['reviewStatus'] = 'confirmed'
         face['rejected'] = False
@@ -871,16 +873,20 @@ def undo_merge(merge_id: str):
     face_map = payload.get('faceMap') or {}
     if payload.get('mode') == 'group':
         # A group merge only re-tagged person rows (no face or membership moved): put the saved rows back.
-        for row in ([base] if base.get('RowKey') else []) + [m for m in merged if m.get('RowKey')]:
-            app.person_table_client.upsert_entity(row)
-        restored_ids = [str(row['RowKey']) for row in ([base] if base.get('RowKey') else []) + merged if row.get('RowKey')]
-        face_ids = []
-        for row in merged:
+        # Rows go back with the name they have now; the saved names are then applied through the label path, so
+        # the photos' metadata follows in the index worker rather than inside this request.
+        saved = ([base] if base.get('RowKey') else []) + [m for m in merged if m.get('RowKey')]
+        renames = {}
+        for row in saved:
             try:
-                face_ids.extend(str(fid) for fid in app.json.loads(row.get('faceIds', '[]') or '[]'))
-            except Exception:
-                pass
-        app._rebuild_metadata_faces_for_filenames(user_id, app._filenames_for_face_ids(user_id, face_ids))
+                current = str(app.person_table_client.get_entity(partition_key=user_id, row_key=row['RowKey']).get('name') or '')
+            except app.ResourceNotFoundError:
+                current = str(row.get('name') or '')
+            if current != str(row.get('name') or ''):
+                renames[str(row['RowKey'])] = str(row.get('name') or '')
+            app.person_table_client.upsert_entity({**row, 'name': current})
+        restored_ids = [str(row['RowKey']) for row in saved]
+        app._apply_person_names(user_id, renames)
         app._resync_person_rule_albums_for_many(user_id, restored_ids)
         app.mark_people_dirty(user_id, restored_ids)
         try:

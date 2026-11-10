@@ -180,3 +180,97 @@ def test_a_photos_people_ids_name_the_first_person_for_a_shard_face(monkeypatch)
     app._person_light_scan_cache.invalidate('u1')
     app._rebuild_metadata_faces_for_filename('u1', 'f3.jpg', searchable_person_index={'S': 'Asha', 'A': 'Asha'})
     assert updates and json.loads(updates[0]['peopleIds']) == ['A']
+
+
+def _person_with(persons, pid, count, name=''):
+    persons.upsert_entity({'PartitionKey': 'u1', 'RowKey': pid, 'name': name,
+                           'faceIds': json.dumps([f'{pid}{i}' for i in range(count)])})
+
+
+def test_a_big_merge_that_still_fits_one_row_is_done_by_retagging(merge_env, monkeypatch):
+    persons, faces, blobs = merge_env
+    monkeypatch.setattr(app, 'GROUP_MERGE_MIN_FACES', 150)
+    _person_with(persons, 'P', 20, 'Pia')
+    _person_with(persons, 'Q', 150)
+    assert app._merge_persons_core('u1', 'P', ['Q'])['mergeId']
+    assert persons.get_entity('u1', 'Q')['groupId'] == 'P'          # kept as a row of P's group
+    assert len(json.loads(persons.get_entity('u1', 'P')['faceIds'])) == 20
+
+
+def test_a_small_merge_still_moves_the_faces(merge_env, monkeypatch):
+    persons, faces, blobs = merge_env
+    monkeypatch.setattr(app, 'GROUP_MERGE_MIN_FACES', 150)
+    _person_with(persons, 'P', 20)
+    _person_with(persons, 'Q', 149)
+    _person_with(persons, 'R', 150)
+    rows = lambda *ids: [persons.get_entity('u1', pid) for pid in ids]
+    assert app._merge_needs_group_mode('u1', rows('P', 'Q')) is False
+    assert app._merge_needs_group_mode('u1', rows('P', 'R')) is True
+
+
+def test_a_group_merge_does_not_rewrite_photo_metadata_inside_the_request(merge_env, monkeypatch):
+    persons, faces, blobs = merge_env
+    inline = []
+    monkeypatch.setattr(app, '_rebuild_metadata_faces_for_filenames', lambda *a, **k: inline.append(a) or {})
+    persons.upsert_entity({**persons.get_entity('u1', 'S'), 'name': 'Asha'})
+    app._merge_persons_core('u1', 'B', ['A'])
+    assert inline == []
+    for pid in ('A', 'S', 'B'):
+        assert persons.get_entity('u1', pid)['name'] == 'Asha'
+    assert persons.get_entity('u1', 'A')['labelPending']             # the worker publishes the new name
+
+
+def test_undo_restores_names_through_the_label_path_too(merge_env):
+    persons, faces, blobs = merge_env
+    persons.upsert_entity({**persons.get_entity('u1', 'A'), 'name': 'Anu'})
+    merge_id = app._merge_persons_core('u1', 'B', ['A'])['mergeId']
+    assert app.app.test_client().post(f'/api/persons/merge/{merge_id}/undo').status_code == 200
+    assert persons.get_entity('u1', 'A')['name'] == 'Anu'
+
+
+def _full_person(persons, pid='FULL', name='Fay'):
+    persons.upsert_entity({'PartitionKey': 'u1', 'RowKey': pid, 'name': name,
+                           'faceIds': json.dumps([f'{i:0>50}' for i in range(1250)])})
+
+
+def _loose_face(faces, face_id):
+    faces.upsert_entity({'PartitionKey': 'u1', 'RowKey': face_id, 'filename': f'{face_id}.jpg', 'personId': '',
+                         'confidence': 0.5, 'rejected': False, 'bbox': '{}', 'embedding': json.dumps([0.1, 0.2])})
+
+
+def test_a_person_with_room_keeps_the_face_on_its_own_row(merge_env):
+    persons, faces, blobs = merge_env
+    _loose_face(faces, 'n1')
+    assert app._owner_row_for_new_face('u1', 'B', 'n1') == 'B'
+
+
+def test_a_full_person_gets_an_overflow_row_for_the_face(merge_env):
+    persons, faces, blobs = merge_env
+    _full_person(persons)
+    _loose_face(faces, 'n1')
+    _loose_face(faces, 'n2')
+    shard = app._owner_row_for_new_face('u1', 'FULL', 'n1')
+    assert shard != 'FULL'
+    row = persons.get_entity('u1', shard)
+    assert row['groupId'] == 'FULL' and row['name'] == 'Fay'
+    assert app._person_group_ids('u1', 'FULL') == ['FULL', shard]
+    assert app._owner_row_for_new_face('u1', 'FULL', 'n2') == shard       # the next face reuses the room there
+    persons.upsert_entity({**persons.get_entity('u1', shard), 'faceIds': json.dumps(['n1'])})
+    assert app._owner_row_for_new_face('u1', 'FULL', 'n1') == shard       # a face already in the group stays put
+
+
+def test_confirming_a_face_into_a_full_person_lands_on_its_overflow_row(merge_env, monkeypatch):
+    persons, faces, blobs = merge_env
+    _full_person(persons)
+    _loose_face(faces, 'n1')
+    added = []
+    monkeypatch.setattr(app, '_remove_face_from_person', lambda *a, **k: None)
+    monkeypatch.setattr(app, '_remove_face_from_other_people', lambda *a, **k: None)
+    monkeypatch.setattr(app, '_add_face_to_person', lambda user, pid, fid, *a, **k: added.append((pid, fid)) or True)
+    monkeypatch.setattr(app, '_update_person_rep_embedding', lambda *a, **k: None)
+    monkeypatch.setattr(app, '_rebuild_metadata_faces_for_filename', lambda *a, **k: None)
+    response = app.app.test_client().post('/api/persons/FULL/confirm-face', json={'faceId': 'n1'})
+    assert response.status_code == 200
+    (shard, face_id), = added
+    assert face_id == 'n1' and shard != 'FULL' and persons.get_entity('u1', shard)['groupId'] == 'FULL'
+    assert faces.get_entity('u1', 'n1')['personId'] == shard
