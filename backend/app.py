@@ -6224,6 +6224,37 @@ def _remove_face_from_other_people(
     return {'removed': removed, 'deletedPeople': deleted_people, 'touchedPeople': touched_people}
 
 
+OVERFLOW_ROW_FACES = 400
+
+
+def _move_faces_to_overflow_rows(user_id: str, root_id: str, face_ids: List[str]) -> List[str]:
+    """Give faces that belong to ``root_id`` (their rows name it) but cannot be listed on its full row to new
+    overflow rows of its group: the rows list them, the face rows point at them and the membership rows follow.
+    Rerunning after an interruption only touches faces still pointing at ``root_id``."""
+    try:
+        root = person_table_client.get_entity(partition_key=user_id, row_key=root_id)
+    except Exception:
+        return []
+    name = str(root.get('name') or '')
+    created: List[str] = []
+    for start in range(0, len(face_ids), OVERFLOW_ROW_FACES):
+        chunk = face_ids[start:start + OVERFLOW_ROW_FACES]
+        try:
+            embedding = _face_embedding_from_entity(face_table_client.get_entity(partition_key=user_id, row_key=chunk[0]))
+        except Exception:
+            embedding = []
+        shard_id = _create_person_entity(user_id, chunk, embedding, name=name)   # lists the faces, syncs members
+        person_table_client.upsert_entity({'PartitionKey': user_id, 'RowKey': shard_id, 'groupId': root_id}, mode='merge')
+        _set_group_pointer(user_id, root_id, add=[shard_id])
+        _batch_upsert_entities(face_table_client, [{'PartitionKey': user_id, 'RowKey': fid, 'personId': shard_id}
+                                                   for fid in chunk])
+        for fid in chunk:
+            _remove_person_member(root_id, fid)
+        created.append(shard_id)
+    _invalidate_people_scan_cache(user_id)
+    return created
+
+
 def _owner_row_for_new_face(user_id: str, person_id: str, face_id: str) -> str:
     """The row that should hold ``face_id`` when the user puts it in ``person_id``: the person's own row while
     its membership list has room, else a row of the same group with room, else a new overflow row (tagged with

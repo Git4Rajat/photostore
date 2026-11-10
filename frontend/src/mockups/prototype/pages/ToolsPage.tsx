@@ -342,18 +342,24 @@ const ToolsPage: React.FC = () => {
     const repairPersonFaceCounts = async () => {
         setBusy(true);
         let fixed = 0;
+        let moved = 0;
         try {
             let after = '';
             for (;;) {
-                const slice = await postTools<{ complete: boolean; lastChecked: string; repaired: unknown[] }>(
+                const slice = await postTools<{ complete: boolean; lastChecked: string; repaired: unknown[]; overflow: { missing: number }[] }>(
                     '/api/tools/people/reconcile-faces', { apply: true, after });
                 fixed += slice.repaired.length;
+                moved += slice.overflow.reduce((sum, entry) => sum + entry.missing, 0);
                 if (slice.complete) break;
                 after = slice.lastChecked;
             }
-            toast(fixed ? `Repaired ${fixed} ${fixed === 1 ? 'person' : 'people'}` : 'Every person’s face list is already correct');
+            const parts = [
+                fixed ? `repaired ${fixed} ${fixed === 1 ? 'person' : 'people'}` : '',
+                moved ? `moved ${moved} faces to overflow rows of people whose list was full` : '',
+            ].filter(Boolean);
+            toast(parts.length ? parts.join(', ').replace(/^./, (c) => c.toUpperCase()) : 'Every person’s face list is already correct');
         } catch {
-            toast(fixed ? `Repaired ${fixed}, then stopped — run it again` : 'Couldn’t repair person face counts', undefined, undefined, 'error');
+            toast(fixed || moved ? 'Repaired part of it, then stopped — run it again' : 'Couldn’t repair person face counts', undefined, undefined, 'error');
         } finally {
             setBusy(false);
         }
