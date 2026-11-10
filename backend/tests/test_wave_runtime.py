@@ -287,6 +287,27 @@ def test_artifact_cleanup_stall_is_bounded_without_scheduling_wakeups(monkeypatc
     assert work._get(token)['failed']
 
 
+def test_exhausted_dispatch_posts_one_stalled_wave_notification(monkeypatch, vision_dispatch):
+    import app
+    from upload_waves import ArtifactCleanupBusy
+    store, work, _, token, payload, sent = vision_dispatch
+    posted = []
+    monkeypatch.setattr(app, '_upsert_job_status', lambda *a, **k: posted.append((a, k)), raising=False)
+    def busy(*args, **kwargs):
+        raise ArtifactCleanupBusy('temporary GC')
+    monkeypatch.setattr(runtime, 'run_vision_release', busy)
+    for _ in range(5):
+        assert runtime.consume(payload) == 'retry'
+    assert not posted
+    with pytest.raises(RuntimeError, match='attempts exhausted'):
+        runtime.consume(payload)
+    assert len(posted) == 1
+    (job_id, library, job_type, status), fields = posted[0]
+    assert job_id == f"wave-stalled-{payload['waveId']}-{payload['stage']}"
+    assert (library, job_type, status) == (payload['userId'], 'upload_wave', 'failed')
+    assert runtime.consume(payload) == 'noop' and len(posted) == 1
+
+
 @pytest.mark.parametrize('failure', [ValueError('invalid evidence'), RuntimeError('lost lease')])
 def test_other_failures_are_not_acknowledged_as_coordination_retries(monkeypatch, vision_dispatch, failure):
     _, work, _, token, payload, sent = vision_dispatch

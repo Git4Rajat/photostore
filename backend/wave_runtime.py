@@ -297,6 +297,13 @@ def consume(payload,*,deadline=None,progress=None):
     if claim.attempt>5:
         record_failure(dict(errorClass='DispatchAttemptsExhausted'))
         work.finish(claim,failed=True)
+        try:
+            # Surface the stall in the notification bell; the wave otherwise
+            # fails silently and holds back every later wave from publishing.
+            app._upsert_job_status(f'wave-stalled-{wave_id}-{stage}',library,'upload_wave','failed',
+                waveId=wave_id,stage=stage,error='Wave dispatch attempts exhausted')
+        except Exception:
+            logging.getLogger(__name__).exception('Wave stalled notification failed')
         raise RuntimeError('Wave dispatch attempts exhausted; operator retry required')
     def made_progress(current):
         after=leases._get(execution_key) or {}
