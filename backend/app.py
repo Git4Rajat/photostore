@@ -15206,9 +15206,9 @@ def attach_live_photos(user_id: str, stem: str, *, dry_run: bool = False) -> Lis
 
 
 def attach_live_photo_after_upload(user_id: str, filename: str, row: Optional[Dict] = None) -> List[Tuple[str, str]]:
-    """Finalize hook, given the row finalize already holds. Only a detected clip, or a photo carrying Apple's
-    content identifier (a Live Photo's still, read by the browser's exiftool), can be half of a pair, so other
-    uploads cost no storage call at all."""
+    """Finalize hook, given the row finalize already holds. Only a detected clip, a photo carrying Apple's
+    content identifier (a Live Photo's still, read by the browser's exiftool), or a photo whose EXIF is not read
+    yet can be half of a pair; anything else costs no storage call at all."""
     import live_photos
     kind = live_photos.extension(filename)
     if kind not in live_photos.PHOTO_EXTENSIONS and kind not in live_photos.VIDEO_EXTENSIONS:
@@ -15220,8 +15220,10 @@ def attach_live_photo_after_upload(user_id: str, filename: str, row: Optional[Di
     if kind in live_photos.VIDEO_EXTENSIONS:
         if live_photos.clip_info(row) is None:
             return []
-    elif not parse_exif_data(row.get('exifData', '{}')).get('ContentIdentifier'):
-        return []
+    else:
+        exif = parse_exif_data(row.get('exifData', '{}'))
+        if exif and not exif.get('ContentIdentifier'):
+            return []      # EXIF read, no Apple identifier: not a Live Photo's still
     return attach_live_photos(user_id, live_photos.base_stem(filename))
 
 
