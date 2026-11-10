@@ -33,3 +33,12 @@ def test_unknown_job_type_still_falls_back_to_generic_job():
 
     assert result['kind'] == 'job'
     assert result['title'] == 'Background task finished'
+
+
+def test_stalled_upload_wave_tells_user_to_retry_from_tools():
+    result = app._humanize_job({'jobId': 'wave-stalled-w1-vision', 'jobType': 'upload_wave', 'status': 'failed',
+                                'error': 'Wave dispatch attempts exhausted'})
+
+    assert result['kind'] == 'upload_wave'
+    assert result['title'] == 'Upload processing stalled'
+    assert 'Tools' in result['message'] and 'retry' in result['message']

@@ -17,6 +17,11 @@ it('distinguishes later index completions even though the job ID is reused', () 
     expect(jobNotificationKey(job({kind: 'cluster', updatedAt: 'later'}))).toBe('job-1');
 });
 
+it('announces a stalled wave again when it fails after a retry reuses the job ID', () => {
+    const first = job({kind: 'upload_wave', status: 'failed', updatedAt: '2026-10-15T10:00:00Z'});
+    expect(jobNotificationKey(first)).not.toBe(jobNotificationKey({...first, updatedAt: '2026-10-15T11:00:00Z'}));
+});
+
 it('groups both duplicate-check passes but keeps scopes and failures distinct', () => {
     const dedup = job({kind: 'index_build', indexScope: 'dedup'});
     expect(indexNotificationGroup(dedup)).toBe(indexNotificationGroup({...dedup, indexScope: 'dedup-idle'}));

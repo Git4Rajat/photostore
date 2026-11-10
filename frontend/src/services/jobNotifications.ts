@@ -29,7 +29,8 @@ export type JobStatusRecord = {
 
 // Index job IDs are reused. A later completion must be announced without
 // repeatedly announcing the same terminal row on every poll or page reload.
-export const jobNotificationKey = (job: JobStatusRecord): string => job.kind === 'index_build' && job.updatedAt
+// A stalled wave reuses its job id, so a failure after a retry must announce again.
+export const jobNotificationKey = (job: JobStatusRecord): string => (job.kind === 'index_build' || job.kind === 'upload_wave') && job.updatedAt
     ? `${job.jobId}:${job.updatedAt}:${job.status}` : job.jobId;
 
 export const indexNotificationGroup = (job: JobStatusRecord): string | undefined => {
@@ -55,7 +56,7 @@ export const TERMINAL_JOB_STATUSES = new Set(['done', 'failed', 'skipped']);
 
 // Job kinds worth interrupting the user with a toast. Everything still lands in
 // the notification bell; previews are frequent + low-signal so they stay quiet.
-export const TOASTABLE_JOB_KINDS = new Set(['recluster', 'find_faces', 'cluster', 'library_clean', 'library_download', 'bulk_mutation', 'job']);
+export const TOASTABLE_JOB_KINDS = new Set(['recluster', 'find_faces', 'cluster', 'library_clean', 'library_download', 'bulk_mutation', 'upload_wave', 'job']);
 
 // People-clustering job kinds. While any of these is queued/running we surface an
 // in-progress indicator (People-page banner + global pill) so the user isn't

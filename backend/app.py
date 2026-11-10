@@ -3604,6 +3604,12 @@ def _humanize_job(row: Dict) -> Dict:
                 message = 'Repair work is queued; this index is not yet current.'
         elif status == 'failed':
             title = f'{label} update failed'
+    elif job_type == 'upload_wave':
+        kind = 'upload_wave'
+        if status == 'failed':
+            title = 'Upload processing stalled'
+            message = ('Some uploaded photos could not finish processing and later uploads are waiting on them. '
+                       'Open Tools, find the stuck upload wave and retry it.')
     elif job_type == 'photo_soft_delete':
         kind = 'bulk_mutation'
         count = int(result.get('deleted') or row.get('totalItems') or 0)
