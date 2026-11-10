@@ -403,6 +403,19 @@ export function useVideoSource(photo?: Photo | null): VideoSourceState {
     return { src, poster, failed, reportError };
 }
 
+/** Direct URL of a Live Photo's motion clip (see Photo.liveClip), resolved once the photo is shown. */
+export function useLiveClipSource(clip?: string): string | undefined {
+    const [src, setSrc] = useState<string | undefined>(undefined);
+    useEffect(() => {
+        setSrc(undefined);
+        if (!clip) return;
+        let active = true;
+        void accessUrl('image', clip).then((url) => { if (active) setSrc(url || undefined); }).catch(() => {});
+        return () => { active = false; };
+    }, [clip]);
+    return src;
+}
+
 // Shape of GET /api/photos/<filename>/metadata, trimmed to the fields the
 // viewer's info panel renders.
 export interface PhotoMetadata {

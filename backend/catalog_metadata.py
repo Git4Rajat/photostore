@@ -6,7 +6,10 @@ _FINALIZATION_FIELDS = (
     'uploadDate',
     'anonymousImageId', 'fileHash', 'perceptualHash', 'mimeType', 'verification_status',
 )
-CATALOG_ADMISSION_FIELDS = ('pendingAnonymousBlob', 'upload_started_at', *_FINALIZATION_FIELDS)
+# A Live Photo's motion clip, once attached to its photo (see live_photos.py), is served with the photo, not
+# as a gallery item of its own.
+LIVE_PHOTO_OF = 'livePhotoOf'
+CATALOG_ADMISSION_FIELDS = ('pendingAnonymousBlob', 'upload_started_at', LIVE_PHOTO_OF, *_FINALIZATION_FIELDS)
 
 
 def is_upload_reservation_only(row):
@@ -22,3 +25,9 @@ def is_upload_reservation_only(row):
     tracking = row.get('pendingAnonymousBlob')
     finalized = any(row.get(field) for field in _FINALIZATION_FIELDS)
     return bool(tracking) and not finalized
+
+
+def is_live_photo_clip(row):
+    """An attached Live Photo clip: the gallery and search leave it out, media access still serves it (the
+    viewer plays it by its own filename)."""
+    return bool(row.get(LIVE_PHOTO_OF))

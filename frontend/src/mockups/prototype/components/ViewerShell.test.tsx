@@ -1,0 +1,38 @@
+import React from 'react';
+import { describe, expect, it, vi } from 'vitest';
+import { fireEvent, render, screen } from '@testing-library/react';
+import ViewerShell, { type ViewerShellProps } from './ViewerShell';
+
+const props = (overrides: Partial<ViewerShellProps> = {}): ViewerShellProps => ({
+    photoKey: 'IMG_1.HEIC', filename: 'IMG_1.HEIC', title: 'IMG_1.HEIC', index: 0, count: 2,
+    onClose: vi.fn(), onStep: vi.fn(), media: { url: 'https://x/preview.jpg', loading: false, progress: 0 },
+    fullRes: false, onToggleFullRes: vi.fn(), showFullResControl: true, onDownloadOriginal: vi.fn(), bar: null,
+    ...overrides,
+});
+
+describe('ViewerShell Live Photos', () => {
+    it('plays the motion clip over the still once, then returns to the still', () => {
+        render(<ViewerShell {...props({ liveSrc: 'https://x/IMG_1.MOV' })} />);
+        expect(document.querySelector('video')).toBeNull();
+        fireEvent.click(screen.getByRole('button', { name: 'Play Live Photo' }));
+        const clip = document.querySelector('video');
+        expect(clip?.getAttribute('src')).toBe('https://x/IMG_1.MOV');
+        expect(screen.getByAltText('IMG_1.HEIC')).toBeTruthy();
+        fireEvent.ended(clip!);
+        expect(document.querySelector('video')).toBeNull();
+    });
+
+    it('stops when the viewer moves to another photo', () => {
+        const { rerender } = render(<ViewerShell {...props({ liveSrc: 'https://x/IMG_1.MOV' })} />);
+        fireEvent.click(screen.getByRole('button', { name: 'Play Live Photo' }));
+        rerender(<ViewerShell {...props({ photoKey: 'IMG_2.HEIC', filename: 'IMG_2.HEIC', liveSrc: 'https://x/IMG_2.MOV' })} />);
+        expect(document.querySelector('video')).toBeNull();
+    });
+
+    it('offers no LIVE control for an ordinary photo or a video', () => {
+        const { rerender } = render(<ViewerShell {...props()} />);
+        expect(screen.queryByRole('button', { name: 'Play Live Photo' })).toBeNull();
+        rerender(<ViewerShell {...props({ liveSrc: 'https://x/IMG_1.MOV', videoSrc: 'https://x/trip.mov' })} />);
+        expect(screen.queryByRole('button', { name: 'Play Live Photo' })).toBeNull();
+    });
+});

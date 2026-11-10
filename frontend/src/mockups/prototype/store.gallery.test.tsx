@@ -624,6 +624,12 @@ describe('index-backed gallery', () => {
         });
     });
 
+    it('carries a Live Photo clip from the index row to the tile', () => {
+        const row = rows()[0];
+        expect(galleryIndexPhoto({ ...row, gallery: { ...row.gallery, liveClip: 'p0.mov' } }, null).liveClip).toBe('p0.mov');
+        expect('liveClip' in galleryIndexPhoto(row, null)).toBe(false);
+    });
+
     it('reuses loaded albums on repeat visits, including an empty list', async () => {
         render(<StoreProvider><Probe /></StoreProvider>);
         await waitFor(() => expect(store.photosLoading).toBe(false));

@@ -28,7 +28,7 @@ from azure.data.tables import UpdateMode
 from azure.storage.blob import ContentSettings as BlobContentSettings
 from werkzeug.utils import secure_filename
 from upload_diagnostics import timed_call, upload_phase
-from catalog_metadata import CATALOG_ADMISSION_FIELDS, is_upload_reservation_only
+from catalog_metadata import CATALOG_ADMISSION_FIELDS, is_live_photo_clip, is_upload_reservation_only
 
 # This module otherwise swallows failures silently (`except Exception: pass`)
 # because they happen inside a request a caller will retry or already
@@ -384,6 +384,7 @@ _SORT_INDEX_RELEVANT_FIELDS = {
     'face_status', 'ai_vision_status', 'map_detection_status',
     'exifData', 'clientLastModified', 'uploadDate', 'tagMetadata',
     'address', 'locationCity', 'locationCountry', 'locationRegion',
+    'livePhotoOf', 'livePhotoClip',
 }
 
 _CTX: Dict[str, object] = {}
@@ -5678,6 +5679,7 @@ _SORT_INDEX_SOURCE_FIELDS = sorted(set(CATALOG_ADMISSION_FIELDS) | {
     'preview_status', 'exif_status', 'ocr_status', 'face_status',
     'ai_vision_status', 'map_detection_status',
     'latitude', 'longitude', 'address', 'locationCity', 'locationCountry', 'locationRegion',
+    'livePhotoClip',
 })
 
 
@@ -5898,7 +5900,7 @@ def _catalog_derivative_receipt(entity: Dict, kind: str):
 
 def _sort_index_row(entity: Dict) -> Optional[Dict[str, object]]:
     filename = str(entity.get('RowKey') or '').strip()
-    if not filename or is_upload_reservation_only(entity):
+    if not filename or is_upload_reservation_only(entity) or is_live_photo_clip(entity):
         return None
     capture_dt = metadata_capture_datetime(entity)
     processing = _safe_json_load(entity.get('processing_metadata'))
@@ -5940,6 +5942,8 @@ def _sort_index_row(entity: Dict) -> Optional[Dict[str, object]]:
                 'aiVision': entity.get('ai_vision_status'),
                 'mapDetection': entity.get('map_detection_status'),
             },
+            # A Live Photo: the attached motion clip's filename (see live_photos.py).
+            **({'liveClip': str(entity['livePhotoClip'])} if entity.get('livePhotoClip') else {}),
         },
     }
 

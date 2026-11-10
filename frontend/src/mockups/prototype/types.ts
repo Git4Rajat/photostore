@@ -38,6 +38,8 @@ export interface Photo {
     thumbnailRotation?: number;
     likes?: number;
     captureDate?: string | null;
+    /** A Live Photo: filename of its attached motion clip (played over the still in the viewer). */
+    liveClip?: string;
     /** Per-step server processing status (mirrors the backend's raw status
      * strings -- 'done'/'pending'/'queued'/'running'/'failed'/'skipped'/
      * 'no_data'/'timeout'/'unsupported' -- or a {status} object for face).

@@ -365,6 +365,32 @@ const ToolsPage: React.FC = () => {
         }
     };
 
+    const attachLiveClips = async () => {
+        setBusy(true);
+        let clips = 0;
+        let attached = 0;
+        let newlyAttached = 0;
+        try {
+            let after = '';
+            for (;;) {
+                const slice = await postTools<{ complete: boolean; lastChecked: string; clips: number; attached: number; newlyAttached: number }>(
+                    '/api/tools/live-photos/attach', { after });
+                clips += slice.clips;
+                attached += slice.attached;
+                newlyAttached += slice.newlyAttached;
+                if (slice.complete) break;
+                after = slice.lastChecked;
+            }
+            toast(clips
+                ? `Attached ${newlyAttached} Live Photo clip${newlyAttached === 1 ? '' : 's'} (${attached} of ${clips} now play from their photo)`
+                : 'No Live Photo clips found');
+        } catch {
+            toast(newlyAttached ? `Attached ${newlyAttached}, then stopped — run it again` : 'Couldn’t attach Live Photo clips', undefined, undefined, 'error');
+        } finally {
+            setBusy(false);
+        }
+    };
+
     const runVerifyFaceIndex = async () => {
         const filenames = verifyInput.split(/[\n,]/).map((f) => f.trim()).filter(Boolean);
         if (!filenames.length) return;
@@ -551,6 +577,11 @@ const ToolsPage: React.FC = () => {
                         <strong>Suppress suspicious faces</strong>
                         <span>Hide faces flagged as likely false detections from clustering and people counts.</span>
                         <button type="button" className="btn" disabled={busy} onClick={() => void runAdmin('Suppress suspicious faces', '/api/admin/people/suppress-suspicious-faces', { repair: true, dryRun: false, confirm: 'SUPPRESS_SUSPICIOUS_FACES' })}>Suppress</button>
+                    </div>
+                    <div className="card-glass pt-recover-card">
+                        <strong>Attach Live Photo clips</strong>
+                        <span>Live Photos arrive as a photo plus a 2–3 second clip. Attach each clip to its photo so it plays from the photo instead of showing as a separate video.</span>
+                        <button type="button" className="btn" disabled={busy} onClick={() => void attachLiveClips()}>Attach</button>
                     </div>
                     <div className="card-glass pt-recover-card">
                         <strong>Repair person face counts</strong>

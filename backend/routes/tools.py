@@ -502,6 +502,75 @@ def reconcile_people_faces():
     return app.jsonify(result)
 
 
+@tools_bp.route('/api/tools/live-photos/attach', methods=['POST'])
+def attach_live_photo_clips():
+    """Attach the Live Photo motion clips already in the library to their photos (new uploads attach while
+    finalizing, see live_photos.py). Detection reads each video's browser metadata packet once and records the
+    verdict. ``{"undo": true}`` detaches every clip again. Work runs in time-bounded slices: pass the returned
+    ``lastChecked`` as ``after`` until ``complete``."""
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    if app.metadata_table_client is None:
+        return app.jsonify({'error': 'Library storage unavailable'}), 503
+    data = app.request.get_json(silent=True) or {}
+    after = str(data.get('after') or '')
+    undo = data.get('undo') is True
+
+    import time
+    import live_photos
+    from concurrent.futures import ThreadPoolExecutor
+    from video_metadata import browser_video_tags
+    deadline = time.monotonic() + 150          # the ingress cuts a request off at 240 s
+    columns = ['RowKey', 'processing_state', 'anonymousImageId', 'uploadMetadataPacket', 'fileHash', 'size',
+               live_photos.CLIP_INFO, live_photos.CLIP_OF, live_photos.PHOTO_CLIP]
+    rows = sorted((row for row in app.metadata_table_client.query_entities(
+        f"PartitionKey eq '{app._escape_odata(user_id)}'", select=columns)
+        if str(row['RowKey']) > after and str(row.get('processing_state') or '').lower() != 'deleted'),
+        key=lambda row: str(row['RowKey']))
+
+    if undo:
+        cleared = 0
+        for row in rows:
+            fields = {field: '' for field in (live_photos.CLIP_OF, live_photos.PHOTO_CLIP) if row.get(field)}
+            if fields:
+                if time.monotonic() > deadline:
+                    return app.jsonify({'undone': cleared, 'complete': False, 'lastChecked': after})
+                app._update_metadata_entity_fields(user_id, row['RowKey'], fields)
+                cleared += 1
+            after = str(row['RowKey'])
+        return app.jsonify({'undone': cleared, 'complete': True, 'lastChecked': after})
+
+    def detect(row):
+        try:
+            clip = live_photos.clip_info_from_tags(browser_video_tags(row))
+        except Exception:
+            clip = None          # no usable browser metadata packet: an ordinary video as far as we can tell
+        value = app.json.dumps(clip, separators=(',', ':')) if clip else live_photos.NOT_A_CLIP
+        app._update_metadata_entity_fields(user_id, row['RowKey'], {live_photos.CLIP_INFO: value})
+        return dict(row, **{live_photos.CLIP_INFO: value})
+
+    videos = [row for row in rows if live_photos.extension(str(row['RowKey'])) in live_photos.VIDEO_EXTENSIONS]
+    result = {'checked': 0, 'clips': 0, 'attached': 0, 'newlyAttached': 0, 'complete': True, 'lastChecked': after}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for start in range(0, len(videos), 64):
+            if time.monotonic() > deadline:
+                result['complete'] = False
+                break
+            chunk = {str(row['RowKey']): row for row in videos[start:start + 64]}
+            for row in pool.map(detect, [row for row in chunk.values() if not row.get(live_photos.CLIP_INFO)]):
+                chunk[str(row['RowKey'])] = row
+            clips = [row for row in chunk.values() if live_photos.clip_info(row) is not None]
+            stems = sorted({live_photos.base_stem(str(row['RowKey'])) for row in clips if not row.get(live_photos.CLIP_OF)})
+            made = {clip for pairs in pool.map(lambda stem: app.attach_live_photos(user_id, stem), stems) for clip, _ in pairs}
+            result['checked'] += len(chunk)
+            result['clips'] += len(clips)
+            result['newlyAttached'] += len([row for row in clips if str(row['RowKey']) in made])
+            result['attached'] += len([row for row in clips if row.get(live_photos.CLIP_OF) or str(row['RowKey']) in made])
+            result['lastChecked'] = str(videos[min(start + 64, len(videos)) - 1]['RowKey'])
+    return app.jsonify(result)
+
+
 @tools_bp.route('/api/tools/pending-edits/reconcile', methods=['POST'])
 def reconcile_pending_edits():
     """Read exact authoritative rows; never infer mutation completion from an index timestamp."""

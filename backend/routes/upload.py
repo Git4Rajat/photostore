@@ -22,6 +22,14 @@ upload_bp = Blueprint('upload', __name__)
 upload_bp.teardown_request(upload_teardown)
 
 
+def attach_live_photo(user_id, final_name, metadata):
+    """Attach a just-finalized Live Photo half to its other half (see live_photos.py). Never fails an upload."""
+    try:
+        timed_call('metadata_packet', app.attach_live_photo_after_upload, user_id, final_name, metadata)
+    except Exception:
+        app.app.logger.warning('Live Photo pairing failed for %s', final_name, exc_info=True)
+
+
 @upload_bp.route('/upload/cleanup', methods=['POST'])
 def cleanup_abandoned_uploads():
     _, library, error = app._require_owner_context(require_auth=True)
@@ -630,6 +638,7 @@ def finalize_direct_upload():
     record_receipt(app, user_id, final_name, data, packet_accepted=packet_accepted,
                    packet_rejection=packet_rejection, processing_rejection=processing_rejection, duplicate=bool(duplicates))
     if not duplicates:
+        attach_live_photo(user_id, final_name, metadata)
         try:
             timed_call('enqueues', processing_diagnostics.queued_call, app._queue_upload_processing, user_id, final_name, data)
         except Exception:
@@ -851,6 +860,7 @@ def finalize_upload_batch():
         record_receipt(app, user_id, final_name, item, packet_accepted=packet_accepted,
                        packet_rejection=packet_rejection, processing_rejection=processing_rejection, duplicate=bool(duplicates))
         if not duplicates:
+            attach_live_photo(user_id, final_name, metadata)
             try:
                 timed_call('enqueues', processing_diagnostics.queued_call, app._queue_upload_processing, user_id, final_name, item)
             except Exception:

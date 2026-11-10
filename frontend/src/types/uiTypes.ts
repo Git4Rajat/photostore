@@ -21,6 +21,8 @@ export interface Photo {
     liked?: boolean;
     tags?: string[];
     rotation?: number;
+    /** A Live Photo: filename of its attached motion clip. */
+    liveClip?: string;
     location?: { latitude: string; longitude: string; address: string };
     hasExif?: boolean;
     exifSummary?: {
