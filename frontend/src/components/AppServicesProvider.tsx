@@ -2390,7 +2390,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             runGatedRequestWithRetry(gate, '/upload/init-batch', {
                 files: admitted.map(({ fileMeta, totalSize, sha256 }) => ({ filename: fileMeta.name, totalSize, sha256,
                     ...admissionByKey.get(fileMeta.key),
-                    ...(isVideoFilename(fileMeta.name) ? {includeMetadata: true} : {}),
+                    ...(isVideoFilename(fileMeta.name) ? {includeMetadata: true} : getRuntimeConfig().browserUploadPreparation ? {includePreview: true, includeMetadata: true} : {}),
                 })),
             })
                 .then((response) => {
@@ -3269,7 +3269,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     directToBlob: true,
                     uploadId: options.existingUploadId,
                     ...options.waveAdmission,
-                    ...(isVideoFilename(file.name) ? {includeMetadata: true} : {}),
+                    ...(isVideoFilename(file.name) ? {includeMetadata: true} : getRuntimeConfig().browserUploadPreparation ? {includePreview: true, includeMetadata: true} : {}),
                 }, options?.signal)
                 : await requestBatchedInit(options!.fileMeta!, options!.session!, file.size, sha256);
             options?.onInitLatencyMs?.(performance.now() - initStartedAt);
@@ -4120,15 +4120,15 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                                 onUploadInitialized: (uploadId, blobName, sha256, targets) => {
                                     resolvedBlobName = blobName;
                                     updatePersistedFile(fileMeta.key, { uploadId, blobName });
-                                    // Image preparation (decode, preview, thumbnail,
-                                    // metadata packet and EXIF extraction) can cost
-                                    // more CPU time than transferring a small file.
-                                    // It is already recoverable through the normal
-                                    // post-finalize browser/backend processing path,
-                                    // including kickOffThumbnailForFile below. Keep
-                                    // only video preparation inline because videos
-                                    // require browser-owned assets and metadata.
-                                    preparation = isVideoFilename(resolvedFile.name)
+                                    // Photos are prepared in flight too (preview <=1.5MB
+                                    // and <=2048px, thumbnail, metadata packet, EXIF), in
+                                    // every processing mode: tiles show at upload time and
+                                    // vision reads the preview instead of downloading the
+                                    // original. kickOffThumbnailForFile is no substitute --
+                                    // it does nothing in 'backend' mode, which left every
+                                    // photo waiting for vision (2026-11-10). A failed
+                                    // preparation still falls back to the backend.
+                                    preparation = getRuntimeConfig().browserUploadPreparation || isVideoFilename(resolvedFile.name)
                                         ? uploadPreparation.start(resolvedFile, sha256,
                                             {...targets, uploadPreparationEnabled: !!targets.uploadPreparationEnabled}, controller.signal)
                                         : Promise.resolve({});
