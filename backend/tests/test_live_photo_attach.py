@@ -74,13 +74,17 @@ def test_a_photo_claimed_meanwhile_keeps_its_clip(library, monkeypatch):
     assert not row(table, 'IMG_2.MOV').get(lp.CLIP_OF)
 
 
-def test_upload_hook_looks_up_only_live_photo_halves(library, monkeypatch):
+def test_upload_hook_looks_up_only_possible_live_photo_halves(library, monkeypatch):
     table, add = library
-    add('plain.jpg', **still_fields())
+    add('plain.jpg', **still_fields())              # EXIF read, no Apple identifier
     add('movie.mov', **{lp.CLIP_INFO: lp.NOT_A_CLIP})
-    monkeypatch.setattr(app, '_live_photo_rows', lambda *a: pytest.fail('looked up a non-Live-Photo upload'))
-    assert app.attach_live_photo_after_upload('lib', 'plain.jpg') == []
-    assert app.attach_live_photo_after_upload('lib', 'movie.mov') == []
+    add('screen.png')
+    add('fresh.heic')                               # EXIF not read yet: could be a Live Photo's still
+    looked_up = []
+    monkeypatch.setattr(app, '_live_photo_rows', lambda user, stem: looked_up.append(stem) or [])
+    for name in ('plain.jpg', 'movie.mov', 'screen.png', 'fresh.heic'):
+        assert app.attach_live_photo_after_upload('lib', name) == []
+    assert looked_up == ['fresh']
 
 
 def test_upload_hook_pairs_whichever_half_arrives_second(library):

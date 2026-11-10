@@ -88,3 +88,25 @@ def test_only_an_attached_clip_counts_as_one():
     assert is_live_photo_clip({'RowKey': 'IMG_1.MOV', lp.CLIP_OF: 'IMG_1.HEIC'})
     assert not is_live_photo_clip({'RowKey': 'IMG_1.HEIC', lp.PHOTO_CLIP: 'IMG_1.MOV'})
     assert not is_live_photo_clip({'RowKey': 'IMG_1.MOV', lp.CLIP_OF: ''})
+
+
+def test_a_short_video_with_apples_identifier_is_a_clip_even_without_live_photo_tags():
+    base = {'CreateDate': '2021-11-04 21:13:50+05:30',
+            'MediaInfo.General.0.extra.com_apple_quicktime_content_identifier': 'ABC'}
+    assert lp.clip_info_from_tags({**base, 'Duration': '2.5'}) == {'contentId': 'ABC', 'capturedAt': base['CreateDate']}
+    assert lp.clip_info_from_tags({**base, 'Duration': '12.0'}) is None             # an ordinary video
+    assert lp.clip_info_from_tags({**base}) is None                                 # length unknown
+    assert lp.clip_info_from_tags({'Duration': '2.5', 'CreateDate': base['CreateDate']}) is None
+
+
+def test_a_clip_recorded_seconds_before_its_still_is_still_its_clip():
+    rows = [clip('IMG_3020.MOV', captured='2023-06-28 21:43:12+02:00'),
+            photo('IMG_3020.HEIC', taken='2023:06:28 21:43:16', offset='+02:00')]
+    assert lp.choose_pairs(rows) == [('IMG_3020.MOV', 'IMG_3020.HEIC')]
+    rows[1] = photo('IMG_3020.HEIC', taken='2023:06:28 21:43:19', offset='+02:00')
+    assert lp.choose_pairs(rows) == []
+
+
+def test_a_png_is_never_a_live_photos_still():
+    rows = [clip('IMG_1.MOV', modified='2025-01-01T10:00:00+00:00'), photo('IMG_1.PNG', modified='2025-01-01T10:00:00+00:00')]
+    assert lp.choose_pairs(rows) == []
