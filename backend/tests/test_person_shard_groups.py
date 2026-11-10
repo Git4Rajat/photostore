@@ -16,6 +16,8 @@ def _world(monkeypatch):
         row = {'PartitionKey': 'u1', 'RowKey': pid, 'name': '', 'faceIds': json.dumps(fids)}
         if group:
             row['groupId'] = group
+        if pid == 'A':
+            row['shardIds'] = json.dumps(['S'])       # A's overflow row, as the pointer records it
         persons.upsert_entity(row)
         for fid in fids:
             faces.upsert_entity({'PartitionKey': 'u1', 'RowKey': fid, 'filename': f'{fid}.jpg', 'personId': pid,

@@ -7854,7 +7854,7 @@ def _people_index_face_bbox(face: Dict) -> Dict[str, object]:
 # face's embedding are 512-float JSON strings, and downloading them for every
 # cluster/face (tens of thousands / hundreds of thousands) is what OOM-ed the
 # 1Gi replica running this build.
-_PEOPLE_INDEX_PERSON_COLUMNS = ['PartitionKey', 'RowKey', 'name', 'faceIds', 'groupId']
+_PEOPLE_INDEX_PERSON_COLUMNS = ['PartitionKey', 'RowKey', 'name', 'faceIds', 'groupId', 'shardIds']
 _PEOPLE_INDEX_FACE_COLUMNS = [
     'PartitionKey', 'RowKey', 'personId', 'rejected', 'reviewStatus', 'confidence',
     'confirmedByUser', 'filename', 'bbox', 'sourceDeleted',
@@ -7879,6 +7879,15 @@ def _build_user_people_index_snapshot(user_id: str, source_version: str) -> Opti
         # refresh_user_people_index persists whatever this returns as the new
         # dirty:false state (see refresh_user_sort_index's identical note).
         return None
+    # Clustering creates overflow rows through its own writer; record them on the first person's row so
+    # opening a grouped person is a point read (person_groups.py). Best effort: the build must not fail on it.
+    try:
+        import person_groups
+        for root_id, shard_ids in person_groups.missing_pointers(person_rows).items():
+            person_table_client.upsert_entity(
+                {'PartitionKey': user_id, 'RowKey': root_id, 'shardIds': shard_ids}, mode='merge')
+    except Exception:
+        _LOGGER.warning('Could not record overflow rows for %s', user_id, exc_info=True)
     # The bulk face table lives in a local SQLite file, not a 150k-entry Python
     # dict: this build is bounded by disk, and each person's faces are fetched
     # with one batched lookup.
