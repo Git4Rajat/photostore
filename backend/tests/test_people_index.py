@@ -130,6 +130,45 @@ def test_build_snapshot_unnamed_person_gets_placeholder_name(people_ctx):
     assert row['name'] == 'Unnamed 1'
 
 
+def test_build_snapshot_shows_shard_group_as_one_person(people_ctx):
+    person_table, face_table, _ = people_ctx
+    _seed_person(person_table, 'lib-A', 'p1', name='Alice', faceIds=json.dumps(['f1', 'f2']))
+    _seed_person(person_table, 'lib-A', 'p2', name='', groupId='p1', faceIds=json.dumps(['f3']))
+    _seed_person(person_table, 'lib-A', 'p3', name='', faceIds=json.dumps(['f4']))
+    _seed_face(face_table, 'lib-A', 'f1', filename='a.jpg', personId='p1', confidence=0.5)
+    _seed_face(face_table, 'lib-A', 'f2', filename='b.jpg', personId='p1', confidence=0.5)
+    _seed_face(face_table, 'lib-A', 'f3', filename='c.jpg', personId='p2', confidence=0.99, confirmedByUser=True)
+    _seed_face(face_table, 'lib-A', 'f4', filename='d.jpg', personId='p3')
+
+    snapshot = storage_utils._build_user_people_index_snapshot('lib-A', 'v1')
+
+    rows = {row['personId']: row for row in snapshot.rows}
+    assert set(rows) == {'p1', 'p3'}
+    assert rows['p1']['name'] == 'Alice' and rows['p1']['faceCount'] == 3
+    assert rows['p1']['coverFaceId'] == 'f3' and rows['p1']['groupMembers'] == ['p1', 'p2']
+    assert rows['p3']['name'] == 'Unnamed 1' and 'groupMembers' not in rows['p3']
+    assert all('_group' not in row and '_score' not in row for row in snapshot.rows)
+
+
+def test_build_snapshot_group_takes_the_name_of_a_named_shard(people_ctx):
+    person_table, face_table, _ = people_ctx
+    _seed_person(person_table, 'lib-A', 'p1', name='', faceIds=json.dumps(['f1']))
+    _seed_person(person_table, 'lib-A', 'p2', name='Bob', groupId='p1', faceIds=json.dumps(['f2']))
+    _seed_face(face_table, 'lib-A', 'f1', filename='a.jpg', personId='p1')
+    _seed_face(face_table, 'lib-A', 'f2', filename='b.jpg', personId='p2')
+
+    row = storage_utils._build_user_people_index_snapshot('lib-A', 'v1').rows[0]
+
+    assert (row['personId'], row['name'], row['isNamed'], row['faceCount']) == ('p1', 'Bob', True, 2)
+
+
+def test_incremental_refresh_rebuilds_fully_when_a_group_is_involved():
+    grouped_prev = [{'personId': 'p1', 'groupMembers': ['p1', 'p2']}]
+    assert storage_utils._people_groups_involved([{'RowKey': 'p2'}], grouped_prev)
+    assert storage_utils._people_groups_involved([{'RowKey': 'p9', 'groupId': 'p1'}], [])
+    assert not storage_utils._people_groups_involved([{'RowKey': 'p9'}], grouped_prev)
+
+
 def test_build_snapshot_excludes_rejected_and_reassigned_faces(people_ctx):
     person_table, face_table, _ = people_ctx
     _seed_person(person_table, 'lib-A', 'p1', name='Alice', faceIds=json.dumps(['f1', 'f2', 'f3']))

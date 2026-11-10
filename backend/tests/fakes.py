@@ -35,7 +35,8 @@ class FakeTable:
     def upsert_entity(self, entity, mode=None, **kwargs):
         key = entity['PartitionKey'], entity['RowKey']
         self.versions[key] = self.versions.get(key, 0) + 1
-        self.rows[key] = dict(entity)
+        merging = str(getattr(mode, 'value', mode) or '').lower() == 'merge' and key in self.rows
+        self.rows[key] = {**self.rows[key], **entity} if merging else dict(entity)
         self.stamps[(entity['PartitionKey'], entity['RowKey'])] = self.clock() if self.clock else datetime.now(timezone.utc)
 
     def create_entity(self, entity, **kwargs):

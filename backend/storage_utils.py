@@ -7854,7 +7854,7 @@ def _people_index_face_bbox(face: Dict) -> Dict[str, object]:
 # face's embedding are 512-float JSON strings, and downloading them for every
 # cluster/face (tens of thousands / hundreds of thousands) is what OOM-ed the
 # 1Gi replica running this build.
-_PEOPLE_INDEX_PERSON_COLUMNS = ['PartitionKey', 'RowKey', 'name', 'faceIds']
+_PEOPLE_INDEX_PERSON_COLUMNS = ['PartitionKey', 'RowKey', 'name', 'faceIds', 'groupId']
 _PEOPLE_INDEX_FACE_COLUMNS = [
     'PartitionKey', 'RowKey', 'personId', 'rejected', 'reviewStatus', 'confidence',
     'confirmedByUser', 'filename', 'bbox', 'sourceDeleted',
@@ -7901,6 +7901,40 @@ def _build_user_people_index_snapshot(user_id: str, source_version: str) -> Opti
             face_kv.close()
 
 
+def _collapse_people_groups(rows: List[Dict[str, object]], unnamed_counter: int) -> List[Dict[str, object]]:
+    """Fold person rows that share a groupId into one entry. A person whose membership list filled its
+    table column spills new faces into shard rows tagged with its id; the People list shows them as one
+    person (the first person's id and name, summed face count, best cover). Rows without a group pass
+    through untouched. Grouped entries carry ``groupMembers`` so incremental refreshes know to rebuild fully."""
+    groups: Dict[str, List[Dict[str, object]]] = {}
+    for row in rows:
+        groups.setdefault(str(row.pop('_group')), []).append(row)
+    result: List[Dict[str, object]] = []
+    for key, members in groups.items():
+        if len(members) == 1 and members[0]['personId'] == key:
+            members[0].pop('_score', None)
+            result.append(members[0])
+            continue
+        primary = next((m for m in members if m['personId'] == key), members[0])
+        named = primary if primary['isNamed'] else next((m for m in members if m['isNamed']), primary)
+        best = max((m for m in members if m.get('_score') is not None), key=lambda m: m['_score'], default=primary)
+        merged = dict(primary)
+        merged.update(
+            faceCount=sum(int(m['faceCount']) for m in members),
+            isNamed=named['isNamed'], autoName=named['autoName'],
+            coverFaceId=best['coverFaceId'], coverFilename=best['coverFilename'], coverBbox=best['coverBbox'],
+            groupMembers=sorted(str(m['personId']) for m in members),
+        )
+        if named['autoName'] and not primary['name']:
+            merged['name'] = f'Unnamed {unnamed_counter}'
+            unnamed_counter += 1
+        else:
+            merged['name'] = named['name'] if named is not primary and named['name'] else primary['name']
+        merged.pop('_score', None)
+        result.append(merged)
+    return result
+
+
 def _people_index_rows_from_scan(
     user_id: str, source_version: str, person_rows: List[Dict], face_kv, person_table_client, face_table_client,
     *, incremental_only: bool = False,
@@ -7927,8 +7961,12 @@ def _people_index_rows_from_scan(
             face_ids = []
         is_named = _people_index_person_is_named(row)
         raw_name = str(row.get('name', '') or '').strip()
+        group_id = str(row.get('groupId') or '')
+        is_shard = bool(group_id) and group_id != person_id
         if raw_name:
             name = raw_name
+        elif is_shard:
+            name = ''           # takes its group's name below
         else:
             name = f'Unnamed {unnamed_counter}'
             unnamed_counter += 1
@@ -8000,8 +8038,11 @@ def _people_index_rows_from_scan(
             'coverFilename': cover_filename,
             'coverBbox': cover_bbox,
             'updatedAt': source_version,
+            '_group': group_id or person_id,
+            '_score': cover_score,
         })
 
+    trimmed_rows = _collapse_people_groups(trimmed_rows, unnamed_counter)
     _sort_people_rows(trimmed_rows)
 
     return LexicalIndexSnapshot(
@@ -8023,6 +8064,19 @@ class _PointReadFaces:
 
 def _odata_utc(moment: datetime) -> str:
     return moment.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def _people_groups_involved(person_rows, prev_rows) -> bool:
+    """True when a refresh touches a person that belongs to a shard group (see _collapse_people_groups).
+    The grouped entry is derived from every member, so such refreshes rebuild from scratch."""
+    grouped = set()
+    for row in prev_rows:
+        if isinstance(row, dict):
+            grouped.update(str(member) for member in row.get('groupMembers') or [])
+    for row in person_rows:
+        if str(row.get('groupId') or '') or str(row.get('RowKey') or row.get('personId') or '') in grouped:
+            return True
+    return False
 
 
 def _incremental_people_index_snapshot(
@@ -8077,6 +8131,8 @@ def _incremental_people_index_snapshot(
                 return None
     if len(changed) > _PEOPLE_INCREMENTAL_MAX_CHANGED:
         return None
+    if _people_groups_involved(changed.values(), prev_rows):
+        return None
     by_id = {str(r.get('personId')): r for r in prev_rows if isinstance(r, dict)}
     for pid in list(by_id):
         if pid not in existing:
@@ -8127,6 +8183,9 @@ def _incremental_people_index_snapshot_by_ids(
             except Exception:
                 return None
     except Exception:
+        return None
+
+    if _people_groups_involved(affected_people.values(), prev_rows):
         return None
 
     # Rebuild only affected people

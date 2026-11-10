@@ -1040,6 +1040,7 @@ def test_full_person_starts_a_new_person_instead_of_failing():
     assert assignments == {'new': deterministic} and created == {deterministic}
     assert h.people.rows['u', 'alice'] == before
     assert h.faces.rows['u', 'new']['personId'] == deterministic
+    assert h.people.rows['u', deterministic]['groupId'] == 'alice'
 
 
 def test_legacy_membership_writer_still_refuses_to_truncate():
