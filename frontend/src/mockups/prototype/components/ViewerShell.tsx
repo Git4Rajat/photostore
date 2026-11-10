@@ -59,6 +59,16 @@ export interface ViewerShellProps {
  *  shared album's: top bar, stage with prev/next + swipe, zoom/pan/pinch,
  *  rotate and full-res controls, focus trap and keyboard. What a viewer does
  *  with a photo (rate, album, delete, info) is supplied by the caller. */
+/** Top-left corner of a contained image inside its box, inset like iOS's LIVE badge. */
+export const liveCorner = (natural: { w: number; h: number } | null, box: { w: number; h: number } | null,
+    rotation: number): React.CSSProperties | undefined => {
+    if (!natural || !box || !natural.w || !natural.h) return undefined;
+    // The image is fitted unrotated, then the CSS rotation turns the drawn rectangle.
+    const scale = Math.min(box.w / natural.w, box.h / natural.h);
+    const [w, h] = rotation % 180 ? [natural.h * scale, natural.w * scale] : [natural.w * scale, natural.h * scale];
+    return { left: Math.round((box.w - w) / 2) + 10, top: Math.round((box.h - h) / 2) + 10 };
+};
+
 const ViewerShell: React.FC<ViewerShellProps> = ({
     photoKey, filename, title, index, count, initialRotation = 0, onRotate, onClose, onStep,
     media, videoSrc, onVideoError, videoFailed: videoFailedProp, videoPoster, liveSrc, fullRes, onToggleFullRes, showFullResControl, onDownloadOriginal, info, bar,
@@ -112,6 +122,18 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
     const swipeRef = useRef<{ x: number; y: number } | null>(null);
 
     const photoRef = useRef<HTMLDivElement>(null);
+    // Where the still is drawn inside the stage (object-fit: contain), so the LIVE button sits on the
+    // photo's own corner rather than the stage's.
+    const [natural, setNatural] = useState<{ w: number; h: number } | null>(null);
+    const [box, setBox] = useState<{ w: number; h: number } | null>(null);
+    useEffect(() => {
+        const el = photoRef.current;
+        if (!el || typeof ResizeObserver === 'undefined') return;
+        const observer = new ResizeObserver(() => setBox({ w: el.clientWidth, h: el.clientHeight }));
+        observer.observe(el);
+        return () => observer.disconnect();
+    }, []);
+    useEffect(() => { setNatural(null); }, [photoKey]);
     // Focus management for the modal (HIG: a modal traps focus and restores it
     // to the trigger on close).
     const rootRef = useRef<HTMLDivElement>(null);
@@ -448,6 +470,7 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
                                 draggable={false}
                                 style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom}) rotate(${displayRotation}deg)` }}
                                 onError={() => setDecodeFailed(true)}
+                                onLoad={(e) => setNatural({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })}
                             />
                         ) : mediaStatus === 'unavailable' || decodeFailed ? (
                             <div className="pt-viewer-unavailable">
@@ -484,6 +507,7 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
                                 <button
                                     type="button"
                                     className={`pt-viewer-live-toggle${livePlaying ? ' on' : ''}`}
+                                    style={liveCorner(natural, box, displayRotation)}
                                     aria-pressed={livePlaying}
                                     aria-label={livePlaying ? 'Stop Live Photo' : 'Play Live Photo'}
                                     onClick={(e) => { e.stopPropagation(); setLivePlaying((v) => !v); }}
