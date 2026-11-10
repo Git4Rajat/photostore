@@ -19,7 +19,7 @@
     "postinstall": "node -e \"const fs=require('fs'); const path=require('path'); const target=path.join(process.cwd(),'node_modules','protobufjs','cli','node_modules','underscore','underscore-min.js'); fs.mkdirSync(path.dirname(target),{recursive:true}); fs.writeFileSync(target,'module.exports = {};\\n');\""
   },
   "dependencies": {
-    "@azure/msal-browser": "^5.10.1",
+    "@azure/msal-browser": "^5.29.0",
     "@azure/storage-blob": "^12.34.0",
     "@colorhythm/libraw-wasm": "1.1.1",
     "@ffmpeg/core": "0.12.10",
