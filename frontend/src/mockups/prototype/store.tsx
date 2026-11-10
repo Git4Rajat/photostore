@@ -106,6 +106,7 @@ export const mapPhoto = (b: BackendPhoto, token: MediaToken | null = getCachedMe
         thumbnailRotation: b.thumbnailRotation,
         captureDate: iso,
         processing: b.processing,
+        ...(b.liveClip ? { liveClip: b.liveClip } : {}),
     };
 };
 
@@ -134,6 +135,7 @@ export const galleryIndexPhoto = (row: SortIndexRow, token: MediaToken | null): 
         processing: row.gallery?.processing,
         thumbnailUrl: thumbnailUrlForBlob(row.thumb, token) || `/api/photos/thumbnail/${encodeURIComponent(row.filename)}`,
         captureDate: iso,
+        ...(row.gallery?.liveClip ? { liveClip: row.gallery.liveClip } : {}),
     };
 };
 

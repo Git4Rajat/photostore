@@ -59,3 +59,35 @@ def test_finalize_batch_with_browser_exif_report_persists_gps(finalize):
     assert float(row['latitude']) == pytest.approx(10.5)
     assert row['exif_status'] == 'done'
     assert row['map_detection_status'] == 'done'
+
+
+def test_finalize_batch_keeps_apples_live_photo_identifier_and_offers_the_photo_for_pairing(finalize, monkeypatch):
+    offered = []
+    monkeypatch.setattr(app, 'attach_live_photo_after_upload', lambda *args: offered.append(args) or [])
+    item = {
+        'filename': 'photo.cr3', 'blobName': 'physical', 'uploadId': 'id', 'totalSize': 100, 'sha256': 'a' * 64,
+        'clientAssetId': 'ddf07989-d788-4ecb-a8b5-94bf671771a2',
+        'clientProcessing': {'exif': {
+            'source': 'browser_exiftool', 'verifiedComplete': True,
+            'exifToolJson': {'EXIF:Make': 'Apple', 'Apple:ContentIdentifier': 'E0CE855B-1F69-4913-90C3-687C6EF0C359'},
+        }},
+        'clientProcessingReport': [{'step': 'exif', 'status': 'done', 'reason': 'done',
+                                    'durationMs': 549, 'runtime': 'browser-exiftool-wasm'}],
+    }
+    with app.app.test_request_context('/upload/finalize-batch', method='POST', json={'files': [item]}):
+        assert upload.finalize_upload_batch().status_code == 200
+    exif = json.loads(finalize.rows[('library', 'renamed.cr3')]['exifData'])
+    assert exif['ContentIdentifier'] == 'E0CE855B-1F69-4913-90C3-687C6EF0C359'
+    assert [args[:2] for args in offered] == [('library', 'renamed.cr3')]
+    assert json.loads(offered[0][2]['exifData'])['ContentIdentifier'] == 'E0CE855B-1F69-4913-90C3-687C6EF0C359'
+
+
+def test_a_failing_live_photo_pairing_never_fails_the_upload(finalize, monkeypatch):
+    def boom(*args):
+        raise RuntimeError('table outage')
+    monkeypatch.setattr(app, 'attach_live_photo_after_upload', boom)
+    item = {'filename': 'photo.cr3', 'blobName': 'physical', 'uploadId': 'id', 'totalSize': 100, 'sha256': 'a' * 64}
+    with app.app.test_request_context('/upload/finalize-batch', method='POST', json={'files': [item]}):
+        response = upload.finalize_upload_batch()
+    assert response.status_code == 200
+    assert response.get_json()['results'][0].get('complete') is True

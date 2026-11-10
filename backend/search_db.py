@@ -50,7 +50,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import perf_instrumentation
 from index_ownership import catalog_publisher
 import search_utils
-from catalog_metadata import is_upload_reservation_only
+from catalog_metadata import is_live_photo_clip, is_upload_reservation_only
 from ordering_utils import metadata_capture_datetime, metadata_upload_datetime
 from summary_incremental import DatabaseSummaryAdapter, SummarySchemaMissing, smart_row_from_record
 
@@ -167,7 +167,7 @@ def row_record(row: Dict) -> Optional[Dict]:
     the full-text document and the place-name terms. None for missing filenames
     or upload reservations that have not finalized."""
     filename = str(row.get('RowKey') or '').strip()
-    if not filename or is_upload_reservation_only(row):
+    if not filename or is_upload_reservation_only(row) or is_live_photo_clip(row):
         return None
     slim = reduced_row(row)
     captured = metadata_capture_datetime(row)

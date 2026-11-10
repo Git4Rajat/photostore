@@ -43,6 +43,8 @@ export interface ViewerShellProps {
     videoFailed?: boolean;
     /** Poster for the player; falls back to the stage image. */
     videoPoster?: string;
+    /** A Live Photo's motion clip: a LIVE button plays it over the still. */
+    liveSrc?: string;
     fullRes: boolean;
     onToggleFullRes: () => void;
     showFullResControl: boolean;
@@ -59,7 +61,7 @@ export interface ViewerShellProps {
  *  with a photo (rate, album, delete, info) is supplied by the caller. */
 const ViewerShell: React.FC<ViewerShellProps> = ({
     photoKey, filename, title, index, count, initialRotation = 0, onRotate, onClose, onStep,
-    media, videoSrc, onVideoError, videoFailed: videoFailedProp, videoPoster, fullRes, onToggleFullRes, showFullResControl, onDownloadOriginal, info, bar,
+    media, videoSrc, onVideoError, videoFailed: videoFailedProp, videoPoster, liveSrc, fullRes, onToggleFullRes, showFullResControl, onDownloadOriginal, info, bar,
 }) => {
     const { url: mainSrc, loading: fullResLoading, progress: fullResProgress, status: mediaStatus } = media;
     const [rotation, setRotation] = useState(0);
@@ -104,6 +106,8 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
     useEffect(() => { setDecodeFailed(false); }, [mainSrc]);
     const [videoErrored, setVideoErrored] = useState(false);
     useEffect(() => { setVideoErrored(false); }, [videoSrc, photoKey]);
+    const [livePlaying, setLivePlaying] = useState(false);
+    useEffect(() => { setLivePlaying(false); }, [photoKey]);
     const videoFailed = onVideoError ? Boolean(videoFailedProp) : videoErrored;
     const swipeRef = useRef<{ x: number; y: number } | null>(null);
 
@@ -461,6 +465,33 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
                                 <Spinner label="" center={false} />
                                 {mediaStatus === 'pending' && <p>Preparing preview…</p>}
                             </div>
+                        )}
+                        {liveSrc && !videoSrc && mainSrc && !decodeFailed && (
+                            <>
+                                {livePlaying && (
+                                    // The motion clip plays once over the still, then hands back to it.
+                                    <video
+                                        className="pt-viewer-img pt-viewer-live"
+                                        src={liveSrc}
+                                        autoPlay
+                                        muted
+                                        playsInline
+                                        style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom}) rotate(${displayRotation}deg)` }}
+                                        onEnded={() => setLivePlaying(false)}
+                                        onError={() => setLivePlaying(false)}
+                                    />
+                                )}
+                                <button
+                                    type="button"
+                                    className={`pt-viewer-live-toggle${livePlaying ? ' on' : ''}`}
+                                    aria-pressed={livePlaying}
+                                    aria-label={livePlaying ? 'Stop Live Photo' : 'Play Live Photo'}
+                                    onClick={(e) => { e.stopPropagation(); setLivePlaying((v) => !v); }}
+                                    onDoubleClick={(e) => e.stopPropagation()}
+                                >
+                                    LIVE
+                                </button>
+                            </>
                         )}
                     </div>
                     <button

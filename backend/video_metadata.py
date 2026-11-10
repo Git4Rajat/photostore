@@ -104,10 +104,28 @@ def apply_browser_video_metadata(app, user_id, filename, client_asset_id):
     from image_utils import is_video_file
     if not is_video_file(filename):
         raise ValueError('Video metadata requires a video filename')
+    import live_photos
+    row = app.metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+    tags = browser_video_tags(row)
+    processing = {'exif': {'hasData': True, 'data': tags, 'source': 'browser_video_metadata', 'runtime': 'mediainfo_wasm'}}
+    if 'GPS.LatitudeDecimal' in tags and 'GPS.LongitudeDecimal' in tags:
+        processing['map_detection'] = {'hasData': True, 'latitude': tags['GPS.LatitudeDecimal'],
+                                       'longitude': tags['GPS.LongitudeDecimal']}
+    metadata = app.apply_client_processing_results_for_file(user_id, filename, client_processing=processing,
+        client_asset_id=client_asset_id, origin='browser_video_metadata', claimed_steps=['exif', 'map_detection'])
+    clip = live_photos.clip_info_from_tags(tags)
+    if clip is not None:
+        # A Live Photo's motion half: finalize attaches it to its photo (app.attach_live_photo_after_upload).
+        metadata = app._update_metadata_entity_fields(
+            user_id, filename, {live_photos.CLIP_INFO: json.dumps(clip, separators=(',', ':'))}) or metadata
+    return metadata
+
+
+def browser_video_tags(row):
+    """Decoded tags of the browser metadata packet recorded on a video's row (raises when there is none)."""
     from azure.core import MatchConditions
     import storage_utils
     from upload_metadata import packet_blob_name, validate_descriptor
-    row = app.metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
     candidate = json.loads(row.get('uploadMetadataPacket') or '{}')
     descriptor = validate_descriptor(candidate, row.get('fileHash'))
     source_size = candidate.get('sourceSize')
@@ -118,10 +136,4 @@ def apply_browser_video_metadata(app, user_id, filename, client_asset_id):
     blob = storage_utils._get_blob_client(storage_utils._CTX['blob_thumbnail_container'], packet_blob_name(candidate['physical']))
     packet = blob.download_blob(offset=0, length=descriptor['bytes'], etag=candidate['etag'],
                                 match_condition=MatchConditions.IfNotModified).readall()
-    tags = decode_video_metadata(packet, descriptor, source_size)
-    processing = {'exif': {'hasData': True, 'data': tags, 'source': 'browser_video_metadata', 'runtime': 'mediainfo_wasm'}}
-    if 'GPS.LatitudeDecimal' in tags and 'GPS.LongitudeDecimal' in tags:
-        processing['map_detection'] = {'hasData': True, 'latitude': tags['GPS.LatitudeDecimal'],
-                                       'longitude': tags['GPS.LongitudeDecimal']}
-    return app.apply_client_processing_results_for_file(user_id, filename, client_processing=processing,
-        client_asset_id=client_asset_id, origin='browser_video_metadata', claimed_steps=['exif', 'map_detection'])
+    return decode_video_metadata(packet, descriptor, source_size)

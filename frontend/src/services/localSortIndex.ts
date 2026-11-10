@@ -33,6 +33,8 @@ export interface SortIndexRow {
         personIds: string[];
         tags: string[];
         processing: Photo['processing'];
+        /** A Live Photo: filename of its attached motion clip. */
+        liveClip?: string;
     };
 }
 

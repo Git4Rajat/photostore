@@ -235,6 +235,7 @@ const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?: React
                             <CheckCircleIcon />
                         </button>
                         <span className="pt-tile-badges" aria-hidden="true">
+                            {photo.liveClip && <span className="live">LIVE</span>}
                             {photo.liked && <HeartIcon className="liked" fill="currentColor" />}
                             {photo.rating > 0 && (
                                 <span className="rating">

@@ -2644,6 +2644,8 @@ def _build_photo_summary(user_id: str, filename: str, metadata: Dict, include_pr
         'resolution': _resolution_from_exif(exif_data),
         'faceCount': metadata.get('faceCount', 0),
         'people': _photo_people_list(metadata, pid_to_name),
+        # A Live Photo: the attached motion clip, played from its own filename (see live_photos.py).
+        **({'liveClip': str(metadata['livePhotoClip'])} if metadata.get('livePhotoClip') else {}),
         'processing': {
             'preview': metadata.get('preview_status'),
             'thumbnail': metadata.get('thumbnail_status'),
@@ -15157,6 +15159,72 @@ def _strip_deleted_people_from_photos(user_id: str, person_ids: set, skip_names:
         app.logger.warning('Deleted-people cleanup failed for %s', user_id, exc_info=True)
 
 
+def _attached_live_clips(user_id: str, filenames: List[str]) -> List[str]:
+    """Motion clips attached to these photos (Live Photos, see live_photos.py) that are not listed themselves:
+    a clip has no tile of its own, so it goes when its photo is deleted for good."""
+    import live_photos
+    names = set(filenames)
+    clips = []
+    for name, row in _get_metadata_entities(user_id, [n for n in filenames if live_photos.extension(n) in live_photos.PHOTO_EXTENSIONS]).items():
+        clip = str((row or {}).get(live_photos.PHOTO_CLIP) or '')
+        if clip and clip not in names:
+            names.add(clip)
+            clips.append(clip)
+    return clips
+
+
+def _live_photo_rows(user_id: str, stem: str) -> List[Dict]:
+    """Rows whose filename has this Live Photo base name (one RowKey range read, see live_photos.base_stem)."""
+    import live_photos
+    from catalog_metadata import CATALOG_ADMISSION_FIELDS, is_upload_reservation_only
+    key, low = _escape_odata(user_id), _escape_odata(stem)
+    rows = metadata_table_client.query_entities(
+        f"PartitionKey eq '{key}' and RowKey ge '{low}' and RowKey lt '{low}\uffff'",
+        select=sorted(set(live_photos.PAIRING_FIELDS) | set(CATALOG_ADMISSION_FIELDS)))
+    return [dict(row) for row in rows
+            if live_photos.base_stem(str(row.get('RowKey') or '')) == stem and not is_upload_reservation_only(row)]
+
+
+def attach_live_photos(user_id: str, stem: str, *, dry_run: bool = False) -> List[Tuple[str, str]]:
+    """Attach the Live Photo clips named like ``stem`` to their photos; returns the (clip, photo) pairs made."""
+    import live_photos
+    if metadata_table_client is None or not stem:
+        return []
+    pairs = live_photos.choose_pairs(_live_photo_rows(user_id, stem))
+    if dry_run:
+        return pairs
+    made = []
+    for clip, photo in pairs:
+        # The photo first: if the clip's write then fails, the clip simply stays a visible video.
+        row = _update_metadata_entity_fields(user_id, photo, {}, derive_updates=lambda row, clip=clip: (
+            {} if row.get(live_photos.PHOTO_CLIP) else {live_photos.PHOTO_CLIP: clip}))
+        if row is None or row.get(live_photos.PHOTO_CLIP) != clip:
+            continue
+        if _update_metadata_entity_fields(user_id, clip, {live_photos.CLIP_OF: photo}) is not None:
+            made.append((clip, photo))
+    return made
+
+
+def attach_live_photo_after_upload(user_id: str, filename: str, row: Optional[Dict] = None) -> List[Tuple[str, str]]:
+    """Finalize hook, given the row finalize already holds. Only a detected clip, or a photo carrying Apple's
+    content identifier (a Live Photo's still, read by the browser's exiftool), can be half of a pair, so other
+    uploads cost no storage call at all."""
+    import live_photos
+    kind = live_photos.extension(filename)
+    if kind not in live_photos.PHOTO_EXTENSIONS and kind not in live_photos.VIDEO_EXTENSIONS:
+        return []
+    if row is None:
+        row = _get_metadata_entity(user_id, filename)
+    if not row or row.get(live_photos.CLIP_OF) or row.get(live_photos.PHOTO_CLIP):
+        return []
+    if kind in live_photos.VIDEO_EXTENSIONS:
+        if live_photos.clip_info(row) is None:
+            return []
+    elif not parse_exif_data(row.get('exifData', '{}')).get('ContentIdentifier'):
+        return []
+    return attach_live_photos(user_id, live_photos.base_stem(filename))
+
+
 def _hard_delete_photos_now(
     user_id: str,
     filenames: List[str],
@@ -15180,9 +15248,10 @@ def _hard_delete_photos_now(
     deleted: List[str] = []
     errors: List[str] = []
     deleted_person_ids: set = set()
-    total = len(valid_names)
     if not valid_names:
         return deleted, errors
+    valid_names += _attached_live_clips(user_id, valid_names)
+    total = len(valid_names)
 
     for start in range(0, total, BULK_MUTATION_CHUNK_SIZE):
         chunk = valid_names[start:start + BULK_MUTATION_CHUNK_SIZE]
