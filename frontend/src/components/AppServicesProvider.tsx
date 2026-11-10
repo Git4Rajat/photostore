@@ -3,7 +3,7 @@ import { sessionScope } from '../services/sessionScope';
 import { acknowledgeStaleUpload, reconcileUploadSessions } from '../services/uploadSessionRecovery';
 import { observeExpiredWaveSession } from '../services/uploadWaveSync';
 import { waveLiveEnabled, waveShadowEnabled } from '../services/uploadWaveClient';
-import { bindWaveChild, declareWaveSelection, retryWaveOperation } from '../services/uploadWaveOperations';
+import { bindWaveChild, declareWaveSelection, retryWaveOperation, pruneStaleWaveOperations } from '../services/uploadWaveOperations';
 import { hasPendingEdits } from '../services/pendingEdits';
 import { startIndexReadyPush } from '../services/indexReadyPush';
 import { reportIndexBuilding } from '../services/indexBuilding';
@@ -166,6 +166,20 @@ const withBrowserProcessingRuntime = async <T,>(select: (runtime: BrowserProcess
 
 const dataUrlToBlob = (dataUrl: string) => withBrowserProcessingRuntime((runtime) => runtime.dataUrlToBlob(dataUrl));
 const idbDelete = (key: string) => withBrowserProcessingRuntime((runtime) => runtime.idbDelete(key));
+// Mobile browsers give an origin a small, shared quota (iOS Safari especially),
+// so on constrained devices never claim more than half of what is left --
+// blobs that don't fit just skip resume caching instead of failing writes.
+const getResumeCacheBudgetBytes = async (): Promise<number> => {
+    if (!isConstrainedUploadDevice()) return Infinity;
+    try {
+        const { quota, usage } = await navigator.storage.estimate();
+        if (quota) return Math.min(CONSTRAINED_DEVICE_CACHE_BUDGET_BYTES, Math.max(0, (quota - (usage || 0)) / 2));
+    } catch {
+        // Estimate unsupported -- fall back to the fixed budget.
+    }
+    return CONSTRAINED_DEVICE_CACHE_BUDGET_BYTES;
+};
+const idbSweepOrphans = (keep: (key: string) => boolean) => withBrowserProcessingRuntime((runtime) => runtime.idbSweepOrphans(keep));
 const idbGet = (key: string) => withBrowserProcessingRuntime((runtime) => runtime.idbGet(key));
 const idbPut = (key: string, value: Blob | File | FileSystemFileHandle) => withBrowserProcessingRuntime((runtime) => runtime.idbPut(key, value));
 const readBlobArrayBuffer = (blob: Blob | File) => withBrowserProcessingRuntime((runtime) => runtime.readBlobArrayBuffer(blob));
@@ -607,6 +621,9 @@ const PICKER_LIKELY_FAILED_THRESHOLD_MS = 45000;
 // find the Retry/Discard banner; auto-discarding after a day self-heals both
 // problems instead of requiring that.
 const STALE_UPLOAD_SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+// Wave bookkeeping in localStorage is only useful while a retry could still
+// link to it; see pruneStaleWaveOperations.
+const WAVE_RECORD_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 // The only intervention point that isn't gated on the native picker
 // cooperating: warn *before* it opens, once per browser, rather than only
@@ -2043,6 +2060,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
         persistSession(null);
         clearUploadRetryAttempts(localStorage);
+        // Backstop for blobs the per-file deletes above missed (e.g. finished
+        // files already dropped from the session record). Mobile tabs are
+        // rarely reloaded, so the load-time sweep alone isn't enough there.
+        const liveId = uploadSessionRef.current?.id;
+        void idbSweepOrphans((key) => !!liveId && key.startsWith(`${liveId}:`)).catch(() => undefined);
     }, [persistSession]);
 
     const computeSha256 = async (file: File, signal?: AbortSignal): Promise<string> => (
@@ -4601,7 +4623,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         // and NOT awaited -- uploadSourceFilesRef above already lets the
         // upload proceed without waiting for this.
         void (async () => {
-            const budgetBytes = isConstrainedUploadDevice() ? CONSTRAINED_DEVICE_CACHE_BUDGET_BYTES : Infinity;
+            const budgetBytes = await getResumeCacheBudgetBytes();
             let cachedBytes = 0;
             let cursor = 0;
             const worker = async () => {
@@ -4819,7 +4841,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         filesToUpload: File[],
         handlesToUpload: Map<string, FileSystemFileHandle>,
     ) => {
-        const budgetBytes = isConstrainedUploadDevice() ? CONSTRAINED_DEVICE_CACHE_BUDGET_BYTES : Infinity;
+        const budgetBytes = await getResumeCacheBudgetBytes();
         let cachedBytes = 0;
         let cursor = 0;
         const worker = async () => {
@@ -5533,6 +5555,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
     useEffect(() => {
         const restored = loadPersistedSession();
+        // Resume-cache blobs are keyed `${sessionId}:...`; anything not
+        // belonging to the restored session is left over from a closed/crashed
+        // tab or a failed delete and only eats this origin's storage quota.
+        // Runs at load, before this tab starts an upload of its own.
+        void idbSweepOrphans((key) => !!restored && key.startsWith(`${restored.id}:`)).catch(() => undefined);
+        pruneStaleWaveOperations(WAVE_RECORD_MAX_AGE_MS, restored?.waveOperationId);
         if (!restored) {
             return;
         }

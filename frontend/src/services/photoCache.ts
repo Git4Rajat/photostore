@@ -59,3 +59,32 @@ export const idbDelete = async (key: string): Promise<void> => {
     });
     db.close();
 };
+
+// Deletes every cached upload blob whose key isn't claimed by `keep`. The
+// per-file deletes in the upload flow (releaseCachedUploadFile,
+// clearPersistedSession) are best-effort and only know about keys still in the
+// persisted session record, so blobs left by a closed/crashed tab, a skipped
+// checkpoint, or a swallowed delete error would otherwise sit in this origin's
+// storage forever, shrinking the quota available to later uploads.
+export const idbSweepOrphans = async (keep: (key: string) => boolean): Promise<number> => {
+    const db = await openUploadDb();
+    try {
+        const keys = await new Promise<IDBValidKey[]>((resolve, reject) => {
+            const req = db.transaction(UPLOAD_DB_STORE, 'readonly').objectStore(UPLOAD_DB_STORE).getAllKeys();
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error || new Error('Failed to list upload blobs.'));
+        });
+        const orphans = keys.filter((key) => typeof key !== 'string' || !keep(key));
+        if (orphans.length === 0) return 0;
+        await new Promise<void>((resolve, reject) => {
+            const tx = db.transaction(UPLOAD_DB_STORE, 'readwrite');
+            const store = tx.objectStore(UPLOAD_DB_STORE);
+            orphans.forEach((key) => store.delete(key));
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error || new Error('Failed to sweep upload blobs.'));
+        });
+        return orphans.length;
+    } finally {
+        db.close();
+    }
+};

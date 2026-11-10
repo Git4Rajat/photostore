@@ -231,4 +231,41 @@ export const retryWaveOperation = (session: PersistedUploadSession): PersistedUp
         files: session.files.map(file => ({ ...file, waveItemKey: byOldKey.get(file.key) || file.waveItemKey })) };
 };
 
+// Wave records live in localStorage (a ~5MB per-origin quota on iOS Safari),
+// and every uploaded file leaves its own outcome-receipt key behind until the
+// server confirms the wave closed (retireWaveOperation). Waves that never
+// close -- tab killed, session discarded, upload abandoned -- leak those keys
+// forever, and a few thousand photos' worth is enough to make later
+// localStorage writes (upload checkpoints, wave admission) start failing.
+// Drops operation records and receipts older than `maxAgeMs`, plus receipts
+// whose operation record no longer exists. `protectedId` is the restored
+// session's wave operation, never pruned.
+export const pruneStaleWaveOperations = (maxAgeMs: number, protectedId?: string, now = Date.now()): number => {
+    let removed = 0;
+    try {
+        const keys = Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index))
+            .filter((storageKey): storageKey is string => Boolean(storageKey?.startsWith(PREFIX)));
+        const stale = new Set<string>();
+        const live = new Set<string>();
+        for (const storageKey of keys) {
+            try {
+                const op = JSON.parse(localStorage.getItem(storageKey) || 'null') as Operation | null;
+                if (!op || typeof op.id !== 'string' || typeof op.scope !== 'string' || storageKey !== key(op.scope, op.id)) continue;
+                (op.id !== protectedId && now - op.createdAt > maxAgeMs ? stale : live).add(storageKey);
+            } catch { /* An outcome receipt ('resolved') or unrecognized value. */ }
+        }
+        for (const storageKey of keys) {
+            const end = storageKey.indexOf('"]:');
+            const base = end === -1 ? storageKey : storageKey.slice(0, end + 2);
+            const orphanReceipt = end !== -1 && !live.has(base) && !stale.has(base);
+            if (!stale.has(base) && !orphanReceipt) continue;
+            localStorage.removeItem(storageKey);
+            operations.delete(base);
+            outcomes.delete(base);
+            removed += 1;
+        }
+    } catch { /* Storage may be disabled altogether. */ }
+    return removed;
+};
+
 export const clearWaveOperationCachesForTests = () => { operations.clear(); outcomes.clear(); };
