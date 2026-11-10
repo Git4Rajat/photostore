@@ -961,14 +961,23 @@ a {
   background: var(--lg-surface);
 }
 
+/* Light is the base so "System" appearance with a light OS (no data-theme
+   attribute) isn't left with the dark highlight; dark is opted into below. */
 .notification-item.unread {
-  border-color: rgba(10, 132, 255, 0.35);
-  background: rgba(6, 15, 24, 0.7);
-}
-
-html[data-theme='light'] .notification-item.unread {
   border-color: rgba(10, 132, 255, 0.24);
   background: linear-gradient(180deg, rgba(229, 242, 255, 0.98) 0%, rgba(244, 249, 255, 0.96) 100%);
+}
+
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme='light']) .notification-item.unread {
+    border-color: rgba(10, 132, 255, 0.35);
+    background: rgba(6, 15, 24, 0.7);
+  }
+}
+
+html[data-theme='dark'] .notification-item.unread {
+  border-color: rgba(10, 132, 255, 0.35);
+  background: rgba(6, 15, 24, 0.7);
 }
 
 .notification-title {

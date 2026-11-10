@@ -455,6 +455,52 @@ def jobs_status():
         return app.jsonify({'jobs': [], 'error': 'Internal server error'}), 500
 
 
+@tools_bp.route('/api/tools/people/reconcile-faces', methods=['POST'])
+def reconcile_people_faces():
+    """Add back faces that belong to a person (their own row and the membership table agree) but are missing
+    from the person's ``faceIds``, which is what the People tile counts. Dry run unless ``{"apply": true}``.
+    A long library is walked in time-bounded slices: pass the returned ``lastChecked`` as ``after`` to resume."""
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    if not app._people_features_available() or app.person_members_table_client is None:
+        return app.jsonify({'error': 'People features not configured'}), 503
+    data = app.request.get_json(silent=True) or {}
+    after = str(data.get('after') or '')
+    apply_changes = data.get('apply') is True
+
+    import time
+    import person_reconcile
+    deadline = time.monotonic() + 150          # the ingress cuts a request off at 240 s
+
+    def person_rows():
+        query = f"PartitionKey eq '{app._escape_odata(user_id)}'"
+        rows = app.person_table_client.query_entities(query, select=['RowKey', 'name', 'faceIds'])
+        return iter(sorted((r for r in rows if str(r['RowKey']) > after), key=lambda r: str(r['RowKey'])))
+
+    def add_face_ids(person_id, extra):
+        def mutate(person):
+            current = [str(f) for f in app.json.loads(person.get('faceIds') or '[]')]
+            merged = current + [f for f in extra if f not in set(current)]
+            if merged == current or not person_reconcile.fits(merged):
+                return None
+            person['faceIds'] = person_reconcile.encode_face_ids(merged)
+            return person
+        app._update_person_entity_with_retry(user_id, person_id, mutate)
+
+    result = person_reconcile.reconcile_people(
+        user_id, person_rows(), app.person_members_table_client,
+        lambda ids: app._load_face_rows_by_ids(user_id, ids), app._face_is_rejected, add_face_ids,
+        dry_run=not apply_changes, should_stop=lambda: time.monotonic() > deadline)
+    if apply_changes and result['repaired']:
+        app.mark_people_dirty(user_id, [row['personId'] for row in result['repaired']])
+    if result['complete']:
+        # Overflow rows clustering created but the first person's pointer does not list yet.
+        result['pointersAdded'] = len(app._refresh_group_pointers(user_id, dry_run=not apply_changes))
+    result['applied'] = apply_changes
+    return app.jsonify(result)
+
+
 @tools_bp.route('/api/tools/pending-edits/reconcile', methods=['POST'])
 def reconcile_pending_edits():
     """Read exact authoritative rows; never infer mutation completion from an index timestamp."""

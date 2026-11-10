@@ -150,6 +150,19 @@ def test_build_snapshot_shows_shard_group_as_one_person(people_ctx):
     assert all('_group' not in row and '_score' not in row for row in snapshot.rows)
 
 
+def test_build_snapshot_records_overflow_rows_on_the_first_person(people_ctx):
+    person_table, face_table, _ = people_ctx
+    _seed_person(person_table, 'lib-A', 'p1', name='Alice', faceIds=json.dumps(['f1']))
+    _seed_person(person_table, 'lib-A', 'p2', name='', groupId='p1', faceIds=json.dumps(['f2']))
+    _seed_face(face_table, 'lib-A', 'f1', filename='a.jpg', personId='p1')
+    _seed_face(face_table, 'lib-A', 'f2', filename='b.jpg', personId='p2')
+
+    storage_utils._build_user_people_index_snapshot('lib-A', 'v1')
+
+    assert json.loads(person_table.get_entity('lib-A', 'p1')['shardIds']) == ['p2']
+    assert json.loads(person_table.get_entity('lib-A', 'p1')['faceIds']) == ['f1']      # nothing else changed
+
+
 def test_build_snapshot_group_takes_the_name_of_a_named_shard(people_ctx):
     person_table, face_table, _ = people_ctx
     _seed_person(person_table, 'lib-A', 'p1', name='', faceIds=json.dumps(['f1']))
