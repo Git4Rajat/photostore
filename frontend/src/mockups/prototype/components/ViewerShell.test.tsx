@@ -1,7 +1,7 @@
 import React from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
-import ViewerShell, { type ViewerShellProps } from './ViewerShell';
+import ViewerShell, { liveCorner, type ViewerShellProps } from './ViewerShell';
 
 const props = (overrides: Partial<ViewerShellProps> = {}): ViewerShellProps => ({
     photoKey: 'IMG_1.HEIC', filename: 'IMG_1.HEIC', title: 'IMG_1.HEIC', index: 0, count: 2,
@@ -34,5 +34,14 @@ describe('ViewerShell Live Photos', () => {
         expect(screen.queryByRole('button', { name: 'Play Live Photo' })).toBeNull();
         rerender(<ViewerShell {...props({ liveSrc: 'https://x/IMG_1.MOV', videoSrc: 'https://x/trip.mov' })} />);
         expect(screen.queryByRole('button', { name: 'Play Live Photo' })).toBeNull();
+    });
+});
+
+describe('liveCorner', () => {
+    it('puts the LIVE button on the drawn photo, not the stage', () => {
+        // A 3:4 portrait still in a wide stage is centred with side margins.
+        expect(liveCorner({ w: 1536, h: 2048 }, { w: 861, h: 538 }, 0)).toEqual({ left: 239, top: 10 });
+        expect(liveCorner({ w: 1536, h: 2048 }, { w: 861, h: 538 }, 90)).toEqual({ left: 172, top: 77 });
+        expect(liveCorner(null, { w: 861, h: 538 }, 0)).toBeUndefined();
     });
 });
