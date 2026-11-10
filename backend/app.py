@@ -3019,7 +3019,7 @@ def _semantic_embedding_for_row(
 # Every person column EXCEPT repEmbedding. A repEmbedding is a 512-float JSON string
 # (~5-8KB); holding it for tens of thousands of clusters is hundreds of MB per
 # cached copy, and the People list/roster/name-lookup routes never read it.
-PERSON_LIGHT_COLUMNS = ['PartitionKey', 'RowKey', 'name', 'faceIds', 'createdAt', 'declinedFaceSuggestions', 'groupId']
+PERSON_LIGHT_COLUMNS = ['PartitionKey', 'RowKey', 'name', 'faceIds', 'createdAt', 'declinedFaceSuggestions', 'groupId', 'shardIds']
 _person_light_scan_cache = _UserScanCache(PEOPLE_SCAN_CACHE_TTL_SECONDS)
 
 
@@ -3060,19 +3060,49 @@ def _cached_person_rows_for_user(user_id: str, *, with_embeddings: bool = True) 
     return _person_scan_cache.get(user_id, _fetch)
 
 
-def _person_shard_ids(user_id: str, person_id: str) -> List[str]:
-    """Ids of the overflow rows tagged ``groupId == person_id`` (see faiss_assignment.choose_person): a person
-    whose membership list filled its table column spills further faces into these. Read fresh, not from the
-    scan cache, so a just-created shard is never missed."""
+def _person_shard_ids(user_id: str, person_id: str, row: Optional[Dict] = None) -> List[str]:
+    """Ids of the person's overflow rows (see faiss_assignment.choose_person): a person whose membership list
+    filled its table column spills further faces into them. Read from the person's own row (``shardIds``, see
+    person_groups.py), one point read -- or none when the caller already holds the row."""
+    import person_groups
+    if row is None:
+        if person_table_client is None:
+            return []
+        try:
+            row = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
+        except Exception:
+            return []
+    return person_groups.shard_ids(dict(row, RowKey=person_id))
+
+
+def _set_group_pointer(user_id: str, person_id: str, add=(), remove=()) -> None:
+    """Record overflow rows on the first person's ``shardIds`` (ETag-guarded read-modify-write)."""
+    import person_groups
+
+    def _mutate(person: Dict) -> Optional[Dict]:
+        current = set(person_groups.shard_ids(person))
+        updated = (current | {str(i) for i in add if i}) - {str(i) for i in remove}
+        if updated == current:
+            return None
+        person['shardIds'] = person_groups.encode(updated)
+        return person
+    _update_person_entity_with_retry(user_id, person_id, _mutate)
+
+
+def _refresh_group_pointers(user_id: str, *, dry_run: bool = False) -> Dict[str, str]:
+    """Add every overflow row its ``groupId`` tag shows but the first person's ``shardIds`` lacks (clustering
+    creates overflow rows without touching it). Returns what was missing; writes it unless ``dry_run``."""
+    import person_groups
     if person_table_client is None:
-        return []
-    try:
-        rows = person_table_client.query_entities(
-            f"PartitionKey eq '{_escape_odata(user_id)}' and groupId eq '{_escape_odata(person_id)}'",
-            select=['RowKey'])
-        return sorted(str(row['RowKey']) for row in rows if row.get('RowKey') and row['RowKey'] != person_id)
-    except Exception:
-        return []
+        return {}
+    rows = [dict(row) for row in person_table_client.query_entities(
+        f"PartitionKey eq '{_escape_odata(user_id)}'", select=['PartitionKey', 'RowKey', 'groupId', 'shardIds'])]
+    missing = person_groups.missing_pointers(rows)
+    if not dry_run:
+        for root_id, value in missing.items():
+            person_table_client.upsert_entity({'PartitionKey': user_id, 'RowKey': root_id, 'shardIds': value},
+                                              mode='merge')
+    return missing
 
 
 def _person_group_ids(user_id: str, person_id: str) -> List[str]:
@@ -3122,7 +3152,7 @@ def _merge_needs_group_mode(user_id: str, rows: List[Dict]) -> bool:
     face_ids: set = set()
     grouped = False
     for row in rows:
-        if str(row.get('groupId') or '') or _person_shard_ids(user_id, str(row.get('RowKey') or '')):
+        if str(row.get('groupId') or '') or _person_shard_ids(user_id, str(row.get('RowKey') or ''), row):
             grouped = True
         try:
             face_ids.update(str(fid) for fid in json.loads(row.get('faceIds', '[]') or '[]'))
@@ -3161,7 +3191,7 @@ def _merge_persons_group(user_id: str, person_id: str, merge_ids: List, base: Di
     retag: List[Dict] = []
     seen = set(group_ids)
     for snapshot in merged_snapshots:
-        for row_id in [str(snapshot['RowKey']), *_person_shard_ids(user_id, str(snapshot['RowKey']))]:
+        for row_id in [str(snapshot['RowKey']), *_person_shard_ids(user_id, str(snapshot['RowKey']), snapshot)]:
             if row_id in seen:
                 continue
             seen.add(row_id)
@@ -3186,7 +3216,8 @@ def _merge_persons_group(user_id: str, person_id: str, merge_ids: List, base: Di
         group_name = str(max(candidates, key=_count)['name']).strip() if candidates else group_name
 
     def _restorable(row: Dict) -> Dict:
-        return dict(row, groupId=str(row.get('groupId') or ''))   # '' clears the tag on undo (upsert merges)
+        # '' clears a column the merge added when undo upserts (merge semantics)
+        return dict(row, groupId=str(row.get('groupId') or ''), shardIds=str(row.get('shardIds') or ''))
 
     snapshots = [_restorable(row) for row in retag]
     merge_id = str(uuid.uuid4())
@@ -3202,7 +3233,8 @@ def _merge_persons_group(user_id: str, person_id: str, merge_ids: List, base: Di
     # The record is durable before any row changes, so a crash part-way can always be undone.
     for row in retag:
         person_table_client.upsert_entity({'PartitionKey': user_id, 'RowKey': row['RowKey'],
-                                           'groupId': person_id}, mode='merge')
+                                           'groupId': person_id, 'shardIds': ''}, mode='merge')
+    _set_group_pointer(user_id, person_id, add=[str(row['RowKey']) for row in retag])
     # Names reach the photos' metadata through the same recoverable label intent a rename uses (the index
     # worker rewrites the affected photos), not inside this request: that per-photo work is what made big
     # merges outlive the 240 s ingress limit.
@@ -6220,6 +6252,7 @@ def _owner_row_for_new_face(user_id: str, person_id: str, face_id: str) -> str:
     root_row = next((row for row in rows if str(row['RowKey']) == root), person)
     shard_id = _create_person_entity(user_id, [], _face_embedding_from_entity(face), name=str(root_row.get('name') or ''))
     person_table_client.upsert_entity({'PartitionKey': user_id, 'RowKey': shard_id, 'groupId': root}, mode='merge')
+    _set_group_pointer(user_id, root, add=[shard_id])
     _invalidate_people_scan_cache(user_id)
     return shard_id
 

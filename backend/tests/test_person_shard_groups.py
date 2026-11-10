@@ -16,6 +16,8 @@ def _world(monkeypatch):
         row = {'PartitionKey': 'u1', 'RowKey': pid, 'name': '', 'faceIds': json.dumps(fids)}
         if group:
             row['groupId'] = group
+        if pid == 'A':
+            row['shardIds'] = json.dumps(['S'])       # A's overflow row, as the pointer records it
         persons.upsert_entity(row)
         for fid in fids:
             faces.upsert_entity({'PartitionKey': 'u1', 'RowKey': fid, 'filename': f'{fid}.jpg', 'personId': pid,
@@ -274,3 +276,41 @@ def test_confirming_a_face_into_a_full_person_lands_on_its_overflow_row(merge_en
     (shard, face_id), = added
     assert face_id == 'n1' and shard != 'FULL' and persons.get_entity('u1', shard)['groupId'] == 'FULL'
     assert faces.get_entity('u1', 'n1')['personId'] == shard
+
+
+def test_finding_a_persons_overflow_rows_never_scans_the_person_table(merge_env, monkeypatch):
+    persons, faces, blobs = merge_env
+    monkeypatch.setattr(persons, 'query_entities', lambda *a, **k: (_ for _ in ()).throw(AssertionError('scan')),
+                        raising=False)
+    assert app._person_group_ids('u1', 'A') == ['A', 'S']
+    assert app._person_shard_ids('u1', 'B') == [] and app._person_shard_ids('u1', 'S') == []
+
+
+def test_a_group_merge_records_the_joined_rows_and_undo_restores_the_pointers(merge_env):
+    persons, faces, blobs = merge_env
+    merge_id = app._merge_persons_core('u1', 'B', ['A'])['mergeId']
+    assert json.loads(persons.get_entity('u1', 'B')['shardIds']) == ['A', 'S']
+    assert not persons.get_entity('u1', 'A').get('shardIds')          # A is no longer a first person
+    assert app._person_group_ids('u1', 'B') == ['B', 'A', 'S']
+    assert app.app.test_client().post(f'/api/persons/merge/{merge_id}/undo').status_code == 200
+    assert not persons.get_entity('u1', 'B').get('shardIds')
+    assert json.loads(persons.get_entity('u1', 'A')['shardIds']) == ['S']
+    assert app._person_group_ids('u1', 'B') == ['B'] and app._person_group_ids('u1', 'A') == ['A', 'S']
+
+
+def test_a_new_overflow_row_is_recorded_on_the_first_person(merge_env):
+    persons, faces, blobs = merge_env
+    _full_person(persons)
+    _loose_face(faces, 'n1')
+    shard = app._owner_row_for_new_face('u1', 'FULL', 'n1')
+    assert json.loads(persons.get_entity('u1', 'FULL')['shardIds']) == [shard]
+
+
+def test_refresh_adds_overflow_rows_clustering_created(merge_env):
+    persons, faces, blobs = merge_env
+    persons.upsert_entity({'PartitionKey': 'u1', 'RowKey': 'S2', 'name': '', 'faceIds': '[]', 'groupId': 'A'})
+    assert list(app._refresh_group_pointers('u1', dry_run=True)) == ['A']
+    assert json.loads(persons.get_entity('u1', 'A')['shardIds']) == ['S']       # a dry run writes nothing
+    app._refresh_group_pointers('u1')
+    assert json.loads(persons.get_entity('u1', 'A')['shardIds']) == ['S', 'S2']
+    assert app._refresh_group_pointers('u1') == {}

@@ -494,6 +494,9 @@ def reconcile_people_faces():
         dry_run=not apply_changes, should_stop=lambda: time.monotonic() > deadline)
     if apply_changes and result['repaired']:
         app.mark_people_dirty(user_id, [row['personId'] for row in result['repaired']])
+    if result['complete']:
+        # Overflow rows clustering created but the first person's pointer does not list yet.
+        result['pointersAdded'] = len(app._refresh_group_pointers(user_id, dry_run=not apply_changes))
     result['applied'] = apply_changes
     return app.jsonify(result)
 
