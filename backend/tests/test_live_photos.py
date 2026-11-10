@@ -110,3 +110,12 @@ def test_a_clip_recorded_seconds_before_its_still_is_still_its_clip():
 def test_a_png_is_never_a_live_photos_still():
     rows = [clip('IMG_1.MOV', modified='2025-01-01T10:00:00+00:00'), photo('IMG_1.PNG', modified='2025-01-01T10:00:00+00:00')]
     assert lp.choose_pairs(rows) == []
+
+
+def test_a_browser_read_photo_without_apples_identifier_is_not_a_clips_still():
+    browser = json.dumps({'client_exif': {'source': 'browser_exiftool'}})
+    rows = [clip('IMG_5.MOV', 'ID-5', '2025-08-10 15:08:29+02:00'),
+            photo('IMG_5.HEIC', taken='2025:08:10 15:08:29', offset='+02:00', processing_metadata=browser)]
+    assert lp.choose_pairs(rows) == []
+    rows[1]['processing_metadata'] = '{}'           # server EXIF never carries the identifier: time still decides
+    assert lp.choose_pairs(rows) == [('IMG_5.MOV', 'IMG_5.HEIC')]

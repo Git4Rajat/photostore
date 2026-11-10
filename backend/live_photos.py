@@ -34,8 +34,8 @@ CAPTURE_TOLERANCE = 6.0
 LIVE_CLIP_MAX_SECONDS = 4.0
 
 # Columns pairing reads (callers project these).
-PAIRING_FIELDS = ('PartitionKey', 'RowKey', 'processing_state', 'exifData', 'clientLastModified',
-                  CLIP_INFO, CLIP_OF, PHOTO_CLIP)
+PAIRING_FIELDS = ('PartitionKey', 'RowKey', 'processing_state', 'exifData', 'processing_metadata',
+                  'clientLastModified', CLIP_INFO, CLIP_OF, PHOTO_CLIP)
 
 _COLLISION_SUFFIX = re.compile(r'-[0-9a-f]{8}$')
 _COPY_SUFFIX = re.compile(r' \(\d+\)$')
@@ -135,6 +135,17 @@ def _seconds_apart(a, b) -> Optional[float]:
     return None
 
 
+def _exif_from_browser(row: Dict) -> bool:
+    """EXIF read by the browser's exiftool, which decodes Apple's maker notes: a Live Photo's still read
+    that way always shows its content identifier."""
+    try:
+        processing = json.loads(row.get('processing_metadata') or '{}')
+    except (TypeError, ValueError):
+        return False
+    client_exif = processing.get('client_exif') if isinstance(processing, dict) else None
+    return isinstance(client_exif, dict) and client_exif.get('source') == 'browser_exiftool'
+
+
 def _photo_capture(row: Dict):
     exif = _exif(row)
     return _when(exif.get('DateTimeOriginal'), exif.get('OffsetTimeOriginal') or exif.get('OffsetTime'))
@@ -156,6 +167,8 @@ def _score(clip: Dict, info: Dict[str, str], photo: Dict):
     photo_id = str(_exif(photo).get('ContentIdentifier') or '').strip()
     if info.get('contentId') and photo_id:
         return (0, 0.0) if photo_id == info['contentId'] else None
+    if info.get('contentId') and _exif_from_browser(photo):
+        return None              # its maker notes were read and name no Live Photo: not this clip's still
     same_name = exact_stem(clip['RowKey']) == exact_stem(photo['RowKey'])
     apart = _seconds_apart(_when(info.get('capturedAt')), _photo_capture(photo))
     if apart is not None:
