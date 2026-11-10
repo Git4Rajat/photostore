@@ -4249,7 +4249,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     title: stillFinalizing > 0 ? 'Upload transferred' : 'Upload complete',
                     details: stillFinalizing > 0
                         ? `All bytes transferred. Confirming ${plural(stillFinalizing, 'file')} in the background.`
-                        : `Uploaded ${plural(totalUploaded, 'file')} successfully. Skipped duplicates: ${totalSkippedDuplicates}.`,
+                        : `Uploaded ${plural(totalUploaded, 'file')} successfully. Skipped duplicates: ${totalSkippedDuplicates}. Your photos will be visible in the gallery after processing.`,
                 });
             }
 
@@ -4390,7 +4390,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             } else if (totalFailed === 0 && !hasPending) {
                 updateUploadNotification({
                     title: 'Upload complete',
-                    details: `Uploaded ${plural(totalUploaded, 'file')} successfully. Skipped duplicates: ${totalSkippedDuplicates}.`,
+                    details: `Uploaded ${plural(totalUploaded, 'file')} successfully. Skipped duplicates: ${totalSkippedDuplicates}. Your photos will be visible in the gallery after processing.`,
                 });
                 setUploadError(null);
             } else {
