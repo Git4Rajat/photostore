@@ -49,13 +49,13 @@ param emailDataLocation string = 'Europe'
 param processingMode string = 'backend'
 
 @description('Public core API image. Defaults to an immutable @sha256 digest (rewritten by the publish workflow after each qualified release), never :latest, so installs never auto-upgrade. To upgrade an EXISTING deployment, override with the new release digest.')
-param coreImage string = 'ghcr.io/git4rajat/photostore-backend@sha256:709b121c7876439664718a9535a885fadb830235fd74412ed09242fdc226c095'
+param coreImage string = 'ghcr.io/git4rajat/photostore-backend@sha256:4e10c835d0914d09b9830819707df1f075272fc6fb1666431dcdceb76e559fac'
 
 @description('Public web (frontend) image. Defaults to an immutable @sha256 digest, never :latest, same as coreImage above.')
-param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:6ff5cda7ffce97b5b6e1eb0867e63f1ae8bcb955e6c86009133a9fa047b3ca39'
+param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:2edfd567e4dcd6d20d6ecd9580fbe5a034e83c0ef63380463b5c9193a4f174d0'
 
 @description('Public vision (server-side image processing) image. Only pulled/deployed when processingMode is "backend" or "both". Same digest-pinning guidance as coreImage applies.')
-param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker@sha256:d425b8dac5b265db904e17e0a1260c2541ce7ccb2562ee2f38a01ccc44c6403d'
+param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker@sha256:ba5ff4dd63a78120a950313713982eef96f59403d4b8b306dfef034a61357b3f'
 
 @description('Quota in GiB for the dedicated clustering FAISS checkpoint SMB share. Local SQLite/work files remain on ephemeral storage.')
 @minValue(1)
@@ -81,11 +81,11 @@ param enableWaveExecution bool = true
 @description('Enroll newly created empty libraries only. Existing libraries never change ownership.')
 param enableNewWaveLibraries bool = true
 @description('Exact-image capability ID. Fresh wave activation requires the seeded release certificate; never leave empty.')
-param waveCapabilityId string = '78df247682077525618a0354c6e2c0a0c68c4fa49059deccfb58e81d9e78a8a0'
+param waveCapabilityId string = '78f400065ec0981098cb6f1824a29cb7218c8ee331c9d977908b7a07c16e4732'
 @description('Earlier release certificates this release may replace in place (set by the release pin job).')
-param waveCompatibleCapabilities string = '1c83f729139f2626ea4801c096b9358c0030354530ceb6b9afbf0695fadbebbe,710b1ab8295761b3e6080d82ac0e50883d1970af82466e14f3599ed116996006,a9a601efeb06a57542fd20763657c7b7b1c998aa186e5d1ffc2e2625227cf274,7bb2fec7c65ed9c17a08571d1289d9e383c8434bce96c899bf24e00366724ddc,85880f3c39543dd1573c7dea5c2ea0f61fe433bee6134111d68d1f913e92e86a,9c4360b4215489d56e32958ab636130a40710fb9757a46b74e39bcaa452a30f2,1f6068c0f15f009a41fe634e0c02e2a594e700c1da16e6717cda82c899cbea5f,3e01ae07beb64f410cf78c3f104387406254007485cf3a756b10b2ba1d1bda16'
+param waveCompatibleCapabilities string = '78df247682077525618a0354c6e2c0a0c68c4fa49059deccfb58e81d9e78a8a0,1c83f729139f2626ea4801c096b9358c0030354530ceb6b9afbf0695fadbebbe,710b1ab8295761b3e6080d82ac0e50883d1970af82466e14f3599ed116996006,a9a601efeb06a57542fd20763657c7b7b1c998aa186e5d1ffc2e2625227cf274,7bb2fec7c65ed9c17a08571d1289d9e383c8434bce96c899bf24e00366724ddc,85880f3c39543dd1573c7dea5c2ea0f61fe433bee6134111d68d1f913e92e86a,9c4360b4215489d56e32958ab636130a40710fb9757a46b74e39bcaa452a30f2,1f6068c0f15f009a41fe634e0c02e2a594e700c1da16e6717cda82c899cbea5f'
 @description('Source commit of the pinned release (set by the release pin job).')
-param waveSourceCommit string = 'eb50ff5f597f15e3b983712b7c97b424ecc200c7'
+param waveSourceCommit string = '70c0132e08e4ffc012afb03c1576a89c09457168'
 param waveBootstrapPending bool = false
 
 @description('Provision managed WebSocket notifications when library indexes are published.')
