@@ -14,7 +14,7 @@ import {
 import { ARC_FACE_5POINT_TEMPLATE, solveSimilarityTransform } from '../services/faceAlignment';
 import { preloadYoloFaceModel, detectFacesWithYolo, resetYoloFaceModelStateForTests } from '../services/yoloFaceDetectionRuntime';
 import { getFileExtension, isHeicFilename, isJxlFilename, isRawFilename, isVideoFilename } from '../utils/photoDisplay';
-import { idbPut, idbGet, idbDelete } from '../services/photoCache';
+import { idbPut, idbGet, idbDelete, idbSweepOrphans } from '../services/photoCache';
 import {
     dataUrlToBlob,
     readBlobArrayBuffer,
@@ -28,7 +28,7 @@ import { extractBrowserExif } from '../utils/browserExifTool';
 // boundary (`typeof import('./browserProcessingRuntime')`) keeps resolving idbPut/idbGet/
 // idbDelete/dataUrlToBlob/readBlobArrayBuffer/sha256ArrayBuffer -- the actual
 // implementations live in services/photoCache.ts and utils/blobIo.ts.
-export { idbPut, idbGet, idbDelete, dataUrlToBlob, readBlobArrayBuffer, sha256ArrayBuffer };
+export { idbPut, idbGet, idbDelete, idbSweepOrphans, dataUrlToBlob, readBlobArrayBuffer, sha256ArrayBuffer };
 import type { BrowserAiLoadStage, BrowserAiModelCacheStatus, BrowserAiModelState as SharedBrowserAiModelState, BrowserAiNetworkGate, BrowserFaceDetection, BrowserFaceFailureStage, BrowserFaceDetectionResult, ClientProcessingReason, ClientProcessingReportItem, ClientProcessingResult, ClientProcessingSourceKind, UploadProfile, ClientProcessingStatus, ClientProcessingStep } from '../types/browserProcessing';
 
 export const formatBytes = (bytes: number) => {
