@@ -395,9 +395,7 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
                     <div
                         ref={photoRef}
                         className="pt-viewer-photo"
-                        // Tapping the photo toggles the floating tools on touch
-                        // (they're always shown on desktop via CSS, so this is a
-                        // no-op there).
+                        // Clicking or tapping the photo toggles the floating tools.
                         onClick={() => setShowTools((v) => !v)}
                         onDoubleClick={(e) => (zoomed ? resetZoom() : zoomAtPoint(zoom + ZOOM_STEP * 2, e.clientX, e.clientY))}
                         onMouseDown={(e) => { if (zoomed) panRef.current = { x: e.clientX, y: e.clientY, px: pan.x, py: pan.y }; }}

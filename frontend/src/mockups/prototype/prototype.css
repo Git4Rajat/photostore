@@ -678,11 +678,11 @@
 }
 /* The zoom/rotate toolbar floats over the top of the photo, covering tall
    portrait shots on a phone. On touch, keep it hidden until the user taps the
-   photo (iOS-style chrome toggle); desktop leaves it always visible. */
-@media (hover: none) and (pointer: coarse) {
-  .pt-viewer-tools { opacity: 0; visibility: hidden; pointer-events: none; transition: opacity 0.16s ease, visibility 0.16s ease; }
-  .pt-viewer.tools-visible .pt-viewer-tools { opacity: 1; visibility: visible; pointer-events: auto; }
-}
+   photo (iOS-style chrome toggle). Not gated on a touch media query: Windows
+   Chrome reports a fine pointer even on touchscreen laptops, so the toolbar
+   would never hide there. */
+.pt-viewer-tools { opacity: 0; visibility: hidden; pointer-events: none; transition: opacity 0.16s ease, visibility 0.16s ease; }
+.pt-viewer.tools-visible .pt-viewer-tools { opacity: 1; visibility: visible; pointer-events: auto; }
 
 /* ---- People card count: centred under the face ---- */
 .pt-person-name, .pt-person-count { text-align: center; max-width: 100%; }
