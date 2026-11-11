@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Search as MagnifyingGlassIcon, Plus as PlusIcon } from 'lucide-react';
 import { useStore } from '../store';
 import { Swatch } from '../components/bits';
+import { plural } from '../../../utils/format';
 import PhotoGrid from '../components/PhotoGrid';
 import { get } from '../../../services/apiClient';
 import { getAskState, loadMoreAsk, runAskSearch, setAskQuery, setAskScroll, useAskState } from '../askSearchStore';
@@ -188,7 +189,7 @@ const AskPage: React.FC = () => {
                                 return (
                                     <div key={p.id} className="card-glass pt-match-card" onClick={go} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } }} role="button" tabIndex={0}>
                                         <Swatch swatch={p.swatch} className="pt-match-face" />
-                                        <div><b>{p.name}</b><span>{p.faceCount ?? 0} photos</span></div>
+                                        <div><b>{p.name}</b><span>{plural(p.faceCount ?? 0, 'photo')}</span></div>
                                     </div>
                                 );
                             })}

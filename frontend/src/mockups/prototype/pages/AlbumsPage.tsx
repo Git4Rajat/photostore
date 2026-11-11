@@ -14,7 +14,7 @@ import {
     Trash2 as TrashIcon,
     Users as UserGroupIcon,
 } from 'lucide-react';
-import { useStore } from '../store';
+import { shownAlbum, useStore } from '../store';
 import PhotoGrid from '../components/PhotoGrid';
 import ScrollSentinel from '../components/ScrollSentinel';
 import { Spinner, SelectionBar } from '../components/bits';
@@ -83,7 +83,7 @@ export const AlbumsPage: React.FC = () => {
     // no-selection case (plain "Albums" tab) falls back to the first album
     // for the desktop preview pane.
     const explicitAlbumId = route.params.albumId;
-    const album = explicitAlbumId ? albums.find((a) => a.id === explicitAlbumId) : albums[0];
+    const album = shownAlbum(route, albums);
     const explicitAlbumMissing = explicitAlbumId ? isAlbumMissing(explicitAlbumId) : false;
     // A transient (network/5xx) failure is distinct from both "still
     // resolving" and a confirmed 404: it must present a retry action rather
@@ -289,13 +289,27 @@ export const AlbumsPage: React.FC = () => {
         window.setTimeout(() => setCopied(false), 1400);
         void navigator.clipboard?.writeText(url).catch(() => {});
     };
-    const togglePublic = () => {
+    // Both directions ask first: turning sharing on publishes the album to
+    // anyone holding the link, and turning it off breaks that link for them.
+    const togglePublic = async () => {
+        const { id, name } = album;
         if (album.isPublic) {
-            void revokeAlbum(album.id);
-        } else {
-            const days = EXPIRY_OPTIONS.find((o) => o.value === expiry)?.days ?? 7;
-            void shareAlbum(album.id, { expiresInDays: days });
+            const ok = await confirmDialog({
+                title: `Stop sharing “${name}”?`,
+                message: 'Anyone with the link loses access straight away.',
+                confirmLabel: 'Stop sharing',
+                danger: true,
+            });
+            if (ok) void revokeAlbum(id);
+            return;
         }
+        const days = EXPIRY_OPTIONS.find((o) => o.value === expiry)?.days ?? 7;
+        const ok = await confirmDialog({
+            title: `Share “${name}”?`,
+            message: `Anyone with the link can see the photos in this album. ${days ? `The link expires in ${plural(days, 'day')}.` : 'The link doesn’t expire.'}`,
+            confirmLabel: 'Create link',
+        });
+        if (ok) void shareAlbum(id, { expiresInDays: days });
     };
     const changeExpiry = (value: string) => {
         setExpiry(value);
@@ -404,7 +418,7 @@ export const AlbumsPage: React.FC = () => {
                                     <button type="button" className="pt-linkish danger" onClick={() => void confirmDeleteAlbum()}>Delete</button>
                                 </p>
                             </div>
-                            <button type="button" className="btn mock-cta" onClick={togglePublic}>
+                            <button type="button" className="btn mock-cta" onClick={() => void togglePublic()}>
                                 <ShareIcon className="toolbar-icon" /> <span>{album.isPublic ? 'Sharing on' : 'Share'}</span>
                             </button>
                         </div>
@@ -433,11 +447,14 @@ export const AlbumsPage: React.FC = () => {
                                                 : <span>{album.hasAccessCode ? 'Protected — generate a new code to reveal one' : 'Add a code to protect the link'}</span>}
                                         </span>
                                         <button type="button" className="btn" onClick={() => {
+                                            const { id } = album;
                                             const code = randomCode();
                                             const days = EXPIRY_OPTIONS.find((o) => o.value === expiry)?.days ?? 7;
-                                            void shareAlbum(album.id, { expiresInDays: days, accessCode: code });
-                                            setCodes((prev) => ({ ...prev, [album.id]: code }));
-                                            toast(`New access code: ${code}`);
+                                            // Shown inline only, once the server has it -- never in a
+                                            // toast, which the notification history keeps.
+                                            void shareAlbum(id, { expiresInDays: days, accessCode: code }).then((ok) => {
+                                                if (ok) setCodes((prev) => ({ ...prev, [id]: code }));
+                                            });
                                         }}>
                                             <ArrowPathIcon className="toolbar-icon" /> New code
                                         </button>

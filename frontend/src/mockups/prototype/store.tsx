@@ -25,6 +25,7 @@ import * as library from '../../services/libraryClient';
 import type { LibraryMember, PendingInvite } from '../../services/libraryClient';
 import type { PersonFace } from '../../types/people';
 import { isNamedLabel } from '../../utils/people';
+import { plural } from '../../utils/format';
 import type { Photo as BackendPhoto } from '../../types/uiTypes';
 import type {
     Album,
@@ -42,6 +43,15 @@ import type {
     AlbumTrashItem,
 } from './types';
 import { routeToSearch, searchToRoute } from './routeUrl';
+
+/** The album the Albums page is showing: the one ?albumId names, or for the
+ *  bare Albums tab the first album, which the detail pane previews. Undefined
+ *  off the Albums page and while an explicit albumId hasn't loaded yet. */
+export const shownAlbum = (route: Route, albums: Album[]): Album | undefined => {
+    if (route.page !== 'albums') return undefined;
+    const id = route.params.albumId;
+    return id ? albums.find((a) => a.id === id) : albums[0];
+};
 
 // ---- backend <-> prototype photo mapping -------------------------------------
 
@@ -69,6 +79,14 @@ const withIndexRetry = async <T,>(fetchIndex: () => Promise<T | null>): Promise<
         if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 3000));
     }
     return null;
+};
+
+// Puts `photos` back at the front of `list`, skipping any already there: a
+// restore racing a failed delete's rollback must not list a photo twice.
+const prependMissing = (photos: Photo[], list: Photo[]): Photo[] => {
+    const present = new Set(list.map((p) => p.id));
+    const missing = photos.filter((p) => !present.has(p.id));
+    return missing.length ? [...missing, ...list] : list;
 };
 
 // Stable placeholder swatch derived from the filename, so a photo shows the same
@@ -392,7 +410,9 @@ interface Store {
     applyPhotoRotation: (filename: string, rotation: number) => void;
     savePhotoRotation: (filename: string, rotation: number, previous: number) => void;
     deletePhotos: (ids: string[]) => void;
-    restorePhotos: (ids: string[]) => void;
+    /** `photos` are the objects to put back; Undo passes the ones it deleted,
+     *  since by then the store may no longer hold them anywhere. */
+    restorePhotos: (ids: string[], photos?: Photo[]) => void;
     restoreAllTrash: () => void;
     purgePhoto: (id: string) => void;
     purgeAllTrash: () => void;
@@ -422,7 +442,8 @@ interface Store {
     removePhotosFromAlbum: (albumId: string, ids: string[]) => void;
     deleteAlbum: (id: string) => void;
     deleteAlbums: (ids: string[]) => void;
-    shareAlbum: (id: string, opts: { expiresInDays: number; accessCode?: string }) => Promise<void>;
+    /** Resolves false when the change didn't land (the error is already toasted). */
+    shareAlbum: (id: string, opts: { expiresInDays: number; accessCode?: string }) => Promise<boolean>;
     revokeAlbum: (id: string) => Promise<void>;
 
     // people (server-backed)
@@ -589,6 +610,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const [maxMembers, setMaxMembers] = useState<number>(15);
     const [membersLoading, setMembersLoading] = useState<boolean>(true);
     const [trash, setTrash] = useState<TrashItem[]>([]);
+    const trashRef = useRef(trash);
+    trashRef.current = trash;
     const [trashLoading, setTrashLoading] = useState<boolean>(false);
     const [albumTrash, setAlbumTrash] = useState<AlbumTrashItem[]>([]);
     const [albumTrashLoading, setAlbumTrashLoading] = useState<boolean>(false);
@@ -1522,22 +1545,30 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         });
     }, []);
 
-    const restorePhotos = useCallback((ids: string[]) => {
+    // The /photos/delete request still in flight for each id. A restore waits
+    // for it: Recently Deleted lists a photo the moment it's deleted, and a
+    // restore that reached the server first would be undone by the delete
+    // landing after it, leaving the photo in the trash.
+    const pendingDeletesRef = useRef(new Map<string, Promise<unknown>>());
+
+    const restorePhotos = useCallback((ids: string[], photos?: Photo[]) => {
         if (!ids.length) return;
         clearLocalSortIndexRemovals(ids);
         const set = new Set(ids);
         // Optimistically move the photos back from the local trash cache; roll
-        // back if the server rejects the restore.
-        const trashed = trash.filter((t) => set.has(t.photo.id)).map((t) => t.photo);
+        // back if the server rejects the restore. Read through the ref: Undo
+        // calls this long after the render it was created in.
+        const trashed = photos?.length ? photos : trashRef.current.filter((t) => set.has(t.photo.id)).map((t) => t.photo);
         const moved = trashed.length ? trashed : photosByIds(ids);
-        if (moved.length) setPhotos((cur) => [...moved, ...cur]);
+        if (moved.length) setPhotos((cur) => prependMissing(moved, cur));
         setTrash((prev) => prev.filter((t) => !set.has(t.photo.id)));
         invalidateLocalSortIndex();
         invalidateLocalPeopleIndex();
         invalidateLocalAlbumsIndex();
         adjustPeopleCountsForPhotos(moved, 1);
         applyPhotoRestoreCount(moved.length);
-        void post('/photos/trash/restore', { filenames: ids }).then(() => {
+        const pendingDeletes = ids.map((id) => pendingDeletesRef.current.get(id)).filter(Boolean);
+        void Promise.allSettled(pendingDeletes).then(() => post('/photos/trash/restore', { filenames: ids })).then(() => {
             publishLibraryChange('photos-restored', ['photos', 'people', 'albums', 'explore', 'trash'], { itemCount: ids.length, entityIds: ids });
         }).catch(() => {
             const movedSet = new Set(moved.map((p) => p.id));
@@ -1548,7 +1579,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             setTrash((prev) => [...moved.map((photo) => ({ photo, purgesInDays: 30 })), ...prev]);
             toast('Couldn’t restore photos', undefined, undefined, 'error');
         });
-    }, [adjustPeopleCountsForPhotos, photosByIds, toast, trash, applyPhotoDeleteCount, applyPhotoRestoreCount]);
+    }, [adjustPeopleCountsForPhotos, photosByIds, toast, applyPhotoDeleteCount, applyPhotoRestoreCount]);
 
     const deletePhotos = useCallback(
         (ids: string[]) => {
@@ -1562,15 +1593,21 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             removeFromEverywhere(ids);
             applyPhotoDeleteCount(ids.length);
             setSelection([]);
-            void post<{ jobId?: string; status?: string }>('/photos/delete', { filenames: ids }).then((response) => {
+            const request = post<{ jobId?: string; status?: string }>('/photos/delete', { filenames: ids });
+            const settled = request.then(() => undefined, () => undefined);
+            ids.forEach((id) => pendingDeletesRef.current.set(id, settled));
+            void settled.then(() => ids.forEach((id) => {
+                if (pendingDeletesRef.current.get(id) === settled) pendingDeletesRef.current.delete(id);
+            }));
+            void request.then((response) => {
                 if (response?.status === 'queued') {
-                    toast(`Moving ${ids.length} photos to Recently Deleted`);
+                    toast(`Moving ${plural(ids.length, 'item')} to Recently Deleted`);
                     requestJobPoll();
                 } else {
                     toast(
-                        `Deleted ${ids.length} photo${ids.length > 1 ? 's' : ''}`,
+                        `Deleted ${plural(ids.length, 'item')}`,
                         'Undo',
-                        () => restorePhotos(ids),
+                        () => restorePhotos(ids, doomed),
                     );
                     publishLibraryChange('photos-deleted', ['photos', 'people', 'albums', 'explore', 'trash'], {
                         itemCount: ids.length, entityIds: ids,
@@ -1580,7 +1617,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 // Roll back the optimistic removal on failure.
                 const set = new Set(ids);
                 setTrash((prev) => prev.filter((t) => !set.has(t.photo.id)));
-                setPhotos((cur) => [...doomed, ...cur]);
+                setPhotos((cur) => prependMissing(doomed, cur));
                 clearLocalSortIndexRemovals(ids);
                 invalidateLocalSortIndex();
                 adjustPeopleCountsForPhotos(doomed, 1);
@@ -2150,7 +2187,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const deleteAlbum = useCallback((id: string) => { deleteAlbums([id]); }, [deleteAlbums]);
 
     const shareAlbum = useCallback(async (id: string, opts: { expiresInDays: number; accessCode?: string }) => {
-        if (hasAlbumDeleteTombstone(id, pendingEditScope())) return;
+        if (hasAlbumDeleteTombstone(id, pendingEditScope())) return false;
         try {
             const res = await post<{ album?: Album }>(`/albums/${encodeURIComponent(id)}/share`, {
                 enabled: true,
@@ -2162,8 +2199,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, ...res.album } : a)));
             }
             invalidateLocalAlbumsIndex();
+            return true;
         } catch {
             toast('Couldn’t update share link', undefined, undefined, 'error');
+            return false;
         }
     }, [toast]);
 

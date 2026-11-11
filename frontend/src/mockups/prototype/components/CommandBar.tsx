@@ -9,7 +9,8 @@ import {
 } from 'lucide-react';
 import { Menu, Stars, SelectionBar } from './bits';
 import { AddToAlbumSheet } from './AddToAlbumMenu';
-import { useStore } from '../store';
+import { confirmDeleteItems } from './confirmDelete';
+import { shownAlbum, useStore } from '../store';
 
 /**
  * Compact floating menu for multi-selection. Delete button always visible,
@@ -20,18 +21,26 @@ import { useStore } from '../store';
  * way to cancel a selection once the user has scrolled away from the top.
  */
 const CommandBar: React.FC = () => {
-    const { selection, ratePhotos, deletePhotos, removePhotosFromAlbum, route, navigate, toast, clearSelection } = useStore();
-    const openAlbumId = route.page === 'albums' ? route.params.albumId : undefined;
+    const { selection, ratePhotos, deletePhotos, removePhotosFromAlbum, route, albums, navigate, toast, clearSelection } = useStore();
+    // The album on screen, not just ?albumId: the bare Albums tab shows the
+    // first album without putting its id in the URL.
+    const openAlbumId = shownAlbum(route, albums)?.id;
     const [albumOpen, setAlbumOpen] = useState(false);
     if (!selection.length) return null;
+
+    const confirmDelete = async () => {
+        const ids = selection;
+        if (await confirmDeleteItems(ids.length)) deletePhotos(ids);
+    };
 
     return (
         <SelectionBar count={selection.length} onClear={clearSelection} label="Selection actions">
             <button
                 type="button"
                 className="pt-fm-delete"
-                onClick={() => deletePhotos(selection)}
-                aria-label={`Delete ${selection.length} photo${selection.length > 1 ? 's' : ''}`}
+                onClick={() => void confirmDelete()}
+                aria-label="Delete from library"
+                title="Delete from library"
             >
                 <TrashIcon />
             </button>
@@ -46,6 +55,12 @@ const CommandBar: React.FC = () => {
             >
                 {(close) => (
                     <div className="pt-fm-menu">
+                        {openAlbumId && (
+                            <button type="button" className="pt-fm-item" onClick={() => { removePhotosFromAlbum(openAlbumId, selection); close(); }}>
+                                <MinusCircleIcon /> Remove from album
+                            </button>
+                        )}
+
                         <Menu
                             align="left"
                             renderTrigger={(toggle) => (
@@ -64,12 +79,6 @@ const CommandBar: React.FC = () => {
                         <button type="button" className="pt-fm-item" onClick={() => { setAlbumOpen(true); close(); }}>
                             <PlusIcon /> Album
                         </button>
-
-                        {openAlbumId && (
-                            <button type="button" className="pt-fm-item" onClick={() => { removePhotosFromAlbum(openAlbumId, selection); close(); }}>
-                                <MinusCircleIcon /> Remove from album
-                            </button>
-                        )}
 
                         <button type="button" className="pt-fm-item" onClick={() => { navigate('tools', { filenames: selection.slice(0, 50).join(',') }); close(); }}>
                             <WrenchScrewdriverIcon /> Workbench

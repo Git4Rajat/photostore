@@ -7,6 +7,7 @@ import {
 } from 'lucide-react';
 import { Menu, Stars } from './bits';
 import { AddToAlbumMenu } from './AddToAlbumMenu';
+import { confirmDeleteItems } from './confirmDelete';
 import ViewerShell from './ViewerShell';
 import { useStore, isVideoFilename } from '../store';
 import { useMainMedia, useVideoSource, downloadPhoto, fetchPhotoMetadata, preloadMediaAccessUrls, useLiveClipSource } from '../media';
@@ -251,7 +252,7 @@ const PhotoViewer: React.FC = () => {
                     </Menu>
                 </div>
                 <div className="pt-vb-group right">
-                    <button type="button" className="pt-vb-btn" onClick={() => deletePhotos([photo.id])}>
+                    <button type="button" className="pt-vb-btn" onClick={() => void confirmDeleteItems(1).then((ok) => { if (ok) deletePhotos([photo.id]); })}>
                         <TrashIcon /> <span>Delete</span>
                     </button>
                 </div>

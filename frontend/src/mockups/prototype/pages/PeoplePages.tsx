@@ -10,6 +10,7 @@ import { useProtectedBlobUrls } from '../../../services/imageClient';
 import { confirmDialog } from '../../../components/shared/dialogs';
 import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
 import type { Person } from '../types';
+import { plural } from '../../../utils/format';
 
 // The merge target when several selected clusters are merged at once: prefer
 // a named person (merging *into* a name is the common case -- folding
@@ -128,7 +129,7 @@ export const PeoplePage: React.FC = () => {
                                 ? <img className="pt-person-face" src={coverSrc} alt={person.name ?? 'Unnamed person'} />
                                 : <Swatch swatch={person.swatch} className="pt-person-face" />}
                             <span className={`pt-person-name${person.name ? '' : ' unnamed'}`}>{person.name ?? 'Add name'}</span>
-                            <span className="pt-person-count">{person.faceCount ?? 0} photos</span>
+                            <span className="pt-person-count">{plural(person.faceCount ?? 0, 'photo')}</span>
                         </button>
                     );
                 })}
@@ -215,6 +216,9 @@ export const PersonDetailPage: React.FC = () => {
         ? [...mergeMatches, chosenMerge]
         : mergeMatches;
     const photos = personPhotosById(person.id);
+    const photoCount = personPhotosHasMore(person.id)
+        ? (personPhotosTotal(person.id) ?? photos?.length ?? person.faceCount ?? 0)
+        : (photos?.length ?? personPhotosTotal(person.id) ?? person.faceCount ?? 0);
     const coverSrc = person.coverThumbnailUrl ? headCover[person.coverThumbnailUrl] : undefined;
 
     const handleDeletePerson = async () => {
@@ -254,7 +258,7 @@ export const PersonDetailPage: React.FC = () => {
                 </div>
             </div>
             <div className="pt-album-photos-head pt-person-photos-head">
-                <p className="pt-page-sub" style={{ margin: 0 }}>{(personPhotosHasMore(person.id) ? (personPhotosTotal(person.id) ?? photos?.length ?? person.faceCount ?? 0) : (photos?.length ?? personPhotosTotal(person.id) ?? person.faceCount ?? 0)).toLocaleString()} photos</p>
+                <p className="pt-page-sub" style={{ margin: 0 }}>{photoCount.toLocaleString()} {photoCount === 1 ? 'photo' : 'photos'}</p>
                 <div className="pt-album-photos-actions">
                     <ThumbSizeControl value={personTile} onChange={setPersonTile} />
                     {photos && photos.length > 0 && (
@@ -289,7 +293,7 @@ export const PersonDetailPage: React.FC = () => {
                     <select className="field field-select" onFocus={() => setMergeActive(true)} value={mergeId} onChange={(e) => { setMergeId(e.target.value); setChosenMerge(mergeResults.find((p) => p.id === e.target.value) ?? null); }} aria-label="Person to merge">
                         <option value="">Choose a person…</option>
                         {mergeOptions.map((o) => (
-                            <option key={o.id} value={o.id}>{o.name ?? 'Unnamed'} · {o.faceCount ?? 0} photos</option>
+                            <option key={o.id} value={o.id}>{o.name ?? 'Unnamed'} · {plural(o.faceCount ?? 0, 'photo')}</option>
                         ))}
                     </select>
                     <button type="button" className="btn" disabled={!mergeId} onClick={() => { mergePeople(mergeId, person.id); setMergeId(''); }}>Merge</button>
