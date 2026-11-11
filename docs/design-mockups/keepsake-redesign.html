@@ -1,0 +1,1543 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Keepsake Redesign</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Jost:wght@500;600&family=Figtree:wght@400;500;600;700&display=swap">
+<style>
+/* Layout: a review board. Each section is one area of the app, shown as a row of phone frames with captions;
+   the shared album also gets a desktop browser frame. The app UI inside the frames uses one token set. */
+:root {
+  --font-display: "Jost", Futura, "Century Gothic", "Trebuchet MS", sans-serif;
+  --font-ui: "Figtree", -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+
+  /* Board (dark first) */
+  --b-bg: #0f0f11; --b-card: #18181b; --b-fg: #ede7da; --b-muted: #9d9587; --b-line: rgba(237,231,218,.10); --b-chip: #232328;
+  --bezel: #050506; --bezel-edge: #2c2c31; --shadow-lg: 0 40px 70px -40px rgba(0,0,0,.75);
+
+  /* App: one accent, one danger, warm neutrals */
+  --bg: #131316; --surface: #1c1c20; --surface-2: #27272c; --fg: #ede7da; --muted: #a39b8c;
+  --line: rgba(237,231,218,.10); --line-strong: rgba(237,231,218,.22);
+  --accent: #7aaed3; --on-accent: #0c1924; --accent-soft: rgba(122,174,211,.16);
+  --danger: #ff7d8c; --on-danger: #2b0b11; --danger-soft: rgba(255,125,140,.14);
+  --scrim: rgba(6,6,8,.62); --sel-dim: rgba(10,10,12,.40); --tile-empty: #222226;
+  --toast-bg: #ede7da; --toast-fg: #17171a; --toast-link: #2f5d82;
+  --knob: #ffffff; --shadow: 0 18px 40px -18px rgba(0,0,0,.7); --shadow-sm: 0 1px 3px rgba(0,0,0,.35);
+  --map-land: #2a2c2a; --map-water: #1c2a36; --map-road: #3d3f3c;
+
+  /* Same in both themes: text and controls that sit on photos, and the always-dark viewer */
+  --on-photo: #ffffff; --photo-shadow: rgba(0,0,0,.55); --photo-scrim: rgba(0,0,0,.62); --photo-scrim-top: rgba(0,0,0,.35);
+  --glass: rgba(18,18,20,.42);
+  --v-bg: #0b0b0c; --v-surface: #18181a; --v-fg: #f1ece2; --v-muted: #a8a091; --v-line: rgba(255,255,255,.08); --v-chip: #26262a;
+  --v-accent: #7aaed3;
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --b-bg: #e7e1d6; --b-card: #f1ece3; --b-fg: #1d1a16; --b-muted: #675f53; --b-line: rgba(29,26,22,.12); --b-chip: #ddd5c7;
+    --bezel: #111113; --bezel-edge: #3a3a40; --shadow-lg: 0 40px 70px -40px rgba(40,30,15,.45);
+    --bg: #f5f1ea; --surface: #fffdf9; --surface-2: #ebe5da; --fg: #1d1a16; --muted: #665f54;
+    --line: rgba(29,26,22,.10); --line-strong: rgba(29,26,22,.22);
+    --accent: #2f5d82; --on-accent: #ffffff; --accent-soft: rgba(47,93,130,.12);
+    --danger: #c23a4b; --on-danger: #ffffff; --danger-soft: rgba(194,58,75,.10);
+    --scrim: rgba(20,18,14,.42); --sel-dim: rgba(255,253,249,.38); --tile-empty: #e2dccf;
+    --toast-bg: #1d1a16; --toast-fg: #f5f1ea; --toast-link: #9cc6e6;
+    --shadow: 0 18px 40px -18px rgba(40,30,15,.35); --shadow-sm: 0 1px 3px rgba(40,30,15,.18);
+    --map-land: #ebe6da; --map-water: #b9d3e3; --map-road: #ffffff;
+    color-scheme: light;
+  }
+}
+:root[data-theme="light"] {
+  --b-bg: #e7e1d6; --b-card: #f1ece3; --b-fg: #1d1a16; --b-muted: #675f53; --b-line: rgba(29,26,22,.12); --b-chip: #ddd5c7;
+  --bezel: #111113; --bezel-edge: #3a3a40; --shadow-lg: 0 40px 70px -40px rgba(40,30,15,.45);
+  --bg: #f5f1ea; --surface: #fffdf9; --surface-2: #ebe5da; --fg: #1d1a16; --muted: #665f54;
+  --line: rgba(29,26,22,.10); --line-strong: rgba(29,26,22,.22);
+  --accent: #2f5d82; --on-accent: #ffffff; --accent-soft: rgba(47,93,130,.12);
+  --danger: #c23a4b; --on-danger: #ffffff; --danger-soft: rgba(194,58,75,.10);
+  --scrim: rgba(20,18,14,.42); --sel-dim: rgba(255,253,249,.38); --tile-empty: #e2dccf;
+  --toast-bg: #1d1a16; --toast-fg: #f5f1ea; --toast-link: #9cc6e6;
+  --shadow: 0 18px 40px -18px rgba(40,30,15,.35); --shadow-sm: 0 1px 3px rgba(40,30,15,.18);
+  --map-land: #ebe6da; --map-water: #b9d3e3; --map-road: #ffffff;
+  color-scheme: light;
+}
+
+/* ---------- Board ---------- */
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; scroll-padding-top: 76px; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+body { margin: 0; background: var(--b-bg); color: var(--b-fg); font: 15px/1.55 var(--font-ui); -webkit-font-smoothing: antialiased; }
+body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 30; background: var(--b-bg); }
+.wrap { max-width: 1180px; margin: 0 auto; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+a { color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+
+.top { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 20; background: var(--b-bg); border-bottom: 1px solid var(--b-line); }
+.top .wrap { display: flex; align-items: center; gap: 14px; padding-block: 10px; }
+.brand { display: flex; align-items: center; gap: 9px; font: 600 17px var(--font-display); white-space: nowrap; }
+.brand small { font: 500 13px var(--font-ui); color: var(--b-muted); }
+.nav { display: flex; gap: 2px; overflow-x: auto; flex: 1; min-width: 0; scrollbar-width: none; }
+.nav::-webkit-scrollbar { display: none; }
+.nav a { color: var(--b-muted); text-decoration: none; font-size: 13.5px; font-weight: 600; padding: 7px 11px; border-radius: 999px; white-space: nowrap; }
+.nav a:hover { background: var(--b-chip); color: var(--b-fg); }
+.tbtn { display: inline-flex; align-items: center; gap: 7px; height: 34px; padding: 0 13px; border-radius: 999px; border: 1px solid var(--b-line); background: var(--b-card); color: var(--b-fg); font: 600 13px var(--font-ui); cursor: pointer; white-space: nowrap; }
+.tbtn .i { width: 16px; height: 16px; }
+
+.intro { padding-block: 56px 36px; }
+.intro h1 { font: 600 clamp(38px, 6vw, 60px)/1.02 var(--font-display); margin: 0 0 18px; letter-spacing: -.02em; text-wrap: balance; }
+.intro p { max-width: 64ch; color: var(--b-muted); margin: 0 0 10px; font-size: 16.5px; }
+.intro p strong { color: var(--b-fg); font-weight: 600; }
+
+.sec { border-top: 1px solid var(--b-line); padding-block: 48px 60px; }
+.sec-head { max-width: 68ch; display: flex; flex-direction: column; gap: 8px; }
+.sec h2 { font: 600 34px/1.08 var(--font-display); margin: 0; letter-spacing: -.01em; text-wrap: balance; }
+.sec .lede { color: var(--b-muted); margin: 0; font-size: 16px; }
+.frames { display: flex; flex-wrap: wrap; gap: 44px 32px; margin-top: 34px; align-items: flex-start; }
+figure.shot { margin: 0; width: 336px; max-width: 100%; display: flex; flex-direction: column; gap: 16px; }
+figure.wide { width: 100%; max-width: 920px; }
+figcaption { font-size: 14px; color: var(--b-muted); line-height: 1.5; }
+figcaption b { display: block; color: var(--b-fg); font-size: 15px; margin-bottom: 3px; }
+.refs { display: block; margin-top: 7px; font-size: 12px; font-weight: 700; letter-spacing: .02em; color: var(--b-muted); font-variant-numeric: tabular-nums; }
+
+/* System strip */
+.sys { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; margin-top: 30px; }
+.card { background: var(--b-card); border: 1px solid var(--b-line); border-radius: 18px; padding: 18px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.card h3 { margin: 0; font: 600 18px var(--font-display); }
+.card p { margin: 0; font-size: 13.5px; color: var(--b-muted); }
+.sw { display: flex; gap: 8px; flex-wrap: wrap; }
+.sw div { display: flex; flex-direction: column; gap: 5px; font-size: 11.5px; color: var(--b-muted); }
+.sw i { width: 44px; height: 44px; border-radius: 12px; border: 1px solid var(--b-line); display: block; }
+.spec-d { font: 600 30px/1 var(--font-display); }
+.spec-b { font: 400 15px/1.4 var(--font-ui); }
+.btnrow { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.iconrow { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px 6px; }
+.iconrow div { display: flex; flex-direction: column; align-items: center; gap: 4px; font-size: 10.5px; color: var(--b-muted); text-align: center; }
+.iconrow .i { width: 22px; height: 22px; color: var(--b-fg); }
+
+/* ---------- Icons ---------- */
+.i { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+
+/* ---------- Device frames ---------- */
+.phone { width: 336px; max-width: 100%; aspect-ratio: 336 / 704; border-radius: 50px; padding: 10px; background: var(--bezel); box-shadow: 0 0 0 1.5px var(--bezel-edge), var(--shadow-lg); }
+.scr { position: relative; height: 100%; border-radius: 40px; overflow: hidden; background: var(--bg); color: var(--fg); display: flex; flex-direction: column; font-size: 13.5px; line-height: 1.4; }
+.sb { height: 36px; flex: none; display: flex; justify-content: space-between; align-items: center; padding: 6px 26px 0 30px; font-weight: 700; font-size: 12.5px; position: relative; z-index: 3; font-variant-numeric: tabular-nums; }
+.sb::after { content: ""; position: absolute; top: 9px; left: 50%; transform: translateX(-50%); width: 86px; height: 25px; border-radius: 14px; background: var(--bezel); }
+.sb-r { display: flex; gap: 6px; align-items: center; }
+.bars { display: inline-flex; gap: 1.5px; align-items: flex-end; height: 10px; }
+.bars b { width: 3px; background: currentColor; border-radius: 1px; }
+.bars b:nth-child(1) { height: 4px; } .bars b:nth-child(2) { height: 6px; } .bars b:nth-child(3) { height: 8px; } .bars b:nth-child(4) { height: 10px; }
+.batt { width: 23px; height: 11px; border: 1.5px solid currentColor; border-radius: 3.5px; position: relative; opacity: .9; }
+.batt::after { content: ""; position: absolute; top: 1.5px; bottom: 1.5px; left: 1.5px; right: 5px; background: currentColor; border-radius: 1.5px; }
+.onphoto { color: var(--on-photo); }
+
+.hdr { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 14px 10px 18px; flex: none; }
+.ttl { font: 600 27px/1.1 var(--font-display); margin: 0; letter-spacing: -.01em; }
+.hdr-r { display: flex; gap: 8px; align-items: center; }
+.navrow { display: flex; align-items: center; justify-content: space-between; padding: 2px 10px 0 8px; flex: none; min-height: 36px; }
+.navrow .link { display: inline-flex; align-items: center; gap: 1px; }
+.content { flex: 1; min-height: 0; overflow: hidden; position: relative; }
+
+/* Controls: 44 primary, 34 compact, text link */
+.btn { height: 44px; padding: 0 18px; border-radius: 999px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; background: var(--surface-2); color: var(--fg); font: 600 14px var(--font-ui); white-space: nowrap; border: 0; }
+.btn .i { width: 18px; height: 18px; }
+.btn.sm { height: 34px; padding: 0 13px; font-size: 13px; }
+.btn.sm .i { width: 16px; height: 16px; }
+.btn.pri { background: var(--accent); color: var(--on-accent); }
+.btn.dan { background: var(--danger); color: var(--on-danger); }
+.btn.off { opacity: .45; }
+.btn.wide { width: 100%; }
+.ibtn { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; background: var(--surface-2); color: var(--fg); position: relative; flex: none; }
+.ibtn .i { width: 18px; height: 18px; }
+.ibtn.ghost { background: transparent; }
+.ibtn.glass { background: var(--glass); color: var(--on-photo); }
+.ibtn.dot::after { content: ""; position: absolute; top: 6px; right: 7px; width: 8px; height: 8px; border-radius: 50%; background: var(--danger); box-shadow: 0 0 0 2px var(--surface-2); }
+.link { color: var(--accent); font-weight: 600; font-size: 14px; white-space: nowrap; }
+.link.dan { color: var(--danger); }
+.link.mut { color: var(--muted); }
+.me { width: 34px; height: 34px; border-radius: 50%; background: var(--accent-soft); color: var(--accent); display: grid; place-items: center; font-weight: 700; font-size: 12px; flex: none; }
+
+.chips { display: flex; gap: 6px; padding: 0 16px 8px; overflow: hidden; flex: none; }
+.chip { height: 34px; padding: 0 13px; border-radius: 999px; background: var(--surface-2); font-size: 12.5px; font-weight: 600; display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; color: var(--fg); }
+.chip.on { background: var(--fg); color: var(--bg); }
+.chip .i { width: 14px; height: 14px; }
+
+/* Photo grid */
+.g { display: grid; gap: 2px; }
+.c4 { grid-template-columns: repeat(4, 1fr); }
+.c3 { grid-template-columns: repeat(3, 1fr); }
+.c2 { grid-template-columns: repeat(2, 1fr); }
+.pad { padding: 0 16px; }
+.t { aspect-ratio: 1; position: relative; border-radius: 3px; overflow: hidden; max-width: 100%; }
+.t .lv { position: absolute; top: 4px; left: 4px; width: 15px; height: 15px; color: var(--on-photo); filter: drop-shadow(0 0 2px var(--photo-shadow)); }
+.t .du { position: absolute; right: 5px; bottom: 3px; font-size: 10px; font-weight: 700; color: var(--on-photo); text-shadow: 0 0 3px var(--photo-shadow); font-variant-numeric: tabular-nums; }
+.t .ck { position: absolute; right: 5px; bottom: 5px; width: 21px; height: 21px; border-radius: 50%; border: 1.5px solid var(--on-photo); background: var(--glass); display: grid; place-items: center; color: transparent; z-index: 2; }
+.t .ck .i { width: 13px; height: 13px; stroke-width: 2.6; }
+.t.sel::after { content: ""; position: absolute; inset: 0; background: var(--sel-dim); box-shadow: inset 0 0 0 2.5px var(--accent); border-radius: 3px; }
+.t.sel .ck { background: var(--accent); color: var(--on-accent); }
+.t.in::after { content: ""; position: absolute; inset: 0; background: var(--sel-dim); }
+.t .tag { position: absolute; left: 5px; bottom: 5px; z-index: 2; font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 999px; background: var(--glass); color: var(--on-photo); }
+.t.hov::after { content: ""; position: absolute; inset: 0; background: linear-gradient(180deg, var(--photo-scrim-top), transparent 45%); }
+.t .tl { position: absolute; top: 7px; left: 7px; right: auto; bottom: auto; z-index: 2; }
+.t .dl { position: absolute; top: 7px; right: 7px; width: 28px; height: 28px; border-radius: 50%; background: var(--glass); color: var(--on-photo); display: grid; place-items: center; z-index: 2; }
+.t .dl .i { width: 15px; height: 15px; }
+.t.empty { background: var(--tile-empty); }
+.day { display: flex; align-items: baseline; gap: 8px; padding: 14px 16px 8px; }
+.day b { font-weight: 700; font-size: 14px; }
+.day span { color: var(--muted); font-size: 12.5px; }
+
+.tabs { display: flex; justify-content: space-around; padding: 8px 30px 26px; border-top: 1px solid var(--line); background: var(--bg); position: relative; flex: none; z-index: 2; }
+.tab { display: flex; flex-direction: column; align-items: center; gap: 3px; color: var(--muted); font-size: 11px; font-weight: 600; min-width: 56px; }
+.tab.on { color: var(--accent); }
+.tab .i { width: 23px; height: 23px; }
+.home { position: absolute; bottom: 8px; left: 50%; width: 112px; height: 4.5px; border-radius: 3px; background: var(--fg); opacity: .8; transform: translateX(-50%); }
+.homebar { position: relative; height: 22px; flex: none; }
+
+.actbar { display: flex; justify-content: space-around; padding: 9px 4px 26px; border-top: 1px solid var(--line); background: var(--bg); flex: none; position: relative; z-index: 2; }
+.act { display: flex; flex-direction: column; align-items: center; gap: 3px; font-size: 10.5px; font-weight: 600; color: var(--fg); min-width: 54px; text-align: center; }
+.act .i { width: 22px; height: 22px; }
+.act.dan { color: var(--danger); }
+.act.pri { color: var(--accent); }
+.selhdr { display: flex; align-items: center; justify-content: space-between; padding: 6px 16px 10px; flex: none; }
+.selhdr b { font-size: 15px; }
+
+.scrim { position: absolute; inset: 0; background: var(--scrim); z-index: 5; }
+.sheet { position: absolute; left: 8px; right: 8px; bottom: 8px; z-index: 6; background: var(--surface); border-radius: 30px; padding: 10px 18px 20px; display: flex; flex-direction: column; gap: 10px; box-shadow: var(--shadow); }
+.sheet.tall { top: 64px; }
+.grab { width: 38px; height: 5px; border-radius: 3px; background: var(--line-strong); align-self: center; margin-bottom: 4px; flex: none; }
+.sheet h4 { font: 600 20px/1.2 var(--font-display); margin: 0; }
+.sheet p { margin: 0; color: var(--muted); font-size: 13.5px; }
+.toast { position: absolute; left: 12px; right: 12px; bottom: 92px; z-index: 4; background: var(--toast-bg); color: var(--toast-fg); border-radius: 16px; padding: 12px 14px; display: flex; justify-content: space-between; align-items: center; gap: 10px; font-size: 13px; font-weight: 500; box-shadow: var(--shadow); }
+.toast b { color: var(--toast-link); font-weight: 700; }
+
+/* Lists, rows, forms */
+.sh { display: flex; justify-content: space-between; align-items: baseline; padding: 14px 16px 8px; }
+.sh b { font: 600 17px var(--font-display); }
+.sh .link { font-size: 13px; }
+.sh small { font-size: 12px; color: var(--muted); }
+.list { margin: 0 16px; background: var(--surface); border-radius: 16px; overflow: hidden; }
+.row { display: flex; align-items: center; gap: 12px; padding: 10px 14px; }
+.row + .row { border-top: 1px solid var(--line); }
+.rt { flex: 1; min-width: 0; }
+.rt b { display: block; font-size: 14px; font-weight: 600; }
+.rt span { display: block; font-size: 12.5px; color: var(--muted); }
+.row .chev { color: var(--muted); width: 16px; height: 16px; }
+.th { width: 44px; height: 44px; border-radius: 10px; flex: none; overflow: hidden; }
+.mos { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; }
+.mos .av { width: 100%; height: 100%; border-radius: 0; }
+.tg { width: 44px; height: 27px; border-radius: 14px; background: var(--surface-2); position: relative; flex: none; box-shadow: inset 0 0 0 1px var(--line); }
+.tg::after { content: ""; position: absolute; top: 3px; left: 3px; width: 21px; height: 21px; border-radius: 50%; background: var(--knob); box-shadow: var(--shadow-sm); }
+.tg.on { background: var(--accent); box-shadow: none; }
+.tg.on::after { left: 20px; }
+.seg { display: flex; background: var(--surface-2); border-radius: 999px; padding: 3px; }
+.seg span { flex: 1; text-align: center; height: 28px; line-height: 28px; border-radius: 999px; font-size: 12.5px; font-weight: 600; color: var(--muted); }
+.seg .on { background: var(--surface); color: var(--fg); box-shadow: var(--shadow-sm); }
+.lbl { font-size: 12.5px; font-weight: 600; color: var(--muted); }
+.field { height: 44px; border-radius: 12px; background: var(--surface-2); display: flex; align-items: center; padding: 0 12px; gap: 8px; font-size: 14px; color: var(--fg); min-width: 0; }
+.field span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.field.ph span { color: var(--muted); }
+.field.focus { box-shadow: 0 0 0 2px var(--accent); background: var(--surface); }
+.caret { width: 1.5px; height: 18px; background: var(--accent); flex: none; }
+.opt { border: 1.5px solid var(--line-strong); border-radius: 14px; padding: 11px 12px; display: flex; gap: 10px; }
+.opt.on { border-color: var(--accent); background: var(--accent-soft); }
+.radio { width: 18px; height: 18px; border-radius: 50%; border: 1.5px solid var(--muted); flex: none; margin-top: 1px; }
+.opt.on .radio { border: 5.5px solid var(--accent); }
+.opt b { display: block; font-size: 14px; }
+.opt span { display: block; font-size: 12.5px; color: var(--muted); margin-top: 1px; }
+.note { display: flex; gap: 7px; align-items: flex-start; font-size: 12.5px; color: var(--muted); }
+.note .i { width: 15px; height: 15px; margin-top: 1px; }
+.pill { font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); white-space: nowrap; }
+.av { width: 40px; height: 40px; border-radius: 50%; overflow: hidden; flex: none; display: block; }
+.av svg { display: block; width: 100%; height: 100%; }
+.ini { width: 40px; height: 40px; border-radius: 50%; background: var(--accent-soft); color: var(--accent); display: grid; place-items: center; font-weight: 700; font-size: 13px; flex: none; }
+.prog { height: 4px; border-radius: 2px; background: var(--surface-2); overflow: hidden; }
+.prog i { display: block; height: 100%; background: var(--accent); border-radius: 2px; }
+
+/* Album bits */
+.acards { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 0 16px; }
+.acard { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.acard .cv { aspect-ratio: 1; border-radius: 12px; max-width: 100%; }
+.acard b { font-size: 13.5px; }
+.acard span { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 4px; margin-top: -4px; }
+.acard span .i { width: 13px; height: 13px; color: var(--accent); }
+.sug { margin: 0 16px; border: 1.5px dashed var(--line-strong); border-radius: 14px; padding: 10px; display: flex; gap: 10px; align-items: center; }
+.hero { position: relative; height: 236px; flex: none; color: var(--on-photo); }
+.hero::after { content: ""; position: absolute; inset: 0; background: linear-gradient(180deg, var(--photo-scrim-top) 0%, transparent 30%, transparent 48%, var(--photo-scrim) 100%); }
+.hero > * { position: relative; z-index: 1; }
+.hero-nav { position: absolute; top: 40px; left: 12px; right: 12px; display: flex; justify-content: space-between; z-index: 2; }
+.hero-t { position: absolute; left: 18px; right: 18px; bottom: 14px; z-index: 2; }
+.hero-t h3 { margin: 0; font: 600 28px/1.1 var(--font-display); }
+.hero-t span { font-size: 12.5px; opacity: .9; }
+.acts { display: flex; gap: 8px; padding: 12px 16px 0; }
+.status { margin: 10px 16px 12px; display: flex; gap: 8px; align-items: center; font-size: 12.5px; color: var(--fg); background: var(--accent-soft); padding: 9px 12px; border-radius: 12px; }
+.status .i { color: var(--accent); width: 16px; height: 16px; }
+.mh { display: flex; justify-content: space-between; align-items: center; padding: 6px 16px 10px; flex: none; }
+.mh b { font-size: 15px; }
+.pickbar { padding: 10px 16px 28px; border-top: 1px solid var(--line); display: flex; justify-content: space-between; align-items: center; gap: 10px; flex: none; font-size: 12.5px; color: var(--muted); }
+
+/* People */
+.banner { margin: 2px 16px 4px; background: var(--surface); border-radius: 16px; padding: 12px; display: flex; gap: 12px; align-items: center; }
+.stack { display: flex; padding-left: 8px; flex: none; }
+.stack .av { width: 30px; height: 30px; border: 2px solid var(--surface); margin-left: -9px; }
+.ppl { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px 8px; padding: 0 12px; }
+.pp { display: flex; flex-direction: column; align-items: center; gap: 2px; text-align: center; min-width: 0; }
+.pp .av { width: 74px; height: 74px; margin-bottom: 5px; }
+.pp b { font-size: 13px; }
+.pp span { font-size: 11.5px; color: var(--muted); }
+.pp .add { color: var(--accent); font-weight: 600; font-size: 13px; }
+.who { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 4px 18px 6px; }
+.who .av { width: 92px; height: 92px; }
+.who .field { width: 100%; }
+.who small { font-size: 12px; color: var(--muted); }
+.same { margin: 8px 16px; background: var(--surface); border-radius: 16px; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+.same .pair { display: flex; align-items: center; gap: 10px; }
+.same .pair .av { width: 46px; height: 46px; }
+
+/* Notifications */
+.gl { padding: 12px 16px 2px; font-size: 12.5px; font-weight: 700; color: var(--muted); }
+.nt { display: flex; gap: 11px; padding: 12px 16px 12px 20px; position: relative; }
+.nt + .nt { border-top: 1px solid var(--line); }
+.nt.unread::before { content: ""; position: absolute; left: 7px; top: 25px; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+.ni { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; flex: none; background: var(--accent-soft); color: var(--accent); }
+.ni .i { width: 17px; height: 17px; }
+.ni.warn { background: var(--danger-soft); color: var(--danger); }
+.nb { flex: 1; min-width: 0; }
+.nb .top2 { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.nb b { font-size: 13.5px; }
+.nb p { margin: 2px 0 0; font-size: 12.5px; color: var(--muted); }
+.ntime { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
+.nacts { display: flex; gap: 8px; margin-top: 9px; }
+.strip { display: flex; gap: 2px; margin-top: 8px; }
+.strip .t { width: 36px; height: 36px; border-radius: 5px; }
+
+/* Viewer (always dark) */
+.vw { background: var(--v-bg); color: var(--v-fg); }
+.vw .sb::after { background: var(--bezel); }
+.vtop { display: flex; align-items: center; justify-content: space-between; padding: 2px 10px 8px; flex: none; }
+.vtop .ibtn { color: var(--v-fg); }
+.vt { text-align: center; }
+.vt b { display: block; font-size: 15px; }
+.vt span { font-size: 11.5px; color: var(--v-muted); }
+.vphoto { flex: none; aspect-ratio: 4 / 3; position: relative; max-width: 100%; }
+.livechip { position: absolute; top: 10px; left: 10px; display: flex; gap: 4px; align-items: center; padding: 3px 9px 3px 5px; border-radius: 999px; background: var(--glass); color: var(--on-photo); font-size: 10.5px; font-weight: 700; letter-spacing: .06em; }
+.livechip .i { width: 15px; height: 15px; }
+.vinfo { flex: 1; min-height: 0; background: var(--v-surface); border-radius: 22px 22px 0 0; margin-top: 12px; padding: 8px 16px 0; display: flex; flex-direction: column; gap: 10px; overflow: hidden; }
+.irow b { display: block; font-size: 14px; }
+.irow span { font-size: 12px; color: var(--v-muted); }
+.vmap { height: 84px; border-radius: 12px; position: relative; overflow: hidden; flex: none;
+  background:
+    linear-gradient(28deg, transparent 46%, #3f413e 46% 48%, transparent 48%),
+    linear-gradient(-52deg, transparent 58%, #3f413e 58% 59.5%, transparent 59.5%),
+    linear-gradient(112deg, #1d2b37 0 36%, #2b2d2b 36%); }
+.vmap .pinw { position: absolute; left: 56%; top: 22%; color: var(--v-accent); }
+.vmap .pinw .i { width: 26px; height: 26px; fill: var(--v-bg); }
+.vmap em { position: absolute; left: 10px; bottom: 8px; font-style: normal; font-size: 11.5px; font-weight: 600; padding: 3px 8px; border-radius: 999px; background: var(--glass); color: var(--on-photo); }
+.cam { display: flex; flex-direction: column; gap: 1px; font-size: 12px; color: var(--v-muted); }
+.cam b { color: var(--v-fg); font-size: 13px; }
+.tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.tags span { font-size: 12px; padding: 4px 10px; border-radius: 999px; background: var(--v-chip); color: var(--v-fg); }
+.vbar { display: flex; justify-content: space-around; padding: 9px 8px 26px; background: var(--v-surface); border-top: 1px solid var(--v-line); flex: none; position: relative; }
+.vbar .act { color: var(--v-fg); }
+.vbar .act.pri { color: var(--v-accent); }
+.vbar .home { background: var(--v-fg); }
+
+/* Shared pages */
+.shr-top { display: flex; align-items: center; justify-content: space-between; padding: 4px 14px 10px 16px; flex: none; }
+.mk { display: inline-flex; align-items: center; gap: 7px; font: 600 14px var(--font-display); }
+.mark { width: 22px; height: 22px; border-radius: 7px; background: var(--accent); color: var(--on-accent); display: grid; place-items: center; flex: none; }
+.mark .i { width: 13px; height: 13px; fill: currentColor; stroke: none; }
+.float { position: absolute; left: 12px; right: 12px; bottom: 30px; background: var(--surface); border-radius: 18px; padding: 11px 13px; box-shadow: var(--shadow); font-size: 12.5px; display: flex; flex-direction: column; gap: 8px; z-index: 3; }
+.float b { font-size: 13px; }
+.float .fr { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.center { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; gap: 12px; padding: 0 26px 40px; }
+.center h3 { margin: 0; font: 600 23px/1.2 var(--font-display); text-wrap: balance; }
+.center p { margin: 0; color: var(--muted); font-size: 13.5px; }
+.bigicon { width: 64px; height: 64px; border-radius: 50%; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent); }
+.bigicon .i { width: 28px; height: 28px; }
+.code { display: flex; gap: 6px; justify-content: center; }
+.code span { width: 36px; height: 46px; border-radius: 10px; background: var(--surface-2); display: grid; place-items: center; font: 600 20px var(--font-display); }
+.code .cur { box-shadow: 0 0 0 2px var(--accent); background: var(--surface); }
+.facts { display: flex; flex-direction: column; gap: 8px; align-self: stretch; text-align: left; background: var(--surface); border-radius: 14px; padding: 12px 14px; }
+.facts div { display: flex; gap: 9px; align-items: center; font-size: 13px; }
+.facts .i { width: 17px; height: 17px; color: var(--muted); }
+.endprev { padding: 16px 18px 18px; display: flex; flex-direction: column; gap: 8px; text-align: center; align-items: center; }
+.endprev b { font-size: 14px; }
+.endprev p { margin: 0; font-size: 12.5px; color: var(--muted); }
+.endprev .prog { width: 70%; }
+.foot { text-align: center; font-size: 11.5px; color: var(--muted); padding: 12px 0 0; }
+
+/* Desktop browser frame */
+.browser { width: 100%; border-radius: 14px; overflow: hidden; background: var(--bg); color: var(--fg); box-shadow: 0 0 0 1px var(--b-line), var(--shadow-lg); font-size: 14px; }
+.bbar { height: 38px; display: flex; align-items: center; gap: 8px; padding: 0 14px; background: var(--surface-2); }
+.bbar i { width: 11px; height: 11px; border-radius: 50%; background: var(--line-strong); display: block; }
+.url { flex: 1; max-width: 420px; margin: 0 auto; height: 24px; border-radius: 7px; background: var(--bg); display: flex; align-items: center; justify-content: center; gap: 6px; font-size: 12px; color: var(--muted); min-width: 0; overflow: hidden; white-space: nowrap; }
+.url .i { width: 12px; height: 12px; }
+.dk { padding: 18px clamp(14px, 3vw, 32px) 30px; display: flex; flex-direction: column; gap: 16px; }
+.dk-top { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+.dk h3 { margin: 0; font: 600 clamp(26px, 4vw, 38px)/1.05 var(--font-display); letter-spacing: -.01em; }
+.dk .meta { color: var(--muted); font-size: 13.5px; margin-top: 4px; }
+.dk-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 14px; flex-wrap: wrap; }
+.dk .g { gap: 6px; }
+.dk .t { border-radius: 6px; }
+
+/* Desktop app shell: sidebar + top bar, same tokens as the phone screens */
+figure.xl { width: 100%; max-width: 1120px; }
+@media (max-width: 1040px) { .scrollx { overflow-x: auto; padding-bottom: 6px; } }
+.browser.app { min-width: 980px; }
+.dapp { display: grid; grid-template-columns: 216px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); height: 600px; background: var(--bg); overflow: hidden; position: relative; }
+.side { background: var(--surface); border-right: 1px solid var(--line); display: flex; flex-direction: column; padding: 16px 10px 12px; gap: 2px; overflow: hidden; }
+.side > .mk { padding: 2px 10px 14px; }
+.si { display: flex; align-items: center; gap: 10px; height: 34px; padding: 0 10px; border-radius: 9px; font-size: 13.5px; font-weight: 600; color: var(--fg); flex: none; }
+.si .i { width: 18px; height: 18px; color: var(--muted); }
+.si.on { background: var(--accent-soft); color: var(--accent); }
+.si.on .i { color: var(--accent); }
+.si em { margin-left: auto; font-style: normal; font-size: 12px; color: var(--muted); font-weight: 500; font-variant-numeric: tabular-nums; }
+.sthumb { width: 18px; height: 18px; border-radius: 5px; flex: none; }
+.sgl { font-size: 11.5px; font-weight: 700; color: var(--muted); padding: 14px 10px 4px; }
+.sfoot { margin-top: auto; border-top: 1px solid var(--line); padding-top: 8px; display: flex; flex-direction: column; gap: 2px; }
+.dmain { display: flex; flex-direction: column; min-width: 0; min-height: 0; position: relative; }
+.dbody.split, .dv { grid-template-rows: minmax(0, 1fr); }
+.dtop { display: flex; align-items: center; gap: 10px; padding: 12px 20px; border-bottom: 1px solid var(--line); flex: none; }
+.dsearch { flex: 1; max-width: 440px; height: 38px; border-radius: 999px; background: var(--surface-2); display: flex; align-items: center; gap: 8px; padding: 0 14px; color: var(--muted); font-size: 13.5px; }
+.dsearch .i { width: 17px; height: 17px; }
+.dsearch kbd { margin-left: auto; font: 600 11px var(--font-ui); color: var(--muted); border: 1px solid var(--line-strong); border-radius: 5px; padding: 1px 6px; }
+.sp { flex: 1; }
+.ibtn.on { background: var(--accent-soft); color: var(--accent); }
+.dbody { flex: 1; min-height: 0; overflow: hidden; position: relative; }
+.dph { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 18px 20px 4px; }
+.dph h3 { margin: 0; font: 600 30px/1.1 var(--font-display); white-space: nowrap; }
+.dph h3 small { color: var(--muted); font: 500 13px var(--font-ui); margin-left: 10px; }
+.dctl { display: flex; gap: 6px; align-items: center; }
+.zoom { display: flex; align-items: center; gap: 7px; color: var(--muted); margin: 0 6px; }
+.zoom .i { width: 14px; height: 14px; }
+.zoom .i + .track + .i { width: 19px; height: 19px; }
+.track { width: 76px; height: 4px; border-radius: 2px; background: var(--surface-2); position: relative; }
+.track i { position: absolute; left: 0; top: 0; bottom: 0; width: 55%; background: var(--accent); border-radius: 2px; }
+.track b { position: absolute; left: 55%; top: 50%; width: 14px; height: 14px; border-radius: 50%; background: var(--knob); box-shadow: var(--shadow-sm), 0 0 0 1px var(--line); transform: translate(-50%, -50%); }
+.dday { display: flex; gap: 8px; align-items: baseline; padding: 14px 20px 8px; }
+.dday b { font-size: 14.5px; }
+.dday span { color: var(--muted); font-size: 13px; }
+.c8 { grid-template-columns: repeat(8, 1fr); }
+.c6 { grid-template-columns: repeat(6, 1fr); }
+.dgrid { padding: 0 20px; gap: 3px; }
+.dgrid .t { border-radius: 4px; }
+.dbanner { height: 150px; margin: 16px 20px 0; border-radius: 14px; position: relative; overflow: hidden; color: var(--on-photo); flex: none; }
+.dbanner::after { content: ""; position: absolute; inset: 0; background: linear-gradient(180deg, transparent 30%, var(--photo-scrim) 100%); }
+.dbanner .hero-t { z-index: 1; left: 22px; bottom: 16px; }
+.dbanner .hero-t h3 { font-size: 32px; }
+.dacts { display: flex; align-items: center; gap: 8px; padding: 12px 20px; }
+.status.inl { margin: 0 0 0 4px; padding: 7px 11px; }
+.pop { position: absolute; z-index: 6; background: var(--surface); border-radius: 18px; box-shadow: var(--shadow), 0 0 0 1px var(--line); padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.pop::before { content: ""; position: absolute; top: -6px; width: 12px; height: 12px; background: var(--surface); transform: rotate(45deg); box-shadow: -1px -1px 0 var(--line); }
+.pop.share { top: 184px; left: 150px; width: 372px; gap: 10px; }
+.pop.share::before { left: 46px; }
+.pop .ph { display: flex; justify-content: space-between; align-items: center; }
+.pop .ph b { font: 600 18px var(--font-display); }
+.pop .ph .ibtn { width: 28px; height: 28px; }
+.pop .pf { display: flex; justify-content: space-between; align-items: center; }
+.pop.np { top: 58px; right: 60px; width: 384px; padding: 0; gap: 0; overflow: visible; }
+.pop.np::before { right: 18px; }
+.pop.np .ph { padding: 14px 16px 6px; }
+.pop.np .pf { padding: 10px 16px 12px; border-top: 1px solid var(--line); }
+.split { display: grid; grid-template-columns: minmax(0, 1fr) 320px; }
+.split > .sl { overflow: hidden; }
+.panel { border-left: 1px solid var(--line); background: var(--surface); padding: 16px 18px; display: flex; flex-direction: column; gap: 12px; overflow: hidden; }
+.panel .who { padding: 0; }
+.panel .same { margin: 0; background: var(--bg); }
+.panel .g .t { border-radius: 4px; }
+.dsh { font: 600 16px var(--font-display); padding: 14px 20px 10px; }
+.ppl.d { grid-template-columns: repeat(6, 1fr); padding: 0 20px; gap: 16px 10px; }
+.ppl.d .av { width: 82px; height: 82px; }
+.pp.cur .av { box-shadow: 0 0 0 3px var(--bg), 0 0 0 5.5px var(--accent); }
+.banner.wide { margin: 8px 20px 0; padding: 12px 14px; }
+.cols { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 18px; padding: 10px 20px 0; align-items: start; }
+.cols > div { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.cols .list { margin: 0; }
+.tbl { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+.tbl th { text-align: left; font-size: 12px; color: var(--muted); font-weight: 600; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+.tbl td { padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+.tbl tr:last-child td { border-bottom: 0; }
+.tbl .who2 { display: flex; align-items: center; gap: 10px; font-weight: 600; }
+.tbl .who2 .av, .tbl .who2 .ini { width: 32px; height: 32px; font-size: 11.5px; }
+.tbl .who2 small { display: block; color: var(--muted); font-weight: 500; font-size: 12px; }
+.tbl .mut { color: var(--muted); font-size: 12.5px; }
+.pcard { background: var(--surface); border-radius: 16px; padding: 16px; display: flex; flex-direction: column; gap: 11px; }
+.pcard h4 { margin: 0; font: 600 19px var(--font-display); }
+.dv { display: grid; grid-template-columns: minmax(0, 1fr) 300px; height: 620px; background: var(--v-bg); color: var(--v-fg); }
+.dv-stage { display: flex; flex-direction: column; min-width: 0; }
+.dv-top { display: flex; align-items: center; gap: 12px; padding: 12px 16px; }
+.dv-top .vt { text-align: left; }
+.dv-acts { margin-left: auto; display: flex; gap: 2px; position: relative; }
+.dv-acts .ibtn, .dv-top > .ibtn { background: transparent; color: var(--v-fg); }
+.dv-acts .ibtn.on { color: var(--v-accent); background: var(--v-chip); }
+.tip { position: absolute; top: 40px; left: 50%; transform: translateX(-50%); white-space: nowrap; font-size: 11.5px; font-weight: 600; padding: 4px 8px; border-radius: 6px; background: var(--v-fg); color: var(--v-bg); z-index: 3; }
+.dv-photo { flex: 1; min-height: 0; display: grid; place-items: center; position: relative; padding: 0 70px; }
+.dv-photo .pic { width: 100%; max-width: 600px; aspect-ratio: 4 / 3; border-radius: 4px; position: relative; }
+.dv-arrow { position: absolute; top: 50%; transform: translateY(-50%); width: 40px; height: 40px; border-radius: 50%; background: var(--v-chip); display: grid; place-items: center; color: var(--v-fg); }
+.dv-arrow.l { left: 16px; } .dv-arrow.r { right: 16px; }
+.film { display: flex; gap: 3px; justify-content: center; padding: 14px 16px 16px; }
+.film .t { width: 46px; height: 46px; border-radius: 4px; opacity: .55; flex: none; }
+.film .t.cur { opacity: 1; box-shadow: 0 0 0 2px var(--v-bg), 0 0 0 4px var(--v-accent); }
+.dv-info { background: var(--v-surface); border-left: 1px solid var(--v-line); padding: 18px 16px; display: flex; flex-direction: column; gap: 14px; overflow: hidden; }
+.dv-info .vh { font-size: 12px; font-weight: 700; color: var(--v-muted); }
+.dv-info .row { padding: 0; }
+.dv-info .rt span { color: var(--v-muted); }
+.vstars { display: flex; gap: 4px; color: var(--v-muted); }
+.vstars .i { width: 19px; height: 19px; }
+.shd { height: 600px; background: var(--bg); position: relative; overflow: hidden; display: flex; flex-direction: column; }
+.shd .float { left: 50%; right: auto; width: 440px; transform: translateX(-50%); bottom: 22px; }
+
+/* Photo placeholders: painted, so the page needs no image files */
+.ph-aurora { background: radial-gradient(circle at 78% 80%, #ffd28a 0 1.4%, transparent 2.2%), radial-gradient(circle at 71% 82%, #ffe2a8 0 1.2%, transparent 2%), radial-gradient(circle at 86% 78%, #ffcf7a 0 1.4%, transparent 2.2%), radial-gradient(circle at 64% 81%, #ffd99a 0 1%, transparent 1.8%), radial-gradient(ellipse 70% 26% at 55% 52%, rgba(98,230,160,.6), transparent 70%), radial-gradient(ellipse 50% 28% at 30% 30%, rgba(170,120,230,.42), transparent 70%), linear-gradient(180deg, #1b1733 0%, #272a4c 32%, #2e5a55 56%, #0f1517 74%, #08090b 100%); }
+.ph-forest { background: radial-gradient(ellipse 40% 22% at 50% 64%, rgba(220,232,236,.35), transparent 70%), linear-gradient(180deg, #cdd6d8 0%, #a9b6b2 22%, #4b5b45 38%, #24321f 58%, #4a5b62 60%, #26323a 100%); }
+.ph-field { background: radial-gradient(ellipse 16% 30% at 38% 96%, #3b2a22 0 96%, transparent 100%), radial-gradient(circle at 38% 62%, #c8a084 0 8%, transparent 8.6%), radial-gradient(circle at 38% 57%, #22180f 0 8.5%, transparent 9%), radial-gradient(ellipse 15% 28% at 63% 97%, #7a6450 0 96%, transparent 100%), radial-gradient(circle at 63% 64%, #d4ab8e 0 7.5%, transparent 8%), radial-gradient(circle at 63% 59%, #2e2016 0 8.5%, transparent 9%), linear-gradient(180deg, #c3cdd3 0%, #aab8bf 38%, #6f8a4a 40%, #4f6b33 100%); }
+.ph-tunnel { background: radial-gradient(ellipse 4% 12% at 50% 66%, #141110 0 90%, transparent 100%), radial-gradient(ellipse 24% 32% at 50% 48%, #efe2bd 0 38%, #9a855c 66%, transparent 100%), linear-gradient(180deg, #191512, #0d0b09); }
+.ph-shot { background: radial-gradient(ellipse 14% 5% at 76% 66%, #e86a8c 0 90%, transparent 100%), linear-gradient(180deg, #fafafa 0 12%, transparent 12%), repeating-linear-gradient(180deg, #f6f6f9 0 9%, #e3e3ea 9% 10.5%); }
+.ph-notif { background: radial-gradient(ellipse 42% 9% at 50% 48%, rgba(255,255,255,.85) 0 90%, transparent 100%), radial-gradient(ellipse 42% 9% at 50% 68%, rgba(255,255,255,.72) 0 90%, transparent 100%), radial-gradient(circle at 26% 16%, rgba(255,255,255,.55) 0 7%, transparent 7.5%), radial-gradient(circle at 50% 16%, rgba(255,255,255,.55) 0 7%, transparent 7.5%), radial-gradient(circle at 74% 16%, rgba(255,255,255,.55) 0 7%, transparent 7.5%), linear-gradient(180deg, #6a9be0, #2c5aa6); }
+.ph-portrait { background: radial-gradient(ellipse 22% 34% at 50% 100%, #2c2224 0 95%, transparent 100%), radial-gradient(ellipse 9% 11% at 50% 58%, #6b4a3c 0 90%, transparent 100%), radial-gradient(ellipse 13% 16% at 50% 55%, #1a1212 0 90%, transparent 100%), linear-gradient(180deg, #24342a, #0c120e); }
+.ph-food { background: radial-gradient(circle at 22% 38%, #b8322a 0 5%, transparent 5.5%), radial-gradient(circle at 46% 30%, #6a3d8a 0 4%, transparent 4.5%), radial-gradient(circle at 64% 52%, #c0392b 0 5%, transparent 5.5%), radial-gradient(circle at 36% 64%, #7a9a3a 0 4%, transparent 4.5%), radial-gradient(circle at 74% 30%, #e9c46a 0 6%, transparent 6.5%), radial-gradient(circle at 56% 72%, #f1d38a 0 7%, transparent 7.5%), radial-gradient(circle at 30% 50%, #f0dca0 0 8%, transparent 8.5%), radial-gradient(circle at 66% 66%, #5e7f30 0 3.5%, transparent 4%), linear-gradient(135deg, #d7a463, #b9823f); box-shadow: inset 0 0 0 5px #8f8a82; }
+.ph-fire { background: radial-gradient(circle at 38% 34%, #fff2c2 0 2%, rgba(255,200,110,.85) 6%, rgba(255,140,60,.35) 14%, transparent 26%), radial-gradient(circle at 68% 26%, #ffe0f0 0 2%, rgba(255,120,170,.7) 6%, transparent 20%), radial-gradient(ellipse 70% 25% at 50% 100%, rgba(255,150,60,.45), transparent 70%), linear-gradient(180deg, #0a0a14, #1b1410 80%, #2a1c10); }
+.ph-fire2 { background: radial-gradient(circle at 55% 40%, #fff6d0 0 3%, rgba(255,214,120,.8) 9%, rgba(255,170,60,.3) 20%, transparent 34%), radial-gradient(circle at 25% 60%, rgba(255,214,120,.5) 0 4%, transparent 14%), linear-gradient(180deg, #120d08, #24170c); }
+.ph-fire3 { background: radial-gradient(circle at 50% 30%, #e8f6ff 0 2%, rgba(120,200,255,.75) 7%, transparent 22%), radial-gradient(circle at 30% 45%, rgba(255,120,200,.6) 0 3%, transparent 14%), linear-gradient(180deg, #070912, #151a2a 70%, #2c2a33); }
+.ph-snow { background: radial-gradient(ellipse 14% 30% at 50% 74%, #1f3550 0 92%, transparent 100%), radial-gradient(circle at 50% 41%, #c69b80 0 6%, transparent 6.5%), radial-gradient(circle at 50% 38%, #2a1d18 0 7.5%, transparent 8%), linear-gradient(180deg, #eef3f6, #cdd9e2); }
+.ph-sea { background: radial-gradient(ellipse 30% 6% at 60% 52%, rgba(255,255,255,.5), transparent 70%), linear-gradient(180deg, #d6e4ec 0%, #b4cddb 42%, #4f8fae 46%, #2b6a8a 72%, #1d4d66 100%); }
+.ph-rocks { background: radial-gradient(ellipse 22% 14% at 25% 72%, #c9b28a 0 90%, transparent 100%), radial-gradient(ellipse 18% 12% at 60% 66%, #d8c29a 0 90%, transparent 100%), radial-gradient(ellipse 20% 12% at 86% 76%, #b89c72 0 90%, transparent 100%), linear-gradient(180deg, #c8d6dc 0%, #9fb4bf 30%, #6f8c86 38%, #557a72 50%, #3f6f72 60%, #2e5c62 100%); }
+.ph-wedding { background: radial-gradient(circle at 20% 30%, rgba(255,214,150,.9) 0 4%, transparent 9%), radial-gradient(circle at 75% 22%, rgba(255,190,210,.8) 0 5%, transparent 11%), radial-gradient(circle at 60% 60%, rgba(255,230,180,.5) 0 6%, transparent 14%), radial-gradient(ellipse 14% 34% at 40% 100%, #1e2433 0 92%, transparent 100%), radial-gradient(ellipse 14% 34% at 62% 100%, #f1ece4 0 92%, transparent 100%), linear-gradient(180deg, #6b3b4f, #2c1a26); }
+.ph-memoji { background: radial-gradient(circle at 50% 48%, #f2c6a8 0 26%, transparent 27%), radial-gradient(ellipse 34% 30% at 50% 32%, #5a3b2c 0 95%, transparent 100%), linear-gradient(180deg, #f7d9e3, #e9b8cb); }
+.ph-indoor { background: radial-gradient(ellipse 50% 40% at 72% 28%, rgba(255,210,140,.55), transparent 70%), radial-gradient(ellipse 12% 32% at 45% 92%, #241818 0 92%, transparent 100%), radial-gradient(circle at 45% 54%, #b98466 0 6%, transparent 6.5%), linear-gradient(180deg, #5a3a26, #2a1a12); }
+.ph-indoor2 { background: radial-gradient(ellipse 40% 30% at 30% 25%, rgba(255,230,180,.45), transparent 70%), repeating-linear-gradient(90deg, #6b4630 0 12%, #5c3c29 12% 24%), linear-gradient(180deg, #3a2618, #24170f); }
+.ph-road { background: radial-gradient(ellipse 30% 10% at 30% 22%, #ffffff 0 70%, transparent 100%), radial-gradient(ellipse 25% 8% at 70% 15%, #ffffff 0 70%, transparent 100%), linear-gradient(180deg, #5d9ad6 0%, #9cc6ea 35%, #6f9a5a 50%, #4e7a40 62%, #8a8a86 64%, #6d6d6a 100%); }
+.ph-garden { background: radial-gradient(circle at 20% 30%, #f3a6c0 0 4%, transparent 4.5%), radial-gradient(circle at 70% 40%, #f6d55c 0 4%, transparent 4.5%), radial-gradient(circle at 45% 70%, #f3a6c0 0 3.5%, transparent 4%), radial-gradient(circle at 80% 75%, #ffffff 0 3%, transparent 3.5%), linear-gradient(160deg, #6f9a4a, #2f5a2a); }
+.ph-notes { background: radial-gradient(ellipse 30% 3% at 40% 30%, #4a5a8a 0 60%, transparent 100%), radial-gradient(ellipse 34% 3% at 46% 45%, #4a5a8a 0 60%, transparent 100%), radial-gradient(ellipse 26% 3% at 38% 60%, #4a5a8a 0 60%, transparent 100%), repeating-linear-gradient(180deg, #ece7da 0 11%, #b9bfcc 11% 11.6%); }
+.ph-market { background: linear-gradient(180deg, #2a2a2e 0 30%, transparent 30%), repeating-linear-gradient(90deg, #c8843c 0 7%, #4f9a7a 7% 14%, #d06aa4 14% 21%, #4f7fc8 21% 28%), linear-gradient(#000, #000); }
+.ph-crowd { background: radial-gradient(circle at 20% 70%, #d23c2c 0 9%, transparent 9.5%), radial-gradient(circle at 45% 64%, #f0a020 0 8%, transparent 8.5%), radial-gradient(circle at 70% 72%, #c02860 0 9%, transparent 9.5%), radial-gradient(circle at 88% 62%, #e85a2a 0 7%, transparent 7.5%), linear-gradient(180deg, #8fb0c8 0%, #c8d6dc 40%, #6a4a3a 42%, #3a2a22 100%); }
+.ph-city { background: radial-gradient(circle, #ffd58a 0 18%, transparent 22%) 0 60% / 12% 9% repeat-x, radial-gradient(circle, #ffe2aa 0 16%, transparent 20%) 6% 72% / 10% 8% repeat-x, linear-gradient(180deg, #0b1430 0%, #1a2550 55%, #0a0d18 56%, #05070c 100%); }
+.ph-lisbon { background: linear-gradient(180deg, transparent 0 55%, #c96a3a 55% 60%, #e8c08a 60% 66%, #b84a2a 66% 72%, #f0d8b0 72%), linear-gradient(180deg, #8ec5e8, #d8ecf6); }
+.ph-tram { background: radial-gradient(ellipse 26% 16% at 50% 62%, #f0c020 0 90%, transparent 100%), linear-gradient(180deg, #d9d2c0 0 40%, #a8a090 40% 70%, #6a6458 70%); }
+.ph-tiles { background: repeating-linear-gradient(45deg, #2f6fb0 0 6%, #f2f0ea 6% 12%), linear-gradient(#000, #000); }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-photos" viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="7" height="7" rx="1.6"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.6"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.6"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.6"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></symbol>
+  <symbol id="i-albums" viewBox="0 0 24 24"><rect x="3.5" y="7.5" width="17" height="13" rx="2.5"/><path d="M6.5 4.5h11"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M7.5 18.5H7a4.5 4.5 0 0 1-.6-8.96A6 6 0 0 1 18 9.5a4 4 0 0 1-.5 9H17"/><path d="M12 12.5v8M9 15.5l3-3 3 3"/></symbol>
+  <symbol id="i-bell" viewBox="0 0 24 24"><path d="M6 16.5V11a6 6 0 0 1 12 0v5.5l1.5 1.5h-15z"/><path d="M10 20.5a2.2 2.2 0 0 0 4 0"/></symbol>
+  <symbol id="i-share" viewBox="0 0 24 24"><path d="M12 3.5v11M8 7.5l4-4 4 4"/><path d="M8 11H6.5A1.5 1.5 0 0 0 5 12.5v6A1.5 1.5 0 0 0 6.5 20h11a1.5 1.5 0 0 0 1.5-1.5v-6A1.5 1.5 0 0 0 17.5 11H16"/></symbol>
+  <symbol id="i-heart" viewBox="0 0 24 24"><path d="M12 20s-7.5-4.6-7.5-10.2A4.3 4.3 0 0 1 12 7.2a4.3 4.3 0 0 1 7.5 2.6C19.5 15.4 12 20 12 20z"/></symbol>
+  <symbol id="i-addalbum" viewBox="0 0 24 24"><rect x="3.5" y="7.5" width="13" height="13" rx="2.5"/><path d="M7.5 4.5h10a3 3 0 0 1 3 3v10"/><path d="M10 11v6M7 14h6"/></symbol>
+  <symbol id="i-rmalbum" viewBox="0 0 24 24"><rect x="3.5" y="7.5" width="13" height="13" rx="2.5"/><path d="M7.5 4.5h10a3 3 0 0 1 3 3v10"/><path d="M7 14h6"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4.5 7h15M9.5 7V4.5h5V7M6.5 7l.9 12.2a1.5 1.5 0 0 0 1.5 1.3h6.2a1.5 1.5 0 0 0 1.5-1.3L17.5 7"/><path d="M10.2 11v5.5M13.8 11v5.5"/></symbol>
+  <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5.5" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="18.5" cy="12" r="1.4" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5.5 12.5l4.2 4.2L18.5 8"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M14.5 5.5L8 12l6.5 6.5"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24"><path d="M9.5 5.5L16 12l-6.5 6.5"/></symbol>
+  <symbol id="i-live" viewBox="0 0 24 24"><circle cx="12" cy="12" r="2.6"/><circle cx="12" cy="12" r="5.6"/><circle cx="12" cy="12" r="8.6" stroke-dasharray="1.6 2.4"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5.5"/><circle cx="12" cy="7.8" r="1" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10.5 13.5a3.8 3.8 0 0 0 5.4 0l2.7-2.7a3.8 3.8 0 0 0-5.4-5.4l-1 1"/><path d="M13.5 10.5a3.8 3.8 0 0 0-5.4 0l-2.7 2.7a3.8 3.8 0 0 0 5.4 5.4l1-1"/></symbol>
+  <symbol id="i-linkoff" viewBox="0 0 24 24"><path d="M10.5 13.5a3.8 3.8 0 0 0 5.4 0l2.7-2.7a3.8 3.8 0 0 0-5.4-5.4l-1 1"/><path d="M13.5 10.5a3.8 3.8 0 0 0-5.4 0l-2.7 2.7a3.8 3.8 0 0 0 5.4 5.4l1-1"/><path d="M4 4l16 16"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7.5 10.5L12 15l4.5-4.5"/><path d="M5 19.5h14"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="8.5" r="3.3"/><path d="M3 19.5a6 6 0 0 1 12 0"/><path d="M15.5 5.4a3.3 3.3 0 0 1 0 6.2M17.5 14a6 6 0 0 1 3.5 5.5"/></symbol>
+  <symbol id="i-userplus" viewBox="0 0 24 24"><circle cx="10" cy="8.5" r="3.3"/><path d="M4 19.5a6 6 0 0 1 12 0"/><path d="M19 8v6M16 11h6"/></symbol>
+  <symbol id="i-userx" viewBox="0 0 24 24"><circle cx="10" cy="8.5" r="3.3"/><path d="M4 19.5a6 6 0 0 1 12 0"/><path d="M16.5 8.5l4 4M20.5 8.5l-4 4"/></symbol>
+  <symbol id="i-mail" viewBox="0 0 24 24"><rect x="3.5" y="5.5" width="17" height="13" rx="2.5"/><path d="M4.5 7l7.5 6 7.5-6"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></symbol>
+  <symbol id="i-pin" viewBox="0 0 24 24"><path d="M12 20.5s-6.5-5.7-6.5-10.7a6.5 6.5 0 0 1 13 0c0 5-6.5 10.7-6.5 10.7z"/><circle cx="12" cy="9.8" r="2.3"/></symbol>
+  <symbol id="i-star" viewBox="0 0 24 24"><path d="M12 4l2.4 5 5.4.6-4 3.7 1.1 5.4L12 16l-4.9 2.7 1.1-5.4-4-3.7 5.4-.6z"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 4.5l8.5 15h-17z"/><path d="M12 10v4"/><circle cx="12" cy="16.8" r="1" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3"/><path d="M19.5 4.5v4.8h-4.8"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7.5h9M17 7.5h3M4 16.5h3M11 16.5h9"/><circle cx="15" cy="7.5" r="2"/><circle cx="9" cy="16.5" r="2"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8.5" y="8.5" width="11" height="11" rx="2.2"/><path d="M15.5 8.5V6.7a2.2 2.2 0 0 0-2.2-2.2H6.7a2.2 2.2 0 0 0-2.2 2.2v6.6a2.2 2.2 0 0 0 2.2 2.2h1.8"/></symbol>
+  <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M5 19l1-4L15.5 5.5a2.1 2.1 0 0 1 3 3L9 18z"/></symbol>
+  <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="15.5" rx="2.5"/><path d="M3.5 9.5h17M8 3v4M16 3v4"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><rect x="3.5" y="6.5" width="12" height="11" rx="2.5"/><path d="M15.5 10.5l5-3v9l-5-3"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M19.5 14.5A7.5 7.5 0 0 1 9.5 4.5a7.5 7.5 0 1 0 10 10z"/></symbol>
+  <symbol id="i-keep" viewBox="0 0 24 24"><path d="M12 19.5s-7-4.3-7-9.4A3.9 3.9 0 0 1 12 7.8a3.9 3.9 0 0 1 7 2.3c0 5.1-7 9.4-7 9.4z"/></symbol>
+</svg>
+
+<header class="top">
+  <div class="wrap">
+    <div class="brand"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span>Keepsake <small>redesign</small></div>
+    <nav class="nav" aria-label="Sections">
+      <a href="#system">System</a><a href="#gallery">Gallery</a><a href="#albums">Albums</a><a href="#people">People</a><a href="#notifications">Notifications</a><a href="#invites">Invites</a><a href="#shared-static">Shared · instant</a><a href="#shared-full">Shared · full</a><a href="#desktop">Desktop</a>
+    </nav>
+    <button class="tbtn" id="theme" type="button"><svg class="i"><use href="#i-sun"/></svg><span>Light mode</span></button>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="intro">
+    <h1>Keepsake, redesigned</h1>
+    <p>These screens redraw seven parts of the app using the 57 findings from our review: the gallery, albums, people, notifications, invites, and the shared album in its instant and full versions. <strong>Nothing in the app has changed.</strong></p>
+    <p>Places, dates and counts come from your library. People's names, email addresses and the “Lisbon 2022” album are examples. The numbers under each screen point to the findings they fix. Use the button at the top to see every screen in the other theme. The last section shows the same screens on a desktop browser.</p>
+  </section>
+
+  <!-- ========== SYSTEM ========== -->
+  <section class="sec" id="system">
+    <div class="sec-head">
+      <h2>One system for every screen</h2>
+      <p class="lede">Today the app uses three blues, three reds, two icon sets and seven button heights. Every screen below uses just these.</p>
+    </div>
+    <div class="sys">
+      <div class="card">
+        <h3>Colour</h3>
+        <div class="sw">
+          <div><i style="background:var(--accent)"></i>Accent</div>
+          <div><i style="background:var(--danger)"></i>Danger</div>
+          <div><i style="background:var(--bg)"></i>Ground</div>
+          <div><i style="background:var(--surface)"></i>Surface</div>
+          <div><i style="background:var(--fg)"></i>Text</div>
+        </div>
+        <p>One blue for anything you can act on, one red for anything you can't undo. Dark mode puts dark text on its lighter blue and red, so filled buttons pass contrast in both themes.</p>
+      </div>
+      <div class="card">
+        <h3>Type</h3>
+        <div class="spec-d">Malmö nights</div>
+        <div class="spec-b">4 items · Shared by Rajat · 10 Oct 2024</div>
+        <p>Jost for titles, close to the current Futura but loaded as a web font so it looks the same on iPhone, Android and Windows. Figtree for everything else. No all-caps monospace hints.</p>
+      </div>
+      <div class="card">
+        <h3>Controls</h3>
+        <div class="btnrow">
+          <span class="btn pri">Share</span><span class="btn">Cancel</span><span class="btn sm">Add photos</span><span class="link">Select</span>
+        </div>
+        <div class="btnrow"><span class="btn dan">Delete 3 items</span></div>
+        <p>Three sizes: 44&nbsp;px for main actions, 34&nbsp;px for compact controls, and text links. Every destructive action is red and asks first.</p>
+      </div>
+      <div class="card">
+        <h3>Icons</h3>
+        <div class="iconrow">
+          <div><svg class="i"><use href="#i-photos"/></svg>Photos</div>
+          <div><svg class="i"><use href="#i-search"/></svg>Search</div>
+          <div><svg class="i"><use href="#i-albums"/></svg>Albums</div>
+          <div><svg class="i"><use href="#i-upload"/></svg>Upload</div>
+          <div><svg class="i"><use href="#i-share"/></svg>Share</div>
+          <div><svg class="i"><use href="#i-addalbum"/></svg>Add to album</div>
+          <div><svg class="i"><use href="#i-heart"/></svg>Like</div>
+          <div><svg class="i"><use href="#i-info"/></svg>Info</div>
+          <div><svg class="i"><use href="#i-trash"/></svg>Delete</div>
+          <div><svg class="i"><use href="#i-live"/></svg>Live</div>
+          <div><svg class="i"><use href="#i-users"/></svg>People</div>
+          <div><svg class="i"><use href="#i-link"/></svg>Link</div>
+        </div>
+        <p>One family, one stroke weight. Each icon means one thing: Upload is no longer a “+”, and the sparkles are gone.</p>
+      </div>
+    </div>
+    <span class="refs">Fixes #28 #29 #30 #31 #32 #33</span>
+  </section>
+
+  <!-- ========== GALLERY ========== -->
+  <section class="sec" id="gallery">
+    <div class="sec-head">
+      <h2>Gallery</h2>
+      <p class="lede">The photos get the screen. Three tabs instead of six, sharp thumbnails at four across, and every day labelled with its date and place. Deleting asks first and says where the photos go.</p>
+    </div>
+    <div class="frames">
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr">
+            <h3 class="ttl">Photos</h3>
+            <div class="hdr-r">
+              <span class="btn sm pri"><svg class="i"><use href="#i-upload"/></svg>Upload</span>
+              <span class="ibtn dot"><svg class="i"><use href="#i-bell"/></svg></span>
+              <span class="me">RA</span>
+            </div>
+          </div>
+          <div class="chips"><span class="chip on">All</span><span class="chip">Photos</span><span class="chip">Videos</span><span class="chip">Liked</span><span class="chip"><svg class="i"><use href="#i-calendar"/></svg>Date</span></div>
+          <div class="content">
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4" data-tiles="aurora forest field*L tunnel shot notif portrait garden"></div>
+            <div class="day"><b>27 January 2024</b><span>Malmö</span></div>
+            <div class="g c4" data-tiles="food*L snow*L"></div>
+            <div class="day"><b>1 January 2024</b><span>Rotterdam</span></div>
+            <div class="g c4" data-tiles="fire*V1 fire2*V1 fire3*V2 wedding*L city memoji*L indoor*V7 notes"></div>
+          </div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>Photos tab</b>Four across with 2&nbsp;px gaps fits twice as many photos, served at full sharpness. Videos show their length and Live Photos a small mark. Upload has its own icon and label.<span class="refs">Fixes #7 #18 #20 #33 #48 #51</span></figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="selhdr"><span class="link">Cancel</span><b>3 selected</b><span class="link">Select all</span></div>
+          <div class="content">
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4" data-tiles="aurora*S forest*s field*L*S tunnel*s shot*s notif*s portrait*S garden*s"></div>
+            <div class="day"><b>27 January 2024</b><span>Malmö</span></div>
+            <div class="g c4" data-tiles="food*L*s snow*L*s"></div>
+          </div>
+          <div class="actbar">
+            <span class="act"><svg class="i"><use href="#i-share"/></svg>Share</span>
+            <span class="act"><svg class="i"><use href="#i-addalbum"/></svg>Add to album</span>
+            <span class="act"><svg class="i"><use href="#i-heart"/></svg>Like</span>
+            <span class="act"><svg class="i"><use href="#i-more"/></svg>More</span>
+            <span class="act dan"><svg class="i"><use href="#i-trash"/></svg>Delete</span>
+            <i class="home"></i>
+          </div>
+          <div class="scrim"></div>
+          <div class="sheet">
+            <div class="grab"></div>
+            <h4>Delete 3 items?</h4>
+            <p>They move to Recently Deleted, where you can restore them for 30 days.</p>
+            <span class="btn dan wide">Delete 3 items</span>
+            <span class="btn wide">Cancel</span>
+          </div>
+        </div></div>
+        <figcaption><b>Selecting and deleting</b>Selected photos get a filled check and an outline. Actions replace the tab bar instead of sitting on top of it. Delete always asks and says where the photos go.<span class="refs">Fixes #1 #8 #50</span></figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr vw">
+          <div class="sb" data-sb></div>
+          <div class="vtop">
+            <span class="ibtn ghost"><svg class="i"><use href="#i-back"/></svg></span>
+            <div class="vt"><b>Malmö</b><span>10 Oct 2024 · 22:41</span></div>
+            <span class="ibtn ghost"><svg class="i"><use href="#i-more"/></svg></span>
+          </div>
+          <div class="vphoto ph-aurora"><span class="livechip"><svg class="i"><use href="#i-live"/></svg>LIVE</span></div>
+          <div class="vinfo">
+            <div class="irow"><b>Thursday, 10 October 2024</b><span>22:41 · IMG_1073.HEIC · 3.1 MB</span></div>
+            <div class="vmap"><span class="pinw"><svg class="i"><use href="#i-pin"/></svg></span><em>Malmö, Sweden</em></div>
+            <div class="cam"><b>iPhone 15 Pro Max</b><span>Ultra Wide · 13 mm · f/2.2 · 1/2 s · ISO 3200</span><span>4032 × 3024</span></div>
+            <div class="tags"><span>Aurora</span><span>Night sky</span><span>Coast</span><span>City lights</span></div>
+          </div>
+          <div class="vbar">
+            <span class="act"><svg class="i"><use href="#i-share"/></svg>Share</span>
+            <span class="act"><svg class="i"><use href="#i-heart"/></svg>Like</span>
+            <span class="act pri"><svg class="i"><use href="#i-info"/></svg>Info</span>
+            <span class="act"><svg class="i"><use href="#i-addalbum"/></svg>Album</span>
+            <span class="act"><svg class="i"><use href="#i-trash"/></svg>Delete</span>
+            <i class="home"></i>
+          </div>
+        </div></div>
+        <figcaption><b>Viewer with info open</b>The title is the place and time, not the filename. Info shows a map, camera details with units, and tags that agree with where the photo was taken. Share is in the toolbar, while Download and rating move into More.<span class="refs">Fixes #9 #21 #22 #23 #24 #45</span></figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ========== ALBUMS ========== -->
+  <section class="sec" id="albums">
+    <div class="sec-head">
+      <h2>Albums</h2>
+      <p class="lede">Albums is also home to people, places and media types. You add photos without leaving the album, removing a photo never deletes it from the library, and sharing is a deliberate step whose state is always visible.</p>
+    </div>
+    <div class="frames">
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr">
+            <h3 class="ttl">Albums</h3>
+            <div class="hdr-r"><span class="btn sm"><svg class="i"><use href="#i-plus"/></svg>New album</span></div>
+          </div>
+          <div class="content">
+            <div class="acards">
+              <div class="acard"><div class="cv ph-aurora"></div><b>Malmö nights</b><span><svg class="i"><use href="#i-link"/></svg>4 items · Shared</span></div>
+              <div class="acard"><div class="cv ph-rocks"></div><b>India 2024</b><span>6 items</span></div>
+            </div>
+            <div class="sh"><b>People &amp; places</b></div>
+            <div class="list">
+              <div class="row"><div class="th mos"><span class="av" data-av="0"></span><span class="av" data-av="1"></span><span class="av" data-av="2"></span><span class="av" data-av="3"></span></div><div class="rt"><b>People</b><span>9 people · 7 to name</span></div><svg class="i chev"><use href="#i-chev"/></svg></div>
+              <div class="row"><div class="th" style="background:linear-gradient(28deg,transparent 46%,var(--map-road) 46% 49%,transparent 49%),linear-gradient(112deg,var(--map-water) 0 40%,var(--map-land) 40%)"></div><div class="rt"><b>Places</b><span>8 places, from Malmö to Manali</span></div><svg class="i chev"><use href="#i-chev"/></svg></div>
+            </div>
+            <div class="sh"><b>Suggested</b><small>Made only if you tap Create</small></div>
+            <div class="sug"><div class="th ph-fire3"></div><div class="rt"><b>Rotterdam</b><span>2 items · 1 Jan 2024</span></div><span class="btn sm">Create</span></div>
+            <div class="sh"><b>Media types</b></div>
+            <div class="list">
+              <div class="row"><svg class="i"><use href="#i-video"/></svg><div class="rt"><b>Videos</b></div><span class="lbl">10</span></div>
+            </div>
+          </div>
+          <div class="tabs" data-tabs="albums"></div>
+        </div></div>
+        <figcaption><b>Albums tab</b>Your albums come first, then people and places. Smart albums are labelled suggestions and are only made when you tap Create, never silently.<span class="refs">Fixes #18 #25</span></figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="hero ph-aurora">
+            <div class="sb onphoto" data-sb></div>
+            <div class="hero-nav"><span class="ibtn glass"><svg class="i"><use href="#i-back"/></svg></span><span class="ibtn glass"><svg class="i"><use href="#i-more"/></svg></span></div>
+            <div class="hero-t"><h3>Malmö nights</h3><span>4 items · October 2024 – January 2024</span></div>
+          </div>
+          <div class="acts">
+            <span class="btn sm"><svg class="i"><use href="#i-addalbum"/></svg>Add photos</span>
+            <span class="btn sm"><svg class="i"><use href="#i-share"/></svg>Share</span>
+            <span style="flex:1"></span>
+            <span class="link" style="align-self:center;font-size:13.5px">Select</span>
+          </div>
+          <div class="status"><svg class="i"><use href="#i-link"/></svg><span>Anyone with the link can view · expires 18 Nov</span></div>
+          <div class="content">
+            <div class="g c3" data-tiles="aurora food*L fire*L snow*L"></div>
+          </div>
+          <div class="tabs" data-tabs="albums"></div>
+        </div></div>
+        <figcaption><b>An album</b>The cover sets the mood. Whether the album is shared, and until when, is always on screen, so nobody has to guess what “Sharing on” means.<span class="refs">Fixes #4 #46</span></figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="mh"><span class="link">Cancel</span><b>Add to Malmö nights</b><span class="link">Add 3</span></div>
+          <div class="chips"><span class="chip on">All</span><span class="chip"><svg class="i"><use href="#i-pin"/></svg>Malmö</span><span class="chip">Rotterdam</span><span class="chip">Noida</span></div>
+          <div class="content">
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4" data-tiles="aurora*A forest*S field*L*s tunnel*S shot*s notif*s portrait*S garden*s"></div>
+            <div class="day"><b>27 January 2024</b><span>Malmö</span></div>
+            <div class="g c4" data-tiles="food*L*A snow*L*A"></div>
+            <div class="day"><b>1 January 2024</b><span>Rotterdam</span></div>
+            <div class="g c4" data-tiles="fire*V1*s fire2*V1*s fire3*V2*s wedding*L*s"></div>
+          </div>
+          <div class="pickbar"><span>3 selected · 3 already in this album</span><span class="btn pri">Add 3</span></div>
+        </div></div>
+        <figcaption><b>Adding photos</b>“Add photos” opens your library over the album, so you never lose your place. Photos already in the album are marked “Added”.<span class="refs">Fixes #11</span></figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="hero ph-aurora">
+            <div class="sb onphoto" data-sb></div>
+            <div class="hero-t"><h3>Malmö nights</h3><span>4 items</span></div>
+          </div>
+          <div class="scrim"></div>
+          <div class="sheet tall">
+            <div class="grab"></div>
+            <h4>Share “Malmö nights”</h4>
+            <div class="row" style="padding:0"><svg class="i" style="color:var(--accent)"><use href="#i-link"/></svg><div class="rt"><b>Link sharing</b><span>Anyone with the link can see these 4 items, and nothing else in your library.</span></div><span class="tg on"></span></div>
+            <div style="display:flex;gap:8px"><div class="field" style="flex:1"><span>…/s/7Kq2x9</span></div><span class="btn"><svg class="i"><use href="#i-copy"/></svg>Copy</span></div>
+            <div style="display:flex;flex-direction:column;gap:6px"><span class="lbl">Link expires</span><div class="seg"><span>1 day</span><span class="on">7 days</span><span>30 days</span><span>Never</span></div><span class="lbl" style="font-weight:500">Stops working on 18 November 2026</span></div>
+            <div class="row" style="padding:0"><svg class="i" style="color:var(--muted)"><use href="#i-lock"/></svg><div class="rt"><b>Ask for a code</b><span>Viewers type a code you give them. Protected links open a little slower.</span></div><span class="tg"></span></div>
+            <span class="btn pri wide">Done</span>
+            <div style="text-align:center"><span class="link dan">Stop sharing</span><div class="lbl" style="font-weight:500;margin-top:2px">Anyone with the link loses access straight away.</div></div>
+          </div>
+        </div></div>
+        <figcaption><b>Sharing an album</b>Turning on a link is a deliberate choice that shows what viewers can see, when the link ends, and whether it needs a code. Stopping says who loses access.<span class="refs">Fixes #4 #5</span></figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="selhdr"><span class="link">Cancel</span><b>1 selected</b><span class="link">Select all</span></div>
+          <div class="content">
+            <div class="day"><b>Malmö nights</b><span>4 items</span></div>
+            <div class="g c3" data-tiles="aurora*s food*L*S fire*L*s snow*L*s"></div>
+          </div>
+          <div class="toast"><span>Removed 1 item from Malmö nights. It's still in Photos.</span><b>Undo</b></div>
+          <div class="actbar">
+            <span class="act pri"><svg class="i"><use href="#i-rmalbum"/></svg>Remove</span>
+            <span class="act"><svg class="i"><use href="#i-share"/></svg>Share</span>
+            <span class="act"><svg class="i"><use href="#i-addalbum"/></svg>Add to album</span>
+            <span class="act dan"><svg class="i"><use href="#i-trash"/></svg>Delete</span>
+            <i class="home"></i>
+          </div>
+        </div></div>
+        <figcaption><b>Removing from an album</b>Inside an album the first action is “Remove”, which keeps the photo in your library, however you got here. Delete stays red and asks first. Undo works.<span class="refs">Fixes #2 #3 #4</span></figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ========== PEOPLE ========== -->
+  <section class="sec" id="people">
+    <div class="sec-head">
+      <h2>People</h2>
+      <p class="lede">Here the job is naming and correcting people. You name someone where you see them, confirm look-alikes Keepsake suggests, and take a wrong photo out with one action.</p>
+    </div>
+    <div class="frames">
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Albums</span><span class="link">Select</span></div>
+          <div class="hdr" style="padding-top:0"><h3 class="ttl">People</h3></div>
+          <div class="content">
+            <div class="banner">
+              <div class="stack"><span class="av" data-av="4"></span><span class="av" data-av="5"></span><span class="av" data-av="6"></span></div>
+              <div class="rt"><b>Name 7 more people</b><span>Names make them searchable.</span></div>
+              <span class="btn sm pri">Start</span>
+            </div>
+            <div class="sh"><b>Named</b></div>
+            <div class="ppl">
+              <div class="pp"><span class="av" data-av="0"></span><b>Asha</b><span>3 photos</span></div>
+              <div class="pp"><span class="av" data-av="2"></span><b>Rajat</b><span>2 photos</span></div>
+            </div>
+            <div class="sh"><b>Not named yet</b></div>
+            <div class="ppl">
+              <div class="pp"><span class="av" data-av="1"></span><span class="add">Add name</span><span>2 photos</span></div>
+              <div class="pp"><span class="av" data-av="3"></span><span class="add">Add name</span><span>1 photo</span></div>
+              <div class="pp"><span class="av" data-av="4"></span><span class="add">Add name</span><span>1 photo</span></div>
+              <div class="pp"><span class="av" data-av="5"></span><span class="add">Add name</span><span>1 photo</span></div>
+              <div class="pp"><span class="av" data-av="6"></span><span class="add">Add name</span><span>1 photo</span></div>
+              <div class="pp"><span class="av" data-av="7"></span><span class="add">Add name</span><span>1 photo</span></div>
+            </div>
+          </div>
+          <div class="tabs" data-tabs="albums"></div>
+        </div></div>
+        <figcaption><b>People</b>Named people come first, and a prompt invites you to name the rest. Counts use the right plural: “1 photo”, not “1 photos”.<span class="refs">Fixes #12 #26 #41</span></figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>People</span><span class="ibtn ghost"><svg class="i"><use href="#i-more"/></svg></span></div>
+          <div class="content">
+            <div class="who">
+              <span class="av" data-av="1"></span>
+              <div class="field focus"><span style="flex:none">Ne</span><i class="caret"></i><span></span></div>
+              <small>2 photos · first seen 10 October 2024</small>
+            </div>
+            <div class="same">
+              <div class="pair"><span class="av" data-av="1"></span><span class="av" data-av="8"></span><div class="rt"><b>Same person?</b><span>This might also be them, in 1 more photo.</span></div></div>
+              <div style="display:flex;gap:8px"><span class="btn sm pri" style="flex:1">Yes, merge</span><span class="btn sm" style="flex:1">Not the same</span></div>
+            </div>
+            <div class="sh"><b>Photos</b><span class="link">Done</span></div>
+            <div class="g c3 pad" data-tiles="field*L*s tunnel*S"></div>
+          </div>
+          <div class="actbar">
+            <span class="act pri"><svg class="i"><use href="#i-userx"/></svg>Not this person</span>
+            <span class="act"><svg class="i"><use href="#i-photos"/></svg>Use as cover</span>
+            <span class="act"><svg class="i"><use href="#i-share"/></svg>Share</span>
+            <i class="home"></i>
+          </div>
+        </div></div>
+        <figcaption><b>One person</b>You type the name right on the page. Suggested look-alikes can be merged even before anyone is named. A photo that isn't them comes out with “Not this person”.<span class="refs">Fixes #12</span></figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ========== NOTIFICATIONS ========== -->
+  <section class="sec" id="notifications">
+    <div class="sec-head">
+      <h2>Notifications</h2>
+      <p class="lede">The bell holds only what you'd act on or want to know about. Quick confirmations appear briefly and aren't saved, so the bell is worth opening again.</p>
+    </div>
+    <div class="frames">
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Photos</span><span class="link">Mark all read</span></div>
+          <div class="hdr" style="padding-top:0"><h3 class="ttl">Notifications</h3></div>
+          <div class="content">
+            <div class="gl">Today</div>
+            <div class="nt unread">
+              <span class="ni"><svg class="i"><use href="#i-upload"/></svg></span>
+              <div class="nb">
+                <div class="top2"><b>31 items uploaded</b><span class="ntime">01:12</span></div>
+                <p>All processed in 4 minutes. 9 people found.</p>
+                <div class="strip" data-tiles="aurora forest field tunnel food fire"></div>
+              </div>
+            </div>
+            <div class="nt unread">
+              <span class="ni warn"><svg class="i"><use href="#i-alert"/></svg></span>
+              <div class="nb">
+                <div class="top2"><b>1 video couldn't be processed</b><span class="ntime">01:14</span></div>
+                <p>IMG_0633.mov uses a format Keepsake can't read yet.</p>
+                <div class="nacts"><span class="btn sm pri"><svg class="i"><use href="#i-refresh"/></svg>Try again</span><span class="btn sm">Show video</span></div>
+              </div>
+            </div>
+            <div class="nt">
+              <span class="ni"><svg class="i"><use href="#i-users"/></svg></span>
+              <div class="nb">
+                <div class="top2"><b>7 people to name</b><span class="ntime">01:15</span></div>
+                <div class="nacts"><span class="btn sm">Name them</span></div>
+              </div>
+            </div>
+            <div class="gl">Yesterday</div>
+            <div class="nt">
+              <span class="ni"><svg class="i"><use href="#i-link"/></svg></span>
+              <div class="nb">
+                <div class="top2"><b>Asha opened “Malmö nights”</b><span class="ntime">18:40</span></div>
+              </div>
+            </div>
+            <div class="nt">
+              <span class="ni"><svg class="i"><use href="#i-mail"/></svg></span>
+              <div class="nb">
+                <div class="top2"><b>Invite to dev@example.com ends tomorrow</b><span class="ntime">09:02</span></div>
+                <div class="nacts"><span class="btn sm">Resend</span></div>
+              </div>
+            </div>
+          </div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>Notifications</b>Grouped by day, each with the one action it needs. Problems are red and say what went wrong. Real events like a finished upload finally show up here.<span class="refs">Fixes #34 #36</span></figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Notifications</span><span></span></div>
+          <div class="hdr" style="padding-top:0"><h3 class="ttl" style="font-size:24px">What to tell you about</h3></div>
+          <div class="content">
+            <div class="sh"><b>Your library</b></div>
+            <div class="list">
+              <div class="row"><div class="rt"><b>Uploads finished</b></div><span class="tg on"></span></div>
+              <div class="row"><div class="rt"><b>Something needs your attention</b><span>Uploads or videos that couldn't be processed</span></div><span class="tg on"></span></div>
+              <div class="row"><div class="rt"><b>New people to name</b></div><span class="tg on"></span></div>
+            </div>
+            <div class="sh"><b>Sharing</b></div>
+            <div class="list">
+              <div class="row"><div class="rt"><b>Someone opens a shared album</b></div><span class="tg"></span></div>
+              <div class="row"><div class="rt"><b>A link is about to expire</b></div><span class="tg on"></span></div>
+              <div class="row"><div class="rt"><b>Invites accepted or ending</b></div><span class="tg on"></span></div>
+            </div>
+            <p class="note" style="padding:14px 18px 0;margin:0"><svg class="i"><use href="#i-info"/></svg><span>Quick confirmations like “Album renamed” appear for a moment and aren't saved here. Notifications are kept for 30 days.</span></p>
+          </div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>Notification settings</b>You choose what's worth a notification. The page explains, in plain words, why brief confirmations don't pile up in the bell.<span class="refs">Fixes #34 #37</span></figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ========== INVITES ========== -->
+  <section class="sec" id="invites">
+    <div class="sec-head">
+      <h2>Invites</h2>
+      <p class="lede">One page shows who's in your library. When you invite someone, you choose clearly between sharing this library and giving them their own, and they get a welcome page that explains what they're joining.</p>
+    </div>
+    <div class="frames">
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Settings</span><span></span></div>
+          <div class="hdr" style="padding-top:0"><h3 class="ttl">Library</h3></div>
+          <div class="content">
+            <div class="list">
+              <div class="row"><div class="rt"><b style="font:600 18px var(--font-display)">Verma family</b><span>31 items · 2 of 15 members</span></div><span class="btn sm"><svg class="i"><use href="#i-pencil"/></svg>Rename</span></div>
+            </div>
+            <div class="sh"><b>Members</b></div>
+            <div class="list">
+              <div class="row"><span class="ini">RA</span><div class="rt"><b>Rajat</b><span>You</span></div><span class="pill">Owner</span></div>
+              <div class="row"><span class="av" data-av="0"></span><div class="rt"><b>Asha</b><span>Joined 3 November</span></div><svg class="i chev"><use href="#i-more"/></svg></div>
+            </div>
+            <div class="sh"><b>Waiting to join</b></div>
+            <div class="list">
+              <div class="row"><span class="ini"><svg class="i" style="width:18px;height:18px"><use href="#i-mail"/></svg></span><div class="rt"><b>dev@example.com</b><span>Invited 9 Nov · ends tomorrow</span></div><span class="link" style="font-size:13px">Resend</span></div>
+            </div>
+            <div style="padding:14px 16px 0"><span class="btn pri wide"><svg class="i"><use href="#i-userplus"/></svg>Invite someone</span></div>
+            <div style="padding:22px 16px 0;text-align:center"><span class="link dan" style="font-size:13px">Delete everything in this library…</span><div class="lbl" style="font-weight:500;margin-top:3px">Asks for your password and an email confirmation first.</div></div>
+          </div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>Library and members</b>The library has a real name instead of your email address. Pending invites show when they end, with Resend right there. The destructive option sits apart, at the bottom.<span class="refs">Fixes #13 #46</span></figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Library</h3></div>
+          <div class="scrim"></div>
+          <div class="sheet tall" style="gap:12px">
+            <div class="grab"></div>
+            <h4>Invite someone</h4>
+            <div style="display:flex;flex-direction:column;gap:6px"><span class="lbl">Email address</span><div class="field focus"><span style="flex:none">dev@example.com</span><i class="caret"></i><span></span></div></div>
+            <span class="lbl">What should they get?</span>
+            <div class="opt on"><span class="radio"></span><div><b>Join Verma family</b><span>They see all 31 items here and can add their own.</span></div></div>
+            <div class="opt"><span class="radio"></span><div><b>Their own library</b><span>A separate, empty library. Nothing here is shared with them.</span></div></div>
+            <p class="note"><svg class="i"><use href="#i-clock"/></svg><span>The invite link works once and ends after 72 hours.</span></p>
+            <span class="btn pri wide">Send invite</span>
+            <span class="btn wide">Cancel</span>
+          </div>
+        </div></div>
+        <figcaption><b>Inviting someone</b>The two choices are spelled out, so nobody has to decode “Join this library” and “Start their own library” from a dropdown.<span class="refs">Fixes #43 #44</span></figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="shr-top"><span class="mk"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span>Keepsake</span><span></span></div>
+          <div class="center" style="justify-content:flex-start;padding-top:28px;gap:14px">
+            <span class="ini" style="width:72px;height:72px;font-size:22px">RA</span>
+            <h3>Rajat invited you to Verma family</h3>
+            <p>Join to see the family's 31 photos and videos, and add your own.</p>
+            <div class="facts">
+              <div><svg class="i"><use href="#i-users"/></svg>2 members</div>
+              <div><svg class="i"><use href="#i-lock"/></svg>Private. Only members can see it.</div>
+              <div><svg class="i"><use href="#i-clock"/></svg>Invite ends 14 Nov at 01:00</div>
+            </div>
+            <span class="btn pri wide">Accept invite</span>
+            <span class="link" style="font-size:13.5px">Already use Keepsake? Sign in to accept</span>
+            <p style="font-size:12px;margin-top:6px">Not expecting this? You can ignore it.</p>
+          </div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>What they receive</b>It says who invited them, to what, and what happens next. If the link has expired or is broken, it says so and links to sign in, instead of mentioning a missing “token”.<span class="refs">Fixes #47</span></figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ========== SHARED STATIC ========== -->
+  <section class="sec" id="shared-static">
+    <div class="sec-head">
+      <h2>Shared album, instant version</h2>
+      <p class="lede">This version is served straight from storage, so it opens in under a second even while Keepsake is asleep. It shows the album right away and hands over to the full album once that's awake. Albums with an access code skip it.</p>
+    </div>
+    <div class="frames">
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="hero ph-aurora" style="height:300px">
+            <div class="sb onphoto" data-sb></div>
+            <div class="hero-nav"><span class="mk onphoto"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span>Keepsake</span><span></span></div>
+            <div class="hero-t"><h3>Malmö nights</h3><span>Shared by Rajat · 4 items · Oct 2024 – Jan 2024</span></div>
+          </div>
+          <div class="content" style="padding-top:2px">
+            <div class="g c2" data-tiles="food*L fire*L snow*L tunnel"></div>
+          </div>
+          <div class="float">
+            <div class="fr"><b>Getting the download ready</b><span class="btn sm off"><svg class="i"><use href="#i-download"/></svg>Download</span></div>
+            <div class="prog"><i style="width:62%"></i></div>
+            <span style="color:var(--muted)">You can look through everything now.</span>
+          </div>
+        </div></div>
+        <figcaption><b>Small album: everything at once</b>All 4 items are already here, and the viewer works. Download turns on as soon as the full album is awake, and the page says so instead of showing a 27-second spinner.<span class="refs">Fixes #16 #40</span></figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="shr-top"><span class="mk"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span>Lisbon 2022</span><span class="lbl">1,240 items</span></div>
+          <div class="content">
+            <div class="g c4" data-tiles="lisbon tram sea crowd market city road lisbon tram sea rocks lisbon market crowd tram sea"></div>
+            <div class="endprev">
+              <b>That's the first 500</b>
+              <p>Loading the other 740. Keep scrolling: they appear here as they arrive.</p>
+              <div class="prog"><i style="width:35%"></i></div>
+            </div>
+            <div class="g c4" data-tiles="x x x x x x x x"></div>
+          </div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>Large album: first 500, then the rest</b>For albums over 500 items, the instant version shows the first 500 and says plainly that the rest is on its way. It never swaps pages while someone is looking at a photo.<span class="refs">Fixes #40</span></figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ========== SHARED FULL ========== -->
+  <section class="sec" id="shared-full">
+    <div class="sec-head">
+      <h2>Shared album, full version</h2>
+      <p class="lede">The live album. Protected albums ask for their code, everything can be downloaded, and when a link stops working the page says so straight away and what to do.</p>
+    </div>
+    <div class="frames">
+      <figure class="shot wide">
+        <div class="browser">
+          <div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/s/7Kq2x9</div></div>
+          <div class="dk">
+            <div class="dk-top"><span class="mk"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span>Keepsake</span><span class="lbl">Shared album</span></div>
+            <div class="dk-head">
+              <div><h3>Malmö nights</h3><div class="meta">Shared by Rajat · 4 items · October 2024 – January 2024 · link ends 18 Nov</div></div>
+              <div class="btnrow"><span class="btn sm">Select</span><span class="btn sm pri"><svg class="i"><use href="#i-download"/></svg>Download all · 38 MB</span></div>
+            </div>
+            <div class="g c4" data-tiles="aurora*H food*L fire*L snow*L"></div>
+            <div class="foot">Shared from Keepsake, a private photo library.</div>
+          </div>
+        </div>
+        <figcaption><b>Full album on a computer</b>Title, who shared it and when the link ends are at the top. Download all shows the size up front. Hovering a photo shows its own select and download buttons.<span class="refs">Fixes #29 #31</span></figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="shr-top"><span class="mk"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span>Keepsake</span><span></span></div>
+          <div class="center">
+            <span class="bigicon"><svg class="i"><use href="#i-lock"/></svg></span>
+            <h3>“Malmö nights” is protected</h3>
+            <p>Enter the 6-character code Rajat gave you.</p>
+            <div class="code"><span>K</span><span>7</span><span>Q</span><span class="cur"></span><span></span><span></span></div>
+            <span class="btn pri wide off">View album</span>
+            <p style="font-size:12.5px">No code? Ask Rajat for one.</p>
+          </div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>Protected album</b>One clear field and one button. A wrong code gets a plain answer and a way forward.<span class="refs">Fixes #5</span></figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="shr-top"><span class="mk"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span>Keepsake</span><span></span></div>
+          <div class="center">
+            <span class="bigicon"><svg class="i"><use href="#i-linkoff"/></svg></span>
+            <h3>This link no longer works</h3>
+            <p>It may have expired, or the person who shared it turned it off.</p>
+            <p>Ask them to send you a new link.</p>
+            <span class="btn wide">Sign in to Keepsake</span>
+          </div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>A link that no longer works</b>Answered right away by the instant version, instead of 27 seconds of “Loading shared album…” followed by “Album not found”.<span class="refs">Fixes #40 #47</span></figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ========== DESKTOP ========== -->
+  <section class="sec" id="desktop">
+    <div class="sec-head">
+      <h2>On a desktop browser</h2>
+      <p class="lede">The same system with more room. A sidebar replaces the three tabs, search sits at the top of every page, and the extra width shows more at once instead of making controls bigger: eight photos across, photo info beside the photo, and a person's details beside the people grid.</p>
+    </div>
+    <div class="frames">
+
+      <figure class="shot xl">
+        <div class="scrollx"><div class="browser app">
+          <div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/photos</div></div>
+          <div class="dapp">
+            <aside class="side" data-side="photos"></aside>
+            <div class="dmain">
+              <div class="dtop" data-dtop></div>
+              <div class="dbody">
+                <div class="dph">
+                  <h3>Photos<small>31 items</small></h3>
+                  <div class="dctl">
+                    <span class="chip on">All</span><span class="chip">Photos</span><span class="chip">Videos</span><span class="chip">Liked</span><span class="chip"><svg class="i"><use href="#i-calendar"/></svg>Date</span>
+                    <span class="zoom" title="Photo size"><svg class="i"><use href="#i-photos"/></svg><span class="track"><i></i><b></b></span><svg class="i"><use href="#i-photos"/></svg></span>
+                    <span class="link">Select</span>
+                  </div>
+                </div>
+                <div class="dday"><b>10 October 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="aurora forest*H field*L tunnel shot notif portrait garden"></div>
+                <div class="dday"><b>27 January 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="food*L snow*L"></div>
+                <div class="dday"><b>1 January 2024</b><span>Rotterdam</span></div>
+                <div class="g c8 dgrid" data-tiles="fire*V1 fire2*V1 fire3*V2 wedding*L city memoji*L indoor*V7 notes"></div>
+                <div class="dday"><b>1 January 2023</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="fire*L indoor2 crowd market road rocks sea lisbon"></div>
+              </div>
+            </div>
+          </div>
+        </div></div>
+        <figcaption><b>Photos</b>The sidebar holds what were tabs, plus People, Places, media types and your albums, each one click away. Search is always at the top, with a keyboard shortcut. A size slider replaces the zoom buttons and stops at sensible limits, and hovering a photo shows its select and download buttons.<span class="refs">Fixes #7 #18 #19 #20 #48</span></figcaption>
+      </figure>
+
+      <figure class="shot xl">
+        <div class="scrollx"><div class="browser app">
+          <div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/photos/IMG_1073</div></div>
+          <div class="dv">
+            <div class="dv-stage">
+              <div class="dv-top">
+                <span class="ibtn"><svg class="i"><use href="#i-back"/></svg></span>
+                <div class="vt"><b>Malmö</b><span>Thursday, 10 October 2024 · 22:41</span></div>
+                <div class="dv-acts">
+                  <span class="ibtn"><svg class="i"><use href="#i-share"/></svg></span>
+                  <span class="ibtn"><svg class="i"><use href="#i-heart"/></svg></span>
+                  <span class="ibtn"><svg class="i"><use href="#i-addalbum"/></svg></span>
+                  <span class="ibtn" style="position:relative"><svg class="i"><use href="#i-download"/></svg><span class="tip">Download original</span></span>
+                  <span class="ibtn"><svg class="i"><use href="#i-trash"/></svg></span>
+                  <span class="ibtn on"><svg class="i"><use href="#i-info"/></svg></span>
+                </div>
+              </div>
+              <div class="dv-photo">
+                <span class="dv-arrow l"><svg class="i"><use href="#i-back"/></svg></span>
+                <div class="pic ph-aurora"><span class="livechip"><svg class="i"><use href="#i-live"/></svg>LIVE</span></div>
+                <span class="dv-arrow r"><svg class="i"><use href="#i-chev"/></svg></span>
+              </div>
+              <div class="film" data-tiles="forest field tunnel aurora*C shot notif portrait garden food snow fire"></div>
+            </div>
+            <aside class="dv-info">
+              <div class="irow"><b>Thursday, 10 October 2024</b><span>22:41 · IMG_1073.HEIC · 3.1 MB</span></div>
+              <div class="vmap"><span class="pinw"><svg class="i"><use href="#i-pin"/></svg></span><em>Malmö, Sweden</em></div>
+              <div class="cam"><b>iPhone 15 Pro Max</b><span>Ultra Wide · 13 mm · f/2.2 · 1/2 s · ISO 3200</span><span>4032 × 3024</span></div>
+              <div class="vh">Tags</div>
+              <div class="tags"><span>Aurora</span><span>Night sky</span><span>Coast</span><span>City lights</span></div>
+              <div class="vh">In albums</div>
+              <div class="row"><span class="th ph-aurora" style="width:36px;height:36px;border-radius:8px"></span><div class="rt"><b>Malmö nights</b><span>4 items · shared</span></div></div>
+              <div class="vh">Your rating</div>
+              <div class="vstars"><svg class="i"><use href="#i-star"/></svg><svg class="i"><use href="#i-star"/></svg><svg class="i"><use href="#i-star"/></svg><svg class="i"><use href="#i-star"/></svg><svg class="i"><use href="#i-star"/></svg></div>
+            </aside>
+          </div>
+        </div></div>
+        <figcaption><b>Viewer</b>The photo takes the middle of the screen, and info sits beside it instead of covering it. Every icon button has a tooltip, the arrow keys move between photos, and the filmstrip shows where you are. Rating lives in the info panel, out of the main toolbar.<span class="refs">Fixes #9 #22 #23 #24 #45</span></figcaption>
+      </figure>
+
+      <figure class="shot xl">
+        <div class="scrollx"><div class="browser app">
+          <div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/albums/malmo-nights</div></div>
+          <div class="dapp">
+            <aside class="side" data-side="a-malmo"></aside>
+            <div class="dmain">
+              <div class="dtop" data-dtop></div>
+              <div class="dbody">
+                <div class="dbanner ph-aurora" style="height:116px"><div class="hero-t"><h3>Malmö nights</h3><span>4 items · October 2024 – January 2024</span></div></div>
+                <div class="dacts">
+                  <span class="btn sm"><svg class="i"><use href="#i-addalbum"/></svg>Add photos</span>
+                  <span class="btn sm pri"><svg class="i"><use href="#i-share"/></svg>Share</span>
+                  <span class="status inl"><svg class="i"><use href="#i-link"/></svg>Anyone with the link can view · ends 18 Nov</span>
+                  <span class="sp"></span>
+                  <span class="link" style="font-size:13.5px">Select</span>
+                  <span class="ibtn ghost"><svg class="i"><use href="#i-more"/></svg></span>
+                </div>
+                <div class="g c6 dgrid" data-tiles="aurora food*L fire*L snow*L"></div>
+                <div class="pop share">
+                  <div class="ph"><b>Share “Malmö nights”</b><span class="ibtn ghost"><svg class="i"><use href="#i-close"/></svg></span></div>
+                  <div class="row" style="padding:0"><svg class="i" style="color:var(--accent)"><use href="#i-link"/></svg><div class="rt"><b>Link sharing</b><span>Anyone with the link sees these 4 items, nothing else.</span></div><span class="tg on"></span></div>
+                  <div style="display:flex;gap:8px"><div class="field" style="flex:1;height:38px"><span>…/s/7Kq2x9</span></div><span class="btn sm"><svg class="i"><use href="#i-copy"/></svg>Copy link</span></div>
+                  <div style="display:flex;flex-direction:column;gap:6px"><span class="lbl">Link expires · stops working on 18 November 2026</span><div class="seg"><span>1 day</span><span class="on">7 days</span><span>30 days</span><span>Never</span></div></div>
+                  <div class="row" style="padding:0"><svg class="i" style="color:var(--muted)"><use href="#i-lock"/></svg><div class="rt"><b>Ask for a code</b><span>Protected links open a little slower.</span></div><span class="tg"></span></div>
+                  <div class="pf"><span class="link dan" style="font-size:13px">Stop sharing</span><span class="btn sm pri">Done</span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div></div>
+        <figcaption><b>An album, sharing open</b>Share opens a small panel beside the button, so you set the expiry and an optional code without leaving the album. The sharing status stays visible next to the actions after the panel closes.<span class="refs">Fixes #4 #5 #11</span></figcaption>
+      </figure>
+
+      <figure class="shot xl">
+        <div class="scrollx"><div class="browser app">
+          <div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/people</div></div>
+          <div class="dapp">
+            <aside class="side" data-side="people"></aside>
+            <div class="dmain">
+              <div class="dtop" data-dtop></div>
+              <div class="dbody split">
+                <div class="sl">
+                  <div class="dph"><h3>People<small>9 people</small></h3><span class="link" style="font-size:13.5px">Select</span></div>
+                  <div class="banner wide">
+                    <div class="stack"><span class="av" data-av="4"></span><span class="av" data-av="5"></span><span class="av" data-av="6"></span></div>
+                    <div class="rt"><b>Name 7 more people</b><span>Names make them searchable, like “Asha in Malmö”.</span></div>
+                    <span class="btn sm pri">Start naming</span>
+                  </div>
+                  <div class="dsh">Named</div>
+                  <div class="ppl d">
+                    <div class="pp"><span class="av" data-av="0"></span><b>Asha</b><span>3 photos</span></div>
+                    <div class="pp"><span class="av" data-av="2"></span><b>Rajat</b><span>2 photos</span></div>
+                  </div>
+                  <div class="dsh">Not named yet</div>
+                  <div class="ppl d">
+                    <div class="pp cur"><span class="av" data-av="1"></span><span class="add">Add name</span><span>2 photos</span></div>
+                    <div class="pp"><span class="av" data-av="3"></span><span class="add">Add name</span><span>1 photo</span></div>
+                    <div class="pp"><span class="av" data-av="4"></span><span class="add">Add name</span><span>1 photo</span></div>
+                    <div class="pp"><span class="av" data-av="5"></span><span class="add">Add name</span><span>1 photo</span></div>
+                    <div class="pp"><span class="av" data-av="6"></span><span class="add">Add name</span><span>1 photo</span></div>
+                    <div class="pp"><span class="av" data-av="7"></span><span class="add">Add name</span><span>1 photo</span></div>
+                  </div>
+                </div>
+                <aside class="panel">
+                  <div class="who">
+                    <span class="av" data-av="1"></span>
+                    <div class="field focus"><span style="flex:none">Ne</span><i class="caret"></i><span></span></div>
+                    <small>2 photos · first seen 10 October 2024</small>
+                  </div>
+                  <div class="same">
+                    <div class="pair"><span class="av" data-av="1"></span><span class="av" data-av="8"></span><div class="rt"><b>Same person?</b><span>Might also be them, in 1 more photo.</span></div></div>
+                    <div style="display:flex;gap:8px"><span class="btn sm pri" style="flex:1">Yes, merge</span><span class="btn sm" style="flex:1">Not the same</span></div>
+                  </div>
+                  <div class="lbl">Photos · 1 selected</div>
+                  <div class="g c3" data-tiles="field*L*s tunnel*S"></div>
+                  <div style="display:flex;gap:8px"><span class="btn sm"><svg class="i"><use href="#i-userx"/></svg>Not this person</span><span class="btn sm">Use as cover</span></div>
+                </aside>
+              </div>
+            </div>
+          </div>
+        </div></div>
+        <figcaption><b>People</b>Clicking a face opens their details beside the grid, without changing page. There you name them, confirm look-alikes, and remove a photo that isn't them.<span class="refs">Fixes #12 #41</span></figcaption>
+      </figure>
+
+      <figure class="shot xl">
+        <div class="scrollx"><div class="browser app">
+          <div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/photos</div></div>
+          <div class="dapp">
+            <aside class="side" data-side="photos"></aside>
+            <div class="dmain">
+              <div class="dtop" data-dtop="bell"></div>
+              <div class="dbody">
+                <div class="dph"><h3>Photos<small>31 items</small></h3></div>
+                <div class="dday"><b>10 October 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="aurora forest field*L tunnel shot notif portrait garden"></div>
+                <div class="dday"><b>27 January 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="food*L snow*L"></div>
+                <div class="dday"><b>1 January 2024</b><span>Rotterdam</span></div>
+                <div class="g c8 dgrid" data-tiles="fire*V1 fire2*V1 fire3*V2 wedding*L city memoji*L indoor*V7 notes"></div>
+              </div>
+              <div class="pop np">
+                <div class="ph"><b>Notifications</b><span class="link" style="font-size:13px">Mark all read</span></div>
+                <div class="gl">Today</div>
+                <div class="nt unread">
+                  <span class="ni"><svg class="i"><use href="#i-upload"/></svg></span>
+                  <div class="nb"><div class="top2"><b>31 items uploaded</b><span class="ntime">01:12</span></div><p>All processed in 4 minutes. 9 people found.</p><div class="strip" data-tiles="aurora forest field tunnel food fire"></div></div>
+                </div>
+                <div class="nt unread">
+                  <span class="ni warn"><svg class="i"><use href="#i-alert"/></svg></span>
+                  <div class="nb"><div class="top2"><b>1 video couldn't be processed</b><span class="ntime">01:14</span></div><p>IMG_0633.mov uses a format Keepsake can't read yet.</p><div class="nacts"><span class="btn sm pri"><svg class="i"><use href="#i-refresh"/></svg>Try again</span><span class="btn sm">Show video</span></div></div>
+                </div>
+                <div class="nt">
+                  <span class="ni"><svg class="i"><use href="#i-users"/></svg></span>
+                  <div class="nb"><div class="top2"><b>7 people to name</b><span class="ntime">01:15</span></div></div>
+                </div>
+                <div class="gl">Yesterday</div>
+                <div class="nt">
+                  <span class="ni"><svg class="i"><use href="#i-mail"/></svg></span>
+                  <div class="nb"><div class="top2"><b>Invite to dev@example.com ends tomorrow</b><span class="ntime">09:02</span></div></div>
+                </div>
+                <div class="pf"><span class="lbl" style="font-weight:500">Kept for 30 days</span><span class="link" style="font-size:13px">Notification settings</span></div>
+              </div>
+            </div>
+          </div>
+        </div></div>
+        <figcaption><b>Notifications</b>The bell opens a panel over whatever you're doing, so checking it never takes you away. Each item carries its one action, and settings are a click away.<span class="refs">Fixes #34 #35 #36 #37</span></figcaption>
+      </figure>
+
+      <figure class="shot xl">
+        <div class="scrollx"><div class="browser app">
+          <div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/library</div></div>
+          <div class="dapp">
+            <aside class="side" data-side="library"></aside>
+            <div class="dmain">
+              <div class="dtop" data-dtop></div>
+              <div class="dbody">
+                <div class="dph"><h3>Library &amp; sharing</h3></div>
+                <div class="cols">
+                  <div>
+                    <div class="list"><div class="row"><div class="rt"><b style="font:600 19px var(--font-display)">Verma family</b><span>31 items · 2 of 15 members</span></div><span class="btn sm"><svg class="i"><use href="#i-pencil"/></svg>Rename</span></div></div>
+                    <div class="list">
+                      <table class="tbl">
+                        <thead><tr><th>Member</th><th>Role</th><th>Status</th><th></th></tr></thead>
+                        <tbody>
+                          <tr><td><div class="who2"><span class="ini">RA</span><div>Rajat<small>You</small></div></div></td><td><span class="pill">Owner</span></td><td class="mut">Since 10 Nov</td><td></td></tr>
+                          <tr><td><div class="who2"><span class="av" data-av="0"></span><div>Asha<small>asha@example.com</small></div></div></td><td>Member</td><td class="mut">Joined 3 Nov</td><td><span class="link mut" style="font-size:13px">Remove</span></td></tr>
+                          <tr><td><div class="who2"><span class="ini"><svg class="i" style="width:15px;height:15px"><use href="#i-mail"/></svg></span><div>dev@example.com<small>Invited 9 Nov</small></div></div></td><td>Member</td><td class="mut">Ends tomorrow</td><td><span class="link" style="font-size:13px">Resend</span></td></tr>
+                        </tbody>
+                      </table>
+                    </div>
+                    <div><span class="link dan" style="font-size:13px">Delete everything in this library…</span><div class="lbl" style="font-weight:500;margin-top:3px">Removes every photo for every member. Asks for your password and an email confirmation first.</div></div>
+                  </div>
+                  <div class="pcard">
+                    <h4>Invite someone</h4>
+                    <div style="display:flex;flex-direction:column;gap:6px"><span class="lbl">Email address</span><div class="field focus" style="height:40px"><span style="flex:none">neha@example.com</span><i class="caret"></i><span></span></div></div>
+                    <span class="lbl">What should they get?</span>
+                    <div class="opt on"><span class="radio"></span><div><b>Join Verma family</b><span>They see all 31 items and can add their own.</span></div></div>
+                    <div class="opt"><span class="radio"></span><div><b>Their own library</b><span>A separate, empty library. Nothing here is shared.</span></div></div>
+                    <p class="note" style="margin:0"><svg class="i"><use href="#i-clock"/></svg><span>The link works once and ends after 72 hours.</span></p>
+                    <span class="btn pri wide"><svg class="i"><use href="#i-userplus"/></svg>Send invite</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div></div>
+        <figcaption><b>Library &amp; sharing</b>Members, pending invites and the invite form share one page. The two invite choices are spelled out, and the destructive option sits apart, under the list.<span class="refs">Fixes #13 #43 #44 #46</span></figcaption>
+      </figure>
+
+      <figure class="shot xl">
+        <div class="scrollx"><div class="browser app">
+          <div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/s/7Kq2x9</div></div>
+          <div class="shd">
+            <div class="dk-top" style="padding:14px 24px"><span class="mk"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span>Keepsake</span><span class="btn sm off"><svg class="i"><use href="#i-download"/></svg>Download all</span></div>
+            <div class="dbanner ph-aurora" style="height:230px;margin:0 24px"><div class="hero-t"><h3>Malmö nights</h3><span>Shared by Rajat · 4 items · October 2024 – January 2024</span></div></div>
+            <div class="g c4 dgrid" style="padding:16px 24px 0" data-tiles="food*L fire*L snow*L tunnel"></div>
+            <div class="float">
+              <div class="fr"><b>Getting the download ready</b><span class="lbl" style="font-weight:500">a few seconds</span></div>
+              <div class="prog"><i style="width:62%"></i></div>
+              <span style="color:var(--muted)">You can look through everything now.</span>
+            </div>
+          </div>
+        </div></div>
+        <figcaption><b>Shared album, instant version</b>On a computer it also opens straight from storage, with the cover across the top and the photos large. Download all turns on once the full album is awake. The full version is shown earlier, in “Shared album, full version”.<span class="refs">Fixes #16 #40</span></figcaption>
+      </figure>
+    </div>
+  </section>
+</main>
+
+<script>
+(function () {
+  var $ = function (s) { return document.querySelectorAll(s); };
+  var icon = function (n) { return '<svg class="i" aria-hidden="true"><use href="#i-' + n + '"/></svg>'; };
+
+  $('[data-sb]').forEach(function (el) {
+    el.innerHTML = '<span>9:41</span><span class="sb-r"><i class="bars"><b></b><b></b><b></b><b></b></i><i class="batt"></i></span>';
+  });
+
+  $('[data-tabs]').forEach(function (el) {
+    var on = el.getAttribute('data-tabs');
+    el.innerHTML = [['photos', 'Photos'], ['search', 'Search'], ['albums', 'Albums']].map(function (t) {
+      return '<span class="tab' + (t[0] === on ? ' on' : '') + '">' + icon(t[0]) + '<span>' + t[1] + '</span></span>';
+    }).join('') + '<i class="home"></i>';
+  });
+
+  // Tile tokens: name*flags. L = Live, V<n> = video of n seconds, S = selected, s = selectable,
+  // A = already in album, H = hover with select and download, x = still loading.
+  $('[data-tiles]').forEach(function (el) {
+    el.innerHTML = el.getAttribute('data-tiles').trim().split(/\s+/).map(function (tok) {
+      var parts = tok.split('*'), k = parts[0], f = parts.slice(1);
+      if (k === 'x') return '<div class="t empty"></div>';
+      var cls = 't ph-' + k, inner = '';
+      f.forEach(function (x) {
+        if (x === 'L') inner += '<span class="lv">' + icon('live') + '</span>';
+        else if (x[0] === 'V') inner += '<span class="du">0:0' + x.slice(1) + '</span>';
+        else if (x === 'S') { cls += ' sel'; inner += '<span class="ck">' + icon('check') + '</span>'; }
+        else if (x === 's') inner += '<span class="ck">' + icon('check') + '</span>';
+        else if (x === 'A') { cls += ' in'; inner += '<span class="tag">Added</span>'; }
+        else if (x === 'H') { cls += ' hov'; inner += '<span class="ck tl"></span><span class="dl">' + icon('download') + '</span>'; }
+        else if (x === 'C') cls += ' cur';
+      });
+      return '<div class="' + cls + '">' + inner + '</div>';
+    }).join('');
+  });
+
+  // Desktop sidebar and top bar
+  var SIDE = [
+    ['photos', 'photos', 'Photos', '31'], ['albums', 'albums', 'Albums', '2'], ['people', 'users', 'People', '9'], ['places', 'pin', 'Places', '8'],
+    ['-', 'Media'], ['videos', 'video', 'Videos', '10'], ['live', 'live', 'Live Photos', '9'], ['liked', 'heart', 'Liked', ''],
+    ['-', 'Your albums'], ['a-malmo', 'ph-aurora', 'Malmö nights', '4'], ['a-india', 'ph-rocks', 'India 2024', '6']
+  ];
+  var FOOT = [['deleted', 'trash', 'Recently Deleted', ''], ['library', 'users', 'Library & sharing', '']];
+  function sideItem(s, on) {
+    var lead = s[1].indexOf('ph-') === 0 ? '<span class="sthumb ' + s[1] + '"></span>' : icon(s[1]);
+    return '<span class="si' + (s[0] === on ? ' on' : '') + '">' + lead + s[2] + (s[3] ? '<em>' + s[3] + '</em>' : '') + '</span>';
+  }
+  $('[data-side]').forEach(function (el) {
+    var on = el.getAttribute('data-side');
+    el.innerHTML = '<span class="mk"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span>Keepsake</span>' +
+      SIDE.map(function (s) { return s[0] === '-' ? '<div class="sgl">' + s[1] + '</div>' : sideItem(s, on); }).join('') +
+      '<div class="sfoot">' + FOOT.map(function (s) { return sideItem(s, on); }).join('') + '</div>';
+  });
+  $('[data-dtop]').forEach(function (el) {
+    var bellOn = el.getAttribute('data-dtop') === 'bell';
+    el.innerHTML = '<div class="dsearch">' + icon('search') + '<span>Search people, places and things</span><kbd>/</kbd></div><span class="sp"></span>' +
+      '<span class="btn sm pri">' + icon('upload') + 'Upload</span><span class="ibtn dot' + (bellOn ? ' on' : '') + '">' + icon('bell') + '</span><span class="me">RA</span>';
+  });
+
+  // Illustrated faces for the people screens (examples, not real people)
+  var AV = [
+    ['#d2a07f', '#2b1d14', '#7a3b45', '#e3c6b6', 1], ['#b07a5a', '#1d1612', '#3b5b7a', '#9fb6c7', 0],
+    ['#c99a7a', '#22170f', '#c08a3a', '#d9cbb5', 0], ['#8e5f45', '#1d1612', '#4c6b3c', '#b9cfb0', 0],
+    ['#e0b494', '#5b4636', '#5a4a7a', '#c7b9d6', 1], ['#c48c6a', '#2b1d14', '#2f4f6a', '#e8d2a8', 0],
+    ['#a86f50', '#9c9c9c', '#6a4a3a', '#cfd6dc', 0], ['#d9a988', '#3a2a20', '#8a4a5a', '#f0d9c8', 1],
+    ['#b38363', '#1d1612', '#3a5a6a', '#c9d9e0', 0]
+  ];
+  function face(n) {
+    var a = AV[n % AV.length], s = a[0], h = a[1], c = a[2], b = a[3], long = a[4];
+    var back = long ? '<path d="M30 72C25 52 27 30 36 23c8-7 22-7 30 0 8 8 8 29 4 49-4-8-4-18-4-26-6-8-14-11-22-10-6 2-10 10-10 20z" fill="' + h + '"/>' : '';
+    var top = long ? 'M33 44C31 26 42 19 51 19c11 0 18 8 16 25-4-8-11-12-20-12-6 0-11 5-14 12z' : 'M33.5 42C32 27 41 21 51 21s18 6 16 21c-3-7-9-10-17-10-7 0-13 3-16.5 10z';
+    return '<svg viewBox="0 0 100 100" aria-hidden="true"><rect width="100" height="100" fill="' + b + '"/>' + back +
+      '<path d="M12 104C16 76 33 67 50 67s34 9 38 37z" fill="' + c + '"/><rect x="43" y="56" width="14" height="14" rx="5" fill="' + s + '"/>' +
+      '<ellipse cx="50" cy="44" rx="16.5" ry="19.5" fill="' + s + '"/><path d="' + top + '" fill="' + h + '"/></svg>';
+  }
+  $('[data-av]').forEach(function (el) { el.innerHTML = face(+el.getAttribute('data-av')); });
+
+  // Theme toggle: no attribute means "follow the system"
+  var root = document.documentElement, btn = document.getElementById('theme');
+  try { var saved = localStorage.getItem('ks-redesign-theme'); if (saved) root.setAttribute('data-theme', saved); } catch (e) {}
+  function current() { return root.getAttribute('data-theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'); }
+  function label() {
+    var dark = current() === 'dark';
+    btn.querySelector('span').textContent = dark ? 'Light mode' : 'Dark mode';
+    btn.querySelector('use').setAttribute('href', dark ? '#i-sun' : '#i-moon');
+  }
+  btn.addEventListener('click', function () {
+    var next = current() === 'dark' ? 'light' : 'dark';
+    root.setAttribute('data-theme', next);
+    try { localStorage.setItem('ks-redesign-theme', next); } catch (e) {}
+    label();
+  });
+  label();
+})();
+</script>
+</body>
+</html>
