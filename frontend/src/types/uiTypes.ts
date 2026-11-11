@@ -9,6 +9,8 @@ export interface Photo {
     thumbnailUrl?: string;
     /** Physical thumbnail blob name (token mode); build the URL with mediaToken.ts. */
     thumbnailBlob?: string;
+    /** Sharper grid-tile image blob name (token mode), present only once it exists. */
+    gridBlob?: string;
     thumbnailRotation?: number;
     size: number;
     lastModified?: string | null;

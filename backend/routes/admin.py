@@ -275,6 +275,44 @@ def admin_backfill_photos():
         'processingMode': app.PROCESSING_MODE,
     })
 
+def _uploads_open(user_id) -> bool:
+    """True while an upload session is feeding a wave in this wave-owned library."""
+    if not app._library_cut_over_to_waves(user_id):
+        return False
+    from upload_waves import ShadowWaves
+    return bool((ShadowWaves(app.jobs_table_client, user_id)._get('control') or {}).get('collectingWaveId'))
+
+
+@admin_bp.route('/api/admin/backfill/grid-images', methods=['POST'])
+@admin_bp.route('/admin/backfill/grid-images', methods=['POST'])
+def admin_backfill_grid_images():
+    """Queue sharp grid-tile images (grid_images.py) for every photo in the
+    library that has a preview but no grid image yet.
+
+    Runs on the clustering worker, not in this request: batches of
+    grid_images.BATCH_SIZE photos, each queueing its own continuation. It reads
+    previews only, never originals, and skips photos that already have a grid
+    image, so it is safe to repeat. Refused while uploads are open (pass
+    "force": true to override a stale upload); photos still being processed
+    are skipped either way and picked up by their wave's own grid job.
+    """
+    user_id, error = app._require_library_owner_id()
+    if error:
+        return error
+    data = app.request.get_json(silent=True) or {}
+    if data.get('repair') is not True or data.get('confirm') != 'BACKFILL_GRID_IMAGES':
+        return app.jsonify({'error': 'repair confirmation required', 'code': 'protected_repair_required'}), 403
+    if not app.grid_images.enabled():
+        return app.jsonify({'error': 'Grid images are disabled', 'code': 'grid_images_disabled'}), 503
+    if data.get('force') is not True and _uploads_open(user_id):
+        return app.jsonify({'error': 'Photos are uploading; run the backfill once uploads finish.',
+                            'code': 'upload_in_progress'}), 409
+    queued = app._enqueue_grid_images(user_id, reason='admin_backfill')
+    if not queued:
+        return app.jsonify({'error': 'Background queue is unavailable', 'code': 'queue_unavailable'}), 503
+    return app.jsonify({'queued': True, 'batchSize': app.grid_images.BATCH_SIZE}), 202
+
+
 @admin_bp.route('/api/admin/people/verify-face-index', methods=['POST'])
 @admin_bp.route('/admin/people/verify-face-index', methods=['POST'])
 def admin_verify_face_index():

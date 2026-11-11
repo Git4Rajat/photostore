@@ -630,6 +630,12 @@ describe('index-backed gallery', () => {
         expect('liveClip' in galleryIndexPhoto(row, null)).toBe(false);
     });
 
+    it('carries the grid-tile image blob only once the index row has one', () => {
+        const row = rows()[0];
+        expect(galleryIndexPhoto({ ...row, grid: 'grid/p0.webp' }, null).gridBlob).toBe('grid/p0.webp');
+        expect('gridBlob' in galleryIndexPhoto(row, null)).toBe(false);
+    });
+
     it('reuses loaded albums on repeat visits, including an empty list', async () => {
         render(<StoreProvider><Probe /></StoreProvider>);
         await waitFor(() => expect(store.photosLoading).toBe(false));

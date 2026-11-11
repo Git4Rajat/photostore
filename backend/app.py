@@ -60,8 +60,10 @@ from image_utils import (
     RAW_EXTENSIONS_CINEMA,
     RAW_EXTENSIONS_RAWPY,
     VIDEO_EXTENSIONS,
+    GRID_CONTENT_TYPE,
     allowed_file,
     convert_image_to_jpeg,
+    create_grid_image_data,
     crop_face_thumbnail,
     create_placeholder_thumbnail,
     extract_raw_native_preview_bytes,
@@ -246,6 +248,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 worker_logger = logging.getLogger(__name__)
 import album_store
+import grid_images
 import share_snapshot
 import perf_instrumentation
 import table_scan
@@ -2628,6 +2631,8 @@ def _build_photo_summary(user_id: str, filename: str, metadata: Dict, include_pr
         'url': media_urls['url'],
         'thumbnailUrl': '' if _direct_thumbnail_blob(metadata, filename) else _thumbnail_url_from_metadata(metadata, filename),
         **({'thumbnailBlob': _direct_thumbnail_blob(metadata, filename)} if _direct_thumbnail_blob(metadata, filename) else {}),
+        # Token mode only, like thumbnailBlob: the grid's srcset image (see grid_images.py).
+        **({'gridBlob': grid_images.served_blob(metadata)} if _direct_media_requested() and grid_images.served_blob(metadata) else {}),
         'size': size,
         'lastModified': last_modified_iso,
         'uploadDate': upload_dt.isoformat() if upload_dt else None,
@@ -11298,6 +11303,79 @@ def _looks_like_jpeg(data: bytes) -> bool:
     return bool(data) and data.startswith(b'\xff\xd8')
 
 
+def _make_grid_image(user_id: str, row: Dict) -> bool:
+    """Grid image for one photo, from its preview (see grid_images.py). The
+    published derivative receipt is authoritative; older photos only have the
+    preview/<physical>.jpg cache blob."""
+    filename = str(row.get('RowKey') or '')
+    physical = _blob_name_from_metadata(row, filename)
+    sources = [_preview_cache_blob_name(physical)]
+    try:
+        published = _derivative_blob_from_metadata(row, filename, 'preview', physical=physical)
+        if published and published not in sources:
+            sources.insert(0, published)
+    except ValueError:
+        pass
+    preview, source = None, ''
+    for source in sources:
+        try:
+            preview = download_media_bytes('thumbnail', source)
+            break
+        except ResourceNotFoundError:
+            continue
+    if not preview:
+        worker_logger.warning('Grid image skipped for %s/%s: no preview blob', user_id, filename)
+        return False
+    try:
+        data, width, height = create_grid_image_data(preview)
+    except Exception:
+        worker_logger.warning('Grid image skipped for %s/%s: preview %s did not decode', user_id, filename, source)
+        return False
+    name = grid_images.blob_name(physical)
+    upload_media_file('thumbnail', name, data, GRID_CONTENT_TYPE)
+    stamp = grid_images.record(name, width, height, len(data), source)
+    saved = _update_metadata_entity_fields(user_id, filename, {grid_images.FIELD: stamp},
+                                           derive_updates=lambda entity: grid_images.stamp_updates(entity, stamp))
+    return saved is not None
+
+
+def _enqueue_grid_images(user_id: str, *, cursor: str = '', since: str = '', reason: str = '') -> bool:
+    """Queue a grid_images batch for a library (see grid_images.py). ``since``
+    limits the scan to rows changed after that UTC time (an upload wave's
+    start), so a finished wave doesn't rescan the whole library."""
+    if not user_id or not grid_images.enabled() or clustering_queue_client is None:
+        return False
+    try:
+        clustering_queue_client.send_message(grid_images.job_message(user_id, cursor=cursor, since=since, reason=reason))
+        return True
+    except Exception:
+        worker_logger.warning('Grid image job enqueue failed for %s', user_id, exc_info=True)
+        return False
+
+
+def _run_grid_image_job(payload: Dict) -> None:
+    user_id = str(payload.get('user_id') or '')
+    if not user_id or metadata_table_client is None or not grid_images.enabled():
+        return
+    cursor = str(payload.get('cursor') or '')
+    since = grid_images.valid_since(payload.get('since'))
+    reason = str(payload.get('reason') or '')[:64]
+    filters = ["preview_status eq 'done'"]
+    if cursor:
+        filters.append(f"RowKey gt '{_escape_odata(cursor)}'")
+    if since:
+        filters.append(f"Timestamp ge datetime'{since}'")
+    rows = _iter_metadata_rows_for_user(user_id, select=list(grid_images.SOURCE_FIELDS),
+                                        extra_filter=' and '.join(filters), purpose='grid_images.scan')
+    result = grid_images.run_batch(rows, lambda row: _make_grid_image(user_id, row), limit=grid_images.BATCH_SIZE)
+    continued = bool(result['cursor']) and _enqueue_grid_images(user_id, cursor=result['cursor'], since=since, reason=reason)
+    if result['cursor'] and not continued:
+        # Raise so the queue redelivers this batch; its finished photos are skipped next time.
+        raise RuntimeError('Grid image continuation could not be queued')
+    worker_logger.info('grid images batch: library=%s reason=%s scanned=%d made=%d failed=%d continued=%s',
+                       user_id, reason or '-', result['scanned'], result['made'], result['failed'], continued)
+
+
 PREVIEW_JOB_TYPE = 'media_preview'
 # Per-user derived-index build job (sort/lexical/albums/people). Written by the
 # tools role's /api/tools/indexes/build route as it runs
@@ -14663,6 +14741,9 @@ def _delete_photo_blobs_if_present(blob_name: str, extra_blob_names: Optional[Li
         error = _delete_blob_if_present(BLOB_THUMBNAIL_CONTAINER, f'metadata/{name}.bin')
         if error:
             errors.append(f'blob metadata: {error}')
+        error = _delete_blob_if_present(BLOB_THUMBNAIL_CONTAINER, grid_images.blob_name(name))
+        if error:
+            errors.append(f'blob grid: {error}')
     return errors
 
 
@@ -15329,6 +15410,11 @@ def _hard_delete_photos_chunk(user_id: str, filenames: List[str]) -> Tuple[List[
     for failed_blob in _batch_delete_blobs(BLOB_THUMBNAIL_CONTAINER, list(metadata_blob_to_names)):
         for safe_name in metadata_blob_to_names.get(failed_blob, ()):
             blob_errors_by_name.setdefault(safe_name, []).append('blob metadata: delete failed')
+    # Named by physical blob, so no metadata read is needed; never-made ones 404 (counted as gone).
+    grid_blob_to_names = {grid_images.blob_name(name): owners for name, owners in blob_to_names.items()}
+    for failed_blob in _batch_delete_blobs(BLOB_THUMBNAIL_CONTAINER, list(grid_blob_to_names)):
+        for safe_name in grid_blob_to_names.get(failed_blob, ()):
+            blob_errors_by_name.setdefault(safe_name, []).append('blob grid: delete failed')
 
     for safe_name, metadata in own_rows_by_name.items():
         if safe_name in shared_names:
@@ -16134,6 +16220,8 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
         return run_artifact_cleanup(payload)
     if payload.get('type') == SHARE_SNAPSHOT_JOB_TYPE:
         return _run_share_snapshot_job(payload)
+    if payload.get('type') == grid_images.JOB_TYPE:
+        return _run_grid_image_job(payload)
     from wave_policy import legacy_message_suppressed
     if legacy_message_suppressed(jobs_table_client,user_id,payload):
         return

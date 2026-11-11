@@ -102,6 +102,7 @@ export const mapPhoto = (b: BackendPhoto, token: MediaToken | null = getCachedMe
         // Token mode: the backend sends a blob name and the browser builds the
         // direct URL; otherwise (or for proxy fallbacks) the backend's URL.
         thumbnailUrl: (b.thumbnailBlob && token ? thumbnailUrlForBlob(b.thumbnailBlob, token) : '') || b.thumbnailUrl,
+        ...(b.gridBlob ? { gridBlob: b.gridBlob } : {}),
         rotation: b.rotation,
         thumbnailRotation: b.thumbnailRotation,
         captureDate: iso,
@@ -134,6 +135,7 @@ export const galleryIndexPhoto = (row: SortIndexRow, token: MediaToken | null): 
         thumbnailRotation: row.gallery?.thumbnailRotation,
         processing: row.gallery?.processing,
         thumbnailUrl: thumbnailUrlForBlob(row.thumb, token) || `/api/photos/thumbnail/${encodeURIComponent(row.filename)}`,
+        ...(row.grid ? { gridBlob: row.grid } : {}),
         captureDate: iso,
         ...(row.gallery?.liveClip ? { liveClip: row.gallery.liveClip } : {}),
     };

@@ -110,6 +110,15 @@ def execute_wave_handoffs(work, store, library, wave_id, send):
             index_events.publish(library, 'wave', wave['completionReceiptId'])
         except Exception:
             pass
+        # The wave's previews are published: queue their grid images, scanning
+        # only rows changed since the wave opened. Best-effort, like the event
+        # above; a later wave or the admin backfill catches anything missed.
+        try:
+            import app
+            import grid_images
+            app._enqueue_grid_images(library, since=grid_images.since_from_epoch(wave.get('createdAt')), reason='wave')
+        except Exception:
+            logging.getLogger(__name__).warning('Grid image enqueue failed for wave %s', wave_id, exc_info=True)
     return 'done'
 
 
