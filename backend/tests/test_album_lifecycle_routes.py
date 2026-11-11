@@ -153,6 +153,23 @@ def test_share_clear_access_code_removes_it(client):
     assert table.get_entity('u1', album['id'])['accessCode'] == ''
 
 
+def test_share_keep_expiry_changes_the_code_but_not_the_expiry(client):
+    http, table = client
+    album = _create(http)
+    http.post(f"/albums/{album['id']}/share", json={'expiresInDays': 0})
+    # The fallback day count is what an older server would have applied.
+    http.post(f"/albums/{album['id']}/share", json={'expiresInDays': 3, 'keepExpiry': True, 'accessCode': 'secret'})
+    entity = table.get_entity('u1', album['id'])
+    assert entity['publicExpiresAt'] == '' and entity['accessCode']
+
+    http.post(f"/albums/{album['id']}/share", json={'expiresInDays': 30})
+    expires = table.get_entity('u1', album['id'])['publicExpiresAt']
+    assert expires
+    http.post(f"/albums/{album['id']}/share", json={'expiresInDays': 30, 'keepExpiry': True, 'clearAccessCode': True})
+    entity = table.get_entity('u1', album['id'])
+    assert entity['publicExpiresAt'] == expires and entity['accessCode'] == ''
+
+
 def test_share_disabled_clears_the_token_and_index(client):
     http, table = client
     album = _create(http)

@@ -36,9 +36,11 @@ function Probe() {
 const sharedAlbum = { id: 'a1', name: 'Trip', photoCount: 0, isPublic: true, publicUrl: 'https://keepsake.invalid/public/album/t1' };
 const shareCalls = () => mocks.post.mock.calls.filter(([path]) => path === '/albums/a1/share');
 const revokeCalls = () => mocks.post.mock.calls.filter(([path]) => path === '/albums/a1/revoke');
+const inDays = (days: number) => new Date(Date.now() + days * 86_400_000).toISOString();
+const onDate = (iso: string) => `On ${new Date(iso).toLocaleDateString()}`;
 
-const renderAlbum = async (isPublic: boolean, hasAccessCode = false) => {
-    mocks.albumsIndex.mockResolvedValue([{ albumId: 'a1', name: 'Trip', photoCount: 0, coverFilename: '', isPublic, publicUrl: isPublic ? sharedAlbum.publicUrl : '', hasAccessCode }]);
+const renderAlbum = async (isPublic: boolean, extra: { hasAccessCode?: boolean; publicExpiresAt?: string } = {}) => {
+    mocks.albumsIndex.mockResolvedValue([{ albumId: 'a1', name: 'Trip', photoCount: 0, coverFilename: '', isPublic, publicUrl: isPublic ? sharedAlbum.publicUrl : '', ...extra }]);
     render(<StoreProvider><Probe /><AlbumsPage /></StoreProvider>);
     // The bare Albums tab: the first album shows without ?albumId.
     await act(async () => { store.navigate('albums', {}); });
@@ -48,8 +50,12 @@ const renderAlbum = async (isPublic: boolean, hasAccessCode = false) => {
 describe('album sharing', () => {
     beforeEach(() => {
         mocks.get.mockReset().mockResolvedValue({});
-        mocks.post.mockReset().mockImplementation(async (path: string) => (
-            path === '/albums/a1/share' ? { album: sharedAlbum } : { album: { ...sharedAlbum, isPublic: false, publicUrl: undefined } }
+        // Answers like the server: keepExpiry leaves the expiry alone, otherwise
+        // expiresInDays sets it (0 = never).
+        mocks.post.mockReset().mockImplementation(async (path: string, body: { expiresInDays?: number; keepExpiry?: boolean }) => (
+            path === '/albums/a1/share'
+                ? { album: { ...sharedAlbum, ...(body.keepExpiry ? {} : { publicExpiresAt: body.expiresInDays ? inDays(body.expiresInDays) : '' }) } }
+                : { album: { ...sharedAlbum, isPublic: false, publicUrl: undefined } }
         ));
         mocks.albumsIndex.mockReset();
         mocks.confirm.mockReset();
@@ -112,10 +118,10 @@ describe('album sharing', () => {
     // A protected album must not become reachable with the link alone
     // because the owner picked a different expiry.
     it('changing the link expiry keeps an existing access code', async () => {
-        await renderAlbum(true, true);
-        await act(async () => { fireEvent.change(screen.getByDisplayValue('In 7 days'), { target: { value: '30' } }); });
+        await renderAlbum(true, { hasAccessCode: true });
+        await act(async () => { fireEvent.change(screen.getByDisplayValue('Never'), { target: { value: '30' } }); });
         await waitFor(() => expect(shareCalls()).toHaveLength(1));
-        expect(shareCalls()[0][1]).toMatchObject({ expiresInDays: 30, accessCode: '', clearAccessCode: false });
+        expect(shareCalls()[0][1]).toMatchObject({ expiresInDays: 30, keepExpiry: false, accessCode: '', clearAccessCode: false });
         expect(screen.getByText('Protected — generate a new code to reveal one')).toBeTruthy();
     });
 
@@ -126,14 +132,65 @@ describe('album sharing', () => {
         const code = String((shareCalls()[0][1] as { accessCode: string }).accessCode);
         await screen.findByText(code);
 
-        await act(async () => { fireEvent.change(screen.getByDisplayValue('In 7 days'), { target: { value: 'never' } }); });
+        await act(async () => { fireEvent.change(screen.getByDisplayValue('Never'), { target: { value: '1' } }); });
         await waitFor(() => expect(shareCalls()).toHaveLength(2));
-        expect(shareCalls()[1][1]).toMatchObject({ expiresInDays: 0, clearAccessCode: false });
+        expect(shareCalls()[1][1]).toMatchObject({ expiresInDays: 1, clearAccessCode: false });
         expect(screen.getByText(code).className).toContain('pt-access-code');
     });
 
+    // The dropdown used to start at "In 7 days" whatever the link was set to,
+    // and the code actions re-sent that, shortening a "Never" link to a week.
+    it('shows the link’s own expiry in the dropdown', async () => {
+        const expiresAt = inDays(12);
+        await renderAlbum(true, { publicExpiresAt: expiresAt });
+        expect(screen.getByDisplayValue(onDate(expiresAt))).toBeTruthy();
+        cleanup();
+
+        await renderAlbum(true);
+        expect(screen.getByDisplayValue('Never')).toBeTruthy();
+    });
+
+    it('a new code leaves a never-expiring link without an expiry', async () => {
+        await renderAlbum(true);
+        await act(async () => { fireEvent.click(screen.getByRole('button', { name: /New code/ })); });
+        await waitFor(() => expect(shareCalls()).toHaveLength(1));
+        // An older server ignores keepExpiry and applies expiresInDays: 0 = never.
+        expect(shareCalls()[0][1]).toMatchObject({ keepExpiry: true, expiresInDays: 0 });
+        await waitFor(() => expect(screen.getByDisplayValue('Never')).toBeTruthy());
+    });
+
+    it('a new code keeps a dated link’s expiry', async () => {
+        const expiresAt = inDays(2.5);
+        await renderAlbum(true, { publicExpiresAt: expiresAt });
+        await act(async () => { fireEvent.click(screen.getByRole('button', { name: /New code/ })); });
+        await waitFor(() => expect(shareCalls()).toHaveLength(1));
+        // Rounded up, so an older server never cuts the link short.
+        expect(shareCalls()[0][1]).toMatchObject({ keepExpiry: true, expiresInDays: 3 });
+        expect(screen.getByDisplayValue(onDate(expiresAt))).toBeTruthy();
+    });
+
+    it('shows the new date once the server confirms an expiry change', async () => {
+        await renderAlbum(true);
+        let respond: (value: unknown) => void = () => {};
+        mocks.post.mockImplementationOnce(() => new Promise((resolve) => { respond = resolve; }));
+        await act(async () => { fireEvent.change(screen.getByDisplayValue('Never'), { target: { value: '30' } }); });
+        expect(screen.getByDisplayValue('In 30 days')).toBeTruthy();
+
+        const expiresAt = inDays(30);
+        await act(async () => { respond({ album: { ...sharedAlbum, publicExpiresAt: expiresAt } }); });
+        expect(screen.getByDisplayValue(onDate(expiresAt))).toBeTruthy();
+    });
+
+    it('puts the dropdown back when an expiry change fails', async () => {
+        await renderAlbum(true);
+        mocks.post.mockRejectedValue(new Error('offline'));
+        await act(async () => { fireEvent.change(screen.getByDisplayValue('Never'), { target: { value: '30' } }); });
+        await waitFor(() => expect(shareCalls()).toHaveLength(1));
+        await waitFor(() => expect(screen.getByDisplayValue('Never')).toBeTruthy());
+    });
+
     it('removes an access code only after the owner confirms', async () => {
-        await renderAlbum(true, true);
+        await renderAlbum(true, { hasAccessCode: true });
         mocks.confirm.mockResolvedValue(false);
         await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Remove code' })); });
         expect(mocks.confirm).toHaveBeenCalledWith(expect.objectContaining({
@@ -145,7 +202,7 @@ describe('album sharing', () => {
         mocks.confirm.mockResolvedValue(true);
         await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Remove code' })); });
         await waitFor(() => expect(shareCalls()).toHaveLength(1));
-        expect(shareCalls()[0][1]).toMatchObject({ accessCode: '', clearAccessCode: true });
+        expect(shareCalls()[0][1]).toMatchObject({ accessCode: '', clearAccessCode: true, keepExpiry: true });
     });
 
     it('offers no Remove code action on an album without a code', async () => {

@@ -275,6 +275,15 @@ const mapThing = (g: ExploreGroup): ThingTag => ({
     coverThumbnailUrl: g.photo?.thumbnailUrl,
 });
 
+// Whole days left on a share link (0 = no expiry): the fallback a server that
+// predates keepExpiry applies. Rounded up and at least 1, so it never shortens
+// the link into "expires now" or turns it into "never expires".
+const daysLeftOnLink = (expiresAt?: string): number => {
+    if (!expiresAt) return 0;
+    const ms = Date.parse(expiresAt) - Date.now();
+    return Number.isFinite(ms) ? Math.max(1, Math.ceil(ms / 86_400_000)) : 1;
+};
+
 // Build the set of distinct photos a person appears in, from their face list.
 
 interface ViewerState {
@@ -445,9 +454,10 @@ interface Store {
     /**
      * Resolves false when the change didn't land (the error is already toasted).
      * An existing access code is kept unless `accessCode` replaces it or
-     * `clearAccessCode` removes it.
+     * `clearAccessCode` removes it, and leaving out `expiresInDays` keeps the
+     * link's current expiry.
      */
-    shareAlbum: (id: string, opts: { expiresInDays: number; accessCode?: string; clearAccessCode?: boolean }) => Promise<boolean>;
+    shareAlbum: (id: string, opts: { expiresInDays?: number; accessCode?: string; clearAccessCode?: boolean }) => Promise<boolean>;
     revokeAlbum: (id: string) => Promise<void>;
 
     // people (server-backed)
@@ -2190,12 +2200,16 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     const deleteAlbum = useCallback((id: string) => { deleteAlbums([id]); }, [deleteAlbums]);
 
-    const shareAlbum = useCallback(async (id: string, opts: { expiresInDays: number; accessCode?: string; clearAccessCode?: boolean }) => {
+    const shareAlbum = useCallback(async (id: string, opts: { expiresInDays?: number; accessCode?: string; clearAccessCode?: boolean }) => {
         if (hasAlbumDeleteTombstone(id, pendingEditScope())) return false;
+        const keepExpiry = opts.expiresInDays === undefined;
         try {
             const res = await post<{ album?: Album }>(`/albums/${encodeURIComponent(id)}/share`, {
                 enabled: true,
-                expiresInDays: opts.expiresInDays,
+                expiresInDays: keepExpiry
+                    ? daysLeftOnLink(albums.find((a) => a.id === id)?.publicExpiresAt)
+                    : opts.expiresInDays,
+                keepExpiry,
                 accessCode: opts.accessCode ?? '',
                 // Only on request: with no code and no clear flag the server
                 // keeps the album's existing code.
@@ -2210,7 +2224,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             toast('Couldn’t update share link', undefined, undefined, 'error');
             return false;
         }
-    }, [toast]);
+    }, [albums, toast]);
 
     const revokeAlbum = useCallback(async (id: string) => {
         if (hasAlbumDeleteTombstone(id, pendingEditScope())) return;
