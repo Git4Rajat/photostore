@@ -311,10 +311,31 @@ export const AlbumsPage: React.FC = () => {
         });
         if (ok) void shareAlbum(id, { expiresInDays: days });
     };
+    // Leaves the access code alone: the store only clears it when asked.
     const changeExpiry = (value: string) => {
         setExpiry(value);
         const days = EXPIRY_OPTIONS.find((o) => o.value === value)?.days ?? 7;
         void shareAlbum(album.id, { expiresInDays: days });
+    };
+    // The only way to drop a code while keeping the link, so it asks first:
+    // afterwards the link alone opens the album.
+    const removeAccessCode = async () => {
+        const { id, name } = album;
+        const ok = await confirmDialog({
+            title: `Remove the access code from “${name}”?`,
+            message: 'Anyone with the link will be able to see the photos without a code.',
+            confirmLabel: 'Remove code',
+            danger: true,
+        });
+        if (!ok) return;
+        const days = EXPIRY_OPTIONS.find((o) => o.value === expiry)?.days ?? 7;
+        if (await shareAlbum(id, { expiresInDays: days, clearAccessCode: true })) {
+            setCodes((prev) => {
+                const next = { ...prev };
+                delete next[id];
+                return next;
+            });
+        }
     };
 
     const activePhotos = albumPhotosById(album.id);
@@ -446,18 +467,23 @@ export const AlbumsPage: React.FC = () => {
                                                 ? <span>Share this code with viewers: <code className="pt-access-code">{codes[album.id]}</code></span>
                                                 : <span>{album.hasAccessCode ? 'Protected — generate a new code to reveal one' : 'Add a code to protect the link'}</span>}
                                         </span>
-                                        <button type="button" className="btn" onClick={() => {
-                                            const { id } = album;
-                                            const code = randomCode();
-                                            const days = EXPIRY_OPTIONS.find((o) => o.value === expiry)?.days ?? 7;
-                                            // Shown inline only, once the server has it -- never in a
-                                            // toast, which the notification history keeps.
-                                            void shareAlbum(id, { expiresInDays: days, accessCode: code }).then((ok) => {
-                                                if (ok) setCodes((prev) => ({ ...prev, [id]: code }));
-                                            });
-                                        }}>
-                                            <ArrowPathIcon className="toolbar-icon" /> New code
-                                        </button>
+                                        <span style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+                                            {(album.hasAccessCode || codes[album.id]) && (
+                                                <button type="button" className="pt-linkish danger" onClick={() => void removeAccessCode()}>Remove code</button>
+                                            )}
+                                            <button type="button" className="btn" onClick={() => {
+                                                const { id } = album;
+                                                const code = randomCode();
+                                                const days = EXPIRY_OPTIONS.find((o) => o.value === expiry)?.days ?? 7;
+                                                // Shown inline only, once the server has it -- never in a
+                                                // toast, which the notification history keeps.
+                                                void shareAlbum(id, { expiresInDays: days, accessCode: code }).then((ok) => {
+                                                    if (ok) setCodes((prev) => ({ ...prev, [id]: code }));
+                                                });
+                                            }}>
+                                                <ArrowPathIcon className="toolbar-icon" /> New code
+                                            </button>
+                                        </span>
                                     </div>
                                 </div>
                             </div>

@@ -37,8 +37,8 @@ const sharedAlbum = { id: 'a1', name: 'Trip', photoCount: 0, isPublic: true, pub
 const shareCalls = () => mocks.post.mock.calls.filter(([path]) => path === '/albums/a1/share');
 const revokeCalls = () => mocks.post.mock.calls.filter(([path]) => path === '/albums/a1/revoke');
 
-const renderAlbum = async (isPublic: boolean) => {
-    mocks.albumsIndex.mockResolvedValue([{ albumId: 'a1', name: 'Trip', photoCount: 0, coverFilename: '', isPublic, publicUrl: isPublic ? sharedAlbum.publicUrl : '' }]);
+const renderAlbum = async (isPublic: boolean, hasAccessCode = false) => {
+    mocks.albumsIndex.mockResolvedValue([{ albumId: 'a1', name: 'Trip', photoCount: 0, coverFilename: '', isPublic, publicUrl: isPublic ? sharedAlbum.publicUrl : '', hasAccessCode }]);
     render(<StoreProvider><Probe /><AlbumsPage /></StoreProvider>);
     // The bare Albums tab: the first album shows without ?albumId.
     await act(async () => { store.navigate('albums', {}); });
@@ -107,5 +107,49 @@ describe('album sharing', () => {
         await act(async () => { fireEvent.click(screen.getByRole('button', { name: /New code/ })); });
         await waitFor(() => expect(shareCalls()).toHaveLength(1));
         expect(document.querySelector('.pt-access-code')).toBeNull();
+    });
+
+    // A protected album must not become reachable with the link alone
+    // because the owner picked a different expiry.
+    it('changing the link expiry keeps an existing access code', async () => {
+        await renderAlbum(true, true);
+        await act(async () => { fireEvent.change(screen.getByDisplayValue('In 7 days'), { target: { value: '30' } }); });
+        await waitFor(() => expect(shareCalls()).toHaveLength(1));
+        expect(shareCalls()[0][1]).toMatchObject({ expiresInDays: 30, accessCode: '', clearAccessCode: false });
+        expect(screen.getByText('Protected — generate a new code to reveal one')).toBeTruthy();
+    });
+
+    it('keeps a code generated this session when the expiry changes afterwards', async () => {
+        await renderAlbum(true);
+        await act(async () => { fireEvent.click(screen.getByRole('button', { name: /New code/ })); });
+        await waitFor(() => expect(shareCalls()).toHaveLength(1));
+        const code = String((shareCalls()[0][1] as { accessCode: string }).accessCode);
+        await screen.findByText(code);
+
+        await act(async () => { fireEvent.change(screen.getByDisplayValue('In 7 days'), { target: { value: 'never' } }); });
+        await waitFor(() => expect(shareCalls()).toHaveLength(2));
+        expect(shareCalls()[1][1]).toMatchObject({ expiresInDays: 0, clearAccessCode: false });
+        expect(screen.getByText(code).className).toContain('pt-access-code');
+    });
+
+    it('removes an access code only after the owner confirms', async () => {
+        await renderAlbum(true, true);
+        mocks.confirm.mockResolvedValue(false);
+        await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Remove code' })); });
+        expect(mocks.confirm).toHaveBeenCalledWith(expect.objectContaining({
+            title: 'Remove the access code from “Trip”?',
+            danger: true,
+        }));
+        expect(shareCalls()).toHaveLength(0);
+
+        mocks.confirm.mockResolvedValue(true);
+        await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Remove code' })); });
+        await waitFor(() => expect(shareCalls()).toHaveLength(1));
+        expect(shareCalls()[0][1]).toMatchObject({ accessCode: '', clearAccessCode: true });
+    });
+
+    it('offers no Remove code action on an album without a code', async () => {
+        await renderAlbum(true);
+        expect(screen.queryByRole('button', { name: 'Remove code' })).toBeNull();
     });
 });

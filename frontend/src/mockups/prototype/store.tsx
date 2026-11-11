@@ -442,8 +442,12 @@ interface Store {
     removePhotosFromAlbum: (albumId: string, ids: string[]) => void;
     deleteAlbum: (id: string) => void;
     deleteAlbums: (ids: string[]) => void;
-    /** Resolves false when the change didn't land (the error is already toasted). */
-    shareAlbum: (id: string, opts: { expiresInDays: number; accessCode?: string }) => Promise<boolean>;
+    /**
+     * Resolves false when the change didn't land (the error is already toasted).
+     * An existing access code is kept unless `accessCode` replaces it or
+     * `clearAccessCode` removes it.
+     */
+    shareAlbum: (id: string, opts: { expiresInDays: number; accessCode?: string; clearAccessCode?: boolean }) => Promise<boolean>;
     revokeAlbum: (id: string) => Promise<void>;
 
     // people (server-backed)
@@ -2186,14 +2190,16 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     const deleteAlbum = useCallback((id: string) => { deleteAlbums([id]); }, [deleteAlbums]);
 
-    const shareAlbum = useCallback(async (id: string, opts: { expiresInDays: number; accessCode?: string }) => {
+    const shareAlbum = useCallback(async (id: string, opts: { expiresInDays: number; accessCode?: string; clearAccessCode?: boolean }) => {
         if (hasAlbumDeleteTombstone(id, pendingEditScope())) return false;
         try {
             const res = await post<{ album?: Album }>(`/albums/${encodeURIComponent(id)}/share`, {
                 enabled: true,
                 expiresInDays: opts.expiresInDays,
                 accessCode: opts.accessCode ?? '',
-                clearAccessCode: !opts.accessCode,
+                // Only on request: with no code and no clear flag the server
+                // keeps the album's existing code.
+                clearAccessCode: opts.clearAccessCode === true,
             });
             if (res?.album) {
                 setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, ...res.album } : a)));

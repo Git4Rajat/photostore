@@ -132,6 +132,27 @@ def test_share_rejects_a_short_access_code(client):
     assert not table.get_entity('u1', album['id']).get('isPublic')
 
 
+def test_share_update_without_a_code_keeps_the_existing_one(client):
+    # The web app changes the expiry this way; it must not unprotect the album.
+    http, table = client
+    album = _create(http)
+    http.post(f"/albums/{album['id']}/share", json={'expiresInDays': 7, 'accessCode': 'secret'})
+    stored = table.get_entity('u1', album['id'])['accessCode']
+    assert stored
+    response = http.post(f"/albums/{album['id']}/share", json={'expiresInDays': 30, 'accessCode': '', 'clearAccessCode': False})
+    assert response.status_code == 200 and response.json['album']['hasAccessCode']
+    assert table.get_entity('u1', album['id'])['accessCode'] == stored
+
+
+def test_share_clear_access_code_removes_it(client):
+    http, table = client
+    album = _create(http)
+    http.post(f"/albums/{album['id']}/share", json={'expiresInDays': 7, 'accessCode': 'secret'})
+    response = http.post(f"/albums/{album['id']}/share", json={'expiresInDays': 7, 'accessCode': '', 'clearAccessCode': True})
+    assert response.status_code == 200 and not response.json['album']['hasAccessCode']
+    assert table.get_entity('u1', album['id'])['accessCode'] == ''
+
+
 def test_share_disabled_clears_the_token_and_index(client):
     http, table = client
     album = _create(http)
