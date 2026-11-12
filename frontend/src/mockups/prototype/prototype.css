@@ -691,6 +691,22 @@
    would never hide there. */
 .pt-viewer-tools { opacity: 0; visibility: hidden; pointer-events: none; transition: opacity 0.16s ease, visibility 0.16s ease; }
 .pt-viewer.tools-visible .pt-viewer-tools { opacity: 1; visibility: visible; pointer-events: auto; }
+/* A video's rotate buttons stay up: a tap on the video belongs to the player, so it can't reveal them. */
+.pt-viewer-tools.always { opacity: 1; visibility: visible; pointer-events: auto; }
+
+/* ---- rotated video: upright controls (TurnedVideoControls.tsx) ---- */
+.pt-turned-video-play { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 2; display: grid; place-items: center; border: 0; border-radius: 50%; background: rgba(0,0,0,0.6); -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); color: #fff; cursor: pointer; }
+.pt-turned-video-play svg { width: 38%; height: 38%; margin-left: 6%; fill: currentColor; }
+.pt-turned-video-bar { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); z-index: 2; width: min(520px, calc(100% - 24px)); box-sizing: border-box; display: flex; align-items: center; gap: 6px; padding: 0 8px; background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.12); border-radius: var(--r-pill); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); color: #ece6d9; }
+.pt-turned-video-bar button { flex: none; display: inline-grid; place-items: center; width: var(--tap-min); height: var(--tap-min); border: 0; border-radius: 50%; background: none; color: inherit; cursor: pointer; }
+.pt-turned-video-bar button svg { width: 18px; height: 18px; }
+.pt-turned-video-bar input[type="range"] { flex: 1; min-width: 0; accent-color: var(--accent); }
+.pt-turned-video-time { flex: none; font-size: 0.78rem; font-variant-numeric: tabular-nums; }
+
+/* A rotated video's tile turns its thumbnail, and with it the play icon baked into it at upload.
+   An upright glass badge covers that one: same centre, a little larger than its 36%. */
+.pt-tile-play { position: absolute; left: 50%; top: 50%; width: 40%; aspect-ratio: 1; transform: translate(-50%, -50%); border-radius: 50%; background: rgba(0,0,0,0.6); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); pointer-events: none; }
+.pt-tile-play::after { content: ""; position: absolute; left: 39%; top: 30%; width: 32%; height: 40%; background: rgba(255,255,255,0.95); clip-path: polygon(0 0, 100% 50%, 0 100%); }
 
 /* ---- People card count: centred under the face ---- */
 .pt-person-name, .pt-person-count { text-align: center; max-width: 100%; }

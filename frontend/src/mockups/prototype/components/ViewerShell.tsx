@@ -10,6 +10,7 @@ import {
     ZoomIn as MagnifyingGlassPlusIcon,
 } from 'lucide-react';
 import { Spinner } from './bits';
+import { TurnedVideoControls } from './TurnedVideoControls';
 
 export const ZOOM_MIN = 1;
 export const ZOOM_MAX = 4;
@@ -134,6 +135,23 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
         return () => observer.disconnect();
     }, []);
     useEffect(() => { setNatural(null); }, [photoKey]);
+
+    // A rotated video turns its drawing, not its box. At a quarter turn the box swaps width and
+    // height (centred on the stage) so object-fit: contain fills the stage with the turned picture.
+    const videoRef = useRef<HTMLVideoElement>(null);
+    const videoTurned = Boolean(videoSrc) && displayRotation !== 0;
+    const quarterTurn = displayRotation % 180 !== 0;
+    const turnedVideoBox: React.CSSProperties | undefined = videoTurned && quarterTurn && box
+        ? { width: box.h, height: box.w, left: (box.w - box.h) / 2, top: (box.h - box.w) / 2 }
+        : undefined;
+    // The poster's baked play icon is 36% of the drawn picture's short edge; the upright play
+    // button covers it (see TurnedVideoControls).
+    const turnedDisc = (() => {
+        if (!natural || !box || !natural.w || !natural.h) return 64;
+        const [w, h] = quarterTurn ? [box.h, box.w] : [box.w, box.h];
+        const scale = Math.min(w / natural.w, h / natural.h);
+        return Math.max(64, Math.round(Math.min(natural.w, natural.h) * scale * 0.42));
+    })();
     // Focus management for the modal (HIG: a modal traps focus and restores it
     // to the trigger on close).
     const rootRef = useRef<HTMLDivElement>(null);
@@ -440,17 +458,27 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
                         style={{ cursor: zoomed ? 'grab' : 'default' }}
                     >
                         {videoSrc && !videoFailed ? (
-                            // Click/double-click belong to the player's own controls, not the
-                            // stage's tools toggle and zoom gestures.
+                            <>
+                            {/* Click/double-click belong to the player's own controls, not the
+                                stage's tools toggle and zoom gestures. */}
                             <video
+                                ref={videoRef}
                                 key={videoSrc}
                                 className="pt-viewer-img"
                                 src={videoSrc}
                                 poster={videoPoster || mainSrc || undefined}
-                                controls
+                                // Native controls turn with a rotated video; TurnedVideoControls stands in.
+                                controls={!videoTurned}
                                 playsInline
                                 preload="metadata"
-                                onClick={(e) => e.stopPropagation()}
+                                style={videoTurned ? { ...turnedVideoBox, transform: `rotate(${displayRotation}deg)` } : undefined}
+                                onLoadedMetadata={(e) => setNatural({ w: e.currentTarget.videoWidth, h: e.currentTarget.videoHeight })}
+                                onClick={(e) => {
+                                    e.stopPropagation();
+                                    if (!videoTurned) return;
+                                    const el = e.currentTarget;
+                                    if (el.paused || el.ended) void el.play().catch(() => {}); else el.pause();
+                                }}
                                 onDoubleClick={(e) => e.stopPropagation()}
                                 // Only an error before metadata loaded means "can't play this"; a later one (a seek
                                 // past truncated data, a dropped connection) leaves the native player to recover.
@@ -459,6 +487,8 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
                                     if (onVideoError) onVideoError(); else setVideoErrored(true);
                                 }}
                             />
+                            {videoTurned && <TurnedVideoControls key={videoSrc} video={videoRef} discSize={turnedDisc} />}
+                            </>
                         ) : videoSrc ? (
                             <div className="pt-viewer-unavailable">
                                 <p>This video can’t be played in your browser.</p>
@@ -534,13 +564,18 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
                     </button>
                 </div>
 
-                {/* Floating zoom / rotate / full-res controls over the stage. */}
-                {!videoSrc && (
-                <div className="pt-viewer-tools" role="toolbar" aria-label="Image controls">
-                    <button type="button" onClick={() => zoomBy(-ZOOM_STEP)} disabled={zoom <= ZOOM_MIN} aria-label="Zoom out"><MagnifyingGlassMinusIcon /></button>
-                    <span className="pt-viewer-zoom-label">{Math.round(zoom * 100)}%</span>
-                    <button type="button" onClick={() => zoomBy(ZOOM_STEP)} disabled={zoom >= ZOOM_MAX} aria-label="Zoom in"><MagnifyingGlassPlusIcon /></button>
-                    <span className="pt-viewer-tools-sep" />
+                {/* Floating zoom / rotate / full-res controls over the stage. A video gets rotate
+                    only, always shown: a tap on it belongs to the player, so it can't reveal them. */}
+                {!(videoSrc && videoFailed) && (
+                <div className={`pt-viewer-tools${videoSrc ? ' always' : ''}`} role="toolbar" aria-label={videoSrc ? 'Video controls' : 'Image controls'}>
+                    {!videoSrc && (
+                        <>
+                            <button type="button" onClick={() => zoomBy(-ZOOM_STEP)} disabled={zoom <= ZOOM_MIN} aria-label="Zoom out"><MagnifyingGlassMinusIcon /></button>
+                            <span className="pt-viewer-zoom-label">{Math.round(zoom * 100)}%</span>
+                            <button type="button" onClick={() => zoomBy(ZOOM_STEP)} disabled={zoom >= ZOOM_MAX} aria-label="Zoom in"><MagnifyingGlassPlusIcon /></button>
+                            <span className="pt-viewer-tools-sep" />
+                        </>
+                    )}
                     <button type="button" onClick={() => rotate(-90)} aria-label="Rotate left"><ArrowUturnLeftIcon /></button>
                     <button type="button" onClick={() => rotate(90)} aria-label="Rotate right"><ArrowUturnRightIcon /></button>
                     {showFullResControl && (
