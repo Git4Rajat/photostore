@@ -74,8 +74,9 @@ class DatabaseSummaryAdapter:
     No connection, commit, source scan, sidecar, or publication is owned here.
     Row ids are the full iter_smart_rows order (SQLite INTEGER PRIMARY KEY).
     Only touched group candidates are repaired after insertion/removal.
-    Timeline counts use stored UTC capture_day, NOT the streaming timeline's
-    local-day/CRC cover semantics. Covers remain SearchDatabase's SQL queries.
+    Timeline counts use the stored capture_day (the capture's own clock date, as
+    the streaming timeline buckets it), NOT the streaming timeline's CRC cover
+    semantics. Covers remain SearchDatabase's SQL queries.
     """
 
     def __init__(self, conn):

@@ -298,7 +298,9 @@ def test_seed_memory_is_not_proportional_to_photos(tmp_path):
     assert peaks[1] < peaks[0] + 512 * 1024
 
 
-def test_sqlite_timeline_is_explicitly_not_the_streaming_reference(tmp_path):
+def test_sqlite_timeline_days_match_the_streaming_reference(tmp_path):
+    # Both count a capture on its own clock's day; the SQL side used to take the UTC day, so this
+    # 00:30 shot in India sat on 31 Dec there and on 1 Jan everywhere else.
     metadata = row('timezone', exifData=json.dumps({'DateTimeOriginal': '2020:01:01 00:30:00+05:30'}))
     path = str(tmp_path / 'search.sqlite')
     builder = search_db.DatabaseBuilder(path)
@@ -311,8 +313,8 @@ def test_sqlite_timeline_is_explicitly_not_the_streaming_reference(tmp_path):
             store.seed([contribution(metadata, 0)], source_version='v1')
             assert store.timeline_summary(now=NOW) == build_timeline_summary([metadata], now=NOW)
             assert store.timeline_summary(now=NOW)['firstDate'] == '2020-01-01'
-            assert sql_summary['firstDate'] == '2019-12-31'
-            assert store.timeline_summary(now=NOW) != sql_summary
+            assert sql_summary['firstDate'] == '2020-01-01'
+            assert sql_summary['years']['2020']['months']['01']['days'] == {'01': 1}
     finally:
         db._conn().close()
 

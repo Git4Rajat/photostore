@@ -27,6 +27,7 @@ import type { LibraryMember, PendingInvite } from '../../services/libraryClient'
 import type { PersonFace } from '../../types/people';
 import { isNamedLabel } from '../../utils/people';
 import { plural } from '../../utils/format';
+import { captureWallClock } from '../../utils/captureDate';
 import type { Photo as BackendPhoto } from '../../types/uiTypes';
 import type {
     Album,
@@ -104,8 +105,7 @@ const swatchFor = (filename: string): SwatchKey => {
 export const mapPhoto = (b: BackendPhoto, token: MediaToken | null = getCachedMediaToken()): Photo => {
     b = applyPendingEdits('photo', b.filename, b);
     const iso = b.captureDate || b.uploadDate || b.lastModified || null;
-    const date = iso ? new Date(iso) : null;
-    const valid = date && !Number.isNaN(date.getTime()) ? date : null;
+    const valid = captureWallClock(iso);
     return {
         id: b.filename,
         filename: b.filename,
@@ -136,8 +136,7 @@ export const galleryIndexPhoto = (row: SortIndexRow, token: MediaToken | null): 
     const edit = applyPendingEdits('photo', row.filename, { rating: row.rating, likes: row.likes, ...row.gallery });
     row = { ...row, rating: edit.rating, likes: edit.likes, ...(row.gallery ? { gallery: { ...row.gallery, ...edit } } : {}) };
     const iso = row.captureDate || row.uploadDate || null;
-    const date = iso ? new Date(iso) : null;
-    const valid = date && !Number.isNaN(date.getTime()) ? date : null;
+    const valid = captureWallClock(iso);
     return {
         id: row.filename,
         filename: row.filename,
@@ -785,16 +784,19 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 throw new Error('sort index unavailable');
             }
             const range = captureRangeRef.current;
-            const startMs = range?.start ? new Date(range.start).getTime() : null;
-            const endMs = range?.end ? new Date(range.end).getTime() : null;
-            const rangeFiltered = (startMs === null && endMs === null)
+            // Ranges are whole days ("2024-01-01".."2024-01-31"), compared with the day on the
+            // capture's own clock as the server's timeline counts them. As instants, the end bound
+            // was midnight UTC and dropped most of the month's last day.
+            const startDay = range?.start ? range.start.slice(0, 10) : null;
+            const endDay = range?.end ? range.end.slice(0, 10) : null;
+            const rangeFiltered = (startDay === null && endDay === null)
                 ? sortIndex
                 : sortIndex.filter((row) => {
-                    if (!row.captureDate) return false;
-                    const t = new Date(row.captureDate).getTime();
-                    if (Number.isNaN(t)) return false;
-                    if (startMs !== null && t < startMs) return false;
-                    if (endMs !== null && t > endMs) return false;
+                    const captured = captureWallClock(row.captureDate);
+                    if (!captured) return false;
+                    const day = `${captured.getFullYear()}-${String(captured.getMonth() + 1).padStart(2, '0')}-${String(captured.getDate()).padStart(2, '0')}`;
+                    if (startDay !== null && day < startDay) return false;
+                    if (endDay !== null && day > endDay) return false;
                     return true;
                 });
             const sorted = sortRowsForGallery(filterRowsForGallery(rangeFiltered, galleryFiltersRef.current));

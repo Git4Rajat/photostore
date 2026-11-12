@@ -460,6 +460,23 @@ describe('index-backed gallery', () => {
         expect(mocks.post).not.toHaveBeenCalled();
     });
 
+    it('a month view keeps its last day and labels shots on the clock where they were taken', async () => {
+        const at = (filename: string, captureDate: string) => ({ ...rows()[0], filename, captureDate });
+        mocks.index.mockResolvedValue([
+            at('last-day.jpg', '2024-01-31T18:00:00+01:00'),
+            at('india-late.jpg', '2024-01-15T23:30:00+05:30'),
+            at('no-zone.jpg', '2024-01-20T23:45:00'),
+            at('february.jpg', '2024-02-01T00:30:00+01:00'),
+        ]);
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await waitFor(() => expect(store.photosLoading).toBe(false));
+        act(() => store.setCaptureRange({ start: '2024-01-01', end: '2024-01-31', label: 'Jan 2024' }));
+        await waitFor(() => expect(store.photos.map((p) => p.filename).sort()).toEqual(['india-late.jpg', 'last-day.jpg', 'no-zone.jpg']));
+        const label = (name: string) => store.photos.find((p) => p.filename === name)?.dateLabel;
+        expect(label('india-late.jpg')).toBe('Jan 15, 2024');
+        expect(label('no-zone.jpg')).toBe('Jan 20, 2024');
+    });
+
     it('keeps an edited name visible until the People index catches up', async () => {
         let indexedName = 'Alice';
         mocks.get.mockImplementation(async () => ({ available: true, rows: [

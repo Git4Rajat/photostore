@@ -1,6 +1,6 @@
 import React from 'react';
 import { CircleCheck as CheckCircleIcon, Heart as HeartIcon, Star as StarIcon } from 'lucide-react';
-import { useStore } from '../store';
+import { isVideoFilename, useStore } from '../store';
 import { tileImage, usePhotoThumbnails, useTileSizes } from '../media';
 import { useDragSelect } from '../../../services/useDragSelect';
 import { perf } from '../../../services/perf';
@@ -217,6 +217,7 @@ const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?: React
                                 style={image.style}
                             />
                         )}
+                        {image?.style?.transform && isVideoFilename(photo.filename) && <span className="pt-tile-play" aria-hidden="true" />}
                         <button
                             type="button"
                             className={`pt-tile-check${selected ? ' on' : ''}`}

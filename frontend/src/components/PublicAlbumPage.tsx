@@ -799,6 +799,8 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
                                                             img.src = resolveApiUrl(`/public/photos/${encodeURIComponent(token)}/thumbnail/${encodeURIComponent(photo.filename)}`);
                                                         }}
                                                     />
+                                                    {/* Covers the play icon baked into a turned video's thumbnail. */}
+                                                    {tileRotationStyle(photo) && isVideoFilename(photo.filename) && <span className="pt-tile-play" aria-hidden="true" />}
                                                     {selectMode && (
                                                         <button
                                                             type="button"
