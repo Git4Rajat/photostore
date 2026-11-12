@@ -62,6 +62,24 @@ describe('FloatingSelectButton', () => {
         expect(store.setSelectMode).toHaveBeenCalledWith(false);
     });
 
+    it('only appears over the grid it selects from, never over the People grid', () => {
+        const { container } = render(
+            <div>
+                <div className="pt-body"><div className="pt-people-grid" /></div>
+                <FloatingSelectButton selectMode={false} onToggle={() => {}} />
+                <FloatingSelectButton selectMode={false} onToggle={() => {}} noun="people" grid=".pt-people-grid" />
+            </div>,
+        );
+        scrollTo(container.querySelector('.pt-body') as HTMLElement, 900);
+        expect(screen.getByRole('button', { name: 'Select photos' }).className).not.toContain('visible');
+        expect(screen.getByRole('button', { name: 'Select people' }).className).toContain('visible');
+    });
+
+    it('marks itself for hiding on touch screens, where long-press starts selecting', () => {
+        render(<FloatingSelectButton selectMode={false} onToggle={() => {}} hideOnTouch />);
+        expect(screen.getByRole('button', { name: 'Select photos' }).className).toContain('touch-hidden');
+    });
+
     it('steps aside when another control (the selection bar) occupies its corner', () => {
         const body = renderOver(true, true);
         scrollTo(body, 900);

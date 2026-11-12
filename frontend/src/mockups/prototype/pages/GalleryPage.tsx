@@ -381,7 +381,11 @@ const GalleryPage: React.FC = () => {
                     <p className="pt-page-sub">{countLabel}{captureRange ? ` · ${captureRange.label}` : ''}</p>
                 </div>
                 <div className="pt-toolbar-actions">
-                    {level === 'days' && (
+                    {/* While selecting, the row holds only Select all + Done. Adding them beside
+                        Filters and zoom wrapped the row to two lines on phones, and the taller
+                        toolbar shoved the grid down under the user's finger (iOS has no scroll
+                        anchoring to absorb it). */}
+                    {level === 'days' && !selectMode && (
                         <Menu
                             className="pt-filter-menu"
                             align="right"
@@ -405,7 +409,7 @@ const GalleryPage: React.FC = () => {
                             )}
                         </Menu>
                     )}
-                    {zoomControl}
+                    {!(level === 'days' && selectMode) && zoomControl}
                     {level === 'days' && (
                         selectMode ? (
                             <>
