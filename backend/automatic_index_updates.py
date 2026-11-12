@@ -262,6 +262,12 @@ def partition(user, kind):
     return 'automatic-' + hashlib.sha256(f'{user}\0{kind}'.encode()).hexdigest()
 
 
+def _lost_control_race(error):
+    """_change gave up after its CAS retries on the shared control row (an ETag conflict, which Azure
+    reports inside a batch as 412)."""
+    return isinstance(error, (ResourceModifiedError, ResourceExistsError)) or getattr(error, 'status_code', None) == 412
+
+
 def _cas(row):
     version = etag(row)
     if not version or version == '*':
@@ -421,8 +427,33 @@ class CoverageStore:
             is_not_found = isinstance(error, ResourceNotFoundError) or getattr(error, 'status_code', None) == 404
             if is_not_found and extra_ops:
                 self._change(user, kind, complete)
+            elif reservation_id and _lost_control_race(error):
+                self._defer_finish(pk, reservation_id, failed)
             else:
                 raise
+
+    def _defer_finish(self, pk, reservation_id, failed):
+        """The source write committed but every attempt to release its count lost to other writers on the
+        shared control row. Raising would fail an upload whose data is saved and leave the reservation open
+        until the stale reaper (two hours of index builds waking to find it busy). Instead record on the
+        reservation's own row -- no contention there -- that only the release is outstanding; the next
+        build releases it (release_finished). If even this write fails, the reaper still covers it."""
+        try:
+            self.table.upsert_entity(dict(PartitionKey=pk, RowKey=f'res-{reservation_id}',
+                                          finishPendingAt=time.time(), finishFailed=bool(failed)), mode=UpdateMode.MERGE)
+        except Exception:
+            LOG.warning('Could not record pending release of reservation %s', reservation_id, exc_info=True)
+            raise
+        LOG.warning('Source reservation %s release deferred to the next build after control-row contention', reservation_id)
+
+    def release_finished(self, user, kind):
+        """Release reservations whose writer finished but could not release them (see _defer_finish)."""
+        released = []
+        for res in self.reservations(user, kind):
+            if res.get('finishPendingAt'):
+                self.finish(user, kind, reservation_id=res['reservationId'], failed=bool(res.get('finishFailed')))
+                released.append(res['reservationId'])
+        return released
 
     def reservations(self, user, kind):
         pk = partition(user, kind)
@@ -488,7 +519,7 @@ class CoverageStore:
 
     def capture(self, user, kind):
         row = self.ensure(user, kind)
-        if row.get('active') and self.reap_stale_reservations(user, kind):
+        if row.get('active') and (self.release_finished(user, kind) or self.reap_stale_reservations(user, kind)):
             row = self.ensure(user, kind)
         if row.get('active'):
             raise SourceBusy(f'Active {kind} source intent for {user}')
