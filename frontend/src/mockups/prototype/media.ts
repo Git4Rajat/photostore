@@ -1,10 +1,10 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type RefObject } from 'react';
 import { get, post, resolveApiUrl } from '../../services/apiClient';
 import { isAuthEnabled } from '../../services/authClient';
 import { fetchProtectedBlobUrl, fetchProtectedBlobUrlWithProgress, ProtectedFetchError } from '../../services/imageClient';
 import { resolveThumbnailAccessUrls } from '../../services/thumbnailAccessCache';
 import { resolveMediaAccessUrls } from '../../services/mediaAccessCache';
-import { getCachedSortThumb } from '../../services/localSortIndex';
+import { getCachedSortGrid, getCachedSortThumb } from '../../services/localSortIndex';
 import { getCachedMediaToken, getMediaToken, imageUrlForBlob, previewUrlForBlob, thumbnailUrlForBlob } from '../../services/mediaToken';
 import { isHttpUrl, shouldFetchScopedThumbnail } from '../../components/shared/PhotoTile';
 import { isRawFilename, isVideoFilename } from '../../utils/photoDisplay';
@@ -93,6 +93,68 @@ export function usePhotoThumbnails(photos: Photo[]): Record<string, string> {
         }
     }
     return out;
+}
+
+// Widths declared in tile srcsets. Tiles are square and crop with object-fit:
+// cover, so what has to cover a tile is an image's SHORT edge, not its width:
+// ~90 px for a typical 4:3 photo's 120 px thumbnail, and 400 px for the grid
+// image (GRID_SHORT_EDGE in backend/image_utils.py). The browser therefore
+// keeps the thumbnail only for tiles up to ~90 device px -- the smallest zoom
+// level on a 1x screen -- and takes the grid image everywhere else.
+const THUMB_COVER_WIDTH = 90;
+const GRID_COVER_WIDTH = 400;
+
+export interface TileImage {
+    src: string;
+    srcSet?: string;
+    style?: CSSProperties;
+}
+
+const normRot = (value?: number) => { const r = Number(value || 0) % 360; return r < 0 ? r + 360 : r; };
+const rotateStyle = (degrees: number): CSSProperties | undefined => (degrees ? { transform: `rotate(${degrees}deg)` } : undefined);
+
+/**
+ * What a grid tile's <img> shows, given the thumbnail src from usePhotoThumbnails:
+ * the thumbnail plus, once the photo has one, the sharp grid image in srcset.
+ *
+ * The thumbnail bakes in `thumbnailRotation`, so its tile turns by only what
+ * the user rotated on top; the grid image, like the preview, bakes in nothing
+ * but EXIF orientation, so its tile turns by the full `rotation`. One <img>
+ * carries one transform, so the two can share a srcset only when the
+ * thumbnail has no baked rotation; otherwise the tile shows the grid image
+ * alone, which is sharp at every zoom level anyway.
+ */
+export const tileImage = (photo: Photo, thumbSrc: string | undefined): TileImage | null => {
+    const grid = thumbnailUrlForBlob(photo.gridBlob || getCachedSortGrid(photo.filename), getCachedMediaToken());
+    if (!grid) {
+        return thumbSrc ? { src: thumbSrc, style: rotateStyle(normRot(normRot(photo.rotation) - normRot(photo.thumbnailRotation))) } : null;
+    }
+    const style = rotateStyle(normRot(photo.rotation));
+    if (!thumbSrc || normRot(photo.thumbnailRotation)) {
+        return { src: grid, style };
+    }
+    return { src: thumbSrc, srcSet: `${thumbSrc} ${THUMB_COVER_WIDTH}w, ${grid} ${GRID_COVER_WIDTH}w`, style };
+};
+
+/**
+ * `sizes` for a grid's tile srcsets: the rendered width of its first tile,
+ * re-measured whenever that tile resizes (zoom level, window). Measured in a
+ * layout effect so it lands before lazy tiles start loading. Undefined until
+ * measured, which the browser reads as 100vw -- it then picks the grid image.
+ */
+export function useTileSizes(gridRef: RefObject<HTMLElement>, firstTileKey?: string): string | undefined {
+    const [width, setWidth] = useState(0);
+    useLayoutEffect(() => {
+        const tile = gridRef.current?.firstElementChild;
+        if (!tile) return undefined;
+        const measure = () => setWidth(Math.round(tile.getBoundingClientRect().width));
+        measure();
+        if (typeof ResizeObserver === 'undefined') return undefined;
+        const observer = new ResizeObserver(measure);
+        observer.observe(tile);
+        return () => observer.disconnect();
+    }, [gridRef, firstTileKey]);
+    return width > 0 ? `${width}px` : undefined;
 }
 
 // Direct container-token URL for one of a photo's media tiers (thumbnail/
