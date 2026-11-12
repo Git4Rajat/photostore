@@ -6,6 +6,7 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useR
 import { SUGGESTIONS } from './data';
 import { get, post } from '../../services/apiClient';
 import { setPhotoRotation } from './media';
+import { failedDeleteIds } from '../../services/photoDeleteResult';
 import { clearLocalSortIndexRemovals, getLocalSortIndex, invalidateLocalSortIndex, isServerPagedLibrary, removeLocalSortIndexRows, type SortIndexRow } from '../../services/localSortIndex';
 import { getCachedMediaToken, getMediaToken, thumbnailUrlForBlob, type MediaToken } from '../../services/mediaToken';
 import { getLocalAlbumsIndex, invalidateLocalAlbumsIndex } from '../../services/localAlbumsIndex';
@@ -120,6 +121,7 @@ export const mapPhoto = (b: BackendPhoto, token: MediaToken | null = getCachedMe
         // Token mode: the backend sends a blob name and the browser builds the
         // direct URL; otherwise (or for proxy fallbacks) the backend's URL.
         thumbnailUrl: (b.thumbnailBlob && token ? thumbnailUrlForBlob(b.thumbnailBlob, token) : '') || b.thumbnailUrl,
+        ...(b.gridBlob ? { gridBlob: b.gridBlob } : {}),
         rotation: b.rotation,
         thumbnailRotation: b.thumbnailRotation,
         captureDate: iso,
@@ -152,6 +154,7 @@ export const galleryIndexPhoto = (row: SortIndexRow, token: MediaToken | null): 
         thumbnailRotation: row.gallery?.thumbnailRotation,
         processing: row.gallery?.processing,
         thumbnailUrl: thumbnailUrlForBlob(row.thumb, token) || `/api/photos/thumbnail/${encodeURIComponent(row.filename)}`,
+        ...(row.grid ? { gridBlob: row.grid } : {}),
         captureDate: iso,
         ...(row.gallery?.liveClip ? { liveClip: row.gallery.liveClip } : {}),
     };
@@ -1593,7 +1596,18 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             removeFromEverywhere(ids);
             applyPhotoDeleteCount(ids.length);
             setSelection([]);
-            const request = post<{ jobId?: string; status?: string }>('/photos/delete', { filenames: ids });
+            // Put photos the server did not delete back where the optimistic removal took them from.
+            const rollBack = (failedIds: string[]) => {
+                const set = new Set(failedIds);
+                const failedPhotos = doomed.filter((photo) => set.has(photo.id));
+                setTrash((prev) => prev.filter((t) => !set.has(t.photo.id)));
+                setPhotos((cur) => prependMissing(failedPhotos, cur));
+                clearLocalSortIndexRemovals(failedIds);
+                invalidateLocalSortIndex();
+                adjustPeopleCountsForPhotos(failedPhotos, 1);
+                applyPhotoRestoreCount(failedIds.length);
+            };
+            const request = post<{ jobId?: string; status?: string; deleted?: string[]; errors?: string[] }>('/photos/delete', { filenames: ids });
             const settled = request.then(() => undefined, () => undefined);
             ids.forEach((id) => pendingDeletesRef.current.set(id, settled));
             void settled.then(() => ids.forEach((id) => {
@@ -1603,25 +1617,32 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 if (response?.status === 'queued') {
                     toast(`Moving ${plural(ids.length, 'item')} to Recently Deleted`);
                     requestJobPoll();
-                } else {
-                    toast(
-                        `Deleted ${plural(ids.length, 'item')}`,
-                        'Undo',
-                        () => restorePhotos(ids, doomed),
-                    );
-                    publishLibraryChange('photos-deleted', ['photos', 'people', 'albums', 'explore', 'trash'], {
-                        itemCount: ids.length, entityIds: ids,
-                    });
+                    return;
                 }
+                // The server reports per-photo failures in a 200 response; a photo it could not trash would
+                // otherwise look deleted until the next reload brought it back.
+                const failedIds = Array.isArray(response?.deleted) ? failedDeleteIds(ids, response.errors) : [];
+                const succeededIds = failedIds.length ? ids.filter((id) => !failedIds.includes(id)) : ids;
+                if (failedIds.length) rollBack(failedIds);
+                if (failedIds.length === ids.length) {
+                    toast('Couldn’t delete photos', undefined, undefined, 'error');
+                    return;
+                }
+                const succeeded = new Set(succeededIds);
+                toast(
+                    failedIds.length
+                        ? `Deleted ${succeededIds.length} of ${plural(ids.length, 'item')}; ${failedIds.length} couldn’t be deleted`
+                        : `Deleted ${plural(ids.length, 'item')}`,
+                    'Undo',
+                    () => restorePhotos(succeededIds, doomed.filter((photo) => succeeded.has(photo.id))),
+                    failedIds.length ? 'error' : undefined,
+                );
+                publishLibraryChange('photos-deleted', ['photos', 'people', 'albums', 'explore', 'trash'], {
+                    itemCount: succeededIds.length, entityIds: succeededIds,
+                });
             }).catch(() => {
                 // Roll back the optimistic removal on failure.
-                const set = new Set(ids);
-                setTrash((prev) => prev.filter((t) => !set.has(t.photo.id)));
-                setPhotos((cur) => prependMissing(doomed, cur));
-                clearLocalSortIndexRemovals(ids);
-                invalidateLocalSortIndex();
-                adjustPeopleCountsForPhotos(doomed, 1);
-                applyPhotoRestoreCount(ids.length);
+                rollBack(ids);
                 toast('Couldn’t delete photos', undefined, undefined, 'error');
             });
         },

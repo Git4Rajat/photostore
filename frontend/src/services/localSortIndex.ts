@@ -25,6 +25,9 @@ export interface SortIndexRow {
     /** Physical thumbnail blob name once the thumbnail exists; with the media
      * token this yields a direct URL with no backend call. */
     thumb?: string;
+    /** Sharper grid-tile image blob (same container and token as `thumb`), present
+     * only once the backend has made it -- see media.ts tileImage. */
+    grid?: string;
     /** Absent only in snapshots built before the v4 schema migration. */
     gallery?: {
         liked: boolean;
@@ -148,6 +151,7 @@ const normalizeRows = (raw: Record<string, unknown>[]): SortIndexRow[] => raw
         likes: Number(row.likes) || 0,
         uploadDate: typeof row.uploadDate === 'string' ? row.uploadDate : null,
         ...(typeof row.thumb === 'string' && row.thumb ? { thumb: row.thumb } : {}),
+        ...(typeof row.grid === 'string' && row.grid ? { grid: row.grid } : {}),
         ...(row.gallery && typeof row.gallery === 'object'
             ? { gallery: row.gallery as SortIndexRow['gallery'] } : {}),
     }))
@@ -435,17 +439,28 @@ export const getLocalSortIndex = async (): Promise<SortIndexRow[] | null> => {
 // container-token URL the gallery uses (one browser-cache entry per thumbnail, whichever page
 // shows it). Empty until the sort index is loaded.
 let thumbMap: Map<string, string> | null = null;
+let gridMap: Map<string, string> | null = null;
 let thumbMapSource: SortIndexRow[] | null = null;
+const blobMaps = (): void => {
+    if (!cachedIndex || (thumbMapSource === cachedIndex && thumbMap && gridMap)) return;
+    thumbMap = new Map();
+    gridMap = new Map();
+    for (const row of cachedIndex) {
+        if (row.thumb) thumbMap.set(row.filename, row.thumb);
+        if (row.grid) gridMap.set(row.filename, row.grid);
+    }
+    thumbMapSource = cachedIndex;
+};
 export const getCachedSortThumb = (filename: string): string => {
     if (!cachedIndex) return '';
-    if (thumbMapSource !== cachedIndex || !thumbMap) {
-        thumbMap = new Map();
-        for (const row of cachedIndex) {
-            if (row.thumb) thumbMap.set(row.filename, row.thumb);
-        }
-        thumbMapSource = cachedIndex;
-    }
-    return thumbMap.get(filename) || '';
+    blobMaps();
+    return thumbMap?.get(filename) || '';
+};
+/** Grid-tile image blob name for the loaded sort index, or '' when the photo has none yet. */
+export const getCachedSortGrid = (filename: string): string => {
+    if (!cachedIndex) return '';
+    blobMaps();
+    return gridMap?.get(filename) || '';
 };
 
 export const invalidateLocalSortIndex = (): void => {

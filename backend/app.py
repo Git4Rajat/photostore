@@ -60,8 +60,10 @@ from image_utils import (
     RAW_EXTENSIONS_CINEMA,
     RAW_EXTENSIONS_RAWPY,
     VIDEO_EXTENSIONS,
+    GRID_CONTENT_TYPE,
     allowed_file,
     convert_image_to_jpeg,
+    create_grid_image_data,
     crop_face_thumbnail,
     create_placeholder_thumbnail,
     extract_raw_native_preview_bytes,
@@ -246,6 +248,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 worker_logger = logging.getLogger(__name__)
 import album_store
+import grid_images
 import share_snapshot
 import perf_instrumentation
 import table_scan
@@ -643,6 +646,12 @@ LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY = int(os.getenv('LIBRARY_EXPORT_DOWNLOAD_CON
 # -- pure network I/O wait each time, same shape as the library-export
 # downloads above, so overlapping them is the same low-risk win.
 DELETE_IO_CONCURRENCY = int(os.getenv('DELETE_IO_CONCURRENCY', '16'))
+# Per-row source writes each open a coverage reservation on one hot control row, and that row loses races past a
+# handful of concurrent writers. Soft delete batches rows into one transaction (one reservation per 100 rows) and
+# only the per-row fallback runs concurrently, kept at the width that has not been seen to lose races.
+DELETE_SOURCE_WRITE_CONCURRENCY = max(1, int(os.getenv('DELETE_SOURCE_WRITE_CONCURRENCY', '4')))
+SOFT_DELETE_TRANSACTION_SIZE = 100  # Azure Table transaction limit
+SOFT_DELETE_TRANSACTION_ATTEMPTS = 3  # whole-group retries before the per-row fallback
 # How long a soft-deleted photo stays recoverable in trash before the
 # retention sweep (see _run_trash_purge_sweep) hard-deletes it for good.
 TRASH_RETENTION_DAYS = int(os.getenv('TRASH_RETENTION_DAYS', '30'))
@@ -2628,6 +2637,8 @@ def _build_photo_summary(user_id: str, filename: str, metadata: Dict, include_pr
         'url': media_urls['url'],
         'thumbnailUrl': '' if _direct_thumbnail_blob(metadata, filename) else _thumbnail_url_from_metadata(metadata, filename),
         **({'thumbnailBlob': _direct_thumbnail_blob(metadata, filename)} if _direct_thumbnail_blob(metadata, filename) else {}),
+        # Token mode only, like thumbnailBlob: the grid's srcset image (see grid_images.py).
+        **({'gridBlob': grid_images.served_blob(metadata)} if _direct_media_requested() and grid_images.served_blob(metadata) else {}),
         'size': size,
         'lastModified': last_modified_iso,
         'uploadDate': upload_dt.isoformat() if upload_dt else None,
@@ -11298,6 +11309,79 @@ def _looks_like_jpeg(data: bytes) -> bool:
     return bool(data) and data.startswith(b'\xff\xd8')
 
 
+def _make_grid_image(user_id: str, row: Dict) -> bool:
+    """Grid image for one photo, from its preview (see grid_images.py). The
+    published derivative receipt is authoritative; older photos only have the
+    preview/<physical>.jpg cache blob."""
+    filename = str(row.get('RowKey') or '')
+    physical = _blob_name_from_metadata(row, filename)
+    sources = [_preview_cache_blob_name(physical)]
+    try:
+        published = _derivative_blob_from_metadata(row, filename, 'preview', physical=physical)
+        if published and published not in sources:
+            sources.insert(0, published)
+    except ValueError:
+        pass
+    preview, source = None, ''
+    for source in sources:
+        try:
+            preview = download_media_bytes('thumbnail', source)
+            break
+        except ResourceNotFoundError:
+            continue
+    if not preview:
+        worker_logger.warning('Grid image skipped for %s/%s: no preview blob', user_id, filename)
+        return False
+    try:
+        data, width, height = create_grid_image_data(preview)
+    except Exception:
+        worker_logger.warning('Grid image skipped for %s/%s: preview %s did not decode', user_id, filename, source)
+        return False
+    name = grid_images.blob_name(physical)
+    upload_media_file('thumbnail', name, data, GRID_CONTENT_TYPE)
+    stamp = grid_images.record(name, width, height, len(data), source)
+    saved = _update_metadata_entity_fields(user_id, filename, {grid_images.FIELD: stamp},
+                                           derive_updates=lambda entity: grid_images.stamp_updates(entity, stamp))
+    return saved is not None
+
+
+def _enqueue_grid_images(user_id: str, *, cursor: str = '', since: str = '', reason: str = '') -> bool:
+    """Queue a grid_images batch for a library (see grid_images.py). ``since``
+    limits the scan to rows changed after that UTC time (an upload wave's
+    start), so a finished wave doesn't rescan the whole library."""
+    if not user_id or not grid_images.enabled() or clustering_queue_client is None:
+        return False
+    try:
+        clustering_queue_client.send_message(grid_images.job_message(user_id, cursor=cursor, since=since, reason=reason))
+        return True
+    except Exception:
+        worker_logger.warning('Grid image job enqueue failed for %s', user_id, exc_info=True)
+        return False
+
+
+def _run_grid_image_job(payload: Dict) -> None:
+    user_id = str(payload.get('user_id') or '')
+    if not user_id or metadata_table_client is None or not grid_images.enabled():
+        return
+    cursor = str(payload.get('cursor') or '')
+    since = grid_images.valid_since(payload.get('since'))
+    reason = str(payload.get('reason') or '')[:64]
+    filters = ["preview_status eq 'done'"]
+    if cursor:
+        filters.append(f"RowKey gt '{_escape_odata(cursor)}'")
+    if since:
+        filters.append(f"Timestamp ge datetime'{since}'")
+    rows = _iter_metadata_rows_for_user(user_id, select=list(grid_images.SOURCE_FIELDS),
+                                        extra_filter=' and '.join(filters), purpose='grid_images.scan')
+    result = grid_images.run_batch(rows, lambda row: _make_grid_image(user_id, row), limit=grid_images.BATCH_SIZE)
+    continued = bool(result['cursor']) and _enqueue_grid_images(user_id, cursor=result['cursor'], since=since, reason=reason)
+    if result['cursor'] and not continued:
+        # Raise so the queue redelivers this batch; its finished photos are skipped next time.
+        raise RuntimeError('Grid image continuation could not be queued')
+    worker_logger.info('grid images batch: library=%s reason=%s scanned=%d made=%d failed=%d continued=%s',
+                       user_id, reason or '-', result['scanned'], result['made'], result['failed'], continued)
+
+
 PREVIEW_JOB_TYPE = 'media_preview'
 # Per-user derived-index build job (sort/lexical/albums/people). Written by the
 # tools role's /api/tools/indexes/build route as it runs
@@ -14663,6 +14747,9 @@ def _delete_photo_blobs_if_present(blob_name: str, extra_blob_names: Optional[Li
         error = _delete_blob_if_present(BLOB_THUMBNAIL_CONTAINER, f'metadata/{name}.bin')
         if error:
             errors.append(f'blob metadata: {error}')
+        error = _delete_blob_if_present(BLOB_THUMBNAIL_CONTAINER, grid_images.blob_name(name))
+        if error:
+            errors.append(f'blob grid: {error}')
     return errors
 
 
@@ -14751,6 +14838,22 @@ def _trash_index_entries(user_id: str) -> List[Dict]:
 
 
 
+def _apply_soft_delete_fields(entity: Dict[str, Any]) -> str:
+    """Flip a metadata row into the trashed state in memory; returns the deletion time."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    pre_delete_statuses = {field: entity.get(field, 'pending') for field, _ in BROWSER_PROCESSING_STATUS_FIELDS}
+    entity['preDeleteStatuses'] = json.dumps(pre_delete_statuses, separators=(',', ':'))
+    entity['processing_state'] = 'deleted'
+    entity['deletedAt'] = now_iso
+    for status_field, _ in BROWSER_PROCESSING_STATUS_FIELDS:
+        entity[status_field] = 'deleted'
+    entity['processing_lease_owner'] = ''
+    entity['processing_lease'] = ''
+    entity['processing_lease_expires_at'] = ''
+    entity['last_processing_update'] = now_iso
+    return now_iso
+
+
 def _mark_processing_deleted_for_file(user_id: str, filename: str) -> Optional[Dict[str, Any]]:
     """Soft-delete a photo row in place: flips it to the trash state every
     read path already guards against (processing_state == 'deleted'), stamps
@@ -14775,17 +14878,7 @@ def _mark_processing_deleted_for_file(user_id: str, filename: str) -> Optional[D
         version = getattr(entity, 'metadata', {}).get('etag')
         if not version or version == '*':
             raise RuntimeError('Photo deletion requires a metadata ETag')
-        now_iso = datetime.now(timezone.utc).isoformat()
-        pre_delete_statuses = {field: entity.get(field, 'pending') for field, _ in BROWSER_PROCESSING_STATUS_FIELDS}
-        entity['preDeleteStatuses'] = json.dumps(pre_delete_statuses, separators=(',', ':'))
-        entity['processing_state'] = 'deleted'
-        entity['deletedAt'] = now_iso
-        for status_field, _ in BROWSER_PROCESSING_STATUS_FIELDS:
-            entity[status_field] = 'deleted'
-        entity['processing_lease_owner'] = ''
-        entity['processing_lease'] = ''
-        entity['processing_lease_expires_at'] = ''
-        entity['last_processing_update'] = now_iso
+        now_iso = _apply_soft_delete_fields(entity)
         try:
             metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE,
                 etag=version, match_condition=MatchConditions.IfNotModified)
@@ -14796,6 +14889,95 @@ def _mark_processing_deleted_for_file(user_id: str, filename: str) -> Optional[D
         _trash_index_add(user_id, filename, now_iso)
         return entity
     raise RuntimeError('Concurrent photo deletion requires retry')
+
+
+def _soft_delete_one_isolated(user_id: str, filename: str) -> str:
+    """Per-row soft delete that reports its own failure instead of failing the whole batch."""
+    try:
+        return 'deleted' if _mark_processing_deleted_for_file(user_id, filename) is not None else 'not_found'
+    except Exception:
+        app.logger.warning('Soft delete failed for %s/%s', user_id, filename, exc_info=True)
+        return 'error'
+
+
+def _soft_delete_rows(user_id: str, names: List[str]) -> Dict[str, str]:
+    """Soft-delete rows, returning name -> 'deleted' | 'not_found' | 'error' | 'trash_index_failed'.
+
+    Rows are updated in one Table transaction per SOFT_DELETE_TRANSACTION_SIZE, so the index-coverage tracking
+    sees one source write (one reservation) for the group instead of one per photo. A conflicting row fails its
+    transaction atomically; that group then falls back to row-by-row writes at limited concurrency, and a row
+    that still fails is reported as 'error' without affecting the others.
+    """
+    outcomes: Dict[str, str] = {}
+
+    def _load(name: str):
+        try:
+            return name, metadata_table_client.get_entity(partition_key=user_id, row_key=name), None
+        except ResourceNotFoundError:
+            return name, None, None
+        except Exception as exc:
+            return name, None, exc
+
+    def _fallback(group: List[str]) -> None:
+        with ThreadPoolExecutor(max_workers=min(DELETE_SOURCE_WRITE_CONCURRENCY, len(group))) as executor:
+            outcomes.update(zip(group, executor.map(lambda name: _soft_delete_one_isolated(user_id, name), group)))
+
+    def _index_trash(items) -> None:
+        def _add(item) -> str:
+            name, deleted_at = item
+            try:
+                _trash_index_add(user_id, name, deleted_at)
+                return 'deleted'
+            except Exception:
+                # The row is already trashed; a replay of the delete repairs the index entry.
+                return 'trash_index_failed'
+        with ThreadPoolExecutor(max_workers=min(DELETE_IO_CONCURRENCY, len(items))) as executor:
+            outcomes.update(zip((name for name, _ in items), executor.map(_add, items)))
+
+    for start in range(0, len(names), SOFT_DELETE_TRANSACTION_SIZE):
+        remaining = names[start:start + SOFT_DELETE_TRANSACTION_SIZE]
+        retry: List[str] = []
+        for attempt in range(SOFT_DELETE_TRANSACTION_ATTEMPTS):
+            with ThreadPoolExecutor(max_workers=min(DELETE_IO_CONCURRENCY, len(remaining))) as executor:
+                loaded = list(executor.map(_load, remaining))
+            operations, pending, already = [], [], []
+            for name, entity, failure in loaded:
+                if failure is not None:
+                    app.logger.warning('Could not read %s/%s for soft delete', user_id, name, exc_info=failure)
+                    outcomes[name] = 'error'
+                elif entity is None:
+                    outcomes[name] = 'not_found'
+                elif str(entity.get('processing_state') or '').strip().lower() == 'deleted':
+                    already.append((name, str(entity.get('deletedAt') or '')))
+                else:
+                    version = getattr(entity, 'metadata', {}).get('etag')
+                    if not version or version == '*':
+                        retry.append(name)  # the per-row path reports a missing ETag as that row's error
+                        continue
+                    deleted_at = _apply_soft_delete_fields(entity)
+                    operations.append(('update', entity, {
+                        'mode': UpdateMode.MERGE, 'etag': version, 'match_condition': MatchConditions.IfNotModified}))
+                    pending.append((name, deleted_at))
+            remaining = []
+            if operations:
+                try:
+                    metadata_table_client.submit_transaction(operations)
+                except Exception:
+                    # Atomic: nothing was written, so the whole group can be re-read and tried again.
+                    app.logger.info('Soft delete transaction for %s lost a race (attempt %s); %s rows',
+                                    user_id, attempt + 1, len(pending), exc_info=True)
+                    remaining = [name for name, _ in pending]
+                    pending = []
+            # Rows already trashed, and rows just trashed, both need their trash-index entry.
+            if already or pending:
+                _index_trash(already + pending)
+            if not remaining:
+                break
+            time.sleep(random.uniform(0.05, 0.25) * (attempt + 1))
+        retry.extend(remaining)
+        if retry:
+            _fallback(retry)
+    return outcomes
 
 
 def _soft_delete_photos_now(
@@ -14811,6 +14993,7 @@ def _soft_delete_photos_now(
     """
     valid_names = [str(name or '').strip() for name in filenames if str(name or '').strip()]
     deleted: List[str] = []
+    trashed: List[str] = []  # deleted plus trashed rows whose trash-index entry failed: all left the gallery
     errors: List[str] = []
     total = len(valid_names)
 
@@ -14824,19 +15007,26 @@ def _soft_delete_photos_now(
         own_rows = {name for name, metadata in metadata_results if metadata is not None}
         temp_removed = _batch_delete_upload_temp_files(names_set)
 
-        def _delete_one(name: str) -> Tuple[str, str]:
-            if name not in own_rows:
-                return name, 'deleted' if name in temp_removed else 'not_found'
-            return name, 'deleted' if _mark_processing_deleted_for_file(user_id, name) is not None else 'error'
-
-        with ThreadPoolExecutor(max_workers=DELETE_IO_CONCURRENCY) as executor:
-            outcomes = list(executor.map(_delete_one, chunk))
+        row_outcomes = _soft_delete_rows(user_id, [name for name in chunk if name in own_rows])
+        outcomes = [
+            (name, row_outcomes.get(name, 'error') if name in own_rows
+             else ('deleted' if name in temp_removed else 'not_found'))
+            for name in chunk
+        ]
         deleted_chunk = [name for name, outcome in outcomes if outcome == 'deleted']
         deleted.extend(deleted_chunk)
+        failure_text = {
+            'not_found': 'Not found',
+            'trash_index_failed': 'trash index: retry to list it in Recently Deleted',
+        }
         errors.extend(
-            f"{name}: {'Not found' if outcome == 'not_found' else 'metadata: soft-delete failed'}"
+            f"{name}: {failure_text.get(outcome, 'metadata: soft-delete failed')}"
             for name, outcome in outcomes if outcome != 'deleted'
         )
+        # A row trashed but not yet in the trash index still left the gallery: hide its faces and
+        # refresh the derived indexes for it, even though the client is told to retry.
+        deleted_chunk = deleted_chunk + [name for name, outcome in outcomes if outcome == 'trash_index_failed']
+        trashed.extend(deleted_chunk)
         if deleted_chunk:
             try:
                 _set_faces_source_deleted_for_filenames(user_id, deleted_chunk, True)
@@ -14845,10 +15035,10 @@ def _soft_delete_photos_now(
         if progress is not None:
             progress(min(start + len(chunk), total), total)
 
-    if deleted:
+    if trashed:
         _invalidate_metadata_scan_cache(user_id)
         try:
-            touch_user_search_indexes_state(user_id, filenames=deleted)
+            touch_user_search_indexes_state(user_id, filenames=trashed)
         except Exception:
             pass
         try:
@@ -15329,6 +15519,11 @@ def _hard_delete_photos_chunk(user_id: str, filenames: List[str]) -> Tuple[List[
     for failed_blob in _batch_delete_blobs(BLOB_THUMBNAIL_CONTAINER, list(metadata_blob_to_names)):
         for safe_name in metadata_blob_to_names.get(failed_blob, ()):
             blob_errors_by_name.setdefault(safe_name, []).append('blob metadata: delete failed')
+    # Named by physical blob, so no metadata read is needed; never-made ones 404 (counted as gone).
+    grid_blob_to_names = {grid_images.blob_name(name): owners for name, owners in blob_to_names.items()}
+    for failed_blob in _batch_delete_blobs(BLOB_THUMBNAIL_CONTAINER, list(grid_blob_to_names)):
+        for safe_name in grid_blob_to_names.get(failed_blob, ()):
+            blob_errors_by_name.setdefault(safe_name, []).append('blob grid: delete failed')
 
     for safe_name, metadata in own_rows_by_name.items():
         if safe_name in shared_names:
@@ -16134,6 +16329,8 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
         return run_artifact_cleanup(payload)
     if payload.get('type') == SHARE_SNAPSHOT_JOB_TYPE:
         return _run_share_snapshot_job(payload)
+    if payload.get('type') == grid_images.JOB_TYPE:
+        return _run_grid_image_job(payload)
     from wave_policy import legacy_message_suppressed
     if legacy_message_suppressed(jobs_table_client,user_id,payload):
         return

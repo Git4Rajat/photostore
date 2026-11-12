@@ -45,3 +45,17 @@ describe('liveCorner', () => {
         expect(liveCorner(null, { w: 861, h: 538 }, 0)).toBeUndefined();
     });
 });
+
+describe('ViewerShell wheel zoom', () => {
+    const scale = () => Number(/scale\(([\d.]+)\)/.exec(screen.getByAltText('IMG_1.HEIC').getAttribute('style') || '')?.[1]);
+
+    it('zooms in and back out with a plain mouse wheel over the photo', () => {
+        render(<ViewerShell {...props()} />);
+        const stage = document.querySelector('.pt-viewer-stage-wrap')!;
+        fireEvent.wheel(stage, { deltaY: -100, clientX: 400, clientY: 300 });
+        fireEvent.wheel(stage, { deltaY: -100, clientX: 400, clientY: 300 });
+        expect(scale()).toBeGreaterThan(1.5);
+        for (let i = 0; i < 10; i += 1) fireEvent.wheel(stage, { deltaY: 100, clientX: 400, clientY: 300 });
+        expect(scale()).toBe(1);
+    });
+});

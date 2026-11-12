@@ -1,7 +1,7 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useRef } from 'react';
 import { Undo2 as ArrowUturnLeftIcon, Trash2 as TrashIcon } from 'lucide-react';
 import { useStore } from '../store';
-import { usePhotoThumbnails } from '../media';
+import { tileImage, usePhotoThumbnails, useTileSizes } from '../media';
 import { TileThumbnail } from '../components/PhotoGrid';
 import { confirmDialog } from '../../../components/shared/dialogs';
 
@@ -13,6 +13,8 @@ const TrashPage: React.FC = () => {
         navigate,
     } = useStore();
     const thumbs = usePhotoThumbnails(trash.map((t) => t.photo));
+    const gridRef = useRef<HTMLDivElement>(null);
+    const tileSizes = useTileSizes(gridRef, trash[0]?.photo.id);
 
     useEffect(() => {
         reloadTrash();
@@ -87,11 +89,13 @@ const TrashPage: React.FC = () => {
                     </div>
                 </div>
             ) : (
-                <div className="pt-grid">
-                    {trash.map((t) => (
+                <div className="pt-grid" ref={gridRef}>
+                    {trash.map((t) => {
+                        const image = tileImage(t.photo, thumbs[t.photo.filename]);
+                        return (
                         <div key={t.photo.id} className={`pt-tile pt-trash-tile mock-swatch ${t.photo.swatch}`}>
-                            {thumbs[t.photo.filename] && (
-                                <TileThumbnail key={thumbs[t.photo.filename]} src={thumbs[t.photo.filename]} alt={t.photo.filename} />
+                            {image && (
+                                <TileThumbnail key={image.src} src={image.src} srcSet={image.srcSet} sizes={tileSizes} alt={t.photo.filename} style={image.style} />
                             )}
                             <div className="pt-trash-actions">
                                 <button type="button" title="Restore" aria-label="Restore" onClick={() => restorePhotos([t.photo.id])}><ArrowUturnLeftIcon /></button>
@@ -99,7 +103,8 @@ const TrashPage: React.FC = () => {
                             </div>
                             <span className="pt-trash-days">{t.purgesInDays}d</span>
                         </div>
-                    ))}
+                        );
+                    })}
                 </div>
             )}
 

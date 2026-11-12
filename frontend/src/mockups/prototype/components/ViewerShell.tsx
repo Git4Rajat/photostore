@@ -165,7 +165,9 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
     // `pan' = pan*ratio + offsetFromCenter*(1-ratio)`, ratio = newZoom/oldZoom.
     const zoomAtPoint = useCallback((targetZoom: number, clientX: number, clientY: number) => {
         const oldZoom = zoomRef.current;
-        const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, +targetZoom.toFixed(2)));
+        const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, +targetZoom.toFixed(3)));
+        // Read by the next wheel event before React re-renders, so fast scrolling accumulates.
+        zoomRef.current = next;
         if (next === 1) {
             setZoom(1);
             setPan({ x: 0, y: 0 });
@@ -235,10 +237,13 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
     useEffect(() => {
         const el = stageWrapRef.current;
         if (!el) return undefined;
+        // The viewer is a full-screen overlay with nothing to scroll, so a plain wheel zooms at the cursor.
+        // Steps scale with the wheel delta: a mouse notch (~100) zooms ~28%, trackpad scrolls and
+        // pinches (ctrl+wheel, small deltas) zoom smoothly.
         const onWheel = (e: WheelEvent) => {
-            if (!e.ctrlKey && !e.metaKey) return;
             e.preventDefault();
-            zoomAtPoint(zoomRef.current + (e.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP), e.clientX, e.clientY);
+            const delta = Math.max(-100, Math.min(100, e.deltaY));
+            zoomAtPoint(zoomRef.current * Math.exp(-delta / (e.ctrlKey ? 100 : 400)), e.clientX, e.clientY);
         };
         el.addEventListener('wheel', onWheel, { passive: false });
         return () => el.removeEventListener('wheel', onWheel);

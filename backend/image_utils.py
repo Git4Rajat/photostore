@@ -5,7 +5,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageOps
 
@@ -84,6 +84,17 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
 THUMBNAIL_SIZE = (120, 120)
 THUMBNAIL_QUALITY = 65
 THUMBNAIL_FORMAT = 'JPEG'
+# Mid-size grid image, made from the preview (never the original) by
+# grid_images.py. Grid tiles are square and crop with object-fit: cover, so
+# the SHORT edge is what has to cover a tile: 400 px covers today's ~168 CSS px
+# phone tile at 2x (336 device px) and an 8-column desktop tile at 2x without
+# upscaling. The long-edge cap only bites on panoramas wider than 2:1.
+# The frontend's srcset declares this short edge (see media.ts tileImage).
+GRID_SHORT_EDGE = 400
+GRID_MAX_LONG_EDGE = 800
+GRID_QUALITY = 72
+GRID_FORMAT = 'WEBP'
+GRID_CONTENT_TYPE = 'image/webp'
 PREVIEW_MAX_BYTES = 1_000_000
 PREVIEW_MAX_DIMENSION = 2048
 # Deliberately above PREVIEW_MAX_BYTES: a source already this close to the
@@ -561,6 +572,36 @@ def create_thumbnail_data(source_bytes: bytes) -> bytes:
             except Exception:
                 pass
         return create_placeholder_thumbnail()
+
+
+def create_grid_image_data(preview_bytes: bytes) -> Tuple[bytes, int, int]:
+    """Encode the grid tile image from an already-shrunk preview JPEG.
+
+    Orientation matches the preview as a browser shows it (EXIF applied, the
+    user's manual rotation NOT baked in -- the grid applies that as CSS, same
+    as the viewer does for the preview). Never upscales a small preview.
+    Returns (bytes, width, height); raises on undecodable input."""
+    with Image.open(io.BytesIO(preview_bytes)) as source:
+        width, height = source.size
+        if width <= 0 or height <= 0:
+            raise ValueError('Preview has no pixels')
+        transposed = source.getexif().get(0x0112, 1) in (5, 6, 7, 8)
+        if transposed:
+            width, height = height, width
+        scale = min(1.0, GRID_SHORT_EDGE / min(width, height), GRID_MAX_LONG_EDGE / max(width, height))
+        target = (max(1, round(width * scale)), max(1, round(height * scale)))
+        # JPEG DCT scaling decodes a 2048 px preview at 1/2 or 1/4 size, a
+        # fraction of a full decode. draft() works in stored (pre-EXIF)
+        # orientation and keeps both dimensions >= the request.
+        source.draft('RGB', (target[1], target[0]) if transposed else target)
+        image = ImageOps.exif_transpose(source)
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        if image.size != target:
+            image = image.resize(target, RESAMPLING_LANCZOS)
+        output = io.BytesIO()
+        image.save(output, format=GRID_FORMAT, quality=GRID_QUALITY, method=4)
+        return output.getvalue(), target[0], target[1]
 
 
 def extract_video_frame_jpeg(video_bytes: bytes, filename: str = '') -> Optional[bytes]:
