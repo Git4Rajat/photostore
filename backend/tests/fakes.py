@@ -52,10 +52,20 @@ class FakeTable:
         # the "N upserts become 1 call" behavior storage_utils's dirty-
         # filename batching relies on (see _flush_dirty_filename_buffer).
         self.submit_transaction_calls.append(list(operations))
+        # Like the service, a transaction with any failed ETag condition applies nothing.
         for operation in operations:
             op_type, entity = operation[:2]
             kwargs = operation[2] if len(operation) > 2 else {}
-            if op_type == 'upsert':
+            if op_type == 'update' and kwargs.get('match_condition') is not None:
+                key = entity['PartitionKey'], entity['RowKey']
+                if key not in self.rows or kwargs.get('etag') != str(self.versions.get(key, 0)):
+                    raise ResourceModifiedError('changed')
+        for operation in operations:
+            op_type, entity = operation[:2]
+            kwargs = operation[2] if len(operation) > 2 else {}
+            if op_type == 'update':
+                self.update_entity(entity, **kwargs)
+            elif op_type == 'upsert':
                 self.upsert_entity(entity, **kwargs)
             elif op_type == 'delete':
                 self.delete_entity(entity['PartitionKey'], entity['RowKey'], **kwargs)

@@ -6,6 +6,7 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useR
 import { SUGGESTIONS } from './data';
 import { get, post } from '../../services/apiClient';
 import { setPhotoRotation } from './media';
+import { failedDeleteIds } from '../../services/photoDeleteResult';
 import { clearLocalSortIndexRemovals, getLocalSortIndex, invalidateLocalSortIndex, isServerPagedLibrary, removeLocalSortIndexRows, type SortIndexRow } from '../../services/localSortIndex';
 import { getCachedMediaToken, getMediaToken, thumbnailUrlForBlob, type MediaToken } from '../../services/mediaToken';
 import { getLocalAlbumsIndex, invalidateLocalAlbumsIndex } from '../../services/localAlbumsIndex';
@@ -1562,29 +1563,46 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             removeFromEverywhere(ids);
             applyPhotoDeleteCount(ids.length);
             setSelection([]);
-            void post<{ jobId?: string; status?: string }>('/photos/delete', { filenames: ids }).then((response) => {
+            // Put photos the server did not delete back where the optimistic removal took them from.
+            const rollBack = (failedIds: string[]) => {
+                const set = new Set(failedIds);
+                const failedPhotos = doomed.filter((photo) => set.has(photo.id));
+                setTrash((prev) => prev.filter((t) => !set.has(t.photo.id)));
+                setPhotos((cur) => [...failedPhotos, ...cur]);
+                clearLocalSortIndexRemovals(failedIds);
+                invalidateLocalSortIndex();
+                adjustPeopleCountsForPhotos(failedPhotos, 1);
+                applyPhotoRestoreCount(failedIds.length);
+            };
+            void post<{ jobId?: string; status?: string; deleted?: string[]; errors?: string[] }>('/photos/delete', { filenames: ids }).then((response) => {
                 if (response?.status === 'queued') {
                     toast(`Moving ${ids.length} photos to Recently Deleted`);
                     requestJobPoll();
-                } else {
-                    toast(
-                        `Deleted ${ids.length} photo${ids.length > 1 ? 's' : ''}`,
-                        'Undo',
-                        () => restorePhotos(ids),
-                    );
-                    publishLibraryChange('photos-deleted', ['photos', 'people', 'albums', 'explore', 'trash'], {
-                        itemCount: ids.length, entityIds: ids,
-                    });
+                    return;
                 }
+                // The server reports per-photo failures in a 200 response; a photo it could not trash would
+                // otherwise look deleted until the next reload brought it back.
+                const failedIds = Array.isArray(response?.deleted) ? failedDeleteIds(ids, response.errors) : [];
+                const succeededIds = failedIds.length ? ids.filter((id) => !failedIds.includes(id)) : ids;
+                if (failedIds.length) rollBack(failedIds);
+                if (failedIds.length === ids.length) {
+                    toast('Couldn’t delete photos', undefined, undefined, 'error');
+                    return;
+                }
+                toast(
+                    failedIds.length
+                        ? `Deleted ${succeededIds.length} of ${ids.length} photos; ${failedIds.length} couldn’t be deleted`
+                        : `Deleted ${ids.length} photo${ids.length > 1 ? 's' : ''}`,
+                    'Undo',
+                    () => restorePhotos(succeededIds),
+                    failedIds.length ? 'error' : undefined,
+                );
+                publishLibraryChange('photos-deleted', ['photos', 'people', 'albums', 'explore', 'trash'], {
+                    itemCount: succeededIds.length, entityIds: succeededIds,
+                });
             }).catch(() => {
                 // Roll back the optimistic removal on failure.
-                const set = new Set(ids);
-                setTrash((prev) => prev.filter((t) => !set.has(t.photo.id)));
-                setPhotos((cur) => [...doomed, ...cur]);
-                clearLocalSortIndexRemovals(ids);
-                invalidateLocalSortIndex();
-                adjustPeopleCountsForPhotos(doomed, 1);
-                applyPhotoRestoreCount(ids.length);
+                rollBack(ids);
                 toast('Couldn’t delete photos', undefined, undefined, 'error');
             });
         },
