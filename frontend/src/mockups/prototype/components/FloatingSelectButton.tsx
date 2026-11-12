@@ -14,8 +14,20 @@ const SETTLE_MS = 150;
  * It sits beside the scroll-to-top button and shares its scroll-container/settle
  * behaviour. Select state belongs to the host page (the store's global select mode in
  * the app, local state on the public album page), so it is passed in.
+ *
+ * `grid` names the grid this button selects from, so the photo button never shows over
+ * the People grid (where it sat on top of People's own selection bar and hid Merge).
+ * `hideOnTouch`: on touch screens a long-press on a tile starts selecting, so the pill
+ * is only clutter there; pages without long-press (the public album) leave it on.
  */
-export const FloatingSelectButton: React.FC<{ selectMode: boolean; onToggle: () => void; suppressed?: boolean; noun?: string }> = ({ selectMode, onToggle, suppressed = false, noun = 'photos' }) => {
+export const FloatingSelectButton: React.FC<{
+    selectMode: boolean;
+    onToggle: () => void;
+    suppressed?: boolean;
+    noun?: string;
+    grid?: string;
+    hideOnTouch?: boolean;
+}> = ({ selectMode, onToggle, suppressed = false, noun = 'photos', grid = '.pt-grid', hideOnTouch = false }) => {
     const [visible, setVisible] = useState(false);
     const settleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -33,7 +45,7 @@ export const FloatingSelectButton: React.FC<{ selectMode: boolean; onToggle: () 
                 return;
             }
             // Only offer it where there is something to select on the current page.
-            settleTimer.current = setTimeout(() => setVisible(Boolean(container.querySelector('.pt-grid, .pt-people-grid'))), SETTLE_MS);
+            settleTimer.current = setTimeout(() => setVisible(Boolean(container.querySelector(grid))), SETTLE_MS);
         };
         container.addEventListener('scroll', onScroll, { passive: true });
         return () => {
@@ -42,7 +54,7 @@ export const FloatingSelectButton: React.FC<{ selectMode: boolean; onToggle: () 
                 clearTimeout(settleTimer.current);
             }
         };
-    }, []);
+    }, [grid]);
 
     // `suppressed`: another control already occupies this corner (the app's bottom selection bar,
     // which has its own close button, covers it once something is selected).
@@ -51,7 +63,7 @@ export const FloatingSelectButton: React.FC<{ selectMode: boolean; onToggle: () 
     return (
         <button
             type="button"
-            className={`pt-float-select${shown ? ' visible' : ''}${selectMode ? ' active' : ''}`}
+            className={`pt-float-select${shown ? ' visible' : ''}${selectMode ? ' active' : ''}${hideOnTouch ? ' touch-hidden' : ''}`}
             onClick={onToggle}
             aria-label={label}
             aria-pressed={selectMode}

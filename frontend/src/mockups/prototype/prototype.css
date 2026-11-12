@@ -90,6 +90,10 @@
 @container (max-width: 805px) {
   .pt-float-select { bottom: calc(64px + env(safe-area-inset-bottom) + 16px); }
 }
+/* Touch screens start selecting with a long-press on a tile, so there the pill is only clutter. */
+@media (hover: none) and (pointer: coarse) {
+  .pt-float-select.touch-hidden { display: none; }
+}
 
 /* The real .ios-tab is an <a>; we render <button>s, so strip the UA button
    chrome while keeping the underline-on-active treatment. */
@@ -361,7 +365,7 @@
 
 /* ---- people ---- */
 .pt-people-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 14px; }
-.pt-person-card { position: relative; display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 14px; border: 1px solid var(--lg-edge); border-radius: var(--r-md); background: var(--lg-surface-wash); cursor: pointer; font: inherit; color: var(--text); }
+.pt-person-card { position: relative; display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 14px; border: 1px solid var(--lg-edge); border-radius: var(--r-md); background: var(--lg-surface-wash); cursor: pointer; font: inherit; color: var(--text); -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
 .pt-person-card:hover { border-color: var(--muted); }
 .pt-person-card.selected { border-color: var(--accent); background: var(--accent-soft); }
 .pt-person-check { position: absolute; top: 8px; right: 8px; }
