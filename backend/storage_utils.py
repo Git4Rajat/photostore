@@ -52,7 +52,7 @@ from image_utils import (
     RAW_EXTENSIONS_TIFF_CONTAINER,
 )
 from exif_utils import extract_exif_from_bytes, extract_gps_decimal_from_exif
-from ordering_utils import metadata_capture_datetime, parse_iso_date
+from ordering_utils import capture_iso, metadata_capture_datetime, parse_iso_date
 from search_utils import AI_TAG_MIN_CONFIDENCE, MAX_TAGS_STORED, PERSON_SCORE_THRESHOLD, build_semantic_layers, build_semantic_text, curate_tag_records, effective_tags, is_sensitive_auto_tag_label, normalize_tags, visible_tags
 import album_store
 import grid_images
@@ -5665,7 +5665,7 @@ def get_user_lexical_index(
 # _VECTOR_INDEX_RELEVANT_FIELDS/_SORT_INDEX_RELEVANT_FIELDS above). A rating
 # tap needs to cheaply re-sort a number, not pay for a full OCR/tag/embedding
 # lexical rebuild -- so this index tracks its own staleness end to end.
-_SORT_INDEX_SCHEMA_VERSION = 'v5'  # v5: exclude unfinalized upload reservations
+_SORT_INDEX_SCHEMA_VERSION = 'v6'  # v6: captureDate keeps its EXIF offset (none when unknown); filename dates
 _SORT_INDEX_CACHE_LOCK = threading.RLock()
 _SORT_INDEX_CACHE: Dict[str, Dict[str, object]] = _serve_only_cache()
 _SORT_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
@@ -5916,7 +5916,7 @@ def _sort_index_row(entity: Dict) -> Optional[Dict[str, object]]:
 
     return {
         'RowKey': filename,
-        'captureDate': capture_dt.isoformat() if capture_dt else None,
+        'captureDate': capture_iso(capture_dt),
         'rating': entity.get('rating') or 0,
         'likes': entity.get('likes') or 0,
         'uploadDate': entity.get('uploadDate') or None,

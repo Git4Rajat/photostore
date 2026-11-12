@@ -53,6 +53,7 @@ from ordering_utils import (
     metadata_capture_datetime,
     metadata_upload_datetime,
     epoch_millis_to_iso,
+    capture_iso,
 )
 from timeline_metadata import TimelineAccumulator, build_timeline_summary
 from image_utils import (
@@ -2642,7 +2643,7 @@ def _build_photo_summary(user_id: str, filename: str, metadata: Dict, include_pr
         'size': size,
         'lastModified': last_modified_iso,
         'uploadDate': upload_dt.isoformat() if upload_dt else None,
-        'captureDate': capture_dt.isoformat() if capture_dt else None,
+        'captureDate': capture_iso(capture_dt),
         'rating': metadata.get('rating', 0),
         'likes': metadata.get('likes', 0),
         'liked': user_id in liked_by,
