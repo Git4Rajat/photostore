@@ -648,6 +648,7 @@ DELETE_IO_CONCURRENCY = int(os.getenv('DELETE_IO_CONCURRENCY', '16'))
 # only the per-row fallback runs concurrently, kept at the width that has not been seen to lose races.
 DELETE_SOURCE_WRITE_CONCURRENCY = max(1, int(os.getenv('DELETE_SOURCE_WRITE_CONCURRENCY', '4')))
 SOFT_DELETE_TRANSACTION_SIZE = 100  # Azure Table transaction limit
+SOFT_DELETE_TRANSACTION_ATTEMPTS = 3  # whole-group retries before the per-row fallback
 # How long a soft-deleted photo stays recoverable in trash before the
 # retention sweep (see _run_trash_purge_sweep) hard-deletes it for good.
 TRASH_RETENTION_DAYS = int(os.getenv('TRASH_RETENTION_DAYS', '30'))
@@ -14853,41 +14854,48 @@ def _soft_delete_rows(user_id: str, names: List[str]) -> Dict[str, str]:
             outcomes.update(zip((name for name, _ in items), executor.map(_add, items)))
 
     for start in range(0, len(names), SOFT_DELETE_TRANSACTION_SIZE):
-        group = names[start:start + SOFT_DELETE_TRANSACTION_SIZE]
-        with ThreadPoolExecutor(max_workers=min(DELETE_IO_CONCURRENCY, len(group))) as executor:
-            loaded = list(executor.map(_load, group))
-        operations, pending, already = [], [], []
+        remaining = names[start:start + SOFT_DELETE_TRANSACTION_SIZE]
         retry: List[str] = []
-        for name, entity, failure in loaded:
-            if failure is not None:
-                app.logger.warning('Could not read %s/%s for soft delete', user_id, name, exc_info=failure)
-                outcomes[name] = 'error'
-            elif entity is None:
-                outcomes[name] = 'not_found'
-            elif str(entity.get('processing_state') or '').strip().lower() == 'deleted':
-                already.append((name, str(entity.get('deletedAt') or '')))
-            else:
-                version = getattr(entity, 'metadata', {}).get('etag')
-                if not version or version == '*':
-                    retry.append(name)  # the per-row path reports a missing ETag as that row's error
-                    continue
-                deleted_at = _apply_soft_delete_fields(entity)
-                operations.append(('update', entity, {
-                    'mode': UpdateMode.MERGE, 'etag': version, 'match_condition': MatchConditions.IfNotModified}))
-                pending.append((name, deleted_at))
-        if operations:
-            try:
-                metadata_table_client.submit_transaction(operations)
-            except Exception:
-                app.logger.info('Soft delete transaction for %s lost a race; retrying %s rows individually',
-                                user_id, len(pending), exc_info=True)
-                retry.extend(name for name, _ in pending)
-                pending = []
+        for attempt in range(SOFT_DELETE_TRANSACTION_ATTEMPTS):
+            with ThreadPoolExecutor(max_workers=min(DELETE_IO_CONCURRENCY, len(remaining))) as executor:
+                loaded = list(executor.map(_load, remaining))
+            operations, pending, already = [], [], []
+            for name, entity, failure in loaded:
+                if failure is not None:
+                    app.logger.warning('Could not read %s/%s for soft delete', user_id, name, exc_info=failure)
+                    outcomes[name] = 'error'
+                elif entity is None:
+                    outcomes[name] = 'not_found'
+                elif str(entity.get('processing_state') or '').strip().lower() == 'deleted':
+                    already.append((name, str(entity.get('deletedAt') or '')))
+                else:
+                    version = getattr(entity, 'metadata', {}).get('etag')
+                    if not version or version == '*':
+                        retry.append(name)  # the per-row path reports a missing ETag as that row's error
+                        continue
+                    deleted_at = _apply_soft_delete_fields(entity)
+                    operations.append(('update', entity, {
+                        'mode': UpdateMode.MERGE, 'etag': version, 'match_condition': MatchConditions.IfNotModified}))
+                    pending.append((name, deleted_at))
+            remaining = []
+            if operations:
+                try:
+                    metadata_table_client.submit_transaction(operations)
+                except Exception:
+                    # Atomic: nothing was written, so the whole group can be re-read and tried again.
+                    app.logger.info('Soft delete transaction for %s lost a race (attempt %s); %s rows',
+                                    user_id, attempt + 1, len(pending), exc_info=True)
+                    remaining = [name for name, _ in pending]
+                    pending = []
+            # Rows already trashed, and rows just trashed, both need their trash-index entry.
+            if already or pending:
+                _index_trash(already + pending)
+            if not remaining:
+                break
+            time.sleep(random.uniform(0.05, 0.25) * (attempt + 1))
+        retry.extend(remaining)
         if retry:
             _fallback(retry)
-        # Rows already trashed, and rows just trashed, both need their trash-index entry.
-        if already or pending:
-            _index_trash(already + pending)
     return outcomes
 
 

@@ -39,7 +39,7 @@ def test_rows_are_deleted_in_one_transaction_per_hundred(monkeypatch):
     assert {key[1] for key in trash.rows} == set(names)
 
 
-def test_a_lost_race_falls_back_to_rows_and_still_deletes_everything(monkeypatch):
+def test_a_lost_race_is_retried_as_a_group_and_still_deletes_everything(monkeypatch):
     meta, trash, names = _setup(monkeypatch, 40)
     real = meta.submit_transaction
 
@@ -53,6 +53,7 @@ def test_a_lost_race_falls_back_to_rows_and_still_deletes_everything(monkeypatch
     assert sorted(result['deleted']) == names and result['errors'] == []
     assert all(meta.rows[('u1', n)]['processing_state'] == 'deleted' for n in names)
     assert meta.rows[('u1', names[3])]['rating'] == 5  # the concurrent edit survived
+    assert len(meta.submit_transaction_calls) == 2  # the lost race was settled by re-reading and retrying the group
 
 
 def test_one_failing_row_is_reported_without_failing_the_request(monkeypatch):
