@@ -59,13 +59,13 @@ param processingMode string = 'backend'
 param browserUploadPreparation bool = true
 
 @description('Public core API image. Defaults to an immutable @sha256 digest (rewritten by the publish workflow after each qualified release), never :latest, so installs never auto-upgrade. To upgrade an EXISTING deployment, override with the new release digest.')
-param coreImage string = 'ghcr.io/git4rajat/photostore-backend@sha256:b5aa5dbca88bab3130696df5bb1a16748ab9859a01bb260f631c26d4d85b1c45'
+param coreImage string = 'ghcr.io/git4rajat/photostore-backend@sha256:2660141e179a4054f1ec19f3d4f39794441448bd0941255b2d1de7cd811389dd'
 
 @description('Public web (frontend) image. Defaults to an immutable @sha256 digest, never :latest, same as coreImage above.')
-param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:cb7d9a8e4f5ea9cafe881fcbba84e8f6447fe53296fb2ceb22b8461b05eabf68'
+param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:4d9823d7ce0a36505460c214fe93345833c3e17e083b8369c6db161b9a01156c'
 
 @description('Public vision (server-side image processing) image. Only pulled/deployed when processingMode is "backend" or "both". Separate from coreImage (unlike the clustering `cluster` role, which reuses it) because vision needs torch/open_clip/onnxruntime/opencv/mediapipe/tesseract -- multiple GB of extra weight that would slow every core/cluster cold start if bundled into their shared image. Same digest-pinning guidance as coreImage applies.')
-param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker@sha256:81c206230f1143e1fa30d575b6157ffecaee8de5ca4c3cc6158a75e588f8efd1'
+param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker@sha256:896016f71789717c0179c5d3034aaa4555fd21a3eba0b1346f4c315307710979'
 
 @description('Quota in GiB for the dedicated clustering FAISS checkpoint SMB share. Local SQLite/work files remain on ephemeral storage.')
 @minValue(1)
@@ -89,12 +89,12 @@ param enableWaveExecution bool = true
 @description('Enroll newly created empty libraries only. Existing libraries never change ownership.')
 param enableNewWaveLibraries bool = true
 @description('Exact-image capability ID. Fresh wave activation requires the seeded release certificate; never leave empty.')
-param waveCapabilityId string = 'ae4e21709ffc524a66642a73659e984c29d1d128e2358453f38f5b6668a3cf74'
+param waveCapabilityId string = 'a3653f3ddb026a351750fd4f3c67d6899b992d59e4e99da5b99b7fa50d6cc83b'
 
 @description('Earlier release certificates this release may replace in place (set by the release pin job).')
-param waveCompatibleCapabilities string = 'c45ea6724b831bb64bb9aeb833d62ad97026d6c76fbaf8109694f3d37af29ade,7b69f28cb92201d6b1cc99b34b19a2a89b821440e313b14c53b28d1108bed7fc,c6743c0e87c2e1a7895a35570d12481304587c38e26cf25f3f5c38d3842bcc9c,e081e1c9df589fff423d6fa33b9776a3f15d62893475278da348ed48c7fd2b05,78f400065ec0981098cb6f1824a29cb7218c8ee331c9d977908b7a07c16e4732,78df247682077525618a0354c6e2c0a0c68c4fa49059deccfb58e81d9e78a8a0,1c83f729139f2626ea4801c096b9358c0030354530ceb6b9afbf0695fadbebbe,710b1ab8295761b3e6080d82ac0e50883d1970af82466e14f3599ed116996006'
+param waveCompatibleCapabilities string = 'ae4e21709ffc524a66642a73659e984c29d1d128e2358453f38f5b6668a3cf74,c45ea6724b831bb64bb9aeb833d62ad97026d6c76fbaf8109694f3d37af29ade,7b69f28cb92201d6b1cc99b34b19a2a89b821440e313b14c53b28d1108bed7fc,c6743c0e87c2e1a7895a35570d12481304587c38e26cf25f3f5c38d3842bcc9c,e081e1c9df589fff423d6fa33b9776a3f15d62893475278da348ed48c7fd2b05,78f400065ec0981098cb6f1824a29cb7218c8ee331c9d977908b7a07c16e4732,78df247682077525618a0354c6e2c0a0c68c4fa49059deccfb58e81d9e78a8a0,1c83f729139f2626ea4801c096b9358c0030354530ceb6b9afbf0695fadbebbe'
 @description('Source commit of the pinned release (set by the release pin job).')
-param waveSourceCommit string = '45639a8526a71bf59186c4546c0600925b014da3'
+param waveSourceCommit string = '2537a56fe1ae8b3ae09d5217cb6579bbab6cc047'
 @description('Fresh-install preparation only: block upload intake and run certificate seeding as a manual recovery job. Activate only after that job succeeds.')
 param waveBootstrapPending bool = false
 
