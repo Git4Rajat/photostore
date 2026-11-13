@@ -15,6 +15,14 @@ import { TurnedVideoControls } from './TurnedVideoControls';
 export const ZOOM_MIN = 1;
 export const ZOOM_MAX = 4;
 export const ZOOM_STEP = 0.5;
+/** The floating panel hides itself this long after it was last shown or used. */
+export const TOOLS_HIDE_MS = 3000;
+/** How far down a one-finger swipe on the photo has to travel to close the viewer. */
+const SWIPE_CLOSE_PX = 90;
+
+// Touches that start on these belong to the control, not to the stage's pan, tap and swipe gestures.
+const CONTROL_SELECTOR = 'button, input, a, select, textarea, .pt-viewer-tools, .pt-viewer-info, .pt-turned-video-bar';
+const isControl = (target: EventTarget | null) => target instanceof Element && Boolean(target.closest(CONTROL_SELECTOR));
 
 export interface ViewerMedia {
     url: string | null | undefined;
@@ -48,6 +56,9 @@ export interface ViewerShellProps {
     liveSrc?: string;
     fullRes: boolean;
     onToggleFullRes: () => void;
+    /** The full-resolution image could not be drawn (a browser that can't decode HEIC, say).
+     *  The stage waits for the caller to turn full resolution off instead of showing an error. */
+    onFullResFailed?: () => void;
     showFullResControl: boolean;
     onDownloadOriginal: () => void;
     /** Rendered inside the stage (the info panel). */
@@ -72,7 +83,7 @@ export const liveCorner = (natural: { w: number; h: number } | null, box: { w: n
 
 const ViewerShell: React.FC<ViewerShellProps> = ({
     photoKey, filename, title, index, count, initialRotation = 0, onRotate, onClose, onStep,
-    media, videoSrc, onVideoError, videoFailed: videoFailedProp, videoPoster, liveSrc, fullRes, onToggleFullRes, showFullResControl, onDownloadOriginal, info, bar,
+    media, videoSrc, onVideoError, videoFailed: videoFailedProp, videoPoster, liveSrc, fullRes, onToggleFullRes, onFullResFailed, showFullResControl, onDownloadOriginal, info, bar,
 }) => {
     const { url: mainSrc, loading: fullResLoading, progress: fullResProgress, status: mediaStatus } = media;
     const [rotation, setRotation] = useState(0);
@@ -87,10 +98,36 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
     // Mirrors `pan` for the same reason zoomRef mirrors `zoom`.
     const panStateRef = useRef(pan);
     useEffect(() => { panStateRef.current = pan; }, [pan]);
-    // On touch devices the floating zoom/rotate toolbar sits over the top of the
-    // photo (it overlaps tall portrait shots). Hide it until the user taps the
-    // photo, iOS-style; a tap toggles it. Desktop keeps it always visible (CSS).
+    // The floating zoom/rotate/full-res panel sits over the top of the photo
+    // (it overlaps tall portrait shots), for videos too. It stays hidden until
+    // wanted: a tap on the photo or video toggles it, a moving mouse shows it,
+    // and it hides itself TOOLS_HIDE_MS after it was last shown or used.
     const [showTools, setShowTools] = useState(false);
+    // Bumped on every show or use, to restart the hide timer.
+    const [toolsNudge, setToolsNudge] = useState(0);
+    const [toolsHovered, setToolsHovered] = useState(false);
+    const lastNudgeRef = useRef(0);
+    const revealTools = useCallback(() => {
+        setShowTools(true);
+        // A moving mouse calls this per event; restarting the timer a few times a second is plenty.
+        const now = Date.now();
+        if (now - lastNudgeRef.current > 250) {
+            lastNudgeRef.current = now;
+            setToolsNudge((n) => n + 1);
+        }
+    }, []);
+    const toggleTools = useCallback(() => {
+        setShowTools((v) => !v);
+        setToolsNudge((n) => n + 1);
+    }, []);
+    useEffect(() => {
+        // Stays up while the mouse rests on it or a full-resolution download shows its progress.
+        if (!showTools || toolsHovered || fullResLoading) return undefined;
+        const timer = window.setTimeout(() => setShowTools(false), TOOLS_HIDE_MS);
+        return () => window.clearTimeout(timer);
+    }, [showTools, toolsHovered, fullResLoading, toolsNudge]);
+    // A tap toggles the panel, but a mouse click only shows it: the mouse already showed it by moving.
+    const pointerTypeRef = useRef('');
     const panRef = useRef<{ x: number; y: number; px: number; py: number } | null>(null);
     const onRotateRef = useRef(onRotate);
     useEffect(() => { onRotateRef.current = onRotate; }, [onRotate]);
@@ -107,6 +144,7 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
         setZoom(1);
         setPan({ x: 0, y: 0 });
         setShowTools(false);
+        setToolsHovered(false);
     }, [photoKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const displayRotation = ((rotation % 360) + 360) % 360;
@@ -115,12 +153,23 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
     // onError, not as a network error. Treated like the hook's 'unavailable'.
     const [decodeFailed, setDecodeFailed] = useState(false);
     useEffect(() => { setDecodeFailed(false); }, [mainSrc]);
+    // A full-resolution original this browser can't draw (HEIC outside Safari) isn't "unsupported":
+    // the preview still works. The stage shows loading while the caller turns full resolution off.
+    const [fullResFailedSrc, setFullResFailedSrc] = useState<string | null>(null);
+    useEffect(() => { setFullResFailedSrc(null); }, [photoKey]);
+    useEffect(() => {
+        if (fullRes && mainSrc && mainSrc === fullResFailedSrc) onFullResFailed?.();
+    }, [fullRes, mainSrc, fullResFailedSrc]); // eslint-disable-line react-hooks/exhaustive-deps
+    const fullResBroken = Boolean(mainSrc) && mainSrc === fullResFailedSrc;
     const [videoErrored, setVideoErrored] = useState(false);
     useEffect(() => { setVideoErrored(false); }, [videoSrc, photoKey]);
     const [livePlaying, setLivePlaying] = useState(false);
     useEffect(() => { setLivePlaying(false); }, [photoKey]);
     const videoFailed = onVideoError ? Boolean(videoFailedProp) : videoErrored;
     const swipeRef = useRef<{ x: number; y: number } | null>(null);
+    // Zoom and pan are for photos; a video's stage never scales, so pinch and wheel leave it alone.
+    const zoomableRef = useRef(!videoSrc);
+    zoomableRef.current = !videoSrc;
 
     const photoRef = useRef<HTMLDivElement>(null);
     // Where the still is drawn inside the stage (object-fit: contain), so the LIVE button sits on the
@@ -168,6 +217,7 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
 
     const resetZoom = useCallback(() => { setZoom(1); setPan({ x: 0, y: 0 }); }, []);
     const zoomBy = useCallback((delta: number) => {
+        if (!zoomableRef.current) return;
         setZoom((z) => {
             const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, +(z + delta).toFixed(2)));
             if (next === 1) setPan({ x: 0, y: 0 });
@@ -260,6 +310,7 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
         // pinches (ctrl+wheel, small deltas) zoom smoothly.
         const onWheel = (e: WheelEvent) => {
             e.preventDefault();
+            if (!zoomableRef.current) return;
             const delta = Math.max(-100, Math.min(100, e.deltaY));
             zoomAtPoint(zoomRef.current * Math.exp(-delta / (e.ctrlKey ? 100 : 400)), e.clientX, e.clientY);
         };
@@ -294,6 +345,7 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
         };
         const onGestureChange = (e: Event) => {
             e.preventDefault();
+            if (!zoomableRef.current) return;
             const scale = (e as unknown as { scale: number }).scale;
             const start = gestureStartRef.current;
             const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, +(start.zoom * scale).toFixed(2)));
@@ -331,6 +383,11 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
     // mobile (reported: "can't pan the zoom"). Baseline (px,py) is seeded from
     // the current pan and deltas are measured from the finger's start point.
     const touchPanRef = useRef<{ x: number; y: number; px: number; py: number } | null>(null);
+    // Claiming a zoomed photo's touches for panning (preventDefault) also cancels
+    // the click a tap would make, so while zoomed a tap is recognised here instead:
+    // one tap toggles the panel, two quick taps zoom back out.
+    const tapRef = useRef<{ x: number; y: number; t: number } | null>(null);
+    const lastTapRef = useRef<{ x: number; y: number; t: number } | null>(null);
     useEffect(() => {
         const el = stageWrapRef.current;
         if (!el) return undefined;
@@ -340,6 +397,9 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
             touchPanRef.current = { x: t.clientX, y: t.clientY, px: panStateRef.current.x, py: panStateRef.current.y };
         };
         const onTouchStart = (e: TouchEvent) => {
+            tapRef.current = null;
+            if (!zoomableRef.current) return;
+            if (e.touches.length === 1 && isControl(e.target)) return;
             if (e.touches.length === 2) {
                 e.preventDefault();
                 const mid = touchMid(e.touches);
@@ -358,9 +418,14 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
                 // leave it to the swipe-to-navigate handler on .pt-viewer-stage.
                 e.preventDefault();
                 seedPan(e.touches[0]);
+                tapRef.current = { x: e.touches[0].clientX, y: e.touches[0].clientY, t: e.timeStamp };
             }
         };
         const onTouchMove = (e: TouchEvent) => {
+            const tap = tapRef.current;
+            if (tap && (e.touches.length !== 1 || Math.hypot(e.touches[0].clientX - tap.x, e.touches[0].clientY - tap.y) > 10)) {
+                tapRef.current = null;
+            }
             if (e.touches.length >= 2 && touchPinchRef.current) {
                 e.preventDefault();
                 const start = touchPinchRef.current;
@@ -388,6 +453,18 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
         };
         const onTouchEnd = (e: TouchEvent) => {
             if (e.touches.length < 2) touchPinchRef.current = null;
+            const tap = tapRef.current;
+            tapRef.current = null;
+            if (tap && e.touches.length === 0 && e.type === 'touchend' && e.timeStamp - tap.t < 300) {
+                const last = lastTapRef.current;
+                if (last && tap.t - last.t < 350 && Math.hypot(tap.x - last.x, tap.y - last.y) < 40) {
+                    lastTapRef.current = null;
+                    resetZoom();
+                } else {
+                    lastTapRef.current = tap;
+                    toggleTools();
+                }
+            }
             if (e.touches.length === 0) {
                 touchPanRef.current = null;
             } else if (e.touches.length === 1 && zoomRef.current > 1) {
@@ -406,8 +483,25 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
             el.removeEventListener('touchend', onTouchEnd);
             el.removeEventListener('touchcancel', onTouchEnd);
         };
-    }, [photoKey]);
+    }, [photoKey, resetZoom, toggleTools]);
     const zoomed = zoom > 1;
+
+    // Swipe down on the photo to close, like Back. The stage follows the finger
+    // and the backdrop thins out so the page behind shows through; letting go
+    // short of SWIPE_CLOSE_PX springs it back. Styled directly: a re-render per
+    // touchmove would redraw the whole viewer.
+    const stageRef = useRef<HTMLDivElement>(null);
+    const dragDown = (dy: number) => {
+        const stage = stageRef.current;
+        const root = rootRef.current;
+        if (!stage || !root) return;
+        const fade = Math.min(1, dy / (SWIPE_CLOSE_PX * 3));
+        stage.style.transition = dy ? 'none' : '';
+        stage.style.transform = dy ? `translateY(${dy}px) scale(${1 - fade * 0.15})` : '';
+        root.style.transition = dy ? 'none' : '';
+        root.style.backgroundColor = dy ? `rgba(14, 13, 11, ${1 - fade * 0.7})` : '';
+        root.classList.toggle('dragging-down', dy > 0);
+    };
 
     return (
         <div ref={rootRef} tabIndex={-1} className={`pt-viewer${showTools ? ' tools-visible' : ''}`} role="dialog" aria-modal="true" aria-label="Photo viewer">
@@ -419,18 +513,40 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
                 <span className="pt-viewer-pos">{index + 1} / {count}</span>
             </div>
 
-            <div className="pt-viewer-stage-wrap" ref={stageWrapRef}>
+            <div
+                className="pt-viewer-stage-wrap"
+                ref={stageWrapRef}
+                onPointerDown={(e) => { pointerTypeRef.current = e.pointerType; }}
+                onPointerMove={(e) => { if (e.pointerType === 'mouse') revealTools(); }}
+            >
                 <div
+                    ref={stageRef}
                     className="pt-viewer-stage"
-                    onTouchStart={(e) => { if (e.touches.length === 1 && !zoomed) swipeRef.current = { x: e.touches[0].clientX, y: e.touches[0].clientY }; }}
+                    onTouchStart={(e) => {
+                        // A second finger makes it a pinch, never a swipe.
+                        swipeRef.current = e.touches.length === 1 && !zoomed && !isControl(e.target)
+                            ? { x: e.touches[0].clientX, y: e.touches[0].clientY }
+                            : null;
+                        if (!swipeRef.current) dragDown(0);
+                    }}
+                    onTouchMove={(e) => {
+                        const start = swipeRef.current;
+                        if (!start || e.touches.length !== 1) return;
+                        const dx = e.touches[0].clientX - start.x;
+                        const dy = e.touches[0].clientY - start.y;
+                        dragDown(dy > 0 && dy > Math.abs(dx) ? dy : 0);
+                    }}
                     onTouchEnd={(e) => {
                         const start = swipeRef.current;
                         swipeRef.current = null;
+                        dragDown(0);
                         if (!start || zoomed || e.changedTouches.length === 0) return;
                         const dx = e.changedTouches[0].clientX - start.x;
                         const dy = e.changedTouches[0].clientY - start.y;
                         if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) onStep(dx < 0 ? 1 : -1);
+                        else if (dy > SWIPE_CLOSE_PX && dy > Math.abs(dx) * 1.5) onClose();
                     }}
+                    onTouchCancel={() => { swipeRef.current = null; dragDown(0); }}
                 >
                     <button
                         type="button"
@@ -444,8 +560,8 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
                     <div
                         ref={photoRef}
                         className="pt-viewer-photo"
-                        // Clicking or tapping the photo toggles the floating tools.
-                        onClick={() => setShowTools((v) => !v)}
+                        // Tapping the photo toggles the floating tools; a mouse click only shows them.
+                        onClick={() => (pointerTypeRef.current === 'mouse' ? revealTools() : toggleTools())}
                         onDoubleClick={(e) => (zoomed ? resetZoom() : zoomAtPoint(zoom + ZOOM_STEP * 2, e.clientX, e.clientY))}
                         onMouseDown={(e) => { if (zoomed) panRef.current = { x: e.clientX, y: e.clientY, px: pan.x, py: pan.y }; }}
                         onMouseMove={(e) => {
@@ -459,8 +575,8 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
                     >
                         {videoSrc && !videoFailed ? (
                             <>
-                            {/* Click/double-click belong to the player's own controls, not the
-                                stage's tools toggle and zoom gestures. */}
+                            {/* A tap shows or hides the floating panel, as on a photo. A mouse click
+                                stays the player's (play/pause); the mouse shows the panel by moving. */}
                             <video
                                 ref={videoRef}
                                 key={videoSrc}
@@ -475,6 +591,7 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
                                 onLoadedMetadata={(e) => setNatural({ w: e.currentTarget.videoWidth, h: e.currentTarget.videoHeight })}
                                 onClick={(e) => {
                                     e.stopPropagation();
+                                    if (pointerTypeRef.current !== 'mouse') { toggleTools(); return; }
                                     if (!videoTurned) return;
                                     const el = e.currentTarget;
                                     if (el.paused || el.ended) void el.play().catch(() => {}); else el.pause();
@@ -497,14 +614,14 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
                                     Download original
                                 </button>
                             </div>
-                        ) : mainSrc && !decodeFailed ? (
+                        ) : mainSrc && !decodeFailed && !fullResBroken ? (
                             <img
                                 className="pt-viewer-img"
                                 src={mainSrc}
                                 alt={filename}
                                 draggable={false}
                                 style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom}) rotate(${displayRotation}deg)` }}
-                                onError={() => setDecodeFailed(true)}
+                                onError={() => (fullRes && onFullResFailed ? setFullResFailedSrc(mainSrc) : setDecodeFailed(true))}
                                 onLoad={(e) => setNatural({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })}
                             />
                         ) : mediaStatus === 'unavailable' || decodeFailed ? (
@@ -524,7 +641,7 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
                                 {mediaStatus === 'pending' && <p>Preparing preview…</p>}
                             </div>
                         )}
-                        {liveSrc && !videoSrc && mainSrc && !decodeFailed && (
+                        {liveSrc && !videoSrc && mainSrc && !decodeFailed && !fullResBroken && (
                             <>
                                 {livePlaying && (
                                     // The motion clip plays once over the still, then hands back to it.
@@ -564,10 +681,18 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
                     </button>
                 </div>
 
-                {/* Floating zoom / rotate / full-res controls over the stage. A video gets rotate
-                    only, always shown: a tap on it belongs to the player, so it can't reveal them. */}
+                {/* Floating zoom / rotate / full-res controls over the stage, shown and hidden the
+                    same way for photos and videos. A video gets rotate only: it never zooms, and
+                    full resolution is what it already plays. */}
                 {!(videoSrc && videoFailed) && (
-                <div className={`pt-viewer-tools${videoSrc ? ' always' : ''}`} role="toolbar" aria-label={videoSrc ? 'Video controls' : 'Image controls'}>
+                <div
+                    className="pt-viewer-tools"
+                    role="toolbar"
+                    aria-label={videoSrc ? 'Video controls' : 'Image controls'}
+                    onPointerDown={revealTools}
+                    onPointerEnter={(e) => { if (e.pointerType === 'mouse') setToolsHovered(true); }}
+                    onPointerLeave={() => setToolsHovered(false)}
+                >
                     {!videoSrc && (
                         <>
                             <button type="button" onClick={() => zoomBy(-ZOOM_STEP)} disabled={zoom <= ZOOM_MIN} aria-label="Zoom out"><MagnifyingGlassMinusIcon /></button>
