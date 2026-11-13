@@ -509,7 +509,10 @@ def find_person_faces(person_id: str):
 
     Queue-first: long-running full-table scans run on the background worker when
     available. If the queue is unavailable (local/dev/no worker), fall back to
-    inline execution so the feature still functions.
+    inline execution so the feature still functions. If the queue exists but the
+    send failed, answer with an error instead: an inline pass leaves no job record,
+    so the per-person de-dupe can't see it, and the request can be cut off
+    part-way through moving faces (2026-11-13).
     """
     user_id, error = app._require_user_id()
     if error:
@@ -534,6 +537,8 @@ def find_person_faces(person_id: str):
             'suggestions': [],
             'candidateFaces': 0,
         })
+    if queued.get('status') != 'unavailable':
+        return app.jsonify({'error': 'Could not start Find more faces. Try again.'}), 503
 
     try:
         result = app._propagate_person_identity(user_id, person_id, apply=True, collect_suggestions=True)
@@ -733,13 +738,17 @@ def merge_persons(person_id: str):
     # table (the slowest part of a merge, and a past OOM driver), so hand it to the
     # queue-scaled worker instead of blocking this request; the reclaimed faces
     # surface on the next refresh. If the queue is unavailable, fall back to running
-    # it inline so behaviour is unchanged when there is no worker.
+    # it inline so behaviour is unchanged when there is no worker. A failed send
+    # skips it (see find_person_faces): the merge itself is done, and Find more
+    # faces picks the rest up later.
     auto_assigned = 0
     propagate_job_id = None
     if app._person_is_named(user_id, person_id):
         queued = app._enqueue_propagate_job(user_id, person_id)
         if queued.get('status') == 'queued':
             propagate_job_id = queued.get('jobId')
+        elif queued.get('status') != 'unavailable':
+            app.app.logger.warning('Skipped identity propagation after merge for %s: %s', person_id, queued.get('status'))
         else:
             try:
                 propagation = app._propagate_person_identity(user_id, person_id, apply=True, collect_suggestions=False)
@@ -815,6 +824,8 @@ def merge_persons_batch():
         queued = app._enqueue_propagate_batch_job(user_id, named_target_ids)
         if queued.get('status') == 'queued':
             propagate_job_id = queued.get('jobId')
+        elif queued.get('status') != 'unavailable':
+            app.app.logger.warning('Skipped identity propagation after batch merge: %s', queued.get('status'))
         else:
             # No worker available (local/dev): fall back to running each pass
             # inline so behaviour is unchanged when there is no queue.
