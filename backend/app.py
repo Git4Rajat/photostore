@@ -3692,6 +3692,8 @@ def _humanize_job(row: Dict) -> Dict:
                     people_phrase = f"{people_count} people"
                     message = (f"Updated {people_phrase}, added {_plural(found, 'matching face')}."
                                if found > 0 else f"Checked {people_phrase} — no new matching faces found.")
+                elif result.get('skipped') == 'not enough anchor faces':
+                    message = 'This person needs at least 2 faces before more can be found.'
                 else:
                     message = (f"Added {_plural(found, 'matching face')}."
                                if found > 0 else 'No new matching faces found.')
@@ -8773,7 +8775,8 @@ def _propagate_person_identity(
     borderline matches (>= ``review_threshold``) are returned as a per-face
     review queue. Faces confirmed to, or owned by, another *named* person are
     never touched."""
-    empty = {'autoAssigned': [], 'autoAssignedCount': 0, 'suggestions': [], 'candidateFaces': 0}
+    empty = {'autoAssigned': [], 'autoAssignedCount': 0, 'repairedCount': 0, 'unfinishedFaces': 0,
+             'suggestions': [], 'candidateFaces': 0}
     if face_table_client is None or person_table_client is None:
         return {**empty, 'error': 'People features not configured'}
     try:
@@ -8832,6 +8835,14 @@ def _propagate_person_identity(
     auto_face_ids: List[str] = []
     review_candidates: List[Tuple[str, Dict, float]] = []
     candidate_face_count = 0
+    # Faces already pointing at this person but missing from its faceIds list
+    # or its membership rows (which the person's photo page reads). A move sets
+    # the face's owner first, so an earlier pass that stopped part-way, or one
+    # from before the membership rows were written here, left these behind;
+    # finishing them here is what lets a re-run repair the person.
+    listed_face_ids = {str(fid) for fid in target_face_ids}
+    member_face_ids = _person_member_ids(person_id) if person_members_table_client is not None else None
+    unfinished_files: Dict[str, str] = {}
 
     batch_ids: List[str] = []
     batch_rows: List[Optional[Dict]] = []
@@ -8898,6 +8909,10 @@ def _propagate_person_identity(
                 continue
             owner_id = str(row.get('personId') or '')
             if owner_id == person_id:
+                unlisted = face_id not in listed_face_ids
+                unmembered = member_face_ids is not None and face_id not in member_face_ids
+                if (unlisted or unmembered) and not _face_is_rejected(row):
+                    unfinished_files[face_id] = str(row.get('filename') or '')
                 continue
             # Only pull from unclustered faces or *unnamed* clusters; never steal a
             # face that already belongs to (or was confirmed for) another named person.
@@ -8929,19 +8944,26 @@ def _propagate_person_identity(
     _process_page()
     _flush_batch()
 
-    if candidate_face_count == 0:
+    if candidate_face_count == 0 and not unfinished_files:
         return {**empty, 'candidateFaces': 0}
 
     result = {
         'autoAssigned': [],
         'autoAssignedCount': len(auto_face_ids),
+        'repairedCount': 0,
+        'unfinishedFaces': len(unfinished_files),
         'suggestions': [],
         'candidateFaces': candidate_face_count,
     }
 
-    if apply and auto_face_ids:
-        affected_files = set()
+    if apply and (auto_face_ids or unfinished_files):
+        affected_files = {name for name in unfinished_files.values() if name}
         applied: List[str] = []
+        repaired = list(unfinished_files)
+        for face_id in repaired:
+            if face_id not in listed_face_ids:
+                _remove_face_from_other_people(user_id, face_id, person_id, person_rows=person_rows)
+            _add_person_member(user_id, person_id, face_id)
         for face_id in auto_face_ids:
             try:
                 face_ent = face_table_client.get_entity(partition_key=user_id, row_key=face_id)
@@ -8961,19 +8983,22 @@ def _propagate_person_identity(
                 face_table_client.upsert_entity(face_ent)
             except Exception:
                 continue
+            # Per face, right after the owner changes: the photo page reads these
+            # rows, so a pass that stops early still leaves every moved face visible.
+            _add_person_member(user_id, person_id, face_id)
             filename = str(face_ent.get('filename') or '')
             if filename:
                 affected_files.add(filename)
             applied.append(face_id)
-        if applied:
-            # Batch the target-person membership update so its rep embedding is
+        if applied or repaired:
+            # Batch the target-person faceIds update so its rep embedding is
             # recomputed once, not once per newly attached face.
             try:
                 target_entity = person_table_client.get_entity(partition_key=user_id, row_key=person_id)
                 existing_ids = json.loads(target_entity.get('faceIds', '[]') or '[]')
             except Exception:
                 existing_ids = []
-            merged_ids = _dedupe_face_ids_preserving_order([*existing_ids, *applied])
+            merged_ids = _dedupe_face_ids_preserving_order([*existing_ids, *repaired, *applied])
             _update_person_entity(user_id, person_id, {'faceIds': json.dumps(merged_ids)})
             _update_person_rep_embedding(user_id, person_id)
             _rebuild_metadata_faces_for_filenames(user_id, affected_files)
@@ -8981,8 +9006,10 @@ def _propagate_person_identity(
             # off already returned, so without this hook a live album would
             # miss any face this propagation pass reclaims.
             _resync_person_rule_albums(user_id, person_id)
-        result['autoAssigned'] = applied
-        result['autoAssignedCount'] = len(applied)
+        # Repaired faces count as found: this pass is what makes them show up on the person.
+        result['autoAssigned'] = [*repaired, *applied]
+        result['autoAssignedCount'] = len(repaired) + len(applied)
+        result['repairedCount'] = len(repaired)
 
     if collect_suggestions and review_candidates:
         review_candidates.sort(key=lambda item: item[2], reverse=True)
@@ -8993,6 +9020,21 @@ def _propagate_person_identity(
             result['suggestions'].append(summary)
 
     return result
+
+
+def _propagation_summary(propagation: Dict) -> Dict:
+    """What a background "Find more faces" job records. A run that skipped or
+    found no candidates must not read as a plain "added 0". (Not 'candidateFaces':
+    the job feed reads that key as a recluster result.)"""
+    summary = {
+        'autoAssignedFaces': int(propagation.get('autoAssignedCount') or 0),
+        'repairedFaces': int(propagation.get('repairedCount') or 0),
+        'searchedFaces': int(propagation.get('candidateFaces') or 0),
+    }
+    for key in ('skipped', 'error'):
+        if propagation.get(key):
+            summary[key] = str(propagation[key])
+    return summary
 
 
 def _albums_feature_available() -> bool:
@@ -16706,14 +16748,12 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
                 if job_id:
                     _upsert_job_status(job_id, user_id, 'clustering', 'failed', error='Identity propagation failed')
                 return
+            worker_logger.info('Identity propagation for %s: %s', person_id, _propagation_summary(propagation))
             if job_id:
-                _upsert_job_status(
-                    job_id,
-                    user_id,
-                    'clustering',
-                    'done',
-                    result={'autoAssignedFaces': int(propagation.get('autoAssignedCount') or 0)},
-                )
+                if propagation.get('error'):
+                    _upsert_job_status(job_id, user_id, 'clustering', 'failed', error=str(propagation['error']))
+                else:
+                    _upsert_job_status(job_id, user_id, 'clustering', 'done', result=_propagation_summary(propagation))
         elif job_type == 'people_propagate_batch':
             person_ids = payload.get('personIds')
             if not isinstance(person_ids, list) or not person_ids:
@@ -16721,6 +16761,7 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
                     _upsert_job_status(job_id, user_id, 'clustering', 'failed', error='missing personIds')
                 return
             total_assigned = 0
+            total_repaired = 0
             failed_ids: List[str] = []
             for raw_pid in person_ids:
                 pid = str(raw_pid)
@@ -16730,7 +16771,12 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
                     worker_logger.exception('Async batch identity propagation failed for %s', pid)
                     failed_ids.append(pid)
                     continue
+                worker_logger.info('Identity propagation for %s: %s', pid, _propagation_summary(propagation))
+                if propagation.get('error'):
+                    failed_ids.append(pid)
+                    continue
                 total_assigned += int(propagation.get('autoAssignedCount') or 0)
+                total_repaired += int(propagation.get('repairedCount') or 0)
             if job_id:
                 if failed_ids and len(failed_ids) == len(person_ids):
                     _upsert_job_status(job_id, user_id, 'clustering', 'failed', error=f'propagation failed for all {len(failed_ids)} people')
@@ -16742,6 +16788,7 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
                         'done',
                         result={
                             'autoAssignedFaces': total_assigned,
+                            'repairedFaces': total_repaired,
                             'peopleCount': len(person_ids),
                             'failedCount': len(failed_ids),
                         },
