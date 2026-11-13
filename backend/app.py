@@ -5942,7 +5942,12 @@ def _make_unnamed_person_name_allocator(user_id: str, person_rows: Optional[List
 
 
 def _is_unnamed_name(name: str) -> bool:
-    return bool(re.match(r'^unnamed\s*\d*$', (name or '').strip(), re.IGNORECASE))
+    # People the FAISS assigner creates carry an empty name, not "Unnamed N".
+    # Reading '' as a name made identity propagation treat every such cluster
+    # as a named person it must never take faces from, so "Find more faces"
+    # moved nothing.
+    name = (name or '').strip()
+    return not name or bool(re.match(r'^unnamed\s*\d*$', name, re.IGNORECASE))
 
 
 def _person_entity_is_named(person: Dict) -> bool:

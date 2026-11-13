@@ -45,6 +45,14 @@ def test_merge_moves_faces_and_deletes_the_source_cluster(monkeypatch):
     assert faces.get_entity('u1', 'f2')['confirmedByUser'] is True
 
 
+def test_merging_a_named_person_into_an_empty_named_cluster_keeps_the_name(monkeypatch):
+    # The FAISS assigner leaves unnamed clusters with an empty name; merging into one must not drop "Asha".
+    persons, faces = _world(monkeypatch)
+    app._merge_persons_core('u1', 'B', ['A'])
+    assert persons.get_entity('u1', 'B')['name'] == 'Asha'
+    assert {faces.get_entity('u1', f)['personId'] for f in ('f1', 'f2', 'f3')} == {'B'}
+
+
 def test_a_batch_of_merges_scans_the_face_table_once(monkeypatch):
     persons, faces = _world(monkeypatch)
     app._merge_persons_core('u1', 'A', ['B'])
