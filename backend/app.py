@@ -3861,11 +3861,17 @@ def _has_active_clustering_job(user_id: str) -> Optional[str]:
     return None
 
 
-def _active_propagate_jobs(user_id: str) -> Dict[str, str]:
+def _waiting_propagate_jobs(user_id: str) -> Dict[str, str]:
     """person_id -> jobId of each "Find more faces" pass (single or batch) still
-    queued or running for this library, under the same staleness cutoff as
+    queued for this library, under the same staleness cutoff as
     _has_active_clustering_job. Lets propagation de-dupe per person; reclusters
-    keep _has_active_clustering_job's per-library guard."""
+    keep _has_active_clustering_job's per-library guard.
+
+    Only passes that haven't started count. A running pass read the person's
+    rep and face list when it started, so a merge that lands after that (Tanu,
+    2026-11-13 16:59) needs a pass of its own; folding it into the running one
+    skipped what the merge changed. Per person that is still at most one pass
+    running plus one waiting, however many requests come in."""
     if jobs_table_client is None:
         return {}
     try:
@@ -3878,7 +3884,7 @@ def _active_propagate_jobs(user_id: str) -> Dict[str, str]:
         job_id = str(row.get('jobId') or '')
         if str(row.get('jobType') or '') != 'clustering' or not job_id.startswith(('propagate:', 'propagate-batch:')):
             continue
-        if str(row.get('status') or '').lower() not in {'queued', 'running'}:
+        if str(row.get('status') or '').lower() != 'queued':
             continue
         updated = _parse_iso_date(str(row.get('updatedAt') or ''))
         if updated is not None and updated < stale_before:
@@ -4613,12 +4619,13 @@ def _enqueue_propagate_job(user_id: str, person_id: str) -> Dict[str, str]:
     the job is *queued*, well before it finishes) fired its own full-table-scan
     job. They queue up and run serially, so the "Finding more faces…" indicator
     stays lit for the whole backlog and the worker burns time re-scanning.
-    Reuse a pass already in flight for this same person instead. The guard is
+    Reuse a pass still waiting to start for this same person instead (see
+    _waiting_propagate_jobs for why a running one doesn't count). The guard is
     per person, not _has_active_clustering_job's per library: reusing whatever
     clustering job was running answered a second person's request with the
     first person's job id, so that person was never searched (2026-11-13).
     """
-    existing_job_id = _active_propagate_jobs(user_id).get(str(person_id))
+    existing_job_id = _waiting_propagate_jobs(user_id).get(str(person_id))
     if existing_job_id:
         return {'status': 'queued', 'jobId': existing_job_id}
     job_id = f"propagate:{user_id}:{uuid.uuid4().hex}"
@@ -4649,14 +4656,14 @@ def _enqueue_propagate_batch_job(user_id: str, person_ids: List[str]) -> Dict[st
     notification) instead of N — see _merge_persons_core's callers.
 
     Same per-person de-dupe guard as _enqueue_propagate_job — see its
-    docstring: people already covered by a pass in flight are left out, and
-    only the rest are queued.
+    docstring: people already covered by a pass waiting to start are left
+    out, and only the rest are queued.
     """
-    active = _active_propagate_jobs(user_id)
+    waiting = _waiting_propagate_jobs(user_id)
     requested = [str(pid) for pid in dict.fromkeys(person_ids) if pid]
-    person_ids = [pid for pid in requested if pid not in active]
+    person_ids = [pid for pid in requested if pid not in waiting]
     if not person_ids:
-        return {'status': 'queued', 'jobId': active[requested[0]]} if requested else {'status': 'skipped', 'jobId': ''}
+        return {'status': 'queued', 'jobId': waiting[requested[0]]} if requested else {'status': 'skipped', 'jobId': ''}
     job_id = f"propagate-batch:{user_id}:{uuid.uuid4().hex}"
     if clustering_queue_client is None:
         app.logger.warning('Clustering queue client is unavailable; batch propagate job %s was not enqueued', job_id)
