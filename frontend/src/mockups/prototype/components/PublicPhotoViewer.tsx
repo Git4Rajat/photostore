@@ -86,6 +86,10 @@ const PublicPhotoViewer: React.FC<{
             videoSrc={isVideo ? resolveSrc(photo.url) : undefined}
             fullRes={fullRes}
             onToggleFullRes={() => setFullRes((v) => !v)}
+            onFullResFailed={() => {
+                setFullRes(false);
+                showToast('This browser can’t show this photo’s original. Showing the preview instead.');
+            }}
             showFullResControl={!isVideo}
             onDownloadOriginal={() => void download()}
             bar={(

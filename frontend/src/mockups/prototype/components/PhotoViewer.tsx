@@ -12,6 +12,7 @@ import ViewerShell from './ViewerShell';
 import { useStore, isVideoFilename } from '../store';
 import { useMainMedia, useVideoSource, downloadPhoto, fetchPhotoMetadata, preloadMediaAccessUrls, useLiveClipSource } from '../media';
 import type { PhotoMetadata } from '../media';
+import { isRawFilename } from '../../../utils/photoDisplay';
 
 const dash = (value?: string | number): string => {
     const text = value === undefined || value === null ? '' : String(value).trim();
@@ -156,7 +157,12 @@ const PhotoViewer: React.FC = () => {
             liveSrc={liveSrc}
             fullRes={fullRes}
             onToggleFullRes={() => setFullRes((v) => !v)}
-            showFullResControl={!isVideo}
+            onFullResFailed={() => {
+                setFullRes(false);
+                toast('This browser can’t show this photo’s original. Showing the preview instead.');
+            }}
+            // A RAW original can't be drawn by any browser; its viewer image is already the best preview there is.
+            showFullResControl={!isVideo && !isRawFilename(photo.filename)}
             onDownloadOriginal={startDownload}
             info={showInfo ? (
                     <aside className="pt-viewer-info card-glass" aria-label="Photo information">

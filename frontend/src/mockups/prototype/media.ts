@@ -321,9 +321,19 @@ export function useMainMedia(photo?: Photo | null, fullRes = false): MainMediaSt
     const [status, setStatus] = useState<'pending' | 'unavailable' | undefined>(undefined);
     const filename = photo?.filename;
     const fallbackUrl = photo?.thumbnailUrl;
+    // The object URL on screen. Switching full resolution on or off for the same
+    // photo keeps it up until the other tier arrives, instead of blanking the
+    // stage to a spinner for the whole download; it is revoked once replaced.
+    const shownRef = useRef<{ filename: string; url: string } | null>(null);
+    const release = () => {
+        if (shownRef.current) URL.revokeObjectURL(shownRef.current.url);
+        shownRef.current = null;
+    };
+    useEffect(() => release, []);
 
     useEffect(() => {
         if (!filename) {
+            release();
             setUrl(undefined);
             setLoading(false);
             setProgress(0);
@@ -331,9 +341,11 @@ export function useMainMedia(photo?: Photo | null, fullRes = false): MainMediaSt
             return;
         }
         let active = true;
-        let created: string | undefined;
         let retryTimer: ReturnType<typeof setTimeout> | undefined;
-        setUrl(undefined);
+        if (shownRef.current?.filename !== filename) {
+            release();
+            setUrl(undefined);
+        }
         setProgress(0);
         setStatus(undefined);
         setLoading(fullRes);
@@ -376,17 +388,19 @@ export function useMainMedia(photo?: Photo | null, fullRes = false): MainMediaSt
                     setLoading(false);
                     return;
                 }
-                created = blobUrl;
+                release();
+                shownRef.current = { filename, url: blobUrl };
                 setProgress(100);
                 setStatus(undefined);
                 setUrl(blobUrl);
                 setLoading(false);
             } catch {
-                if (active) {
-                    setUrl(undefined);
-                    setStatus('unavailable');
-                    setLoading(false);
-                }
+                if (!active) return;
+                setLoading(false);
+                // A failed switch of tier leaves the photo that is already showing.
+                if (shownRef.current?.filename === filename) return;
+                setUrl(undefined);
+                setStatus('unavailable');
             }
         };
 
@@ -397,9 +411,6 @@ export function useMainMedia(photo?: Photo | null, fullRes = false): MainMediaSt
             controller.abort();
             if (retryTimer) {
                 clearTimeout(retryTimer);
-            }
-            if (created) {
-                URL.revokeObjectURL(created);
             }
         };
     }, [filename, fullRes]); // eslint-disable-line react-hooks/exhaustive-deps

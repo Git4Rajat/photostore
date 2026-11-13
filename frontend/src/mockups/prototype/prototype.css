@@ -684,15 +684,21 @@
     .pt-viewer-title { display: none; }
     .pt-toolbar { align-items: flex-start; }
 }
-/* The zoom/rotate toolbar floats over the top of the photo, covering tall
-   portrait shots on a phone. On touch, keep it hidden until the user taps the
-   photo (iOS-style chrome toggle). Not gated on a touch media query: Windows
-   Chrome reports a fine pointer even on touchscreen laptops, so the toolbar
-   would never hide there. */
+/* The zoom/rotate toolbar floats over the top of the photo or video, covering
+   tall portrait shots on a phone. It stays hidden until a tap (or a moving
+   mouse) shows it, and hides itself again (see ViewerShell). Not gated on a
+   touch media query: Windows Chrome reports a fine pointer even on
+   touchscreen laptops, so the toolbar would never hide there. */
 .pt-viewer-tools { opacity: 0; visibility: hidden; pointer-events: none; transition: opacity 0.16s ease, visibility 0.16s ease; }
 .pt-viewer.tools-visible .pt-viewer-tools { opacity: 1; visibility: visible; pointer-events: auto; }
-/* A video's rotate buttons stay up: a tap on the video belongs to the player, so it can't reveal them. */
-.pt-viewer-tools.always { opacity: 1; visibility: visible; pointer-events: auto; }
+/* Swipe down to close: the stage follows the finger (ViewerShell sets the
+   transform) and springs back from here when let go short of closing. */
+.pt-viewer { transition: background-color 0.2s ease; }
+.pt-viewer-stage { transition: transform 0.2s ease; }
+.pt-viewer-top, .pt-viewer-bar { transition: opacity 0.16s ease; }
+.pt-viewer.dragging-down .pt-viewer-top,
+.pt-viewer.dragging-down .pt-viewer-bar,
+.pt-viewer.dragging-down .pt-viewer-tools { opacity: 0; }
 
 /* ---- rotated video: upright controls (TurnedVideoControls.tsx) ---- */
 .pt-turned-video-play { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 2; display: grid; place-items: center; border: 0; border-radius: 50%; background: rgba(0,0,0,0.6); -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); color: #fff; cursor: pointer; }
