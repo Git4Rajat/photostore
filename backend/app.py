@@ -3861,6 +3861,40 @@ def _has_active_clustering_job(user_id: str) -> Optional[str]:
     return None
 
 
+def _active_propagate_jobs(user_id: str) -> Dict[str, str]:
+    """person_id -> jobId of each "Find more faces" pass (single or batch) still
+    queued or running for this library, under the same staleness cutoff as
+    _has_active_clustering_job. Lets propagation de-dupe per person; reclusters
+    keep _has_active_clustering_job's per-library guard."""
+    if jobs_table_client is None:
+        return {}
+    try:
+        rows = list(jobs_table_client.query_entities(f"PartitionKey eq '{_escape_odata(user_id)}'"))
+    except Exception:
+        return {}
+    stale_before = datetime.now(timezone.utc) - timedelta(minutes=CLUSTERING_ACTIVE_JOB_STALE_MINUTES)
+    active: Dict[str, str] = {}
+    for row in rows:
+        job_id = str(row.get('jobId') or '')
+        if str(row.get('jobType') or '') != 'clustering' or not job_id.startswith(('propagate:', 'propagate-batch:')):
+            continue
+        if str(row.get('status') or '').lower() not in {'queued', 'running'}:
+            continue
+        updated = _parse_iso_date(str(row.get('updatedAt') or ''))
+        if updated is not None and updated < stale_before:
+            continue
+        try:
+            raw = row.get('payload')
+            payload = raw if isinstance(raw, dict) else json.loads(raw or '{}')
+        except Exception:
+            continue
+        person_ids = payload.get('personIds') if isinstance(payload.get('personIds'), list) else [payload.get('personId')]
+        for pid in person_ids:
+            if pid:
+                active.setdefault(str(pid), job_id)
+    return active
+
+
 def _mark_clustering_job_rerun_requested(job_id: str, user_id: str) -> None:
     """Flag an in-flight clustering job so the worker fires exactly one
     follow-up job once it finishes, instead of the caller enqueueing its own.
@@ -4579,10 +4613,12 @@ def _enqueue_propagate_job(user_id: str, person_id: str) -> Dict[str, str]:
     the job is *queued*, well before it finishes) fired its own full-table-scan
     job. They queue up and run serially, so the "Finding more faces…" indicator
     stays lit for the whole backlog and the worker burns time re-scanning.
-    Reuse whatever clustering-family job is already in flight for the user
-    instead, same as the guard _enqueue_clustering_job already has.
+    Reuse a pass already in flight for this same person instead. The guard is
+    per person, not _has_active_clustering_job's per library: reusing whatever
+    clustering job was running answered a second person's request with the
+    first person's job id, so that person was never searched (2026-11-13).
     """
-    existing_job_id = _has_active_clustering_job(user_id)
+    existing_job_id = _active_propagate_jobs(user_id).get(str(person_id))
     if existing_job_id:
         return {'status': 'queued', 'jobId': existing_job_id}
     job_id = f"propagate:{user_id}:{uuid.uuid4().hex}"
@@ -4612,11 +4648,15 @@ def _enqueue_propagate_batch_job(user_id: str, person_ids: List[str]) -> Dict[st
     at once produces a single background job (and a single completion
     notification) instead of N — see _merge_persons_core's callers.
 
-    Same de-dupe guard as _enqueue_propagate_job — see its docstring.
+    Same per-person de-dupe guard as _enqueue_propagate_job — see its
+    docstring: people already covered by a pass in flight are left out, and
+    only the rest are queued.
     """
-    existing_job_id = _has_active_clustering_job(user_id)
-    if existing_job_id:
-        return {'status': 'queued', 'jobId': existing_job_id}
+    active = _active_propagate_jobs(user_id)
+    requested = [str(pid) for pid in dict.fromkeys(person_ids) if pid]
+    person_ids = [pid for pid in requested if pid not in active]
+    if not person_ids:
+        return {'status': 'queued', 'jobId': active[requested[0]]} if requested else {'status': 'skipped', 'jobId': ''}
     job_id = f"propagate-batch:{user_id}:{uuid.uuid4().hex}"
     if clustering_queue_client is None:
         app.logger.warning('Clustering queue client is unavailable; batch propagate job %s was not enqueued', job_id)
