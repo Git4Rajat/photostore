@@ -2165,6 +2165,18 @@ video.photo-preview-media.is-loading {
   transform: translateX(0);
 }
 
+/* Toasts and the bell's preview close on a tap or a flick (services/swipeDismiss.ts):
+   the page must not scroll or select text under the finger. The stack itself
+   lets clicks through, so each toast takes them back. */
+.app-toast,
+.notification-preview {
+  pointer-events: auto;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: pointer;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .app-toast {
     transform: none;

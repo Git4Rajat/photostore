@@ -9,6 +9,7 @@ import { formatMegabytesPerSecond } from './browserAiShared';
 import { formatNotificationTime } from '../services/notificationTime';
 import type { AppNotification } from '../types/browserProcessing';
 import { useAppServices } from './AppServicesProvider';
+import { useSwipeDismiss } from '../services/swipeDismiss';
 
 export const NotificationBell: React.FC = () => {
     const {
@@ -54,6 +55,8 @@ export const NotificationBell: React.FC = () => {
             setPreview(null);
         }
     }, [showNotifications]);
+    // A tap on the preview, or a flick in any direction, closes it early.
+    const previewRef = useSwipeDismiss<HTMLDivElement>(() => setPreview(null));
 
     const closeNotifications = useCallback(() => {
         setShowNotifications(false);
@@ -202,7 +205,13 @@ export const NotificationBell: React.FC = () => {
                 {unreadCount > 0 && <span className="notification-badge">{unreadCount}</span>}
             </button>
             {preview && !showNotifications && (
-                <div className="notification-preview card-glass" role="status" aria-live="polite">
+                <div
+                    key={`${preview.id}:${preview.timestamp}`}
+                    ref={previewRef}
+                    className="notification-preview card-glass"
+                    role="status"
+                    aria-live="polite"
+                >
                     <p className="notification-title">{preview.title}</p>
                     {preview.details && <p className="notification-details">{preview.details}</p>}
                     <time className="notification-time" dateTime={new Date(preview.timestamp).toISOString()}>

@@ -3,6 +3,7 @@
 // this module only manages the DOM lifecycle. Multiple toasts stack.
 
 import { hasNotificationSink, publishNotification } from './notificationSink';
+import { attachSwipeDismiss } from './swipeDismiss';
 
 let toastStack: HTMLDivElement | null = null;
 
@@ -105,6 +106,8 @@ export const showToast = (message: string, optionsOrTimeout: number | ToastOptio
             el.appendChild(button);
         }
 
+        // A tap, or a flick in any direction, closes it early.
+        attachSwipeDismiss(el, remove);
         getStack().appendChild(el);
         // Force a layout so the enter transition runs from the initial state.
         void el.offsetHeight;

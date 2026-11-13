@@ -669,7 +669,7 @@
 @media (min-width: 621px) {
   .pt-toasts { left: 50%; right: auto; transform: translateX(-50%); bottom: 88px; }
 }
-.pt-toast { pointer-events: auto; display: flex; align-items: center; gap: 14px; background: var(--text); color: var(--bg-1); padding: 10px 16px; border-radius: var(--r-pill); box-shadow: 0 10px 30px rgba(0,0,0,0.3); font-size: 0.85rem; }
+.pt-toast { touch-action: none; -webkit-user-select: none; user-select: none; cursor: pointer; pointer-events: auto; display: flex; align-items: center; gap: 14px; background: var(--text); color: var(--bg-1); padding: 10px 16px; border-radius: var(--r-pill); box-shadow: 0 10px 30px rgba(0,0,0,0.3); font-size: 0.85rem; }
 .pt-toast-action { background: none; border: 0; color: inherit; font: inherit; font-weight: 700; text-decoration: underline; cursor: pointer; }
 /* Error toasts read distinctly from routine confirmations (which use the
    default near-black pill) so a failure isn't mistaken for a success. */

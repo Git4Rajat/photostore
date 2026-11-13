@@ -6,6 +6,8 @@ import type { AppNotification } from '../types/browserProcessing';
 let services: Record<string, unknown>;
 vi.mock('./AppServicesProvider', () => ({ useAppServices: () => services }));
 import { NotificationBell } from './AppServiceIndicators';
+import { EXIT_MS } from '../services/swipeDismiss';
+import { gesture } from '../test/pointerGesture';
 
 const note = (over: Partial<AppNotification>): AppNotification => ({
     id: 'a', title: 'Hello', details: 'World', timestamp: Date.now(), unread: true, ...over,
@@ -50,5 +52,28 @@ describe('NotificationBell preview', () => {
         act(() => { view.getByText('Undo').click(); });
         expect(onClick).toHaveBeenCalled();
         expect(view.container.querySelector('.notification-preview')).toBeNull();
+    });
+
+    it('closes early on a tap or a flick, and leaves the action to its button', () => {
+        services = base([]);
+        const view = render(<NotificationBell />);
+        services = base([note({ id: 'c', title: 'Saved' })]);
+        view.rerender(<NotificationBell />);
+        const preview = view.container.querySelector('.notification-preview')!;
+        act(() => { gesture(preview, 0, 0, 100); });
+        act(() => { vi.advanceTimersByTime(EXIT_MS); });
+        expect(view.container.querySelector('.notification-preview')).toBeNull();
+
+        const onClick = vi.fn();
+        services = base([note({ id: 'd', title: 'Deleted', timestamp: Date.now() + 1, action: { label: 'Undo', onClick } })]);
+        view.rerender(<NotificationBell />);
+        const next = view.container.querySelector('.notification-preview')!;
+        act(() => { gesture(next, 0, 0, 100, view.getByText('Undo')); });
+        act(() => { vi.advanceTimersByTime(EXIT_MS); });
+        expect(view.container.querySelector('.notification-preview')).not.toBeNull();
+        act(() => { gesture(next, 0, -90, 600); });
+        act(() => { vi.advanceTimersByTime(EXIT_MS); });
+        expect(view.container.querySelector('.notification-preview')).toBeNull();
+        expect(onClick).not.toHaveBeenCalled();
     });
 });
