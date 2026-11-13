@@ -537,6 +537,9 @@ def share_album(album_id: str):
     data = app.request.get_json(silent=True) or {}
     enabled = app._coerce_bool(data.get('enabled', True))
     expires_in_days = int(data.get('expiresInDays', 0) or 0)
+    # Lets the web app change the access code without touching the link's
+    # expiry. It still sends expiresInDays as a fallback for older servers.
+    keep_expiry = app._coerce_bool(data.get('keepExpiry', False))
     access_code = (data.get('accessCode') or '').strip()
     clear_access_code = app._coerce_bool(data.get('clearAccessCode', False))
     if access_code and not clear_access_code and len(access_code) < app.MIN_ALBUM_ACCESS_CODE_LENGTH:
@@ -555,7 +558,9 @@ def share_album(album_id: str):
     if new_token:
         app._store_album_token_index(new_token, user_id, album_id)
 
-    if expires_in_days > 0:
+    if keep_expiry:
+        pass
+    elif expires_in_days > 0:
         expires = app.datetime.now(app.timezone.utc) + app.timedelta(days=expires_in_days)
         entity['publicExpiresAt'] = expires.isoformat()
     else:

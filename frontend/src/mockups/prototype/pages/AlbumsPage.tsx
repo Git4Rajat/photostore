@@ -31,6 +31,7 @@ const EXPIRY_OPTIONS: { value: string; label: string; days: number }[] = [
     { value: '30', label: 'In 30 days', days: 30 },
     { value: 'never', label: 'Never', days: 0 },
 ];
+const NEW_LINK_EXPIRY_DAYS = 7;
 
 const SMART_ALBUM_RULES: Array<{ id: string; label: string; description: string; Icon: React.ComponentType<React.SVGProps<SVGSVGElement>> }> = [
     { id: 'location', label: 'By location', description: 'Places across the library', Icon: MapPinIcon },
@@ -95,7 +96,9 @@ export const AlbumsPage: React.FC = () => {
     const albumMissing = Boolean(explicitAlbumId) && !album && explicitAlbumMissing;
     const albumOpenFailed = Boolean(explicitAlbumId) && !album && explicitAlbumFailed;
     const [copied, setCopied] = useState(false);
-    const [expiry, setExpiry] = useState('7');
+    // The expiry picked in the dropdown until the server confirms it; the
+    // dropdown otherwise shows the album's own expiry.
+    const [pendingExpiry, setPendingExpiry] = useState<{ albumId: string; value: string } | null>(null);
     const covers = useProtectedBlobUrls(albums.map((a) => a.coverThumbnailUrl).filter((u): u is string => Boolean(u)));
     // The backend never returns an album's access code back (it's a stored
     // secret), so remember codes we generate this session to show the owner.
@@ -303,7 +306,7 @@ export const AlbumsPage: React.FC = () => {
             if (ok) void revokeAlbum(id);
             return;
         }
-        const days = EXPIRY_OPTIONS.find((o) => o.value === expiry)?.days ?? 7;
+        const days = NEW_LINK_EXPIRY_DAYS;
         const ok = await confirmDialog({
             title: `Share “${name}”?`,
             message: `Anyone with the link can see the photos in this album. ${days ? `The link expires in ${plural(days, 'day')}.` : 'The link doesn’t expire.'}`,
@@ -311,10 +314,37 @@ export const AlbumsPage: React.FC = () => {
         });
         if (ok) void shareAlbum(id, { expiresInDays: days });
     };
+    const expiryValue = pendingExpiry?.albumId === album.id
+        ? pendingExpiry.value
+        : (album.publicExpiresAt ? 'current' : 'never');
+    // Leaves the access code alone: the store only clears it when asked.
     const changeExpiry = (value: string) => {
-        setExpiry(value);
-        const days = EXPIRY_OPTIONS.find((o) => o.value === value)?.days ?? 7;
-        void shareAlbum(album.id, { expiresInDays: days });
+        const option = EXPIRY_OPTIONS.find((o) => o.value === value);
+        if (!option) return;
+        const { id } = album;
+        setPendingExpiry({ albumId: id, value });
+        void shareAlbum(id, { expiresInDays: option.days }).finally(() => {
+            setPendingExpiry((prev) => (prev?.albumId === id && prev.value === value ? null : prev));
+        });
+    };
+    // The only way to drop a code while keeping the link, so it asks first:
+    // afterwards the link alone opens the album.
+    const removeAccessCode = async () => {
+        const { id, name } = album;
+        const ok = await confirmDialog({
+            title: `Remove the access code from “${name}”?`,
+            message: 'Anyone with the link will be able to see the photos without a code.',
+            confirmLabel: 'Remove code',
+            danger: true,
+        });
+        if (!ok) return;
+        if (await shareAlbum(id, { clearAccessCode: true })) {
+            setCodes((prev) => {
+                const next = { ...prev };
+                delete next[id];
+                return next;
+            });
+        }
     };
 
     const activePhotos = albumPhotosById(album.id);
@@ -428,8 +458,11 @@ export const AlbumsPage: React.FC = () => {
                                 <div className="pt-menu-label">Sharing</div>
                                 <div className="share-sheet">
                                     <div className="share-row">
-                                        <span className="lbl"><b>Link expires</b>{album.publicExpiresAt && <span>{new Date(album.publicExpiresAt).toLocaleDateString()}</span>}</span>
-                                        <select className="field field-select" value={expiry} onChange={(e) => changeExpiry(e.target.value)}>
+                                        <span className="lbl"><b>Link expires</b></span>
+                                        <select className="field field-select" value={expiryValue} onChange={(e) => changeExpiry(e.target.value)}>
+                                            {album.publicExpiresAt && (
+                                                <option value="current">On {new Date(album.publicExpiresAt).toLocaleDateString()}</option>
+                                            )}
                                             {EXPIRY_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
                                         </select>
                                     </div>
@@ -446,18 +479,22 @@ export const AlbumsPage: React.FC = () => {
                                                 ? <span>Share this code with viewers: <code className="pt-access-code">{codes[album.id]}</code></span>
                                                 : <span>{album.hasAccessCode ? 'Protected — generate a new code to reveal one' : 'Add a code to protect the link'}</span>}
                                         </span>
-                                        <button type="button" className="btn" onClick={() => {
-                                            const { id } = album;
-                                            const code = randomCode();
-                                            const days = EXPIRY_OPTIONS.find((o) => o.value === expiry)?.days ?? 7;
-                                            // Shown inline only, once the server has it -- never in a
-                                            // toast, which the notification history keeps.
-                                            void shareAlbum(id, { expiresInDays: days, accessCode: code }).then((ok) => {
-                                                if (ok) setCodes((prev) => ({ ...prev, [id]: code }));
-                                            });
-                                        }}>
-                                            <ArrowPathIcon className="toolbar-icon" /> New code
-                                        </button>
+                                        <span style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+                                            {(album.hasAccessCode || codes[album.id]) && (
+                                                <button type="button" className="pt-linkish danger" onClick={() => void removeAccessCode()}>Remove code</button>
+                                            )}
+                                            <button type="button" className="btn" onClick={() => {
+                                                const { id } = album;
+                                                const code = randomCode();
+                                                // Shown inline only, once the server has it -- never in a
+                                                // toast, which the notification history keeps.
+                                                void shareAlbum(id, { accessCode: code }).then((ok) => {
+                                                    if (ok) setCodes((prev) => ({ ...prev, [id]: code }));
+                                                });
+                                            }}>
+                                                <ArrowPathIcon className="toolbar-icon" /> New code
+                                            </button>
+                                        </span>
                                     </div>
                                 </div>
                             </div>
