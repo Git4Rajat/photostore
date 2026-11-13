@@ -1,6 +1,8 @@
 """Find-more-faces de-dupes per person: repeat requests for one person reuse
-its pass in flight (no pile-up of full face-table scans), while another
-person gets a pass of their own. Reclusters keep the per-library guard.
+its pass waiting to start (no pile-up of full face-table scans), while another
+person gets a pass of their own. A pass already running doesn't absorb new
+requests, since it started before whatever prompted them (e.g. a merge).
+Reclusters keep the per-library guard.
 Only a missing queue runs a pass inline on core; a failed send doesn't,
 since an inline pass has no job record for the de-dupe to see."""
 from __future__ import annotations
@@ -24,9 +26,17 @@ class _Queue:
         self.sent.append(json.loads(body))
 
 
+class _JobsTable(FakeTable):
+    """Azure's upsert_entity merges by default, so a status write keeps the job's
+    stored payload (which person it searches); FakeTable would replace the row."""
+
+    def upsert_entity(self, entity, mode='merge', **kwargs):
+        super().upsert_entity(entity, mode=mode, **kwargs)
+
+
 @pytest.fixture
 def queue(monkeypatch):
-    monkeypatch.setattr(app, 'jobs_table_client', FakeTable())
+    monkeypatch.setattr(app, 'jobs_table_client', _JobsTable())
     q = _Queue()
     monkeypatch.setattr(app, 'clustering_queue_client', q)
     return q
@@ -56,8 +66,27 @@ def test_another_person_gets_a_pass_while_the_first_is_running(queue):
     assert [m['personId'] for m in queue.sent] == ['pihu', 'tanu']
 
 
-@pytest.mark.parametrize('status, minutes_ago', [('done', 0), ('failed', 0), ('running', 60)])
-def test_finished_or_stale_passes_do_not_block_the_same_person(queue, status, minutes_ago):
+def test_a_request_while_that_persons_pass_runs_gets_one_more_pass(queue):
+    # Tanu, 2026-11-13: a second merge landed after her pass had read her rep; folding
+    # it into that running pass skipped what the merge changed.
+    running = app._enqueue_propagate_job(USER, 'tanu')
+    app._upsert_job_status(running['jobId'], USER, 'clustering', 'running')
+    after_merge = app._enqueue_propagate_job(USER, 'tanu')
+    assert after_merge['status'] == 'queued' and after_merge['jobId'] != running['jobId']
+    # Still bounded: more taps reuse the waiting pass, not the running one.
+    assert app._enqueue_propagate_job(USER, 'tanu')['jobId'] == after_merge['jobId']
+    assert [m['personId'] for m in queue.sent] == ['tanu', 'tanu']
+
+
+def test_batch_includes_people_whose_pass_is_already_running(queue):
+    running = app._enqueue_propagate_job(USER, 'tanu')
+    app._upsert_job_status(running['jobId'], USER, 'clustering', 'running')
+    app._enqueue_propagate_batch_job(USER, ['tanu', 'pihu'])
+    assert queue.sent[-1]['personIds'] == ['tanu', 'pihu']
+
+
+@pytest.mark.parametrize('status, minutes_ago', [('done', 0), ('failed', 0), ('running', 0), ('running', 60)])
+def test_started_finished_or_stale_passes_do_not_block_the_same_person(queue, status, minutes_ago):
     _job('propagate:lib-A:old', status, {'personId': 'pihu'}, minutes_ago=minutes_ago)
     result = app._enqueue_propagate_job(USER, 'pihu')
     assert result['jobId'] != 'propagate:lib-A:old' and len(queue.sent) == 1
