@@ -11,3 +11,10 @@ def test_names_the_biggest_blocker_first():
 def test_leaves_out_empty_buckets():
     text = reason(rejected=0, suspicious=3, stale_version=0, no_embedding=0)
     assert text == 'No face can be clustered: 3 faces are held back as suspicious.'
+
+
+def test_a_single_face_reads_in_the_singular():
+    text = reason(rejected=1, suspicious=1, stale_version=0, no_embedding=0)
+    assert '1 face is held back as suspicious' in text
+    assert '1 face was rejected' in text
+    assert '1 faces' not in text

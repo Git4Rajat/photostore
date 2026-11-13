@@ -1098,12 +1098,19 @@ def delete_faces():
 
 def _no_faces_accepted_reason(rejected, suspicious, stale_version, no_embedding):
     """Names what is actually keeping every face out of clustering, biggest bucket first."""
+    def faces(count, plural, singular):
+        return f'{count} face {singular}' if count == 1 else f'{count} faces {plural}'
+
     reasons = sorted(
         [
-            (no_embedding, f'{no_embedding} faces have no embedding yet, so they cannot be clustered; reprocess their photos'),
-            (suspicious, f'{suspicious} faces are held back as suspicious'),
-            (stale_version, f'{stale_version} faces have an out-of-date embedding version'),
-            (rejected, f'{rejected} faces were rejected'),
+            (no_embedding, faces(
+                no_embedding,
+                'have no embedding yet, so they cannot be clustered; reprocess their photos',
+                'has no embedding yet, so it cannot be clustered; reprocess its photo',
+            )),
+            (suspicious, faces(suspicious, 'are held back as suspicious', 'is held back as suspicious')),
+            (stale_version, faces(stale_version, 'have an out-of-date embedding version', 'has an out-of-date embedding version')),
+            (rejected, faces(rejected, 'were rejected', 'was rejected')),
         ],
         key=lambda item: item[0], reverse=True,
     )

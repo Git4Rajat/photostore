@@ -4,6 +4,7 @@ import { useProtectedBlobUrls } from '../../../services/imageClient';
 import { tileImage, usePhotoThumbnails } from '../media';
 import { TileThumbnail } from '../components/PhotoGrid';
 import { Swatch } from '../components/bits';
+import { plural } from '../../../utils/format';
 import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
 
 const SHELF_PAGE = 16;
@@ -119,7 +120,7 @@ const ExplorePage: React.FC = () => {
                                 ? <img className="pt-shelf-face" src={src} alt={p.name ?? 'Person'} />
                                 : <Swatch swatch={p.swatch} className="pt-shelf-face" />}
                             <span className="pt-shelf-card-name">{p.name ?? 'Unnamed'}</span>
-                            <span className="pt-shelf-card-sub">{p.faceCount} photos</span>
+                            <span className="pt-shelf-card-sub">{plural(p.faceCount ?? 0, 'photo')}</span>
                         </button>
                     )}
                 />

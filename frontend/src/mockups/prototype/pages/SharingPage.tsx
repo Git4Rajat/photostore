@@ -2,18 +2,13 @@ import React, { useEffect, useState } from 'react';
 import { Send as PaperAirplaneIcon } from 'lucide-react';
 import { useStore } from '../store';
 import { Avatar, Spinner } from '../components/bits';
+import { initialsFor, plural } from '../../../utils/format';
 import * as library from '../../../services/libraryClient';
 import { getRuntimeConfig } from '../../../config/appConfig';
 import { confirmDialog, promptDialog } from '../../../components/shared/dialogs';
 import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-const initialsFor = (value: string): string => {
-    const parts = value.replace(/@.*/, '').split(/[\s._-]+/).filter(Boolean);
-    const letters = parts.length >= 2 ? parts[0][0] + parts[1][0] : value.slice(0, 2);
-    return (letters || '?').toUpperCase();
-};
 
 /** Sharing — shared-library members, pending invites, and library settings. */
 const SharingPage: React.FC = () => {
@@ -88,7 +83,7 @@ const SharingPage: React.FC = () => {
             <div className="pt-toolbar">
                 <div>
                     <h1 className="pt-page-title">Sharing</h1>
-                    <p className="pt-page-sub">{libraryName || 'Library'} · {memberCount} of {maxMembers} {memberCount === 1 ? 'member' : 'members'}</p>
+                    <p className="pt-page-sub">{libraryName || 'Library'} · {memberCount} of {plural(maxMembers, 'member')}</p>
                 </div>
             </div>
 

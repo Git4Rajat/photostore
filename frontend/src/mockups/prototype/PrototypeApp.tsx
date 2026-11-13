@@ -55,6 +55,8 @@ import ToolsPage from './pages/ToolsPage';
 import TrashPage from './pages/TrashPage';
 import AdditionalInfoPage from '../../components/AdditionalInfoPage';
 import type { PageId } from './types';
+import { applyTheme, loadTheme, saveTheme, type Theme } from './theme';
+import { initialsFor } from '../../utils/format';
 
 const LazyLoginPage = React.lazy(() => import('../../components/LoginPage'));
 
@@ -63,16 +65,6 @@ const LazyLoginPage = React.lazy(() => import('../../components/LoginPage'));
 // real app's guardPrivateRoute (which renders straight through when auth is
 // disabled).
 const isSignedIn = (): boolean => (!isAuthEnabled() || Boolean(getActiveAccount()));
-
-const accountInitials = (name: string, email: string): string => {
-    const source = (name || email || '').trim();
-    if (!source) return '?';
-    const parts = source.split(/[\s@._-]+/).filter(Boolean);
-    const letters = parts.length >= 2 ? parts[0][0] + parts[1][0] : source.slice(0, 2);
-    return letters.toUpperCase();
-};
-
-type Theme = 'light' | 'dark' | 'system';
 
 // A share link (…/public/album/<token>) is a public, no-auth destination. The
 // prototype's own store-based navigation ignores the URL path, so without this
@@ -111,17 +103,6 @@ const MOBILE_NAV_ICONS: Record<string, [React.ElementType, React.ElementType]> =
     explore: [SparklesIcon, SparklesIconSolid],
 };
 
-const applyTheme = (theme: Theme) => {
-    const root = document.documentElement;
-    if (theme === 'system') {
-        delete root.dataset.theme;
-        root.style.colorScheme = '';
-    } else {
-        root.dataset.theme = theme;
-        root.style.colorScheme = theme;
-    }
-};
-
 const activeNavFor = (page: PageId): PageId | '' => (
     page === 'person' ? 'people' : (page === 'trash' || page === 'additional') ? '' : page
 );
@@ -152,7 +133,7 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
     const account = getActiveAccount();
     const accountName = account?.name || account?.username || 'Signed in';
     const accountEmail = account?.username || '';
-    const initials = accountInitials(account?.name || '', account?.username || '');
+    const initials = initialsFor(account?.name || account?.username || '');
 
     return (
         <header className="ios-header">
@@ -370,15 +351,19 @@ const DataRefreshBridge: React.FC = () => {
 };
 
 const Shell: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
-    const [theme, setTheme] = useState<Theme>('system');
+    const [theme, setTheme] = useState<Theme>(loadTheme);
     useEffect(() => applyTheme(theme), [theme]);
+    const chooseTheme = useCallback((next: Theme) => {
+        setTheme(next);
+        saveTheme(next);
+    }, []);
 
     return (
         <div className="pt-shell">
             <div className="mock-stage">
                 <div className="mock-viewport">
                     <div className="mock-app">
-                        <Topbar theme={theme} onTheme={setTheme} onSignOut={onSignOut} />
+                        <Topbar theme={theme} onTheme={chooseTheme} onSignOut={onSignOut} />
                         <div className="mock-body pt-body">
                             <UploadPausedBanner />
                             <IndexBuildBar />
