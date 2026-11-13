@@ -10889,6 +10889,32 @@ def _execute_library_clean(library_id: str) -> Dict:
     return {'photosDeleted': photos_deleted, 'blobsDeleted': blobs_deleted, 'blobErrors': blob_errors}
 
 
+def _run_library_clean(library_id: str, job_id: str) -> Dict:
+    """_execute_library_clean behind the library's own index sign-off.
+
+    The clean's quiesced cleanup needs proof that no index writer is mid-write.
+    Nobody else gives it for a user-approved clean, so the clean fences the
+    library, waits for writers to drain and records that itself, lifting the
+    fence afterwards (automatic_index_updates.self_quiesced)."""
+    import automatic_index_updates as automatic
+    with automatic.self_quiesced(library_id, operation='library_clean', reason=job_id or 'library_clean'):
+        return _execute_library_clean(library_id)
+
+
+def _library_clean_failure_reason(error: BaseException) -> str:
+    """What the job row and the library record say when a clean fails.
+
+    The two refusals that come before anything is deleted get a reason a user
+    can act on; anything else keeps the generic text."""
+    from automatic_index_updates import OperatorFenced, QuiescenceTimeout
+    if isinstance(error, QuiescenceTimeout):
+        return ('This library was still updating its indexes. Nothing was deleted; '
+                'try again in a few minutes.')
+    if isinstance(error, OperatorFenced):
+        return 'An administrator has paused index updates for this library. Nothing was deleted.'
+    return 'Library clean failed'
+
+
 def _enqueue_library_clean_job(library_id: str, actor_user_id: str, request_id: str) -> Dict[str, str]:
     job_id = f"libclean:{library_id}:{uuid.uuid4().hex}"
     if library_ops_queue_client is None:
@@ -10897,15 +10923,16 @@ def _enqueue_library_clean_job(library_id: str, actor_user_id: str, request_id: 
         app.logger.warning('Library-ops queue client is unavailable; running library clean %s inline', job_id)
         try:
             library_store.set_cleanup_in_progress(library_id, job_id)
-            summary = _execute_library_clean(library_id)
+            summary = _run_library_clean(library_id, job_id)
             library_store.set_cleanup_completed(library_id, summary.get('photosDeleted', 0), summary.get('blobsDeleted', 0))
             _upsert_job_status(job_id, actor_user_id, 'library_clean', 'done', result=summary, libraryId=library_id)
             _notify_cleanup_completed(library_id, summary)
             return {'status': 'done', 'jobId': job_id}
         except Exception as exc:
             app.logger.exception('Inline library clean failed for %s', library_id)
-            library_store.set_cleanup_failed(library_id, 'Library clean failed')
-            _upsert_job_status(job_id, actor_user_id, 'library_clean', 'failed', error='Library clean failed', libraryId=library_id)
+            reason = _library_clean_failure_reason(exc)
+            library_store.set_cleanup_failed(library_id, reason)
+            _upsert_job_status(job_id, actor_user_id, 'library_clean', 'failed', error=reason, libraryId=library_id)
             return {'status': 'failed', 'jobId': job_id}
     message = {
         'jobId': job_id,
@@ -16526,7 +16553,7 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
         heartbeat_thread = threading.Thread(target=_send_heartbeat, daemon=True)
         heartbeat_thread.start()
         try:
-            summary = _execute_library_clean(target_library_id)
+            summary = _run_library_clean(target_library_id, job_id)
             if library_store is not None:
                 library_store.set_cleanup_completed(
                     target_library_id,
@@ -16538,10 +16565,11 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
                 _upsert_job_status(job_id, user_id, 'library_clean', 'done', result=summary, libraryId=target_library_id)
         except Exception as exc:
             worker_logger.exception('Library clean failed for %s', target_library_id)
+            reason = _library_clean_failure_reason(exc)
             if library_store is not None:
-                library_store.set_cleanup_failed(target_library_id, 'Library clean failed')
+                library_store.set_cleanup_failed(target_library_id, reason)
             if job_id:
-                _upsert_job_status(job_id, user_id, 'library_clean', 'failed', error='Library clean failed', libraryId=target_library_id)
+                _upsert_job_status(job_id, user_id, 'library_clean', 'failed', error=reason, libraryId=target_library_id)
         finally:
             stop_heartbeat.set()
             heartbeat_thread.join(timeout=5)
@@ -16656,7 +16684,11 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
     if job_type == 'library_delete_purge':
         library_id = str(payload.get('libraryId') or user_id)
         try:
-            _purge_library_data(library_id)
+            # Same sign-off as Clean library: without it the purge's quiesced
+            # cleanup refuses every deleted library's data.
+            import automatic_index_updates as automatic
+            with automatic.self_quiesced(library_id, operation='library_delete_purge', reason=job_id or 'library_delete_purge'):
+                _purge_library_data(library_id)
             invalidate_user_vector_index_cache(library_id)
             invalidate_user_lexical_index_cache(library_id)
         except Exception:

@@ -29,6 +29,10 @@ explicitly releases the fence; until then source writes/builders remain blocked.
 Confirmed proof also permits existing library/account purge to remove immutable
 artifacts and automatic state inside the same lock, before cleanup completion.
 Leave writers stopped until recovery/purge finishes; proof has no timeout.
+
+A user-approved wipe (Clean library, deleting a library) has no operator, so it
+fences, drains and attests the library itself (self_quiesced) under a
+``system:`` fence it lifts when done. It never touches an operator's fence.
 """
 from __future__ import annotations
 
@@ -115,10 +119,23 @@ def _quiescence_row(user):
 
 
 def check_source_admission(user):
-    """Indefinite operator fence; never confuse an expired lease with a drain."""
+    """Indefinite operator fence; never confuse an expired lease with a drain.
+
+    The one exception is a system fence (self_quiesced) its job never lifted
+    because the worker died: past SYSTEM_FENCE_MAX_SECONDS it is removed here so
+    the library does not stay closed to uploads forever. A wipe still running
+    behind it then fails its own proof check rather than racing this writer."""
     import storage_utils as su
-    if su.DURABLE_INDEX_UPDATES and _quiescence_row(user) is not None:
-        raise SourceBusy('Library writers fenced for operator quiescence')
+    if not su.DURABLE_INDEX_UPDATES:
+        return
+    row = _quiescence_row(user)
+    if row is None:
+        return
+    if _abandoned_system_fence(row):
+        LOG.warning('Lifting abandoned %s fence for library=%r', row.get('operator'), user)
+        _delete_fence(row)
+        return
+    raise SourceBusy('Library writers fenced for operator quiescence')
 
 
 def _check_publication_claims(user):
@@ -254,6 +271,142 @@ def resume_quiesced_sources(user, *, guard, fence_id):
 
 class SourceBusy(RuntimeError):
     """An active source writer is not a failed build or a poison job."""
+
+
+class OperatorFenced(SourceBusy):
+    """An administrator's fence is up and not yet proven; a wipe must not take it over."""
+
+
+class QuiescenceTimeout(SourceBusy):
+    """Writers or index builds were still running when a wipe gave up waiting for them."""
+
+
+# A user-approved library wipe (Clean library, deleting a library) has no
+# operator to attest that writers stopped, so it proves that itself: see
+# self_quiesced. Its fences are marked with this operator prefix.
+SYSTEM_OPERATOR_PREFIX = 'system:'
+SELF_QUIESCE_WAIT_SECONDS = float(os.getenv('INDEX_SELF_QUIESCE_WAIT_SECONDS', '300'))
+SELF_QUIESCE_POLL_SECONDS = 5.0
+SYSTEM_FENCE_MAX_SECONDS = float(os.getenv('INDEX_SYSTEM_FENCE_MAX_SECONDS', '21600'))
+
+
+def _is_system_fence(row):
+    return str(row.get('operator') or '').startswith(SYSTEM_OPERATOR_PREFIX)
+
+
+def _abandoned_system_fence(row, now=None):
+    if not _is_system_fence(row) or SYSTEM_FENCE_MAX_SECONDS <= 0:
+        return False
+    started = float(row.get('fencedAt') or 0)
+    return bool(started) and (time.time() if now is None else now) - started > SYSTEM_FENCE_MAX_SECONDS
+
+
+def _delete_fence(row):
+    import app
+    try:
+        app.jobs_table_client.delete_entity(row['PartitionKey'], row['RowKey'], etag=etag(row),
+                                           match_condition=MatchConditions.IfNotModified)
+    except (ResourceNotFoundError, ResourceModifiedError):
+        pass  # Already lifted, or changed under us (a newer fence): leave it.
+
+
+def _sources_busy(user):
+    """Why this library's sources are not idle yet, or '' when they are.
+
+    Settles what an artifact build's capture settles first: a release a
+    finished writer could not record, and a reservation whose writer died long
+    ago. Any other reservation is a writer between its admission check and its
+    release, i.e. possibly mid-write. A live maintenance claim is an index
+    build that may still publish."""
+    store = configured_store()
+    for kind in KINDS:
+        row = store.control(user, kind)
+        if row is None or not int(row.get('active') or 0):
+            continue
+        if store.release_finished(user, kind) or store.reap_stale_reservations(user, kind):
+            row = store.control(user, kind)
+        if row is not None and int(row.get('active') or 0):
+            return f'{kind} source writes still in flight'
+    try:
+        _check_publication_claims(user)
+    except SourceBusy as error:
+        return str(error)
+    return ''
+
+
+@contextmanager
+def self_quiesced(user, *, operation, reason, wait_seconds=None, poll_seconds=None,
+                  sleep=time.sleep, clock=time.monotonic):
+    """Fence, drain and attest one library for a user-approved wipe, then lift the fence.
+
+    The operator proof (see the module docstring) exists because writers can be
+    mid-write where nothing observes them. With the fence up, every tracked
+    writer is refused at admission and again just before it writes, and one
+    already past that holds a coverage reservation until it finishes. So once
+    the fence is up, every kind's ``active`` count is zero and no maintenance
+    claim is live -- rechecked under the real catalog lock -- no writer can
+    still be mid-write, and this records the proof as ``system:<operation>``.
+    Every deployed writer runs this admission code, which is what the operator
+    attests by ``legacyWritersStopped``.
+
+    An administrator's fence is never taken over or lifted: proven, it already
+    permits the wipe; unproven, the wipe stops with OperatorFenced. A system
+    fence left by a wipe whose worker died is adopted, so a retry finishes the
+    job and lifts it. Gives up with QuiescenceTimeout after ``wait_seconds``.
+    """
+    import storage_utils as su
+    if not su.DURABLE_INDEX_UPDATES:
+        yield
+        return
+    import app
+    operator = SYSTEM_OPERATOR_PREFIX + operation
+    existing = _quiescence_row(user)
+    if existing is not None and not _is_system_fence(existing):
+        if existing.get('proven') is not True:
+            raise OperatorFenced('An administrator has paused index updates for this library')
+        yield
+        return
+    if existing is None:
+        try:
+            app.jobs_table_client.create_entity(dict(
+                PartitionKey=QUIESCENCE_PARTITION, RowKey=hashlib.sha256(user.encode()).hexdigest(),
+                libraryId=user, fenceId=uuid.uuid4().hex, operator=operator, reason=str(reason),
+                proven=False, fencedAt=time.time()))
+        except ResourceExistsError:
+            pass
+        existing = _quiescence_row(user)
+        if existing is None or not _is_system_fence(existing):
+            raise OperatorFenced('An administrator has paused index updates for this library')
+    fence_id = existing['fenceId']
+    try:
+        if existing.get('proven') is not True:
+            from index_artifact_cleanup import artifact_catalog_serialization
+            wait = SELF_QUIESCE_WAIT_SECONDS if wait_seconds is None else wait_seconds
+            poll = SELF_QUIESCE_POLL_SECONDS if poll_seconds is None else poll_seconds
+            deadline = clock() + wait
+            while True:
+                busy = _sources_busy(user)
+                if not busy:
+                    with artifact_catalog_serialization(user, storage=su) as guard:
+                        busy = _sources_busy(user)
+                        if not busy:
+                            operator_prove(user, fence_id, guard=guard, operator=operator,
+                                reason=f'{reason}: fenced; no source reservation or maintenance claim',
+                                all_writers_stopped=True, no_paused_requests=True, legacy_writers_stopped=True)
+                            break
+                if clock() >= deadline:
+                    raise QuiescenceTimeout(f'Library still busy after {wait:.0f}s: {busy}')
+                sleep(poll)
+        yield
+    finally:
+        try:
+            row = _quiescence_row(user)
+            if row is not None and row.get('fenceId') == fence_id:
+                _delete_fence(row)
+        except Exception:
+            # Never mask the wipe's own outcome; check_source_admission lifts it
+            # after SYSTEM_FENCE_MAX_SECONDS, and the next wipe adopts it sooner.
+            LOG.exception('Could not lift %s fence for library=%r', operator, user)
 
 
 def partition(user, kind):
