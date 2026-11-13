@@ -690,11 +690,19 @@ var backendEnv = [
   { name: 'PEOPLE_CLUSTER_ABSOLUTE_MAX_PAIR_DISTANCE', value: '0.40' }
   { name: 'PEOPLE_CLUSTER_MAX_PAIR_DISTANCE', value: '0.40' }
   { name: 'PEOPLE_MATCH_THRESHOLD', value: '0.60' }
-  { name: 'PEOPLE_CLUSTER_ASSIGN_THRESHOLD', value: '0.62' }
+  // Lowered 0.62 -> 0.58 (2026-11-13), the first calibration on the AdaFace
+  // -mp tiers actually in use: faces within a week of each other, often the
+  // same day, sat at 0.53-0.60 in separate people. Replayed over a 15,435-face
+  // library together with PEOPLE_CLUSTER_ASSIGN_CERTAIN (app.py), people fell
+  // ~5,500 -> ~2,200-2,650 while distinct faces of one photo put in one person
+  // went 13-14 -> 19-23 of 12,539 pairs. 0.55 pushed that to 24-31.
+  { name: 'PEOPLE_CLUSTER_ASSIGN_THRESHOLD', value: '0.58' }
   // Master safety floor that previously clamped EVERY auto path (match / assign /
   // propagate) up to 0.98 and blocked all automatic merges once v2 embeddings
-  // landed. Lowered so the preset thresholds above actually govern.
-  { name: 'MIN_AUTO_FACE_MERGE_SIMILARITY', value: '0.60' }
+  // landed. Lowered so the preset thresholds above actually govern. 0.58 lets
+  // the assign threshold above reach 0.58; match (0.60) and propagation (0.74)
+  // sit above it either way.
+  { name: 'MIN_AUTO_FACE_MERGE_SIMILARITY', value: '0.58' }
   // Identity propagation: use a named person's rep embedding to pull their faces
   // out of unnamed clusters (auto-move above AUTO, review queue above REVIEW).
   // This — NOT PEOPLE_CLUSTER_EPS/PEOPLE_MATCH_THRESHOLD above — is the lever

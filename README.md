@@ -392,3 +392,9 @@ needed. See `_resolve_people_cluster_config` in `backend/app.py` for the full
 threshold table and the calibration script
 (`backend/scripts/calibrate_face_thresholds.py`) used to derive these numbers
 from real face-embedding data.
+
+A new face must also beat the next-best person by `PEOPLE_CLUSTER_ASSIGN_MARGIN`,
+so a face that fits two different people equally well starts its own person.
+Above `PEOPLE_CLUSTER_ASSIGN_CERTAIN` (default 0.75) that margin is waived: a
+face that close to two people is almost always one person already split in
+two, and refusing it would only split them further.
