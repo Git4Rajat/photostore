@@ -1564,7 +1564,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             adjustPeopleCountsForPhotos(doomed, -1);
             removeFromEverywhere(ids);
             applyPhotoDeleteCount(ids.length);
-            setSelection([]);
+            // Acting on a selection ends select mode, not just the picks.
+            clearSelection();
             // Put photos the server did not delete back where the optimistic removal took them from.
             const rollBack = (failedIds: string[]) => {
                 const set = new Set(failedIds);
@@ -1591,12 +1592,13 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                     toast('Couldn’t delete photos', undefined, undefined, 'error');
                     return;
                 }
+                // No Undo on the toast: deleted photos are restored from Recently Deleted.
                 toast(
                     failedIds.length
                         ? `Deleted ${succeededIds.length} of ${ids.length} photos; ${failedIds.length} couldn’t be deleted`
                         : `Deleted ${ids.length} photo${ids.length > 1 ? 's' : ''}`,
-                    'Undo',
-                    () => restorePhotos(succeededIds),
+                    undefined,
+                    undefined,
                     failedIds.length ? 'error' : undefined,
                 );
                 publishLibraryChange('photos-deleted', ['photos', 'people', 'albums', 'explore', 'trash'], {
@@ -1608,7 +1610,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 toast('Couldn’t delete photos', undefined, undefined, 'error');
             });
         },
-        [photosByIds, adjustPeopleCountsForPhotos, removeFromEverywhere, toast, restorePhotos, applyPhotoDeleteCount, applyPhotoRestoreCount],
+        [photosByIds, adjustPeopleCountsForPhotos, removeFromEverywhere, toast, clearSelection, applyPhotoDeleteCount, applyPhotoRestoreCount],
     );
 
     const reloadTrash = useCallback(async () => {
@@ -2083,7 +2085,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const gone = cached ? cached.filter((p) => idSet.has(p.id)).length : ids.length;
         setAlbumPhotos((prev) => (prev[albumId] ? { ...prev, [albumId]: prev[albumId].filter((p) => !idSet.has(p.id)) } : prev));
         setAlbums((prev) => prev.map((a) => (a.id === albumId ? { ...a, photoCount: Math.max(0, a.photoCount - gone) } : a)));
-        setSelection([]);
+        clearSelection();
         invalidateLocalAlbumsIndex();
         void post<{ success?: boolean; removed?: number; album?: Album }>(
             `/albums/${encodeURIComponent(albumId)}/photos/remove`, { filenames: ids },
@@ -2097,7 +2099,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 toast('Couldn’t remove photos from the album', undefined, undefined, 'error');
                 void openAlbum(albumId);
             });
-    }, [openAlbum, toast]);
+    }, [openAlbum, toast, clearSelection]);
 
     type DeleteMultipleResponse = { deletedAlbums?: string[]; albumErrors?: { albumId: string; error: string }[]; success?: boolean };
 

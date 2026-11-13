@@ -56,7 +56,7 @@ const CommandBar: React.FC = () => {
                         >
                             {(rateClose) => (
                                 <div className="pt-rate-pop">
-                                    <Stars value={0} onRate={(n) => { ratePhotos(selection, n); toast(`Rated ${selection.length} · ${n}★`); rateClose(); close(); }} size={26} />
+                                    <Stars value={0} onRate={(n) => { ratePhotos(selection, n); toast(`Rated ${selection.length} · ${n}★`); rateClose(); close(); clearSelection(); }} size={26} />
                                 </div>
                             )}
                         </Menu>
