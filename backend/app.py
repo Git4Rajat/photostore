@@ -5131,7 +5131,7 @@ def _remove_person_member(person_id: str, face_id: str) -> None:
         app.logger.exception('Failed to remove person-membership row for %s/%s', person_id, face_id)
 
 
-def _person_member_ids(person_id: str) -> set:
+def _person_member_ids(person_id: str) -> Optional[set]:
     """Current photopersonmembers rows for one person -- cheap, since the
     table is partitioned by person_id (one partition scan per person, not per
     library). Used by _repair_face_memberships to reconcile this table
@@ -5140,7 +5140,10 @@ def _person_member_ids(person_id: str) -> set:
     list at once instead of calling _add_person_member/_remove_person_member
     incrementally -- those don't track which individual faces moved, so
     reconciling here after the fact closes the gap instead of threading exact
-    diffs through DBSCAN's cluster-assignment logic."""
+    diffs through DBSCAN's cluster-assignment logic.
+
+    None when the read fails: an empty set would read as "every face is
+    missing its row", and callers would rewrite them all."""
     if person_members_table_client is None or not person_id:
         return set()
     try:
@@ -5148,7 +5151,7 @@ def _person_member_ids(person_id: str) -> set:
         return {str(row.get('RowKey') or '') for row in rows if row.get('RowKey')}
     except Exception:
         app.logger.exception('Failed to read person-membership rows for %s', person_id)
-        return set()
+        return None
 
 
 def _bounded_io_map(executor, function, items):
@@ -8534,6 +8537,8 @@ def _repair_face_memberships(user_id: str, *, dry_run: bool = True) -> Dict:
                 continue
             target_ids = set(face_ids)
             current_ids = _person_member_ids(person_id)
+            if current_ids is None:
+                continue
             for stale_fid in current_ids - target_ids:
                 _remove_person_member(person_id, stale_fid)
             for new_fid in target_ids - current_ids:
@@ -8879,7 +8884,8 @@ def _propagate_person_identity(
     # or its membership rows (which the person's photo page reads). A move sets
     # the face's owner first, so an earlier pass that stopped part-way, or one
     # from before the membership rows were written here, left these behind;
-    # finishing them here is what lets a re-run repair the person.
+    # finishing them here is what lets a re-run repair the person. If the
+    # membership rows can't be read, only the faceIds list is checked.
     listed_face_ids = {str(fid) for fid in target_face_ids}
     member_face_ids = _person_member_ids(person_id) if person_members_table_client is not None else None
     unfinished_files: Dict[str, str] = {}

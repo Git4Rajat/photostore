@@ -126,6 +126,22 @@ def test_a_rerun_finishes_faces_an_interrupted_pass_left_half_moved(tables, writ
     assert again['repairedCount'] == 0 and again['candidateFaces'] == 0
 
 
+def test_an_unreadable_membership_table_only_repairs_unlisted_faces(tables, writes, monkeypatch):
+    # A failed read used to look like "no rows at all", so every one of the person's
+    # faces was rewritten and every photo's metadata rebuilt.
+    faces, people = tables
+    _tanu(faces, people, writes)
+    _face(faces, 'orphan', TANU, 'tanu')
+
+    def unreadable(*a, **k):
+        raise RuntimeError('membership table unavailable')
+    monkeypatch.setattr(writes, 'query_entities', unreadable)
+
+    assert app._person_member_ids('tanu') is None
+    result = app._propagate_person_identity(USER, 'tanu', apply=True, collect_suggestions=False)
+    assert result['repairedCount'] == 1 and result['autoAssigned'] == ['orphan']
+
+
 def test_job_record_keeps_skip_reasons_and_stays_a_find_faces_job():
     skipped = app._propagation_summary({'autoAssignedCount': 0, 'skipped': 'not enough anchor faces'})
     assert skipped == {'autoAssignedFaces': 0, 'repairedFaces': 0, 'searchedFaces': 0, 'skipped': 'not enough anchor faces'}

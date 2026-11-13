@@ -1,6 +1,8 @@
 """Find-more-faces de-dupes per person: repeat requests for one person reuse
 its pass in flight (no pile-up of full face-table scans), while another
-person gets a pass of their own. Reclusters keep the per-library guard."""
+person gets a pass of their own. Reclusters keep the per-library guard.
+Only a missing queue runs a pass inline on core; a failed send doesn't,
+since an inline pass has no job record for the de-dupe to see."""
 from __future__ import annotations
 
 import json
@@ -82,3 +84,61 @@ def test_batch_leaves_out_people_already_being_searched(queue):
     again = app._enqueue_propagate_batch_job(USER, ['tanu', 'pihu'])
     assert again == {'status': 'queued', 'jobId': batch['jobId']} and len(queue.sent) == 2
     assert app._enqueue_propagate_job(USER, 'rajat')['jobId'] == batch['jobId']
+
+
+class _BrokenQueue:
+    def send_message(self, body):
+        raise RuntimeError('queue send failed')
+
+
+@pytest.fixture
+def routes(monkeypatch):
+    from routes import people
+    monkeypatch.setattr(app, 'jobs_table_client', FakeTable())
+    persons = FakeTable()
+    persons.upsert_entity({'PartitionKey': USER, 'RowKey': 'tanu', 'name': 'Tanu'})
+    monkeypatch.setattr(app, 'person_table_client', persons)
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: (USER, None))
+    monkeypatch.setattr(app, '_people_features_available', lambda: True)
+    inline = []
+    monkeypatch.setattr(app, '_propagate_person_identity',
+                        lambda uid, pid, **k: inline.append(pid) or {'autoAssignedCount': 0})
+    return people, inline
+
+
+def _find_faces(people):
+    with app.app.test_request_context('/api/persons/tanu/find-faces', method='POST'):
+        response = people.find_person_faces('tanu')
+    return response if isinstance(response, tuple) else (response, 200)
+
+
+def test_a_failed_hand_off_answers_with_an_error_instead_of_searching_on_core(routes, monkeypatch):
+    people, inline = routes
+    monkeypatch.setattr(app, 'clustering_queue_client', _BrokenQueue())
+    _, status = _find_faces(people)
+    assert status == 503 and inline == []
+
+
+def test_without_a_queue_find_more_faces_still_runs_inline(routes, monkeypatch):
+    people, inline = routes
+    monkeypatch.setattr(app, 'clustering_queue_client', None)
+    response, status = _find_faces(people)
+    assert status == 200 and response.get_json()['status'] == 'done' and inline == ['tanu']
+
+
+def test_merges_still_succeed_when_the_hand_off_fails_but_search_nothing_on_core(routes, monkeypatch):
+    people, inline = routes
+    monkeypatch.setattr(app, 'clustering_queue_client', _BrokenQueue())
+    monkeypatch.setattr(app, '_merge_persons_core', lambda uid, pid, ids, **k: {'mergeId': 'm1'})
+    monkeypatch.setattr(app, '_load_user_face_summary_by_id', lambda uid: {})
+    monkeypatch.setattr(app, '_person_is_named', lambda uid, pid: True)
+    for name in ('mark_people_dirty', 'touch_user_people_index_state', '_trigger_indexer_rebuild'):
+        monkeypatch.setattr(app, name, lambda *a, **k: None)
+    with app.app.test_request_context('/api/persons/tanu/merge', method='POST', json={'mergeIds': ['x']}):
+        single = people.merge_persons('tanu').get_json()
+    with app.app.test_request_context('/api/persons/merge/batch', method='POST',
+                                      json={'merges': [{'targetPersonId': 'tanu', 'mergeIds': ['y']}]}):
+        batch = people.merge_persons_batch().get_json()
+    assert single['success'] and single['propagateJobId'] is None
+    assert batch['success'] and batch['propagateJobId'] is None
+    assert inline == []
