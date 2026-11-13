@@ -1,5 +1,5 @@
 import React from 'react';
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -27,6 +27,7 @@ vi.mock('../../services/jobNotifications', () => ({ requestJobPoll: mocks.poll }
 
 import { __resetPendingEditsForTests, beginPendingEdit, confirmPendingEdit, rollbackPendingEdit, pendingEditScope } from '../../services/pendingEdits';
 import { AlbumsPage } from './pages/AlbumsPage';
+import CommandBar from './components/CommandBar';
 import { __resetAlbumOperationsForTests, beginAlbumDelete, updateAlbumCreateReceipt, hasAlbumDeleteTombstone, clearAlbumDeleteTombstone } from '../../services/albumOperations';
 import { clearLocalSortIndexRemovals } from '../../services/localSortIndex';
 import { galleryIndexPhoto, StoreProvider, useStore } from './store';
@@ -64,10 +65,38 @@ describe('index-backed gallery', () => {
         render(<StoreProvider><Probe /></StoreProvider>);
         await act(async () => { await store.fetchAlbums(true); });
         expect(store.albums.find((a) => a.id === 'a1')?.photoCount).toBe(3);
+        act(() => { store.setSelectMode(true); store.selectMany(['p1.jpg', 'p2.jpg']); });
         await act(async () => { store.removePhotosFromAlbum('a1', ['p1.jpg', 'p2.jpg']); });
         expect(mocks.post).toHaveBeenCalledWith('/albums/a1/photos/remove', { filenames: ['p1.jpg', 'p2.jpg'] });
         expect(mocks.post).not.toHaveBeenCalledWith('/photos/delete', expect.anything());
         expect(store.albums.find((a) => a.id === 'a1')?.photoCount).toBe(1);
+        expect(store.selectMode).toBe(false);
+        expect(store.selection).toEqual([]);
+    });
+
+    it('deleting a selection ends select mode and the toast offers no Undo', async () => {
+        mocks.post.mockImplementation(async (path: string, data: {filenames?: string[]}) => (
+            path === '/photos/delete' ? { deleted: data.filenames || [] } : { photos: [] }
+        ));
+        render(<StoreProvider><Probe /></StoreProvider>);
+        act(() => { store.setSelectMode(true); store.selectMany(['p1.jpg', 'p2.jpg']); });
+        await act(async () => { store.deletePhotos(['p1.jpg', 'p2.jpg']); });
+        expect(mocks.post).toHaveBeenCalledWith('/photos/delete', { filenames: ['p1.jpg', 'p2.jpg'] });
+        expect(store.selectMode).toBe(false);
+        expect(store.selection).toEqual([]);
+        await waitFor(() => expect(store.toasts.map((t) => t.message)).toContain('Deleted 2 items'));
+        expect(store.toasts.find((t) => t.message === 'Deleted 2 items')?.actionLabel).toBeUndefined();
+    });
+
+    it('rating a selection from the selection bar ends select mode', async () => {
+        render(<StoreProvider><Probe /><CommandBar /></StoreProvider>);
+        act(() => { store.setSelectMode(true); store.selectMany(['p1.jpg', 'p2.jpg']); });
+        fireEvent.click(screen.getByRole('button', { name: 'More options' }));
+        fireEvent.click(screen.getByRole('button', { name: 'Rate' }));
+        await act(async () => { fireEvent.click(screen.getByRole('button', { name: '4 stars' })); });
+        expect(mocks.post).toHaveBeenCalledWith('/photos/rate-multiple', { filenames: ['p1.jpg', 'p2.jpg'], rating: 4 });
+        expect(store.selectMode).toBe(false);
+        expect(screen.queryByRole('toolbar', { name: 'Selection actions' })).toBeNull();
     });
 
     it('restoring all of the trash un-hides the photos the server restored, even ones this tab never loaded', async () => {

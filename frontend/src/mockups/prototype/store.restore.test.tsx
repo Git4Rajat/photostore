@@ -41,16 +41,17 @@ describe('deleting and restoring photos', () => {
     });
     afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
-    it('Undo on the delete toast puts the deleted video back and takes it out of Recently Deleted', async () => {
+    it('restoring from Recently Deleted puts the deleted video back and takes it out of the trash', async () => {
         render(<StoreProvider><Probe /></StoreProvider>);
         await act(async () => { store.registerPhotos([clip()]); });
         await act(async () => { store.deletePhotos(['clip.mp4']); });
         expect(store.photoById('clip.mp4')).toBeUndefined();
         expect(store.trash.map((t) => t.photo.id)).toEqual(['clip.mp4']);
 
-        const undo = store.toasts.find((t) => t.actionLabel === 'Undo');
-        expect(undo?.message).toBe('Deleted 1 item');
-        await act(async () => { undo!.onAction!(); });
+        // The delete popup has no Undo; Recently Deleted is where a photo comes back from.
+        const deleted = store.toasts.find((t) => t.message === 'Deleted 1 item');
+        expect(deleted?.actionLabel).toBeUndefined();
+        await act(async () => { store.restorePhotos(['clip.mp4']); });
 
         await waitFor(() => expect(mocks.post).toHaveBeenCalledWith('/photos/trash/restore', { filenames: ['clip.mp4'] }));
         expect(store.trash).toEqual([]);
