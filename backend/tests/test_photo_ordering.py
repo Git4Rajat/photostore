@@ -215,6 +215,65 @@ def test_creation_date_preferred_over_container_create_date_for_video():
     assert captured.year == 2020
 
 
+def test_exif_offset_places_photo_at_its_real_moment():
+    # iPhones write DateTimeOriginal as local time and the zone in OffsetTimeOriginal. Read as UTC,
+    # a 23:32 shot in India (+05:30) sorted 5.5 h late and showed on the next day in Europe.
+    row = {'exifData': json.dumps({'DateTimeOriginal': '2021:09:07 23:32:34', 'OffsetTimeOriginal': '+05:30'})}
+    captured = ordering_utils.metadata_capture_datetime(row)
+    assert captured.utcoffset().total_seconds() == 5.5 * 3600
+    assert captured.date().isoformat() == '2021-09-07'
+    assert ordering_utils.capture_iso(captured) == '2021-09-07T23:32:34+05:30'
+
+
+def test_live_photo_still_and_clip_share_one_moment():
+    still = {'exifData': json.dumps({'DateTimeOriginal': '2024:01:01 00:02:07', 'OffsetTimeOriginal': '+01:00'})}
+    clip = {'exifData': json.dumps({'CreateDate': '2024-01-01 00:02:07+01:00'})}
+    assert ordering_utils.metadata_capture_datetime(still) == ordering_utils.metadata_capture_datetime(clip)
+
+
+def test_exif_time_without_offset_stays_on_the_camera_clock():
+    # No zone recorded: the time is kept as written and emitted without an offset, so the browser
+    # shows the clock time rather than shifting it into the viewer's zone.
+    captured = ordering_utils.metadata_capture_datetime({'exifData': _exif('2015:05:10 22:59:21')})
+    assert captured.tzinfo is ordering_utils.FLOATING
+    assert ordering_utils.capture_iso(captured) == '2015-05-10T22:59:21'
+    # Naive container atoms (exiftool on a video) are UTC by the QuickTime spec.
+    utc = ordering_utils.metadata_capture_datetime({'exifData': json.dumps({'MediaCreateDate': '2024:03:02 10:00:00'})})
+    assert ordering_utils.capture_iso(utc) == '2024-03-02T10:00:00+00:00'
+
+
+def test_filename_date_outranks_file_modified_time():
+    # DJI Fly exports carry no EXIF date; their modified time is the download, years after the flight.
+    row = {
+        'RowKey': 'dji_fly_20220910_160714_5_1662823272461_photo_optimized.jpeg',
+        'clientLastModified': '2026-11-10T21:53:14+00:00',
+        'uploadDate': '2026-11-11T08:41:49+00:00',
+    }
+    assert ordering_utils.capture_iso(ordering_utils.metadata_capture_datetime(row)) == '2022-09-10T16:07:14'
+    # Real EXIF still wins over the filename.
+    row['exifData'] = _exif('2022:09:10 18:00:00')
+    assert ordering_utils.metadata_capture_datetime(row).hour == 18
+
+
+def test_filename_date_patterns():
+    parse = ordering_utils.parse_filename_capture_date
+    expected = {
+        'IMG_20240105_101112.jpg': '2024-01-05T10:11:12',
+        'PXL_20231231_235959123.MP.jpg': '2023-12-31T23:59:59',
+        'VID_20240105_101112.mp4': '2024-01-05T10:11:12',
+        'Screenshot 2024-01-05 at 10.11.12.png': '2024-01-05T10:11:12',
+        'Screenshot_20240105-101112.png': '2024-01-05T10:11:12',
+        'PHOTO-2024-01-05-10-11-12.jpg': '2024-01-05T10:11:12',
+        'IMG-20231112-WA0001.jpg': '2023-11-12T00:00:00',
+    }
+    for name, iso in expected.items():
+        assert ordering_utils.capture_iso(parse(name)) == iso, name
+    for name in ('0C1D7F9D-B143-4929-808C-066DEF39DBB7.mov', '1335645234-picsay_Original.jpg', 'IMG_4430.MOV',
+                 '75674322768__A9409009-B676-4889-AA75-1EF6F3DB6365.mov', 'IMG_20241305_101112.jpg',
+                 'IMG_19800105_101112.jpg', 'IMG_20990105_101112.jpg'):
+        assert parse(name) is None, name
+
+
 def test_epoch_millis_to_iso():
     assert ordering_utils.epoch_millis_to_iso(1717200000000).startswith('2024-06-01')
     assert ordering_utils.epoch_millis_to_iso(None) is None

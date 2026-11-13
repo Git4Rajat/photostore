@@ -52,9 +52,10 @@ from image_utils import (
     RAW_EXTENSIONS_TIFF_CONTAINER,
 )
 from exif_utils import extract_exif_from_bytes, extract_gps_decimal_from_exif
-from ordering_utils import metadata_capture_datetime, parse_iso_date
+from ordering_utils import capture_iso, metadata_capture_datetime, parse_iso_date
 from search_utils import AI_TAG_MIN_CONFIDENCE, MAX_TAGS_STORED, PERSON_SCORE_THRESHOLD, build_semantic_layers, build_semantic_text, curate_tag_records, effective_tags, is_sensitive_auto_tag_label, normalize_tags, visible_tags
 import album_store
+import grid_images
 import share_snapshot
 import index_files
 import table_scan
@@ -96,7 +97,7 @@ PHOTO_LIST_SELECT_FIELDS = [
     'face_status', 'ai_vision_status', 'map_detection_status',
     'processing_lease_owner', 'processing_lease_expires_at',
     'anonymousImageId', 'thumbnailArtifact', 'previewArtifact', 'processing_state', 'deletedAt',
-    'uploadDate', 'upload_started_at', 'last_processing_update', 'clientLastModified',
+    'uploadDate', 'upload_started_at', 'last_processing_update', 'clientLastModified', 'gridImage',
 ]
 SUSPICIOUS_FACE_CONFIDENCE = float(os.getenv('SUSPICIOUS_FACE_CONFIDENCE', '0.60'))
 FACE_MIN_STORE_CONFIDENCE = float(os.getenv('FACE_MIN_STORE_CONFIDENCE', '0.24'))
@@ -384,7 +385,7 @@ _SORT_INDEX_RELEVANT_FIELDS = {
     'face_status', 'ai_vision_status', 'map_detection_status',
     'exifData', 'clientLastModified', 'uploadDate', 'tagMetadata',
     'address', 'locationCity', 'locationCountry', 'locationRegion',
-    'livePhotoOf', 'livePhotoClip',
+    'livePhotoOf', 'livePhotoClip', 'gridImage',
 }
 
 _CTX: Dict[str, object] = {}
@@ -5664,7 +5665,7 @@ def get_user_lexical_index(
 # _VECTOR_INDEX_RELEVANT_FIELDS/_SORT_INDEX_RELEVANT_FIELDS above). A rating
 # tap needs to cheaply re-sort a number, not pay for a full OCR/tag/embedding
 # lexical rebuild -- so this index tracks its own staleness end to end.
-_SORT_INDEX_SCHEMA_VERSION = 'v5'  # v5: exclude unfinalized upload reservations
+_SORT_INDEX_SCHEMA_VERSION = 'v6'  # v6: captureDate keeps its EXIF offset (none when unknown); filename dates
 _SORT_INDEX_CACHE_LOCK = threading.RLock()
 _SORT_INDEX_CACHE: Dict[str, Dict[str, object]] = _serve_only_cache()
 _SORT_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
@@ -5674,7 +5675,7 @@ _SORT_INDEX_SOURCE_FIELDS = sorted(set(CATALOG_ADMISSION_FIELDS) | {
     'PartitionKey', 'RowKey', 'processing_state',
     'rating', 'likes', 'uploadDate',
     'exifData', 'clientLastModified', 'upload_started_at', 'last_processing_update',
-    'anonymousImageId', 'thumbnail_status', 'thumbnailArtifact', 'previewArtifact',
+    'anonymousImageId', 'thumbnail_status', 'thumbnailArtifact', 'previewArtifact', 'gridImage',
     'likedBy', 'rotation', 'tags', 'tagMetadata', 'peopleIds', 'processing_metadata',
     'preview_status', 'exif_status', 'ocr_status', 'face_status',
     'ai_vision_status', 'map_detection_status',
@@ -5915,7 +5916,7 @@ def _sort_index_row(entity: Dict) -> Optional[Dict[str, object]]:
 
     return {
         'RowKey': filename,
-        'captureDate': capture_dt.isoformat() if capture_dt else None,
+        'captureDate': capture_iso(capture_dt),
         'rating': entity.get('rating') or 0,
         'likes': entity.get('likes') or 0,
         'uploadDate': entity.get('uploadDate') or None,
@@ -5927,6 +5928,9 @@ def _sort_index_row(entity: Dict) -> Optional[Dict[str, object]]:
         # blob directly and treats a 404 as "still generating" instead of
         # asking this index whether it's ready first.
         'thumb': receipt['blob'] if receipt else str(entity.get('anonymousImageId') or filename),
+        # Sharper tile image for srcset, present only once it exists (see
+        # grid_images.py): the browser must never be offered a missing size.
+        **({'grid': grid} if (grid := grid_images.served_blob(entity)) else {}),
         'gallery': {
             'liked': str(entity.get('PartitionKey') or '') in _json_list(entity.get('likedBy')),
             'rotation': rotation(entity.get('rotation')),

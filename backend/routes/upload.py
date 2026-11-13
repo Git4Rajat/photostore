@@ -22,6 +22,31 @@ upload_bp = Blueprint('upload', __name__)
 upload_bp.teardown_request(upload_teardown)
 
 
+@upload_bp.before_request
+def share_source_reservations():
+    """One index-coverage reservation per (library, index kind) for the whole request, instead of one per
+    metadata write. A finalize batch makes ~100 writes; each used to open and close its own reservation on
+    the library's single control row, and upload bursts (tens of concurrent requests) lost those CAS races:
+    the upload failed after its row was written and the reservation stayed open for two hours of blocked
+    index builds. The shared reservation is closed in teardown, when the request's writes are done."""
+    from automatic_index_updates import coalesced_source_reservations
+    scope = coalesced_source_reservations()
+    scope.__enter__()
+    g._source_reservations = scope
+
+
+@upload_bp.teardown_request
+def close_source_reservations(error):
+    scope = g.pop('_source_reservations', None)
+    if scope is None:
+        return
+    try:
+        scope.__exit__(type(error) if error else None, error, error.__traceback__ if error else None)
+    except BaseException:
+        # Never turn a finished request into a failure; an unreleased reservation is reaped later.
+        app.app.logger.warning('Could not close shared source reservations', exc_info=True)
+
+
 def attach_live_photo(user_id, final_name, metadata):
     """Attach a just-finalized Live Photo half to its other half (see live_photos.py). Never fails an upload."""
     try:

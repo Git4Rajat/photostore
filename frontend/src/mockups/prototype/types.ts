@@ -34,6 +34,9 @@ export interface Photo {
     // PhotoViewer resolve these to a loadable src via services/imageClient +
     // components/shared/PhotoTile helpers.
     thumbnailUrl?: string;
+    /** Blob name of the sharper grid-tile image, once the backend has made it
+     * (same container token as the thumbnail; see media.ts tileImage). */
+    gridBlob?: string;
     rotation?: number;
     thumbnailRotation?: number;
     likes?: number;

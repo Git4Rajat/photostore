@@ -38,6 +38,16 @@ def _big_row():
     }
 
 
+def test_capture_day_is_the_day_on_the_capture_clock():
+    # A video shot at 00:30 in Amsterdam is 23:30 UTC the day before; it belongs to its own day,
+    # the one its label and the timeline show.
+    row = {'PartitionKey': 'lib', 'RowKey': 'late.mov', 'uploadDate': '2026-01-02T00:00:00+00:00',
+           'exifData': json.dumps({'CreateDate': '2024-01-01 00:30:00+01:00'})}
+    record = search_db.row_record(row)
+    assert date.fromordinal(record['capture_day']) == date(2024, 1, 1)
+    assert record['capture_md'] == 101
+
+
 # --- reduced rows ---------------------------------------------------------------
 
 def test_reduced_row_is_scorer_compatible_and_much_smaller():

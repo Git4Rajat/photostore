@@ -116,8 +116,10 @@ def test_exact_reduced_shape_not_raw_stream_and_sql_dates(tmp_path, hydration):
     ]
     db = database(tmp_path, rows)
     equivalent(db)
-    assert db.timeline_summary(today=TODAY)['years']['2019']['months']['12']['days']['31'] == 1
-    assert 'coverFilename' not in db.timeline_summary(today=TODAY)['years']['2019']
+    # 00:30 on 1 Jan in India is still 1 Jan: counted on the capture's own day (it used to land on
+    # 31 Dec 2019 by UTC, in a year with no cover since covers already used the local year).
+    assert db.timeline_summary(today=TODAY)['years']['2020']['months']['01']['days']['01'] == 1
+    assert '2019' not in db.timeline_summary(today=TODAY)['years']
     assert db.explore_groups()['places'][0]['latitude'] == '55.123456'
     assert all(g['label'] != 'Raw-Only' for g in db.explore_groups()['things'])
     assert db.timeline_summary(today=date(2026, 11, 2)) == sql_timeline_reference(db, date(2026, 11, 2))

@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useStore } from '../store';
 import { useProtectedBlobUrls } from '../../../services/imageClient';
-import { usePhotoThumbnails } from '../media';
+import { tileImage, usePhotoThumbnails } from '../media';
 import { TileThumbnail } from '../components/PhotoGrid';
 import { Swatch } from '../components/bits';
 import { plural } from '../../../utils/format';
@@ -170,13 +170,17 @@ const ExplorePage: React.FC = () => {
 
             {recent.length > 0 && (
                 <PlainShelf title="Recently added">
-                    {recent.map((p, i) => (
-                        <button key={p.id} type="button" className={`pt-shelf-card photo mock-swatch ${p.swatch}`} onClick={() => openViewer(recentIds, i)} aria-label={p.filename}>
-                            {recentThumbs[p.filename] && (
-                                <TileThumbnail key={recentThumbs[p.filename]} src={recentThumbs[p.filename]} alt={p.filename} className="pt-explore-cover" />
-                            )}
-                        </button>
-                    ))}
+                    {recent.map((p, i) => {
+                        const image = tileImage(p, recentThumbs[p.filename]);
+                        return (
+                            <button key={p.id} type="button" className={`pt-shelf-card photo mock-swatch ${p.swatch}`} onClick={() => openViewer(recentIds, i)} aria-label={p.filename}>
+                                {image && (
+                                    // Cards are a fixed 112 px square (.pt-shelf-card.photo).
+                                    <TileThumbnail key={image.src} src={image.src} srcSet={image.srcSet} sizes="112px" alt={p.filename} className="pt-explore-cover" style={image.style} />
+                                )}
+                            </button>
+                        );
+                    })}
                 </PlainShelf>
             )}
 

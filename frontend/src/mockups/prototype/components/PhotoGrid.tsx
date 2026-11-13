@@ -1,24 +1,15 @@
 import React from 'react';
 import { CircleCheck as CheckCircleIcon, Heart as HeartIcon, Star as StarIcon } from 'lucide-react';
-import { useStore } from '../store';
-import { usePhotoThumbnails } from '../media';
+import { isVideoFilename, useStore } from '../store';
+import { tileImage, usePhotoThumbnails, useTileSizes } from '../media';
 import { useDragSelect } from '../../../services/useDragSelect';
 import { perf } from '../../../services/perf';
 import type { Photo } from '../types';
 
-// The served thumbnail bakes in only the client's auto-orientation
-// (thumbnailRotation); the user's manual rotate action lives in `rotation` and
-// is applied on top as a CSS transform -- mirrors PhotoTile's remainingRotation
-// so the grid tile matches what the viewer shows. No down-scale is needed: the
-// img is already forced to a square via object-fit: cover (see .pt-tile-img),
-// so a 90/270 rotation keeps the same square footprint and can't overflow —
-// scaling it down just left the tile looking unfilled after a manual rotate.
-const normRot = (value?: number) => { const r = Number(value || 0) % 360; return r < 0 ? r + 360 : r; };
-const tileRotationStyle = (photo: Photo): React.CSSProperties | undefined => {
-    const remaining = normRot(normRot(photo.rotation) - normRot(photo.thumbnailRotation));
-    if (!remaining) return undefined;
-    return { transform: `rotate(${remaining}deg)` };
-};
+// Tile rotation and the thumbnail/grid-image srcset are worked out by
+// tileImage (media.ts). No down-scale is needed for a 90/270 turn: the img is
+// forced to a square via object-fit: cover (see .pt-tile-img), so it keeps the
+// same square footprint.
 
 // Thumbnail URLs are now attempted directly (see usePhotoThumbnails/media.ts)
 // without the backend confirming the blob exists first, so a just-uploaded
@@ -26,13 +17,15 @@ const tileRotationStyle = (photo: Photo): React.CSSProperties | undefined => {
 // load failure so the tile's own swatch background (mock-swatch, see the
 // parent div below) shows through instead of a broken-image icon -- keyed by
 // `src` so a later render with a corrected/ready URL gets a fresh attempt.
-export const TileThumbnail: React.FC<{ src: string; alt: string; style?: React.CSSProperties; className?: string }> = ({ src, alt, style, className }) => {
+export const TileThumbnail: React.FC<{ src: string; srcSet?: string; sizes?: string; alt: string; style?: React.CSSProperties; className?: string }> = ({ src, srcSet, sizes, alt, style, className }) => {
     const [broken, setBroken] = React.useState(false);
     if (broken) return null;
     return (
         <img
             className={className || 'pt-tile-img'}
             src={src}
+            srcSet={srcSet}
+            sizes={srcSet ? sizes : undefined}
             alt={alt}
             loading="lazy"
             draggable={false}
@@ -106,6 +99,8 @@ const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?: React
         },
     });
 
+    const tileSizes = useTileSizes(gridRef, photos[0]?.id);
+
     if (!photos.length) {
         return <p className="pt-grid-empty">{emptyHint ?? 'Nothing here yet.'}</p>;
     }
@@ -161,6 +156,7 @@ const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?: React
         >
             {photos.map((photo, i) => {
                 const selected = selection.includes(photo.id);
+                const image = tileImage(photo, thumbs[photo.filename]);
                 return (
                     <div
                         key={photo.id}
@@ -211,14 +207,17 @@ const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?: React
                         onTouchMove={clearLongPress}
                         onTouchEnd={clearLongPress}
                     >
-                        {thumbs[photo.filename] && (
+                        {image && (
                             <TileThumbnail
-                                key={thumbs[photo.filename]}
-                                src={thumbs[photo.filename]}
+                                key={image.src}
+                                src={image.src}
+                                srcSet={image.srcSet}
+                                sizes={tileSizes}
                                 alt={photo.filename}
-                                style={tileRotationStyle(photo)}
+                                style={image.style}
                             />
                         )}
+                        {image?.style?.transform && isVideoFilename(photo.filename) && <span className="pt-tile-play" aria-hidden="true" />}
                         <button
                             type="button"
                             className={`pt-tile-check${selected ? ' on' : ''}`}

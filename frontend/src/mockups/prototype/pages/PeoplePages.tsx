@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft as ArrowLeftIcon, Check as CheckIcon, Sparkles as SparklesIcon, Trash2 as TrashIcon, Users as UserGroupIcon } from 'lucide-react';
 import { useStore } from '../store';
 import { Swatch, Spinner, SelectionBar } from '../components/bits';
@@ -20,7 +20,7 @@ const MERGE_PICKER_MAX_OPTIONS = 200;
 const pickMergeTarget = (selected: Person[]): Person => selected.find((p) => p.name) ?? selected[0];
 
 /** People — a grid of face clusters; unnamed ones are flagged for naming.
- *  "Select" mode lets several clusters be picked and merged into one in a
+ *  "Select" mode (or a long-press on a card) lets several clusters be picked and merged into one in a
  *  single action, instead of the one-at-a-time merge on the detail page. */
 export const PeoplePage: React.FC = () => {
     const { people, peopleLoading, peopleTotal, peopleUnnamedTotal, peopleHasMore, peopleUnavailable, loadMorePeople, navigate, mergePeopleBatch, deletePeopleBatch, fetchPeople } = useStore();
@@ -52,6 +52,29 @@ export const PeoplePage: React.FC = () => {
 
     const toggleSelect = (id: string) => {
         setSelectedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+    };
+
+    // Long-press a card to start selecting with that person picked, the same gesture as the
+    // photo grid. Scrolling cancels the timer (onTouchMove), and `longPressedRef` swallows the
+    // click that follows the hold so it doesn't open the person or undo the pick.
+    const longPressTimer = useRef<number | null>(null);
+    const longPressedRef = useRef(false);
+    const clearLongPress = () => {
+        if (longPressTimer.current !== null) {
+            window.clearTimeout(longPressTimer.current);
+            longPressTimer.current = null;
+        }
+    };
+    useEffect(() => clearLongPress, []);
+    const startLongPress = (id: string) => {
+        longPressedRef.current = false;
+        clearLongPress();
+        longPressTimer.current = window.setTimeout(() => {
+            longPressTimer.current = null;
+            longPressedRef.current = true;
+            setSelectMode(true);
+            toggleSelect(id);
+        }, 400);
     };
 
     const handleMerge = () => {
@@ -118,7 +141,20 @@ export const PeoplePage: React.FC = () => {
                             key={person.id}
                             type="button"
                             className={`pt-person-card${checked ? ' selected' : ''}`}
-                            onClick={() => (selectMode ? toggleSelect(person.id) : navigate('person', { personId: person.id }))}
+                            onClick={() => {
+                                if (longPressedRef.current) {
+                                    longPressedRef.current = false;
+                                    return;
+                                }
+                                if (selectMode) toggleSelect(person.id);
+                                else navigate('person', { personId: person.id });
+                            }}
+                            onTouchStart={() => startLongPress(person.id)}
+                            onTouchMove={clearLongPress}
+                            onTouchEnd={clearLongPress}
+                            onTouchCancel={clearLongPress}
+                            // Android opens the image context menu on a hold; the hold selects here.
+                            onContextMenu={(e) => e.preventDefault()}
                         >
                             {selectMode && (
                                 <span className={`pt-album-row-check pt-person-check${checked ? ' on' : ''}`} aria-hidden="true">
@@ -126,7 +162,7 @@ export const PeoplePage: React.FC = () => {
                                 </span>
                             )}
                             {coverSrc
-                                ? <img className="pt-person-face" src={coverSrc} alt={person.name ?? 'Unnamed person'} />
+                                ? <img className="pt-person-face" src={coverSrc} alt={person.name ?? 'Unnamed person'} draggable={false} />
                                 : <Swatch swatch={person.swatch} className="pt-person-face" />}
                             <span className={`pt-person-name${person.name ? '' : ' unnamed'}`}>{person.name ?? 'Add name'}</span>
                             <span className="pt-person-count">{plural(person.faceCount ?? 0, 'photo')}</span>
@@ -141,6 +177,8 @@ export const PeoplePage: React.FC = () => {
                     onToggle={() => (selectMode ? exitSelectMode() : setSelectMode(true))}
                     suppressed={selectedIds.length > 0}
                     noun="people"
+                    grid=".pt-people-grid"
+                    hideOnTouch
                 />
             )}
             {selectMode && selectedIds.length > 0 && (

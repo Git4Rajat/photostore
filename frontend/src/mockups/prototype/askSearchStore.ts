@@ -4,6 +4,7 @@ import { getCachedMediaToken, thumbnailUrlForBlob } from '../../services/mediaTo
 import { getActiveLibraryFromToken } from '../../services/passwordAuthClient';
 import { reportIndexBuilding } from '../../services/indexBuilding';
 import type { Photo as BackendPhoto } from '../../types/uiTypes';
+import { captureWallClock } from '../../utils/captureDate';
 import type { Photo } from './types';
 
 /**
@@ -16,8 +17,7 @@ const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', '
 
 const mapSearchResult = (b: BackendPhoto): Photo => {
     const iso = b.captureDate || b.uploadDate || null;
-    const d = iso ? new Date(iso) : null;
-    const valid = d && !Number.isNaN(d.getTime()) ? d : null;
+    const valid = captureWallClock(iso);
     return {
         id: b.filename,
         filename: b.filename,

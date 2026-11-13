@@ -16,12 +16,20 @@ always break ties by filename.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 # Sentinel used as the sort value for photos whose date is unknown. Kept
 # timezone-aware so it never raises when compared against real, aware datetimes.
 DATE_MIN = datetime.min.replace(tzinfo=timezone.utc)
+
+# A capture time read off a clock whose zone was never recorded (EXIF with no
+# OffsetTime*, a date in the filename). It compares and sorts as UTC, but it is
+# the wall-clock time where the photo was taken, so it must be shown as is,
+# never converted into the viewer's zone. ``capture_iso`` emits it without an
+# offset for that reason. Identify it with ``tzinfo is FLOATING``.
+FLOATING = timezone(timedelta(0), 'floating')
 
 
 def parse_iso_date(value: str) -> Optional[datetime]:
@@ -86,9 +94,81 @@ def parse_capture_date(exif_data: Dict[str, str]) -> Optional[datetime]:
         'CreateDate', 'MediaCreateDate', 'TrackCreateDate',
     ):
         parsed = _parse_capture_value(exif_data.get(key))
-        if parsed is not None:
+        if parsed is None:
+            continue
+        if parsed.tzinfo is None:
+            offset = next((o for o in map(_parse_offset, (exif_data.get(k) for k in _EXIF_OFFSET_KEYS.get(key, ())))
+                           if o is not None), None)
+            parsed = parsed.replace(tzinfo=offset or (FLOATING if key in _FLOATING_KEYS else timezone.utc))
+        return parsed
+    return None
+
+
+# EXIF writes DateTimeOriginal/DateTime/CreateDate as the camera's local time
+# with no zone; since EXIF 2.31 the zone sits in a separate OffsetTime* tag
+# (iPhones always write it). Reading the time as UTC without it put every such
+# photo hours away from the videos shot beside it (theirs carry an offset) and
+# pushed late-evening shots onto the next day.
+_EXIF_OFFSET_KEYS = {
+    'DateTimeOriginal': ('OffsetTimeOriginal', 'OffsetTime', 'OffsetTimeDigitized'),
+    'DateTime': ('OffsetTime', 'OffsetTimeOriginal', 'OffsetTimeDigitized'),
+    'CreateDate': ('OffsetTimeDigitized', 'OffsetTimeOriginal', 'OffsetTime'),
+}
+# EXIF local times whose zone is unknown without that tag. Naive container
+# atoms (CreateDate/MediaCreateDate/... from exiftool on a video) are UTC by the
+# QuickTime spec, so they stay UTC.
+_FLOATING_KEYS = ('DateTimeOriginal', 'DateTime')
+_OFFSET = re.compile(r'^([+-])(\d{2}):?(\d{2})$')
+
+
+def _parse_offset(value: object) -> Optional[timezone]:
+    match = _OFFSET.match(str(value or '').strip())
+    if not match:
+        return None
+    hours, minutes = int(match[2]), int(match[3])
+    if hours > 14 or minutes > 59:
+        return None
+    delta = timedelta(hours=hours, minutes=minutes)
+    return timezone(-delta if match[1] == '-' else delta)
+
+
+# Dates that apps and cameras put in the filename when the file itself carries
+# no capture date: Android/Pixel/DJI "IMG_20240105_101112", "PXL_20231231_235959123",
+# "dji_fly_20220910_160714_5_...", macOS "Screenshot 2024-01-05 at 10.11.12",
+# WhatsApp exports "PHOTO-2024-01-05-10-11-12" and "IMG-20231112-WA0001" (date only).
+_FILENAME_DATES = (
+    re.compile(r'(?<![0-9])((?:19|20)[0-9]{2})([0-9]{2})([0-9]{2})[_-]([0-9]{2})([0-9]{2})([0-9]{2})(?:[0-9]{1,3})?(?![0-9])'),
+    re.compile(r'(?<![0-9])((?:19|20)[0-9]{2})-([0-9]{2})-([0-9]{2})(?:[ _T-]|\s+at\s+)([0-9]{2})[.:-]([0-9]{2})[.:-]([0-9]{2})(?![0-9])'),
+    re.compile(r'(?<![0-9])((?:19|20)[0-9]{2})([0-9]{2})([0-9]{2})-WA[0-9]+', re.IGNORECASE),
+)
+_MIN_FILENAME_YEAR = 1990
+
+
+def parse_filename_capture_date(filename: str, *, now: Optional[datetime] = None) -> Optional[datetime]:
+    """The capture time an app or camera wrote into the filename, as wall-clock time (FLOATING), or None."""
+    name = str(filename or '')
+    latest = (now or datetime.now(timezone.utc)).year + 1
+    for pattern in _FILENAME_DATES:
+        match = pattern.search(name)
+        if not match:
+            continue
+        parts = [int(p) for p in match.groups()] + [0, 0, 0]
+        try:
+            parsed = datetime(*parts[:6], tzinfo=FLOATING)
+        except ValueError:
+            continue
+        if _MIN_FILENAME_YEAR <= parsed.year <= latest:
             return parsed
     return None
+
+
+def capture_iso(value: Optional[datetime]) -> Optional[str]:
+    """ISO string for a capture time: with its offset when the zone is known, without one when it is FLOATING."""
+    if value is None:
+        return None
+    if value.tzinfo is FLOATING:
+        return value.replace(tzinfo=None).isoformat()
+    return value.isoformat()
 
 
 # Container atoms with no clock set store seconds since the 1904 QuickTime
@@ -127,8 +207,7 @@ def _parse_capture_value(value: object) -> Optional[datetime]:
             continue
         if parsed.year < _MIN_PLAUSIBLE_CAPTURE_YEAR:
             return None
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
+        # Naive stays naive: parse_capture_date decides its zone from the key and the offset tags.
         return parsed
     return None
 
@@ -175,12 +254,17 @@ def metadata_capture_datetime(metadata: Dict) -> Optional[datetime]:
     """Return the capture time, falling back to the upload time.
 
     Implements the product rule "if a photo has no capture date, use its upload
-    date as the capture date", with the client's own file-modified time as an
-    intermediate fallback (see ``metadata_client_last_modified_datetime``).
-    Returns None only when none of the three is known.
+    date as the capture date", with two intermediate fallbacks: a date the
+    camera or app wrote into the filename (DJI, Android, WhatsApp and screenshot
+    exports carry no EXIF date but name the file after the moment), then the
+    client's own file-modified time (see
+    ``metadata_client_last_modified_datetime``), which for a download or an
+    AirDrop is the transfer time, not the capture. Returns None only when none
+    is known.
     """
     return (
         parse_capture_date(_exif_dict(metadata))
+        or parse_filename_capture_date(str(metadata.get('RowKey') or ''))
         or metadata_client_last_modified_datetime(metadata)
         or metadata_upload_datetime(metadata)
     )

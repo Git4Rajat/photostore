@@ -11,9 +11,9 @@ import {
     Sparkles as SparklesIcon,
     User as UserIcon,
 } from 'lucide-react';
-import { usePhotoThumbnails, fetchPhotoMetadata } from '../media';
+import { tileImage, usePhotoThumbnails, useTileSizes, fetchPhotoMetadata } from '../media';
 import { ThumbSizeControl, useTileSize } from './controls';
-import type { PhotoMetadata } from '../media';
+import type { PhotoMetadata, TileImage } from '../media';
 import type { Photo } from '../types';
 import { get, post } from '../../../services/apiClient';
 import { mapPhoto } from '../store';
@@ -77,19 +77,20 @@ type SortMode = 'uploaded' | 'name';
 
 const WorkbenchTile: React.FC<{
     photo: Photo;
-    thumb?: string;
+    image: TileImage | null;
+    sizes?: string;
     selected: boolean;
     onToggleSelect: () => void;
     infoOpen: boolean;
     onToggleInfo: () => void;
-}> = ({ photo, thumb, selected, onToggleSelect, infoOpen, onToggleInfo }) => {
+}> = ({ photo, image, sizes, selected, onToggleSelect, infoOpen, onToggleInfo }) => {
     const [meta, setMeta] = useState<PhotoMetadata | null | 'loading'>(null);
     // Thumbnail URLs are attempted directly without the backend confirming the
     // blob exists first (see usePhotoThumbnails/media.ts), so a just-uploaded
     // photo's thumbnail can 404 while still generating. Hide on load failure
     // so the tile's swatch background shows through instead of a broken icon.
     const [thumbBroken, setThumbBroken] = useState(false);
-    useEffect(() => setThumbBroken(false), [thumb]);
+    useEffect(() => setThumbBroken(false), [image?.src]);
 
     const openInfo = () => {
         onToggleInfo();
@@ -107,10 +108,13 @@ const WorkbenchTile: React.FC<{
             <button type="button" className="wb-tile-info" aria-label="Photo details" onClick={(e) => { e.stopPropagation(); openInfo(); }}>
                 <InformationCircleIcon />
             </button>
-            {thumb && !thumbBroken && (
+            {image && !thumbBroken && (
                 <img
                     className="wb-tile-img"
-                    src={thumb}
+                    src={image.src}
+                    srcSet={image.srcSet}
+                    sizes={image.srcSet ? sizes : undefined}
+                    style={image.style}
                     alt={photo.filename}
                     loading="lazy"
                     draggable={false}
@@ -258,6 +262,8 @@ const WorkbenchGrid: React.FC<{
     }, [items, pinnedPhotos, debounced]);
 
     const thumbs = usePhotoThumbnails(shown);
+    const gridRef = useRef<HTMLDivElement>(null);
+    const tileSizes = useTileSizes(gridRef, shown[0]?.id);
     const selectedSet = new Set(selection);
     const allSelected = total !== null && total > 0 && selection.length >= Math.min(total, SELECT_ALL_CAP) && shown.every((p) => selectedSet.has(p.id));
 
@@ -309,12 +315,13 @@ const WorkbenchGrid: React.FC<{
             {shown.length === 0 && !loading ? (
                 <p className="pt-grid-empty">{debounced ? `No photos match “${debounced}”.` : 'No photos yet.'}</p>
             ) : (
-                <div className="wb-grid" style={{ ['--wb-tile-min' as string]: `${tile}px` } as React.CSSProperties}>
+                <div className="wb-grid" ref={gridRef} style={{ ['--wb-tile-min' as string]: `${tile}px` } as React.CSSProperties}>
                     {shown.map((photo) => (
                         <WorkbenchTile
                             key={photo.id}
                             photo={photo}
-                            thumb={thumbs[photo.filename]}
+                            image={tileImage(photo, thumbs[photo.filename])}
+                            sizes={tileSizes}
                             selected={selectedSet.has(photo.id)}
                             onToggleSelect={() => onToggleSelect(photo.id)}
                             infoOpen={infoOpenId === photo.id}

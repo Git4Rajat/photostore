@@ -817,3 +817,70 @@ def test_reaped_markers_are_collected_after_grace(runtime):
     runtime.store.reap_stale_reservations('A', 'vector', now=reaped_at + 2 * 86400 + 10)
     with pytest.raises(Exception):
         runtime.store.table.get_entity(pk, f'res-{dead}')
+
+
+def _lose_every_control_race(runtime, monkeypatch):
+    real = runtime.store._change
+
+    def contended(user, kind, change, *args, **kwargs):
+        if getattr(change, '__name__', '') == 'complete':
+            raise ResourceModifiedError('control row changed')
+        return real(user, kind, change, *args, **kwargs)
+    monkeypatch.setattr(runtime.store, '_change', contended)
+    return real
+
+
+def test_a_finish_that_loses_every_control_race_is_deferred_not_raised(runtime, monkeypatch):
+    res = runtime.store.begin('A', 'lexical_artifact', ['photo1'], owner='upload-pod')
+    real = _lose_every_control_race(runtime, monkeypatch)
+    runtime.store.finish('A', 'lexical_artifact', reservation_id=res)          # the write committed: no raise
+    pending = runtime.store.reservations('A', 'lexical_artifact')
+    assert [r['reservationId'] for r in pending] == [res] and pending[0]['finishPendingAt']
+    assert runtime.store.control('A', 'lexical_artifact')['active'] == 1
+
+    monkeypatch.setattr(runtime.store, '_change', real)
+    full_before = runtime.store.control('A', 'lexical_artifact')['fullRequired']
+    captured = runtime.store.capture('A', 'lexical_artifact')               # the next build releases it
+    assert captured.ids == ['photo1']
+    control = runtime.store.control('A', 'lexical_artifact')
+    assert control['active'] == 0 and control['fullRequired'] == full_before
+    assert runtime.store.reservations('A', 'lexical_artifact') == []
+
+
+def test_a_deferred_release_does_not_unblock_a_writer_that_is_still_open(runtime, monkeypatch):
+    done = runtime.store.begin('A', 'lexical_artifact', ['photo1'], owner='upload-pod')
+    open_writer = runtime.store.begin('A', 'lexical_artifact', ['photo2'], owner='crashed-pod')
+    real = _lose_every_control_race(runtime, monkeypatch)
+    runtime.store.finish('A', 'lexical_artifact', reservation_id=done)
+    monkeypatch.setattr(runtime.store, '_change', real)
+    with pytest.raises(automatic.SourceBusy):
+        runtime.store.capture('A', 'lexical_artifact')
+    assert [r['reservationId'] for r in runtime.store.reservations('A', 'lexical_artifact')] == [open_writer]
+    assert runtime.store.control('A', 'lexical_artifact')['active'] == 1
+
+
+def test_other_finish_errors_still_raise(runtime, monkeypatch):
+    res = runtime.store.begin('A', 'lexical_artifact', ['photo1'])
+    monkeypatch.setattr(runtime.store, '_change', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('Unbalanced source reservation')))
+    with pytest.raises(RuntimeError):
+        runtime.store.finish('A', 'lexical_artifact', reservation_id=res)
+    assert not runtime.store.reservations('A', 'lexical_artifact')[0].get('finishPendingAt')
+
+
+def test_an_upload_request_shares_one_reservation_per_kind(runtime, monkeypatch):
+    from routes import upload
+    begun, finished = [], []
+    monkeypatch.setattr(automatic, 'configured_store', lambda: runtime.store)
+    real_begin, real_finish = runtime.store.begin, runtime.store.finish
+    monkeypatch.setattr(runtime.store, 'begin', lambda *a, **k: begun.append(a[:2]) or real_begin(*a, **k))
+    monkeypatch.setattr(runtime.store, 'finish', lambda *a, **k: finished.append(a[:2]) or real_finish(*a, **k))
+    with app.app.test_request_context('/upload/finalize-batch', method='POST'):
+        upload.share_source_reservations()
+        scope = automatic._COALESCED.get()
+        for _ in range(5):                                  # five wave-owned writes in one request
+            scope.reserve('A', 'lexical_artifact', deleted=False, operation='metadata.update_entity')
+        assert runtime.store.control('A', 'lexical_artifact')['active'] == 1
+        upload.close_source_reservations(None)
+        assert automatic._COALESCED.get() is None
+    assert begun == [('A', 'lexical_artifact')] and finished == [('A', 'lexical_artifact')]
+    assert runtime.store.control('A', 'lexical_artifact')['active'] == 0

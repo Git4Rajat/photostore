@@ -56,7 +56,7 @@ from summary_incremental import DatabaseSummaryAdapter, SummarySchemaMissing, sm
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 'sqlite-v6'  # v6: indexed representative covers for timeline periods
+SCHEMA_VERSION = 'sqlite-v7'  # v7: capture days on the capture's own clock; EXIF offsets and filename dates
 SEARCH_DB_DIR = os.getenv('SEARCH_DB_DIR', '').strip() or os.path.join(tempfile.gettempdir(), 'photostore-search')
 # Cap on candidates pulled per query (bm25-ranked); the scorer then ranks them.
 CANDIDATE_LIMIT = int(os.getenv('SEARCH_DB_CANDIDATE_LIMIT', '4000'))
@@ -182,7 +182,9 @@ def row_record(row: Dict) -> Optional[Dict]:
     return {
         'filename': filename,
         'row_json': json.dumps(slim, ensure_ascii=False, separators=(',', ':')),
-        'capture_day': captured.astimezone(timezone.utc).date().toordinal() if captured else None,
+        # The day on the clock where it was taken, like capture_year/capture_md and the timeline; the
+        # UTC day put a 00:30 video (+01:00) on the day before its own label.
+        'capture_day': captured.date().toordinal() if captured else None,
         'capture_ts': captured.timestamp() if captured else None,
         'upload_ts': uploaded.timestamp() if uploaded else None,
         'capture_year': captured.year if captured else None,
