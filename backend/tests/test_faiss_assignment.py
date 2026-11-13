@@ -855,6 +855,32 @@ def test_close_distinct_people_fail_margin_even_above_threshold():
     assert mapping['new'] not in ('alice', 'bob') and created == {mapping['new']}
 
 
+def test_certain_match_joins_best_person_despite_close_runner_up():
+    # One person already split in two: a new photo of them scores high against both copies.
+    h = Harness(config=AssignmentConfig(threshold=.78, margin=.1, certain=.95))
+    for pid, vector in [('alice', [1, 0]), ('alice-again', [.99, .1])]:
+        h.person(pid, [pid])
+        h.face(pid, vector, person=pid)
+    h.face('new')
+    assert h.assign('new') == ({'new': 'alice'}, set())
+
+
+def test_close_runner_up_below_certain_still_needs_the_margin():
+    h = Harness(config=AssignmentConfig(threshold=.78, margin=.1, certain=.95))
+    for pid, vector in [('alice', [.9, .43589]), ('bob', [.89, -.45596])]:
+        h.person(pid, [pid])
+        h.face(pid, vector, person=pid)
+    h.face('new')
+    mapping, created = h.assign('new')
+    assert mapping['new'] not in ('alice', 'bob') and created == {mapping['new']}
+
+
+@pytest.mark.parametrize('certain', [float('nan'), 1.5, -2])
+def test_invalid_certain_rejected(certain):
+    with pytest.raises(ValueError):
+        AssignmentConfig(certain=certain)
+
+
 @pytest.mark.parametrize('change', [dict(rejected=True), dict(rejected='true'),
                                     dict(reviewStatus='rejected'), dict(clusterable=False),
                                     dict(eligible=False)])

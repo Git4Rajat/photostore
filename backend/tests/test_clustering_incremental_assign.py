@@ -156,6 +156,26 @@ def test_confident_match_assigns_to_existing_person_without_creating_new_one(clu
     assert created == set()
 
 
+@pytest.mark.parametrize('certain, joins', [(0.95, True), (1.01, False)])
+def test_person_split_in_two_takes_a_certain_match_despite_the_margin(clustering_tables, monkeypatch, certain, joins):
+    # One person already exists twice: a new photo scores ~1.0 against both, inside the margin.
+    face_table, person_table = clustering_tables
+    user_id = 'lib-A'
+    monkeypatch.setattr(app, 'PEOPLE_CLUSTER_ASSIGN_CERTAIN', certain)
+    _seed_person(person_table, user_id, 'person-1', ['old-face'], PERSON_A_EMBEDDING)
+    _seed_face(face_table, user_id, 'old-face', 'earlier.jpg', PERSON_A_EMBEDDING, personId='person-1')
+    _seed_person(person_table, user_id, 'person-2', ['other-face'], PERSON_A_EMBEDDING_CLOSE)
+    _seed_face(face_table, user_id, 'other-face', 'later.jpg', PERSON_A_EMBEDDING_CLOSE, personId='person-2')
+    _seed_face(face_table, user_id, 'new-face', 'photo.jpg', PERSON_A_EMBEDDING)
+
+    assignments, created = app._assign_faces_to_people_incrementally(user_id, 'photo.jpg', ['new-face'])
+
+    if joins:
+        assert assignments == {'new-face': 'person-1'} and created == set()
+    else:
+        assert assignments['new-face'] not in ('person-1', 'person-2') and created == {assignments['new-face']}
+
+
 def test_matches_using_embedding_from_dedicated_table_when_row_has_no_inline_embedding(
     clustering_tables, monkeypatch,
 ):

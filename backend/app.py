@@ -900,6 +900,19 @@ PEOPLE_MATCH_THRESHOLD = max(float(_PEOPLE_CLUSTER_CONFIG['match_threshold']), M
 PEOPLE_MATCH_MARGIN = float(_PEOPLE_CLUSTER_CONFIG['match_margin'])
 PEOPLE_CLUSTER_ASSIGN_THRESHOLD = max(float(_PEOPLE_CLUSTER_CONFIG['assign_threshold']), MIN_AUTO_FACE_MERGE_SIMILARITY)
 PEOPLE_CLUSTER_ASSIGN_MARGIN = float(_PEOPLE_CLUSTER_CONFIG['assign_margin'])
+# A best match at or above this joins that person even when a runner-up person
+# is within PEOPLE_CLUSTER_ASSIGN_MARGIN. Measured 2026-11-13 on a 15,435-face
+# AdaFace library (both -mp tiers): 3,318 of 3,981 faces whose nearest
+# other-photo face (>=0.62) sat in a different person were refused by the
+# margin alone, and in a sampled contact sheet the best and runner-up people
+# were the same individual every time (0.99/0.99 down to 0.64/0.63). Once a
+# person is split, each new photo ties between the copies and starts another
+# one. Different-person pairs (two faces in one photo, double detections
+# excluded) sit at p99 ~0.44, so two people both scoring >=0.75 against one face
+# is near-impossible. Replayed over that library, waiving the margin here halved
+# people (5,454-5,957 -> ~2,950) and singletons, while distinct faces of one
+# photo put in one person went 13-14 -> 18 of 12,539 pairs.
+PEOPLE_CLUSTER_ASSIGN_CERTAIN = float(os.getenv('PEOPLE_CLUSTER_ASSIGN_CERTAIN', '0.75'))
 PEOPLE_ASSIGNMENT_ENGINE = os.getenv('PEOPLE_ASSIGNMENT_ENGINE', 'faiss').strip().lower()
 if PEOPLE_ASSIGNMENT_ENGINE not in ('faiss', 'legacy'):
     raise ValueError('PEOPLE_ASSIGNMENT_ENGINE must be faiss or legacy')
@@ -6601,6 +6614,7 @@ def _get_live_faiss_assigner():
             lease=BlobLibraryLeaseFactory(blob_service_client, BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER),
             config=AssignmentConfig(
                 threshold=PEOPLE_CLUSTER_ASSIGN_THRESHOLD, margin=PEOPLE_CLUSTER_ASSIGN_MARGIN,
+                certain=PEOPLE_CLUSTER_ASSIGN_CERTAIN,
                 candidates=int(os.getenv('PEOPLE_FAISS_CANDIDATES', '64')),
                 nprobe=int(os.getenv('PEOPLE_FAISS_NPROBE', '64')),
                 delta_limit=int(os.getenv('PEOPLE_FAISS_DELTA_LIMIT', '10000')),
@@ -6761,7 +6775,10 @@ def _assign_faces_to_people_incrementally_legacy(user_id: str, filename: str, fa
             if (
                 best_person
                 and best_score >= PEOPLE_CLUSTER_ASSIGN_THRESHOLD
-                and (best_score - second_best_score) >= PEOPLE_CLUSTER_ASSIGN_MARGIN
+                and (
+                    (best_score - second_best_score) >= PEOPLE_CLUSTER_ASSIGN_MARGIN
+                    or best_score >= PEOPLE_CLUSTER_ASSIGN_CERTAIN
+                )
             ):
                 person_id = str(best_person.get('personId') or '')
                 rep_already_refreshed = _add_face_to_person(

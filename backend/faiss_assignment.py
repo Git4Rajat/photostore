@@ -46,6 +46,8 @@ from clustering_runtime import LiveFaceIndex, RebuildNeeded
 class AssignmentConfig:
     threshold: float = 0.78
     margin: float = 0.05
+    # A best match at or above this needs no margin over the runner-up (None: always required).
+    certain: float | None = None
     person_cache_size: int = 128
     index_config: IndexConfig = field(default_factory=IndexConfig)
     candidates: int = 64
@@ -61,7 +63,8 @@ class AssignmentConfig:
 
     def __post_init__(self):
         if (not math.isfinite(self.threshold) or not -1 <= self.threshold <= 1
-                or not math.isfinite(self.margin) or not 0 <= self.margin <= 2):
+                or not math.isfinite(self.margin) or not 0 <= self.margin <= 2
+                or (self.certain is not None and (not math.isfinite(self.certain) or not -1 <= self.certain <= 1))):
             raise ValueError('Invalid assignment threshold/margin')
         if type(self.person_cache_size) is not int or self.person_cache_size <= 0:
             raise ValueError('person_cache_size must be a positive integer')
@@ -78,6 +81,12 @@ class AssignmentConfig:
             work, share = Path(self.work_dir).resolve(), Path(self.checkpoint_dir).resolve()
             if work == share or work in share.parents or share in work.parents:
                 raise ValueError('Work and checkpoint directories must not overlap')
+
+    def accepts(self, best, second):
+        """Whether the best person's score is a match, given the runner-up person's score."""
+        if best < self.threshold:
+            return False
+        return best - second >= self.margin or (self.certain is not None and best >= self.certain)
 
 
 @dataclass
@@ -667,8 +676,7 @@ class FaissAssigner:
         is_new = False
         if person is None:
             best, second, matched_id = runtime.best_two(vector, tier, version, validator)
-            if (matched_id is not None and best >= self.config.threshold
-                    and best - second >= self.config.margin):
+            if matched_id is not None and self.config.accepts(best, second):
                 person = person_lookup(matched_id)
                 if person is None:
                     raise RuntimeError('Matched person disappeared before persistence')
