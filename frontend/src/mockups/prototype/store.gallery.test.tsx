@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
     get: vi.fn(), post: vi.fn(), index: vi.fn(), token: vi.fn(),
     albumsIndex: vi.fn(),
-    labelPerson: vi.fn(), poll: vi.fn(), postTools: vi.fn(),
+    labelPerson: vi.fn(), poll: vi.fn(), postTools: vi.fn(), findFaces: vi.fn(),
 }));
 vi.mock('../../services/apiClient', () => ({ get: mocks.get, post: mocks.post, postTools: mocks.postTools }));
 vi.mock('../../services/localSortIndex', () => ({
@@ -18,7 +18,7 @@ vi.mock('../../services/mediaToken', () => ({
 }));
 vi.mock('../../services/backgroundRequestQueue', () => ({ enqueueBackgroundRequest: (task: () => Promise<unknown>) => task() }));
 vi.mock('../../services/indexBuilding', () => ({ reportIndexBuilding: vi.fn(), onIndexReady: () => () => {} }));
-vi.mock('../../services/faceService', () => ({ default: { labelPerson: mocks.labelPerson } }));
+vi.mock('../../services/faceService', () => ({ default: { labelPerson: mocks.labelPerson, findPersonFaces: mocks.findFaces } }));
 vi.mock('../../services/libraryClient', () => ({}));
 vi.mock('../../services/thumbnailAccessCache', () => ({ resolveThumbnailAccessUrls: vi.fn() }));
 vi.mock('../../services/localAlbumsIndex', () => ({ getLocalAlbumsIndex: mocks.albumsIndex, invalidateLocalAlbumsIndex: vi.fn() }));
@@ -86,6 +86,20 @@ describe('index-backed gallery', () => {
         expect(store.selection).toEqual([]);
         await waitFor(() => expect(store.toasts.map((t) => t.message)).toContain('Deleted 2 items'));
         expect(store.toasts.find((t) => t.message === 'Deleted 2 items')?.actionLabel).toBeUndefined();
+    });
+
+    it.each([
+        ['queued on the worker', () => Promise.resolve({ success: true, queued: true }), 'Looking for more faces. You’ll get a notification when it’s done.', true],
+        ['run inline', () => Promise.resolve({ success: true, queued: false, autoAssignedFaces: 3 }), 'Added 3 matching faces', false],
+        ['too few faces', () => Promise.resolve({ success: true, queued: false, skipped: 'not enough anchor faces' }), 'This person needs at least 2 faces before more can be found', false],
+        ['failed', () => Promise.reject(new Error('offline')), 'Couldn’t look for more faces', false],
+    ])('find more faces asks the server to search (%s)', async (_case, reply, message, polls) => {
+        mocks.findFaces.mockReset().mockImplementation(reply);
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async () => { await store.findMoreFaces('p1'); });
+        expect(mocks.findFaces).toHaveBeenCalledWith('p1');
+        expect(store.toasts.map((t) => t.message)).toContain(message);
+        expect(mocks.poll).toHaveBeenCalledTimes(polls ? 1 : 0);
     });
 
     it('rating a selection from the selection bar ends select mode', async () => {
