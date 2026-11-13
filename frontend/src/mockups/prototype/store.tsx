@@ -484,6 +484,7 @@ interface Store {
     loadMorePersonPhotos: (id: string) => void;
     personPhotosLoading: boolean;
     renamePerson: (id: string, name: string) => void;
+    findMoreFaces: (id: string) => Promise<void>;
     mergePeople: (sourceId: string, targetId: string) => void;
     mergePeopleBatch: (targetId: string, sourceIds: string[]) => void;
     deletePerson: (id: string) => void;
@@ -2485,6 +2486,34 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     const personPhotosById = useCallback((id: string) => applyPendingPhotoCollection(personPhotos[id]), [personPhotos]);
 
+    // Pulls this person's faces out of unnamed clusters (the server's identity
+    // propagation). Usually queued on the worker, whose completion notification
+    // reports what it added; without a worker it runs inline and answers here.
+    const findMoreFaces = useCallback(async (id: string) => {
+        try {
+            const result = await faceService.findPersonFaces(id);
+            if (result?.queued) {
+                toast('Looking for more faces. You’ll get a notification when it’s done.');
+                requestJobPoll();
+                return;
+            }
+            if (result?.skipped === 'not enough anchor faces') {
+                toast('This person needs at least 2 faces before more can be found');
+                return;
+            }
+            const found = result?.autoAssignedFaces ?? 0;
+            toast(found ? `Added ${found} matching face${found === 1 ? '' : 's'}` : 'No new matching faces found');
+            if (found) {
+                invalidateLocalPeopleIndex();
+                publishLibraryChange('person-faces-found', ['people'], { itemCount: found });
+                void openPerson(id);
+                void fetchPeople();
+            }
+        } catch {
+            toast('Couldn’t look for more faces', undefined, undefined, 'error');
+        }
+    }, [toast, openPerson, fetchPeople]);
+
     const renamePerson = useCallback((id: string, name: string) => {
         const trimmed = name.trim();
         const previousEdit = personNameEditsRef.current.get(id);
@@ -2946,6 +2975,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             loadMorePersonPhotos,
             personPhotosLoading,
             renamePerson,
+            findMoreFaces,
             mergePeople,
             mergePeopleBatch,
             deletePerson,
@@ -2973,7 +3003,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             albumsLoading, reloadAlbums, fetchAlbums, openAlbum, isAlbumMissing, isAlbumOpenFailed, isAlbumOpenTerminal, albumPhotosById, isAlbumPhotosLoading, loadMoreAlbumPhotos, albumPhotosTotal, albumPhotosHasMore,
             createAlbum, autoCreateAlbum, renameAlbum, addPhotosToAlbum, removePhotosFromAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum,
             peopleLoading, peopleTotal, peopleUnnamedTotal, peopleHasMore, peopleUnavailable, loadMorePeople, searchPeople, reloadPeople, fetchPeople, openPerson, personPhotosById, personPhotosTotal, personPhotosHasMore, loadMorePersonPhotos, personPhotosLoading,
-            renamePerson, mergePeople, mergePeopleBatch, deletePerson, deletePeopleBatch, applyExternalPeopleRemoval, reloadMembers, fetchMembers, invite, revokeInvite,
+            renamePerson, findMoreFaces, mergePeople, mergePeopleBatch, deletePerson, deletePeopleBatch, applyExternalPeopleRemoval, reloadMembers, fetchMembers, invite, revokeInvite,
             removeMember, renameLibrary, toast, dismissToast,
         ],
     );

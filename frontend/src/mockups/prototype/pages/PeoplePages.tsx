@@ -204,7 +204,7 @@ export const PeoplePage: React.FC = () => {
 
 /** Person detail — rename / name, browse their photos, and merge in another cluster. */
 export const PersonDetailPage: React.FC = () => {
-    const { route, personById, searchPeople, openPerson, personPhotosById, personPhotosTotal, personPhotosHasMore, loadMorePersonPhotos, personPhotosLoading, navigate, renamePerson, mergePeople, deletePerson, reloadPeople, toast, selectMode: photoSelectMode, setSelectMode: setPhotoSelectMode } = useStore();
+    const { route, personById, searchPeople, openPerson, personPhotosById, personPhotosTotal, personPhotosHasMore, loadMorePersonPhotos, personPhotosLoading, navigate, renamePerson, findMoreFaces, mergePeople, deletePerson, toast, selectMode: photoSelectMode, setSelectMode: setPhotoSelectMode } = useStore();
     const personId = route.params.personId;
     const person = personId ? personById(personId) : undefined;
     const [draft, setDraft] = useState(person?.name ?? '');
@@ -214,6 +214,7 @@ export const PersonDetailPage: React.FC = () => {
     const [chosenMerge, setChosenMerge] = useState<Person | null>(null);
     // The merge picker only searches once it is used (typing or focus), not on every person that is opened.
     const [mergeActive, setMergeActive] = useState(false);
+    const [findingFaces, setFindingFaces] = useState(false);
     const [personTile, setPersonTile] = useTileSize('photostore.personTileSize');
     const headCover = useProtectedBlobUrls(person?.coverThumbnailUrl ? [person.coverThumbnailUrl] : []);
 
@@ -291,7 +292,17 @@ export const PersonDetailPage: React.FC = () => {
                     </div>
                 </div>
                 <div className="pt-toolbar-actions">
-                    <button type="button" className="btn" onClick={() => { toast('Scanning for more faces…'); reloadPeople(); }}><SparklesIcon className="toolbar-icon" /> Find more faces</button>
+                    <button
+                        type="button"
+                        className="btn"
+                        disabled={findingFaces}
+                        onClick={() => {
+                            setFindingFaces(true);
+                            void findMoreFaces(person.id).finally(() => setFindingFaces(false));
+                        }}
+                    >
+                        <SparklesIcon className="toolbar-icon" /> {findingFaces ? 'Looking…' : 'Find more faces'}
+                    </button>
                     <button type="button" className="btn btn-danger" onClick={() => void handleDeletePerson()}><TrashIcon className="toolbar-icon" /> Delete</button>
                 </div>
             </div>
