@@ -1415,25 +1415,67 @@ def _wave_table_service():
 
 
 _owner_retry_at = 0.0
+_owner_retry_lock = threading.Lock()
+OWNER_BOOTSTRAP_RETRY_SECONDS = 900
 
 
-def retry_owner_bootstrap() -> None:
+def _owner_bootstrap_tables() -> list:
+    """Tables that seeding the owner reads or writes (creating the personal library writes invites too). The
+    module-level create_*_table helpers only run after the boot code, so on a brand-new storage account the jobs
+    and metadata tables didn't exist yet when it seeded, and no owner account was ever created (2026-11-14)."""
+    return [t for t in (config_table_client, users_table_client, libraries_table_client, memberships_table_client,
+                        invites_table_client, audit_table_client, jobs_table_client, metadata_table_client)
+            if t is not None]
+
+
+def _ensure_owner_bootstrap_tables() -> None:
+    for table in _owner_bootstrap_tables():
+        try:
+            table.create_table()
+        except ResourceExistsError:
+            pass
+        except Exception as exc:
+            app.logger.debug('Owner bootstrap table ensure skipped: %s', exc)
+
+
+def retry_owner_bootstrap() -> bool:
     """Seed the owner credential and account again, at most every 30 s. A fresh deployment's first boot can run
-    before its storage role assignments take effect, which leaves no owner credential; without this every
-    login would be refused until the app next restarts."""
+    before its storage role assignments take effect, which leaves no owner credential (and no tables, since
+    their creation failed too); without this every login would be refused until the app next restarts.
+    Returns True once the owner account exists with a password."""
     global _owner_retry_at
-    if AUTH_MODE != 'password' or time.monotonic() - _owner_retry_at < 30:
-        return
-    _owner_retry_at = time.monotonic()
-    try:
-        if password_auth.seed_owner_if_missing(config_table_client, OWNER_EMAIL, OWNER_PASSWORD):
-            app.logger.info('Seeded initial owner credential for %s on retry', OWNER_EMAIL or '(no email)')
-    except Exception as exc:
-        app.logger.warning('Owner credential seeding retry failed: %s', exc)
-    _bootstrap_owner_account()
+    if AUTH_MODE != 'password':
+        return False
+    # A sign-in arriving while the background retry runs waits for it, instead of being throttled and refused
+    # moments before the account appears.
+    with _owner_retry_lock:
+        if time.monotonic() - _owner_retry_at < 30:
+            return False
+        _owner_retry_at = time.monotonic()
+        _ensure_owner_bootstrap_tables()
+        try:
+            if password_auth.seed_owner_if_missing(config_table_client, OWNER_EMAIL, OWNER_PASSWORD):
+                app.logger.info('Seeded initial owner credential for %s on retry', OWNER_EMAIL or '(no email)')
+        except Exception as exc:
+            app.logger.warning('Owner credential seeding retry failed: %s', exc)
+        return _bootstrap_owner_account()
 
 
-def _bootstrap_owner_account() -> None:
+def _retry_owner_bootstrap_in_background() -> None:
+    """Keep retrying a failed first-boot owner bootstrap for a while instead of waiting for a sign-in attempt:
+    Forgot password never retried, so an owner without an account got no reset email either."""
+    def _loop():
+        deadline = time.monotonic() + OWNER_BOOTSTRAP_RETRY_SECONDS
+        while time.monotonic() < deadline:
+            time.sleep(31)
+            if retry_owner_bootstrap():
+                app.logger.info('Owner account created on background retry')
+                return
+        app.logger.warning('Owner account still missing after %ss of retries', OWNER_BOOTSTRAP_RETRY_SECONDS)
+    threading.Thread(target=_loop, name='owner-bootstrap-retry', daemon=True).start()
+
+
+def _bootstrap_owner_account() -> bool:
     """Idempotently mirror the seeded password-mode owner into the account and
     library tables, giving them ``user_id == library_id == OWNER_USER_ID``.
 
@@ -1441,27 +1483,39 @@ def _bootstrap_owner_account() -> None:
     ``photousers`` row and an email->id lookup created so login-by-email works,
     while the legacy config-table credential remains the source of truth until
     the multi-account cutover. No-op after the first run.
+
+    Returns False while the owner account is missing or has no password (the caller retries), True otherwise.
     """
     if library_store is None or AUTH_MODE != 'password' or os.getenv('UPLOAD_WAVE_BOOTSTRAP_PENDING','').lower()=='true':
-        return
+        return True
     try:
         if os.getenv('UPLOAD_WAVE_AUTO_BOOTSTRAP') == 'true':
             import wave_bootstrap
             wave_bootstrap.auto_seed(_wave_table_service())
         cred = password_auth.get_owner_credential(config_table_client) or {}
+        seeded_hash = str(cred.get('passwordHash') or '')
         # Prefer an explicitly-configured OWNER_EMAIL so an operator can set it
         # after the fact to recover login-by-email; fall back to the seeded value.
         email = OWNER_EMAIL or str(cred.get('email') or '')
         owner = library_store.get_user(password_auth.OWNER_USER_ID)
         if owner is None:
+            if not seeded_hash:
+                # Roles without OWNER_PASSWORD (cluster, vision) boot alongside core. An account they created
+                # before core seeded the credential had no password, and nothing ever added one.
+                return False
             library_store.create_user(
                 email=email,
-                password_hash=str(cred.get('passwordHash') or '') or None,
+                password_hash=seeded_hash,
                 user_id=password_auth.OWNER_USER_ID,
             )
-        elif email and library_utils.normalize_email(owner.get('emailNorm')) != library_utils.normalize_email(email):
-            # Reconcile a changed/newly-set OWNER_EMAIL onto the existing account.
-            library_store.set_user_email(password_auth.OWNER_USER_ID, email)
+        else:
+            if email and library_utils.normalize_email(owner.get('emailNorm')) != library_utils.normalize_email(email):
+                # Reconcile a changed/newly-set OWNER_EMAIL onto the existing account.
+                library_store.set_user_email(password_auth.OWNER_USER_ID, email)
+            if seeded_hash and not owner.get('passwordHash'):
+                # Created without one by such a role on an older image: give it the deploy-time password.
+                library_store.set_user_password(password_auth.OWNER_USER_ID, seeded_hash)
+                app.logger.warning('Owner account had no password; set it from the deploy-time credential')
         library_store.ensure_personal_library(
             password_auth.OWNER_USER_ID,
             name=email or 'My Library',
@@ -1471,8 +1525,10 @@ def _bootstrap_owner_account() -> None:
                 'Owner account has no email; login-by-email will fail until '
                 'OWNER_EMAIL is set. Set OWNER_EMAIL and restart to enable sign-in.'
             )
+        return bool(seeded_hash or owner.get('passwordHash'))
     except Exception as exc:
         app.logger.warning('Owner account bootstrap failed: %s', exc)
+        return False
 
 
 def _init_storage_clients():
@@ -1695,7 +1751,9 @@ def _init_storage_clients():
         _ensure_fns.append(index_maintenance_queue_client.create_queue)
     _ensure_blocking_fns = []
     if AUTH_MODE == 'password':
-        _ensure_blocking_fns.append(lambda: config_table_client.create_table())
+        # Seeding the owner below reads the jobs and metadata tables too (see _owner_bootstrap_tables).
+        _ensure_blocking_fns.extend([config_table_client.create_table, jobs_table_client.create_table,
+                                     metadata_table_client_local.create_table])
 
     def _run_ensure(fns):
         with ThreadPoolExecutor(max_workers=len(fns)) as _ensure_pool:
@@ -1740,7 +1798,8 @@ def _init_storage_clients():
     # Backfill the account + library tables so existing single-owner data maps to
     # a library whose id equals the legacy user id (no photo/face/album data moves).
     # Entra users are bootstrapped lazily on first authenticated request instead.
-    _bootstrap_owner_account()
+    if not _bootstrap_owner_account() and OWNER_PASSWORD:
+        _retry_owner_bootstrap_in_background()
 
     # Configure storage_utils (do not pass account keys or SAS keys)
     configure_storage(

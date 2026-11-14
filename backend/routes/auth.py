@@ -196,6 +196,10 @@ def _send_reset_link(email_in):
     if not app.email_utils.is_configured() or app.library_store is None:
         return
     account = app.library_store.get_user_by_email(email_in)
+    if not account and email_in == app.library_utils.normalize_email(app.OWNER_EMAIL):
+        # Same first-boot retry as login: the owner may have no account yet.
+        app.retry_owner_bootstrap()
+        account = app.library_store.get_user_by_email(email_in)
     if not account:
         return
     account_id = str(account.get('RowKey'))
