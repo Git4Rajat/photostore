@@ -65,6 +65,36 @@ def test_missing_certificate_seeds_on_fresh_storage(monkeypatch):
     assert wave_bootstrap.auto_seed(Service(), e) == EXPECTED == seen['exp']
 
 
+@pytest.mark.parametrize('other_role_certified, refused', [(True, False), (False, True)])
+def test_a_role_that_lost_the_seeding_race_accepts_the_winners_certificate(monkeypatch, other_role_certified, refused):
+    # Every role boots at once on a fresh deployment: another one certified the same images and enrolled the
+    # library between this role's certificate check and its seed, so seed sees "existing library data".
+    proof = {'protocol': PROTOCOL, 'deployments': __import__('json').dumps(wave_bootstrap.deployment_contract(CORE, VISION))}
+    reads = []
+
+    class Table:
+        def get_entity(self, pk, rk):
+            reads.append(rk)
+            if len(reads) == 1 or not other_role_certified:
+                raise wave_bootstrap.ResourceNotFoundError()
+            return proof
+
+    class Service:
+        def get_table_client(self, name):
+            return Table()
+
+    def seed(*a, **k):
+        raise RuntimeError('Fresh wave bootstrap refused: existing library data or ownership')
+
+    monkeypatch.setattr(wave_bootstrap, 'seed', seed)
+    monkeypatch.setattr(wave_bootstrap, 'upgrade_existing', lambda *a, **k: False)
+    if refused:
+        with pytest.raises(RuntimeError, match='cannot take over the existing library'):
+            wave_bootstrap.auto_seed(Service(), env())
+    else:
+        assert wave_bootstrap.auto_seed(Service(), env()) == EXPECTED
+
+
 def test_every_role_derives_the_same_certificate_from_the_shared_images():
     import wave_policy
     core_env, vision_env = env(UPLOAD_WAVE_DEPLOYMENT_ID=CORE), env(UPLOAD_WAVE_DEPLOYMENT_ID=VISION)

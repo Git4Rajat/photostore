@@ -338,8 +338,13 @@ When the deployment finishes, open the app URL and log in.
   link is emailed to you via Azure Communication Services (provisioned by the
   template with an Azure-managed sender domain — no DNS setup). Reset emails may
   land in your spam folder.
-- **Break-glass reset:** you can always reset by updating the `owner-password`
-  secret on the `<appName>-backend` Container App in the Azure Portal.
+- **The deploy password only sets your first login.** The `owner-password`
+  secret is read once, when the app creates your account; changing it later
+  doesn't change your password. Use "Forgot password?" or change it in the app.
+- **Right after a new install,** the app may need a minute or two before your
+  login works while Azure finishes granting it access to storage. It keeps
+  retrying for 15 minutes, and every sign-in or "Forgot password?" attempt
+  retries too.
 - **Change your password** anytime from inside the app.
 - **Your email is your sign-in identity.** Set the login **email** (`OWNER_EMAIL`)
   in the deploy form — password-mode sign-in is by email + password, so an empty

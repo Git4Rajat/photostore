@@ -58,12 +58,16 @@ def auto_seed(service, env=os.environ):
     expected = digest([PROTOCOL, deployments])
     if env.get('UPLOAD_WAVE_CAPABILITY_ID') not in (None, '', expected):
         raise ValueError('Template capability ID does not match its pinned images')
-    try:
-        proof = service.get_table_client('photojobs').get_entity(CAPABILITIES, expected)
-        if proof.get('protocol') == PROTOCOL and json.loads(proof['deployments']) == deployments:
-            return expected
-    except ResourceNotFoundError:
-        pass
+
+    def certified():
+        try:
+            proof = service.get_table_client('photojobs').get_entity(CAPABILITIES, expected)
+        except ResourceNotFoundError:
+            return False
+        return proof.get('protocol') == PROTOCOL and json.loads(proof['deployments']) == deployments
+
+    if certified():
+        return expected
     if upgrade_existing(service, deployments, expected, env):
         return expected
     try:
@@ -71,6 +75,10 @@ def auto_seed(service, env=os.environ):
     except RuntimeError as error:
         if 'existing library data' not in str(error):
             raise
+        # Every role boots at once: another one certified these same images and enrolled the owner's library
+        # between our check above and seed's (3 of 100 emulated fresh deployments, 2026-11-14).
+        if certified():
+            return expected
         raise RuntimeError(
             f'{error}. This release (certificate {expected}) cannot take over the existing library: its current '
             'certificate must be listed in UPLOAD_WAVE_COMPATIBLE_CAPABILITIES (the release pin job writes it into '
@@ -92,7 +100,10 @@ def upgrade_existing(service, deployments, expected, env=os.environ):
         return False
     import wave_upgrade
     table = service.get_table_client('photojobs')
-    bound = {row['capabilityId'] for row in wave_upgrade.library_policies(table)}
+    try:
+        bound = {row['capabilityId'] for row in wave_upgrade.library_policies(table)}
+    except ResourceNotFoundError:
+        return False  # brand-new storage: no jobs table yet, so no library is enrolled
     if not bound or not bound <= compatible:
         return False
     if len(bound) > 1:
