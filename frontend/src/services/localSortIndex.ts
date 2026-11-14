@@ -28,6 +28,12 @@ export interface SortIndexRow {
     /** Sharper grid-tile image blob (same container and token as `thumb`), present
      * only once the backend has made it -- see media.ts tileImage. */
     grid?: string;
+    /** When `thumb` is a versioned derivative (derived/v1/...), the preview's name, which a
+     * physical `thumb` would give by convention: just its content hash when it sits beside the
+     * thumbnail, else the full blob name. See getCachedSortPreview. */
+    preview?: string;
+    /** When `thumb` is a versioned derivative, the original's physical blob name. */
+    original?: string;
     /** Absent only in snapshots built before the v4 schema migration. */
     gallery?: {
         liked: boolean;
@@ -152,6 +158,8 @@ const normalizeRows = (raw: Record<string, unknown>[]): SortIndexRow[] => raw
         uploadDate: typeof row.uploadDate === 'string' ? row.uploadDate : null,
         ...(typeof row.thumb === 'string' && row.thumb ? { thumb: row.thumb } : {}),
         ...(typeof row.grid === 'string' && row.grid ? { grid: row.grid } : {}),
+        ...(typeof row.preview === 'string' && row.preview ? { preview: row.preview } : {}),
+        ...(typeof row.original === 'string' && row.original ? { original: row.original } : {}),
         ...(row.gallery && typeof row.gallery === 'object'
             ? { gallery: row.gallery as SortIndexRow['gallery'] } : {}),
     }))
@@ -440,14 +448,20 @@ export const getLocalSortIndex = async (): Promise<SortIndexRow[] | null> => {
 // shows it). Empty until the sort index is loaded.
 let thumbMap: Map<string, string> | null = null;
 let gridMap: Map<string, string> | null = null;
+let previewMap: Map<string, string> | null = null;
+let originalMap: Map<string, string> | null = null;
 let thumbMapSource: SortIndexRow[] | null = null;
 const blobMaps = (): void => {
-    if (!cachedIndex || (thumbMapSource === cachedIndex && thumbMap && gridMap)) return;
+    if (!cachedIndex || (thumbMapSource === cachedIndex && thumbMap && gridMap && previewMap && originalMap)) return;
     thumbMap = new Map();
     gridMap = new Map();
+    previewMap = new Map();
+    originalMap = new Map();
     for (const row of cachedIndex) {
         if (row.thumb) thumbMap.set(row.filename, row.thumb);
         if (row.grid) gridMap.set(row.filename, row.grid);
+        if (row.preview) previewMap.set(row.filename, row.preview);
+        if (row.original) originalMap.set(row.filename, row.original);
     }
     thumbMapSource = cachedIndex;
 };
@@ -461,6 +475,23 @@ export const getCachedSortGrid = (filename: string): string => {
     if (!cachedIndex) return '';
     blobMaps();
     return gridMap?.get(filename) || '';
+};
+// derived/v1/<scope>/<key>/thumbnail/<sha>.jpg -- a bare preview hash sits in the same folder.
+const VERSIONED_THUMB = /^(derived\/v1\/[^/]+\/[^/]+)\/thumbnail\/[^/]+$/;
+/** Full blob name of a versioned photo's preview, or '' when `thumb` already implies it (or it isn't made yet). */
+export const getCachedSortPreview = (filename: string): string => {
+    if (!cachedIndex) return '';
+    blobMaps();
+    const preview = previewMap?.get(filename) || '';
+    if (!preview || preview.includes('/')) return preview;
+    const folder = VERSIONED_THUMB.exec(thumbMap?.get(filename) || '')?.[1];
+    return folder ? `${folder}/preview/${preview}.jpg` : '';
+};
+/** Physical original blob name of a photo whose `thumb` is a versioned derivative, else ''. */
+export const getCachedSortOriginal = (filename: string): string => {
+    if (!cachedIndex) return '';
+    blobMaps();
+    return originalMap?.get(filename) || '';
 };
 
 export const invalidateLocalSortIndex = (): void => {

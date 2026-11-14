@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({ fetchPreview: vi.fn(), fetchOriginal: vi.fn(), revoke: vi.fn() }));
 vi.mock('../../services/localSortIndex', () => ({
     getCachedSortGrid: () => '',
+    getCachedSortOriginal: () => '',
+    getCachedSortPreview: () => '',
     getCachedSortThumb: () => 'abc',
 }));
 vi.mock('../../services/mediaToken', () => ({

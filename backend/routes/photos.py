@@ -578,7 +578,9 @@ def photos_media_token():
     The browser builds ``{baseUrl}/{blobName}?{sas}`` itself (the physical blob
     name -- anonymousImageId or filename -- is the SAME across all three tiers,
     just a different container/prefix: thumbnail blob as-is, preview under
-    ``preview/``, full-res in the separate image-container token below), so
+    ``preview/``, full-res in the separate image-container token below; a
+    photo with versioned derivatives gets its preview and original names from
+    the sort index, see storage_utils._sort_index_media_names), so
     loading photos involves no backend call and no per-photo signing. Each
     token is short-lived (MEDIA_TOKEN_SAS_TTL_SECONDS, independent of the
     shared day-long delegation key still used to sign it -- see

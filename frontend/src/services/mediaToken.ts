@@ -165,10 +165,16 @@ export const thumbnailUrlForBlob = (blob: string | undefined | null, token: Medi
     blob && token ? `${token.baseUrl}/${encodeBlobPath(blob)}?${token.sas}` : ''
 );
 
-/** Direct preview URL (previews live under `preview/` in the same container). */
-export const previewUrlForBlob = (blob: string | undefined | null, token: MediaToken | null = getCachedMediaToken()): string => (
-    blob && !blob.startsWith('derived/v1/') && token ? `${token.baseUrl}/${token.previewPrefix}${encodeBlobPath(blob)}.jpg?${token.sas}` : ''
-);
+const VERSIONED_PREVIEW = /^derived\/v1\/[^/]+\/[^/]+\/preview\/[^/]+$/;
+
+/** Direct preview URL, from a photo's physical blob name (previews live under `preview/` in the
+ * same container) or a versioned preview's own name (derived/v1/.../preview/<sha>.jpg). A versioned
+ * thumbnail's name says nothing about its preview, so it yields ''. */
+export const previewUrlForBlob = (blob: string | undefined | null, token: MediaToken | null = getCachedMediaToken()): string => {
+    if (!blob || !token) return '';
+    if (VERSIONED_PREVIEW.test(blob)) return `${token.baseUrl}/${encodeBlobPath(blob)}?${token.sas}`;
+    return blob.startsWith('derived/v1/') ? '' : `${token.baseUrl}/${token.previewPrefix}${encodeBlobPath(blob)}.jpg?${token.sas}`;
+};
 
 /** Direct full-resolution original URL (separate container token from thumbnail/preview), or '' when unavailable. */
 export const imageUrlForBlob = (blob: string | undefined | null, token: MediaToken | null = getCachedMediaToken()): string => (

@@ -130,7 +130,9 @@ def test_catalog_omits_invalid_receipts_without_weakening_completion_validation(
     elif bad == 'typed': invalid['library'] = 123
     raw = {'json': '{', 'list': '[]', 'null': 'null'}.get(bad, json.dumps(invalid))
     row['thumbnailArtifact'] = row['previewArtifact'] = raw
-    assert storage_utils._sort_index_row(row)['thumb'] == row['anonymousImageId']
+    sort_row = storage_utils._sort_index_row(row)
+    assert sort_row['thumb'] == row['anonymousImageId']
+    assert {'preview', 'original'}.isdisjoint(sort_row)
     projected = storage_utils._access_index_row(row)
     assert projected['RowKey'] == row['RowKey'] and projected['blobName'] == row['anonymousImageId']
     assert 'thumbnailArtifact' not in projected and 'previewArtifact' not in projected
@@ -247,6 +249,33 @@ def test_sort_and_access_projections_preserve_versioned_derivative_pointers(blob
     assert derivative_blob(compact, 'thumbnail', 'wrong') == receipt['blob']
     assert compact['previewArtifact'] == row['previewArtifact']
     assert storage_utils.metadata_index_kinds({'thumbnailArtifact': row['thumbnailArtifact']}) >= {'sort', 'access'}
+
+
+def test_sort_rows_name_the_preview_and_original_behind_a_versioned_thumbnail(blobs):
+    from processing_artifacts import published_name
+    (metadata, *_, fence), _ = blobs
+    row = metadata.get_entity('lib', 'photo.jpg')
+    # Legacy: `thumb` is the physical name and the browser derives the other tiers from it.
+    assert {'preview', 'original'}.isdisjoint(storage_utils._sort_index_row(row))
+    with result_fence(fence):
+        publish(storage_utils, row, 'thumbnail', data=jpeg())
+        preview = publish(storage_utils, row, 'preview', data=jpeg('blue'))
+    sort_row = storage_utils._sort_index_row(row)
+    assert sort_row['original'] == row['anonymousImageId']
+    # Beside the thumbnail only the content hash travels; the browser rebuilds the path from `thumb`.
+    assert sort_row['preview'] == preview['sha256']
+    assert sort_row['thumb'].rsplit('/', 2)[0] + '/preview/' + sort_row['preview'] + '.jpg' == preview['blob']
+
+    # A preview kept from an earlier generation lives under another key: send its full name.
+    older = dict(preview, revision='older')
+    older['blob'] = published_name(older['library'], older['photoId'], 'older', 'preview', older['sha256'])
+    row['previewArtifact'] = json.dumps(older)
+    assert storage_utils._sort_index_row(row)['preview'] == older['blob']
+
+    row.pop('thumbnailArtifact')
+    sort_row = storage_utils._sort_index_row(row)
+    assert sort_row['thumb'] == row['anonymousImageId'] and 'original' not in sort_row
+    assert sort_row['preview'] == older['blob']
 
 
 @pytest.mark.parametrize('kind', ['thumbnail', 'preview', 'image'])
