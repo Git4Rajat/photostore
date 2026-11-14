@@ -5665,7 +5665,7 @@ def get_user_lexical_index(
 # _VECTOR_INDEX_RELEVANT_FIELDS/_SORT_INDEX_RELEVANT_FIELDS above). A rating
 # tap needs to cheaply re-sort a number, not pay for a full OCR/tag/embedding
 # lexical rebuild -- so this index tracks its own staleness end to end.
-_SORT_INDEX_SCHEMA_VERSION = 'v6'  # v6: captureDate keeps its EXIF offset (none when unknown); filename dates
+_SORT_INDEX_SCHEMA_VERSION = 'v7'  # v7: versioned-derivative rows carry `preview`/`original`; v6: captureDate keeps its EXIF offset (none when unknown); filename dates
 _SORT_INDEX_CACHE_LOCK = threading.RLock()
 _SORT_INDEX_CACHE: Dict[str, Dict[str, object]] = _serve_only_cache()
 _SORT_INDEX_REBUILD_LOCKS = _KeyedLockRegistry()
@@ -5899,6 +5899,31 @@ def _catalog_derivative_receipt(entity: Dict, kind: str):
         return None
 
 
+def _sort_index_media_names(entity: Dict, thumb_receipt) -> Dict[str, str]:
+    """Preview and original blob names the browser can't derive from `thumb`.
+
+    A legacy `thumb` is the physical name, and the browser adds `preview/` or
+    switches container to reach the other tiers. A versioned derivative
+    (derived/v1/<scope>/<key>/thumbnail/<sha>.jpg) names only the thumbnail:
+    the preview has its own content hash and the original keeps the physical
+    name. Without these the browser asked /api/photos/access-batch to sign
+    each preview and original separately instead of using its media token.
+
+    `preview` is just the content hash when the preview sits beside the
+    thumbnail (derived/v1/<scope>/<key>/preview/<sha>.jpg, the usual case),
+    which keeps the index small; otherwise the full blob name.
+    """
+    names: Dict[str, str] = {}
+    if thumb_receipt:
+        names['original'] = str(entity.get('anonymousImageId') or entity.get('RowKey') or '')
+    preview = _catalog_derivative_receipt(entity, 'preview')
+    if preview:
+        beside = thumb_receipt and preview['blob'] == '{}/preview/{}.jpg'.format(
+            thumb_receipt['blob'].rsplit('/', 2)[0], preview['sha256'])
+        names['preview'] = preview['sha256'] if beside else preview['blob']
+    return names
+
+
 def _sort_index_row(entity: Dict) -> Optional[Dict[str, object]]:
     filename = str(entity.get('RowKey') or '').strip()
     if not filename or is_upload_reservation_only(entity) or is_live_photo_clip(entity):
@@ -5928,6 +5953,8 @@ def _sort_index_row(entity: Dict) -> Optional[Dict[str, object]]:
         # blob directly and treats a 404 as "still generating" instead of
         # asking this index whether it's ready first.
         'thumb': receipt['blob'] if receipt else str(entity.get('anonymousImageId') or filename),
+        # The other tiers' names when `thumb` is a versioned derivative.
+        **_sort_index_media_names(entity, receipt),
         # Sharper tile image for srcset, present only once it exists (see
         # grid_images.py): the browser must never be offered a missing size.
         **({'grid': grid} if (grid := grid_images.served_blob(entity)) else {}),

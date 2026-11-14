@@ -94,3 +94,14 @@ it('loads versioned thumbnails directly but resolves other tiers independently',
     expect(previewUrlForBlob(blob, token)).toBe('');
     expect(imageUrlForBlob(blob, token)).toBe('');
 });
+
+it('builds a versioned preview from its own name with the same container token', async () => {
+    getMock.mockResolvedValue(tokenResponse());
+    const token = await getMediaToken();
+    const preview = 'derived/v1/scope/key/preview/digest.jpg';
+    expect(previewUrlForBlob(preview, token)).toBe(
+        'https://acct.blob.core.windows.net/thumbnails/derived/v1/scope/key/preview/digest.jpg?sp=r&sr=c&sig=abc');
+    expect(previewUrlForBlob('derived/v1/scope/key/thumbnail/digest.jpg', token)).toBe('');
+    expect(previewUrlForBlob('physical-id', token)).toBe(
+        'https://acct.blob.core.windows.net/thumbnails/preview/physical-id.jpg?sp=r&sr=c&sig=abc');
+});

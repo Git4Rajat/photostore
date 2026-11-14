@@ -4,7 +4,7 @@ import { isAuthEnabled } from '../../services/authClient';
 import { fetchProtectedBlobUrl, fetchProtectedBlobUrlWithProgress, ProtectedFetchError } from '../../services/imageClient';
 import { resolveThumbnailAccessUrls } from '../../services/thumbnailAccessCache';
 import { resolveMediaAccessUrls } from '../../services/mediaAccessCache';
-import { getCachedSortGrid, getCachedSortThumb } from '../../services/localSortIndex';
+import { getCachedSortGrid, getCachedSortOriginal, getCachedSortPreview, getCachedSortThumb } from '../../services/localSortIndex';
 import { getCachedMediaToken, getMediaToken, imageUrlForBlob, previewUrlForBlob, thumbnailUrlForBlob } from '../../services/mediaToken';
 import { isHttpUrl, shouldFetchScopedThumbnail } from '../../components/shared/PhotoTile';
 import { isRawFilename, isVideoFilename } from '../../utils/photoDisplay';
@@ -157,10 +157,11 @@ export function useTileSizes(gridRef: RefObject<HTMLElement>, firstTileKey?: str
     return width > 0 ? `${width}px` : undefined;
 }
 
-// Direct container-token URL for one of a photo's media tiers (thumbnail/
-// preview/full-res all share the same physical blob name -- just a different
-// container/prefix, see /api/photos/media-token), or '' when the blob name or
-// token isn't known client-side yet.
+// Direct container-token URL for one of a photo's media tiers, or '' when the
+// blob name or token isn't known client-side yet. A legacy photo's tiers share
+// its physical blob name (just a different container/prefix, see
+// /api/photos/media-token); a photo whose thumbnail is a versioned derivative
+// gets its preview and original names from the sort index instead.
 const directMediaUrl = (kind: 'preview' | 'image' | 'thumbnail', filename: string): string => {
     const blob = getCachedSortThumb(filename);
     const token = getCachedMediaToken();
@@ -168,9 +169,17 @@ const directMediaUrl = (kind: 'preview' | 'image' | 'thumbnail', filename: strin
         return '';
     }
     if (kind === 'thumbnail') return thumbnailUrlForBlob(blob, token);
-    if (kind === 'preview') return previewUrlForBlob(blob, token);
-    return imageUrlForBlob(blob, token);
+    if (kind === 'preview') return previewUrlForBlob(getCachedSortPreview(filename) || blob, token);
+    return imageUrlForBlob(getCachedSortOriginal(filename) || blob, token);
 };
+
+// True when the direct URL for this tier came from a name the sort index carries
+// for a versioned photo, which goes stale if the photo is reprocessed or
+// replaced after the index was loaded.
+const fromVersionedName = (kind: 'preview' | 'image' | 'thumbnail', filename: string): kind is 'preview' | 'image' => (
+    (kind === 'preview' && Boolean(getCachedSortPreview(filename)))
+    || (kind === 'image' && Boolean(getCachedSortOriginal(filename)))
+);
 
 // Resolves one of a photo's media tiers to a loadable URL. Prefers the direct
 // container-token URL (zero backend calls, the common case once the sort
@@ -269,14 +278,25 @@ const fetchFirstAvailableTier = async (
         }
     };
 
+    const isNotFound = (err: unknown) => err instanceof ProtectedFetchError && err.status === 404;
     for (const kind of order) {
         const target = await accessUrl(kind, filename);
         if (!target) continue;
         try {
             return await fetchWithAuthRetry(kind, target);
         } catch (err) {
-            if (err instanceof ProtectedFetchError && err.status === 404) continue;
-            throw err;
+            if (!isNotFound(err)) throw err;
+        }
+        // A versioned name from an older sort index can point at a blob that a
+        // later reprocessing replaced. Ask the backend, which reads the current
+        // metadata, before falling through to a bigger tier.
+        if (!fromVersionedName(kind, filename)) continue;
+        const signed = (await resolveMediaAccessUrls(kind, [filename])).get(filename);
+        if (!signed || signed === target) continue;
+        try {
+            return await fetchOne(signed);
+        } catch (err) {
+            if (!isNotFound(err)) throw err;
         }
     }
     if (fallbackUrl && isHttpUrl(fallbackUrl)) {

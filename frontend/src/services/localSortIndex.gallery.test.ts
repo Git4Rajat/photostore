@@ -78,6 +78,22 @@ describe('index-backed gallery cache', () => {
         });
     });
 
+    it('names a versioned photo\'s preview and original, rebuilding a bare preview hash beside its thumbnail', async () => {
+        const folder = 'derived/v1/scope/key';
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ sourceVersion: '2026-02-01', rows: [
+            { RowKey: 'beside.jpg', thumb: `${folder}/thumbnail/t1.jpg`, preview: 'p1', original: 'uuid-1', gallery },
+            { RowKey: 'apart.jpg', thumb: `${folder}/thumbnail/t2.jpg`, preview: 'derived/v1/scope/old/preview/p2.jpg', original: 'uuid-2', gallery },
+            { RowKey: 'legacy.jpg', thumb: 'uuid-3', gallery },
+        ] }))));
+        const index = await import('./localSortIndex');
+        await index.getLocalSortIndex();
+        expect(index.getCachedSortPreview('beside.jpg')).toBe(`${folder}/preview/p1.jpg`);
+        expect(index.getCachedSortOriginal('beside.jpg')).toBe('uuid-1');
+        expect(index.getCachedSortPreview('apart.jpg')).toBe('derived/v1/scope/old/preview/p2.jpg');
+        expect(index.getCachedSortPreview('legacy.jpg')).toBe('');
+        expect(index.getCachedSortOriginal('legacy.jpg')).toBe('');
+    });
+
     it('applies all deltas on a fresh load and reuses the complete snapshot after reload', async () => {
         mocks.get.mockResolvedValue({available: true, indexUrl: 'https://storage.test/sort',
             sourceVersion: '2026-02-01', deltaSeq: 2, deltaUrls: ['https://storage.test/d1', 'https://storage.test/d2']});
