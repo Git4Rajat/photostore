@@ -62,7 +62,7 @@ param browserUploadPreparation bool = true
 param coreImage string = 'ghcr.io/git4rajat/photostore-backend@sha256:51a30a757f8a9a8aa44c4b314333d479481c682b96e9e2398a26b177d63e872d'
 
 @description('Public web (frontend) image. Defaults to an immutable @sha256 digest, never :latest, same as coreImage above.')
-param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:40b2ec7c947d00ff44d9343352196c48e4612eed227744df7be81f5a41eaff36'
+param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:c48a4f9b4625a226507f2524c9731e2a1b2893a31946c9cf8832976e15363869'
 
 @description('Public vision (server-side image processing) image. Only pulled/deployed when processingMode is "backend" or "both". Separate from coreImage (unlike the clustering `cluster` role, which reuses it) because vision needs torch/open_clip/onnxruntime/opencv/mediapipe/tesseract -- multiple GB of extra weight that would slow every core/cluster cold start if bundled into their shared image. Same digest-pinning guidance as coreImage applies.')
 param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker@sha256:981dd33f29d7ef5ca01464f50f2cba81b53c4d56536e9239359ef8295b564b25'
@@ -94,7 +94,7 @@ param waveCapabilityId string = 'f230dfabdbf8336d684e2fc87df591aea622638db8c7f10
 @description('Earlier release certificates this release may replace in place (set by the release pin job).')
 param waveCompatibleCapabilities string = 'a09b5f520611c246e6e4b29b19b412ab144b156a3c09e7656cf9170654ff44de,2fa1191c25e2ff250656252ba7f787059632d3153cc72f0bd4161faf7462dd66,ba6fc54c96b205b9b18a923e17d55d403f69e76f86c2f56fc86011698e1b619f,a3653f3ddb026a351750fd4f3c67d6899b992d59e4e99da5b99b7fa50d6cc83b,ae4e21709ffc524a66642a73659e984c29d1d128e2358453f38f5b6668a3cf74,c45ea6724b831bb64bb9aeb833d62ad97026d6c76fbaf8109694f3d37af29ade,7b69f28cb92201d6b1cc99b34b19a2a89b821440e313b14c53b28d1108bed7fc,c6743c0e87c2e1a7895a35570d12481304587c38e26cf25f3f5c38d3842bcc9c'
 @description('Source commit of the pinned release (set by the release pin job).')
-param waveSourceCommit string = '3a31d71be77f6df040508bd67b905c97c517eb5b'
+param waveSourceCommit string = '8979236cca90f03e0d40248ef143dddd4f2344d5'
 @description('Fresh-install preparation only: block upload intake and run certificate seeding as a manual recovery job. Activate only after that job succeeds.')
 param waveBootstrapPending bool = false
 
