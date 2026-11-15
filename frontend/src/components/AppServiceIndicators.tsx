@@ -4,7 +4,8 @@
 // only on the public useAppServices() contract, so they can live independently
 // of the (much larger) provider component itself.
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { BellIcon, TrashIcon, XMarkIcon } from '@heroicons/react/24/outline';
+import { Bell as BellIcon, Trash2 as TrashIcon, X as XMarkIcon } from 'lucide-react';
+import { IconButton } from './ui/Button';
 import { formatMegabytesPerSecond } from './browserAiShared';
 import { formatNotificationTime } from '../services/notificationTime';
 import type { AppNotification } from '../types/browserProcessing';
@@ -101,24 +102,12 @@ export const NotificationBell: React.FC = () => {
                     <div className="notification-head">
                         <h3 className="toolbar-title">Notifications</h3>
                         <div className="notification-actions">
-                            <button
-                                type="button"
-                                className="btn btn-soft icon-btn"
-                                onClick={clearNotifications}
-                                aria-label="Clear notifications"
-                            >
+                            <IconButton label="Clear notifications" size="sm" onClick={clearNotifications}>
                                 <TrashIcon className="toolbar-icon" />
-                                <span className="sr-only">Clear notifications</span>
-                            </button>
-                            <button
-                                type="button"
-                                className="btn btn-soft icon-btn notification-close"
-                                onClick={closeNotifications}
-                                aria-label="Close notifications"
-                            >
+                            </IconButton>
+                            <IconButton label="Close notifications" size="sm" className="notification-close" onClick={closeNotifications}>
                                 <XMarkIcon className="toolbar-icon" />
-                                <span className="sr-only">Close notifications</span>
-                            </button>
+                            </IconButton>
                         </div>
                     </div>
 

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ArrowDownTrayIcon, ArrowPathIcon, ArrowUturnLeftIcon, ArrowUturnRightIcon, CheckIcon, ChevronLeftIcon, ChevronRightIcon, EllipsisHorizontalIcon, HeartIcon, InformationCircleIcon, RectangleStackIcon, ShareIcon, TrashIcon } from '@heroicons/react/24/outline';
+import { Download as ArrowDownTrayIcon, RefreshCw as ArrowPathIcon, Undo2 as ArrowUturnLeftIcon, Redo2 as ArrowUturnRightIcon, Check as CheckIcon, ChevronLeft as ChevronLeftIcon, ChevronRight as ChevronRightIcon, MoreHorizontal as EllipsisHorizontalIcon, Heart as HeartIcon, Info as InformationCircleIcon, Layers as RectangleStackIcon, Share2 as ShareIcon, Trash2 as TrashIcon } from 'lucide-react';
 import { post, resolveApiUrl } from '../../services/apiClient';
 import { getAccessToken, isAuthEnabled } from '../../services/authClient';
 import { fetchProtectedBlobUrl } from '../../services/imageClient';

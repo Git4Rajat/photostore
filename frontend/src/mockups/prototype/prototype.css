@@ -2,7 +2,7 @@
    Prototype-only styles for the fully-functional Keepsake prototype.
    Loaded after index.css + mockups.css, so it reuses real tokens and the
    shared mock classes (mock-swatch, upload-dock, share-sheet, member-row,
-   mock-switch, btn/.mock-cta, card-glass, .ios-header/.ios-tabs …) and only
+   mock-switch, btn, card-glass, .ios-header/.ios-tabs …) and only
    adds the pt-* classes the prototype app introduces.
    ================================================================= */
 
@@ -130,7 +130,7 @@
 }
 .pt-menu-panel.left { left: 0; }
 .pt-menu-panel.right { right: 0; }
-.pt-menu-label { font-family: var(--font-label); font-size: 0.72rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); margin: 0 0 8px; padding: 0 4px; }
+.pt-menu-label { font-size: 0.8rem; font-weight: 600; color: var(--muted); margin: 0 0 8px; padding: 0 4px; }
 
 .pt-account-menu { min-width: 240px; }
 .pt-account-menu > button { display: flex; align-items: center; width: 100%; min-height: var(--tap-min); text-align: left; background: none; border: 0; padding: 9px 10px; border-radius: var(--r-xs); font: inherit; font-size: 0.88rem; color: var(--text); cursor: pointer; }
@@ -154,7 +154,7 @@
 
 /* ---- stars ---- */
 .pt-stars { display: inline-flex; gap: 2px; }
-.pt-star { background: none; border: 0; padding: 0; cursor: pointer; color: #e2b33f; display: inline-grid; place-items: center; min-width: var(--tap-min); min-height: var(--tap-min); }
+.pt-star { background: none; border: 0; padding: 0; cursor: pointer; color: var(--star); display: inline-grid; place-items: center; min-width: var(--tap-min); min-height: var(--tap-min); }
 .pt-star:disabled, .pt-star.static { cursor: default; min-width: 0; min-height: 0; }
 .pt-star svg { display: block; }
 /* Compact single-star, partial-fill rating indicator -- hidden by default;
@@ -166,7 +166,7 @@
 /* Constrain the compact star's glyph to a 20px box centred in its 44px tap
    target -- otherwise it filled the whole target and rendered ~2x the size of
    the neighbouring Like/Delete icons (which are 20px) in the viewer bar. */
-.pt-star-compact-bg, .pt-star-compact-fg { position: absolute; top: 50%; left: 50%; width: 20px; height: 20px; transform: translate(-50%, -50%); color: #e2b33f; }
+.pt-star-compact-bg, .pt-star-compact-fg { position: absolute; top: 50%; left: 50%; width: 20px; height: 20px; transform: translate(-50%, -50%); color: var(--star); }
 .pt-star-compact-fg { clip-path: inset(0 calc(100% - var(--pt-star-fill, 0%)) 0 0); }
 
 /* ---- toolbar / page headers ---- */
@@ -271,9 +271,9 @@
 .pt-tile-check svg { width: 22px; height: 22px; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.45)); }
 .pt-tile-check.on { color: var(--accent); }
 .pt-tile-badges { position: absolute; bottom: 6px; right: 6px; display: flex; gap: 4px; align-items: center; }
-.pt-tile-badges .liked { width: 16px; height: 16px; color: #ff6b7d; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.4)); }
+.pt-tile-badges .liked { width: 16px; height: 16px; color: var(--like); filter: drop-shadow(0 1px 2px rgba(0,0,0,0.4)); }
 .pt-tile-badges .rating { display: inline-flex; align-items: center; gap: 2px; font-size: 0.72rem; font-weight: 700; color: #fff; background: rgba(0,0,0,0.42); border-radius: var(--r-pill); padding: 1px 6px; }
-.pt-tile-badges .rating svg { width: 10px; height: 10px; color: #e2b33f; }
+.pt-tile-badges .rating svg { width: 10px; height: 10px; color: var(--star); }
 .pt-tile-badges .live { font-size: 0.62rem; font-weight: 700; letter-spacing: 0.06em; color: #fff; background: rgba(0,0,0,0.42); border-radius: var(--r-pill); padding: 1px 6px; }
 .pt-grid-empty { color: var(--muted); padding: 24px 0; }
 
@@ -358,7 +358,7 @@
 .pt-album-list-head { display: flex; align-items: center; justify-content: space-between; padding: 0 8px 4px; }
 .pt-album-row-check { width: 20px; height: 20px; flex: 0 0 auto; border-radius: 999px; border: 1.5px solid var(--lg-edge); display: inline-flex; align-items: center; justify-content: center; color: transparent; }
 .pt-album-row-check svg { width: 13px; height: 13px; }
-.pt-album-row-check.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.pt-album-row-check.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .pt-album-detail { padding: 16px; }
 .pt-album-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
 .pt-album-photos-head { display: flex; align-items: center; justify-content: space-between; margin: 6px 0 10px; }
@@ -444,7 +444,7 @@
 
 /* ---- sharing extras ---- */
 .pt-danger-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
-.pt-access-code { font-family: var(--font-label, monospace); font-weight: 700; letter-spacing: 0.12em; background: var(--accent-soft); color: var(--accent); padding: 1px 6px; border-radius: 5px; }
+.pt-access-code { font-family: var(--font-mono); font-weight: 700; letter-spacing: 0.12em; background: var(--accent-soft); color: var(--accent); padding: 1px 6px; border-radius: 5px; }
 
 /* ---- tools ---- */
 .pt-subnav { display: flex; gap: 16px; border-bottom: 1px solid var(--lg-edge); margin-bottom: 16px; overflow-x: auto; }
@@ -477,10 +477,10 @@
 .wb-tile-name { display: block; font-size: 0.72rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .wb-tile-steps { display: flex; gap: 4px; margin-top: 4px; }
 .wb-step-icon { width: 15px; height: 15px; flex: 0 0 auto; color: var(--lg-edge); }
-.wb-step-icon.done { color: #34c759; }
+.wb-step-icon.done { color: var(--success); }
 .wb-step-icon.pending { color: var(--muted); opacity: 0.6; }
-.wb-step-icon.no-data { color: #d19a00; }
-.wb-step-icon.failed { color: #ff453a; }
+.wb-step-icon.no-data { color: var(--warning); }
+.wb-step-icon.failed { color: var(--danger); }
 /* Non-color status cue: a tiny shape badge so done/failed/no-data are
    distinguishable without relying on the icon tint. */
 .wb-step { position: relative; display: inline-flex; line-height: 0; }
@@ -582,33 +582,33 @@
 }
 
 /* ---- photo viewer (fixed, full-window) ---- */
-.pt-viewer { position: fixed; inset: 0; z-index: 80; background: #0e0d0b; color: #ece6d9; display: flex; flex-direction: column; }
+.pt-viewer { position: fixed; inset: 0; z-index: 80; background: var(--viewer-bg); color: var(--viewer-text); display: flex; flex-direction: column; }
 .pt-viewer-top { display: flex; align-items: center; gap: 12px; padding: 14px 18px; }
-.pt-viewer-back { display: inline-flex; align-items: center; gap: 6px; background: none; border: 0; color: #cfc8ba; font: inherit; font-weight: 600; cursor: pointer; }
+.pt-viewer-back { display: inline-flex; align-items: center; gap: 6px; background: none; border: 0; color: var(--viewer-muted); font: inherit; font-weight: 600; cursor: pointer; }
 .pt-viewer-back svg { width: 18px; height: 18px; }
-.pt-viewer-title { font-size: 0.9rem; color: #cfc8ba; }
-.pt-viewer-pos { margin-left: auto; font-size: 0.82rem; color: #9c9486; font-family: var(--font-label); }
+.pt-viewer-title { font-size: 0.9rem; color: var(--viewer-muted); }
+.pt-viewer-pos { margin-left: auto; font-size: 0.82rem; color: var(--viewer-subtle); font-variant-numeric: tabular-nums; white-space: nowrap; }
 /* touch-action: none stops the browser from turning a two-finger pinch here
    into a whole-page zoom; the pinch is handled in JS to zoom the photo instead.
    The info panel re-enables panning so it can still scroll (see below). */
 .pt-viewer-stage-wrap { flex: 1; position: relative; display: flex; min-height: 0; touch-action: none; }
 .pt-viewer-info { touch-action: pan-y; }
 .pt-viewer-stage { flex: 1; display: flex; align-items: center; gap: 12px; padding: 0 18px; min-height: 0; }
-.pt-viewer-loading { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: #9c9486; font-size: 0.9rem; }
-.pt-viewer-unavailable { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; color: #ece6d9; font-size: 0.95rem; text-align: center; padding: 0 32px; }
-.pt-viewer-unavailable p { max-width: 420px; color: #c9c2b4; margin: 0; }
-.pt-viewer-unavailable button { display: inline-flex; align-items: center; gap: 8px; border: 1px solid rgba(255,255,255,0.18); border-radius: var(--r-pill); padding: 8px 18px; background: rgba(255,255,255,0.08); color: #ece6d9; cursor: pointer; font-size: 0.9rem; }
+.pt-viewer-loading { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: var(--viewer-subtle); font-size: 0.9rem; }
+.pt-viewer-unavailable { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; color: var(--viewer-text); font-size: 0.95rem; text-align: center; padding: 0 32px; }
+.pt-viewer-unavailable p { max-width: 420px; color: var(--viewer-muted); margin: 0; }
+.pt-viewer-unavailable button { display: inline-flex; align-items: center; gap: 8px; border: 1px solid rgba(255,255,255,0.18); border-radius: var(--r-pill); padding: 8px 18px; background: rgba(255,255,255,0.08); color: var(--viewer-text); cursor: pointer; font-size: 0.9rem; }
 .pt-viewer-unavailable button:hover { background: rgba(255,255,255,0.16); }
 /* Floating image controls (zoom / rotate / full-res) over the stage. */
 .pt-viewer-tools { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 4px; background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.12); border-radius: var(--r-pill); padding: 4px 8px; backdrop-filter: blur(8px); z-index: 2; }
-.pt-viewer-tools button { display: inline-grid; place-items: center; width: var(--tap-min); height: var(--tap-min); border: 0; border-radius: 50%; background: none; color: #ece6d9; cursor: pointer; }
+.pt-viewer-tools button { display: inline-grid; place-items: center; width: var(--tap-min); height: var(--tap-min); border: 0; border-radius: 50%; background: none; color: var(--viewer-text); cursor: pointer; }
 .pt-viewer-tools button:hover:not(:disabled) { background: rgba(255,255,255,0.14); }
 .pt-viewer-tools button:disabled { opacity: 0.35; cursor: default; }
 .pt-viewer-tools button.on { color: var(--accent); background: rgba(255,255,255,0.14); }
 .pt-viewer-tools button svg { width: 18px; height: 18px; }
 .pt-viewer-tools .pt-viewer-fr { font-size: 0.6rem; font-weight: 700; margin-left: 1px; }
 .pt-viewer-tools button:has(.pt-viewer-fr) { width: auto; padding: 0 8px; gap: 3px; }
-.pt-viewer-zoom-label { font-size: 0.72rem; color: #cfc8ba; font-family: var(--font-label); min-width: 40px; text-align: center; }
+.pt-viewer-zoom-label { font-size: 0.72rem; color: var(--viewer-muted); font-variant-numeric: tabular-nums; min-width: 40px; text-align: center; }
 .pt-viewer-tools-sep { width: 1px; height: 20px; background: rgba(255,255,255,0.15); margin: 0 2px; }
 .pt-viewer-fr-loading { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px; width: 22px; height: 22px; position: relative; }
 .pt-viewer-fr-ring { width: 22px; height: 22px; position: absolute; inset: 0; }
@@ -641,9 +641,9 @@
 .pt-vb-group.left { flex: 1 1 0; justify-content: flex-start; }
 .pt-vb-group.center { flex: 0 0 auto; justify-content: center; }
 .pt-vb-group.right { flex: 1 1 0; justify-content: flex-end; }
-.pt-vb-btn { display: inline-flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: var(--tap-min); min-height: var(--tap-min); background: none; border: 0; color: #ece6d9; font: inherit; font-size: 0.72rem; cursor: pointer; padding: 4px 6px; }
+.pt-vb-btn { display: inline-flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: var(--tap-min); min-height: var(--tap-min); background: none; border: 0; color: var(--viewer-text); font: inherit; font-size: 0.72rem; cursor: pointer; padding: 4px 6px; }
 .pt-vb-btn svg { width: 20px; height: 20px; }
-.pt-vb-btn.on { color: #ff6b7d; }
+.pt-vb-btn.on { color: var(--like); }
 /* Touch devices navigate by swipe, so the prev/next buttons aren't needed. */
 @media (hover: none) and (pointer: coarse) {
   .pt-viewer-nav { display: none; }
@@ -673,7 +673,7 @@
 .pt-toast-action { background: none; border: 0; color: inherit; font: inherit; font-weight: 700; text-decoration: underline; cursor: pointer; }
 /* Error toasts read distinctly from routine confirmations (which use the
    default near-black pill) so a failure isn't mistaken for a success. */
-.pt-toast.error { background: var(--danger); color: #fff; }
+.pt-toast.error { background: var(--danger); color: var(--on-danger); }
 .pt-toast-icon { flex: 0 0 auto; width: 18px; height: 18px; }
 
 /* ---- narrow (phone) tweaks; mock-viewport is the query container ---- */
@@ -703,7 +703,7 @@
 /* ---- rotated video: upright controls (TurnedVideoControls.tsx) ---- */
 .pt-turned-video-play { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 2; display: grid; place-items: center; border: 0; border-radius: 50%; background: rgba(0,0,0,0.6); -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); color: #fff; cursor: pointer; }
 .pt-turned-video-play svg { width: 38%; height: 38%; margin-left: 6%; fill: currentColor; }
-.pt-turned-video-bar { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); z-index: 2; width: min(520px, calc(100% - 24px)); box-sizing: border-box; display: flex; align-items: center; gap: 6px; padding: 0 8px; background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.12); border-radius: var(--r-pill); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); color: #ece6d9; }
+.pt-turned-video-bar { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); z-index: 2; width: min(520px, calc(100% - 24px)); box-sizing: border-box; display: flex; align-items: center; gap: 6px; padding: 0 8px; background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.12); border-radius: var(--r-pill); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); color: var(--viewer-text); }
 .pt-turned-video-bar button { flex: none; display: inline-grid; place-items: center; width: var(--tap-min); height: var(--tap-min); border: 0; border-radius: 50%; background: none; color: inherit; cursor: pointer; }
 .pt-turned-video-bar button svg { width: 18px; height: 18px; }
 .pt-turned-video-bar input[type="range"] { flex: 1; min-width: 0; accent-color: var(--accent); }
@@ -804,10 +804,8 @@
    instead of the old bespoke banner layout. */
 .pt-public-shell .pt-public-tag {
     margin-left: auto;
-    font-family: var(--font-label);
-    font-size: 0.66rem;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
+    font-size: 0.75rem;
+    font-weight: 600;
     color: var(--muted);
     border: 1px solid var(--lg-edge);
     border-radius: var(--r-pill);

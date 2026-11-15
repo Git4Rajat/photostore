@@ -645,7 +645,7 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
                                     <div className="pt-toolbar-actions">
                                         <ThumbSizeControl value={tileSize} onChange={setTileSize} />
                                         {fullAlbumUrl ? (
-                                            <a className="btn mock-cta" href={fullAlbumUrl}>Open full album</a>
+                                            <a className="btn btn-primary" href={fullAlbumUrl}>Open full album</a>
                                         ) : selectMode ? (
                                             <>
                                                 <button type="button" className="btn" onClick={toggleSelectAll}>
@@ -656,7 +656,7 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
                                                 </button>
                                                 <button
                                                     type="button"
-                                                    className="btn mock-cta"
+                                                    className="btn btn-primary"
                                                     disabled={downloading || selectedCount === 0}
                                                     onClick={() => void handleDownload()}
                                                 >
@@ -671,7 +671,7 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
                                                 </button>
                                                 <button
                                                     type="button"
-                                                    className="btn mock-cta"
+                                                    className="btn btn-primary"
                                                     disabled={downloading}
                                                     onClick={() => void handleDownload()}
                                                 >
@@ -737,7 +737,7 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
                                             />
                                             <button
                                                 type="button"
-                                                className="btn mock-cta"
+                                                className="btn btn-primary"
                                                 disabled={retryAfterSeconds !== null && retryAfterSeconds > 0}
                                                 onClick={() => { void loadPublicAlbum(accessCode); }}
                                             >
@@ -822,7 +822,7 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
                                         <div className="pt-public-state" style={{ minHeight: 'auto', padding: '18px 0 6px' }}>
                                             <button
                                                 type="button"
-                                                className="btn mock-cta"
+                                                className="btn btn-primary"
                                                 disabled={loadingMore}
                                                 onClick={loadMorePhotos}
                                             >

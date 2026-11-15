@@ -11,11 +11,14 @@
 :root {
   color-scheme: light dark;
 
-  /* ---- Fonts: system stacks only, straight from the sketchbook -- no webfont load needed. ---- */
-  --font-label: 'SF Mono', Menlo, Consolas, 'Roboto Mono', monospace;
-  --font-display: Futura, 'Avenir Next Condensed', 'Century Gothic', 'Trebuchet MS', sans-serif;
-  --font-ui: -apple-system, 'SF Pro Text', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-  --font-mono: var(--font-label);
+  /* ---- Fonts: Jost for titles, Figtree for everything else. Both ship with the
+     app (@fontsource-variable, imported in index.tsx), so headings look the same
+     on iPhone, Android and Windows instead of falling back to whatever the OS
+     has. --font-mono is for codes and data only, never for labels or hints. ---- */
+  --font-display: 'Jost Variable', Futura, 'Century Gothic', 'Trebuchet MS', sans-serif;
+  --font-ui: 'Figtree Variable', -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: 'SF Mono', Menlo, Consolas, 'Roboto Mono', monospace;
+  --font-label: var(--font-ui);
 
   /* ---- Brand surface ---- */
   --bg-1: #fbf9f5;
@@ -30,7 +33,12 @@
   --muted: #6b6458;
   --accent: #2f5d82;
   --accent-soft: rgba(47, 93, 130, 0.12);
-  --danger: #d24b5a;
+  --danger: #c23a4b;
+  --danger-soft: rgba(194, 58, 75, 0.12);
+  /* Text on a filled --accent / --danger button. White passes contrast on the
+     deep light-theme colours; dark theme lightens them, so it flips to ink. */
+  --on-accent: #ffffff;
+  --on-danger: #ffffff;
   --success: #1a8c61;
   /* Badges/notification dots only ("All new", "As built") -- kept
      distinct from --danger, which stays reserved for destructive
@@ -90,6 +98,18 @@
   --surface-strong: var(--lg-surface-strong);
   --shadow-soft: var(--lg-shadow-resting);
   --focus-ring: 0 0 0 3px rgba(47, 93, 130, 0.32);
+
+  /* ---- Same in both themes: marks drawn on photos, and the always-dark viewer ---- */
+  --star: #e2b33f;
+  --like: #ff6b7d;
+  --warning: #d19a00;
+  --on-photo: #ffffff;
+  --viewer-bg: #0e0d0b;
+  --viewer-text: #ece6d9;
+  --viewer-muted: #cfc8ba;
+  --viewer-subtle: #9c9486;
+  --viewer-accent: #6fa3c9;
+  --viewer-danger: #ff8a8a;
 }
 
 /* ---- Dark appearance (System → Display → Dark) ---- */
@@ -108,6 +128,10 @@
     --accent: #6fa3c9;
     --accent-soft: rgba(111, 163, 201, 0.16);
     --danger: #ff6b7d;
+    --danger-soft: rgba(255, 107, 125, 0.14);
+    --on-accent: #0c1924;
+    --on-danger: #2b0b11;
+    --focus-ring: 0 0 0 3px rgba(111, 163, 201, 0.42);
     --success: #3ddc97;
     --grease: #e2643d;
     --grease-soft: rgba(226, 100, 61, 0.14);
@@ -141,7 +165,12 @@ html[data-theme='light'] {
   --muted: #6b6458;
   --accent: #2f5d82;
   --accent-soft: rgba(47, 93, 130, 0.12);
-  --danger: #d24b5a;
+  --danger: #c23a4b;
+  --danger-soft: rgba(194, 58, 75, 0.12);
+  /* Text on a filled --accent / --danger button. White passes contrast on the
+     deep light-theme colours; dark theme lightens them, so it flips to ink. */
+  --on-accent: #ffffff;
+  --on-danger: #ffffff;
   --success: #1a8c61;
   --grease: #c1401f;
   --grease-soft: rgba(193, 64, 31, 0.1);
@@ -176,6 +205,10 @@ html[data-theme='dark'] {
   --accent: #6fa3c9;
   --accent-soft: rgba(111, 163, 201, 0.16);
   --danger: #ff6b7d;
+  --danger-soft: rgba(255, 107, 125, 0.14);
+  --on-accent: #0c1924;
+  --on-danger: #2b0b11;
+  --focus-ring: 0 0 0 3px rgba(111, 163, 201, 0.42);
   --success: #3ddc97;
   --grease: #e2643d;
   --grease-soft: rgba(226, 100, 61, 0.14);
@@ -568,7 +601,7 @@ a {
 
 .local-login input:focus-visible {
   outline: none;
-  border-color: rgba(30, 106, 225, 0.4);
+  border-color: var(--accent);
   box-shadow: var(--focus-ring);
 }
 
@@ -614,11 +647,8 @@ a {
 
 .local-login label {
   margin-top: 10px;
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  font-family: var(--font-label);
+  font-size: 12.5px;
+  font-weight: 600;
   color: var(--muted);
 }
 
@@ -661,13 +691,11 @@ a {
   text-align: center;
 }
 
-/* Primary action uses the brand accent. The shared .btn-primary still ships a
-   leftover iOS-blue gradient; auth CTAs match the prototype's .mock-cta so the
-   sign-in / invite / reset buttons stay on-brand (and match the emails). */
+/* Primary action uses the brand accent, like every .btn-primary. */
 .auth-page .btn-primary {
   background: var(--accent);
   border-color: transparent;
-  color: #fff;
+  color: var(--on-accent);
 }
 
 .auth-page .btn-primary:hover {
@@ -908,8 +936,8 @@ a {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  color: #fff;
-  background: linear-gradient(145deg, #f25f5f 0%, #da3b52 100%);
+  color: var(--on-danger);
+  background: var(--danger);
 }
 
 .notification-pane {
@@ -943,7 +971,7 @@ a {
   gap: 6px;
 }
 
-.notification-close {
+.notification-actions .notification-close {
   display: none;
 }
 
@@ -964,20 +992,8 @@ a {
 /* Light is the base so "System" appearance with a light OS (no data-theme
    attribute) isn't left with the dark highlight; dark is opted into below. */
 .notification-item.unread {
-  border-color: rgba(10, 132, 255, 0.24);
-  background: linear-gradient(180deg, rgba(229, 242, 255, 0.98) 0%, rgba(244, 249, 255, 0.96) 100%);
-}
-
-@media (prefers-color-scheme: dark) {
-  html:not([data-theme='light']) .notification-item.unread {
-    border-color: rgba(10, 132, 255, 0.35);
-    background: rgba(6, 15, 24, 0.7);
-  }
-}
-
-html[data-theme='dark'] .notification-item.unread {
-  border-color: rgba(10, 132, 255, 0.35);
-  background: rgba(6, 15, 24, 0.7);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  background: var(--accent-soft);
 }
 
 .notification-title {
@@ -1005,9 +1021,9 @@ html[data-theme='dark'] .notification-item.unread {
   justify-content: space-between;
   margin: 2px 0 14px;
   padding: 10px 12px;
-  border: 1px solid rgba(10, 132, 255, 0.3);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
   border-radius: var(--r-lg);
-  background: rgba(229, 242, 255, 0.72);
+  background: var(--accent-soft);
 }
 
 .upload-approval-title {
@@ -1145,7 +1161,7 @@ html[data-theme='dark'] .notification-item.unread {
 .field:focus-visible,
 .field-select:focus-visible {
   outline: none;
-  border-color: rgba(30, 106, 225, 0.4);
+  border-color: var(--accent);
   box-shadow: var(--focus-ring);
 }
 
@@ -1180,7 +1196,7 @@ html[data-theme='dark'] .notification-item.unread {
 }
 
 .photo-preview-star.is-on {
-  color: #ffcf4a;
+  color: var(--star);
 }
 
 @media (max-width: 720px) {
@@ -1210,9 +1226,9 @@ html[data-theme='dark'] .notification-item.unread {
 }
 
 .photo-preview-like.is-liked {
-  color: #ff5c7a;
-  border-color: rgba(255, 92, 122, 0.4);
-  background: rgba(255, 92, 122, 0.12);
+  color: var(--like);
+  border-color: color-mix(in srgb, var(--like) 40%, transparent);
+  background: color-mix(in srgb, var(--like) 12%, transparent);
 }
 
 .photo-preview-like .toolbar-icon {
@@ -1228,9 +1244,7 @@ html[data-theme='dark'] .notification-item.unread {
   transition: transform var(--dur-quick) ease, background-color var(--dur-quick) ease, border-color var(--dur-quick) ease, box-shadow var(--dur-base) ease;
 }
 
-/* Heroicons ship no intrinsic size -- without this, a .toolbar-icon inside
-   a plain (non-.icon-btn) button has no width/height and renders at the
-   browser's oversized replaced-element default. */
+/* Icons inside a plain button: one size, whatever the icon's own default. */
 .btn .toolbar-icon {
   width: 15px;
   height: 15px;
@@ -1239,7 +1253,7 @@ html[data-theme='dark'] .notification-item.unread {
 
 .btn:focus-visible {
   outline: none;
-  border-color: rgba(30, 106, 225, 0.4);
+  border-color: var(--accent);
   box-shadow: var(--focus-ring);
 }
 
@@ -1252,24 +1266,74 @@ html[data-theme='dark'] .notification-item.unread {
   transform: scale(0.97);
 }
 
+/* One primary colour app-wide: the brand accent (this used to be a separate
+   iOS-blue gradient, so dialogs and pages had two different blues). */
 .btn-primary {
   border-color: transparent;
-  background: linear-gradient(145deg, #2f98ff 0%, #0a84ff 100%);
-  color: #fff;
+  background: var(--accent);
+  color: var(--on-accent);
 }
 
-.btn-danger {
-  border-color: rgba(218, 59, 82, 0.26);
-  color: var(--danger);
+.btn-primary:hover {
+  background: color-mix(in srgb, var(--accent) 88%, black);
 }
 
 .btn-soft {
   background: var(--lg-surface-wash);
 }
 
+/* Control sizes: .btn is the 44px default for main actions; .btn-sm is the
+   34px compact size for toolbars and inline rows. Text links use .btn-link. */
+.btn-sm {
+  min-height: 34px;
+  padding: 6px 12px;
+}
+
+/* Icon-only button: a circle at either size. Always give it an aria-label. */
+.btn-icon {
+  width: var(--tap-min);
+  padding: 0;
+  border-radius: 50%;
+  display: inline-grid;
+  place-items: center;
+}
+
+.btn-icon.btn-sm {
+  width: 34px;
+}
+
+/* Filter chip: compact pill; the selected one inverts. */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 34px;
+  padding: 0 13px;
+  border: 1px solid var(--lg-edge);
+  border-radius: var(--r-pill);
+  background: var(--lg-surface-wash);
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.chip[aria-pressed='true'] {
+  background: var(--text);
+  border-color: var(--text);
+  color: var(--bg-1);
+}
+
+.chip:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
 .btn-soft.active {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   border-color: var(--accent);
 }
 
@@ -1318,8 +1382,8 @@ html[data-theme='dark'] .notification-item.unread {
 }
 
 .photo-card.selected {
-  border-color: rgba(20, 120, 255, 0.6);
-  box-shadow: var(--lg-shadow-raised), 0 0 0 2px rgba(20, 120, 255, 0.16);
+  border-color: var(--accent);
+  box-shadow: var(--lg-shadow-raised), 0 0 0 2px var(--accent-soft);
 }
 
 .photo-media {
@@ -1454,9 +1518,9 @@ html[data-theme='dark'] .notification-item.unread {
   font-weight: 600;
   padding: 2px 8px;
   border-radius: var(--r-pill);
-  background: rgba(99, 102, 241, 0.12);
-  color: #4f46e5;
-  border: 1px solid rgba(99, 102, 241, 0.2);
+  background: var(--accent-soft);
+  color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent);
   white-space: nowrap;
 }
 
@@ -1616,7 +1680,7 @@ html[data-theme='dark'] .notification-item.unread {
 
 .photo-preview-error {
   margin: 4px 0 0;
-  color: #ffd0d0;
+  color: color-mix(in srgb, var(--viewer-danger) 45%, white);
   font-size: 12px;
 }
 
@@ -1662,8 +1726,8 @@ html[data-theme='dark'] .notification-item.unread {
 }
 
 .photo-preview-fr.is-active {
-  background: rgba(120, 200, 255, 0.28);
-  border-color: rgba(120, 200, 255, 0.55);
+  background: color-mix(in srgb, var(--viewer-accent) 30%, transparent);
+  border-color: color-mix(in srgb, var(--viewer-accent) 60%, transparent);
 }
 
 .photo-preview-fr-loading {
@@ -1894,7 +1958,7 @@ video.photo-preview-media.is-loading {
 }
 
 .photo-preview-actionbar-item.is-danger {
-  color: #ff8a8a;
+  color: var(--viewer-danger);
 }
 
 .photo-preview-actionbar-item .toolbar-icon {
@@ -1976,7 +2040,7 @@ video.photo-preview-media.is-loading {
 
 .photo-preview-speed-btn.active {
   background: rgba(255, 255, 255, 0.9);
-  color: #111827;
+  color: var(--viewer-bg);
   border-color: transparent;
 }
 
@@ -1991,8 +2055,8 @@ video.photo-preview-media.is-loading {
 }
 
 .photo-preview-info-toggle.is-active {
-  background: rgba(120, 200, 255, 0.28);
-  border-color: rgba(120, 200, 255, 0.55);
+  background: color-mix(in srgb, var(--viewer-accent) 30%, transparent);
+  border-color: color-mix(in srgb, var(--viewer-accent) 60%, transparent);
 }
 
 .photo-preview-details {
@@ -2126,7 +2190,7 @@ video.photo-preview-media.is-loading {
 
 .error-state-icon {
   color: var(--danger);
-  background: rgba(210, 75, 90, 0.12);
+  background: var(--danger-soft);
 }
 
 /* ---- Toasts (services/toast.ts) ---- */
@@ -2219,8 +2283,9 @@ video.photo-preview-media.is-loading {
 
 .dialog-title {
   margin: 0 0 8px;
-  font-size: 17px;
-  font-weight: 700;
+  font-family: var(--font-display);
+  font-size: 19px;
+  font-weight: 600;
   color: var(--text);
 }
 
@@ -2254,7 +2319,7 @@ video.photo-preview-media.is-loading {
 .btn-danger {
   background: var(--danger);
   border-color: transparent;
-  color: #fff;
+  color: var(--on-danger);
 }
 
 .btn-danger:hover {
@@ -2411,7 +2476,7 @@ video.photo-preview-media.is-loading {
 
 .progress-bar {
   height: 100%;
-  background: linear-gradient(145deg, #53b5ff 0%, #0a84ff 100%);
+  background: var(--accent);
   transition: width var(--dur-base) ease;
 }
 
@@ -2659,8 +2724,8 @@ video.photo-preview-media.is-loading {
     z-index: 80;
   }
 
-  .notification-close {
-    display: inline-flex;
+  .notification-actions .notification-close {
+    display: inline-grid;
   }
 }
 
@@ -2695,7 +2760,7 @@ video.photo-preview-media.is-loading {
 
 .btn-soft.danger {
   margin-top: 0.75rem;
-  color: #b4231f;
+  color: var(--danger);
 }
 
 .btn-soft.danger:disabled {

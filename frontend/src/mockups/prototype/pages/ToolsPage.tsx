@@ -556,7 +556,7 @@ const ToolsPage: React.FC = () => {
                     <div className="card-glass pt-recover-card">
                         <strong>Deduplicate faces</strong>
                         <span>Find and remove duplicate face rows across your library.</span>
-                        <button type="button" className="btn mock-cta" disabled={busy} onClick={() => void runAdmin('Face dedupe', '/api/admin/people/dedupe-faces', { repair: true, dryRun: false, confirm: 'DEDUPE_FACES' })}>Apply</button>
+                        <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void runAdmin('Face dedupe', '/api/admin/people/dedupe-faces', { repair: true, dryRun: false, confirm: 'DEDUPE_FACES' })}>Apply</button>
                     </div>
                     <div className="card-glass pt-recover-card">
                         <strong>Rebuild people index</strong>

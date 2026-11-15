@@ -162,7 +162,7 @@ const AskPage: React.FC = () => {
                     onChange={(e) => setQuery(e.target.value)}
                 />
                 {results.length > 0 && (
-                    <button type="button" className="btn mock-cta" onClick={saveAsAlbum} disabled={saving}>
+                    <button type="button" className="btn btn-primary" onClick={saveAsAlbum} disabled={saving}>
                         <PlusIcon className="toolbar-icon" /> {saving ? 'Saving…' : 'Save as album'}
                     </button>
                 )}
