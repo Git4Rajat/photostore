@@ -288,7 +288,7 @@ export const PersonDetailPage: React.FC = () => {
                             onChange={(e) => setDraft(e.target.value)}
                             onKeyDown={(e) => { if (e.key === 'Enter' && draft.trim()) { renamePerson(person.id, draft.trim()); toast('Name saved'); } }}
                         />
-                        <button type="button" className="btn mock-cta" disabled={!draft.trim()} onClick={() => { renamePerson(person.id, draft.trim()); toast('Name saved'); }}>Save</button>
+                        <button type="button" className="btn btn-primary" disabled={!draft.trim()} onClick={() => { renamePerson(person.id, draft.trim()); toast('Name saved'); }}>Save</button>
                     </div>
                 </div>
                 <div className="pt-toolbar-actions">

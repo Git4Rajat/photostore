@@ -272,7 +272,7 @@ export const AlbumsPage: React.FC = () => {
                 {albumsLoading ? <Spinner label="Loading albums…" /> : <p>No albums yet.</p>}
                 {!albumsLoading && (
                     <div className="pt-arrive-actions">
-                        <button type="button" className="btn mock-cta" onClick={() => void handleCreate(true)}>
+                        <button type="button" className="btn btn-primary" onClick={() => void handleCreate(true)}>
                             <PlusIcon className="toolbar-icon" /> New album
                         </button>
                         <button type="button" className="btn" onClick={() => setSmartSheetOpen(true)} disabled={smartCreatingRule !== null}>
@@ -448,7 +448,7 @@ export const AlbumsPage: React.FC = () => {
                                     <button type="button" className="pt-linkish danger" onClick={() => void confirmDeleteAlbum()}>Delete</button>
                                 </p>
                             </div>
-                            <button type="button" className="btn mock-cta" onClick={() => void togglePublic()}>
+                            <button type="button" className="btn btn-primary" onClick={() => void togglePublic()}>
                                 <ShareIcon className="toolbar-icon" /> <span>{album.isPublic ? 'Sharing on' : 'Share'}</span>
                             </button>
                         </div>

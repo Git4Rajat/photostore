@@ -2,7 +2,7 @@
    Prototype-only styles for the fully-functional Keepsake prototype.
    Loaded after index.css + mockups.css, so it reuses real tokens and the
    shared mock classes (mock-swatch, upload-dock, share-sheet, member-row,
-   mock-switch, btn/.mock-cta, card-glass, .ios-header/.ios-tabs …) and only
+   mock-switch, btn, card-glass, .ios-header/.ios-tabs …) and only
    adds the pt-* classes the prototype app introduces.
    ================================================================= */
 

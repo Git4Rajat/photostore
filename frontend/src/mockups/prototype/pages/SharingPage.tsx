@@ -115,7 +115,7 @@ const SharingPage: React.FC = () => {
                             <option value="join">Join this library</option>
                             <option value="fresh">Start their own library</option>
                         </select>
-                        <button type="button" className="btn mock-cta" disabled={!valid || atCapacity} onClick={send}>
+                        <button type="button" className="btn btn-primary" disabled={!valid || atCapacity} onClick={send}>
                             <PaperAirplaneIcon className="toolbar-icon" /> Send invite
                         </button>
                     </div>

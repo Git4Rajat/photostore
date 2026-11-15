@@ -83,7 +83,7 @@ const StuckWavesCard: React.FC<{ onMessage: (message: string, error?: boolean) =
                 <div key={String(wave.waveId)} className="pt-wave-row">
                     <span>{String(wave.waveId)}: {describeWave(wave)}</span>
                     {canRetry(wave) && (
-                        <button type="button" className="btn mock-cta" disabled={!!busy} onClick={() => void retry(wave)}>
+                        <button type="button" className="btn btn-primary" disabled={!!busy} onClick={() => void retry(wave)}>
                             {busy === wave.waveId ? 'Retrying…' : 'Retry'}
                         </button>
                     )}

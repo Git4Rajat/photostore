@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { Button } from '../ui/Button';
 
 // Promise-based, theme-styled replacements for window.confirm / window.prompt.
 // A single <DialogHost /> is mounted in App; confirmDialog()/promptDialog() can
@@ -140,27 +141,22 @@ export const DialogHost: React.FC = () => {
                             onChange={(event) => setInputValue(event.target.value)}
                         />
                         <div className="dialog-actions">
-                            <button type="button" className="btn btn-soft" onClick={() => settle(null)}>
+                            <Button variant="soft" onClick={() => settle(null)}>
                                 {opts.cancelLabel || 'Cancel'}
-                            </button>
-                            <button type="submit" className="btn btn-primary">
+                            </Button>
+                            <Button type="submit" variant="primary">
                                 {opts.confirmLabel || 'OK'}
-                            </button>
+                            </Button>
                         </div>
                     </form>
                 ) : (
                     <div className="dialog-actions">
-                        <button type="button" className="btn btn-soft" onClick={() => settle(false)}>
+                        <Button variant="soft" onClick={() => settle(false)}>
                             {opts.cancelLabel || 'Cancel'}
-                        </button>
-                        <button
-                            type="button"
-                            ref={primaryRef}
-                            className={`btn ${opts.danger ? 'btn-danger' : 'btn-primary'}`}
-                            onClick={() => settle(true)}
-                        >
+                        </Button>
+                        <Button ref={primaryRef} variant={opts.danger ? 'danger' : 'primary'} onClick={() => settle(true)}>
                             {opts.confirmLabel || 'OK'}
-                        </button>
+                        </Button>
                     </div>
                 )}
             </div>

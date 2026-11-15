@@ -340,7 +340,7 @@ const GalleryPage: React.FC = () => {
                         <div className="empty-state-action pt-arrive-actions">
                             <button
                                 type="button"
-                                className="btn mock-cta"
+                                className="btn btn-primary"
                                 onClick={() => { setGalleryRating(0); setGalleryLikedOnly(false); setMediaFilter('all'); }}
                             >
                                 Clear filters
@@ -359,7 +359,7 @@ const GalleryPage: React.FC = () => {
                         Upload your first photos and Keepsake starts sorting faces, places and moments as they come in.
                     </p>
                     <div className="empty-state-action pt-arrive-actions">
-                        <button type="button" className="btn mock-cta" onClick={requestUpload}>
+                        <button type="button" className="btn btn-primary" onClick={requestUpload}>
                             <ArrowUpTrayIcon className="toolbar-icon" /> Upload photos
                         </button>
                         <button type="button" className="btn" onClick={() => navigate('sharing')}>
@@ -416,7 +416,7 @@ const GalleryPage: React.FC = () => {
                                 <button type="button" className="btn" onClick={() => selectMany(visiblePhotos.map((p) => p.id))}>
                                     Select all
                                 </button>
-                                <button type="button" className="btn mock-cta" onClick={() => setSelectMode(false)}>
+                                <button type="button" className="btn btn-primary" onClick={() => setSelectMode(false)}>
                                     Done
                                 </button>
                             </>

@@ -30,7 +30,7 @@ export const HomeChrome: React.FC<{ subtitle: string; tileMin?: number; children
                             ))}
                         </nav>
                         <div className="app-header-actions" aria-hidden="true">
-                            <span className="btn mock-cta pt-upload-btn"><PlusIcon className="toolbar-icon" /> <span className="pt-upload-label">Upload</span></span>
+                            <span className="btn btn-primary pt-upload-btn"><PlusIcon className="toolbar-icon" /> <span className="pt-upload-label">Upload</span></span>
                             <span className="mock-avatar pt-avatar-btn" />
                         </div>
                     </header>

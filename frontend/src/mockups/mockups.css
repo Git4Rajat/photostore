@@ -140,14 +140,6 @@
   gap: 7px;
 }
 
-/* shared: primary CTA in the brand accent, same as .btn-primary. */
-.btn.mock-cta {
-  background: var(--accent);
-  border-color: transparent;
-  color: var(--on-accent);
-}
-.btn.mock-cta:hover { background: color-mix(in srgb, var(--accent) 88%, black); }
-
 /* placeholder photo swatches (stand in for real thumbnails) */
 .mock-swatch { background: linear-gradient(135deg, #7a8b6f, #b7c39a); }
 .mock-swatch.s2 { background: linear-gradient(135deg, #3f5a73, #8fb4c9); }

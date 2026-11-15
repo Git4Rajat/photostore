@@ -148,7 +148,7 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
                 ))}
             </nav>
             <div className="app-header-actions">
-                <button type="button" className="btn mock-cta pt-upload-btn" onClick={requestUpload} aria-label="Upload">
+                <button type="button" className="btn btn-primary pt-upload-btn" onClick={requestUpload} aria-label="Upload">
                     <PlusIcon className="toolbar-icon" /> <span className="pt-upload-label">Upload</span>
                 </button>
 
