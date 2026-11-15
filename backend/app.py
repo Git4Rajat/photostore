@@ -25,6 +25,7 @@ import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from collections import deque
 from contextlib import ExitStack
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote as _urlquote, urlparse
@@ -647,6 +648,9 @@ LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY = int(os.getenv('LIBRARY_EXPORT_DOWNLOAD_CON
 # -- pure network I/O wait each time, same shape as the library-export
 # downloads above, so overlapping them is the same low-risk win.
 DELETE_IO_CONCURRENCY = int(os.getenv('DELETE_IO_CONCURRENCY', '16'))
+# Clean library runs its own bulk wipe (library_clean.py, docs/library-clean-dedicated.md); 'legacy' keeps
+# the old per-photo path for one release as a rollback.
+LIBRARY_CLEAN_ENGINE = os.getenv('LIBRARY_CLEAN_ENGINE', 'dedicated').strip().lower()
 # Per-row source writes each open a coverage reservation on one hot control row, and that row loses races past a
 # handful of concurrent writers. Soft delete batches rows into one transaction (one reservation per 100 rows) and
 # only the per-row fallback runs concurrently, kept at the width that has not been seen to lose races.
@@ -10809,7 +10813,105 @@ def _execute_library_clean(library_id: str) -> Dict:
     """Delete every photo/video and its derived data for a library. Runs on the
     queue-scaled worker (see _enqueue_library_clean_job) since it walks the
     library's full metadata partition, mirroring the existing clustering jobs'
-    "don't do full scans inline" rule."""
+    "don't do full scans inline" rule. Both engines run under the same catalog
+    lock and quiescence proof."""
+    if LIBRARY_CLEAN_ENGINE == 'legacy':
+        return _legacy_library_clean(library_id)
+    return _dedicated_library_clean(library_id)
+
+
+# The running clean's job id, so the dedicated clean can report progress on its job row.
+_LIBRARY_CLEAN_JOB: ContextVar = ContextVar('library_clean_job', default='')
+
+
+def _library_clean_stores(library_id: str, check) -> 'library_clean.Stores':
+    import library_clean
+    clients = {
+        'metadata': metadata_table_client, 'embeddings': embeddings_table_client,
+        'face_embeddings': face_embeddings_table_client, 'faces': face_table_client,
+        'face_by_filename': face_by_filename_table_client, 'people': person_table_client,
+        'person_members': person_members_table_client, 'albums': albums_table_client,
+        'album_members': album_members_table_client, 'album_tokens': album_token_index_table_client,
+        'merges': merge_table_client, 'image_names': image_names_table_client, 'hashes': hash_index_table_client,
+        'filename_owners': filename_owners_table_client, 'trash': trash_index_table_client,
+        'workbench': workbench_actions_table_client, 'jobs': jobs_table_client,
+        'people_dirty': people_dirty_set_table_client, 'albums_dirty': albums_dirty_set_table_client,
+        'upload_sessions': upload_sessions_table_client,
+    }
+    containers = {
+        'images': BLOB_IMAGE_CONTAINER, 'thumbnails': BLOB_THUMBNAIL_CONTAINER, 'covers': BLOB_COVER_CONTAINER,
+        'exports': BLOB_EXPORTS_CONTAINER, 'merge_payloads': BLOB_MERGE_PAYLOADS_CONTAINER,
+        'people_embedding_index': BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER, 'web': share_snapshot.WEB_CONTAINER,
+    }
+    job_id = _LIBRARY_CLEAN_JOB.get()
+
+    def progress(state):
+        # Update only: a progress write must never create a job row the clean would then have to delete.
+        if job_id and jobs_table_client is not None:
+            try:
+                jobs_table_client.update_entity({'PartitionKey': library_id, 'RowKey': job_id,
+                                                 'progress': json.dumps(state, separators=(',', ':'))},
+                                                mode=UpdateMode.MERGE)
+            except ResourceNotFoundError:
+                pass
+
+    return library_clean.Stores(
+        tables=clients, blobs=blob_service_client, containers=containers, check=check or (lambda: None),
+        progress=progress, finish_indexes=lambda: _finish_library_clean_indexes(library_id),
+        delete_snapshot=share_snapshot.delete)
+
+
+def _finish_library_clean_indexes(library_id: str) -> None:
+    """The index side of a clean, after the source rows are gone (phase 5 of library_clean)."""
+    import processing_cleanup
+    try:
+        invalidate_image_names_cache(library_id)
+    except Exception:
+        pass
+    _delete_cover_blobs_for_library(library_id)
+    delete_user_vector_index_data(library_id)
+    delete_user_lexical_index_data(library_id)
+    delete_user_tag_embedding_index_data(library_id)
+    storage_utils_module.delete_user_people_embedding_index_data(library_id)
+    delete_user_sort_index_data(library_id)
+    delete_user_access_index_data(library_id)
+    delete_user_albums_index_data(library_id)
+    delete_user_people_index_data(library_id)
+    _invalidate_metadata_scan_cache(library_id)
+    processing_cleanup.collect_library_artifacts(jobs_table_client, storage_utils_module, metadata_table_client,
+                                                 library_id)
+    if storage_utils_module.DURABLE_INDEX_UPDATES:
+        quiesced_user_index_artifact_purge(library_id)
+
+
+def _dedicated_library_clean(library_id: str) -> Dict:
+    import library_clean
+    import processing_cleanup
+    if storage_utils_module.DURABLE_INDEX_UPDATES:
+        _require_quiesced_index_purge(library_id)
+    from automatic_index_updates import current_cleanup_check
+    check = current_cleanup_check(library_id)
+    processing_cleanup.begin_library_cleanup(jobs_table_client, metadata_table_client, library_id)
+    summary = library_clean.run(library_id, _library_clean_stores(library_id, check))
+    processing_cleanup.finish_library_cleanup(jobs_table_client, library_id)
+    return summary
+
+
+def _delete_library_lock_blobs(library_id: str) -> None:
+    """The per-library lease blobs (catalog lock, FAISS assignment lock), once the clean has released them.
+    A lease someone else holds makes the delete fail, which leaves it alone; the next acquire recreates it."""
+    if blob_service_client is None:
+        return
+    name = hashlib.sha256(library_id.encode('utf-8')).hexdigest() + '.json'
+    for container, blob in ((BLOB_LEXICAL_INDEX_CONTAINER, 'catalog-publication-locks/' + name),
+                            (BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER, 'faiss-assignment-locks/' + name)):
+        try:
+            blob_service_client.get_blob_client(container=container, blob=blob).delete_blob()
+        except Exception:
+            pass
+
+
+def _legacy_library_clean(library_id: str) -> Dict:
     import processing_cleanup
     if storage_utils_module.DURABLE_INDEX_UPDATES:
         _require_quiesced_index_purge(library_id)
@@ -10956,8 +11058,15 @@ def _run_library_clean(library_id: str, job_id: str) -> Dict:
     library, waits for writers to drain and records that itself, lifting the
     fence afterwards (automatic_index_updates.self_quiesced)."""
     import automatic_index_updates as automatic
-    with automatic.self_quiesced(library_id, operation='library_clean', reason=job_id or 'library_clean'):
-        return _execute_library_clean(library_id)
+    token = _LIBRARY_CLEAN_JOB.set(job_id or '')
+    try:
+        with automatic.self_quiesced(library_id, operation='library_clean', reason=job_id or 'library_clean'):
+            summary = _execute_library_clean(library_id)
+    finally:
+        _LIBRARY_CLEAN_JOB.reset(token)
+    if LIBRARY_CLEAN_ENGINE != 'legacy':
+        _delete_library_lock_blobs(library_id)
+    return summary
 
 
 def _library_clean_failure_reason(error: BaseException) -> str:

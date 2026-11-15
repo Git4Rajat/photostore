@@ -34,6 +34,9 @@ class StreamingTable(FakeTable):
 
 @pytest.fixture(autouse=True)
 def isolated_cleanup(monkeypatch):
+    # These pin the per-photo engine kept as LIBRARY_CLEAN_ENGINE=legacy (and shared with library purge);
+    # tests/test_library_clean.py covers the dedicated clean.
+    monkeypatch.setattr(app, 'LIBRARY_CLEAN_ENGINE', 'legacy')
     for name in vars(app):
         if name.endswith('_table_client'):
             monkeypatch.setattr(app, name, None)
