@@ -366,25 +366,69 @@ def begin_library_cleanup(table,metadata,library):
             latest=store._required('control')
             store.table.submit_transaction([store._change(latest,dict(latest,collectingWaveId='',tailWaveId=''))])
     store._retry(detach)
-    # Invalidate source attempts before the caller starts physical deletion.
+    # Invalidate source attempts before the caller starts physical deletion: a deletion proof per photo
+    # and processing_state='deleted' on its metadata row. Written in transactions -- proofs
+    # PROOF_BATCH per control-row commit, metadata rows 100 per transaction -- instead of three
+    # sequential calls per photo (about half an hour for a 20k-photo library at 25 ms a call).
+    from itertools import islice
+    from wave_settlement import deletion_key
     query="PartitionKey eq '"+library.replace("'","''")+"'"
+    proven=_deletion_proofs(store)
+    rows=iter(metadata.query_entities(query,select=_DELETION_FIELDS,results_per_page=1000))
+    while page:=list(islice(rows,1000)):
+        proofs=[(deletion_key(row['anonymousImageId'],row['processingRevision']),row) for row in page
+                if row.get('anonymousImageId') and row.get('processingRevision')]
+        proofs=[(key,row) for key,row in proofs if key not in proven]
+        for i in range(0,len(proofs),PROOF_BATCH):
+            _record_deletion_proofs(store,proofs[i:i+PROOF_BATCH])
+            proven.update(key for key,_ in proofs[i:i+PROOF_BATCH])
+        for i in range(0,len(page),100):
+            _mark_sources_deleted(metadata,library,page[i:i+100])
+    return True
+
+
+# One wave commit carries the control row, the policy guard and an execution-lease guard besides its changes.
+PROOF_BATCH=96
+_DELETION_FIELDS=['PartitionKey','RowKey','anonymousImageId','processingRevision','processingFence',
+    'processingDeletedAttempt']
+
+
+def _deletion_proofs(store):
+    query=(f"PartitionKey eq '{store.partition}' and RowKey ge 'deleted-source!' "
+           f"and RowKey lt 'deleted-source!~'")
+    return {row['RowKey'] for row in store.table.query_entities(query,results_per_page=1000)}
+
+
+def _record_deletion_proofs(store,proofs):
+    pending=list(proofs);attempts=[0]
+    def record():
+        nonlocal pending
+        if attempts[0]:  # lost a race: someone may have written some of these meanwhile
+            pending=[(key,row) for key,row in pending if store._get(key) is None]
+        attempts[0]+=1
+        if not pending:return
+        store._commit(store._get('control'),[('create',store._row(key,
+            photoId=row['anonymousImageId'],processingRevision=row['processingRevision'],filename=row['RowKey'],
+            processingAttempt=row.get('processingFence') or row.get('processingDeletedAttempt',''),
+            deletedAt=store.clock())) for key,row in pending],maintenance=True)
+    store._retry(record)
+
+
+def _mark_sources_deleted(metadata,library,rows):
     from azure.core import MatchConditions
     from azure.data.tables import UpdateMode
-    for row in metadata.query_entities(query):
-        if row.get('anonymousImageId') and row.get('processingRevision'):
-            from wave_settlement import deletion_key
-            key=deletion_key(row['anonymousImageId'],row['processingRevision'])
-            def record():
-                if store._get(key):return
-                store._commit(store._get('control'),[('create',store._row(key,
-                    photoId=row['anonymousImageId'],processingRevision=row['processingRevision'],filename=row['RowKey'],
-                    processingAttempt=row.get('processingFence') or row.get('processingDeletedAttempt',''),deletedAt=store.clock()))],maintenance=True)
-            store._retry(record)
-        metadata.update_entity(dict(PartitionKey=library,RowKey=row['RowKey'],processing_state='deleted',
+    def change(row):
+        return dict(PartitionKey=library,RowKey=row['RowKey'],processing_state='deleted',
             processingDeletedAttempt=row.get('processingFence') or row.get('processingDeletedAttempt',''),
-            processingFence='',processing_lease_owner='',processing_lease='',processing_lease_expires_at=''),
-            mode=UpdateMode.MERGE,etag=row.metadata['etag'],match_condition=MatchConditions.IfNotModified)
-    return True
+            processingFence='',processing_lease_owner='',processing_lease='',processing_lease_expires_at='')
+    options=lambda row:dict(mode=UpdateMode.MERGE,etag=row.metadata['etag'],match_condition=MatchConditions.IfNotModified)
+    try:
+        metadata.submit_transaction([('update',change(row),options(row)) for row in rows])
+    except Exception:
+        # One changed row fails the whole transaction. Redo it row by row so that row's conflict
+        # surfaces exactly as it always has (and the cleanup retries) while the others still land.
+        for row in rows:
+            metadata.update_entity(change(row),**options(row))
 
 
 def collect_library_artifacts(table,storage,metadata,library,*,limit=50,purge=False,lease_check=lambda:None):

@@ -139,16 +139,20 @@ def check_source_admission(user):
 
 
 def _check_publication_claims(user):
+    """No live maintenance claim for this library. Every work row carries its libraryId (WorkStore.request
+    and claim write it), so one query per partition answers what used to take a point read per scope:
+    2 calls instead of 30, and a clean rechecks this once per round of writes."""
     import app
     from index_work import PARTITION
-    from index_updates import SCOPE_KINDS
     if app.jobs_table_client is None:
         raise RuntimeError('Quiescence work storage unavailable')
+    now = time.time()
     for pk in (PARTITION, TAG_PARTITION):
-        store = WorkStore(app.jobs_table_client, partition=pk)
-        for scope in SCOPE_KINDS:
-            row = store._get(store.key(user, scope))
-            if row and float(row.get('leaseUntil') or 0) > time.time():
+        rows = app.jobs_table_client.query_entities(
+            f"PartitionKey eq '{pk}' and libraryId eq '{user.replace(chr(39), chr(39) * 2)}'",
+            select=['libraryId', 'leaseUntil'])
+        for row in rows:
+            if row.get('libraryId') == user and float(row.get('leaseUntil') or 0) > now:
                 raise SourceBusy('Live maintenance claim prevents quiesced recovery')
 
 

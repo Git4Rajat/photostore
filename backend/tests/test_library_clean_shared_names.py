@@ -40,6 +40,13 @@ def filename_owners_table(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _legacy_engine(monkeypatch):
+    # Pins the per-photo engine kept as LIBRARY_CLEAN_ENGINE=legacy; tests/test_library_clean.py covers the
+    # dedicated clean, including a filename shared with another library.
+    monkeypatch.setattr(app, 'LIBRARY_CLEAN_ENGINE', 'legacy')
+
+
+@pytest.fixture(autouse=True)
 def _no_op_side_tables(monkeypatch):
     # _execute_library_clean also sweeps these; keep them out of scope for
     # this test by pointing every other table client at None so the second
