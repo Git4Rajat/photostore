@@ -4982,6 +4982,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         );
         const precomputedHashes = new Map<File, string>();
         let preflightSkippedDuplicateCount = 0;
+        const unreadableFileNames: string[] = [];
         const dedupController = new AbortController();
         uploadAbortControllersRef.current.add(dedupController);
         try {
@@ -4998,12 +4999,20 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     const index = cursor++;
                     if (index >= filesToUpload.length) return;
                     const file = filesToUpload[index];
-                    const sha256 = await computeSha256(file, dedupController.signal);
-                    results[index] = {
-                        file,
-                        sha256,
-                        duplicate: knownHashesRef.current.has(sha256) || libraryHashesRef.current.has(sha256),
-                    };
+                    try {
+                        const sha256 = await computeSha256(file, dedupController.signal);
+                        results[index] = {
+                            file,
+                            sha256,
+                            duplicate: knownHashesRef.current.has(sha256) || libraryHashesRef.current.has(sha256),
+                        };
+                    } catch (error) {
+                        // A cancelled start must still abort; anything else
+                        // (a photo iOS can't read, a revoked file handle) only
+                        // costs that one file instead of the whole selection.
+                        if (dedupController.signal.aborted) throw error;
+                        unreadableFileNames.push(file.name);
+                    }
                     completed += 1;
                     if (completed === filesToUpload.length || completed % 25 === 0) {
                         updateNotification(dedupNotificationId, {
@@ -5013,6 +5022,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 }
             };
             await Promise.all(Array.from({ length: Math.min(4, filesToUpload.length) }, () => hashWorker()));
+            if (unreadableFileNames.length > 0) {
+                addNotification(
+                    'Some files were skipped',
+                    `${plural(unreadableFileNames.length, 'file')} couldn't be read and won't be uploaded (${unreadableFileNames.slice(0, 3).join(', ')}${unreadableFileNames.length > 3 ? ', …' : ''}). Try selecting them again.`,
+                );
+            }
             const candidates: File[] = [];
             const selectedHashes = new Set<string>();
             for (const result of results) {
