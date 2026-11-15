@@ -85,7 +85,7 @@ const TrashPage: React.FC = () => {
                     <p className="empty-state-title">{trashLoading ? 'Loading…' : 'Nothing in Recently Deleted'}</p>
                     <p className="empty-state-message">Deleted photos rest here for 30 days before they’re gone for good.</p>
                     <div className="empty-state-action">
-                        <button type="button" className="btn" onClick={() => navigate('gallery')}>Back to Gallery</button>
+                        <button type="button" className="btn" onClick={() => navigate('gallery')}>Back to Photos</button>
                     </div>
                 </div>
             ) : (
