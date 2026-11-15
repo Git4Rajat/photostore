@@ -130,7 +130,7 @@
 }
 .pt-menu-panel.left { left: 0; }
 .pt-menu-panel.right { right: 0; }
-.pt-menu-label { font-family: var(--font-label); font-size: 0.72rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); margin: 0 0 8px; padding: 0 4px; }
+.pt-menu-label { font-size: 0.8rem; font-weight: 600; color: var(--muted); margin: 0 0 8px; padding: 0 4px; }
 
 .pt-account-menu { min-width: 240px; }
 .pt-account-menu > button { display: flex; align-items: center; width: 100%; min-height: var(--tap-min); text-align: left; background: none; border: 0; padding: 9px 10px; border-radius: var(--r-xs); font: inherit; font-size: 0.88rem; color: var(--text); cursor: pointer; }
@@ -444,7 +444,7 @@
 
 /* ---- sharing extras ---- */
 .pt-danger-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
-.pt-access-code { font-family: var(--font-label, monospace); font-weight: 700; letter-spacing: 0.12em; background: var(--accent-soft); color: var(--accent); padding: 1px 6px; border-radius: 5px; }
+.pt-access-code { font-family: var(--font-mono); font-weight: 700; letter-spacing: 0.12em; background: var(--accent-soft); color: var(--accent); padding: 1px 6px; border-radius: 5px; }
 
 /* ---- tools ---- */
 .pt-subnav { display: flex; gap: 16px; border-bottom: 1px solid var(--lg-edge); margin-bottom: 16px; overflow-x: auto; }
@@ -587,7 +587,7 @@
 .pt-viewer-back { display: inline-flex; align-items: center; gap: 6px; background: none; border: 0; color: var(--viewer-muted); font: inherit; font-weight: 600; cursor: pointer; }
 .pt-viewer-back svg { width: 18px; height: 18px; }
 .pt-viewer-title { font-size: 0.9rem; color: var(--viewer-muted); }
-.pt-viewer-pos { margin-left: auto; font-size: 0.82rem; color: var(--viewer-subtle); font-family: var(--font-label); }
+.pt-viewer-pos { margin-left: auto; font-size: 0.82rem; color: var(--viewer-subtle); font-variant-numeric: tabular-nums; white-space: nowrap; }
 /* touch-action: none stops the browser from turning a two-finger pinch here
    into a whole-page zoom; the pinch is handled in JS to zoom the photo instead.
    The info panel re-enables panning so it can still scroll (see below). */
@@ -608,7 +608,7 @@
 .pt-viewer-tools button svg { width: 18px; height: 18px; }
 .pt-viewer-tools .pt-viewer-fr { font-size: 0.6rem; font-weight: 700; margin-left: 1px; }
 .pt-viewer-tools button:has(.pt-viewer-fr) { width: auto; padding: 0 8px; gap: 3px; }
-.pt-viewer-zoom-label { font-size: 0.72rem; color: var(--viewer-muted); font-family: var(--font-label); min-width: 40px; text-align: center; }
+.pt-viewer-zoom-label { font-size: 0.72rem; color: var(--viewer-muted); font-variant-numeric: tabular-nums; min-width: 40px; text-align: center; }
 .pt-viewer-tools-sep { width: 1px; height: 20px; background: rgba(255,255,255,0.15); margin: 0 2px; }
 .pt-viewer-fr-loading { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px; width: 22px; height: 22px; position: relative; }
 .pt-viewer-fr-ring { width: 22px; height: 22px; position: absolute; inset: 0; }
@@ -804,10 +804,8 @@
    instead of the old bespoke banner layout. */
 .pt-public-shell .pt-public-tag {
     margin-left: auto;
-    font-family: var(--font-label);
-    font-size: 0.66rem;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
+    font-size: 0.75rem;
+    font-weight: 600;
     color: var(--muted);
     border: 1px solid var(--lg-edge);
     border-radius: var(--r-pill);

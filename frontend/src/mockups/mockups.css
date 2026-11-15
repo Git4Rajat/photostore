@@ -179,7 +179,7 @@
 .share-row .lbl b { font-size: 0.88rem; font-weight: 600; }
 .share-row .lbl span { font-size: 0.76rem; color: var(--muted); }
 .share-url {
-  font-family: var(--font-label);
+  font-family: var(--font-mono);
   font-size: 0.78rem;
   background: var(--bg-2);
   border: 1px solid var(--lg-edge);
@@ -207,10 +207,8 @@
 .member-meta b { font-size: 0.9rem; font-weight: 600; }
 .member-meta span { font-size: 0.76rem; color: var(--muted); }
 .member-badge {
-  font-family: var(--font-label);
-  font-size: 0.6rem;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  font-size: 0.72rem;
+  font-weight: 700;
   padding: 3px 8px;
   border-radius: var(--r-pill);
   border: 1px solid var(--lg-edge);

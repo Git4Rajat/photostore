@@ -11,11 +11,14 @@
 :root {
   color-scheme: light dark;
 
-  /* ---- Fonts: system stacks only, straight from the sketchbook -- no webfont load needed. ---- */
-  --font-label: 'SF Mono', Menlo, Consolas, 'Roboto Mono', monospace;
-  --font-display: Futura, 'Avenir Next Condensed', 'Century Gothic', 'Trebuchet MS', sans-serif;
-  --font-ui: -apple-system, 'SF Pro Text', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-  --font-mono: var(--font-label);
+  /* ---- Fonts: Jost for titles, Figtree for everything else. Both ship with the
+     app (@fontsource-variable, imported in index.tsx), so headings look the same
+     on iPhone, Android and Windows instead of falling back to whatever the OS
+     has. --font-mono is for codes and data only, never for labels or hints. ---- */
+  --font-display: 'Jost Variable', Futura, 'Century Gothic', 'Trebuchet MS', sans-serif;
+  --font-ui: 'Figtree Variable', -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: 'SF Mono', Menlo, Consolas, 'Roboto Mono', monospace;
+  --font-label: var(--font-ui);
 
   /* ---- Brand surface ---- */
   --bg-1: #fbf9f5;
@@ -644,11 +647,8 @@ a {
 
 .local-login label {
   margin-top: 10px;
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  font-family: var(--font-label);
+  font-size: 12.5px;
+  font-weight: 600;
   color: var(--muted);
 }
 
