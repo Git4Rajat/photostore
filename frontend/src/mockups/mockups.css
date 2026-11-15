@@ -18,7 +18,7 @@
 }
 .mock-seg button.active {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 /* the "loupe" mount: a phone frame in mobile mode, full-bleed in desktop */
@@ -140,12 +140,11 @@
   gap: 7px;
 }
 
-/* shared: primary CTA in the *intended* warm accent (the real .btn-primary
-   still ships a leftover iOS-blue gradient — one of the flagged fixes). */
+/* shared: primary CTA in the brand accent, same as .btn-primary. */
 .btn.mock-cta {
   background: var(--accent);
   border-color: transparent;
-  color: #fff;
+  color: var(--on-accent);
 }
 .btn.mock-cta:hover { background: color-mix(in srgb, var(--accent) 88%, black); }
 
