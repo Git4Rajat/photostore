@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ArrowLeftIcon, ArrowRightOnRectangleIcon } from '@heroicons/react/24/outline';
+import { ArrowLeft as ArrowLeftIcon, LogIn as ArrowRightOnRectangleIcon } from 'lucide-react';
 import { Link, useNavigate } from 'react-router-dom';
 import { setUserId } from '../services/apiClient';
 import { getRuntimeConfig } from '../config/appConfig';

@@ -4,7 +4,7 @@
 // only on the public useAppServices() contract, so they can live independently
 // of the (much larger) provider component itself.
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { BellIcon, TrashIcon, XMarkIcon } from '@heroicons/react/24/outline';
+import { Bell as BellIcon, Trash2 as TrashIcon, X as XMarkIcon } from 'lucide-react';
 import { formatMegabytesPerSecond } from './browserAiShared';
 import { formatNotificationTime } from '../services/notificationTime';
 import type { AppNotification } from '../types/browserProcessing';

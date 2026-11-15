@@ -26,7 +26,6 @@
     "@ffmpeg/ffmpeg": "0.12.15",
     "@fontsource-variable/figtree": "^5.3.0",
     "@fontsource-variable/jost": "^5.3.0",
-    "@heroicons/react": "^2.2.0",
     "@tensorflow/tfjs-backend-cpu": "^4.22.0",
     "@tensorflow/tfjs-backend-webgl": "^4.22.0",
     "@tensorflow/tfjs-converter": "^4.22.0",

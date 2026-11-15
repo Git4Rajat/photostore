@@ -1244,9 +1244,7 @@ a {
   transition: transform var(--dur-quick) ease, background-color var(--dur-quick) ease, border-color var(--dur-quick) ease, box-shadow var(--dur-base) ease;
 }
 
-/* Heroicons ship no intrinsic size -- without this, a .toolbar-icon inside
-   a plain (non-.icon-btn) button has no width/height and renders at the
-   browser's oversized replaced-element default. */
+/* Icons inside a plain button: one size, whatever the icon's own default. */
 .btn .toolbar-icon {
   width: 15px;
   height: 15px;
