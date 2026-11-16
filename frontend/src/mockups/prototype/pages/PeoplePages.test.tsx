@@ -23,6 +23,7 @@ vi.mock('../store', () => ({
         mergePeopleBatch: mocks.mergePeopleBatch,
         deletePeopleBatch: mocks.deletePeopleBatch,
         fetchPeople: vi.fn(async () => {}),
+        route: { page: 'people', params: {} },
     }),
 }));
 vi.mock('../../../services/imageClient', () => ({ useProtectedBlobUrls: () => ({}) }));
@@ -111,3 +112,23 @@ function expectSelectModeOver() {
     expect(document.querySelector('.pt-person-card.selected')).toBeNull();
     expect(screen.getByRole('button', { name: 'Select' })).toBeTruthy();
 }
+
+describe('PeoplePage layout', () => {
+    beforeEach(() => { mocks.navigate.mockReset(); });
+
+    it('lists named people first, then the ones still to name, with a prompt that opens the first', () => {
+        render(<PeoplePage />);
+        const headings = screen.getAllByRole('heading', { level: 2 }).map((h) => h.textContent);
+        expect(headings).toEqual(['Named', 'Not named yet']);
+        const names = Array.from(document.querySelectorAll('.pt-person-name')).map((n) => n.textContent);
+        expect(names).toEqual(['Asha', 'Add name']);
+        expect(screen.getByText('Name 1 more person')).toBeTruthy();
+        fireEvent.click(screen.getByRole('button', { name: 'Start' }));
+        expect(mocks.navigate).toHaveBeenCalledWith('person', { personId: 'p1' });
+    });
+
+    it('uses the right plural for photo counts', () => {
+        render(<PeoplePage />);
+        expect(screen.getByText('11 photos')).toBeTruthy();
+    });
+});
