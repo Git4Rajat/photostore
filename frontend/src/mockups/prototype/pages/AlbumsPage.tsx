@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import {
     ArrowLeft as ArrowLeftIcon,
+    ChevronLeft as ChevronLeftIcon,
     CalendarDays as CalendarDaysIcon,
     Check as CheckIcon,
     Clock as ClockIcon,
@@ -424,6 +425,10 @@ export const AlbumsPage: React.FC = () => {
                     <section className="pt-album-detail">
                         <div className={`pt-album-hero${cover ? '' : ' no-cover'}`}>
                             {cover && <img src={cover} alt="" />}
+                            {/* Phones: back sits on the cover, as the redesign draws it. */}
+                            <button type="button" className="pt-hero-back" onClick={() => navigate('albums', {})} aria-label="Back to albums">
+                                <ChevronLeftIcon />
+                            </button>
                             <div className="pt-album-hero-text">
                                 <h1 className="pt-album-hero-name">{album.name}</h1>
                                 <p>{plural(album.photoCount, 'item')}{span ? ` · ${span}` : ''}</p>

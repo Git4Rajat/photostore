@@ -1,10 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
     MoreHorizontal as EllipsisHorizontalIcon,
-    Plus as PlusIcon,
+    ImagePlus as AddToAlbumIcon,
+    Download as DownloadIcon,
     Trash2 as TrashIcon,
     Heart,
     Info as InfoIcon,
+    MapPin as MapPinIcon,
     Star as StarIcon,
 } from 'lucide-react';
 import { Menu, Stars } from './bits';
@@ -21,10 +23,9 @@ const DAY_FORMAT = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: '
 const LONG_DAY_FORMAT = new Intl.DateTimeFormat(undefined, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
 const TIME_FORMAT = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
 
-const dash = (value?: string | number): string => {
-    const text = value === undefined || value === null ? '' : String(value).trim();
-    return text || '—';
-};
+const formatFileSize = (bytes: number): string => (
+    bytes >= 1_000_000 ? `${(bytes / 1_000_000).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1000))} KB`
+);
 
 // EXIF arrives as raw, unrounded numeric strings (e.g. a computed FNumber of
 // "7.66082624558859") -- these convert them to the rounded, unit-suffixed
@@ -146,6 +147,11 @@ const PhotoViewer: React.FC = () => {
     const loc = meta?.location ?? {};
     const infoTags = Array.from(new Set([...(meta?.tags ?? []), ...(meta?.objects ?? []), ...(photo.tags ?? [])])).slice(0, 24);
     const locationLine = [loc.city, loc.country].filter(Boolean).join(', ');
+    // One line of camera settings, with the lens only when its name is short ("Ultra Wide").
+    const shortLens = exif.lens && exif.lens.length <= 24 ? exif.lens : null;
+    const exposure = [shortLens, formatFocalLength(exif.focalLength), formatAperture(exif.fNumber), formatShutterSpeed(exif.exposureTime), formatIso(exif.iso)]
+        .filter(Boolean).join(' · ');
+    const fileSize = typeof meta?.size === 'number' && meta.size > 0 ? formatFileSize(meta.size) : '';
     // Title: where, then when. Without a known place the day takes the title.
     const captured = captureWallClock(photo.captureDate ?? null);
     const dayText = captured ? DAY_FORMAT.format(captured) : '';
@@ -183,70 +189,65 @@ const PhotoViewer: React.FC = () => {
             showFullResControl={!isVideo && !isRawFilename(photo.filename)}
             onDownloadOriginal={startDownload}
             info={showInfo ? (
-                    <aside className="pt-viewer-info card-glass" aria-label="Photo information">
-                            <div className="pt-viewer-info-head">
-                                <h3>Photo info</h3>
-                                <button type="button" onClick={() => setShowInfo(false)} aria-label="Close info">×</button>
-                            </div>
+                    <aside className="pt-viewer-info" aria-label="Photo information">
                             {!meta ? (
                                 <p className="pt-viewer-info-empty">Loading details…</p>
                             ) : (
-                                <dl className="pt-viewer-info-list">
-                                    {/* When and where first, then the camera, then the file. */}
-                                    {captured
-                                        ? (<><dt>Taken</dt><dd>{LONG_DAY_FORMAT.format(captured)} · {timeText}</dd></>)
-                                        : exif.capturedAt ? (<><dt>Taken</dt><dd>{exif.capturedAt}</dd></>) : null}
-                                    {locationLine && (<><dt>Place</dt><dd>{locationLine}</dd></>)}
-                                    <dt>Camera</dt><dd>{dash(exif.camera)}</dd>
-                                    <dt>Lens</dt><dd>{dash(exif.lens)}</dd>
-                                    {(exif.fNumber || exif.exposureTime || exif.iso || exif.focalLength) && (
-                                        <>
-                                            <dt>Exposure</dt>
-                                            <dd>
-                                                {[
-                                                    formatIso(exif.iso),
-                                                    formatFocalLength(exif.focalLength),
-                                                    formatAperture(exif.fNumber),
-                                                    formatShutterSpeed(exif.exposureTime),
-                                                ].filter(Boolean).join(' · ') || '—'}
-                                            </dd>
-                                        </>
+                                <>
+                                    {/* When, where, the camera, then what's in it -- as the redesign lays it out. */}
+                                    <div className="pt-vi-block">
+                                        <b>{captured ? LONG_DAY_FORMAT.format(captured) : (exif.capturedAt || 'Date unknown')}</b>
+                                        <span>{[timeText, photo.filename, fileSize].filter(Boolean).join(' · ')}</span>
+                                    </div>
+                                    {locationLine && (
+                                        <div className="pt-vi-place"><MapPinIcon aria-hidden="true" /><span>{locationLine}</span></div>
                                     )}
-                                    {meta.resolution?.width ? (<><dt>Size</dt><dd>{meta.resolution.width} × {meta.resolution.height}</dd></>) : null}
-                                    <dt>File</dt><dd>{photo.filename}</dd>
+                                    {(exif.camera || exposure) && (
+                                        <div className="pt-vi-block">
+                                            <b>{exif.camera || 'Camera unknown'}</b>
+                                            {exposure && <span>{exposure}</span>}
+                                            {meta.resolution?.width ? <span>{meta.resolution.width} × {meta.resolution.height}</span> : null}
+                                        </div>
+                                    )}
                                     {infoTags.length > 0 && (
-                                        <>
-                                            <dt>Tags</dt>
-                                            <dd className="pt-viewer-info-tags">{infoTags.map((t) => <span key={t} className="pt-chip">{t}</span>)}</dd>
-                                        </>
+                                        <div className="pt-vi-tags">{infoTags.map((t) => <span key={t}>{t}</span>)}</div>
                                     )}
-                                    {meta.ocrText && meta.ocrText.trim() && (<><dt>Text</dt><dd className="pt-viewer-info-ocr">{meta.ocrText.trim().slice(0, 400)}</dd></>)}
-                                </dl>
+                                    <div className="pt-vi-block">
+                                        <span className="pt-vi-label">Your rating</span>
+                                        <Stars value={photo.rating} onRate={(n) => ratePhotos([photo.id], n)} size={22} />
+                                    </div>
+                                    {meta.ocrText && meta.ocrText.trim() && (
+                                        <div className="pt-vi-block">
+                                            <span className="pt-vi-label">Text in the photo</span>
+                                            <span className="pt-viewer-info-ocr">{meta.ocrText.trim().slice(0, 400)}</span>
+                                        </div>
+                                    )}
+                                </>
                             )}
                         </aside>
             ) : null}
             bar={(
                 <>
                 <div className="pt-vb-group center">
-                    <button type="button" className={`pt-vb-btn${photo.liked ? ' on' : ''}`} aria-pressed={photo.liked} onClick={() => toggleLike(photo.id)}>
+                    <button type="button" className={`pt-vb-btn like${photo.liked ? ' on' : ''}`} aria-pressed={photo.liked} title="Like" onClick={() => toggleLike(photo.id)}>
                         <Heart fill={photo.liked ? 'currentColor' : 'none'} /> <span>Like</span>
                     </button>
-                    <button type="button" className={`pt-vb-btn${showInfo ? ' on' : ''}`} aria-pressed={showInfo} onClick={() => setShowInfo((v) => !v)}>
+                    <button type="button" className={`pt-vb-btn info${showInfo ? ' on' : ''}`} aria-pressed={showInfo} title="Info" onClick={() => setShowInfo((v) => !v)}>
                         <InfoIcon /> <span>Info</span>
                     </button>
                     <AddToAlbumMenu
                         photoIds={[photo.id]}
                         align="right"
                         renderTrigger={(toggle) => (
-                            <button type="button" className="pt-vb-btn" onClick={toggle}>
-                                <PlusIcon /> <span>Album</span>
+                            <button type="button" className="pt-vb-btn" title="Add to album" onClick={toggle}>
+                                <AddToAlbumIcon /> <span>Album</span>
                             </button>
                         )}
                     />
                     <Menu
                         align="right"
                         renderTrigger={(toggle) => (
-                            <button type="button" className="pt-vb-btn" onClick={toggle}>
+                            <button type="button" className="pt-vb-btn" title="More" onClick={toggle}>
                                 <EllipsisHorizontalIcon /> <span>More</span>
                             </button>
                         )}
@@ -282,7 +283,11 @@ const PhotoViewer: React.FC = () => {
                     </Menu>
                 </div>
                 <div className="pt-vb-group right">
-                    <button type="button" className="pt-vb-btn" onClick={() => void confirmDeleteItems(1).then((ok) => { if (ok) deletePhotos([photo.id]); })}>
+                    {/* Desktops show Download in the toolbar; phones keep it under More. */}
+                    <button type="button" className="pt-vb-btn wide-only" title="Download original" onClick={startDownload}>
+                        <DownloadIcon /> <span>Download</span>
+                    </button>
+                    <button type="button" className="pt-vb-btn" title="Delete" onClick={() => void confirmDeleteItems(1).then((ok) => { if (ok) deletePhotos([photo.id]); })}>
                         <TrashIcon /> <span>Delete</span>
                     </button>
                 </div>

@@ -208,3 +208,13 @@ def test_video_finalization_reports_missing_hash_without_fallback(monkeypatch, b
         assert response.get_json()['results'][0]['error'] == 'Video uploads require a client SHA-256'
     else:
         assert response[1] == 400
+
+
+@pytest.mark.parametrize('stored, expected', [('3100000', 3100000), (3100000, 3100000), ('', 0), ('not-a-number', 0)])
+def test_photo_metadata_reports_the_original_size(monkeypatch, stored, expected):
+    monkeypatch.setattr(app, '_require_user_id', lambda: ('library', None))
+    monkeypatch.setattr(app, '_get_metadata_entity', lambda *_: {'RowKey': 'clip.mp4', 'size': stored})
+    monkeypatch.setattr(app, 'download_media_bytes', lambda *_: pytest.fail('no download needed'))
+    with app.app.test_request_context('/api/photos/clip.mp4/metadata'):
+        response = app.app.make_response(photos.get_photo_metadata('clip.mp4'))
+    assert response.status_code == 200 and response.get_json()['size'] == expected

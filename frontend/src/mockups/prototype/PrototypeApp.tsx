@@ -146,6 +146,18 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
     const accountName = account?.name || account?.username || 'Signed in';
     const accountEmail = account?.username || '';
     const initials = initialsFor(account?.name || account?.username || '');
+    // "/" opens Search from anywhere, unless you're typing.
+    useEffect(() => {
+        const onKey = (e: KeyboardEvent) => {
+            if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return;
+            const el = e.target as HTMLElement | null;
+            if (el && (el.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName))) return;
+            e.preventDefault();
+            navigate('ask');
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+    }, [navigate]);
 
     return (
         <header className="ios-header">
@@ -153,7 +165,7 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
                 copy). Desktops: the sidebar names the page, and the header holds search. */}
             <h1 className="pt-header-title">{pageTitle(route)}</h1>
             <button type="button" className="pt-header-search" onClick={() => navigate('ask')}>
-                <MagnifyingGlassIcon aria-hidden="true" /> <span>Search people, places and things</span>
+                <MagnifyingGlassIcon aria-hidden="true" /> <span>Search people, places and things</span><kbd aria-hidden="true">/</kbd>
             </button>
             <nav className="ios-tabs" aria-label="Primary navigation">
                 {NAV.map((item) => (
