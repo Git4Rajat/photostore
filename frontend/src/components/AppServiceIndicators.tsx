@@ -237,7 +237,7 @@ export const NotificationBell: React.FC = () => {
                     }
                 }}
                 className="btn btn-soft notification-bell"
-                aria-label="Open notifications"
+                aria-label={unreadCount > 0 ? `Open notifications, ${unreadCount} new` : "Open notifications"}
             >
                 <BellIcon className="toolbar-icon" />
                 {unreadCount > 0 && <span className="notification-badge">{unreadCount}</span>}

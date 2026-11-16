@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { CalendarSearch as CalendarSearchIcon, ChevronDown as ChevronDownIcon, Heart as HeartIcon, SlidersHorizontal as FilterIcon, Star as StarIcon, Upload as ArrowUpTrayIcon, ZoomOut as MagnifyingGlassMinusIcon, ZoomIn as MagnifyingGlassPlusIcon, Image as PhotoIcon, UserPlus as UserPlusIcon } from 'lucide-react';
+import { CalendarSearch as CalendarSearchIcon, ChevronDown as ChevronDownIcon, Heart as HeartIcon, SlidersHorizontal as FilterIcon, Star as StarIcon, Upload as ArrowUpTrayIcon, Grid2x2 as LargePhotosIcon, Grid3x3 as SmallPhotosIcon, Image as PhotoIcon, UserPlus as UserPlusIcon } from 'lucide-react';
 import { useStore, isVideoFilename } from '../store';
 import type { CaptureRange, MediaFilter } from '../store';
 import { useAppServices } from '../../../components/AppServicesProvider';
@@ -8,7 +8,7 @@ import { invalidateLocalSortIndex } from '../../../services/localSortIndex';
 import PhotoGrid from '../components/PhotoGrid';
 import TimelineBrowser from '../components/TimelineBrowser';
 import { Menu, Spinner } from '../components/bits';
-import { useTileSize, TILE_RANGE, TILE_STEP, GALLERY_TILE_KEY, defaultGalleryTile } from '../components/controls';
+import { useTileSize, TILE_RANGE, TILE_STEP, galleryTileKey, defaultGalleryTile } from '../components/controls';
 
 const MEDIA_FILTERS: { value: MediaFilter; label: string }[] = [
     { value: 'all', label: 'All' },
@@ -52,7 +52,9 @@ const GalleryPage: React.FC = () => {
     const [dragging, setDragging] = useState(false);
     // Four across on a phone, about eight on a desktop. A new storage key so
     // everyone starts from these defaults once, not from the old 3-across size.
-    const [tileMin, setTileMin] = useTileSize(GALLERY_TILE_KEY, { min: GALLERY_TILE_MIN, default: defaultGalleryTile(GALLERY_TILE_MIN) });
+    // Picked once per visit: a window resized mid-session must not write one size under the other key.
+    const [tileKey] = useState(galleryTileKey);
+    const [tileMin, setTileMin] = useTileSize(tileKey, { min: GALLERY_TILE_MIN, default: defaultGalleryTile(GALLERY_TILE_MIN) });
     // iOS-style zoom levels: keep zooming out past the smallest tiles to browse
     // Months, then Years (replaces the old timeline rail).
     const [level, setLevel] = useState<ZoomLevel>('days');
@@ -239,13 +241,26 @@ const GalleryPage: React.FC = () => {
         + (galleryFilters.likedOnly ? 1 : 0)
         + (mediaFilter !== 'all' ? 1 : 0);
 
+    // A size slider, as the redesign draws it. The small and large photo icons
+    // on either side still step past the ends into Months and Years.
     const zoomControl = (
-        <div className="pt-zoom" role="group" aria-label="Zoom level">
-            <button type="button" className="btn btn-icon btn-sm" aria-label="Zoom out" disabled={zoomedOutFully} onClick={zoomOut}>
-                <MagnifyingGlassMinusIcon className="toolbar-icon" />
+        <div className="pt-size-slider" role="group" aria-label="Photo size">
+            <button type="button" className="pt-size-end" aria-label="Smaller photos" title="Smaller photos" disabled={zoomedOutFully} onClick={zoomOut}>
+                <SmallPhotosIcon aria-hidden="true" />
             </button>
-            <button type="button" className="btn btn-icon btn-sm" aria-label="Zoom in" disabled={zoomedInFully} onClick={zoomIn}>
-                <MagnifyingGlassPlusIcon className="toolbar-icon" />
+            {level === 'days' && (
+                <input
+                    type="range"
+                    aria-label="Photo size"
+                    min={GALLERY_TILE_MIN}
+                    max={TILE_RANGE.max}
+                    step={4}
+                    value={tileMin}
+                    onChange={(e) => setTileMin(clampGalleryTile(Number(e.target.value)))}
+                />
+            )}
+            <button type="button" className="pt-size-end" aria-label="Larger photos" title="Larger photos" disabled={zoomedInFully} onClick={zoomIn}>
+                <LargePhotosIcon aria-hidden="true" />
             </button>
         </div>
     );
@@ -394,17 +409,18 @@ const GalleryPage: React.FC = () => {
                         <h1 className="pt-page-title">{levelTitle}</h1>
                         <p className="pt-page-sub">{countLabel}{captureRange ? ` · ${captureRange.label}` : ''}</p>
                     </div>
+                    {/* One row on desktops: title, chips, size, Select. Phones keep only the chips. */}
+                    {level === 'days' && filterChips}
                     <div className="pt-toolbar-actions">
                         {zoomControl}
                         {level === 'days' && (
-                            <button type="button" className="btn btn-sm" onClick={() => setSelectMode(true)}>
+                            <button type="button" className="pt-linkish" onClick={() => setSelectMode(true)}>
                                 Select
                             </button>
                         )}
                     </div>
                 </div>
             )}
-            {level === 'days' && !selectMode && filterChips}
 
             {scopeCrumbs}
 

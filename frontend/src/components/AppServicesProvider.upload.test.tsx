@@ -1718,7 +1718,7 @@ describe('Core stale-upload notifications', () => {
         await advance(61000);
         await act(async () => { window.dispatchEvent(new Event('focus')); });
         expect(services.notifications.filter(n => n.uploadSessionId === 'closed-parent')).toHaveLength(1);
-        await act(async () => { fireEvent.click(screen.getByLabelText('Open notifications')); });
+        await act(async () => { fireEvent.click(screen.getByLabelText(/^Open notifications/)); });
         await act(async () => { fireEvent.click(screen.getByText('Retry unfinished files')); });
         expect(services.notifications.some(n => n.title === 'Reselect unfinished files')).toBe(true);
         expect(mocks.post).toHaveBeenCalledWith('/api/upload-sessions/notifications/closed-parent/ack', {}, expect.any(Object));

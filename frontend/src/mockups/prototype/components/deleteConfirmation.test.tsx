@@ -48,6 +48,8 @@ const expectedDialog = (count: number) => expect.objectContaining({
     message: count === 1
         ? 'It moves to Recently Deleted, where you can restore it for 30 days.'
         : 'They move to Recently Deleted, where you can restore them for 30 days.',
+    // The button names what it does, as in the redesign: "Delete 3 items".
+    confirmLabel: `Delete ${count} ${count === 1 ? 'item' : 'items'}`,
     danger: true,
 });
 

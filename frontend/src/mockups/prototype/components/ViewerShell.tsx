@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
-    ArrowLeft as ArrowLeftIcon,
     RotateCcw as ArrowUturnLeftIcon,
     RotateCw as ArrowUturnRightIcon,
     ChevronLeft as ChevronLeftIcon,
@@ -508,8 +507,8 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
     return (
         <div ref={rootRef} tabIndex={-1} className={`pt-viewer${showTools ? ' tools-visible' : ''}`} role="dialog" aria-modal="true" aria-label="Photo viewer">
             <div className="pt-viewer-top">
-                <button type="button" className="pt-viewer-back" onClick={onClose}>
-                    <ArrowLeftIcon /> Back
+                <button type="button" className="pt-viewer-back" onClick={onClose} aria-label="Back" title="Back">
+                    <ChevronLeftIcon />
                 </button>
                 <span className="pt-viewer-title">
                     <b>{title}</b>

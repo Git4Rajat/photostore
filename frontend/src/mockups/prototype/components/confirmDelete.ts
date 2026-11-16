@@ -8,6 +8,6 @@ export const confirmDeleteItems = (count: number): Promise<boolean> => confirmDi
     message: count === 1
         ? 'It moves to Recently Deleted, where you can restore it for 30 days.'
         : 'They move to Recently Deleted, where you can restore them for 30 days.',
-    confirmLabel: 'Delete',
+    confirmLabel: `Delete ${plural(count, 'item')}`,
     danger: true,
 });

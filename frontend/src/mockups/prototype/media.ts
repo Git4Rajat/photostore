@@ -517,6 +517,8 @@ export interface PhotoMetadata {
         iso?: string; focalLength?: string; capturedAt?: string;
     };
     resolution?: { width?: number; height?: number };
+    /** Bytes of the original. */
+    size?: number;
     location?: { city?: string; country?: string; address?: string; latitude?: string; longitude?: string };
     tags?: string[];
     objects?: string[];

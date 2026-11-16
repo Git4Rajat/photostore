@@ -1565,6 +1565,8 @@ def get_photo_metadata(filename: str):
             'exifData': exif_data,
             'exifSummary': app.exif_summary(exif_data) if exif_data else {},
             'resolution': resolution,
+            # Bytes of the original, for the viewer's "IMG_1073.HEIC · 3.1 MB" line.
+            'size': int(metadata.get('size')) if str(metadata.get('size') or '').isdigit() else 0,
             'faces': app.json.loads(metadata.get('faces', '[]') or '[]'),
             'faceCount': metadata.get('faceCount', 0),
             'peopleIds': app.json.loads(metadata.get('peopleIds', '[]') or '[]'),
