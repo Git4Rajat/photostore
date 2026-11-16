@@ -86,9 +86,17 @@ _JS = """
     });
   }
 
-  function tileRotation(p) {
-    var rem = (((p.rot || 0) - (p.trot || 0)) % 360 + 360) % 360;
-    return rem ? 'rotate(' + rem + 'deg) scale(' + (rem % 180 === 0 ? 1 : 0.74) + ')' : '';
+  function norm(deg) { return ((deg || 0) % 360 + 360) % 360; }
+  function turn(rem) { return rem ? 'rotate(' + rem + 'deg) scale(' + (rem % 180 === 0 ? 1 : 0.74) + ')' : ''; }
+
+  // Mirrors tileImage in the app (media.ts): the grid image (g) is listed next
+  // to the thumbnail (t) in srcset. It bakes in no rotation, so it turns by the
+  // full rot; the thumbnail already carries trot. When trot is set the two need
+  // different turns, so the tile shows the grid image alone.
+  function tileImage(p) {
+    if (!p.g) return { src: p.t, transform: turn(norm(norm(p.rot) - norm(p.trot))) };
+    if (!p.t || norm(p.trot)) return { src: p.g, transform: turn(norm(p.rot)) };
+    return { src: p.t, srcset: p.t + ' 90w, ' + p.g + ' 400w', transform: turn(norm(p.rot)) };
   }
 
   function render() {
@@ -105,7 +113,7 @@ _JS = """
       grid.appendChild(e);
     }
     manifest.photos.forEach(function (p, i) {
-      if (!p.t) return;
+      if (!p.t && !p.g) return;
       var b = document.createElement('button');
       b.className = 'tile';
       b.type = 'button';
@@ -115,9 +123,10 @@ _JS = """
       img.decoding = 'async';
       img.alt = '';
       img.onerror = function () { b.remove(); };
-      img.src = p.t;
-      var tr = tileRotation(p);
-      if (tr) img.style.transform = tr;
+      var tile = tileImage(p);
+      if (tile.srcset) img.srcset = tile.srcset;
+      img.src = tile.src;
+      if (tile.transform) img.style.transform = tile.transform;
       b.appendChild(img);
       if (p.video) {
         var badge = document.createElement('span');
@@ -133,7 +142,7 @@ _JS = """
 
   function openLb(i) {
     var p = manifest.photos[i];
-    if (!p || !p.t) return;
+    if (!p || !(p.t || p.g)) return;
     current = i;
     var lb = $('lb'), img = $('lbImg'), cap = $('lbCap');
     lb.hidden = false;
@@ -141,8 +150,13 @@ _JS = """
     img.style.transform = rot ? 'rotate(' + rot + 'deg)' : '';
     img.style.maxWidth = rot % 180 ? '100vh' : '100vw';
     img.style.maxHeight = rot % 180 ? '100vw' : '100vh';
-    img.onerror = function () { if (p.t && img.getAttribute('src') !== p.t) img.src = p.t; };
-    img.src = p.p || p.t;
+    // Preview, else the grid image (both unrotated, like this transform assumes), else the thumbnail.
+    var chain = [p.p, p.g, p.t].filter(Boolean);
+    img.onerror = function () {
+      var next = chain[chain.indexOf(img.getAttribute('src')) + 1];
+      if (next) img.src = next;
+    };
+    img.src = chain[0];
     cap.textContent = '';
     if (p.video || !p.p) {
       cap.appendChild(document.createTextNode(p.video ? 'Videos play in the full album. ' : 'Full-size photo opens in the full album. '));

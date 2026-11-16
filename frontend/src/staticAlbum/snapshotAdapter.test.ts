@@ -18,4 +18,12 @@ describe('manifestToAlbumResponse', () => {
         });
         expect(res.photos[1].previewUrl).toBeUndefined();
     });
+
+    it('carries the grid image when the snapshot copied one', () => {
+        const res = manifestToAlbumResponse({
+            total: 2, cached: 2, photos: [{ n: 'a.jpg', t: 't/0.jpg', g: 'g/0.webp' }, { n: 'b.jpg', t: 't/1.jpg', g: '' }],
+        }, base, 'tok');
+        expect(res.photos[0]).toMatchObject({ gridUrl: `${base}g/0.webp` });
+        expect('gridUrl' in res.photos[1]).toBe(false);
+    });
 });
