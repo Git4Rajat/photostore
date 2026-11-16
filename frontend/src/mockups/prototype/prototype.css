@@ -535,7 +535,8 @@
 .pt-chip:hover { border-color: var(--accent); color: var(--accent); }
 .pt-match-cards { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
 .pt-match-card { display: flex; align-items: center; gap: 10px; padding: 10px 14px; cursor: pointer; }
-.pt-match-face { width: 40px; height: 40px; border-radius: 50%; flex: 0 0 auto; }
+.pt-match-face { width: 40px; height: 40px; border-radius: 10px; flex: 0 0 auto; object-fit: cover; display: block; }
+.pt-match-face.round { border-radius: 50%; }
 .pt-match-card b { display: block; font-size: 0.86rem; }
 .pt-match-card span { font-size: 0.76rem; color: var(--muted); }
 
@@ -773,10 +774,6 @@
 @media (max-width: 520px) {
   .pt-vb-btn span { display: none; }
   .pt-vb-group { gap: 2px; }
-  /* 5 separate star buttons crowd into the Like button at this width --
-     collapse to one partial-fill star instead. */
-  .pt-viewer-bar .pt-stars-full { display: none; }
-  .pt-viewer-bar .pt-star-compact { display: inline-grid; place-items: center; }
 }
 .pt-more-menu button { display: block; width: 100%; text-align: left; background: none; border: 0; padding: 9px 10px; border-radius: var(--r-xs); font: inherit; font-size: 0.86rem; color: var(--text); cursor: pointer; }
 .pt-more-menu button:hover { background: var(--lg-surface-wash); }
@@ -1059,8 +1056,6 @@
   .pt-gallery-toolbar .pt-chips { width: 100%; }
   .pt-chip-select { display: inline-flex; }
   /* Photos run edge to edge, as in the mock-up; headings keep the page inset. */
-  .pt-gallery .pt-drop-surface { margin: 0 -12px; }
-  .pt-gallery .pt-day-heading { padding-left: 14px; padding-right: 14px; }
 }
 .pt-chip-select { display: none; margin-left: auto; color: var(--accent); }
 
@@ -1259,7 +1254,6 @@
   .pt-public-toolbar > .pt-public-head { display: none !important; }
   .pt-public-toolbar { flex-direction: row !important; justify-content: flex-end; margin-bottom: 10px; }
   .pt-public-toolbar .pt-toolbar-actions { width: auto !important; }
-  .pt-public-grid { margin: 0 -12px; }
 }
 
 /* ---- Polish against the mock-up (2026-11-16) ---- */
@@ -1361,3 +1355,27 @@
   .pt-album-detail .pt-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 .pt-browse-links .pt-browse-thumb { flex: none; width: 40px; height: 40px; display: grid; }
+
+/* Rating in menus and the info panel: five small stars close together. The
+   menu's own button rule (full width, padded) must not reach the stars. */
+.pt-fm-rate .pt-stars, .pt-vi-block .pt-stars { gap: 0; }
+.pt-fm-rate .pt-star, .pt-more-menu .pt-fm-rate .pt-star, .pt-vi-block .pt-star {
+  display: inline-grid; width: 34px; min-width: 34px; min-height: 40px; padding: 0; border-radius: 8px; text-align: center;
+}
+.pt-more-menu .pt-fm-rate .pt-star:hover { background: var(--lg-surface-wash); }
+.pt-vi-block .pt-stars { margin-left: -7px; }
+
+/* Phones: every photo grid runs to the screen's side edges, cancelling the
+   page's side padding (the same clamp as .mock-body); headings keep an inset. */
+@container (max-width: 805px) {
+  .pt-body .pt-grid { margin-left: calc(-1 * clamp(12px, 3vw, 20px)); margin-right: calc(-1 * clamp(12px, 3vw, 20px)); }
+  .pt-body .pt-grid .pt-day-heading { padding-left: 14px; padding-right: 14px; }
+}
+@media (max-width: 805px) {
+  .pt-picker-body .pt-picker-grid { margin-left: -16px; margin-right: -16px; }
+  .pt-picker-grid .pt-day-heading { padding-left: 14px; padding-right: 14px; }
+}
+@container (max-width: 805px) {
+  .pt-albums.show-detail .pt-album-detail { padding: 0; }
+  .pt-album-hero { margin-left: calc(-1 * clamp(12px, 3vw, 20px)) !important; margin-right: calc(-1 * clamp(12px, 3vw, 20px)) !important; margin-top: -8px !important; border-radius: 0; }
+}

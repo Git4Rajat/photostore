@@ -2,6 +2,8 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Search as MagnifyingGlassIcon, Plus as PlusIcon } from 'lucide-react';
 import { useStore } from '../store';
 import { Swatch } from '../components/bits';
+import { useProtectedBlobUrls } from '../../../services/imageClient';
+import type { SwatchKey } from '../types';
 import { plural } from '../../../utils/format';
 import PhotoGrid from '../components/PhotoGrid';
 import { get } from '../../../services/apiClient';
@@ -16,6 +18,13 @@ const SAVE_PAGE = 500;
 // (thumbnails, ratings, dates, ...) via a point-lookup, preserving the local
 // score order for whatever resolves (lookup-batch can drop a filename it can't
 // resolve, e.g. one deleted between scoring and lookup).
+/** A match card's picture: the person's face or the place's photo, else its swatch. */
+const MatchImage: React.FC<{ src?: string; swatch: SwatchKey; round?: boolean }> = ({ src, swatch, round }) => (
+    src
+        ? <img className={`pt-match-face${round ? ' round' : ''}`} src={src} alt="" />
+        : <Swatch swatch={swatch} className={`pt-match-face${round ? ' round' : ''}`} />
+);
+
 /**
  * Ask — one search box fused across people / places / things / years. Search
  * runs entirely on the backend (/photos/search over a per-library SQLite
@@ -77,6 +86,10 @@ const AskPage: React.FC = () => {
     const matchedPlaces = useMemo(
         () => places.filter((pl) => tokens.some((tk) => pl.name.toLowerCase().includes(tk))),
         [places, tokens],
+    );
+    // Faces and place photos for the match cards (they were plain colour swatches).
+    const matchCovers = useProtectedBlobUrls(
+        [...matchedPeople, ...matchedPlaces].map((m) => m.coverThumbnailUrl).filter((u): u is string => Boolean(u)),
     );
 
     const suggestions = useMemo(() => {
@@ -188,7 +201,7 @@ const AskPage: React.FC = () => {
                                 const go = () => navigate('person', { personId: p.id });
                                 return (
                                     <div key={p.id} className="card-glass pt-match-card" onClick={go} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } }} role="button" tabIndex={0}>
-                                        <Swatch swatch={p.swatch} className="pt-match-face" />
+                                        <MatchImage src={p.coverThumbnailUrl ? matchCovers[p.coverThumbnailUrl] : undefined} swatch={p.swatch} round />
                                         <div><b>{p.name}</b><span>{plural(p.faceCount ?? 0, 'photo')}</span></div>
                                     </div>
                                 );
@@ -197,8 +210,8 @@ const AskPage: React.FC = () => {
                                 const go = () => navigate('ask', { query: pl.name });
                                 return (
                                     <div key={pl.id} className="card-glass pt-match-card" onClick={go} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } }} role="button" tabIndex={0}>
-                                        <Swatch swatch={pl.swatch} className="pt-match-face" />
-                                        <div><b>{pl.name}</b><span>place</span></div>
+                                        <MatchImage src={pl.coverThumbnailUrl ? matchCovers[pl.coverThumbnailUrl] : undefined} swatch={pl.swatch} />
+                                        <div><b>{pl.name}</b><span>{pl.count ? `Place · ${plural(pl.count, 'photo')}` : 'Place'}</span></div>
                                     </div>
                                 );
                             })}

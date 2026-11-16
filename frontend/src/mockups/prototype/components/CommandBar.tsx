@@ -76,7 +76,7 @@ const CommandBar: React.FC = () => {
                     <div className="pt-fm-menu">
                         <div className="pt-fm-rate">
                             <span><StarIcon /> Rate</span>
-                            <Stars value={0} onRate={(n) => { ratePhotos(selection, n); toast(`Rated ${selection.length} · ${n}★`); close(); clearSelection(); }} size={24} />
+                            <Stars value={0} onRate={(n) => { ratePhotos(selection, n); toast(`Rated ${selection.length} · ${n}★`); close(); clearSelection(); }} size={20} />
                         </div>
                         <button type="button" className="pt-fm-item" onClick={() => { navigate('tools', { filenames: selection.slice(0, 50).join(',') }); close(); }}>
                             <WrenchScrewdriverIcon /> Open in Workbench
