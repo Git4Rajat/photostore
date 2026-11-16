@@ -1118,8 +1118,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     const toast = useCallback(
         (message: string, actionLabel?: string, onAction?: () => void, tone: 'info' | 'error' = 'info') => {
-            // With a panel mounted, the bell previews it and the panel records it.
-            if (publishNotification(message, '', actionLabel && onAction ? { label: actionLabel, onClick: onAction } : undefined)) return;
+            // Confirmations ("Album renamed") show briefly and aren't saved, so the
+            // bell holds only what's worth reading again. Problems go to the bell.
+            if (tone === 'error' && publishNotification(message, '', actionLabel && onAction ? { label: actionLabel, onClick: onAction } : undefined)) return;
             const id = nextId();
             setToasts((prev) => [...prev, { id, message, actionLabel, onAction, tone }]);
             toastTimers.current[id] = window.setTimeout(() => {

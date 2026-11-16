@@ -204,3 +204,24 @@ describe('album sharing', () => {
         expect(screen.queryByRole('button', { name: /Make a new code/ })).toBeNull();
     });
 });
+
+describe('what reaches the bell', () => {
+    beforeEach(() => {
+        mocks.get.mockReset().mockResolvedValue({});
+        mocks.post.mockReset().mockResolvedValue({});
+        mocks.albumsIndex.mockReset().mockResolvedValue([]);
+        mocks.notify.mockReset().mockReturnValue(true);
+    });
+    afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+
+    // Quick confirmations show for a moment and aren't saved; problems are.
+    it('keeps confirmations out of the saved notifications, but not problems', async () => {
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async () => { store.toast('Album renamed'); });
+        expect(mocks.notify).not.toHaveBeenCalled();
+        expect(store.toasts.map((t) => t.message)).toContain('Album renamed');
+
+        await act(async () => { store.toast('Couldn’t rename the album', undefined, undefined, 'error'); });
+        expect(mocks.notify).toHaveBeenCalledWith('Couldn’t rename the album', '', undefined);
+    });
+});

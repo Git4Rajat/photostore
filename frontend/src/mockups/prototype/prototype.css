@@ -1167,3 +1167,32 @@
 @container (max-width: 805px) {
   .pt-person .pt-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
+
+/* ---- Notifications (redesign): grouped by day, one icon per kind, the action as a button ---- */
+.pt-shell .notification-pane { width: min(400px, 94vw); max-height: min(560px, calc(100vh - 90px)); padding: 14px 6px 8px 14px; display: flex; flex-direction: column; box-shadow: var(--lg-shadow-raised); }
+.pt-shell .notification-head { padding-right: 8px; }
+.pt-shell .notification-head .toolbar-title { font: 600 22px/1.1 var(--font-display); margin: 0; }
+.pt-shell .notification-list { display: block; max-height: none; flex: 1; min-height: 0; overflow-y: auto; padding-right: 8px; }
+.notification-day-label { margin: 10px 0 4px; font-size: 0.72rem; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.pt-shell .notification-item { display: flex; gap: 12px; align-items: flex-start; padding: 10px 8px; border: 0; border-radius: 12px; background: none; position: relative; }
+.pt-shell .notification-item.unread { background: none; border: 0; }
+.pt-shell .notification-item.unread::before { content: ''; position: absolute; left: -6px; top: 22px; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+.notification-icon { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; flex: none; background: var(--accent-soft); color: var(--accent); }
+.notification-icon svg { width: 17px; height: 17px; }
+.notification-icon.warn { background: var(--danger-soft); color: var(--danger); }
+.notification-body { flex: 1; min-width: 0; }
+.notification-top { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.pt-shell .notification-top .notification-title { font-size: 0.88rem; font-weight: 650; }
+.pt-shell .notification-top .notification-time { margin: 0; flex: none; font-variant-numeric: tabular-nums; }
+.pt-shell .notification-details { font-size: 0.8rem; line-height: 1.4; }
+.notification-acts { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.pt-shell .notification-progress-track { height: 6px; border-radius: 999px; }
+/* Phones: the panel is a page of its own, as the redesign draws it. */
+@media (max-width: 640px) {
+  .pt-shell .notification-pane { position: fixed; inset: 0; top: 0; left: 0; right: 0; width: auto; max-height: none; border-radius: 0; border: 0; padding: calc(12px + env(safe-area-inset-top)) 6px 8px 18px; z-index: 90; }
+  .pt-shell .notification-actions .notification-close { display: inline-flex; }
+}
+@media (max-width: 640px) {
+  /* The open panel sits above the tab bar. */
+  .pt-shell .mock-app > .ios-header:has(.notification-pane) { z-index: 95; }
+}
