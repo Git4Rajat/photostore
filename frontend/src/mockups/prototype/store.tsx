@@ -1308,6 +1308,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 photoCount: r.photoCount,
                 updatedAt: r.updatedAt,
                 coverThumbnailUrl: r.coverFilename ? covers.get(r.coverFilename) || undefined : undefined,
+                ...(r.coverFilename ? { coverFilename: r.coverFilename } : {}),
                 isPublic: r.isPublic,
                 publicUrl: r.publicUrl || undefined,
                 publicExpiresAt: r.publicExpiresAt || undefined,

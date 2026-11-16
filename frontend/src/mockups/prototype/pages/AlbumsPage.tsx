@@ -16,7 +16,7 @@ import {
     Trash2 as TrashIcon,
     Users as UserGroupIcon,
 } from 'lucide-react';
-import { shownAlbum, useStore } from '../store';
+import { isVideoFilename, shownAlbum, useStore } from '../store';
 import PhotoGrid from '../components/PhotoGrid';
 import ScrollSentinel from '../components/ScrollSentinel';
 import { Menu, Spinner, SelectionBar } from '../components/bits';
@@ -30,6 +30,8 @@ import { ThumbSizeControl, useTileSize } from '../components/controls';
 import { confirmDialog, promptDialog } from '../../../components/shared/dialogs';
 import { useProtectedBlobUrls } from '../../../services/imageClient';
 import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
+import { tileImage, useMainMedia } from '../media';
+import type { Photo } from '../types';
 
 const SMART_ALBUM_RULES: Array<{ id: string; label: string; description: string; Icon: React.ComponentType<React.SVGProps<SVGSVGElement>> }> = [
     { id: 'location', label: 'By location', description: 'Places across the library', Icon: MapPinIcon },
@@ -38,6 +40,19 @@ const SMART_ALBUM_RULES: Array<{ id: string; label: string; description: string;
     { id: 'event-window', label: 'By event/time', description: 'Capture date window', Icon: CalendarDaysIcon },
     { id: 'tag-object', label: 'By tag/object', description: 'AI tags and detected objects', Icon: TagIcon },
 ];
+
+/** The album banner: the cover thumbnail at once, then the photo's preview so a
+ *  full-width banner isn't an upscaled thumbnail. */
+const AlbumBanner: React.FC<{ thumb: string; photo?: Photo }> = ({ thumb, photo }) => {
+    // Videos have no still preview to load; their thumbnail is the frame.
+    const media = useMainMedia(photo && !isVideoFilename(photo.filename) ? photo : null);
+    const [failed, setFailed] = useState<string[]>([]);
+    // Best first: the preview, then the 400px grid image, then the thumbnail.
+    const candidates = [media.url, photo ? tileImage(photo, undefined)?.src : undefined, thumb]
+        .filter((u): u is string => Boolean(u) && !failed.includes(u as string));
+    const src = candidates[0] ?? thumb;
+    return <img src={src} alt="" onError={() => { if (src !== thumb) setFailed((prev) => [...prev, src]); }} />;
+};
 
 /** Albums — list first on mobile, detail view on larger screens. */
 export const AlbumsPage: React.FC = () => {
@@ -289,6 +304,8 @@ export const AlbumsPage: React.FC = () => {
         ? [dayHeading(dated[dated.length - 1]), dayHeading(dated[0])].filter((d, i, all) => all.indexOf(d) === i).join(' – ')
         : '';
     const cover = album.coverThumbnailUrl ? covers[album.coverThumbnailUrl] : undefined;
+    // The banner is far wider than a thumbnail; it loads the cover photo's preview when that photo is loaded.
+    const coverPhoto = (activePhotos ?? []).find((p) => p.filename === album.coverFilename);
 
     // Split into the scrollable row list and a footer that stays outside the
     // scrolling container -- the sidebar/mobile list wrappers clip overflow
@@ -424,7 +441,7 @@ export const AlbumsPage: React.FC = () => {
 
                     <section className="pt-album-detail">
                         <div className={`pt-album-hero${cover ? '' : ' no-cover'}`}>
-                            {cover && <img src={cover} alt="" />}
+                            {cover && <AlbumBanner thumb={cover} photo={coverPhoto} />}
                             {/* Phones: back sits on the cover, as the redesign draws it. */}
                             <button type="button" className="pt-hero-back" onClick={() => navigate('albums', {})} aria-label="Back to albums">
                                 <ChevronLeftIcon />

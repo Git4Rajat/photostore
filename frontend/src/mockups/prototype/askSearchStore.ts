@@ -1,11 +1,11 @@
 import { useSyncExternalStore } from 'react';
 import { get } from '../../services/apiClient';
-import { getCachedMediaToken, thumbnailUrlForBlob } from '../../services/mediaToken';
+import { getCachedMediaToken } from '../../services/mediaToken';
 import { getActiveLibraryFromToken } from '../../services/passwordAuthClient';
 import { reportIndexBuilding } from '../../services/indexBuilding';
 import type { Photo as BackendPhoto } from '../../types/uiTypes';
-import { captureWallClock } from '../../utils/captureDate';
 import type { Photo } from './types';
+import { mapPhoto } from './store';
 
 /**
  * The Ask page's search lives here, outside React, so it keeps running (and keeps its results) when the
@@ -13,30 +13,9 @@ import type { Photo } from './types';
  * when they come back, along with the pages already scrolled through and the scroll position. State is
  * per library; a different account/library starts empty.
  */
-const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-
-const mapSearchResult = (b: BackendPhoto): Photo => {
-    const iso = b.captureDate || b.uploadDate || null;
-    const valid = captureWallClock(iso);
-    return {
-        id: b.filename,
-        filename: b.filename,
-        swatch: 's1',
-        dateLabel: valid ? `${MONTHS[valid.getMonth()]} ${valid.getDate()}, ${valid.getFullYear()}` : '',
-        year: valid ? valid.getFullYear() : 0,
-        rating: b.rating ?? 0,
-        liked: Boolean(b.liked),
-        likes: b.likes,
-        placeId: null,
-        personIds: (b.people ?? []).map((p) => p.personId),
-        tags: b.tags ?? [],
-        // Token mode: the server sends blob names and the browser builds the (cacheable) URLs.
-        thumbnailUrl: (b.thumbnailBlob ? thumbnailUrlForBlob(b.thumbnailBlob) : '') || b.thumbnailUrl,
-        rotation: b.rotation,
-        thumbnailRotation: b.thumbnailRotation,
-        captureDate: iso,
-    };
-};
+// The same record the Gallery builds (thumbnail, sharp grid image, Live Photo
+// clip, rotation), so search results load and look exactly like Photos.
+const mapSearchResult = (b: BackendPhoto): Photo => mapPhoto(b);
 
 // Results arrive a screenful at a time and keep loading as the user scrolls.
 const SEARCH_PAGE_LIMIT = 120;

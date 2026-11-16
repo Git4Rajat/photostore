@@ -214,7 +214,7 @@ const PhotoViewer: React.FC = () => {
                                     )}
                                     <div className="pt-vi-block">
                                         <span className="pt-vi-label">Your rating</span>
-                                        <Stars value={photo.rating} onRate={(n) => ratePhotos([photo.id], n)} size={22} />
+                                        <Stars value={photo.rating} onRate={(n) => ratePhotos([photo.id], n)} size={20} />
                                     </div>
                                     {meta.ocrText && meta.ocrText.trim() && (
                                         <div className="pt-vi-block">
@@ -256,7 +256,7 @@ const PhotoViewer: React.FC = () => {
                             <div className="pt-more-menu">
                                 <div className="pt-fm-rate">
                                     <span><StarIcon /> Rating</span>
-                                    <Stars value={photo.rating} onRate={(n) => ratePhotos([photo.id], n)} size={24} />
+                                    <Stars value={photo.rating} onRate={(n) => ratePhotos([photo.id], n)} size={20} />
                                 </div>
                                 <button type="button" onClick={() => { close(); startDownload(); }}>Download</button>
                                 <button type="button" onClick={() => { close(); navigate('tools', { filenames: photo.filename }); }}>Open in Workbench</button>
