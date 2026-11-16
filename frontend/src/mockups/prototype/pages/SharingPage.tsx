@@ -7,6 +7,7 @@ import { initialsFor, plural } from '../../../utils/format';
 import * as library from '../../../services/libraryClient';
 import { getRuntimeConfig } from '../../../config/appConfig';
 import { confirmDialog, promptDialog } from '../../../components/shared/dialogs';
+import DownloadLibrary from '../components/DownloadLibrary';
 import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -213,6 +214,8 @@ const SharingPage: React.FC = () => {
                         <p className="pt-page-sub">Only the library owner can invite or remove members.</p>
                     )}
                     {atCapacity && isOwner && <p className="pt-page-sub">This library is at its member limit.</p>}
+
+                    {isOwner && <DownloadLibrary />}
 
                     {/* The destructive option sits apart, at the bottom. */}
                     {isOwner && (

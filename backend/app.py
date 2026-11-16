@@ -643,6 +643,8 @@ LIBRARY_EXPORT_PART_MAX_BYTES = int(os.getenv('LIBRARY_EXPORT_PART_MAX_BYTES', s
 # part boundaries, or resumability, only how much wall-clock time each
 # batch of downloads actually takes.
 LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY = int(os.getenv('LIBRARY_EXPORT_DOWNLOAD_CONCURRENCY', '8'))
+# How long a Download library read token lasts; the browser renews it before then (library_download.py).
+LIBRARY_DOWNLOAD_SAS_TTL_SECONDS = int(os.getenv('LIBRARY_DOWNLOAD_SAS_TTL_SECONDS', str(12 * 3600)))
 # delete_multiple_photos does several point-reads/deletes (metadata, blobs,
 # hash/filename-owner index rows) per file, previously run one file at a time
 # -- pure network I/O wait each time, same shape as the library-export

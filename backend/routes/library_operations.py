@@ -1,4 +1,6 @@
 """Archive-only whole-library operations. Heavy work remains on workers."""
+import itertools
+
 from flask import Blueprint
 
 import app
@@ -144,6 +146,66 @@ def library_export_manifest_page():
         files.append({'filename': filename, 'blobName': blob_name})
 
     return app.jsonify({'baseUrl': base_url, 'sas': sas, 'files': files, 'nextCursor': next_cursor})
+
+@library_operations_bp.route('/api/library/download/manifest', methods=['GET'])
+def library_download_manifest():
+    """The whole library as NDJSON for the browser's folder download (library_download.py): one streamed
+    pass, one request, so the archive role wakes once instead of being paged for the length of the run."""
+    import library_download
+    _account_id, library_id, error = app._require_owner_context()
+    if error:
+        return error
+    if app.metadata_table_client is None:
+        return app.jsonify({'error': 'Could not list library contents.'}), 503
+    try:
+        lines = library_download.entries(app.metadata_table_client, library_id)
+        first = next(lines)  # a storage failure surfaces as a 503, not as a truncated 200
+    except Exception:
+        app.app.logger.exception('Failed to start library download manifest for %s', library_id)
+        return app.jsonify({'error': 'Could not list library contents.'}), 503
+
+    def body():
+        yield from library_download.ndjson(itertools.chain([first], lines))
+
+    return app.Response(body(), mimetype='application/x-ndjson',
+                        headers={'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no'})
+
+
+@library_operations_bp.route('/api/library/download/token', methods=['GET'])
+def library_download_token():
+    """A read token for the originals container, renewed by the browser before it expires. Capped at
+    LIBRARY_DOWNLOAD_SAS_TTL_SECONDS and at the delegation key's own lifetime."""
+    _account_id, _library_id, error = app._require_owner_context()
+    if error:
+        return error
+    try:
+        base_url, sas, expires_at = app._stable_container_read_sas(
+            app.BLOB_IMAGE_CONTAINER, ttl_seconds=app.LIBRARY_DOWNLOAD_SAS_TTL_SECONDS)
+    except Exception:
+        app.app.logger.exception('Failed to sign library download token')
+        return app.jsonify({'error': 'Could not prepare download links.'}), 503
+    response = app.jsonify({'baseUrl': base_url, 'sas': sas, 'expiresAt': expires_at})
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@library_operations_bp.route('/api/library/download/info', methods=['GET'])
+def library_download_info():
+    """Albums and people names for the library.json saved beside the downloaded files."""
+    import album_store
+    import library_download
+    _account_id, library_id, error = app._require_owner_context()
+    if error:
+        return error
+    try:
+        info = library_download.library_info(app.albums_table_client, app.person_table_client, library_id,
+                                             album_store.all_names)
+    except Exception:
+        app.app.logger.exception('Failed to read library info for download of %s', library_id)
+        return app.jsonify({'error': 'Could not read albums and people.'}), 503
+    meta = (app.library_store.get_library(library_id) or {}) if app.library_store is not None else {}
+    return app.jsonify({'libraryName': str(meta.get('name') or ''), **info})
+
 
 @library_operations_bp.route('/api/library/clean/request', methods=['POST'])
 def library_clean_request():

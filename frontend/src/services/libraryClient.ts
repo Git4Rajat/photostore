@@ -380,3 +380,42 @@ export const getLibraryExportManifestPage = async (cursor?: string | null): Prom
     return response.json();
 };
 
+
+// --- Download library (services/libraryDownload, docs/library-download-dedicated.md) ---
+
+export interface DownloadToken {
+    baseUrl: string;
+    sas: string;
+    expiresAt: string;
+}
+
+export interface DownloadInfo {
+    libraryName: string;
+    albums: Array<{ id: string; name: string; photos: string[] }>;
+    people: Array<{ id: string; name: string }>;
+}
+
+// The whole library as NDJSON, one file per line. Returned unparsed so the caller can stream it.
+export const getLibraryDownloadManifest = async (signal?: AbortSignal): Promise<Response> => {
+    const response = await authedFetch('/api/library/download/manifest', { signal });
+    if (!response.ok) {
+        throw new Error(await parseError(response, 'Could not list the library.'));
+    }
+    return response;
+};
+
+export const getLibraryDownloadToken = async (): Promise<DownloadToken> => {
+    const response = await authedFetch('/api/library/download/token');
+    if (!response.ok) {
+        throw new Error(await parseError(response, 'Could not prepare download links.'));
+    }
+    return response.json();
+};
+
+export const getLibraryDownloadInfo = async (): Promise<DownloadInfo> => {
+    const response = await authedFetch('/api/library/download/info');
+    if (!response.ok) {
+        throw new Error(await parseError(response, 'Could not read albums and people.'));
+    }
+    return response.json();
+};
