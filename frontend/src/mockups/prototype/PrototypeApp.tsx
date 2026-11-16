@@ -10,10 +10,7 @@ import {
     Search as MagnifyingGlassIcon,
     Image as PhotoIcon,
     Images as RectangleStackIcon,
-    Users as UserGroupIcon,
-    ChevronRight as ChevronRightIcon,
     CloudUpload as UploadIcon,
-    MapPin as MapPinIcon,
     // The active-tab "solid" cue is handled by color + a heavier stroke in the
     // tab bar (Lucide is a single outline set), so the solid aliases point at
     // the same glyphs.
@@ -109,21 +106,6 @@ const activeMobileNavFor = (page: PageId): PageId | '' => {
     return active === 'people' || active === 'explore' ? 'albums' : active;
 };
 
-/** Albums tab: the way in to People and Explore, which have no tab of their own on a phone. */
-const BrowseLinks: React.FC = () => {
-    const { navigate } = useStore();
-    return (
-        <nav className="pt-browse-links" aria-label="Browse by">
-            <button type="button" onClick={() => navigate('people')}>
-                <UserGroupIcon aria-hidden="true" /><span><b>People</b><small>Everyone Keepsake has found</small></span><ChevronRightIcon aria-hidden="true" className="pt-browse-chev" />
-            </button>
-            <button type="button" onClick={() => navigate('explore')}>
-                <MapPinIcon aria-hidden="true" /><span><b>Places and things</b><small>Browse by where and what</small></span><ChevronRightIcon aria-hidden="true" className="pt-browse-chev" />
-            </button>
-        </nav>
-    );
-};
-
 const PAGE_TITLES: Record<PageId, string> = {
     gallery: 'Photos', ask: 'Search', albums: 'Albums', people: 'People', person: 'People',
     explore: 'Places and things', sharing: 'Library', tools: 'Tools', trash: 'Recently deleted', additional: 'About',
@@ -142,7 +124,7 @@ const Page: React.FC = () => {
     switch (route.page) {
         case 'ask': return <AskPage />;
         case 'gallery': return <GalleryPage />;
-        case 'albums': return <>{!route.params.albumId && <BrowseLinks />}<AlbumsPage /></>;
+        case 'albums': return <AlbumsPage />;
         case 'people': return <PeoplePage />;
         case 'person': return <PersonDetailPage />;
         case 'explore': return <ExplorePage />;

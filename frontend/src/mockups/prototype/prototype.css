@@ -364,8 +364,7 @@
      always there, just scrolled past the whole list first. */
   .pt-album-detail { display: none; }
   .pt-albums.show-detail .pt-album-detail { display: block; padding: 8px; max-height: none; overflow-y: visible; }
-  .pt-share-section { max-height: none; overflow: visible; }
-  .pt-album-detail-head .btn span { display: none; }
+  .pt-albums-browse-desktop { display: none; }
   .pt-body { overflow-y: auto; }
 }
 .pt-album-row { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; padding: 8px; border: 0; border-radius: var(--r-sm); background: transparent; cursor: pointer; font: inherit; color: var(--text); }
@@ -381,8 +380,82 @@
 .pt-album-row-check svg { width: 13px; height: 13px; }
 .pt-album-row-check.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .pt-album-detail { padding: 16px; }
-.pt-album-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
-.pt-album-photos-head { display: flex; align-items: center; justify-content: space-between; margin: 6px 0 10px; }
+.pt-album-photos-head { display: flex; align-items: center; justify-content: flex-end; margin: 6px 0 10px; }
+
+/* Album list on phones: a title row, then two-up cover cards. */
+.pt-albums-head { margin-bottom: 12px; align-items: center !important; flex-direction: row !important; }
+.pt-albums-head .pt-toolbar-actions { width: auto !important; }
+.pt-album-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 10px; margin-bottom: 20px; }
+.pt-album-card { appearance: none; border: 0; background: none; padding: 0; color: var(--text); font: inherit; text-align: left; cursor: pointer; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.pt-album-card-cover { position: relative; aspect-ratio: 1; border-radius: var(--r-md); overflow: hidden; background: var(--lg-edge); margin-bottom: 6px; }
+.pt-album-card-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.pt-album-card-cover .pt-album-row-check { position: absolute; right: 8px; bottom: 8px; background: rgba(0,0,0,0.25); border-color: #fff; }
+.pt-album-card.selected .pt-album-card-cover { box-shadow: inset 0 0 0 3px var(--accent); }
+.pt-album-card b { font-size: 0.92rem; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pt-album-card > span:last-child { display: inline-flex; align-items: center; gap: 4px; font-size: 0.78rem; color: var(--muted); }
+.pt-album-card > span:last-child svg { width: 13px; height: 13px; color: var(--accent); }
+
+/* An open album: its cover as a banner with the name over it, then actions. */
+.pt-album-hero { position: relative; height: 150px; border-radius: var(--r-md); overflow: hidden; margin-bottom: 12px; background: linear-gradient(135deg, var(--accent-soft), var(--lg-edge)); display: flex; align-items: flex-end; }
+.pt-album-hero img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.pt-album-hero::after { content: ''; position: absolute; inset: 0; background: linear-gradient(180deg, transparent 35%, rgba(0,0,0,0.6)); }
+.pt-album-hero.no-cover::after { display: none; }
+.pt-album-hero-text { position: relative; z-index: 1; padding: 14px 16px; color: #fff; min-width: 0; }
+.pt-album-hero.no-cover .pt-album-hero-text { color: var(--text); }
+.pt-album-hero-text .pt-page-title { color: inherit; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pt-album-hero-text p { margin: 2px 0 0; font-size: 0.82rem; opacity: 0.85; }
+.pt-album-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.pt-album-actions-spacer { flex: 1; }
+.pt-album-status { display: inline-flex; align-items: center; gap: 6px; font-size: 0.8rem; color: var(--muted); margin: 0; }
+.pt-album-status svg { width: 14px; height: 14px; color: var(--accent); flex: none; }
+.pt-album-status.stacked { display: none; margin-bottom: 8px; }
+@media (max-width: 620px) {
+  .pt-album-hero { height: 190px; margin: -8px -8px 12px; border-radius: 0; }
+  .pt-album-status.inline { display: none; }
+  .pt-album-status.stacked { display: flex; }
+}
+.pt-more-menu button.danger { color: var(--danger); }
+
+/* On/off switch (share sheet). */
+.pt-switch { appearance: none; flex: none; width: 46px; height: 28px; border-radius: 999px; border: 0; padding: 3px; background: var(--lg-edge); cursor: pointer; transition: background 0.15s ease; }
+.pt-switch span { display: block; width: 22px; height: 22px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.3); transition: transform 0.15s ease; }
+.pt-switch.on { background: var(--accent); }
+.pt-switch.on span { transform: translateX(18px); }
+.pt-switch:disabled { opacity: 0.6; cursor: default; }
+.pt-switch:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+/* Share sheet. */
+.pt-share { display: flex; flex-direction: column; gap: 16px; }
+.pt-share-row { display: flex; align-items: flex-start; gap: 12px; }
+.pt-share-icon { width: 20px; height: 20px; flex: none; margin-top: 2px; color: var(--muted); }
+.pt-share-icon.accent { color: var(--accent); }
+.pt-share-text { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+.pt-share-text b { font-size: 0.92rem; }
+.pt-share-text small { font-size: 0.8rem; color: var(--muted); }
+.pt-share-url { display: flex; gap: 8px; align-items: center; }
+.pt-share-expiry { display: flex; flex-direction: column; gap: 6px; }
+.pt-share-expiry .mock-seg { display: flex; }
+.pt-share-expiry .mock-seg button { flex: 1; }
+.pt-share-label { font-size: 0.8rem; font-weight: 650; color: var(--muted); }
+.pt-share-note { font-size: 0.78rem; color: var(--muted); }
+.pt-share-newcode { align-self: flex-start; margin-left: 32px; }
+.pt-share-done { width: 100%; justify-content: center; }
+.pt-share-stop { display: flex; flex-direction: column; align-items: center; gap: 2px; text-align: center; }
+.pt-share-stop small { font-size: 0.76rem; color: var(--muted); }
+
+/* Add-photos picker: the library over the album, full screen. */
+.pt-picker { position: fixed; inset: 0; z-index: 85; background: var(--bg-1); display: flex; flex-direction: column; }
+.pt-picker-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--lg-edge); }
+.pt-picker-head b { font-size: 1rem; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pt-picker-head .pt-linkish:disabled { color: var(--muted); cursor: default; }
+.pt-picker-body { flex: 1; overflow-y: auto; padding: 8px 16px 16px; }
+.pt-picker-grid { --pt-tile-min: 84px; }
+@media (min-width: 700px) { .pt-picker-grid { --pt-tile-min: 130px; } }
+.pt-picker-grid .pt-tile { border: 0; padding: 0; font: inherit; }
+.pt-picker-grid .pt-tile.added { cursor: default; }
+.pt-picker-grid .pt-tile.added::after { content: ''; position: absolute; inset: 0; background: rgba(0,0,0,0.45); }
+.pt-picker-added { position: absolute; left: 6px; bottom: 6px; z-index: 1; font-size: 0.7rem; font-weight: 700; padding: 2px 7px; border-radius: 999px; background: rgba(0,0,0,0.5); color: #fff; }
+.pt-picker-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 16px calc(10px + env(safe-area-inset-bottom)); border-top: 1px solid var(--lg-edge); font-size: 0.84rem; color: var(--muted); }
 
 /* ---- people ---- */
 .pt-people-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 14px; }
