@@ -1196,3 +1196,43 @@
   /* The open panel sits above the tab bar. */
   .pt-shell .mock-app > .ios-header:has(.notification-pane) { z-index: 95; }
 }
+
+/* ---- Library and sharing (redesign) ---- */
+.pt-library-cols { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; align-items: start; }
+.pt-library-main { display: flex; flex-direction: column; min-width: 0; }
+.pt-library-name { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; margin-bottom: 18px; border-radius: 16px; background: var(--lg-surface); }
+.pt-library-name > span { display: flex; flex-direction: column; min-width: 0; }
+.pt-library-name b { font: 600 19px/1.2 var(--font-display); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pt-library-name small { font-size: 0.8rem; color: var(--muted); }
+.pt-library-name .btn { gap: 6px; flex: none; }
+.pt-list { border-radius: 16px; background: var(--lg-surface); padding: 2px 14px; margin-bottom: 18px; }
+.pt-list .member-row:last-child { border-bottom: 0; }
+.pt-invite-icon { width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; flex: none; background: var(--lg-surface-wash); color: var(--muted); }
+.pt-invite-icon svg { width: 17px; height: 17px; }
+.pt-invite-open { width: 100%; justify-content: center; }
+.pt-library-danger { display: flex; flex-direction: column; align-items: center; gap: 2px; margin-top: 28px; text-align: center; }
+.pt-library-danger small { font-size: 0.76rem; color: var(--muted); }
+.pt-library-invite { display: none; }
+.pt-invite-form { display: flex; flex-direction: column; gap: 12px; }
+.pt-invite-title { margin: 0; font: 600 20px/1.2 var(--font-display); }
+.pt-sheet .pt-invite-title { display: none; }
+.pt-invite-field { display: flex; flex-direction: column; gap: 6px; }
+.pt-invite-field > span, .pt-invite-options legend { font-size: 0.8rem; font-weight: 650; color: var(--muted); }
+.pt-invite-options { border: 0; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.pt-invite-options legend { padding: 0; margin-bottom: 6px; }
+.pt-option { display: flex; gap: 12px; align-items: flex-start; padding: 12px; border: 1.5px solid var(--lg-edge); border-radius: 14px; cursor: pointer; }
+.pt-option.on { border-color: var(--accent); background: var(--accent-soft); }
+.pt-option input { margin: 2px 0 0; accent-color: var(--accent); width: 18px; height: 18px; flex: none; }
+.pt-option span { display: flex; flex-direction: column; gap: 2px; }
+.pt-option b { font-size: 0.9rem; }
+.pt-option small { font-size: 0.78rem; color: var(--muted); }
+.pt-invite-note { display: flex; gap: 8px; align-items: center; margin: 0; font-size: 0.8rem; color: var(--muted); }
+.pt-invite-note svg { width: 16px; height: 16px; flex: none; }
+.pt-invite-form .btn-primary { width: 100%; justify-content: center; gap: 7px; }
+@container (min-width: 1000px) {
+  .pt-library-cols { grid-template-columns: minmax(0, 1fr) 340px; }
+  .pt-library-invite { display: block; padding: 18px; border-radius: 18px; background: var(--lg-surface); border: 0; position: sticky; top: 0; }
+  .pt-library .pt-invite-open { display: none; }
+  .pt-library-danger { align-items: flex-start; text-align: left; }
+}
+.pt-invite-field .field { width: 100%; box-sizing: border-box; }
