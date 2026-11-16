@@ -371,7 +371,7 @@ const GalleryPage: React.FC = () => {
         );
     }
 
-    const levelTitle = level === 'years' ? 'Years' : level === 'months' ? (focusYear ?? 'Months') : 'Gallery';
+    const levelTitle = level === 'years' ? 'Years' : level === 'months' ? (focusYear ?? 'Months') : 'Photos';
 
     return (
         <div>

@@ -882,3 +882,14 @@
 .pt-tile-skeleton { cursor: default; background: linear-gradient(100deg, var(--surface-2, rgba(128,128,128,.14)) 30%, var(--surface-3, rgba(128,128,128,.24)) 50%, var(--surface-2, rgba(128,128,128,.14)) 70%); background-size: 200% 100%; animation: pt-skel 1.4s ease-in-out infinite; }
 @keyframes pt-skel { to { background-position: -200% 0; } }
 @media (prefers-reduced-motion: reduce) { .pt-tile-skeleton { animation: none; } }
+
+/* ---- Albums tab: the way in to People and Explore ---- */
+.pt-browse-links { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px; margin: 0 0 18px; }
+.pt-browse-links button { display: flex; align-items: center; gap: 12px; min-height: 56px; padding: 8px 14px; border: 1px solid var(--lg-edge); border-radius: var(--r-md); background: var(--lg-surface-strong); color: var(--text); font: inherit; text-align: left; cursor: pointer; }
+.pt-browse-links button:hover { background: var(--lg-surface-wash); }
+.pt-browse-links button:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.pt-browse-links svg { width: 20px; height: 20px; flex: none; color: var(--accent); }
+.pt-browse-links span { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+.pt-browse-links b { font-size: 0.92rem; font-weight: 600; }
+.pt-browse-links small { font-size: 0.78rem; color: var(--muted); }
+.pt-browse-links .pt-browse-chev { width: 16px; height: 16px; color: var(--muted); }

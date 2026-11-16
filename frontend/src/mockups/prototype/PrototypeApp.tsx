@@ -7,21 +7,19 @@ import { perf } from '../../services/perf';
 import React, { useCallback, useEffect, useState } from 'react';
 import { MemoryRouter, BrowserRouter, Routes, Route } from 'react-router-dom';
 import {
-    Plus as PlusIcon,
     Search as MagnifyingGlassIcon,
     Image as PhotoIcon,
     Images as RectangleStackIcon,
     Users as UserGroupIcon,
-    Sparkles as SparklesIcon,
-    MoreHorizontal as EllipsisHorizontalIcon,
+    ChevronRight as ChevronRightIcon,
+    CloudUpload as UploadIcon,
+    MapPin as MapPinIcon,
     // The active-tab "solid" cue is handled by color + a heavier stroke in the
     // tab bar (Lucide is a single outline set), so the solid aliases point at
     // the same glyphs.
     Search as MagnifyingGlassIconSolid,
     Image as PhotoIconSolid,
     Images as RectangleStackIconSolid,
-    Users as UserGroupIconSolid,
-    Sparkles as SparklesIconSolid,
 } from 'lucide-react';
 import { LogoLockup } from '../../components/shared/Logo';
 import { NAV_ITEMS } from './components/HomeChrome';
@@ -88,24 +86,41 @@ const isConfirmLibraryCleanPath = (): boolean =>
     typeof window !== 'undefined' && window.location.pathname === '/confirm-library-clean';
 
 const NAV: { id: PageId; label: string }[] = [...NAV_ITEMS];
-// The phone tab bar holds 5 primary destinations; the remaining ones live
-// behind a "More" tab (HIG: fold overflow beyond 5 tabs into More rather than
-// dropping those destinations, which previously left Tools/Sharing unreachable
-// on mobile).
-const MOBILE_NAV = NAV.slice(0, 5);
-const MOBILE_MORE = NAV.slice(5); // Tools, Sharing
+// The phone tab bar holds the three places people live in. People and Explore
+// are reached from the Albums tab; Library & sharing, Recently Deleted and
+// Tools sit in the account menu.
+const MOBILE_NAV = NAV.slice(0, 3);
 
 const MOBILE_NAV_ICONS: Record<string, [React.ElementType, React.ElementType]> = {
     ask: [MagnifyingGlassIcon, MagnifyingGlassIconSolid],
     gallery: [PhotoIcon, PhotoIconSolid],
     albums: [RectangleStackIcon, RectangleStackIconSolid],
-    people: [UserGroupIcon, UserGroupIconSolid],
-    explore: [SparklesIcon, SparklesIconSolid],
 };
 
+const ACCOUNT_PAGES: PageId[] = ['trash', 'additional', 'tools', 'sharing'];
 const activeNavFor = (page: PageId): PageId | '' => (
-    page === 'person' ? 'people' : (page === 'trash' || page === 'additional') ? '' : page
+    page === 'person' ? 'people' : ACCOUNT_PAGES.includes(page) ? '' : page
 );
+// On a phone People and Explore live under the Albums tab.
+const activeMobileNavFor = (page: PageId): PageId | '' => {
+    const active = activeNavFor(page);
+    return active === 'people' || active === 'explore' ? 'albums' : active;
+};
+
+/** Albums tab: the way in to People and Explore, which have no tab of their own on a phone. */
+const BrowseLinks: React.FC = () => {
+    const { navigate } = useStore();
+    return (
+        <nav className="pt-browse-links" aria-label="Browse by">
+            <button type="button" onClick={() => navigate('people')}>
+                <UserGroupIcon aria-hidden="true" /><span><b>People</b><small>Everyone Keepsake has found</small></span><ChevronRightIcon aria-hidden="true" className="pt-browse-chev" />
+            </button>
+            <button type="button" onClick={() => navigate('explore')}>
+                <MapPinIcon aria-hidden="true" /><span><b>Places and things</b><small>Browse by where and what</small></span><ChevronRightIcon aria-hidden="true" className="pt-browse-chev" />
+            </button>
+        </nav>
+    );
+};
 
 const Page: React.FC = () => {
     const { route } = useStore();
@@ -114,7 +129,7 @@ const Page: React.FC = () => {
     switch (route.page) {
         case 'ask': return <AskPage />;
         case 'gallery': return <GalleryPage />;
-        case 'albums': return <AlbumsPage />;
+        case 'albums': return <>{!route.params.albumId && <BrowseLinks />}<AlbumsPage /></>;
         case 'people': return <PeoplePage />;
         case 'person': return <PersonDetailPage />;
         case 'explore': return <ExplorePage />;
@@ -127,7 +142,7 @@ const Page: React.FC = () => {
 };
 
 const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: () => void }> = ({ theme, onTheme, onSignOut }) => {
-    const { route, navigate, toast } = useStore();
+    const { route, navigate } = useStore();
     const { requestUpload } = useAppServices();
     const active = activeNavFor(route.page);
     const account = getActiveAccount();
@@ -137,19 +152,19 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
 
     return (
         <header className="ios-header">
-            <button type="button" className="pt-wordmark-btn" onClick={() => navigate('gallery')} aria-label="Go to Gallery">
+            <button type="button" className="pt-wordmark-btn" onClick={() => navigate('gallery')} aria-label="Go to Photos">
                 <LogoLockup size={30} className="ios-header-wordmark" />
             </button>
             <nav className="ios-tabs" aria-label="Primary navigation">
                 {NAV.map((item) => (
-                    <button key={item.id} type="button" className={`ios-tab${item.id === active ? ' active' : ''}`} onClick={() => navigate(item.id)}>
+                    <button key={item.id} type="button" className={`ios-tab${item.id === active ? ' active' : ''}`} aria-current={item.id === active ? 'page' : undefined} onClick={() => navigate(item.id)}>
                         {item.label}
                     </button>
                 ))}
             </nav>
             <div className="app-header-actions">
                 <button type="button" className="btn btn-primary pt-upload-btn" onClick={requestUpload} aria-label="Upload">
-                    <PlusIcon className="toolbar-icon" /> <span className="pt-upload-label">Upload</span>
+                    <UploadIcon className="toolbar-icon" /> <span className="pt-upload-label">Upload</span>
                 </button>
 
                 <NotificationBell />
@@ -163,9 +178,10 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
                     {(close) => (
                         <div className="pt-account-menu">
                             <div className="pt-account-head"><b>{accountName}</b>{accountEmail && <span>{accountEmail}</span>}</div>
-                            <button type="button" onClick={() => { navigate('trash'); close(); }}>Recently Deleted</button>
-                            <button type="button" onClick={() => { toast('Corrupted uploads: all clear'); close(); }}>Corrupted Uploads</button>
-                            <button type="button" onClick={() => { navigate('additional'); close(); }}>Additional Info</button>
+                            <button type="button" onClick={() => { navigate('sharing'); close(); }}>Library and sharing</button>
+                            <button type="button" onClick={() => { navigate('trash'); close(); }}>Recently deleted</button>
+                            <button type="button" onClick={() => { navigate('tools'); close(); }}>Tools</button>
+                            <button type="button" onClick={() => { navigate('additional'); close(); }}>About Keepsake</button>
                             <div className="pt-account-sep" />
                             <div className="pt-account-theme">
                                 <span>Theme</span>
@@ -176,7 +192,7 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
                                 </div>
                             </div>
                             <div className="pt-account-sep" />
-                            <button type="button" onClick={() => { close(); onSignOut(); }}>Sign Out</button>
+                            <button type="button" onClick={() => { close(); onSignOut(); }}>Sign out</button>
                         </div>
                     )}
                 </Menu>
@@ -187,8 +203,7 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
 
 const MobileTabbar: React.FC = () => {
     const { route, navigate } = useStore();
-    const active = activeNavFor(route.page);
-    const moreActive = MOBILE_MORE.some((item) => item.id === route.page);
+    const active = activeMobileNavFor(route.page);
     return (
         <nav className="mock-tabbar" aria-label="Primary navigation (mobile)">
             {MOBILE_NAV.map((item) => {
@@ -196,30 +211,12 @@ const MobileTabbar: React.FC = () => {
                 const [Outline, Solid] = MOBILE_NAV_ICONS[item.id];
                 const Icon = isActive ? Solid : Outline;
                 return (
-                    <button key={item.id} type="button" className={isActive ? 'on' : undefined} onClick={() => navigate(item.id)}>
+                    <button key={item.id} type="button" className={isActive ? 'on' : undefined} aria-current={isActive ? 'page' : undefined} onClick={() => navigate(item.id)}>
                         <Icon className="mock-tabbar-icon" aria-hidden="true" strokeWidth={isActive ? 2.5 : 2} />
                         <span>{item.label}</span>
                     </button>
                 );
             })}
-            <Menu
-                align="right"
-                className="mock-tabbar-more"
-                renderTrigger={(toggle) => (
-                    <button type="button" className={moreActive ? 'on' : undefined} onClick={toggle} aria-haspopup="menu" aria-label="More">
-                        <EllipsisHorizontalIcon className="mock-tabbar-icon" aria-hidden="true" />
-                        <span>More</span>
-                    </button>
-                )}
-            >
-                {(close) => (
-                    <div className="pt-more-menu">
-                        {MOBILE_MORE.map((item) => (
-                            <button key={item.id} type="button" onClick={() => { navigate(item.id); close(); }}>{item.label}</button>
-                        ))}
-                    </div>
-                )}
-            </Menu>
         </nav>
     );
 };
