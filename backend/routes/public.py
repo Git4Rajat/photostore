@@ -138,6 +138,8 @@ def public_album(token: str):
         'album': {
             'name': entity.get('name', ''),
             'photoCount': total,
+            # When the link stops working, so the page can say so up front ('' = never).
+            'expiresAt': entity.get('publicExpiresAt') or '',
         },
         'photos': photos,
         'total': total,

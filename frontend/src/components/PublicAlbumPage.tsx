@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { CircleCheck as CheckCircleIcon, Download as DownloadIcon, Lock as LockIcon, Image as PhotoIcon, Video as VideoMarkIcon } from 'lucide-react';
+import { Check as CheckIcon, Download as DownloadIcon, Link2Off as LinkOffIcon, Lock as LockIcon, Image as PhotoIcon, Video as VideoMarkIcon } from 'lucide-react';
 import { useParams } from 'react-router-dom';
 // public_bp moved to the dedicated `extras` container app (2026-09-17, see
 // app.py's APP_ROLE=extras split) -- aliased so every call site below stays
@@ -17,7 +17,7 @@ import { getMainMediaPath } from './shared/PhotoViewer';
 import PublicPhotoViewer from '../mockups/prototype/components/PublicPhotoViewer';
 import { FloatingSelectButton } from '../mockups/prototype/components/FloatingSelectButton';
 import { ScrollToTopButton } from '../mockups/prototype/components/ScrollToTopButton';
-import { ThumbSizeControl, useTileSize } from '../mockups/prototype/components/controls';
+import { useTileSize } from '../mockups/prototype/components/controls';
 import { Logo, LogoLockup } from './shared/Logo';
 import { EmptyState } from './shared/EmptyState';
 import { ErrorState } from './shared/ErrorState';
@@ -37,7 +37,13 @@ interface PublicPhoto {
 interface PublicAlbum {
     name: string;
     photoCount: number;
+    /** When the link stops working; '' or absent = never. */
+    expiresAt?: string;
 }
+
+// The server's answers for a link that no longer opens anything.
+const GONE_ERRORS = new Set(['Album not found', 'Album not public', 'Album expired']);
+const LINK_END = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short' });
 
 // Shared inline "Loading…" indicator that matches the app's Spinner (see the
 // prototype's bits.tsx / prototype.css .pt-loading). Kept local so this
@@ -156,6 +162,10 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
     const [retryAfterSeconds, setRetryAfterSeconds] = useState<number | null>(null);
     const [codeRequired, setCodeRequired] = useState<boolean>(false);
     const [accessCode, setAccessCode] = useState<string>('');
+    // The link itself is dead (expired, turned off, wrong): say so plainly, no retry.
+    const [linkGone, setLinkGone] = useState(false);
+    // A code was sent at least once, so a refusal means the code was wrong.
+    const [codeTried, setCodeTried] = useState(false);
     const [album, setAlbum] = useState<PublicAlbum | null>(null);
     const [photos, setPhotos] = useState<PublicPhoto[]>([]);
     const [offset, setOffset] = useState<number>(0);
@@ -164,7 +174,7 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
     const [viewerIndex, setViewerIndex] = useState<number | null>(null);
     const [selectedPhotos, setSelectedPhotos] = useState<Set<string>>(new Set());
     const [selectMode, setSelectMode] = useState<boolean>(false);
-    const [tileSize, setTileSize] = useTileSize('photostore.publicAlbumTileSize', { default: 128 });
+    const [tileSize] = useTileSize('photostore.publicAlbumTileSize', { default: 128 });
     const [downloading, setDownloading] = useState<boolean>(false);
     const downloadFormRef = useRef<HTMLFormElement | null>(null);
     // The scrollable region is the app-shell body (overflow-y:auto), not the
@@ -250,6 +260,7 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
     }, [bufferReady, photos.length, openViewerAt]);
 
     const loadPublicAlbum = useCallback(async (code: string = '', nextOffset = 0, append = false) => {
+            if (code.trim() && !append) setCodeTried(true);
             if (!token) {
                 setError('Invalid album link.');
                 setLoading(false);
@@ -302,6 +313,7 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
                     bufferedPhotoCountRef.current = 0;
                 }
                 setCodeRequired(false);
+                setLinkGone(false);
             } catch (err) {
                 if (append) {
                     notifyApiError(err, { context: 'Unable to load more shared album photos.', retry: () => { void loadPublicAlbum(accessCode, nextOffset, true); } });
@@ -320,7 +332,11 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
                         setError('This album is protected. Enter the access code to continue.');
                     }
                 } else {
-                    const errorMsg = typeof payload.error === 'string' ? payload.error : 'This public album link is invalid or no longer available.';
+                    // Only a short plain message from our API is shown as is; a proxy's
+                    // HTML error page (a bare 404 from the wrong host) never reaches the visitor.
+                    const plain = typeof payload.error === 'string' && payload.error.length < 200 && !payload.error.trimStart().startsWith('<');
+                    const errorMsg = plain ? String(payload.error) : 'This public album link is invalid or no longer available.';
+                    setLinkGone(GONE_ERRORS.has(errorMsg));
                     setCodeRequired(false);
                     setRetryAfterSeconds(null);
                     setError(errorMsg);
@@ -616,7 +632,14 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
     // it here showed "120 photos" on a much larger album, climbing as the
     // user scrolled instead of showing the true count up front.
     const totalPhotoCount = album?.photoCount ?? photos.length;
-    const countLabel = `${totalPhotoCount} photo${totalPhotoCount === 1 ? '' : 's'}`;
+    const countLabel = `${totalPhotoCount} item${totalPhotoCount === 1 ? '' : 's'}`;
+    const linkEnds = album?.expiresAt ? new Date(album.expiresAt) : null;
+    const metaLine = [
+        countLabel,
+        linkEnds && !Number.isNaN(linkEnds.getTime()) ? `link ends ${LINK_END.format(linkEnds)}` : '',
+        selectMode && selectedCount > 0 ? `${selectedCount} selected` : '',
+        bufferReady && bufferPercent < 100 ? `caching ${bufferPercent}%` : '',
+    ].filter(Boolean).join(' · ');
     const showToolbar = !loading && !error && bufferReady && photos.length > 0;
 
     return (
@@ -625,63 +648,68 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
                 <div className="mock-viewport">
                     <div className="mock-app">
                         <header className={`ios-header pt-public-header${headerCollapsed ? ' is-collapsed' : ''}`}>
-                            <LogoLockup size={30} className="ios-header-wordmark" />
+                            <LogoLockup size={26} className="ios-header-wordmark" />
                             <span className="pt-public-tag">Shared album</span>
                         </header>
 
                         <div className="mock-body pt-body" ref={bodyRef}>
                             {showToolbar && (
-                                <div className="pt-toolbar">
-                                    <div>
-                                        <h1 className="pt-page-title">{album ? album.name : 'Shared album'}</h1>
-                                        <p className="pt-page-sub">
-                                            {countLabel}
-                                            <span> · Read-only</span>
-                                            {fullAlbumUrl && <span> · Open the full album to download</span>}
-                                            {selectMode && selectedCount > 0 && <span> · {selectedCount} selected</span>}
-                                            {bufferReady && bufferPercent < 100 && <span> · Caching {bufferPercent}%</span>}
-                                        </p>
+                                <>
+                                    {/* Phones open on the first photo, with the title over it. */}
+                                    {photos[0] && (
+                                        <div className="pt-public-hero">
+                                            <img src={resolveMediaSrc(photos[0].thumbnailUrl)} alt="" style={tileRotationStyle(photos[0])} />
+                                            <div className="pt-public-hero-text">
+                                                <h1 className="pt-public-title">{album ? album.name : 'Shared album'}</h1>
+                                                <p>{metaLine}</p>
+                                            </div>
+                                        </div>
+                                    )}
+                                    <div className="pt-toolbar pt-public-toolbar">
+                                        <div className="pt-public-head">
+                                            <h1 className="pt-public-title">{album ? album.name : 'Shared album'}</h1>
+                                            <p className="pt-page-sub">{metaLine}</p>
+                                        </div>
+                                        <div className="pt-toolbar-actions">
+                                            {fullAlbumUrl ? (
+                                                <a className="btn btn-primary btn-sm" href={fullAlbumUrl}>Open full album</a>
+                                            ) : selectMode ? (
+                                                <>
+                                                    <button type="button" className="btn btn-sm" onClick={toggleSelectAll}>
+                                                        {allSelected ? 'Clear' : 'Select all'}
+                                                    </button>
+                                                    <button type="button" className="btn btn-sm" onClick={exitSelectMode}>
+                                                        Done
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        className="btn btn-primary btn-sm"
+                                                        disabled={downloading || selectedCount === 0}
+                                                        onClick={() => void handleDownload()}
+                                                    >
+                                                        <DownloadIcon className="toolbar-icon" />
+                                                        Download{selectedCount > 0 ? ` ${selectedCount}` : ''}
+                                                    </button>
+                                                </>
+                                            ) : (
+                                                <>
+                                                    <button type="button" className="btn btn-sm" onClick={() => setSelectMode(true)}>
+                                                        Select
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        className="btn btn-primary btn-sm"
+                                                        disabled={downloading}
+                                                        onClick={() => void handleDownload()}
+                                                    >
+                                                        <DownloadIcon className="toolbar-icon" />
+                                                        Download all
+                                                    </button>
+                                                </>
+                                            )}
+                                        </div>
                                     </div>
-                                    <div className="pt-toolbar-actions">
-                                        <ThumbSizeControl value={tileSize} onChange={setTileSize} />
-                                        {fullAlbumUrl ? (
-                                            <a className="btn btn-primary" href={fullAlbumUrl}>Open full album</a>
-                                        ) : selectMode ? (
-                                            <>
-                                                <button type="button" className="btn" onClick={toggleSelectAll}>
-                                                    {allSelected ? 'Clear' : 'Select all'}
-                                                </button>
-                                                <button type="button" className="btn" onClick={exitSelectMode}>
-                                                    Done
-                                                </button>
-                                                <button
-                                                    type="button"
-                                                    className="btn btn-primary"
-                                                    disabled={downloading || selectedCount === 0}
-                                                    onClick={() => void handleDownload()}
-                                                >
-                                                    <DownloadIcon className="toolbar-icon" />
-                                                    Download{selectedCount > 0 ? ` (${selectedCount})` : ''}
-                                                </button>
-                                            </>
-                                        ) : (
-                                            <>
-                                                <button type="button" className="btn" onClick={() => setSelectMode(true)}>
-                                                    Select
-                                                </button>
-                                                <button
-                                                    type="button"
-                                                    className="btn btn-primary"
-                                                    disabled={downloading}
-                                                    onClick={() => void handleDownload()}
-                                                >
-                                                    <DownloadIcon className="toolbar-icon" />
-                                                    Download all
-                                                </button>
-                                            </>
-                                        )}
-                                    </div>
-                                </div>
+                                </>
                             )}
 
                             <form
@@ -708,7 +736,18 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
                                 </div>
                             )}
 
-                            {!loading && error && !codeRequired && (
+                            {!loading && linkGone && (
+                                <div className="pt-arrive pt-public-state">
+                                    <div className="empty-state pt-public-lock">
+                                        <span className="empty-state-icon" aria-hidden="true"><LinkOffIcon /></span>
+                                        <p className="empty-state-title">This link no longer works</p>
+                                        <p className="empty-state-message">It may have expired, or the person who shared it turned it off. Ask them to send you a new link.</p>
+                                        <a className="btn" href="/">Sign in to Keepsake</a>
+                                    </div>
+                                </div>
+                            )}
+
+                            {!loading && error && !codeRequired && !linkGone && (
                                 <div className="pt-arrive pt-public-state">
                                     <ErrorState
                                         title="Album unavailable"
@@ -723,13 +762,13 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
                                     <div className="empty-state pt-public-lock">
                                         <span className="empty-state-icon" aria-hidden="true"><LockIcon /></span>
                                         <p className="empty-state-title">This album is protected</p>
-                                        <p className="empty-state-message">{error || 'Enter the access code to continue.'}</p>
+                                        <p className="empty-state-message">{retryAfterSeconds ? error : (codeTried ? 'That code isn’t right. Check it and try again.' : 'Enter the code the person who shared it gave you.')}</p>
                                         <div className="pt-public-lock-form">
                                             <input
                                                 id="public-album-access-code"
                                                 type="password"
                                                 className="field"
-                                                placeholder="Access code"
+                                                placeholder="Code"
                                                 autoComplete="current-password"
                                                 value={accessCode}
                                                 onChange={(e) => setAccessCode(e.target.value)}
@@ -741,12 +780,13 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
                                                 disabled={retryAfterSeconds !== null && retryAfterSeconds > 0}
                                                 onClick={() => { void loadPublicAlbum(accessCode); }}
                                             >
-                                                <LockIcon className="toolbar-icon" />
-                                                Unlock
+                                                View album
                                             </button>
                                         </div>
-                                        {retryAfterSeconds !== null && retryAfterSeconds > 0 && (
+                                        {retryAfterSeconds !== null && retryAfterSeconds > 0 ? (
                                             <p className="pt-page-sub">Retry available in {retryAfterSeconds}s.</p>
+                                        ) : (
+                                            <p className="pt-page-sub">No code? Ask the person who shared it.</p>
                                         )}
                                     </div>
                                 </div>
@@ -811,7 +851,7 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
                                                             onTouchStart={(e) => e.stopPropagation()}
                                                             {...dragSelectHandlers}
                                                         >
-                                                            <CheckCircleIcon />
+                                                            <CheckIcon />
                                                         </button>
                                                     )}
                                                 </div>
@@ -836,7 +876,7 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
                             {!loading && (
                                 <footer className="pt-public-footer">
                                     <Logo size={18} />
-                                    <span>Powered by <strong>Keepsake</strong> — your own private photo library</span>
+                                    <span>Shared from <strong>Keepsake</strong>, a private photo library.</span>
                                 </footer>
                             )}
                         </div>
