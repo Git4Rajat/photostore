@@ -22,7 +22,7 @@ vi.mock('../../../services/jobNotifications', () => ({ requestJobPoll: vi.fn() }
 vi.mock('../../../services/imageClient', () => ({ useProtectedBlobUrls: () => ({}) }));
 vi.mock('../../../components/shared/dialogs', () => ({ confirmDialog: mocks.confirm, promptDialog: vi.fn() }));
 vi.mock('../media', () => ({
-    setPhotoRotation: vi.fn(), preloadMediaAccessUrls: vi.fn(), fetchPhotoMetadata: vi.fn(), downloadPhoto: vi.fn(),
+    setPhotoRotation: vi.fn(), preloadMediaAccessUrls: vi.fn(), fetchPhotoMetadata: vi.fn().mockResolvedValue(null), downloadPhoto: vi.fn(),
     useMainMedia: () => ({ url: '', loading: false, progress: 0, status: '' }),
     useVideoSource: () => ({ src: undefined, failed: false, poster: undefined, reportError: vi.fn() }),
     useLiveClipSource: () => undefined,
@@ -87,7 +87,7 @@ describe('delete confirmation', () => {
         mocks.confirm.mockResolvedValue(false);
         await renderWith(<CommandBar />);
         await act(async () => { store.selectMany(['a.jpg', 'b.mp4', 'c.jpg']); });
-        const trash = screen.getByRole('button', { name: 'Delete from library' });
+        const trash = screen.getByRole('button', { name: 'Delete' });
         await act(async () => { fireEvent.click(trash); });
         expect(mocks.confirm).toHaveBeenCalledWith(expectedDialog(3));
         expect(deleteCalls()).toHaveLength(0);
@@ -116,7 +116,7 @@ describe('selection menu inside an album', () => {
         await act(async () => { await store.fetchAlbums(true); });
         await act(async () => { store.navigate('albums', {}); });
         await act(async () => { store.selectMany(['a.jpg']); });
-        fireEvent.click(screen.getByRole('button', { name: 'More options' }));
+        fireEvent.click(screen.getByRole('button', { name: 'More' }));
         const items = Array.from(document.querySelectorAll('.pt-fm-menu .pt-fm-item'));
         expect(items[0]?.textContent).toContain('Remove from album');
         await act(async () => { fireEvent.click(screen.getByRole('button', { name: /Remove from album/ })); });
@@ -128,7 +128,7 @@ describe('selection menu inside an album', () => {
         await act(async () => { await store.fetchAlbums(true); });
         await act(async () => { store.navigate('gallery', {}); });
         await act(async () => { store.selectMany(['a.jpg']); });
-        fireEvent.click(screen.getByRole('button', { name: 'More options' }));
+        fireEvent.click(screen.getByRole('button', { name: 'More' }));
         expect(screen.queryByRole('button', { name: /Remove from album/ })).toBeNull();
     });
 });

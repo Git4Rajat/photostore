@@ -202,8 +202,10 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
 };
 
 const MobileTabbar: React.FC = () => {
-    const { route, navigate } = useStore();
+    const { route, navigate, selection, selectMode } = useStore();
     const active = activeMobileNavFor(route.page);
+    // While selecting, the selection's action bar takes this bar's place.
+    if (selection.length || (selectMode && route.page === 'gallery')) return null;
     return (
         <nav className="mock-tabbar" aria-label="Primary navigation (mobile)">
             {MOBILE_NAV.map((item) => {

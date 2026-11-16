@@ -245,6 +245,20 @@
 .pt-filter-popover-content .btn,
 .pt-filter-popover-content .pt-date-jump { width: 100%; justify-content: center; }
 
+/* ---- gallery filter chips + selection header ---- */
+.pt-gallery-toolbar { margin-bottom: 10px; }
+.pt-chips { display: flex; gap: 6px; margin: 0 0 12px; overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+.pt-chips::-webkit-scrollbar { display: none; }
+.pt-chips > .pt-menu-anchor { flex: 0 0 auto; }
+.pt-chip-icon { width: 14px; height: 14px; flex: 0 0 auto; }
+.pt-date-chip { position: relative; }
+.pt-date-chip input { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; opacity: 0; cursor: pointer; }
+.pt-date-chip input::-webkit-calendar-picker-indicator { position: absolute; inset: 0; width: 100%; height: 100%; cursor: pointer; }
+.pt-date-chip:has(input:focus-visible) { box-shadow: var(--focus-ring); }
+.pt-select-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 52px; margin-bottom: 12px; position: sticky; top: 0; z-index: 5; }
+.pt-select-head b { font-size: 1rem; font-weight: 700; }
+.pt-select-head .pt-linkish { font-size: 0.95rem; min-height: var(--tap-min); padding: 0 4px; }
+
 /* ---- gallery timeline scrubber (year -> month -> day) ---- */
 @media (max-width: 620px) {
   .pt-toolbar { flex-direction: column; align-items: flex-start; }
@@ -255,21 +269,28 @@
 }
 
 /* ---- photo grid ---- */
-.pt-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--pt-tile-min, 120px), 1fr)); gap: 6px; user-select: none; -webkit-user-select: none; }
-.pt-tile { position: relative; aspect-ratio: 1; border-radius: var(--r-sm); cursor: pointer; overflow: hidden; -webkit-touch-callout: none; -webkit-user-select: none; }
-.pt-tile.selected { outline: 3px solid var(--accent); outline-offset: -3px; }
+/* 2px gaps and near-square corners: the photos get the space, not the gutters. */
+.pt-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--pt-tile-min, 120px), 1fr)); gap: 2px; user-select: none; -webkit-user-select: none; }
+.pt-tile { position: relative; aspect-ratio: 1; border-radius: 3px; cursor: pointer; overflow: hidden; -webkit-touch-callout: none; -webkit-user-select: none; }
+.pt-tile.selected::after { content: ''; position: absolute; inset: 0; background: rgba(0,0,0,0.18); box-shadow: inset 0 0 0 2.5px var(--accent); border-radius: 3px; pointer-events: none; }
+/* One heading per capture day, spanning the full row. */
+.pt-day-heading { grid-column: 1 / -1; margin: 0; padding: 14px 2px 6px; font: 700 0.9rem/1.2 var(--font-ui); color: var(--text); }
+.pt-day-heading:first-child { padding-top: 2px; }
 .pt-tile-img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; -webkit-user-drag: none; user-select: none; }
 /* 44x44 tap target flush with the tile's corner (the tile clips overflow, so
    the hit area can't extend past it) with the 22px glyph inset via padding
    to sit where it visually sat before. */
-.pt-tile-check { position: absolute; top: 0; left: 0; width: 44px; height: 44px; box-sizing: border-box; display: flex; align-items: flex-start; justify-content: flex-start; padding: 6px; border: 0; background: none; color: rgba(255,255,255,0.9); cursor: pointer; opacity: 0; pointer-events: none; transition: opacity 0.12s ease; touch-action: none; }
+.pt-tile-check { position: absolute; right: 0; bottom: 0; z-index: 1; width: 44px; height: 44px; box-sizing: border-box; display: flex; align-items: flex-end; justify-content: flex-end; padding: 6px; border: 0; background: none; color: transparent; cursor: pointer; opacity: 0; pointer-events: none; transition: opacity 0.12s ease; touch-action: none; }
 /* Checkboxes only appear (and become clickable) in Select mode, so an ordinary
    tap or a scroll can't accidentally select photos -- the top complaint was
    that scrolling kept catching the always-visible checkbox. */
 .pt-grid.select-mode .pt-tile-check { opacity: 0.9; pointer-events: auto; }
 .pt-grid.select-mode .pt-tile:hover .pt-tile-check, .pt-grid.select-mode .pt-tile-check.on { opacity: 1; }
-.pt-tile-check svg { width: 22px; height: 22px; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.45)); }
-.pt-tile-check.on { color: var(--accent); }
+/* An empty ring until selected, then a filled accent circle with a check. */
+.pt-tile-check svg { width: 21px; height: 21px; box-sizing: border-box; padding: 3px; stroke-width: 3; border-radius: 50%; border: 1.5px solid #fff; background: rgba(0,0,0,0.22); box-shadow: 0 1px 3px rgba(0,0,0,0.35); }
+.pt-tile-check.on { color: var(--on-accent); }
+.pt-tile-check.on svg { background: var(--accent); border-color: var(--accent); }
+.pt-grid.select-mode .pt-tile-badges { display: none; }
 .pt-tile-badges { position: absolute; bottom: 6px; right: 6px; display: flex; gap: 4px; align-items: center; }
 .pt-tile-badges .liked { width: 16px; height: 16px; color: var(--like); filter: drop-shadow(0 1px 2px rgba(0,0,0,0.4)); }
 .pt-tile-badges .rating { display: inline-flex; align-items: center; gap: 2px; font-size: 0.72rem; font-weight: 700; color: #fff; background: rgba(0,0,0,0.42); border-radius: var(--r-pill); padding: 1px 6px; }
@@ -546,6 +567,26 @@
 .pt-trash-actions button svg { width: 18px; height: 18px; }
 .pt-trash-days { position: absolute; top: 6px; right: 6px; font-size: 0.72rem; font-weight: 700; color: #fff; background: rgba(0,0,0,0.4); border-radius: var(--r-pill); padding: 1px 6px; }
 
+/* ---- selection action bar: replaces the tab bar on phones, docks at the bottom on desktop ---- */
+.pt-action-bar { position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%); z-index: 60; display: flex; align-items: stretch; justify-content: center; gap: 4px; padding: 6px 10px; border: 1px solid var(--lg-edge); border-radius: var(--r-lg, 22px); background: var(--lg-surface-strong); backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate)); -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate)); box-shadow: 0 14px 44px rgba(0,0,0,0.28); }
+.pt-ab-btn { appearance: none; border: 0; background: none; color: var(--text); font: inherit; font-size: 0.72rem; font-weight: 600; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; min-width: 64px; min-height: 52px; padding: 4px 8px; border-radius: 12px; cursor: pointer; }
+.pt-ab-btn svg { width: 22px; height: 22px; }
+.pt-ab-btn:hover:not(:disabled) { background: var(--lg-surface-wash); }
+.pt-ab-btn:disabled { opacity: 0.4; cursor: default; }
+.pt-ab-btn.on { color: var(--like); }
+.pt-ab-btn.danger { color: var(--danger); }
+.pt-ab-count { color: var(--muted); }
+.pt-action-bar .pt-menu-anchor { display: flex; }
+.pt-action-bar .pt-menu-panel { top: auto; bottom: calc(100% + 10px); }
+.pt-fm-rate { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px 10px; border-bottom: 1px solid var(--lg-edge); margin-bottom: 4px; }
+.pt-fm-rate > span { display: inline-flex; align-items: center; gap: 8px; font-size: 0.85rem; font-weight: 600; color: var(--muted); }
+.pt-fm-rate > span svg { width: 16px; height: 16px; }
+@media (max-width: 805px) {
+  /* Edge to edge where the tab bar was, same height and safe-area padding. */
+  .pt-action-bar { left: 0; right: 0; bottom: 0; transform: none; justify-content: space-around; gap: 0; padding: 6px 4px calc(6px + env(safe-area-inset-bottom)); border-radius: 0; border-width: 1px 0 0; box-shadow: none; }
+  .pt-ab-btn { flex: 1; min-width: 0; }
+}
+
 /* ---- floating menu (centered, compact, minimal delete + options) ---- */
 .pt-floating-menu { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 60; display: flex; align-items: center; justify-content: center; gap: 12px; background: var(--text); color: var(--bg-1); padding: 12px; border-radius: var(--r-pill); box-shadow: 0 14px 44px rgba(0,0,0,0.4); }
 @media (max-width: 620px) {
@@ -586,8 +627,11 @@
 .pt-viewer-top { display: flex; align-items: center; gap: 12px; padding: 14px 18px; }
 .pt-viewer-back { display: inline-flex; align-items: center; gap: 6px; background: none; border: 0; color: var(--viewer-muted); font: inherit; font-weight: 600; cursor: pointer; }
 .pt-viewer-back svg { width: 18px; height: 18px; }
-.pt-viewer-title { font-size: 0.9rem; color: var(--viewer-muted); }
-.pt-viewer-pos { margin-left: auto; font-size: 0.82rem; color: var(--viewer-subtle); font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* Place (or day) over date and time, centred like a phone's own photo viewer. */
+.pt-viewer-title { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: center; text-align: center; line-height: 1.25; }
+.pt-viewer-title b { font-size: 0.95rem; font-weight: 700; color: var(--viewer-text); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pt-viewer-title small { font-size: 0.74rem; color: var(--viewer-muted); white-space: nowrap; }
+.pt-viewer-pos { font-size: 0.82rem; color: var(--viewer-subtle); font-variant-numeric: tabular-nums; white-space: nowrap; }
 /* touch-action: none stops the browser from turning a two-finger pinch here
    into a whole-page zoom; the pinch is handled in JS to zoom the photo instead.
    The info panel re-enables panning so it can still scroll (see below). */
@@ -681,7 +725,6 @@
     .pt-albums { grid-template-columns: 1fr; }
     .pt-upload-label { display: none; }
     .pt-upload-btn { padding: 9px 11px; min-width: 44px; }
-    .pt-viewer-title { display: none; }
     .pt-toolbar { align-items: flex-start; }
 }
 /* The zoom/rotate toolbar floats over the top of the photo or video, covering

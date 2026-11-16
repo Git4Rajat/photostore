@@ -83,6 +83,9 @@ const withIndexRetry = async <T,>(fetchIndex: () => Promise<T | null>): Promise<
     return null;
 };
 
+const VIEWER_HISTORY_KEY = 'keepsakeViewer';
+const isViewerHistoryEntry = (): boolean => Boolean((window.history.state as Record<string, unknown> | null)?.[VIEWER_HISTORY_KEY]);
+
 // Puts `photos` back at the front of `list`, skipping any already there: a
 // restore racing a failed delete's rollback must not list a photo twice.
 const prependMissing = (photos: Photo[], list: Photo[]): Photo[] => {
@@ -635,6 +638,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const [selection, setSelection] = useState<string[]>([]);
     const [selectMode, setSelectModeState] = useState<boolean>(false);
     const [viewer, setViewer] = useState<ViewerState | null>(null);
+    // Whether the viewer's history entry is live (see openViewer), and whether
+    // the next popstate is our own history.back() from closeViewer.
+    const viewerOpenRef = useRef(false);
+    const closingViewerRef = useRef(false);
     const [toasts, setToasts] = useState<Toast[]>([]);
     const toastTimers = useRef<Record<string, number>>({});
 
@@ -1133,14 +1140,27 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         // same album) would otherwise pile up a duplicate history entry.
         const next = `${window.location.pathname}${routeToSearch({ page, params })}`;
         if (`${window.location.pathname}${window.location.search}` !== next) {
-            window.history.pushState(null, '', next);
+            // Leaving from inside the viewer: reuse its history entry rather
+            // than leaving a dead "viewer open" step behind the new page.
+            if (isViewerHistoryEntry()) window.history.replaceState(null, '', next);
+            else window.history.pushState(null, '', next);
         }
+        viewerOpenRef.current = false;
     }, []);
 
     // Back/forward: resync in-memory route state from the URL the browser
     // just navigated to, instead of only ever moving forward via navigate().
     useEffect(() => {
         const onPopState = () => {
+            // Our own history.back() from closeViewer: the viewer is already shut.
+            if (closingViewerRef.current) { closingViewerRef.current = false; return; }
+            // Back while the viewer is open closes the viewer and nothing else --
+            // the page underneath (its zoom, scroll and filters) stays as it was.
+            if (viewerOpenRef.current) {
+                viewerOpenRef.current = false;
+                setViewer(null);
+                return;
+            }
             setRoute(searchToRoute(window.location.search));
             setSelection([]);
             setSelectModeState(false);
@@ -1162,10 +1182,26 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }, []);
     const clearSelection = useCallback(() => { setSelection([]); setSelectModeState(false); }, []);
 
-    const openViewer = useCallback((ids: string[], index: number, opts?: { extendable?: boolean }) => (
-        setViewer({ ids, index, extendable: opts?.extendable })
-    ), []);
+    // The open viewer owns one history entry (same URL), so the browser's or
+    // phone's Back closes the photo instead of leaving the page under it.
+    const openViewer = useCallback((ids: string[], index: number, opts?: { extendable?: boolean }) => {
+        if (!viewerOpenRef.current) {
+            viewerOpenRef.current = true;
+            window.history.pushState({ [VIEWER_HISTORY_KEY]: true }, '', `${window.location.pathname}${window.location.search}`);
+        }
+        setViewer({ ids, index, extendable: opts?.extendable });
+    }, []);
     const closeViewer = useCallback(() => setViewer(null), []);
+    // However the viewer closed (Back button, Escape, a deletion emptying it,
+    // a page change), drop its history entry so the next Back leaves the page.
+    useEffect(() => {
+        if (viewer || !viewerOpenRef.current) return;
+        viewerOpenRef.current = false;
+        if (isViewerHistoryEntry()) {
+            closingViewerRef.current = true;
+            window.history.back();
+        }
+    }, [viewer]);
     const viewerStep = useCallback((delta: number) => {
         setViewer((prev) => {
             if (!prev) return prev;
