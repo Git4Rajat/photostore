@@ -1,10 +1,19 @@
 import React from 'react';
-import { CircleCheck as CheckCircleIcon, Heart as HeartIcon, Star as StarIcon } from 'lucide-react';
+import { Check as CheckIcon, Heart as HeartIcon, Star as StarIcon } from 'lucide-react';
 import { isVideoFilename, useStore } from '../store';
 import { tileImage, usePhotoThumbnails, useTileSizes } from '../media';
 import { useDragSelect } from '../../../services/useDragSelect';
 import { perf } from '../../../services/perf';
+import { captureWallClock } from '../../../utils/captureDate';
 import type { Photo } from '../types';
+
+const DAY_FORMAT = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'long', year: 'numeric' });
+
+/** The day heading a photo sits under: its capture day, or "Undated". */
+export const dayHeading = (photo: Photo): string => {
+    const day = captureWallClock(photo.captureDate ?? null);
+    return day ? DAY_FORMAT.format(day) : 'Undated';
+};
 
 // Tile rotation and the thumbnail/grid-image srcset are worked out by
 // tileImage (media.ts). No down-scale is needed for a 90/270 turn: the img is
@@ -47,7 +56,7 @@ export const TileThumbnail: React.FC<{ src: string; srcSet?: string; sizes?: str
  * checkbox toggles selection (which surfaces the command bar). Rating and like
  * state show as small overlays.
  */
-const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?: React.RefObject<HTMLDivElement>; extendable?: boolean }> = ({ photos, emptyHint, extendable }) => {
+const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?: React.RefObject<HTMLDivElement>; extendable?: boolean; dayHeadings?: boolean }> = ({ photos, emptyHint, extendable, dayHeadings }) => {
     const { selection, toggleSelect, selectMany, openViewer, selectMode, setSelectMode } = useStore();
     const thumbs = usePhotoThumbnails(photos);
     const [lastSelected, setLastSelected] = React.useState<number | null>(null);
@@ -157,9 +166,14 @@ const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?: React
             {photos.map((photo, i) => {
                 const selected = selection.includes(photo.id);
                 const image = tileImage(photo, thumbs[photo.filename]);
+                // A heading spans the whole row whenever the capture day changes,
+                // so the grid reads as days rather than one undivided wall.
+                const heading = dayHeadings ? dayHeading(photo) : null;
+                const showHeading = heading !== null && (i === 0 || dayHeading(photos[i - 1]) !== heading);
                 return (
+                    <React.Fragment key={photo.id}>
+                    {showHeading && <h2 className="pt-day-heading">{heading}</h2>}
                     <div
-                        key={photo.id}
                         className={`pt-tile mock-swatch ${photo.swatch}${selected ? ' selected' : ''}`}
                         role="button"
                         tabIndex={0}
@@ -231,7 +245,7 @@ const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?: React
                             onTouchStart={(e) => e.stopPropagation()}
                             {...touchDragSelect}
                         >
-                            <CheckCircleIcon />
+                            <CheckIcon />
                         </button>
                         <span className="pt-tile-badges" aria-hidden="true">
                             {photo.liveClip && <span className="live">LIVE</span>}
@@ -243,6 +257,7 @@ const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?: React
                             )}
                         </span>
                     </div>
+                    </React.Fragment>
                 );
             })}
         </div>
