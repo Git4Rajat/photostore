@@ -6,6 +6,7 @@ import { initialsFor, plural } from '../../../utils/format';
 import * as library from '../../../services/libraryClient';
 import { getRuntimeConfig } from '../../../config/appConfig';
 import { confirmDialog, promptDialog } from '../../../components/shared/dialogs';
+import DownloadLibrary from '../components/DownloadLibrary';
 import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -132,6 +133,7 @@ const SharingPage: React.FC = () => {
                         <button type="button" className="btn" onClick={() => void renameLibraryPrompt()}>Rename library</button>
                         <button type="button" className="btn" onClick={() => void cleanLibrary()}>Clean library</button>
                     </div>
+                    <DownloadLibrary />
                 </div>
             )}
         </div>

@@ -75,6 +75,7 @@ def test_core_role_serves_management_but_not_archive_operations():
     assert not {
         '/api/library', '/api/library/export/manifest',
         '/api/library/download/request', '/api/library/download/status',
+        '/api/library/download/manifest', '/api/library/download/token', '/api/library/download/info',
         '/api/library/clean/request', '/api/library/clean/confirm',
         '/api/library/clean/status', '/api/library/cleanup-info',
         '/api/library/clean/confirmation-status',
@@ -172,6 +173,7 @@ def test_archive_role_serves_only_library_and_public_routes():
     assert {
         '/api/library', '/api/library/export/manifest',
         '/api/library/download/request', '/api/library/download/status',
+        '/api/library/download/manifest', '/api/library/download/token', '/api/library/download/info',
         '/api/library/clean/request', '/api/library/clean/confirm',
         '/api/library/clean/status', '/api/library/cleanup-info',
         '/api/library/clean/confirmation-status',
