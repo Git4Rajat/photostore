@@ -122,7 +122,13 @@ const Page: React.FC = () => {
         case 'gallery': return <GalleryPage />;
         case 'albums': return <AlbumsPage />;
         case 'people': return <PeoplePage />;
-        case 'person': return <PersonDetailPage />;
+        // Desktops keep the People grid beside the person; phones show the person alone.
+        case 'person': return (
+            <div className="pt-people-split">
+                <div className="pt-people-split-list"><PeoplePage /></div>
+                <aside className="pt-people-split-panel" aria-label="Person"><PersonDetailPage /></aside>
+            </div>
+        );
         case 'explore': return <ExplorePage />;
         case 'sharing': return <SharingPage />;
         case 'tools': return <ToolsPage />;
