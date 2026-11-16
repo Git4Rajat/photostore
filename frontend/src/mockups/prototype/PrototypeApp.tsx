@@ -21,7 +21,6 @@ import {
     Image as PhotoIconSolid,
     Images as RectangleStackIconSolid,
 } from 'lucide-react';
-import { LogoLockup } from '../../components/shared/Logo';
 import { NAV_ITEMS } from './components/HomeChrome';
 import Loading from '../../components/shared/Loading';
 import { CachedGalleryPreview, PreviewUntilGallery, useHomeSnapshot } from './components/CachedGalleryPreview';
@@ -31,7 +30,10 @@ import { formatBytes } from '../../components/browserAiShared';
 import { NotificationBell } from '../../components/AppServiceIndicators';
 import { DialogHost } from '../../components/shared/dialogs';
 import { getActiveAccount, initAuth, isAuthEnabled, signIn, signOut } from '../../services/authClient';
-import { StoreProvider, useStore } from './store';
+import { StoreProvider, shownAlbum, useStore } from './store';
+
+import type { Album, Route as AppRoute } from './types';
+import AppSidebar from './components/AppSidebar';
 import { Menu } from './components/bits';
 import CommandBar from './components/CommandBar';
 import PhotoViewer from './components/PhotoViewer';
@@ -122,6 +124,17 @@ const BrowseLinks: React.FC = () => {
     );
 };
 
+const PAGE_TITLES: Record<PageId, string> = {
+    gallery: 'Photos', ask: 'Search', albums: 'Albums', people: 'People', person: 'People',
+    explore: 'Places and things', sharing: 'Library', tools: 'Tools', trash: 'Recently deleted', additional: 'About',
+};
+/** What the phone header calls the page: an open album goes by its own name. */
+const pageTitle = (route: AppRoute, albums: Album[]): string => (
+    route.page === 'albums' && route.params.albumId
+        ? shownAlbum(route, albums)?.name ?? 'Albums'
+        : PAGE_TITLES[route.page] ?? 'Keepsake'
+);
+
 const Page: React.FC = () => {
     const { route } = useStore();
     // Tag every request / resource / long task with the page that caused it.
@@ -142,7 +155,7 @@ const Page: React.FC = () => {
 };
 
 const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: () => void }> = ({ theme, onTheme, onSignOut }) => {
-    const { route, navigate } = useStore();
+    const { route, navigate, albums } = useStore();
     const { requestUpload } = useAppServices();
     const active = activeNavFor(route.page);
     const account = getActiveAccount();
@@ -152,8 +165,11 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
 
     return (
         <header className="ios-header">
-            <button type="button" className="pt-wordmark-btn" onClick={() => navigate('gallery')} aria-label="Go to Photos">
-                <LogoLockup size={30} className="ios-header-wordmark" />
+            {/* Phones: the page's own title sits in the header row (the page hides its
+                copy). Desktops: the sidebar names the page, and the header holds search. */}
+            <h1 className="pt-header-title">{pageTitle(route, albums)}</h1>
+            <button type="button" className="pt-header-search" onClick={() => navigate('ask')}>
+                <MagnifyingGlassIcon aria-hidden="true" /> <span>Search people, places and things</span>
             </button>
             <nav className="ios-tabs" aria-label="Primary navigation">
                 {NAV.map((item) => (
@@ -163,7 +179,7 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
                 ))}
             </nav>
             <div className="app-header-actions">
-                <button type="button" className="btn btn-primary pt-upload-btn" onClick={requestUpload} aria-label="Upload">
+                <button type="button" className="btn btn-primary btn-sm pt-upload-btn" onClick={requestUpload}>
                     <UploadIcon className="toolbar-icon" /> <span className="pt-upload-label">Upload</span>
                 </button>
 
@@ -202,8 +218,10 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
 };
 
 const MobileTabbar: React.FC = () => {
-    const { route, navigate } = useStore();
+    const { route, navigate, selection, selectMode } = useStore();
     const active = activeMobileNavFor(route.page);
+    // While selecting, the selection's action bar takes this bar's place.
+    if (selection.length || (selectMode && route.page === 'gallery')) return null;
     return (
         <nav className="mock-tabbar" aria-label="Primary navigation (mobile)">
             {MOBILE_NAV.map((item) => {
@@ -360,6 +378,7 @@ const Shell: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
             <div className="mock-stage">
                 <div className="mock-viewport">
                     <div className="mock-app">
+                        <AppSidebar />
                         <Topbar theme={theme} onTheme={chooseTheme} onSignOut={onSignOut} />
                         <div className="mock-body pt-body">
                             <UploadPausedBanner />

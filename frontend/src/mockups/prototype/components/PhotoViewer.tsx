@@ -4,6 +4,8 @@ import {
     Plus as PlusIcon,
     Trash2 as TrashIcon,
     Heart,
+    Info as InfoIcon,
+    Star as StarIcon,
 } from 'lucide-react';
 import { Menu, Stars } from './bits';
 import { AddToAlbumMenu } from './AddToAlbumMenu';
@@ -13,6 +15,11 @@ import { useStore, isVideoFilename } from '../store';
 import { useMainMedia, useVideoSource, downloadPhoto, fetchPhotoMetadata, preloadMediaAccessUrls, useLiveClipSource } from '../media';
 import type { PhotoMetadata } from '../media';
 import { isRawFilename } from '../../../utils/photoDisplay';
+import { captureWallClock } from '../../../utils/captureDate';
+
+const DAY_FORMAT = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
+const LONG_DAY_FORMAT = new Intl.DateTimeFormat(undefined, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+const TIME_FORMAT = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
 
 const dash = (value?: string | number): string => {
     const text = value === undefined || value === null ? '' : String(value).trim();
@@ -21,7 +28,7 @@ const dash = (value?: string | number): string => {
 
 // EXIF arrives as raw, unrounded numeric strings (e.g. a computed FNumber of
 // "7.66082624558859") -- these convert them to the rounded, unit-suffixed
-// form a camera's own display would show (ISO 6400, 500mm, f8, 1/100s).
+// form a camera's own display would show (ISO 6400, 500 mm, f/8, 1/100 s).
 const formatIso = (iso?: string): string | null => {
     if (!iso) return null;
     const n = parseFloat(iso);
@@ -30,12 +37,14 @@ const formatIso = (iso?: string): string | null => {
 const formatFocalLength = (focalLength?: string): string | null => {
     if (!focalLength) return null;
     const n = parseFloat(focalLength);
-    return Number.isFinite(n) ? `${Math.round(n)} mm` : focalLength;
+    // Phone lenses are a few millimetres: keep one decimal there (2.2 mm, not 2 mm).
+    return Number.isFinite(n) ? `${n < 10 ? Number(n.toFixed(1)) : Math.round(n)} mm` : focalLength;
 };
+// One decimal, as a lens barrel prints it: f/2.2, f/8.
 const formatAperture = (fNumber?: string): string | null => {
     if (!fNumber) return null;
     const n = parseFloat(fNumber);
-    return `f${Number.isFinite(n) ? Math.round(n) : fNumber}`;
+    return `f/${Number.isFinite(n) ? Number(n.toFixed(1)) : fNumber}`;
 };
 const formatShutterSpeed = (exposureTime?: string): string | null => {
     if (!exposureTime) return null;
@@ -116,13 +125,14 @@ const PhotoViewer: React.FC = () => {
         pendingRotationRef.current = { filename: photo.filename, rotation: next, previous };
     }, [photo]);
 
-    // Fetch metadata lazily the first time the info panel is opened for a photo.
+    // Fetch metadata as each photo opens: the title names the place it was
+    // taken, and the info panel reads from the same response.
     useEffect(() => {
-        if (!showInfo || !photo || meta) return;
+        if (!photo || meta) return;
         let active = true;
         void fetchPhotoMetadata(photo.filename).then((m) => { if (active) setMeta(m); });
         return () => { active = false; };
-    }, [showInfo, photo, meta]);
+    }, [photo, meta]);
 
     const media = useMainMedia(photo && isVideoFilename(photo.filename) ? null : photo, fullRes);
     const video = useVideoSource(photo);
@@ -136,13 +146,21 @@ const PhotoViewer: React.FC = () => {
     const loc = meta?.location ?? {};
     const infoTags = Array.from(new Set([...(meta?.tags ?? []), ...(meta?.objects ?? []), ...(photo.tags ?? [])])).slice(0, 24);
     const locationLine = [loc.city, loc.country].filter(Boolean).join(', ');
+    // Title: where, then when. Without a known place the day takes the title.
+    const captured = captureWallClock(photo.captureDate ?? null);
+    const dayText = captured ? DAY_FORMAT.format(captured) : '';
+    const timeText = captured ? TIME_FORMAT.format(captured) : '';
+    const place = loc.city || loc.country || '';
+    const title = place || dayText || photo.filename;
+    const subtitle = place ? [dayText, timeText].filter(Boolean).join(' · ') : timeText;
     const startDownload = () => void downloadPhoto(photo).then(() => toast('Download started')).catch(() => toast('Download failed', undefined, undefined, 'error'));
 
     return (
         <ViewerShell
             photoKey={photo.id}
             filename={photo.filename}
-            title={`${photo.filename}${photo.dateLabel ? ` · ${photo.dateLabel}` : ''}`}
+            title={title}
+            subtitle={subtitle}
             index={index}
             count={live.length}
             initialRotation={photo.rotation}
@@ -174,9 +192,11 @@ const PhotoViewer: React.FC = () => {
                                 <p className="pt-viewer-info-empty">Loading details…</p>
                             ) : (
                                 <dl className="pt-viewer-info-list">
-                                    <dt>File</dt><dd>{photo.filename}</dd>
-                                    {(photo.dateLabel || exif.capturedAt) && (<><dt>Captured</dt><dd>{photo.dateLabel || exif.capturedAt}</dd></>)}
-                                    {meta.resolution?.width ? (<><dt>Dimensions</dt><dd>{meta.resolution.width} × {meta.resolution.height}</dd></>) : null}
+                                    {/* When and where first, then the camera, then the file. */}
+                                    {captured
+                                        ? (<><dt>Taken</dt><dd>{LONG_DAY_FORMAT.format(captured)} · {timeText}</dd></>)
+                                        : exif.capturedAt ? (<><dt>Taken</dt><dd>{exif.capturedAt}</dd></>) : null}
+                                    {locationLine && (<><dt>Place</dt><dd>{locationLine}</dd></>)}
                                     <dt>Camera</dt><dd>{dash(exif.camera)}</dd>
                                     <dt>Lens</dt><dd>{dash(exif.lens)}</dd>
                                     {(exif.fNumber || exif.exposureTime || exif.iso || exif.focalLength) && (
@@ -192,7 +212,8 @@ const PhotoViewer: React.FC = () => {
                                             </dd>
                                         </>
                                     )}
-                                    {locationLine && (<><dt>Location</dt><dd>{locationLine}</dd></>)}
+                                    {meta.resolution?.width ? (<><dt>Size</dt><dd>{meta.resolution.width} × {meta.resolution.height}</dd></>) : null}
+                                    <dt>File</dt><dd>{photo.filename}</dd>
                                     {infoTags.length > 0 && (
                                         <>
                                             <dt>Tags</dt>
@@ -206,12 +227,12 @@ const PhotoViewer: React.FC = () => {
             ) : null}
             bar={(
                 <>
-                <div className="pt-vb-group left">
-                    <Stars value={photo.rating} onRate={(n) => ratePhotos([photo.id], n)} size={20} />
-                </div>
                 <div className="pt-vb-group center">
-                    <button type="button" className={`pt-vb-btn${photo.liked ? ' on' : ''}`} onClick={() => toggleLike(photo.id)}>
+                    <button type="button" className={`pt-vb-btn${photo.liked ? ' on' : ''}`} aria-pressed={photo.liked} onClick={() => toggleLike(photo.id)}>
                         <Heart fill={photo.liked ? 'currentColor' : 'none'} /> <span>Like</span>
+                    </button>
+                    <button type="button" className={`pt-vb-btn${showInfo ? ' on' : ''}`} aria-pressed={showInfo} onClick={() => setShowInfo((v) => !v)}>
+                        <InfoIcon /> <span>Info</span>
                     </button>
                     <AddToAlbumMenu
                         photoIds={[photo.id]}
@@ -232,7 +253,10 @@ const PhotoViewer: React.FC = () => {
                     >
                         {(close) => (
                             <div className="pt-more-menu">
-                                <button type="button" onClick={() => { setShowInfo(true); close(); }}>Photo info</button>
+                                <div className="pt-fm-rate">
+                                    <span><StarIcon /> Rating</span>
+                                    <Stars value={photo.rating} onRate={(n) => ratePhotos([photo.id], n)} size={24} />
+                                </div>
                                 <button type="button" onClick={() => { close(); startDownload(); }}>Download</button>
                                 <button type="button" onClick={() => { close(); navigate('tools', { filenames: photo.filename }); }}>Open in Workbench</button>
                                 {route.page !== 'gallery' && (

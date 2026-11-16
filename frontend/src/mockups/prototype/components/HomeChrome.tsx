@@ -1,6 +1,5 @@
 import React from 'react';
 import { CloudUpload as UploadIcon } from 'lucide-react';
-import { LogoLockup } from '../../../components/shared/Logo';
 
 /** Primary navigation, shared by the live header and the read-only home previews. */
 export const NAV_ITEMS = [
@@ -21,7 +20,7 @@ export const HomeChrome: React.FC<{ subtitle: string; tileMin?: number; children
             <div className="mock-viewport">
                 <div className="mock-app">
                     <header className="ios-header">
-                        <span className="pt-wordmark-btn"><LogoLockup size={30} className="ios-header-wordmark" /></span>
+                        <h1 className="pt-header-title">Photos</h1>
                         <nav className="ios-tabs" aria-label="Primary navigation">
                             {NAV_ITEMS.map((item) => (
                                 <span key={item.id} className={`ios-tab${item.id === 'gallery' ? ' active' : ''}`}>{item.label}</span>

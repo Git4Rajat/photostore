@@ -102,11 +102,38 @@ describe('index-backed gallery', () => {
         expect(mocks.poll).toHaveBeenCalledTimes(polls ? 1 : 0);
     });
 
+    it('Back closes the open viewer and leaves the page under it alone', async () => {
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async () => { store.navigate('albums', { albumId: 'a1' }); });
+        const before = store.route;
+        act(() => { store.openViewer(['p1.jpg', 'p2.jpg'], 1); });
+        expect(window.history.state).toEqual({ keepsakeViewer: true });
+        await act(async () => {
+            window.history.back();
+            await new Promise((resolve) => window.addEventListener('popstate', resolve, { once: true }));
+        });
+        expect(store.viewer).toBeNull();
+        expect(store.route).toBe(before);
+        expect(window.location.search).toContain('albumId=a1');
+    });
+
+    it('closing the viewer from its own Back button drops its history entry', async () => {
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await act(async () => { store.navigate('albums', { albumId: 'a2' }); });
+        act(() => { store.openViewer(['p1.jpg'], 0); });
+        const popped = new Promise((resolve) => window.addEventListener('popstate', resolve, { once: true }));
+        // The history step happens in an effect after the close renders, so
+        // wait for it outside act (inside, act would hold the effect back).
+        act(() => { store.closeViewer(); });
+        await act(async () => { await popped; });
+        expect(window.history.state).toBeNull();
+        expect(store.route.params.albumId).toBe('a2');
+    });
+
     it('rating a selection from the selection bar ends select mode', async () => {
         render(<StoreProvider><Probe /><CommandBar /></StoreProvider>);
         act(() => { store.setSelectMode(true); store.selectMany(['p1.jpg', 'p2.jpg']); });
-        fireEvent.click(screen.getByRole('button', { name: 'More options' }));
-        fireEvent.click(screen.getByRole('button', { name: 'Rate' }));
+        fireEvent.click(screen.getByRole('button', { name: 'More' }));
         await act(async () => { fireEvent.click(screen.getByRole('button', { name: '4 stars' })); });
         expect(mocks.post).toHaveBeenCalledWith('/photos/rate-multiple', { filenames: ['p1.jpg', 'p2.jpg'], rating: 4 });
         expect(store.selectMode).toBe(false);
