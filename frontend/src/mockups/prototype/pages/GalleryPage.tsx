@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { CalendarSearch as CalendarSearchIcon, ChevronDown as ChevronDownIcon, Heart as HeartIcon, SlidersHorizontal as FilterIcon, Star as StarIcon, Upload as ArrowUpTrayIcon, Grid2x2 as LargePhotosIcon, Grid3x3 as SmallPhotosIcon, Image as PhotoIcon, UserPlus as UserPlusIcon } from 'lucide-react';
+import { CalendarSearch as CalendarSearchIcon, Heart as HeartIcon, X as XIcon, SlidersHorizontal as FilterIcon, Star as StarIcon, Upload as ArrowUpTrayIcon, Grid2x2 as LargePhotosIcon, Grid3x3 as SmallPhotosIcon, Image as PhotoIcon, UserPlus as UserPlusIcon } from 'lucide-react';
 import { useStore, isVideoFilename } from '../store';
 import type { CaptureRange, MediaFilter } from '../store';
 import { useAppServices } from '../../../components/AppServicesProvider';
@@ -7,7 +7,8 @@ import { UploadDock } from '../../../components/UploadDock';
 import { invalidateLocalSortIndex } from '../../../services/localSortIndex';
 import PhotoGrid from '../components/PhotoGrid';
 import TimelineBrowser from '../components/TimelineBrowser';
-import { Menu, Spinner } from '../components/bits';
+import { Spinner, Stars } from '../components/bits';
+import { BottomSheet } from '../components/BottomSheet';
 import { useTileSize, TILE_RANGE, TILE_STEP, galleryTileKey, defaultGalleryTile } from '../components/controls';
 
 const MEDIA_FILTERS: { value: MediaFilter; label: string }[] = [
@@ -60,6 +61,7 @@ const GalleryPage: React.FC = () => {
     const [level, setLevel] = useState<ZoomLevel>('days');
     const [focusYear, setFocusYear] = useState<string | null>(null);
     const [dateJump, setDateJump] = useState('');
+    const [filterOpen, setFilterOpen] = useState(false);
     const [jumping, setJumping] = useState(false);
     const jumpAnimTimerRef = useRef<number | null>(null);
     useEffect(() => () => { if (jumpAnimTimerRef.current) window.clearTimeout(jumpAnimTimerRef.current); }, []);
@@ -265,69 +267,82 @@ const GalleryPage: React.FC = () => {
         </div>
     );
 
-    // One row of chips replaces the old Filters popover: every filter is a tap
-    // away and the active ones are visible without opening anything.
+    // Option D: every filter behind one Filter button, so the photos start right
+    // under the title. Whatever is on shows as a chip with an x to drop it.
+    const clearFilters = () => { setMediaFilter('all'); setGalleryLikedOnly(false); setGalleryRating(0); };
+    const activeChips: { key: string; label: React.ReactNode; clear: () => void }[] = [
+        ...(mediaFilter !== 'all' ? [{ key: 'type', label: mediaFilter === 'video' ? 'Videos' : 'Photos', clear: () => setMediaFilter('all') }] : []),
+        ...(galleryFilters.likedOnly ? [{ key: 'liked', label: <><HeartIcon className="pt-chip-icon" fill="currentColor" aria-hidden="true" />Liked</>, clear: () => setGalleryLikedOnly(false) }] : []),
+        ...(galleryFilters.rating > 0 ? [{ key: 'rating', label: <><StarIcon className="pt-chip-icon" fill="currentColor" aria-hidden="true" />{`${galleryFilters.rating} star${galleryFilters.rating === 1 ? '' : 's'}`}</>, clear: () => setGalleryRating(0) }] : []),
+    ];
     const filterChips = (
         <div className="pt-chips" role="group" aria-label="Filter photos">
-            {MEDIA_FILTERS.map((f) => (
-                <button key={f.value} type="button" className="chip" aria-pressed={mediaFilter === f.value} onClick={() => setMediaFilter(f.value)}>
-                    {f.label}
+            <button
+                type="button"
+                className="chip pt-filter-chip"
+                aria-pressed={activeFilterCount > 0}
+                aria-haspopup="dialog"
+                aria-label={activeFilterCount > 0 ? `Filter, ${activeFilterCount} on` : 'Filter'}
+                onClick={() => setFilterOpen(true)}
+            >
+                <FilterIcon className="pt-chip-icon" aria-hidden="true" /> Filter
+                {activeFilterCount > 0 && <span className="pt-filter-count" aria-hidden="true">{activeFilterCount}</span>}
+            </button>
+            {activeChips.map((c) => (
+                <button key={c.key} type="button" className="chip pt-active-chip" onClick={c.clear} aria-label={`Remove filter: ${typeof c.label === 'string' ? c.label : c.key}`}>
+                    {c.label}<XIcon className="pt-chip-icon" aria-hidden="true" />
                 </button>
             ))}
-            <button type="button" className="chip" aria-pressed={galleryFilters.likedOnly} onClick={() => setGalleryLikedOnly(!galleryFilters.likedOnly)}>
-                <HeartIcon className="pt-chip-icon" fill={galleryFilters.likedOnly ? 'currentColor' : 'none'} /> Liked
-            </button>
-            <Menu
-                className="pt-rating-filter"
-                align="left"
-                renderTrigger={(toggle, open) => (
-                    <button
-                        type="button"
-                        className="chip"
-                        aria-pressed={galleryFilters.rating > 0}
-                        aria-haspopup="menu"
-                        aria-expanded={open}
-                        onClick={toggle}
-                    >
-                        <StarIcon className="pt-chip-icon" fill={galleryFilters.rating > 0 ? 'currentColor' : 'none'} />
-                        {galleryFilters.rating > 0 ? `${galleryFilters.rating} star${galleryFilters.rating === 1 ? '' : 's'}` : 'Rating'}
-                        <ChevronDownIcon className="pt-chip-icon" />
-                    </button>
-                )}
-            >
-                {(close) => (
-                    <div className="pt-rating-options" aria-label="Filter by rating">
-                        {[0, 1, 2, 3, 4, 5].map((rating) => (
-                            <button
-                                key={rating}
-                                type="button"
-                                role="menuitemradio"
-                                aria-checked={galleryFilters.rating === rating}
-                                className={galleryFilters.rating === rating ? 'active' : undefined}
-                                onClick={() => { setGalleryRating(rating); close(); }}
-                            >
-                                <StarIcon className="toolbar-icon" fill={rating > 0 ? 'currentColor' : 'none'} />
-                                {rating === 0 ? 'All ratings' : `${rating} star${rating === 1 ? '' : 's'}`}
+            {/* Phones hide the title row, so Select lives at the end of this row there. */}
+            <button type="button" className="pt-linkish pt-chip-select" onClick={() => setSelectMode(true)}>Select</button>
+        </div>
+    );
+    const filterSheet = (
+        <BottomSheet open={filterOpen} onClose={() => setFilterOpen(false)} title="Filter photos">
+            <div className="pt-filter-sheet">
+                <div className="pt-fs-row column">
+                    <span className="pt-fs-label">Show</span>
+                    <div className="mock-seg pt-fs-seg" role="group" aria-label="Show">
+                        {MEDIA_FILTERS.map((f) => (
+                            <button key={f.value} type="button" className={mediaFilter === f.value ? 'active' : undefined} aria-pressed={mediaFilter === f.value} onClick={() => setMediaFilter(f.value)}>
+                                {f.label}
                             </button>
                         ))}
                     </div>
-                )}
-            </Menu>
-            <label className="chip pt-date-chip">
-                <CalendarSearchIcon className="pt-chip-icon" aria-hidden="true" />
-                <span>{dateJump ? formatDateJumpLabel(dateJump) : 'Date'}</span>
-                <input
-                    type="date"
-                    aria-label="Jump to date"
-                    value={dateJump}
-                    min={timeline?.firstDate ?? undefined}
-                    max={timeline?.lastDate ?? undefined}
-                    onChange={(e) => handleDateJump(e.target.value)}
-                />
-            </label>
-            {/* Phones hide the title row, so Select lives at the end of the chips there. */}
-            <button type="button" className="chip pt-chip-select" onClick={() => setSelectMode(true)}>Select</button>
-        </div>
+                </div>
+                <label className="pt-fs-row">
+                    <span><HeartIcon className="pt-chip-icon" aria-hidden="true" /> Only liked</span>
+                    <button
+                        type="button"
+                        role="switch"
+                        aria-checked={galleryFilters.likedOnly}
+                        aria-label="Only liked"
+                        className={`pt-switch${galleryFilters.likedOnly ? ' on' : ''}`}
+                        onClick={() => setGalleryLikedOnly(!galleryFilters.likedOnly)}
+                    ><span aria-hidden="true" /></button>
+                </label>
+                <div className="pt-fs-row column">
+                    <span className="pt-fs-label">Rating{galleryFilters.rating > 0 ? ` · exactly ${galleryFilters.rating} star${galleryFilters.rating === 1 ? '' : 's'}` : ''}</span>
+                    <div className="pt-fs-stars"><Stars value={galleryFilters.rating} onRate={setGalleryRating} size={22} /></div>
+                </div>
+                <label className="pt-fs-row pt-date-chip">
+                    <span><CalendarSearchIcon className="pt-chip-icon" aria-hidden="true" /> Jump to date</span>
+                    <span className="pt-fs-value">{dateJump ? formatDateJumpLabel(dateJump) : 'Any'}</span>
+                    <input
+                        type="date"
+                        aria-label="Jump to date"
+                        value={dateJump}
+                        min={timeline?.firstDate ?? undefined}
+                        max={timeline?.lastDate ?? undefined}
+                        onChange={(e) => { handleDateJump(e.target.value); setFilterOpen(false); }}
+                    />
+                </label>
+                <div className="pt-fs-actions">
+                    <button type="button" className="pt-linkish" disabled={activeFilterCount === 0} onClick={clearFilters}>Clear</button>
+                    <button type="button" className="btn btn-primary" onClick={() => setFilterOpen(false)}>Done</button>
+                </div>
+            </div>
+        </BottomSheet>
     );
 
     const scopeCrumbs = (level !== 'days' || captureRange) ? (
@@ -351,6 +366,9 @@ const GalleryPage: React.FC = () => {
         if (activeFilterCount > 0) {
             return (
                 <div className="pt-arrive">
+                    {/* Keep the filters in reach, so one can be dropped instead of all. */}
+                    {filterChips}
+                    {filterSheet}
                     <div className="empty-state">
                         <span className="empty-state-icon"><FilterIcon /></span>
                         <p className="empty-state-title">No photos match your filters</p>
@@ -449,7 +467,7 @@ const GalleryPage: React.FC = () => {
                     onTouchMove={onTouchMove}
                     onTouchEnd={onTouchEnd}
                 >
-                    <PhotoGrid photos={visiblePhotos} gridRef={gridRef} extendable dayHeadings />
+                    <PhotoGrid photos={visiblePhotos} gridRef={gridRef} extendable dayHeadings emptyHint={mediaFilter !== 'all' ? '' : undefined} />
                     {mediaFilter !== 'all' && visiblePhotos.length === 0 && (
                         <p className="pt-grid-empty">No {mediaFilter === 'video' ? 'videos' : 'photos'} on the loaded pages yet — scroll to load more.</p>
                     )}
@@ -462,6 +480,7 @@ const GalleryPage: React.FC = () => {
                     </div>
                 </div>
             )}
+            {filterSheet}
         </div>
     );
 };

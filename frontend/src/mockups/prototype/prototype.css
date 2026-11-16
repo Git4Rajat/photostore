@@ -1437,3 +1437,32 @@
   .pt-album-hero { margin-left: calc(-1 * clamp(12px, 3vw, 20px)) !important; margin-right: calc(-1 * clamp(12px, 3vw, 20px)) !important; margin-top: -8px !important; border-radius: 0; }
 }
 .pt-album-card-cover .pt-album-card-swatch { position: absolute; inset: 0; }
+/* The one-star compact rating is unused now; the menu's button rule must not bring it back as a sixth star. */
+.pt-more-menu .pt-star-compact, .pt-fm-rate .pt-star-compact, .pt-vi-block .pt-star-compact { display: none; }
+
+/* ---- Photos filter (option D): one Filter button, a sheet, removable chips ---- */
+.pt-chips { flex-wrap: wrap; overflow: visible; row-gap: 8px; align-items: center; }
+.pt-shell .pt-filter-chip[aria-pressed='true'] { background: var(--text); color: var(--bg-1); }
+.pt-filter-count { display: inline-grid; place-items: center; min-width: 17px; height: 17px; padding: 0 5px; border-radius: 999px; background: var(--accent); color: var(--on-accent); font-size: 11px; font-weight: 700; }
+.pt-active-chip { gap: 5px; }
+.pt-active-chip .pt-chip-icon:last-child { width: 13px; height: 13px; opacity: 0.7; }
+.pt-chip-select { min-height: 34px; padding: 0 4px; }
+.pt-filter-sheet { display: flex; flex-direction: column; gap: 4px; }
+.pt-fs-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 48px; padding: 6px 0; border-bottom: 1px solid var(--lg-edge); font-size: 0.92rem; cursor: pointer; }
+.pt-fs-row.column { flex-direction: column; align-items: stretch; gap: 8px; cursor: default; }
+.pt-fs-row > span:first-child { display: inline-flex; align-items: center; gap: 8px; }
+.pt-fs-label { font-size: 0.8rem; font-weight: 650; color: var(--muted); }
+.pt-fs-seg { display: flex; }
+.pt-fs-seg button { flex: 1; }
+.pt-fs-value { color: var(--muted); font-size: 0.86rem; }
+.pt-fs-row.pt-date-chip { position: relative; }
+.pt-fs-stars .pt-stars { gap: 0; margin-left: -6px; }
+.pt-fs-stars .pt-star { width: 40px; min-width: 40px; min-height: 40px; }
+.pt-fs-stars .pt-star-compact { display: none; }
+.pt-fs-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 12px; }
+.pt-fs-actions .btn { min-width: 120px; justify-content: center; }
+.pt-fs-actions .pt-linkish:disabled { color: var(--muted); cursor: default; }
+@container (max-width: 805px) {
+  .pt-chips .pt-chip-select { display: inline-flex; margin-left: auto; }
+}
+.pt-more-menu .pt-fm-rate .pt-star, .pt-fm-menu .pt-fm-rate .pt-star { color: var(--star); }
