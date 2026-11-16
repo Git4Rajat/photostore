@@ -22,3 +22,9 @@ export const formatNotificationTime = (timestamp: number, now: number = Date.now
     const months = Math.max(1, Math.floor(age / (30 * DAY_MS)));
     return `${months} mo`;
 };
+
+// The clock time alone, for entries listed under a day heading that already
+// says which day it was.
+export const formatNotificationClock = (timestamp: number): string => (
+    Number.isFinite(timestamp) ? new Date(timestamp).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' }) : ''
+);

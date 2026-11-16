@@ -30,6 +30,8 @@ export interface AppNotification {
     unread: boolean;
     progress?: UploadProgress;
     uploadSessionId?: string;
+    // A few of the photos a finished upload added (library filenames), drawn as a thumbnail strip.
+    photos?: string[];
     // Ephemeral (in-memory) button shown on the preview, e.g. Undo or Retry.
     action?: { label: string; onClick: () => void };
 }

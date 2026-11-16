@@ -179,7 +179,7 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
                     <UploadIcon className="toolbar-icon" /> <span className="pt-upload-label">Upload</span>
                 </button>
 
-                <NotificationBell />
+                <NotificationBell backLabel={pageTitle(route)} />
 
                 <Menu
                     align="right"

@@ -4,10 +4,12 @@
 // only on the public useAppServices() contract, so they can live independently
 // of the (much larger) provider component itself.
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Bell as BellIcon, CircleAlert as AlertIcon, CloudUpload as UploadIcon, Trash2 as TrashIcon, Users as PeopleIcon, X as XMarkIcon } from 'lucide-react';
-import { IconButton } from './ui/Button';
+import { Bell as BellIcon, ChevronLeft as BackIcon, CloudUpload as UploadIcon, RotateCw as RetryIcon, TriangleAlert as AlertIcon, Users as PeopleIcon } from 'lucide-react';
 import { formatMegabytesPerSecond } from './browserAiShared';
-import { formatNotificationTime } from '../services/notificationTime';
+import { formatNotificationClock, formatNotificationTime } from '../services/notificationTime';
+import { getCachedSortThumb } from '../services/localSortIndex';
+import { thumbnailUrlForBlob } from '../services/mediaToken';
+import { resolveThumbnailAccessUrls } from '../services/thumbnailAccessCache';
 import type { AppNotification } from '../types/browserProcessing';
 import { useAppServices } from './AppServicesProvider';
 import { useSwipeDismiss } from '../services/swipeDismiss';
@@ -45,7 +47,44 @@ export const groupByDay = (items: AppNotification[], now = new Date()): Array<[s
     return Array.from(groups.entries());
 };
 
-export const NotificationBell: React.FC = () => {
+/** A finished upload's few photos, as small square thumbnails. Thumbnails the
+ *  loaded sort index already knows load directly; the rest are resolved in one
+ *  batch. One that isn't made yet stays an empty square. */
+const NotificationStrip: React.FC<{ filenames: string[] }> = ({ filenames }) => {
+    const direct = (filename: string) => thumbnailUrlForBlob(getCachedSortThumb(filename));
+    const [resolved, setResolved] = useState<Record<string, string>>({});
+    const [broken, setBroken] = useState<Set<string>>(() => new Set());
+    const key = filenames.join('|');
+    useEffect(() => {
+        const need = filenames.filter((filename) => !direct(filename));
+        if (need.length === 0) return undefined;
+        let active = true;
+        void resolveThumbnailAccessUrls(need).then((urls) => {
+            if (active) setResolved(Object.fromEntries(Array.from(urls).filter(([, url]) => url)));
+        });
+        return () => { active = false; };
+    }, [key]); // eslint-disable-line react-hooks/exhaustive-deps
+    return (
+        <div className="notification-strip">
+            {filenames.map((filename) => {
+                const src = direct(filename) || resolved[filename];
+                return (
+                    <span key={filename} className="notification-thumb">
+                        {src && !broken.has(filename) && (
+                            <img src={src} alt="" loading="lazy" decoding="async"
+                                onError={() => setBroken((prev) => new Set(prev).add(filename))} />
+                        )}
+                    </span>
+                );
+            })}
+        </div>
+    );
+};
+
+const NO_IDS: ReadonlySet<string> = new Set();
+
+/** The bell, and the panel it opens: a popover under the bell on desktops, a page of its own on phones. */
+export const NotificationBell: React.FC<{ backLabel?: string }> = ({ backLabel = 'Back' }) => {
     const {
         notifications,
         unreadCount,
@@ -55,6 +94,10 @@ export const NotificationBell: React.FC = () => {
         uploadActive,
     } = useAppServices();
     const [showNotifications, setShowNotifications] = useState<boolean>(false);
+    // Opening the panel marks everything read (and acknowledges stale uploads),
+    // but what was new when it opened keeps its dot -- and the bell its dot --
+    // until Mark all read or the panel closes.
+    const [seenUnread, setSeenUnread] = useState<ReadonlySet<string>>(NO_IDS);
     const wrapRef = useRef<HTMLDivElement | null>(null);
 
     // Every new notification previews under the bell for a few seconds, the same
@@ -94,7 +137,12 @@ export const NotificationBell: React.FC = () => {
 
     const closeNotifications = useCallback(() => {
         setShowNotifications(false);
+        setSeenUnread(NO_IDS);
     }, []);
+    const markRead = () => {
+        markAllNotificationsRead();
+        setSeenUnread(NO_IDS);
+    };
 
     // Close the pane when clicking outside of it or pressing Escape. The pane
     // itself is anchored to the bell in normal flow, so it scrolls along with
@@ -125,27 +173,32 @@ export const NotificationBell: React.FC = () => {
         };
     }, [showNotifications, closeNotifications]);
 
+    const isNew = (n: AppNotification) => n.unread || seenUnread.has(n.id);
+    const newCount = notifications.filter(isNew).length;
+
     const overlay = showNotifications
         ? (
             <div
-                className="notification-pane card-glass"
+                className="notification-pane"
                 role="dialog"
                 aria-label="Notifications"
             >
                     <div className="notification-head">
-                        <h3 className="toolbar-title">Notifications</h3>
-                        <div className="notification-actions">
-                            <IconButton label="Clear notifications" size="sm" onClick={clearNotifications}>
-                                <TrashIcon className="toolbar-icon" />
-                            </IconButton>
-                            <IconButton label="Close notifications" size="sm" className="notification-close" onClick={closeNotifications}>
-                                <XMarkIcon className="toolbar-icon" />
-                            </IconButton>
-                        </div>
+                        <button type="button" className="notification-back" onClick={closeNotifications} aria-label={`Back to ${backLabel}`}>
+                            <BackIcon aria-hidden="true" />{backLabel}
+                        </button>
+                        <h3 className="notification-heading">Notifications</h3>
+                        {newCount > 0 && (
+                            <button type="button" className="notification-link notification-mark" onClick={markRead}>Mark all read</button>
+                        )}
                     </div>
 
                     {notifications.length === 0 ? (
-                        <p className="status">Nothing new. Finished uploads and anything that needs you show up here.</p>
+                        <div className="notification-empty">
+                            <span className="notification-icon" aria-hidden="true"><BellIcon /></span>
+                            <p className="notification-title">Nothing new</p>
+                            <p className="notification-details">Finished uploads and anything that needs you show up here.</p>
+                        </div>
                     ) : (
                         <div className="notification-list">
                             {groupByDay(latestProgressOnly(notifications)).map(([day, items]) => (
@@ -154,52 +207,60 @@ export const NotificationBell: React.FC = () => {
                                     {items.map((notification) => {
                                         const kind = notificationKind(notification);
                                         const Icon = KIND_ICONS[kind];
+                                        const progress = notification.progress;
+                                        // A bar only while the job is still going; a finished one says how it went in words.
+                                        const running = progress && progress.uploadedCount + progress.failedCount < progress.totalCount;
                                         return (
                                             <article
                                                 key={notification.id}
-                                                className={`notification-item ${notification.unread ? 'unread' : ''}`}
+                                                className={`notification-item ${isNew(notification) ? 'unread' : ''}`}
                                             >
                                                 <span className={`notification-icon ${kind}`} aria-hidden="true"><Icon /></span>
                                                 <div className="notification-body">
                                                     <div className="notification-top">
-                                                        <p className="notification-title">{notification.title}</p>
+                                                        <p className="notification-title">
+                                                            {isNew(notification) && <span className="sr-only">New: </span>}
+                                                            {notification.title}
+                                                        </p>
                                                         <time
                                                             className="notification-time"
                                                             dateTime={new Date(notification.timestamp).toISOString()}
                                                         >
-                                                            {formatNotificationTime(notification.timestamp)}
+                                                            {formatNotificationClock(notification.timestamp)}
                                                         </time>
                                                     </div>
                                                     {notification.details && <p className="notification-details">{notification.details}</p>}
-                                                    {notification.progress && (
+                                                    {running && (
                                                         <>
-                                                            <div className="progress-track notification-progress-track">
-                                                                <div
-                                                                    className="progress-bar"
+                                                            <div className="notification-progress" aria-hidden="true">
+                                                                <i
                                                                     style={{
-                                                                        width: `${notification.progress.totalCount > 0
-                                                                            ? (notification.progress.uploadedCount / notification.progress.totalCount) * 100
+                                                                        width: `${progress.totalCount > 0
+                                                                            ? (progress.uploadedCount / progress.totalCount) * 100
                                                                             : 100}%`,
                                                                     }}
                                                                 />
                                                             </div>
                                                             <p className="notification-details">
-                                                                {notification.progress.uploadedCount}/{notification.progress.totalCount}
-                                                                {notification.progress.failedCount > 0
-                                                                    ? ` (Failed ${notification.progress.failedCount})`
+                                                                {progress.uploadedCount}/{progress.totalCount}
+                                                                {progress.failedCount > 0
+                                                                    ? ` (Failed ${progress.failedCount})`
                                                                     : ''}
-                                                                {notification.progress.skippedDuplicateCount > 0
-                                                                    ? ` (Skipped duplicates ${notification.progress.skippedDuplicateCount})`
+                                                                {progress.skippedDuplicateCount > 0
+                                                                    ? ` (Skipped duplicates ${progress.skippedDuplicateCount})`
                                                                     : ''}
-                                                                {(notification.progress.mbPerSecond ?? 0) > 0 ? ` · ${formatMegabytesPerSecond(notification.progress.mbPerSecond)}` : ''}
+                                                                {(progress.mbPerSecond ?? 0) > 0 ? ` · ${formatMegabytesPerSecond(progress.mbPerSecond)}` : ''}
                                                             </p>
                                                         </>
+                                                    )}
+                                                    {notification.photos && notification.photos.length > 0 && (
+                                                        <NotificationStrip filenames={notification.photos} />
                                                     )}
                                                     {notification.uploadSessionId && (
                                                         <div className="notification-acts">
                                                             <button type="button" className="btn btn-primary btn-sm" disabled={uploadActive}
                                                                 onClick={() => void retryPersistedUploadSession(notification.uploadSessionId)}>
-                                                                Retry unfinished files
+                                                                <RetryIcon aria-hidden="true" />Retry unfinished files
                                                             </button>
                                                         </div>
                                                     )}
@@ -211,9 +272,19 @@ export const NotificationBell: React.FC = () => {
                             ))}
                         </div>
                     )}
+
+                    <div className="notification-foot">
+                        <span>Kept for 30 days</span>
+                        {notifications.length > 0 && (
+                            <button type="button" className="notification-link" onClick={clearNotifications}>Clear all</button>
+                        )}
+                    </div>
             </div>
         )
         : null;
+
+    const previewKind = preview ? notificationKind(preview) : 'info';
+    const PreviewIcon = KIND_ICONS[previewKind];
 
     return (
         <div className="notification-wrap" ref={wrapRef}>
@@ -230,47 +301,56 @@ export const NotificationBell: React.FC = () => {
                     // always sees the latest showNotifications from this
                     // render, so there's no staleness risk in reading it
                     // directly instead.
-                    const next = !showNotifications;
-                    setShowNotifications(next);
-                    if (next) {
-                        markAllNotificationsRead();
+                    if (showNotifications) {
+                        closeNotifications();
+                        return;
                     }
+                    setShowNotifications(true);
+                    setSeenUnread(new Set(notifications.filter((n) => n.unread).map((n) => n.id)));
+                    markAllNotificationsRead();
                 }}
-                className="btn btn-soft notification-bell"
+                className={`btn btn-soft notification-bell${showNotifications ? ' open' : ''}`}
                 aria-label={unreadCount > 0 ? `Open notifications, ${unreadCount} new` : "Open notifications"}
+                aria-expanded={showNotifications}
+                aria-haspopup="dialog"
             >
                 <BellIcon className="toolbar-icon" />
-                {unreadCount > 0 && <span className="notification-badge">{unreadCount}</span>}
+                {newCount > 0 && <span className="notification-badge">{newCount}</span>}
             </button>
             {preview && !showNotifications && (
                 <div
                     key={`${preview.id}:${preview.timestamp}`}
                     ref={previewRef}
-                    className="notification-preview card-glass"
+                    className="notification-preview"
                     role="status"
                     aria-live="polite"
                 >
-                    <p className="notification-title">{preview.title}</p>
-                    {preview.details && <p className="notification-details">{preview.details}</p>}
-                    <time className="notification-time" dateTime={new Date(preview.timestamp).toISOString()}>
-                        {formatNotificationTime(preview.timestamp)}
-                    </time>
-                    {preview.action && (
-                        <button
-                            type="button"
-                            className="btn btn-soft"
-                            onClick={() => {
-                                try { preview.action?.onClick(); } finally { setPreview(null); }
-                            }}
-                        >
-                            {preview.action.label}
-                        </button>
-                    )}
+                    <span className={`notification-icon ${previewKind}`} aria-hidden="true"><PreviewIcon /></span>
+                    <div className="notification-body">
+                        <div className="notification-top">
+                            <p className="notification-title">{preview.title}</p>
+                            <time className="notification-time" dateTime={new Date(preview.timestamp).toISOString()}>
+                                {formatNotificationTime(preview.timestamp)}
+                            </time>
+                        </div>
+                        {preview.details && <p className="notification-details">{preview.details}</p>}
+                        {preview.action && (
+                            <div className="notification-acts">
+                                <button
+                                    type="button"
+                                    className="btn btn-soft btn-sm"
+                                    onClick={() => {
+                                        try { preview.action?.onClick(); } finally { setPreview(null); }
+                                    }}
+                                >
+                                    {preview.action.label}
+                                </button>
+                            </div>
+                        )}
+                    </div>
                 </div>
             )}
             {overlay}
         </div>
     );
 };
-
-
