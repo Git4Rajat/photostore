@@ -292,7 +292,8 @@ def admin_backfill_grid_images():
     Runs on the clustering worker, not in this request: batches of
     grid_images.BATCH_SIZE photos, each queueing its own continuation. It reads
     previews only, never originals, and skips photos that already have a grid
-    image, so it is safe to repeat. Refused while uploads are open (pass
+    image, so it is safe to repeat. When it finishes it also refreshes the
+    library's shared-album snapshots so they carry grid images. Refused while uploads are open (pass
     "force": true to override a stale upload); photos still being processed
     are skipped either way and picked up by their wave's own grid job.
     """

@@ -23,11 +23,14 @@ import { EmptyState } from './shared/EmptyState';
 import { ErrorState } from './shared/ErrorState';
 import { isVideoFilename } from '../utils/photoDisplay';
 import { photoFromDeepLink } from '../utils/publicAlbumDeepLink';
+import { composeTileImage, thumbnailTileStyle, useTileSizes } from '../utils/tileImage';
 
 interface PublicPhoto {
     filename: string;
     url: string;
     thumbnailUrl?: string;
+    /** Sharp grid-tile image (backend grid_images.py), present only once it exists. */
+    gridUrl?: string;
     previewUrl?: string;
     rawFullPreviewUrl?: string;
     rotation?: number;
@@ -55,29 +58,19 @@ const InlineSpinner: React.FC<{ label: string }> = ({ label }) => (
     </div>
 );
 
-// The served thumbnail bakes in only the client's auto-orientation
-// (thumbnailRotation); the user's manual rotate lives in `rotation` and is
-// applied on top as a CSS transform -- mirrors PhotoGrid/PhotoTile so a grid
-// tile matches what the viewer shows. The 0.74 down-scale on quarter-turns
-// keeps a rotated landscape thumbnail from overflowing its square.
-const normalizeRotation = (value?: number): number => {
-    const rotation = Number(value || 0) % 360;
-    return rotation < 0 ? rotation + 360 : rotation;
-};
-const tileRotationStyle = (photo: PublicPhoto): React.CSSProperties | undefined => {
-    const remaining = normalizeRotation(normalizeRotation(photo.rotation) - normalizeRotation(photo.thumbnailRotation));
-    if (!remaining) {
-        return undefined;
-    }
-    return { transform: `rotate(${remaining}deg) scale(${remaining % 180 === 0 ? 1 : 0.74})` };
-};
-
 const resolveMediaSrc = (url?: string): string => {
     if (!url) {
         return '';
     }
     return url.startsWith('http') ? url : resolveApiUrl(url);
 };
+
+// Thumbnail plus, once the photo has one, the sharp grid image in srcset; the
+// tile turns by whichever rotation that image needs (see composeTileImage).
+const tileImageFor = (photo: PublicPhoto) => composeTileImage(
+    resolveMediaSrc(photo.thumbnailUrl) || undefined, resolveMediaSrc(photo.gridUrl) || undefined,
+    photo.rotation, photo.thumbnailRotation,
+);
 
 // Thumbnails are cheap (small, day-stable SAS/proxy URLs) so warming them all
 // up front makes scrolling feel instant instead of waiting on native
@@ -175,6 +168,12 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
     const [selectedPhotos, setSelectedPhotos] = useState<Set<string>>(new Set());
     const [selectMode, setSelectMode] = useState<boolean>(false);
     const [tileSize] = useTileSize('photostore.publicAlbumTileSize', { default: 128 });
+    const gridRef = useRef<HTMLDivElement | null>(null);
+    const tileSizes = useTileSizes(gridRef, photos[0]?.filename);
+    const heroImage = photos[0]
+        ? composeTileImage(photos[0].gridUrl ? undefined : resolveMediaSrc(photos[0].thumbnailUrl) || undefined,
+            resolveMediaSrc(photos[0].gridUrl) || undefined, photos[0].rotation, photos[0].thumbnailRotation) ?? { src: '' }
+        : { src: '' };
     const [downloading, setDownloading] = useState<boolean>(false);
     const downloadFormRef = useRef<HTMLFormElement | null>(null);
     // The scrollable region is the app-shell body (overflow-y:auto), not the
@@ -417,8 +416,9 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
             return url.startsWith('http') ? url : resolveApiUrl(url);
         };
 
+        // Warm what the tile will actually show: the grid image when there is one.
         const prefetchOne = (photo: PublicPhoto) => new Promise<void>((resolve) => {
-            const src = resolveThumbSrc(photo.thumbnailUrl);
+            const src = resolveThumbSrc(photo.gridUrl || photo.thumbnailUrl);
             if (!src) {
                 resolve();
                 return;
@@ -658,7 +658,8 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
                                     {/* Phones open on the first photo, with the title over it. */}
                                     {photos[0] && (
                                         <div className="pt-public-hero">
-                                            <img src={resolveMediaSrc(photos[0].thumbnailUrl)} alt="" style={tileRotationStyle(photos[0])} />
+                                            {/* The banner is phone-wide, so the grid image alone when there is one. */}
+                                            <img {...heroImage} alt="" />
                                             <div className="pt-public-hero-text">
                                                 <h1 className="pt-public-title">{album ? album.name : 'Shared album'}</h1>
                                                 <p>{metaLine}</p>
@@ -801,11 +802,13 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
                             {!loading && !error && bufferReady && photos.length > 0 && viewerIndex === null && (
                                 <div>
                                     <div
+                                        ref={gridRef}
                                         className={`pt-grid pt-public-grid${selectMode ? ' select-mode' : ''}`}
                                         style={{ ['--pt-tile-min' as string]: `${tileSize}px` } as React.CSSProperties}
                                     >
                                         {photos.map((photo, index) => {
                                             const isSelected = selectedPhotos.has(photo.filename);
+                                            const image = tileImageFor(photo);
                                             return (
                                                 <div
                                                     key={photo.filename}
@@ -824,18 +827,23 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
                                                 >
                                                     <img
                                                         className="pt-tile-img"
-                                                        src={resolveMediaSrc(photo.thumbnailUrl)}
+                                                        src={image?.src ?? ''}
+                                                        srcSet={image?.srcSet}
+                                                        sizes={image?.srcSet ? tileSizes : undefined}
                                                         alt={photo.filename}
                                                         loading="lazy"
                                                         draggable={false}
-                                                        style={tileRotationStyle(photo)}
+                                                        style={image?.style}
                                                         onError={(e) => {
                                                             // Direct storage URL missed (thumbnail not at that blob yet):
                                                             // retry once through the API proxy, which resolves the real
                                                             // blob and serves a placeholder instead of a broken image.
+                                                            // Drop the grid image too, and take the thumbnail's turn.
                                                             const img = e.currentTarget;
                                                             if (!token || img.dataset.proxied) { return; }
                                                             img.dataset.proxied = '1';
+                                                            img.removeAttribute('srcset');
+                                                            img.style.transform = String(thumbnailTileStyle(photo.rotation, photo.thumbnailRotation)?.transform ?? '');
                                                             img.src = resolveApiUrl(`/public/photos/${encodeURIComponent(token)}/thumbnail/${encodeURIComponent(photo.filename)}`);
                                                         }}
                                                     />

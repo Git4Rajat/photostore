@@ -10,7 +10,8 @@ It does not make images itself. A dry run scans each library's metadata
 --apply queues one `grid_images` job per library on the clustering queue; the
 clustering worker then works through the library in batches inside Azure,
 where reading previews costs no egress, and skips photos that already have a
-grid image. Safe to re-run.
+grid image. When a library finishes, its shared-album snapshots are rebuilt so
+they carry grid images too. Safe to re-run.
 
 Do NOT --apply while photos are uploading to that environment: libraries with
 an open upload are refused unless you pass --force. Same action as

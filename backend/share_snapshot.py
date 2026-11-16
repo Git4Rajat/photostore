@@ -2,7 +2,7 @@
 
 A shared-album link that lands on a scale-to-zero container shows a blank page for ~30s. The
 snapshot is a write-through cache that an always-on origin can serve instead: a small page, a
-manifest, and the thumbnails plus previews of the first ``PREVIEW_LIMIT`` photos, all under
+manifest, and the thumbnails, grid images and previews of the first ``PREVIEW_LIMIT`` photos, all under
 ``s/<token>/`` in the ``$web`` container. The page wakes the real app in the background and hands
 over to it (see ``share_snapshot_page``). Nothing here imports Azure or Flask: callers pass the
 container client and the photo source, so the logic is unit-testable.
@@ -45,6 +45,8 @@ def _int_env(name: str, default: int) -> int:
 PREVIEW_LIMIT = _int_env('SHARE_SNAPSHOT_PREVIEW_LIMIT', 500)
 # Previews are ~1.5 MB at most; anything far larger is skipped (the viewer falls back to the thumbnail).
 PREVIEW_MAX_BYTES = 2 * 1024 * 1024
+# Grid images (grid_images.py) are ~15-45 KB; this only guards against a bad blob.
+GRID_MAX_BYTES = 512 * 1024
 # Previews decode full originals; keep this low so a RAW-heavy album cannot exhaust the worker's memory.
 WORKERS = max(1, _int_env('SHARE_SNAPSHOT_WORKERS', 4))
 
@@ -103,7 +105,8 @@ class Photo:
 
     def __init__(self, filename: str, *, version: str, is_video: bool = False, rotation: int = 0,
                  thumbnail_rotation: int = 0, read_thumbnail: Callable[[], Optional[bytes]],
-                 read_preview: Optional[Callable[[], Optional[bytes]]] = None):
+                 read_preview: Optional[Callable[[], Optional[bytes]]] = None,
+                 read_grid: Optional[Callable[[], Optional[bytes]]] = None):
         self.filename = filename
         self.version = version
         self.is_video = is_video
@@ -111,6 +114,8 @@ class Photo:
         self.thumbnail_rotation = thumbnail_rotation
         self.read_thumbnail = read_thumbnail
         self.read_preview = read_preview
+        # The sharp grid-tile image (grid_images.py), when the photo has one.
+        self.read_grid = read_grid
 
 
 def _content_settings(content_type: str, cache_control: str):
@@ -145,11 +150,12 @@ def build(entity: Dict, container, photos: Iterable[Photo], total: int, meta: Di
     def sync(index: int, photo: Photo) -> Dict[str, object]:
         entry: Dict[str, object] = {
             'n': photo.filename, 'rot': photo.rotation, 'trot': photo.thumbnail_rotation,
-            'video': photo.is_video, 't': '', 'p': '',
+            'video': photo.is_video, 't': '', 'p': '', 'g': '',
         }
-        for key, name, reader, limit in (
-            ('t', f't/{index}.jpg', photo.read_thumbnail, None),
-            ('p', f'p/{index}.jpg', None if photo.is_video else photo.read_preview, PREVIEW_MAX_BYTES),
+        for key, name, reader, limit, content_type in (
+            ('t', f't/{index}.jpg', photo.read_thumbnail, None, 'image/jpeg'),
+            ('p', f'p/{index}.jpg', None if photo.is_video else photo.read_preview, PREVIEW_MAX_BYTES, 'image/jpeg'),
+            ('g', f'g/{index}.webp', None if photo.is_video else photo.read_grid, GRID_MAX_BYTES, 'image/webp'),
         ):
             if reader is None:
                 continue
@@ -158,7 +164,7 @@ def build(entity: Dict, container, photos: Iterable[Photo], total: int, meta: Di
                     data = reader()
                     if not data or (limit and len(data) > limit):
                         continue
-                    put(name, data, 'image/jpeg', photo.version)
+                    put(name, data, content_type, photo.version)
                 entry[key] = name
                 wanted[base + name] = photo.version
             except Exception:

@@ -152,10 +152,13 @@ def valid_since(value) -> str:
     return value if isinstance(value, str) and _SINCE_RE.fullmatch(value) else ''
 
 
-def job_message(library: str, *, cursor: str = '', since: str = '', reason: str = '') -> str:
+def job_message(library: str, *, cursor: str = '', since: str = '', reason: str = '', made: int = 0) -> str:
+    """``made`` counts grid images the earlier batches of this chain already
+    made, so the last batch knows whether shared-album snapshots need a refresh."""
     job_id = f'grid-images:{uuid.uuid4().hex}'
     return json.dumps({'jobId': job_id, 'correlationId': job_id, 'type': JOB_TYPE, 'user_id': library,
-                       'cursor': cursor, 'since': valid_since(since), 'reason': reason}, separators=(',', ':'))
+                       'cursor': cursor, 'since': valid_since(since), 'reason': reason, 'made': max(0, int(made))},
+                      separators=(',', ':'))
 
 
 def run_batch(rows: Iterable[Dict], process: Callable[[Dict], bool], *, limit: int = BATCH_SIZE,
