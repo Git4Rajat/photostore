@@ -1,7 +1,7 @@
 import {Blob as NodeBlob} from 'node:buffer';
 import {
     eligibleUploadJpeg, generateUploadPreview, generateUploadThumbnail, uploadDerivativeSize,
-    validUploadDerivative, stampVideoThumbnail, UPLOAD_PREVIEW_MAX_BYTES,
+    validUploadDerivative, UPLOAD_PREVIEW_MAX_BYTES,
 } from './uploadDerivatives';
 
 let encodes: Array<{width: number; height: number; quality?: number}>;
@@ -102,23 +102,4 @@ test('validates worker results before accepting a derivative', () => {
     expect(validUploadDerivative({...value, width: 2049}, 2048, 1_500_000)).toBe(false);
     expect(validUploadDerivative({...value, height: 1.5}, 2048, 1_500_000)).toBe(false);
     expect(validUploadDerivative({...value, blob: new Blob([])}, 2048, 1_500_000)).toBe(false);
-});
-
-test('stamps a play icon onto a thumbnail-sized canvas, and falls back to the plain frame on failure', () => {
-    const calls: string[] = [];
-    vi.stubGlobal('OffscreenCanvas', class {
-        constructor(public width: number, public height: number) {}
-        getContext() {
-            const noop = () => undefined;
-            return {drawImage: noop, beginPath: noop, closePath: noop, moveTo: noop, lineTo: noop,
-                arc: () => calls.push('disc'), fill: () => calls.push('fill')};
-        }
-    });
-    const stamped = stampVideoThumbnail({width: 1920, height: 1080} as OffscreenCanvas);
-    expect(stamped).toMatchObject({width: 120, height: 68});
-    expect(calls).toEqual(['disc', 'fill', 'fill']);
-
-    vi.stubGlobal('OffscreenCanvas', class { constructor() { throw new Error('no canvas'); } });
-    const plain = {width: 1920, height: 1080} as OffscreenCanvas;
-    expect(stampVideoThumbnail(plain)).toBe(plain);
 });

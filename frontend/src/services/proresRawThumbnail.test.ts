@@ -1,6 +1,6 @@
 import {proresRawThumbnail} from './proresRawThumbnail';
 const encode = vi.hoisted(() => vi.fn());
-vi.mock('../utils/uploadDerivatives', () => ({generateUploadThumbnail: encode, stampVideoThumbnail: (source: unknown) => source}));
+vi.mock('../utils/uploadDerivatives', () => ({generateUploadThumbnail: encode}));
 let worker: {postMessage: ReturnType<typeof vi.fn>; terminate: ReturnType<typeof vi.fn>; onmessage?: (event: {data: unknown}) => void; onerror?: () => void};
 let close: ReturnType<typeof vi.fn>;
 beforeEach(() => {

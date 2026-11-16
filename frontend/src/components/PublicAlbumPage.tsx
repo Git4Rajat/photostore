@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { CircleCheck as CheckCircleIcon, Download as DownloadIcon, Lock as LockIcon, Image as PhotoIcon } from 'lucide-react';
+import { CircleCheck as CheckCircleIcon, Download as DownloadIcon, Lock as LockIcon, Image as PhotoIcon, Video as VideoMarkIcon } from 'lucide-react';
 import { useParams } from 'react-router-dom';
 // public_bp moved to the dedicated `extras` container app (2026-09-17, see
 // app.py's APP_ROLE=extras split) -- aliased so every call site below stays
@@ -799,8 +799,8 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
                                                             img.src = resolveApiUrl(`/public/photos/${encodeURIComponent(token)}/thumbnail/${encodeURIComponent(photo.filename)}`);
                                                         }}
                                                     />
-                                                    {/* Covers the play icon baked into a turned video's thumbnail. */}
-                                                    {tileRotationStyle(photo) && isVideoFilename(photo.filename) && <span className="pt-tile-play" aria-hidden="true" />}
+                                                    {/* Video thumbnails carry no drawn play icon; a corner mark says it's a video. */}
+                                                    {isVideoFilename(photo.filename) && <span className="pt-tile-video" aria-label="Video"><VideoMarkIcon /></span>}
                                                     {selectMode && (
                                                         <button
                                                             type="button"
