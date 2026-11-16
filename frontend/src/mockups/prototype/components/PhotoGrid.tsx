@@ -1,5 +1,5 @@
 import React from 'react';
-import { Check as CheckIcon, Heart as HeartIcon, Star as StarIcon } from 'lucide-react';
+import { Check as CheckIcon, Video as VideoIcon, Heart as HeartIcon, Star as StarIcon } from 'lucide-react';
 import { isVideoFilename, useStore } from '../store';
 import { tileImage, usePhotoThumbnails, useTileSizes } from '../media';
 import { useDragSelect } from '../../../services/useDragSelect';
@@ -8,6 +8,15 @@ import { captureWallClock } from '../../../utils/captureDate';
 import type { Photo } from '../types';
 
 const DAY_FORMAT = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'long', year: 'numeric' });
+
+/** The Live Photo mark: concentric rings, top-left on the tile. */
+export const LiveMark: React.FC = () => (
+    <svg className="pt-tile-live" viewBox="0 0 24 24" role="img" aria-label="Live Photo">
+        <circle cx="12" cy="12" r="2.6" />
+        <circle cx="12" cy="12" r="5.6" />
+        <circle cx="12" cy="12" r="8.6" strokeDasharray="1.6 2.4" />
+    </svg>
+);
 
 /** The day heading a photo sits under: its capture day, or "Undated". */
 export const dayHeading = (photo: Photo): string => {
@@ -231,7 +240,10 @@ const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?: React
                                 style={image.style}
                             />
                         )}
-                        {image?.style?.transform && isVideoFilename(photo.filename) && <span className="pt-tile-play" aria-hidden="true" />}
+                        {/* Small marks in the corners, as the redesign has them, instead of
+                            a play circle over the middle of the picture. */}
+                        {photo.liveClip && <LiveMark />}
+                        {isVideoFilename(photo.filename) && <span className="pt-tile-video" aria-label="Video"><VideoIcon /></span>}
                         <button
                             type="button"
                             className={`pt-tile-check${selected ? ' on' : ''}`}
@@ -248,7 +260,6 @@ const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?: React
                             <CheckIcon />
                         </button>
                         <span className="pt-tile-badges" aria-hidden="true">
-                            {photo.liveClip && <span className="live">LIVE</span>}
                             {photo.liked && <HeartIcon className="liked" fill="currentColor" />}
                             {photo.rating > 0 && (
                                 <span className="rating">

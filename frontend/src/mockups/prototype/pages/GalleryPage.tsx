@@ -8,7 +8,7 @@ import { invalidateLocalSortIndex } from '../../../services/localSortIndex';
 import PhotoGrid from '../components/PhotoGrid';
 import TimelineBrowser from '../components/TimelineBrowser';
 import { Menu, Spinner } from '../components/bits';
-import { useTileSize, TILE_RANGE, TILE_STEP } from '../components/controls';
+import { useTileSize, TILE_RANGE, TILE_STEP, GALLERY_TILE_KEY, defaultGalleryTile } from '../components/controls';
 
 const MEDIA_FILTERS: { value: MediaFilter; label: string }[] = [
     { value: 'all', label: 'All' },
@@ -24,12 +24,6 @@ type ZoomLevel = 'days' | 'months' | 'years';
 // Months too early, so the Gallery gets its own, much smaller floor.
 const GALLERY_TILE_MIN = 24;
 const clampGalleryTile = (n: number) => Math.min(TILE_RANGE.max, Math.max(GALLERY_TILE_MIN, n));
-const defaultGalleryTile = (): number => {
-    const width = typeof window === 'undefined' ? 1024 : window.innerWidth;
-    // Narrow screens: exactly four columns across the content width (page
-    // padding up to ~40px, three 2px gaps). Wider ones: ~8 columns.
-    return width < 700 ? Math.max(GALLERY_TILE_MIN, Math.floor((width - 46) / 4)) : 140;
-};
 // Jump-to-date doesn't scroll through a continuous timeline -- it swaps in a
 // fresh page starting at the target date (see jumpToGalleryDate), so there's
 // nothing to actually scroll past. Without this, the swap reads as "did
@@ -58,7 +52,7 @@ const GalleryPage: React.FC = () => {
     const [dragging, setDragging] = useState(false);
     // Four across on a phone, about eight on a desktop. A new storage key so
     // everyone starts from these defaults once, not from the old 3-across size.
-    const [tileMin, setTileMin] = useTileSize('photostore.galleryTileSize.v2', { min: GALLERY_TILE_MIN, default: defaultGalleryTile() });
+    const [tileMin, setTileMin] = useTileSize(GALLERY_TILE_KEY, { min: GALLERY_TILE_MIN, default: defaultGalleryTile(GALLERY_TILE_MIN) });
     // iOS-style zoom levels: keep zooming out past the smallest tiles to browse
     // Months, then Years (replaces the old timeline rail).
     const [level, setLevel] = useState<ZoomLevel>('days');
@@ -316,6 +310,8 @@ const GalleryPage: React.FC = () => {
                     onChange={(e) => handleDateJump(e.target.value)}
                 />
             </label>
+            {/* Phones hide the title row, so Select lives at the end of the chips there. */}
+            <button type="button" className="chip pt-chip-select" onClick={() => setSelectMode(true)}>Select</button>
         </div>
     );
 
@@ -383,7 +379,7 @@ const GalleryPage: React.FC = () => {
     const levelTitle = level === 'years' ? 'Years' : level === 'months' ? (focusYear ?? 'Months') : 'Photos';
 
     return (
-        <div>
+        <div className="pt-gallery">
             {level === 'days' && selectMode ? (
                 // While selecting, the header becomes Cancel · count · Select all (same
                 // height as the title row, so the grid doesn't jump under the finger).
