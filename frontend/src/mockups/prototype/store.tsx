@@ -46,13 +46,13 @@ import type {
 } from './types';
 import { routeToSearch, searchToRoute } from './routeUrl';
 
-/** The album the Albums page is showing: the one ?albumId names, or for the
- *  bare Albums tab the first album, which the detail pane previews. Undefined
- *  off the Albums page and while an explicit albumId hasn't loaded yet. */
+/** The album open on the Albums page: the one ?albumId names. The bare Albums
+ *  tab shows album cards, not an album. Undefined off the Albums page and
+ *  while an explicit albumId hasn't loaded yet. */
 export const shownAlbum = (route: Route, albums: Album[]): Album | undefined => {
     if (route.page !== 'albums') return undefined;
     const id = route.params.albumId;
-    return id ? albums.find((a) => a.id === id) : albums[0];
+    return id ? albums.find((a) => a.id === id) : undefined;
 };
 
 // ---- backend <-> prototype photo mapping -------------------------------------
@@ -548,6 +548,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // final fetch always reflects whatever filters/range are current by then.
     const pendingResetRef = useRef(false);
     const [albums, setAlbums] = useState<Album[]>([]);
+    // The latest albums for callbacks that must not re-create on every list change.
+    const albumsRef = useRef<Album[]>(albums);
+    albumsRef.current = albums;
     const [albumsLoading, setAlbumsLoading] = useState<boolean>(true);
     const albumsLoadedAtRef = useRef<number | null>(null);
     const albumsFetchRef = useRef<Promise<void> | null>(null);
@@ -2182,14 +2185,20 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         )
             .then(() => {
                 publishLibraryChange('album-photos-removed', ['albums'], { itemCount: ids.length });
-                toast(`Removed ${ids.length} photo${ids.length > 1 ? 's' : ''} from the album`);
+                // Say where the photos still are, and offer the way back.
+                const name = albumsRef.current.find((a) => a.id === albumId)?.name;
+                toast(
+                    `Removed ${ids.length === 1 ? '1 item' : `${ids.length} items`} from ${name ? `“${name}”` : 'the album'}. ${ids.length === 1 ? 'It’s' : 'They’re'} still in Photos.`,
+                    'Undo',
+                    () => { void addPhotosToAlbum(albumId, ids); },
+                );
                 void openAlbum(albumId);
             })
             .catch(() => {
                 toast('Couldn’t remove photos from the album', undefined, undefined, 'error');
                 void openAlbum(albumId);
             });
-    }, [openAlbum, toast, clearSelection]);
+    }, [openAlbum, toast, clearSelection, addPhotosToAlbum]);
 
     type DeleteMultipleResponse = { deletedAlbums?: string[]; albumErrors?: { albumId: string; error: string }[]; success?: boolean };
 

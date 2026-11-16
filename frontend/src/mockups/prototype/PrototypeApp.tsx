@@ -10,10 +10,7 @@ import {
     Search as MagnifyingGlassIcon,
     Image as PhotoIcon,
     Images as RectangleStackIcon,
-    Users as UserGroupIcon,
-    ChevronRight as ChevronRightIcon,
     CloudUpload as UploadIcon,
-    MapPin as MapPinIcon,
     // The active-tab "solid" cue is handled by color + a heavier stroke in the
     // tab bar (Lucide is a single outline set), so the solid aliases point at
     // the same glyphs.
@@ -30,9 +27,9 @@ import { formatBytes } from '../../components/browserAiShared';
 import { NotificationBell } from '../../components/AppServiceIndicators';
 import { DialogHost } from '../../components/shared/dialogs';
 import { getActiveAccount, initAuth, isAuthEnabled, signIn, signOut } from '../../services/authClient';
-import { StoreProvider, shownAlbum, useStore } from './store';
+import { StoreProvider, useStore } from './store';
 
-import type { Album, Route as AppRoute } from './types';
+import type { Route as AppRoute } from './types';
 import AppSidebar from './components/AppSidebar';
 import { Menu } from './components/bits';
 import CommandBar from './components/CommandBar';
@@ -109,31 +106,12 @@ const activeMobileNavFor = (page: PageId): PageId | '' => {
     return active === 'people' || active === 'explore' ? 'albums' : active;
 };
 
-/** Albums tab: the way in to People and Explore, which have no tab of their own on a phone. */
-const BrowseLinks: React.FC = () => {
-    const { navigate } = useStore();
-    return (
-        <nav className="pt-browse-links" aria-label="Browse by">
-            <button type="button" onClick={() => navigate('people')}>
-                <UserGroupIcon aria-hidden="true" /><span><b>People</b><small>Everyone Keepsake has found</small></span><ChevronRightIcon aria-hidden="true" className="pt-browse-chev" />
-            </button>
-            <button type="button" onClick={() => navigate('explore')}>
-                <MapPinIcon aria-hidden="true" /><span><b>Places and things</b><small>Browse by where and what</small></span><ChevronRightIcon aria-hidden="true" className="pt-browse-chev" />
-            </button>
-        </nav>
-    );
-};
-
 const PAGE_TITLES: Record<PageId, string> = {
     gallery: 'Photos', ask: 'Search', albums: 'Albums', people: 'People', person: 'People',
     explore: 'Places and things', sharing: 'Library', tools: 'Tools', trash: 'Recently deleted', additional: 'About',
 };
-/** What the phone header calls the page: an open album goes by its own name. */
-const pageTitle = (route: AppRoute, albums: Album[]): string => (
-    route.page === 'albums' && route.params.albumId
-        ? shownAlbum(route, albums)?.name ?? 'Albums'
-        : PAGE_TITLES[route.page] ?? 'Keepsake'
-);
+/** What the phone header calls the page. An open album still says Albums: its cover banner carries the name. */
+const pageTitle = (route: AppRoute): string => PAGE_TITLES[route.page] ?? 'Keepsake';
 
 const Page: React.FC = () => {
     const { route } = useStore();
@@ -142,7 +120,7 @@ const Page: React.FC = () => {
     switch (route.page) {
         case 'ask': return <AskPage />;
         case 'gallery': return <GalleryPage />;
-        case 'albums': return <>{!route.params.albumId && <BrowseLinks />}<AlbumsPage /></>;
+        case 'albums': return <AlbumsPage />;
         case 'people': return <PeoplePage />;
         case 'person': return <PersonDetailPage />;
         case 'explore': return <ExplorePage />;
@@ -155,7 +133,7 @@ const Page: React.FC = () => {
 };
 
 const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: () => void }> = ({ theme, onTheme, onSignOut }) => {
-    const { route, navigate, albums } = useStore();
+    const { route, navigate } = useStore();
     const { requestUpload } = useAppServices();
     const active = activeNavFor(route.page);
     const account = getActiveAccount();
@@ -167,7 +145,7 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
         <header className="ios-header">
             {/* Phones: the page's own title sits in the header row (the page hides its
                 copy). Desktops: the sidebar names the page, and the header holds search. */}
-            <h1 className="pt-header-title">{pageTitle(route, albums)}</h1>
+            <h1 className="pt-header-title">{pageTitle(route)}</h1>
             <button type="button" className="pt-header-search" onClick={() => navigate('ask')}>
                 <MagnifyingGlassIcon aria-hidden="true" /> <span>Search people, places and things</span>
             </button>
@@ -221,7 +199,7 @@ const MobileTabbar: React.FC = () => {
     const { route, navigate, selection, selectMode } = useStore();
     const active = activeMobileNavFor(route.page);
     // While selecting, the selection's action bar takes this bar's place.
-    if (selection.length || (selectMode && route.page === 'gallery')) return null;
+    if (selection.length || (selectMode && (route.page === 'gallery' || route.page === 'albums'))) return null;
     return (
         <nav className="mock-tabbar" aria-label="Primary navigation (mobile)">
             {MOBILE_NAV.map((item) => {

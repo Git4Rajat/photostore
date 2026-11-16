@@ -1,12 +1,13 @@
 import React, { useEffect, useState } from 'react';
 import {
     ArrowLeft as ArrowLeftIcon,
-    RefreshCw as ArrowPathIcon,
     CalendarDays as CalendarDaysIcon,
     Check as CheckIcon,
-    Copy as ClipboardDocumentIcon,
     Clock as ClockIcon,
+    ImagePlus as AddPhotosIcon,
+    Link as LinkIcon,
     MapPin as MapPinIcon,
+    MoreHorizontal as MoreIcon,
     Plus as PlusIcon,
     Share2 as ShareIcon,
     Sparkles as SparklesIcon,
@@ -17,21 +18,17 @@ import {
 import { shownAlbum, useStore } from '../store';
 import PhotoGrid from '../components/PhotoGrid';
 import ScrollSentinel from '../components/ScrollSentinel';
-import { Spinner, SelectionBar } from '../components/bits';
+import { Menu, Spinner, SelectionBar } from '../components/bits';
+import { BrowseLinks } from '../components/BrowseLinks';
+import { ShareAlbumSheet, sharingStatus } from '../components/ShareAlbumSheet';
+import { AddPhotosPicker } from '../components/AddPhotosPicker';
+import { dayHeading } from '../components/PhotoGrid';
 import { plural } from '../../../utils/format';
 import { BottomSheet } from '../components/BottomSheet';
 import { ThumbSizeControl, useTileSize } from '../components/controls';
 import { confirmDialog, promptDialog } from '../../../components/shared/dialogs';
 import { useProtectedBlobUrls } from '../../../services/imageClient';
 import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
-
-const EXPIRY_OPTIONS: { value: string; label: string; days: number }[] = [
-    { value: '1', label: 'In 1 day', days: 1 },
-    { value: '7', label: 'In 7 days', days: 7 },
-    { value: '30', label: 'In 30 days', days: 30 },
-    { value: 'never', label: 'Never', days: 0 },
-];
-const NEW_LINK_EXPIRY_DAYS = 7;
 
 const SMART_ALBUM_RULES: Array<{ id: string; label: string; description: string; Icon: React.ComponentType<React.SVGProps<SVGSVGElement>> }> = [
     { id: 'location', label: 'By location', description: 'Places across the library', Icon: MapPinIcon },
@@ -41,19 +38,12 @@ const SMART_ALBUM_RULES: Array<{ id: string; label: string; description: string;
     { id: 'tag-object', label: 'By tag/object', description: 'AI tags and detected objects', Icon: TagIcon },
 ];
 
-// Must stay at or above the server's MIN_ALBUM_ACCESS_CODE_LENGTH (6), or the share request is rejected.
-const randomCode = () => {
-    const bytes = new Uint8Array(4);
-    crypto.getRandomValues(bytes);
-    return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('').toUpperCase();
-};
-
 /** Albums — list first on mobile, detail view on larger screens. */
 export const AlbumsPage: React.FC = () => {
     const {
         albums, albumsLoading, route, navigate, openAlbum, isAlbumMissing, isAlbumOpenFailed, isAlbumOpenTerminal, albumPhotosById, isAlbumPhotosLoading, loadMoreAlbumPhotos, albumPhotosHasMore,
-        createAlbum, autoCreateAlbum, renameAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum, toast,
-        selectMode: photoSelectMode, setSelectMode: setPhotoSelectMode, fetchAlbums,
+        createAlbum, autoCreateAlbum, renameAlbum, deleteAlbum, deleteAlbums, toast,
+        selectMode: photoSelectMode, setSelectMode: setPhotoSelectMode, fetchAlbums, selection, selectMany, clearSelection,
     } = useStore();
 
     // Loads albums when this tab is actually visited, queued behind whatever
@@ -84,7 +74,9 @@ export const AlbumsPage: React.FC = () => {
     // no-selection case (plain "Albums" tab) falls back to the first album
     // for the desktop preview pane.
     const explicitAlbumId = route.params.albumId;
-    const album = shownAlbum(route, albums);
+    // The bare tab shows cards; the first album only stands in so the page has
+    // something to bind its sheets to. Its photos are not loaded.
+    const album = shownAlbum(route, albums) ?? (explicitAlbumId ? undefined : albums[0]);
     const explicitAlbumMissing = explicitAlbumId ? isAlbumMissing(explicitAlbumId) : false;
     // A transient (network/5xx) failure is distinct from both "still
     // resolving" and a confirmed 404: it must present a retry action rather
@@ -95,10 +87,8 @@ export const AlbumsPage: React.FC = () => {
     const albumResolving = Boolean(explicitAlbumId) && !album && !explicitAlbumMissing && !explicitAlbumFailed && !albumOpenTerminal;
     const albumMissing = Boolean(explicitAlbumId) && !album && explicitAlbumMissing;
     const albumOpenFailed = Boolean(explicitAlbumId) && !album && explicitAlbumFailed;
-    const [copied, setCopied] = useState(false);
-    // The expiry picked in the dropdown until the server confirms it; the
-    // dropdown otherwise shows the album's own expiry.
-    const [pendingExpiry, setPendingExpiry] = useState<{ albumId: string; value: string } | null>(null);
+    const [shareOpen, setShareOpen] = useState(false);
+    const [pickerOpen, setPickerOpen] = useState(false);
     const covers = useProtectedBlobUrls(albums.map((a) => a.coverThumbnailUrl).filter((u): u is string => Boolean(u)));
     // The backend never returns an album's access code back (it's a stored
     // secret), so remember codes we generate this session to show the owner.
@@ -122,12 +112,12 @@ export const AlbumsPage: React.FC = () => {
     // queue it behind fetchAlbums rather than firing in parallel with it, so
     // landing on the tab doesn't pay for two uncoordinated requests every time.
     useEffect(() => {
-        if (!album?.id || albumPhotosById(album.id)) return;
+        if (!showDetail || !album?.id || albumPhotosById(album.id)) return;
         const controller = new AbortController();
         void enqueueBackgroundRequest(async () => { await openAlbum(album.id); }, { signal: controller.signal }).catch(() => {});
         return () => controller.abort();
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [album?.id]);
+    }, [album?.id, showDetail]);
 
     const toggleAlbumSelect = (id: string) => {
         setSelectedAlbumIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
@@ -285,69 +275,19 @@ export const AlbumsPage: React.FC = () => {
         );
     }
 
-    const url = album.publicUrl ?? '';
-    const copy = () => {
-        if (!url) return;
-        setCopied(true);
-        window.setTimeout(() => setCopied(false), 1400);
-        void navigator.clipboard?.writeText(url).catch(() => {});
-    };
-    // Both directions ask first: turning sharing on publishes the album to
-    // anyone holding the link, and turning it off breaks that link for them.
-    const togglePublic = async () => {
-        const { id, name } = album;
-        if (album.isPublic) {
-            const ok = await confirmDialog({
-                title: `Stop sharing “${name}”?`,
-                message: 'Anyone with the link loses access straight away.',
-                confirmLabel: 'Stop sharing',
-                danger: true,
-            });
-            if (ok) void revokeAlbum(id);
-            return;
-        }
-        const days = NEW_LINK_EXPIRY_DAYS;
-        const ok = await confirmDialog({
-            title: `Share “${name}”?`,
-            message: `Anyone with the link can see the photos in this album. ${days ? `The link expires in ${plural(days, 'day')}.` : 'The link doesn’t expire.'}`,
-            confirmLabel: 'Create link',
-        });
-        if (ok) void shareAlbum(id, { expiresInDays: days });
-    };
-    const expiryValue = pendingExpiry?.albumId === album.id
-        ? pendingExpiry.value
-        : (album.publicExpiresAt ? 'current' : 'never');
-    // Leaves the access code alone: the store only clears it when asked.
-    const changeExpiry = (value: string) => {
-        const option = EXPIRY_OPTIONS.find((o) => o.value === value);
-        if (!option) return;
-        const { id } = album;
-        setPendingExpiry({ albumId: id, value });
-        void shareAlbum(id, { expiresInDays: option.days }).finally(() => {
-            setPendingExpiry((prev) => (prev?.albumId === id && prev.value === value ? null : prev));
-        });
-    };
-    // The only way to drop a code while keeping the link, so it asks first:
-    // afterwards the link alone opens the album.
-    const removeAccessCode = async () => {
-        const { id, name } = album;
-        const ok = await confirmDialog({
-            title: `Remove the access code from “${name}”?`,
-            message: 'Anyone with the link will be able to see the photos without a code.',
-            confirmLabel: 'Remove code',
-            danger: true,
-        });
-        if (!ok) return;
-        if (await shareAlbum(id, { clearAccessCode: true })) {
-            setCodes((prev) => {
-                const next = { ...prev };
-                delete next[id];
-                return next;
-            });
-        }
-    };
-
     const activePhotos = albumPhotosById(album.id);
+    const setCode = (albumId: string, code: string | null) => setCodes((prev) => {
+        const next = { ...prev };
+        if (code) next[albumId] = code; else delete next[albumId];
+        return next;
+    });
+    const status = sharingStatus(album);
+    // The span of days the album covers, once all of it is loaded (listing is newest first).
+    const dated = (activePhotos ?? []).filter((p) => p.captureDate);
+    const span = dated.length && !albumPhotosHasMore(album.id)
+        ? [dayHeading(dated[dated.length - 1]), dayHeading(dated[0])].filter((d, i, all) => all.indexOf(d) === i).join(' – ')
+        : '';
+    const cover = album.coverThumbnailUrl ? covers[album.coverThumbnailUrl] : undefined;
 
     // Split into the scrollable row list and a footer that stays outside the
     // scrolling container -- the sidebar/mobile list wrappers clip overflow
@@ -392,7 +332,7 @@ export const AlbumsPage: React.FC = () => {
                         )}
                         <span className="pt-album-row-meta">
                             <b>{a.name}</b>
-                            <span>{plural(a.photoCount, 'photo')}</span>
+                            <span>{plural(a.photoCount, 'item')}{a.isPublic ? ' · Shared' : ''}</span>
                         </span>
                     </button>
                 );
@@ -413,10 +353,53 @@ export const AlbumsPage: React.FC = () => {
 
     return (
         <div className="pt-albums-wrapper">
-            {/* Mobile list view */}
+            {/* Mobile list view: your albums as cover cards, then the ways in to
+                People and Places, then the less common ways to make an album. */}
             <div className={`pt-albums-mobile-list${showDetail ? ' hidden' : ''}`}>
-                <div className="pt-album-list-scroll">{albumListRows}</div>
-                {albumListFooter}
+                <div className="pt-toolbar pt-albums-head">
+                    <h1 className="pt-page-title">Albums</h1>
+                    <div className="pt-toolbar-actions">
+                        {albums.length > 0 && (
+                            <button type="button" className="pt-linkish" onClick={() => (selectMode ? exitSelectMode() : setSelectMode(true))}>
+                                {selectMode ? 'Cancel' : 'Select'}
+                            </button>
+                        )}
+                        {!selectMode && (
+                            <button type="button" className="btn btn-sm" onClick={() => void handleCreate(true)}>
+                                <PlusIcon className="toolbar-icon" /> New album
+                            </button>
+                        )}
+                    </div>
+                </div>
+                <div className="pt-album-cards">
+                    {albums.map((a) => {
+                        const checked = selectedAlbumIds.includes(a.id);
+                        const src = a.coverThumbnailUrl ? covers[a.coverThumbnailUrl] : undefined;
+                        return (
+                            <button
+                                key={a.id}
+                                type="button"
+                                className={`pt-album-card${checked ? ' selected' : ''}`}
+                                aria-pressed={selectMode ? checked : undefined}
+                                onClick={() => (selectMode ? toggleAlbumSelect(a.id) : navigate('albums', { albumId: a.id }))}
+                            >
+                                <span className="pt-album-card-cover">
+                                    {src ? <img src={src} alt="" /> : null}
+                                    {selectMode && <span className={`pt-album-row-check${checked ? ' on' : ''}`} aria-hidden="true"><CheckIcon /></span>}
+                                </span>
+                                <b>{a.name}</b>
+                                <span>{a.isPublic && <LinkIcon aria-label="Shared" />}{plural(a.photoCount, 'item')}{a.isPublic ? ' · Shared' : ''}</span>
+                            </button>
+                        );
+                    })}
+                </div>
+                <h2 className="pt-section-label">People and places</h2>
+                <BrowseLinks />
+                {!selectMode && (
+                    <button type="button" className="albm-newbtn" onClick={() => setSmartSheetOpen(true)} disabled={smartCreatingRule !== null}>
+                        <SparklesIcon /> {smartCreatingRule ? 'Creating…' : 'Make a smart album'}
+                    </button>
+                )}
             </div>
 
             {/* Desktop sidebar + mobile detail view */}
@@ -431,6 +414,7 @@ export const AlbumsPage: React.FC = () => {
                         <ArrowLeftIcon /> Back
                     </button>
                 )}
+                {!showDetail && <div className="pt-albums-browse-desktop"><BrowseLinks /></div>}
                 <div className={`pt-albums${showDetail ? ' show-detail' : ''}`}>
                     <aside className="pt-album-sidebar">
                         <div className="pt-album-list-scroll">{albumListRows}</div>
@@ -438,86 +422,60 @@ export const AlbumsPage: React.FC = () => {
                     </aside>
 
                     <section className="pt-album-detail">
-                        <div className="pt-album-detail-head">
-                            <div>
-                                <h1 className="pt-page-title">{album.name}</h1>
-                                <p className="pt-page-sub">
-                                    {plural(album.photoCount, 'photo')} ·{' '}
-                                    <button type="button" className="pt-linkish" onClick={() => void renameAlbumPrompt()}>Rename</button>
-                                    {' · '}
-                                    <button type="button" className="pt-linkish danger" onClick={() => void confirmDeleteAlbum()}>Delete</button>
-                                </p>
+                        <div className={`pt-album-hero${cover ? '' : ' no-cover'}`}>
+                            {cover && <img src={cover} alt="" />}
+                            <div className="pt-album-hero-text">
+                                <h1 className="pt-album-hero-name">{album.name}</h1>
+                                <p>{plural(album.photoCount, 'item')}{span ? ` · ${span}` : ''}</p>
                             </div>
-                            <button type="button" className="btn btn-primary" onClick={() => void togglePublic()}>
-                                <ShareIcon className="toolbar-icon" /> <span>{album.isPublic ? 'Sharing on' : 'Share'}</span>
-                            </button>
                         </div>
-
-                        {album.isPublic && (
-                            <div className="pt-share-section">
-                                <div className="pt-menu-label">Sharing</div>
-                                <div className="share-sheet">
-                                    <div className="share-row">
-                                        <span className="lbl"><b>Link expires</b></span>
-                                        <select className="field field-select" value={expiryValue} onChange={(e) => changeExpiry(e.target.value)}>
-                                            {album.publicExpiresAt && (
-                                                <option value="current">On {new Date(album.publicExpiresAt).toLocaleDateString()}</option>
-                                            )}
-                                            {EXPIRY_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-                                        </select>
-                                    </div>
-                                    {url && (
-                                        <div className="share-row">
-                                            <span className="share-url">{url}</span>
-                                            <button type="button" className="btn" onClick={copy}><ClipboardDocumentIcon className="toolbar-icon" />{copied ? 'Copied' : 'Copy'}</button>
-                                        </div>
-                                    )}
-                                    <div className="share-row">
-                                        <span className="lbl">
-                                            <b>Access code</b>
-                                            {codes[album.id]
-                                                ? <span>Share this code with viewers: <code className="pt-access-code">{codes[album.id]}</code></span>
-                                                : <span>{album.hasAccessCode ? 'Protected — generate a new code to reveal one' : 'Add a code to protect the link'}</span>}
-                                        </span>
-                                        <span style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
-                                            {(album.hasAccessCode || codes[album.id]) && (
-                                                <button type="button" className="pt-linkish danger" onClick={() => void removeAccessCode()}>Remove code</button>
-                                            )}
-                                            <button type="button" className="btn" onClick={() => {
-                                                const { id } = album;
-                                                const code = randomCode();
-                                                // Shown inline only, once the server has it -- never in a
-                                                // toast, which the notification history keeps.
-                                                void shareAlbum(id, { accessCode: code }).then((ok) => {
-                                                    if (ok) setCodes((prev) => ({ ...prev, [id]: code }));
-                                                });
-                                            }}>
-                                                <ArrowPathIcon className="toolbar-icon" /> New code
-                                            </button>
-                                        </span>
-                                    </div>
-                                </div>
+                        {photoSelectMode ? (
+                            <div className="pt-select-head" role="toolbar" aria-label="Selection">
+                                <button type="button" className="pt-linkish" onClick={() => { clearSelection(); setPhotoSelectMode(false); }}>Cancel</button>
+                                <b aria-live="polite">{selection.length ? `${selection.length} selected` : 'Select items'}</b>
+                                <button type="button" className="pt-linkish" onClick={() => selectMany((activePhotos ?? []).map((p) => p.id))}>Select all</button>
                             </div>
+                        ) : (
+                        <div className="pt-album-actions">
+                            <button type="button" className="btn btn-sm" onClick={() => setPickerOpen(true)}>
+                                <AddPhotosIcon className="toolbar-icon" /> Add photos
+                            </button>
+                            <button type="button" className={`btn btn-sm${album.isPublic ? '' : ' btn-primary'}`} onClick={() => setShareOpen(true)}>
+                                <ShareIcon className="toolbar-icon" /> Share
+                            </button>
+                            {status && <span className="pt-album-status inline"><LinkIcon aria-hidden="true" />{status}</span>}
+                            <span className="pt-album-actions-spacer" />
+                            {activePhotos && activePhotos.length > 0 && (
+                                <button type="button" className="pt-linkish" onClick={() => setPhotoSelectMode(!photoSelectMode)}>
+                                    {photoSelectMode ? 'Done' : 'Select'}
+                                </button>
+                            )}
+                            <Menu
+                                align="right"
+                                renderTrigger={(toggle) => (
+                                    <button type="button" className="btn btn-icon btn-sm" aria-label="Album options" onClick={toggle}><MoreIcon /></button>
+                                )}
+                            >
+                                {(close) => (
+                                    <div className="pt-more-menu">
+                                        <button type="button" onClick={() => { close(); void renameAlbumPrompt(); }}>Rename album</button>
+                                        <button type="button" className="danger" onClick={() => { close(); void confirmDeleteAlbum(); }}>Delete album</button>
+                                    </div>
+                                )}
+                            </Menu>
+                        </div>
                         )}
+                        {status && !photoSelectMode && <p className="pt-album-status stacked"><LinkIcon aria-hidden="true" />{status}</p>}
 
                         <div className="pt-album-photos-head">
-                            <div className="pt-menu-label" style={{ margin: 0 }}>Photos</div>
-                            <div className="pt-album-photos-actions">
-                                <ThumbSizeControl value={albumTile} onChange={setAlbumTile} />
-                                {activePhotos && activePhotos.length > 0 && (
-                                    <button type="button" className="pt-linkish" onClick={() => setPhotoSelectMode(!photoSelectMode)}>
-                                        {photoSelectMode ? 'Done' : 'Select'}
-                                    </button>
-                                )}
-                                <button type="button" className="pt-linkish" onClick={() => { navigate('gallery'); toast('Select photos, then use “Add to album”'); }}><PlusIcon className="toolbar-icon" /> Add photos</button>
-                            </div>
+                            <ThumbSizeControl value={albumTile} onChange={setAlbumTile} />
                         </div>
                         {/* Before the fetch starts the cache is empty and nothing is flagged loading yet; an album that has photos must not flash "No photos yet" in that gap. */}
                         {activePhotos === undefined && (isAlbumPhotosLoading(album.id) || (album.photoCount > 0 && !isAlbumOpenFailed(album.id))) ? (
                             <Spinner label="Loading photos…" center={false} />
                         ) : (
                             <div style={{ ['--pt-tile-min' as string]: `${albumTile}px` } as React.CSSProperties}>
-                                <PhotoGrid photos={activePhotos ?? []} emptyHint="No photos yet — add some from the gallery." />
+                                <PhotoGrid photos={activePhotos ?? []} emptyHint="No photos yet. Use Add photos to pick some from your library." />
                                 {albumPhotosHasMore(album.id) && <ScrollSentinel onVisible={() => loadMoreAlbumPhotos(album.id)} deps={activePhotos?.length ?? 0} />}
                             </div>
                         )}
@@ -539,6 +497,8 @@ export const AlbumsPage: React.FC = () => {
             )}
 
             {smartAlbumSheet}
+            <ShareAlbumSheet album={album} open={shareOpen} onClose={() => setShareOpen(false)} codes={codes} onCode={setCode} />
+            <AddPhotosPicker album={album} open={pickerOpen} onClose={() => setPickerOpen(false)} />
         </div>
     );
 };
