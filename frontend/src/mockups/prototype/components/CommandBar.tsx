@@ -28,7 +28,8 @@ const CommandBar: React.FC = () => {
     // first album without putting its id in the URL.
     const openAlbumId = shownAlbum(route, albums)?.id;
     const [albumOpen, setAlbumOpen] = useState(false);
-    const inGallerySelect = route.page === 'gallery' && selectMode;
+    // Photos and an open album show Cancel and the count in their own header.
+    const inGallerySelect = selectMode && (route.page === 'gallery' || (route.page === 'albums' && Boolean(openAlbumId)));
     if (!selection.length && !inGallerySelect) return null;
     const none = selection.length === 0;
 
@@ -48,6 +49,13 @@ const CommandBar: React.FC = () => {
             {!inGallerySelect && (
                 <button type="button" className="pt-ab-btn pt-ab-count" onClick={() => { clearSelection(); setSelectMode(false); }} aria-label="Clear selection">
                     <XMarkIcon /> <span>{selection.length} selected</span>
+                </button>
+            )}
+            {/* Inside an album the first action takes photos out of it and
+                nothing more; they stay in the library. */}
+            {openAlbumId && (
+                <button type="button" className="pt-ab-btn accent" disabled={none} onClick={() => removePhotosFromAlbum(openAlbumId, selection)}>
+                    <MinusCircleIcon /> <span>Remove</span>
                 </button>
             )}
             <button type="button" className="pt-ab-btn" disabled={none} onClick={() => setAlbumOpen(true)}>
@@ -70,11 +78,6 @@ const CommandBar: React.FC = () => {
                             <span><StarIcon /> Rate</span>
                             <Stars value={0} onRate={(n) => { ratePhotos(selection, n); toast(`Rated ${selection.length} · ${n}★`); close(); clearSelection(); }} size={24} />
                         </div>
-                        {openAlbumId && (
-                            <button type="button" className="pt-fm-item" onClick={() => { removePhotosFromAlbum(openAlbumId, selection); close(); }}>
-                                <MinusCircleIcon /> Remove from album
-                            </button>
-                        )}
                         <button type="button" className="pt-fm-item" onClick={() => { navigate('tools', { filenames: selection.slice(0, 50).join(',') }); close(); }}>
                             <WrenchScrewdriverIcon /> Open in Workbench
                         </button>

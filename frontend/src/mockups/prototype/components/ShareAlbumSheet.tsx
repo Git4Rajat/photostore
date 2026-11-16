@@ -3,6 +3,7 @@ import { Copy as CopyIcon, Link as LinkIcon, Lock as LockIcon, RefreshCw as Refr
 import { BottomSheet } from './BottomSheet';
 import { useStore } from '../store';
 import { plural } from '../../../utils/format';
+import { confirmDialog } from '../../../components/shared/dialogs';
 import type { Album } from '../types';
 
 const EXPIRY_OPTIONS: { label: string; days: number }[] = [
@@ -74,9 +75,16 @@ export const ShareAlbumSheet: React.FC<{
         if (on) {
             const next = randomCode();
             if (await shareAlbum(id, { accessCode: next })) onCode(id, next);
-        } else if (await shareAlbum(id, { clearAccessCode: true })) {
-            onCode(id, null);
+            return;
         }
+        // Dropping the code opens the album to anyone with the link, so it asks first.
+        const ok = await confirmDialog({
+            title: `Remove the access code from “${album.name}”?`,
+            message: 'Anyone with the link will be able to see the photos without a code.',
+            confirmLabel: 'Remove code',
+            danger: true,
+        });
+        if (ok && await shareAlbum(id, { clearAccessCode: true })) onCode(id, null);
     });
     const newCode = () => void run(async () => {
         const next = randomCode();
@@ -89,6 +97,11 @@ export const ShareAlbumSheet: React.FC<{
         window.setTimeout(() => setCopied(false), 1400);
     };
     const expiresOn = album.publicExpiresAt ? new Date(album.publicExpiresAt) : null;
+    // Highlight the option the link was set with: the one nearest its days left.
+    const daysLeft = expiresOn ? (expiresOn.getTime() - Date.now()) / 86_400_000 : 0;
+    const activeDays = pickedDays ?? (expiresOn
+        ? EXPIRY_OPTIONS.filter((o) => o.days > 0).reduce((best, o) => (Math.abs(o.days - daysLeft) < Math.abs(best - daysLeft) ? o.days : best), 1)
+        : 0);
     const codeOn = Boolean(album.hasAccessCode || code);
 
     return (
@@ -115,7 +128,7 @@ export const ShareAlbumSheet: React.FC<{
                             <span className="pt-share-label">Link expires</span>
                             <div className="mock-seg" role="group" aria-label="Link expires">
                                 {EXPIRY_OPTIONS.map((o) => (
-                                    <button key={o.label} type="button" disabled={busy} className={pickedDays === o.days ? 'active' : undefined} onClick={() => pickExpiry(o.days)}>
+                                    <button key={o.label} type="button" disabled={busy} className={activeDays === o.days ? 'active' : undefined} aria-pressed={activeDays === o.days} onClick={() => pickExpiry(o.days)}>
                                         {o.label}
                                     </button>
                                 ))}

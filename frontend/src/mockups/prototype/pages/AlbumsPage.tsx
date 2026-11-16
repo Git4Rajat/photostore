@@ -43,7 +43,7 @@ export const AlbumsPage: React.FC = () => {
     const {
         albums, albumsLoading, route, navigate, openAlbum, isAlbumMissing, isAlbumOpenFailed, isAlbumOpenTerminal, albumPhotosById, isAlbumPhotosLoading, loadMoreAlbumPhotos, albumPhotosHasMore,
         createAlbum, autoCreateAlbum, renameAlbum, deleteAlbum, deleteAlbums, toast,
-        selectMode: photoSelectMode, setSelectMode: setPhotoSelectMode, fetchAlbums,
+        selectMode: photoSelectMode, setSelectMode: setPhotoSelectMode, fetchAlbums, selection, selectMany, clearSelection,
     } = useStore();
 
     // Loads albums when this tab is actually visited, queued behind whatever
@@ -74,7 +74,9 @@ export const AlbumsPage: React.FC = () => {
     // no-selection case (plain "Albums" tab) falls back to the first album
     // for the desktop preview pane.
     const explicitAlbumId = route.params.albumId;
-    const album = shownAlbum(route, albums);
+    // The bare tab shows cards; the first album only stands in so the page has
+    // something to bind its sheets to. Its photos are not loaded.
+    const album = shownAlbum(route, albums) ?? (explicitAlbumId ? undefined : albums[0]);
     const explicitAlbumMissing = explicitAlbumId ? isAlbumMissing(explicitAlbumId) : false;
     // A transient (network/5xx) failure is distinct from both "still
     // resolving" and a confirmed 404: it must present a retry action rather
@@ -110,12 +112,12 @@ export const AlbumsPage: React.FC = () => {
     // queue it behind fetchAlbums rather than firing in parallel with it, so
     // landing on the tab doesn't pay for two uncoordinated requests every time.
     useEffect(() => {
-        if (!album?.id || albumPhotosById(album.id)) return;
+        if (!showDetail || !album?.id || albumPhotosById(album.id)) return;
         const controller = new AbortController();
         void enqueueBackgroundRequest(async () => { await openAlbum(album.id); }, { signal: controller.signal }).catch(() => {});
         return () => controller.abort();
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [album?.id]);
+    }, [album?.id, showDetail]);
 
     const toggleAlbumSelect = (id: string) => {
         setSelectedAlbumIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
@@ -391,6 +393,7 @@ export const AlbumsPage: React.FC = () => {
                         );
                     })}
                 </div>
+                <h2 className="pt-section-label">People and places</h2>
                 <BrowseLinks />
                 {!selectMode && (
                     <button type="button" className="albm-newbtn" onClick={() => setSmartSheetOpen(true)} disabled={smartCreatingRule !== null}>
@@ -422,10 +425,17 @@ export const AlbumsPage: React.FC = () => {
                         <div className={`pt-album-hero${cover ? '' : ' no-cover'}`}>
                             {cover && <img src={cover} alt="" />}
                             <div className="pt-album-hero-text">
-                                <h1 className="pt-page-title">{album.name}</h1>
+                                <h1 className="pt-album-hero-name">{album.name}</h1>
                                 <p>{plural(album.photoCount, 'item')}{span ? ` · ${span}` : ''}</p>
                             </div>
                         </div>
+                        {photoSelectMode ? (
+                            <div className="pt-select-head" role="toolbar" aria-label="Selection">
+                                <button type="button" className="pt-linkish" onClick={() => { clearSelection(); setPhotoSelectMode(false); }}>Cancel</button>
+                                <b aria-live="polite">{selection.length ? `${selection.length} selected` : 'Select items'}</b>
+                                <button type="button" className="pt-linkish" onClick={() => selectMany((activePhotos ?? []).map((p) => p.id))}>Select all</button>
+                            </div>
+                        ) : (
                         <div className="pt-album-actions">
                             <button type="button" className="btn btn-sm" onClick={() => setPickerOpen(true)}>
                                 <AddPhotosIcon className="toolbar-icon" /> Add photos
@@ -454,7 +464,8 @@ export const AlbumsPage: React.FC = () => {
                                 )}
                             </Menu>
                         </div>
-                        {status && <p className="pt-album-status stacked"><LinkIcon aria-hidden="true" />{status}</p>}
+                        )}
+                        {status && !photoSelectMode && <p className="pt-album-status stacked"><LinkIcon aria-hidden="true" />{status}</p>}
 
                         <div className="pt-album-photos-head">
                             <ThumbSizeControl value={albumTile} onChange={setAlbumTile} />

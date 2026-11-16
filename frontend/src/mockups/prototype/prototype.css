@@ -384,7 +384,8 @@
 
 /* Album list on phones: a title row, then two-up cover cards. */
 .pt-albums-head { margin-bottom: 12px; align-items: center !important; flex-direction: row !important; }
-.pt-albums-head .pt-toolbar-actions { width: auto !important; }
+.pt-albums-head .pt-toolbar-actions { width: auto !important; margin-left: auto; }
+.pt-section-label { margin: 0 0 8px; font: 700 0.95rem/1.2 var(--font-ui); color: var(--text); }
 .pt-album-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 10px; margin-bottom: 20px; }
 .pt-album-card { appearance: none; border: 0; background: none; padding: 0; color: var(--text); font: inherit; text-align: left; cursor: pointer; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .pt-album-card-cover { position: relative; aspect-ratio: 1; border-radius: var(--r-md); overflow: hidden; background: var(--lg-edge); margin-bottom: 6px; }
@@ -402,7 +403,7 @@
 .pt-album-hero.no-cover::after { display: none; }
 .pt-album-hero-text { position: relative; z-index: 1; padding: 14px 16px; color: #fff; min-width: 0; }
 .pt-album-hero.no-cover .pt-album-hero-text { color: var(--text); }
-.pt-album-hero-text .pt-page-title { color: inherit; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pt-album-hero-name { color: inherit; margin: 0; font: 600 28px/1.1 var(--font-display); letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pt-album-hero-text p { margin: 2px 0 0; font-size: 0.82rem; opacity: 0.85; }
 .pt-album-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
 .pt-album-actions-spacer { flex: 1; }
@@ -412,6 +413,7 @@
 @media (max-width: 620px) {
   .pt-album-hero { height: 190px; margin: -8px -8px 12px; border-radius: 0; }
   .pt-album-status.inline { display: none; }
+  .pt-album-photos-head { display: none; }
   .pt-album-status.stacked { display: flex; }
 }
 .pt-more-menu button.danger { color: var(--danger); }
@@ -433,6 +435,7 @@
 .pt-share-text b { font-size: 0.92rem; }
 .pt-share-text small { font-size: 0.8rem; color: var(--muted); }
 .pt-share-url { display: flex; gap: 8px; align-items: center; }
+.pt-share-url .btn { gap: 6px; flex: none; }
 .pt-share-expiry { display: flex; flex-direction: column; gap: 6px; }
 .pt-share-expiry .mock-seg { display: flex; }
 .pt-share-expiry .mock-seg button { flex: 1; }
@@ -648,6 +651,7 @@
 .pt-ab-btn:disabled { opacity: 0.4; cursor: default; }
 .pt-ab-btn.on { color: var(--like); }
 .pt-ab-btn.danger { color: var(--danger); }
+.pt-ab-btn.accent { color: var(--accent); }
 .pt-ab-count { color: var(--muted); }
 .pt-action-bar .pt-menu-anchor { display: flex; }
 .pt-action-bar .pt-menu-panel { top: auto; bottom: calc(100% + 10px); }
@@ -1087,3 +1091,17 @@
 /* Chips as the mock-up draws them: flat fills, no outline. */
 .pt-shell .chip { border: 0; background: var(--lg-surface-wash); }
 .pt-shell .chip[aria-pressed='true'] { background: var(--text); color: var(--bg-1); }
+
+/* Albums, every width: cover cards when no album is open, the album full
+   width when one is. The app sidebar already lists albums on desktops. */
+.pt-albums-mobile-list { display: flex; padding: 0; }
+.pt-albums-mobile-list.hidden { display: none !important; }
+.pt-albums { grid-template-columns: minmax(0, 1fr); }
+.pt-album-sidebar { display: none !important; }
+.pt-albums-browse-desktop { display: none; }
+.pt-album-detail { display: none; max-height: none; overflow: visible; padding: 0; }
+.pt-albums.show-detail .pt-album-detail { display: block; }
+.pt-album-cards { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+@container (max-width: 805px) {
+  .pt-album-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
