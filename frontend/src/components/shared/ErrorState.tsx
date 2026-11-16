@@ -1,5 +1,5 @@
 import React from 'react';
-import { ExclamationTriangleIcon } from '@heroicons/react/24/outline';
+import { TriangleAlert as ExclamationTriangleIcon } from 'lucide-react';
 
 interface ErrorStateProps {
     title?: string;

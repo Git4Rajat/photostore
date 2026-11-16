@@ -23,6 +23,7 @@ import PhotoGrid from './components/PhotoGrid';
 import type { Photo } from './types';
 
 vi.mock('./store', () => ({
+    isVideoFilename: (name: string) => /\.(mov|mp4)$/i.test(name),
     useStore: () => ({
         selection: [], toggleSelect: vi.fn(), selectMany: vi.fn(), openViewer: vi.fn(),
         selectMode: false, setSelectMode: vi.fn(),

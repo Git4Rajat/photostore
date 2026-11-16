@@ -8,6 +8,19 @@ export const TILE_STEP = 30;
 export const TILE_RANGE = { min: 72, max: 260 };
 const TILE_DEFAULT = 120;
 
+/** The Gallery's tile size: stored under its own key, defaulting to four
+ *  across on a phone (page padding, three 2px gaps) and ~8 on a desktop. */
+// Kept apart for narrow and wide screens, so a size picked on a desktop
+// window never turns a phone into two photos across.
+export const galleryTileKey = (): string => {
+    const width = typeof window === 'undefined' ? 1024 : window.innerWidth;
+    return `photostore.galleryTileSize.v2.${width < 700 ? 'phone' : 'wide'}`;
+};
+export const defaultGalleryTile = (min: number): number => {
+    const width = typeof window === 'undefined' ? 1024 : window.innerWidth;
+    return width < 700 ? Math.max(min, Math.floor((width - 46) / 4)) : 140;
+};
+
 // Per-view size bounds. Photo grids share the default range; the Workbench
 // tiles carry a step-badge footer, so they use a larger floor/ceiling.
 export interface TileSizeOptions { min?: number; max?: number; default?: number; step?: number }

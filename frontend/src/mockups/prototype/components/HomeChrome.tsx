@@ -1,16 +1,13 @@
 import React from 'react';
-import { Plus as PlusIcon } from 'lucide-react';
-import { LogoLockup } from '../../../components/shared/Logo';
+import { CloudUpload as UploadIcon } from 'lucide-react';
 
 /** Primary navigation, shared by the live header and the read-only home previews. */
 export const NAV_ITEMS = [
-    { id: 'ask', label: 'Ask' },
-    { id: 'gallery', label: 'Gallery' },
+    { id: 'gallery', label: 'Photos' },
+    { id: 'ask', label: 'Search' },
     { id: 'albums', label: 'Albums' },
     { id: 'people', label: 'People' },
     { id: 'explore', label: 'Explore' },
-    { id: 'tools', label: 'Tools' },
-    { id: 'sharing', label: 'Sharing' },
 ] as const;
 
 /**
@@ -23,21 +20,21 @@ export const HomeChrome: React.FC<{ subtitle: string; tileMin?: number; children
             <div className="mock-viewport">
                 <div className="mock-app">
                     <header className="ios-header">
-                        <span className="pt-wordmark-btn"><LogoLockup size={30} className="ios-header-wordmark" /></span>
+                        <h1 className="pt-header-title">Photos</h1>
                         <nav className="ios-tabs" aria-label="Primary navigation">
                             {NAV_ITEMS.map((item) => (
                                 <span key={item.id} className={`ios-tab${item.id === 'gallery' ? ' active' : ''}`}>{item.label}</span>
                             ))}
                         </nav>
                         <div className="app-header-actions" aria-hidden="true">
-                            <span className="btn mock-cta pt-upload-btn"><PlusIcon className="toolbar-icon" /> <span className="pt-upload-label">Upload</span></span>
+                            <span className="btn btn-primary pt-upload-btn"><UploadIcon className="toolbar-icon" /> <span className="pt-upload-label">Upload</span></span>
                             <span className="mock-avatar pt-avatar-btn" />
                         </div>
                     </header>
                     <div className="mock-body pt-body" aria-busy="true">
                         <div className="pt-toolbar">
                             <div>
-                                <h1 className="pt-page-title">Gallery</h1>
+                                <h1 className="pt-page-title">Photos</h1>
                                 <p className="pt-page-sub" role="status">{subtitle}</p>
                             </div>
                         </div>

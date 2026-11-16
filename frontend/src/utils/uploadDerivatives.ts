@@ -55,42 +55,6 @@ export async function generateUploadThumbnail(source: Source): Promise<UploadDer
     return result;
 }
 
-// Draws a small play icon (translucent disc, white triangle) in the centre of a thumbnail-sized frame so
-// video tiles are recognisable everywhere the thumbnail is shown. Returns a canvas for generateUploadThumbnail;
-// a stamp failure falls back to the plain frame rather than failing the upload.
-export function stampVideoThumbnail(source: Source): Source {
-    try {
-        const {width, height} = uploadDerivativeSize(source.width, source.height, UPLOAD_THUMBNAIL_MAX_EDGE);
-        const canvas = new OffscreenCanvas(width, height);
-        const context = canvas.getContext('2d') as OffscreenCanvasRenderingContext2D | null;
-        if (!context) return source;
-        context.imageSmoothingEnabled = true;
-        context.imageSmoothingQuality = 'high';
-        context.drawImage(source, 0, 0, width, height);
-        const radius = Math.max(6, Math.round(Math.min(width, height) * 0.18));
-        const cx = width / 2;
-        const cy = height / 2;
-        context.fillStyle = 'rgba(0, 0, 0, 0.45)';
-        context.beginPath();
-        context.arc(cx, cy, radius, 0, Math.PI * 2);
-        context.closePath();
-        context.fill();
-        // Triangle nudged right so its visual centre sits in the disc.
-        const half = radius * 0.45;
-        const left = cx - half * 0.6;
-        context.fillStyle = 'rgba(255, 255, 255, 0.95)';
-        context.beginPath();
-        context.moveTo(left, cy - half);
-        context.lineTo(left + half * 1.6, cy);
-        context.lineTo(left, cy + half);
-        context.closePath();
-        context.fill();
-        return canvas;
-    } catch {
-        return source;
-    }
-}
-
 // Call only after native decoding; dimensions must match that decoded image.
 export async function eligibleUploadJpeg(source: Blob, width: number, height: number): Promise<boolean> {
     if (![width, height].every(value => Number.isInteger(value) && value > 0)

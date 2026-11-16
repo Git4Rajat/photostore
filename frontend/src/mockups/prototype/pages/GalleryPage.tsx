@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { CalendarSearch as CalendarSearchIcon, ChevronDown as ChevronDownIcon, Heart as HeartIcon, SlidersHorizontal as FilterIcon, Star as StarIcon, Upload as ArrowUpTrayIcon, ZoomOut as MagnifyingGlassMinusIcon, ZoomIn as MagnifyingGlassPlusIcon, Image as PhotoIcon, UserPlus as UserPlusIcon } from 'lucide-react';
+import { CalendarSearch as CalendarSearchIcon, ChevronDown as ChevronDownIcon, Heart as HeartIcon, SlidersHorizontal as FilterIcon, Star as StarIcon, Upload as ArrowUpTrayIcon, Grid2x2 as LargePhotosIcon, Grid3x3 as SmallPhotosIcon, Image as PhotoIcon, UserPlus as UserPlusIcon } from 'lucide-react';
 import { useStore, isVideoFilename } from '../store';
 import type { CaptureRange, MediaFilter } from '../store';
 import { useAppServices } from '../../../components/AppServicesProvider';
@@ -8,7 +8,7 @@ import { invalidateLocalSortIndex } from '../../../services/localSortIndex';
 import PhotoGrid from '../components/PhotoGrid';
 import TimelineBrowser from '../components/TimelineBrowser';
 import { Menu, Spinner } from '../components/bits';
-import { useTileSize, TILE_RANGE, TILE_STEP } from '../components/controls';
+import { useTileSize, TILE_RANGE, TILE_STEP, galleryTileKey, defaultGalleryTile } from '../components/controls';
 
 const MEDIA_FILTERS: { value: MediaFilter; label: string }[] = [
     { value: 'all', label: 'All' },
@@ -46,11 +46,15 @@ const GalleryPage: React.FC = () => {
     const {
         photos, navigate, selectMany, photosLoading, hasMorePhotos,
         loadMorePhotos, reloadPhotos, totalPhotos, mediaFilter, setMediaFilter, galleryFilters, setGalleryRating, setGalleryLikedOnly, jumpToGalleryDate, captureRange, setCaptureRange, timeline,
-        route, focusPhoto, selectMode, setSelectMode,
+        route, focusPhoto, selectMode, setSelectMode, selection, clearSelection,
     } = useStore();
     const { requestUpload, startUpload, uploadActive, registerUploadCompletionHandler } = useAppServices();
     const [dragging, setDragging] = useState(false);
-    const [tileMin, setTileMin] = useTileSize('photostore.galleryTileSize', { min: GALLERY_TILE_MIN });
+    // Four across on a phone, about eight on a desktop. A new storage key so
+    // everyone starts from these defaults once, not from the old 3-across size.
+    // Picked once per visit: a window resized mid-session must not write one size under the other key.
+    const [tileKey] = useState(galleryTileKey);
+    const [tileMin, setTileMin] = useTileSize(tileKey, { min: GALLERY_TILE_MIN, default: defaultGalleryTile(GALLERY_TILE_MIN) });
     // iOS-style zoom levels: keep zooming out past the smallest tiles to browse
     // Months, then Years (replaces the old timeline rail).
     const [level, setLevel] = useState<ZoomLevel>('days');
@@ -237,33 +241,57 @@ const GalleryPage: React.FC = () => {
         + (galleryFilters.likedOnly ? 1 : 0)
         + (mediaFilter !== 'all' ? 1 : 0);
 
+    // A size slider, as the redesign draws it. The small and large photo icons
+    // on either side still step past the ends into Months and Years.
     const zoomControl = (
-        <div className="pt-zoom" role="group" aria-label="Zoom level">
-            <button type="button" className="btn" aria-label="Zoom out" disabled={zoomedOutFully} onClick={zoomOut}>
-                <MagnifyingGlassMinusIcon className="toolbar-icon" />
+        <div className="pt-size-slider" role="group" aria-label="Photo size">
+            <button type="button" className="pt-size-end" aria-label="Smaller photos" title="Smaller photos" disabled={zoomedOutFully} onClick={zoomOut}>
+                <SmallPhotosIcon aria-hidden="true" />
             </button>
-            <button type="button" className="btn" aria-label="Zoom in" disabled={zoomedInFully} onClick={zoomIn}>
-                <MagnifyingGlassPlusIcon className="toolbar-icon" />
+            {level === 'days' && (
+                <input
+                    type="range"
+                    aria-label="Photo size"
+                    min={GALLERY_TILE_MIN}
+                    max={TILE_RANGE.max}
+                    step={4}
+                    value={tileMin}
+                    onChange={(e) => setTileMin(clampGalleryTile(Number(e.target.value)))}
+                />
+            )}
+            <button type="button" className="pt-size-end" aria-label="Larger photos" title="Larger photos" disabled={zoomedInFully} onClick={zoomIn}>
+                <LargePhotosIcon aria-hidden="true" />
             </button>
         </div>
     );
 
-    const renderFilterControls = () => (
-        <>
+    // One row of chips replaces the old Filters popover: every filter is a tap
+    // away and the active ones are visible without opening anything.
+    const filterChips = (
+        <div className="pt-chips" role="group" aria-label="Filter photos">
+            {MEDIA_FILTERS.map((f) => (
+                <button key={f.value} type="button" className="chip" aria-pressed={mediaFilter === f.value} onClick={() => setMediaFilter(f.value)}>
+                    {f.label}
+                </button>
+            ))}
+            <button type="button" className="chip" aria-pressed={galleryFilters.likedOnly} onClick={() => setGalleryLikedOnly(!galleryFilters.likedOnly)}>
+                <HeartIcon className="pt-chip-icon" fill={galleryFilters.likedOnly ? 'currentColor' : 'none'} /> Liked
+            </button>
             <Menu
                 className="pt-rating-filter"
                 align="left"
                 renderTrigger={(toggle, open) => (
                     <button
                         type="button"
-                        className={`btn pt-filter-button${galleryFilters.rating > 0 ? ' active' : ''}`}
+                        className="chip"
+                        aria-pressed={galleryFilters.rating > 0}
                         aria-haspopup="menu"
                         aria-expanded={open}
                         onClick={toggle}
                     >
-                        <StarIcon className="toolbar-icon" fill={galleryFilters.rating > 0 ? 'currentColor' : 'none'} />
+                        <StarIcon className="pt-chip-icon" fill={galleryFilters.rating > 0 ? 'currentColor' : 'none'} />
                         {galleryFilters.rating > 0 ? `${galleryFilters.rating} star${galleryFilters.rating === 1 ? '' : 's'}` : 'Rating'}
-                        <ChevronDownIcon className="pt-filter-chevron" />
+                        <ChevronDownIcon className="pt-chip-icon" />
                     </button>
                 )}
             >
@@ -285,12 +313,9 @@ const GalleryPage: React.FC = () => {
                     </div>
                 )}
             </Menu>
-            <button type="button" className={`btn pt-like-filter${galleryFilters.likedOnly ? ' active' : ''}`} aria-pressed={galleryFilters.likedOnly} onClick={() => setGalleryLikedOnly(!galleryFilters.likedOnly)}>
-                <HeartIcon className="toolbar-icon" fill={galleryFilters.likedOnly ? 'currentColor' : 'none'} /> Likes
-            </button>
-            <label className="pt-date-jump">
-                <CalendarSearchIcon className="toolbar-icon" aria-hidden="true" />
-                <span>{formatDateJumpLabel(dateJump)}</span>
+            <label className="chip pt-date-chip">
+                <CalendarSearchIcon className="pt-chip-icon" aria-hidden="true" />
+                <span>{dateJump ? formatDateJumpLabel(dateJump) : 'Date'}</span>
                 <input
                     type="date"
                     aria-label="Jump to date"
@@ -300,14 +325,9 @@ const GalleryPage: React.FC = () => {
                     onChange={(e) => handleDateJump(e.target.value)}
                 />
             </label>
-            <div className="mock-seg pt-media-filter" role="group" aria-label="Media type">
-                {MEDIA_FILTERS.map((f) => (
-                    <button key={f.value} type="button" className={mediaFilter === f.value ? 'active' : undefined} onClick={() => setMediaFilter(f.value)}>
-                        {f.label}
-                    </button>
-                ))}
-            </div>
-        </>
+            {/* Phones hide the title row, so Select lives at the end of the chips there. */}
+            <button type="button" className="chip pt-chip-select" onClick={() => setSelectMode(true)}>Select</button>
+        </div>
     );
 
     const scopeCrumbs = (level !== 'days' || captureRange) ? (
@@ -340,7 +360,7 @@ const GalleryPage: React.FC = () => {
                         <div className="empty-state-action pt-arrive-actions">
                             <button
                                 type="button"
-                                className="btn mock-cta"
+                                className="btn btn-primary"
                                 onClick={() => { setGalleryRating(0); setGalleryLikedOnly(false); setMediaFilter('all'); }}
                             >
                                 Clear filters
@@ -359,7 +379,7 @@ const GalleryPage: React.FC = () => {
                         Upload your first photos and Keepsake starts sorting faces, places and moments as they come in.
                     </p>
                     <div className="empty-state-action pt-arrive-actions">
-                        <button type="button" className="btn mock-cta" onClick={requestUpload}>
+                        <button type="button" className="btn btn-primary" onClick={requestUpload}>
                             <ArrowUpTrayIcon className="toolbar-icon" /> Upload photos
                         </button>
                         <button type="button" className="btn" onClick={() => navigate('sharing')}>
@@ -371,63 +391,36 @@ const GalleryPage: React.FC = () => {
         );
     }
 
-    const levelTitle = level === 'years' ? 'Years' : level === 'months' ? (focusYear ?? 'Months') : 'Gallery';
+    const levelTitle = level === 'years' ? 'Years' : level === 'months' ? (focusYear ?? 'Months') : 'Photos';
 
     return (
-        <div>
-            <div className="pt-toolbar">
-                <div>
-                    <h1 className="pt-page-title">{levelTitle}</h1>
-                    <p className="pt-page-sub">{countLabel}{captureRange ? ` · ${captureRange.label}` : ''}</p>
+        <div className="pt-gallery">
+            {level === 'days' && selectMode ? (
+                // While selecting, the header becomes Cancel · count · Select all (same
+                // height as the title row, so the grid doesn't jump under the finger).
+                <div className="pt-select-head" role="toolbar" aria-label="Selection">
+                    <button type="button" className="pt-linkish" onClick={() => { clearSelection(); setSelectMode(false); }}>Cancel</button>
+                    <b aria-live="polite">{selection.length ? `${selection.length} selected` : 'Select items'}</b>
+                    <button type="button" className="pt-linkish" onClick={() => selectMany(visiblePhotos.map((p) => p.id))}>Select all</button>
                 </div>
-                <div className="pt-toolbar-actions">
-                    {/* While selecting, the row holds only Select all + Done. Adding them beside
-                        Filters and zoom wrapped the row to two lines on phones, and the taller
-                        toolbar shoved the grid down under the user's finger (iOS has no scroll
-                        anchoring to absorb it). */}
-                    {level === 'days' && !selectMode && (
-                        <Menu
-                            className="pt-filter-menu"
-                            align="right"
-                            renderTrigger={(toggle, open) => (
-                                <button
-                                    type="button"
-                                    className={`btn pt-filter-button${activeFilterCount > 0 ? ' active' : ''}`}
-                                    aria-haspopup="menu"
-                                    aria-expanded={open}
-                                    onClick={toggle}
-                                >
-                                    <FilterIcon className="toolbar-icon" /> Filters{activeFilterCount > 0 ? ` (${activeFilterCount})` : ''}
-                                    <ChevronDownIcon className="pt-filter-chevron" />
-                                </button>
-                            )}
-                        >
-                            {() => (
-                                <div className="pt-filter-popover-content">
-                                    {renderFilterControls()}
-                                </div>
-                            )}
-                        </Menu>
-                    )}
-                    {!(level === 'days' && selectMode) && zoomControl}
-                    {level === 'days' && (
-                        selectMode ? (
-                            <>
-                                <button type="button" className="btn" onClick={() => selectMany(visiblePhotos.map((p) => p.id))}>
-                                    Select all
-                                </button>
-                                <button type="button" className="btn mock-cta" onClick={() => setSelectMode(false)}>
-                                    Done
-                                </button>
-                            </>
-                        ) : (
-                            <button type="button" className="btn" onClick={() => setSelectMode(true)}>
+            ) : (
+                <div className="pt-toolbar pt-gallery-toolbar">
+                    <div>
+                        <h1 className="pt-page-title">{levelTitle}</h1>
+                        <p className="pt-page-sub">{countLabel}{captureRange ? ` · ${captureRange.label}` : ''}</p>
+                    </div>
+                    {/* One row on desktops: title, chips, size, Select. Phones keep only the chips. */}
+                    {level === 'days' && filterChips}
+                    <div className="pt-toolbar-actions">
+                        {zoomControl}
+                        {level === 'days' && (
+                            <button type="button" className="pt-linkish" onClick={() => setSelectMode(true)}>
                                 Select
                             </button>
-                        )
-                    )}
+                        )}
+                    </div>
                 </div>
-            </div>
+            )}
 
             {scopeCrumbs}
 
@@ -456,7 +449,7 @@ const GalleryPage: React.FC = () => {
                     onTouchMove={onTouchMove}
                     onTouchEnd={onTouchEnd}
                 >
-                    <PhotoGrid photos={visiblePhotos} gridRef={gridRef} extendable />
+                    <PhotoGrid photos={visiblePhotos} gridRef={gridRef} extendable dayHeadings />
                     {mediaFilter !== 'all' && visiblePhotos.length === 0 && (
                         <p className="pt-grid-empty">No {mediaFilter === 'video' ? 'videos' : 'photos'} on the loaded pages yet — scroll to load more.</p>
                     )}

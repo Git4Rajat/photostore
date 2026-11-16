@@ -9297,6 +9297,32 @@ def _sync_share_snapshot(entity: Dict) -> None:
         worker_logger.warning('Share snapshot sync failed', exc_info=True)
 
 
+def _refresh_share_snapshots(user_id: str) -> int:
+    """Queue a rebuild of every snapshot this library already publishes, e.g. once
+    new grid images exist (photos join albums before their grid image is made,
+    and a snapshot is otherwise rebuilt only when its album changes). Builds
+    re-upload only photos whose metadata changed. Never creates or revokes a
+    snapshot; _sync_share_snapshot owns that. Returns the number queued."""
+    if not share_snapshot.enabled() or albums_table_client is None or not user_id:
+        return 0
+    try:
+        rows = albums_table_client.query_entities(
+            f"PartitionKey eq '{_escape_odata(user_id)}'",
+            select=['PartitionKey', 'RowKey', 'isPublic', 'publicToken', 'accessCode', 'publicExpiresAt',
+                    'shareSnapshotToken', 'deleted'])
+        queued = 0
+        for row in rows:
+            token = str(row.get('shareSnapshotToken') or '')
+            if (token and token == str(row.get('publicToken') or '') and share_snapshot.eligible(row)
+                    and not _coerce_bool(row.get('deleted'))):
+                queued += _enqueue_share_snapshot('build', user_id, str(row.get('RowKey') or ''),
+                                                  delay=SHARE_SNAPSHOT_DEBOUNCE_SECONDS)
+        return queued
+    except Exception:
+        worker_logger.warning('Share snapshot refresh failed for %s', user_id, exc_info=True)
+        return 0
+
+
 def _share_snapshot_photos(entity: Dict) -> Tuple[List['share_snapshot.Photo'], int]:
     owner_id = str(entity.get('PartitionKey') or '')
     names, total = album_store.page(entity, 0, share_snapshot.PREVIEW_LIMIT + 50)   # slack for deleted rows
@@ -9318,6 +9344,9 @@ def _share_snapshot_photos(entity: Dict) -> Tuple[List['share_snapshot.Photo'], 
         def read_thumbnail(blob=thumb_blob):
             return download_media_bytes('thumbnail', blob) if blob else None
 
+        def read_grid(blob=grid_images.served_blob(metadata)):
+            return download_media_bytes('thumbnail', blob) if blob else None
+
         def read_preview(name=name, physical=physical):
             try:
                 cached = download_media_bytes('thumbnail', _preview_cache_blob_name(physical))
@@ -9332,7 +9361,8 @@ def _share_snapshot_photos(entity: Dict) -> Tuple[List['share_snapshot.Photo'], 
             name, version=version, is_video=video,
             rotation=_normalize_rotation((metadata or {}).get('rotation', 0)),
             thumbnail_rotation=_thumbnail_rotation_from_metadata(metadata),
-            read_thumbnail=read_thumbnail, read_preview=None if video else read_preview))
+            read_thumbnail=read_thumbnail, read_preview=None if video else read_preview,
+            read_grid=None if video else read_grid))
         if len(photos) >= share_snapshot.PREVIEW_LIMIT:
             break
     return photos, total
@@ -10186,7 +10216,7 @@ def _find_public_album_by_token(token: str) -> Optional[Dict]:
 
 
 def _public_photo_urls(token: str, filename: str, blob_name: Optional[str] = None,
-                       thumbnail_blob: Optional[str] = None) -> Dict[str, str]:
+                       thumbnail_blob: Optional[str] = None, grid_blob: Optional[str] = None) -> Dict[str, str]:
     # The shrunk preview is the default lightbox image for every non-video photo now
     # (see getMainMediaPath in PhotoViewer.tsx), not just RAW/HEIC/JXL. previewUrl must
     # therefore be populated here for every image, or the frontend falls back to its
@@ -10218,9 +10248,18 @@ def _public_photo_urls(token: str, filename: str, blob_name: Optional[str] = Non
         thumbnail_url, _ = _create_stable_read_sas_url(BLOB_THUMBNAIL_CONTAINER, thumbnail_blob or physical_name)
     except Exception:
         thumbnail_url = f'/public/photos/{token}/thumbnail/{filename}'
+    # The sharp grid-tile image (grid_images.py), only for photos that have one:
+    # the page lists it in srcset, which must never offer a missing size.
+    grid_url = ''
+    if grid_blob:
+        try:
+            grid_url, _ = _create_stable_read_sas_url(BLOB_THUMBNAIL_CONTAINER, grid_blob)
+        except Exception:
+            grid_url = f'/public/photos/{token}/grid/{filename}'
     return {
         'url': image_url,
         'thumbnailUrl': thumbnail_url,
+        'gridUrl': grid_url,
         'previewUrl': preview_url,
         'rawFullPreviewUrl': raw_full_preview_url,
     }
@@ -11660,14 +11699,14 @@ def _make_grid_image(user_id: str, row: Dict) -> bool:
     return saved is not None
 
 
-def _enqueue_grid_images(user_id: str, *, cursor: str = '', since: str = '', reason: str = '') -> bool:
+def _enqueue_grid_images(user_id: str, *, cursor: str = '', since: str = '', reason: str = '', made: int = 0) -> bool:
     """Queue a grid_images batch for a library (see grid_images.py). ``since``
     limits the scan to rows changed after that UTC time (an upload wave's
     start), so a finished wave doesn't rescan the whole library."""
     if not user_id or not grid_images.enabled() or clustering_queue_client is None:
         return False
     try:
-        clustering_queue_client.send_message(grid_images.job_message(user_id, cursor=cursor, since=since, reason=reason))
+        clustering_queue_client.send_message(grid_images.job_message(user_id, cursor=cursor, since=since, reason=reason, made=made))
         return True
     except Exception:
         worker_logger.warning('Grid image job enqueue failed for %s', user_id, exc_info=True)
@@ -11689,12 +11728,21 @@ def _run_grid_image_job(payload: Dict) -> None:
     rows = _iter_metadata_rows_for_user(user_id, select=list(grid_images.SOURCE_FIELDS),
                                         extra_filter=' and '.join(filters), purpose='grid_images.scan')
     result = grid_images.run_batch(rows, lambda row: _make_grid_image(user_id, row), limit=grid_images.BATCH_SIZE)
-    continued = bool(result['cursor']) and _enqueue_grid_images(user_id, cursor=result['cursor'], since=since, reason=reason)
+    try:
+        made = max(0, int(payload.get('made') or 0)) + result['made']
+    except (TypeError, ValueError):
+        made = result['made']
+    continued = bool(result['cursor']) and _enqueue_grid_images(user_id, cursor=result['cursor'], since=since,
+                                                                reason=reason, made=made)
     if result['cursor'] and not continued:
         # Raise so the queue redelivers this batch; its finished photos are skipped next time.
         raise RuntimeError('Grid image continuation could not be queued')
-    worker_logger.info('grid images batch: library=%s reason=%s scanned=%d made=%d failed=%d continued=%s',
-                       user_id, reason or '-', result['scanned'], result['made'], result['failed'], continued)
+    # A manual backfill refreshes them even when it made nothing new: snapshots
+    # built before shared albums carried grid images still need theirs.
+    refresh = not result['cursor'] and (made or reason in ('admin_backfill', 'script_backfill'))
+    refreshed = _refresh_share_snapshots(user_id) if refresh else 0
+    worker_logger.info('grid images batch: library=%s reason=%s scanned=%d made=%d failed=%d continued=%s snapshots=%d',
+                       user_id, reason or '-', result['scanned'], result['made'], result['failed'], continued, refreshed)
 
 
 PREVIEW_JOB_TYPE = 'media_preview'

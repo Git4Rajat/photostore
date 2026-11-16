@@ -37,7 +37,7 @@ def share(monkeypatch):
                         lambda owner, names: {n: state['meta'].get(n, {}) for n in names})
     monkeypatch.setattr(app, '_validate_media_filename', lambda n: n if n.endswith('.jpg') else None)
     monkeypatch.setattr(app, '_public_photo_urls',
-                        lambda token, name, blob_name=None, thumbnail_blob=None: {'url': f'/img/{name}', 'thumbnailUrl': f'/th/{name}'})
+                        lambda token, name, blob_name=None, thumbnail_blob=None, grid_blob=None: {'url': f'/img/{name}', 'thumbnailUrl': f'/th/{name}'})
     monkeypatch.setattr(app, 'resolve_physical_blob_name', lambda owner, name, kind: 'blob-' + name)
     monkeypatch.setattr(password_auth, 'login_attempt_allowed', lambda table, row_key=None: state['throttle_ok'])
     monkeypatch.setattr(password_auth, 'record_login_failure', lambda table, row_key=None, **k: state['failures'].append(row_key))
@@ -73,8 +73,13 @@ class TestPublicAlbum:
         share['meta']['gone.jpg'] = {'processing_state': 'deleted'}
         body = share['client'].get('/api/public/albums/tok').json
         assert [p['filename'] for p in body['photos']] == ['a.jpg', 'b.jpg']
-        assert body['album'] == {'name': 'Trip', 'photoCount': 3} and body['total'] == 3 and body['hasMore'] is False
+        assert body['album'] == {'name': 'Trip', 'photoCount': 3, 'expiresAt': ''} and body['total'] == 3 and body['hasMore'] is False
         assert body['photos'][0]['url'] == '/img/a.jpg'
+
+    def test_says_when_the_link_ends(self, share, monkeypatch):
+        monkeypatch.setattr(app, '_album_is_expired', lambda e: False)
+        share['entity']['publicExpiresAt'] = '2026-11-23T10:00:00+00:00'
+        assert share['client'].get('/api/public/albums/tok').json['album']['expiresAt'] == '2026-11-23T10:00:00+00:00'
 
     def test_paging_clamps_and_reports_has_more(self, share, monkeypatch):
         monkeypatch.setattr(app, '_album_is_expired', lambda e: False)

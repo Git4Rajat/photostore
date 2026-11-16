@@ -2,7 +2,7 @@
    Prototype-only styles for the fully-functional Keepsake prototype.
    Loaded after index.css + mockups.css, so it reuses real tokens and the
    shared mock classes (mock-swatch, upload-dock, share-sheet, member-row,
-   mock-switch, btn/.mock-cta, card-glass, .ios-header/.ios-tabs …) and only
+   mock-switch, btn, card-glass, .ios-header/.ios-tabs …) and only
    adds the pt-* classes the prototype app introduces.
    ================================================================= */
 
@@ -130,7 +130,7 @@
 }
 .pt-menu-panel.left { left: 0; }
 .pt-menu-panel.right { right: 0; }
-.pt-menu-label { font-family: var(--font-label); font-size: 0.72rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); margin: 0 0 8px; padding: 0 4px; }
+.pt-menu-label { font-size: 0.8rem; font-weight: 600; color: var(--muted); margin: 0 0 8px; padding: 0 4px; }
 
 .pt-account-menu { min-width: 240px; }
 .pt-account-menu > button { display: flex; align-items: center; width: 100%; min-height: var(--tap-min); text-align: left; background: none; border: 0; padding: 9px 10px; border-radius: var(--r-xs); font: inherit; font-size: 0.88rem; color: var(--text); cursor: pointer; }
@@ -154,7 +154,7 @@
 
 /* ---- stars ---- */
 .pt-stars { display: inline-flex; gap: 2px; }
-.pt-star { background: none; border: 0; padding: 0; cursor: pointer; color: #e2b33f; display: inline-grid; place-items: center; min-width: var(--tap-min); min-height: var(--tap-min); }
+.pt-star { background: none; border: 0; padding: 0; cursor: pointer; color: var(--star); display: inline-grid; place-items: center; min-width: var(--tap-min); min-height: var(--tap-min); }
 .pt-star:disabled, .pt-star.static { cursor: default; min-width: 0; min-height: 0; }
 .pt-star svg { display: block; }
 /* Compact single-star, partial-fill rating indicator -- hidden by default;
@@ -166,7 +166,7 @@
 /* Constrain the compact star's glyph to a 20px box centred in its 44px tap
    target -- otherwise it filled the whole target and rendered ~2x the size of
    the neighbouring Like/Delete icons (which are 20px) in the viewer bar. */
-.pt-star-compact-bg, .pt-star-compact-fg { position: absolute; top: 50%; left: 50%; width: 20px; height: 20px; transform: translate(-50%, -50%); color: #e2b33f; }
+.pt-star-compact-bg, .pt-star-compact-fg { position: absolute; top: 50%; left: 50%; width: 20px; height: 20px; transform: translate(-50%, -50%); color: var(--star); }
 .pt-star-compact-fg { clip-path: inset(0 calc(100% - var(--pt-star-fill, 0%)) 0 0); }
 
 /* ---- toolbar / page headers ---- */
@@ -245,6 +245,20 @@
 .pt-filter-popover-content .btn,
 .pt-filter-popover-content .pt-date-jump { width: 100%; justify-content: center; }
 
+/* ---- gallery filter chips + selection header ---- */
+.pt-gallery-toolbar { margin-bottom: 10px; }
+.pt-chips { display: flex; gap: 6px; margin: 0 0 12px; overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+.pt-chips::-webkit-scrollbar { display: none; }
+.pt-chips > .pt-menu-anchor { flex: 0 0 auto; }
+.pt-chip-icon { width: 14px; height: 14px; flex: 0 0 auto; }
+.pt-date-chip { position: relative; }
+.pt-date-chip input { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; opacity: 0; cursor: pointer; }
+.pt-date-chip input::-webkit-calendar-picker-indicator { position: absolute; inset: 0; width: 100%; height: 100%; cursor: pointer; }
+.pt-date-chip:has(input:focus-visible) { box-shadow: var(--focus-ring); }
+.pt-select-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 52px; margin-bottom: 12px; position: sticky; top: 0; z-index: 5; }
+.pt-select-head b { font-size: 1rem; font-weight: 700; }
+.pt-select-head .pt-linkish { font-size: 0.95rem; min-height: var(--tap-min); padding: 0 4px; }
+
 /* ---- gallery timeline scrubber (year -> month -> day) ---- */
 @media (max-width: 620px) {
   .pt-toolbar { flex-direction: column; align-items: flex-start; }
@@ -255,25 +269,32 @@
 }
 
 /* ---- photo grid ---- */
-.pt-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--pt-tile-min, 120px), 1fr)); gap: 6px; user-select: none; -webkit-user-select: none; }
-.pt-tile { position: relative; aspect-ratio: 1; border-radius: var(--r-sm); cursor: pointer; overflow: hidden; -webkit-touch-callout: none; -webkit-user-select: none; }
-.pt-tile.selected { outline: 3px solid var(--accent); outline-offset: -3px; }
+/* 2px gaps and near-square corners: the photos get the space, not the gutters. */
+.pt-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--pt-tile-min, 120px), 1fr)); gap: 2px; user-select: none; -webkit-user-select: none; }
+.pt-tile { position: relative; aspect-ratio: 1; border-radius: 3px; cursor: pointer; overflow: hidden; -webkit-touch-callout: none; -webkit-user-select: none; }
+.pt-tile.selected::after { content: ''; position: absolute; inset: 0; background: rgba(0,0,0,0.18); box-shadow: inset 0 0 0 2.5px var(--accent); border-radius: 3px; pointer-events: none; }
+/* One heading per capture day, spanning the full row. */
+.pt-day-heading { grid-column: 1 / -1; margin: 0; padding: 14px 2px 6px; font: 700 0.9rem/1.2 var(--font-ui); color: var(--text); }
+.pt-day-heading:first-child { padding-top: 2px; }
 .pt-tile-img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; -webkit-user-drag: none; user-select: none; }
 /* 44x44 tap target flush with the tile's corner (the tile clips overflow, so
    the hit area can't extend past it) with the 22px glyph inset via padding
    to sit where it visually sat before. */
-.pt-tile-check { position: absolute; top: 0; left: 0; width: 44px; height: 44px; box-sizing: border-box; display: flex; align-items: flex-start; justify-content: flex-start; padding: 6px; border: 0; background: none; color: rgba(255,255,255,0.9); cursor: pointer; opacity: 0; pointer-events: none; transition: opacity 0.12s ease; touch-action: none; }
+.pt-tile-check { position: absolute; right: 0; bottom: 0; z-index: 1; width: 44px; height: 44px; box-sizing: border-box; display: flex; align-items: flex-end; justify-content: flex-end; padding: 6px; border: 0; background: none; color: transparent; cursor: pointer; opacity: 0; pointer-events: none; transition: opacity 0.12s ease; touch-action: none; }
 /* Checkboxes only appear (and become clickable) in Select mode, so an ordinary
    tap or a scroll can't accidentally select photos -- the top complaint was
    that scrolling kept catching the always-visible checkbox. */
 .pt-grid.select-mode .pt-tile-check { opacity: 0.9; pointer-events: auto; }
 .pt-grid.select-mode .pt-tile:hover .pt-tile-check, .pt-grid.select-mode .pt-tile-check.on { opacity: 1; }
-.pt-tile-check svg { width: 22px; height: 22px; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.45)); }
-.pt-tile-check.on { color: var(--accent); }
-.pt-tile-badges { position: absolute; bottom: 6px; right: 6px; display: flex; gap: 4px; align-items: center; }
-.pt-tile-badges .liked { width: 16px; height: 16px; color: #ff6b7d; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.4)); }
+/* An empty ring until selected, then a filled accent circle with a check. */
+.pt-tile-check svg { width: 21px; height: 21px; box-sizing: border-box; padding: 3px; stroke-width: 3; border-radius: 50%; border: 1.5px solid #fff; background: rgba(0,0,0,0.22); box-shadow: 0 1px 3px rgba(0,0,0,0.35); }
+.pt-tile-check.on { color: var(--on-accent); }
+.pt-tile-check.on svg { background: var(--accent); border-color: var(--accent); }
+.pt-grid.select-mode .pt-tile-badges { display: none; }
+.pt-tile-badges { position: absolute; bottom: 6px; left: 6px; display: flex; gap: 4px; align-items: center; }
+.pt-tile-badges .liked { width: 16px; height: 16px; color: var(--like); filter: drop-shadow(0 1px 2px rgba(0,0,0,0.4)); }
 .pt-tile-badges .rating { display: inline-flex; align-items: center; gap: 2px; font-size: 0.72rem; font-weight: 700; color: #fff; background: rgba(0,0,0,0.42); border-radius: var(--r-pill); padding: 1px 6px; }
-.pt-tile-badges .rating svg { width: 10px; height: 10px; color: #e2b33f; }
+.pt-tile-badges .rating svg { width: 10px; height: 10px; color: var(--star); }
 .pt-tile-badges .live { font-size: 0.62rem; font-weight: 700; letter-spacing: 0.06em; color: #fff; background: rgba(0,0,0,0.42); border-radius: var(--r-pill); padding: 1px 6px; }
 .pt-grid-empty { color: var(--muted); padding: 24px 0; }
 
@@ -343,8 +364,7 @@
      always there, just scrolled past the whole list first. */
   .pt-album-detail { display: none; }
   .pt-albums.show-detail .pt-album-detail { display: block; padding: 8px; max-height: none; overflow-y: visible; }
-  .pt-share-section { max-height: none; overflow: visible; }
-  .pt-album-detail-head .btn span { display: none; }
+  .pt-albums-browse-desktop { display: none; }
   .pt-body { overflow-y: auto; }
 }
 .pt-album-row { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; padding: 8px; border: 0; border-radius: var(--r-sm); background: transparent; cursor: pointer; font: inherit; color: var(--text); }
@@ -358,10 +378,87 @@
 .pt-album-list-head { display: flex; align-items: center; justify-content: space-between; padding: 0 8px 4px; }
 .pt-album-row-check { width: 20px; height: 20px; flex: 0 0 auto; border-radius: 999px; border: 1.5px solid var(--lg-edge); display: inline-flex; align-items: center; justify-content: center; color: transparent; }
 .pt-album-row-check svg { width: 13px; height: 13px; }
-.pt-album-row-check.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.pt-album-row-check.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .pt-album-detail { padding: 16px; }
-.pt-album-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
-.pt-album-photos-head { display: flex; align-items: center; justify-content: space-between; margin: 6px 0 10px; }
+.pt-album-photos-head { display: flex; align-items: center; justify-content: flex-end; margin: 6px 0 10px; }
+
+/* Album list on phones: a title row, then two-up cover cards. */
+.pt-albums-head { margin-bottom: 12px; align-items: center !important; flex-direction: row !important; }
+.pt-albums-head .pt-toolbar-actions { width: auto !important; margin-left: auto; }
+.pt-section-label { margin: 0 0 8px; font: 700 0.95rem/1.2 var(--font-ui); color: var(--text); }
+.pt-album-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 10px; margin-bottom: 20px; }
+.pt-album-card { appearance: none; border: 0; background: none; padding: 0; color: var(--text); font: inherit; text-align: left; cursor: pointer; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.pt-album-card-cover { position: relative; aspect-ratio: 1; border-radius: var(--r-md); overflow: hidden; background: var(--lg-edge); margin-bottom: 6px; }
+.pt-album-card-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.pt-album-card-cover .pt-album-row-check { position: absolute; right: 8px; bottom: 8px; background: rgba(0,0,0,0.25); border-color: #fff; }
+.pt-album-card.selected .pt-album-card-cover { box-shadow: inset 0 0 0 3px var(--accent); }
+.pt-album-card b { font-size: 0.92rem; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pt-album-card > span:last-child { display: inline-flex; align-items: center; gap: 4px; font-size: 0.78rem; color: var(--muted); }
+.pt-album-card > span:last-child svg { width: 13px; height: 13px; color: var(--accent); }
+
+/* An open album: its cover as a banner with the name over it, then actions. */
+.pt-album-hero { position: relative; height: 150px; border-radius: var(--r-md); overflow: hidden; margin-bottom: 12px; background: linear-gradient(135deg, var(--accent-soft), var(--lg-edge)); display: flex; align-items: flex-end; }
+.pt-album-hero img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.pt-album-hero::after { content: ''; position: absolute; inset: 0; background: linear-gradient(180deg, transparent 35%, rgba(0,0,0,0.6)); }
+.pt-album-hero.no-cover::after { display: none; }
+.pt-album-hero-text { position: relative; z-index: 1; padding: 14px 16px; color: #fff; min-width: 0; }
+.pt-album-hero.no-cover .pt-album-hero-text { color: var(--text); }
+.pt-album-hero-name { color: inherit; margin: 0; font: 600 28px/1.1 var(--font-display); letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pt-album-hero-text p { margin: 2px 0 0; font-size: 0.82rem; opacity: 0.85; }
+.pt-album-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.pt-album-actions-spacer { flex: 1; }
+.pt-album-status { display: inline-flex; align-items: center; gap: 6px; font-size: 0.8rem; color: var(--muted); margin: 0; }
+.pt-album-status svg { width: 14px; height: 14px; color: var(--accent); flex: none; }
+.pt-album-status.stacked { display: none; margin-bottom: 8px; }
+@media (max-width: 620px) {
+  .pt-album-hero { height: 190px; margin: -8px -8px 12px; border-radius: 0; }
+  .pt-album-status.inline { display: none; }
+  .pt-album-photos-head { display: none; }
+  .pt-album-status.stacked { display: flex; }
+}
+.pt-more-menu button.danger { color: var(--danger); }
+
+/* On/off switch (share sheet). */
+.pt-switch { appearance: none; flex: none; width: 46px; height: 28px; border-radius: 999px; border: 0; padding: 3px; background: var(--lg-edge); cursor: pointer; transition: background 0.15s ease; }
+.pt-switch span { display: block; width: 22px; height: 22px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.3); transition: transform 0.15s ease; }
+.pt-switch.on { background: var(--accent); }
+.pt-switch.on span { transform: translateX(18px); }
+.pt-switch:disabled { opacity: 0.6; cursor: default; }
+.pt-switch:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+/* Share sheet. */
+.pt-share { display: flex; flex-direction: column; gap: 16px; }
+.pt-share-row { display: flex; align-items: flex-start; gap: 12px; }
+.pt-share-icon { width: 20px; height: 20px; flex: none; margin-top: 2px; color: var(--muted); }
+.pt-share-icon.accent { color: var(--accent); }
+.pt-share-text { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+.pt-share-text b { font-size: 0.92rem; }
+.pt-share-text small { font-size: 0.8rem; color: var(--muted); }
+.pt-share-url { display: flex; gap: 8px; align-items: center; }
+.pt-share-url .btn { gap: 6px; flex: none; }
+.pt-share-expiry { display: flex; flex-direction: column; gap: 6px; }
+.pt-share-expiry .mock-seg { display: flex; }
+.pt-share-expiry .mock-seg button { flex: 1; }
+.pt-share-label { font-size: 0.8rem; font-weight: 650; color: var(--muted); }
+.pt-share-note { font-size: 0.78rem; color: var(--muted); }
+.pt-share-newcode { align-self: flex-start; margin-left: 32px; }
+.pt-share-done { width: 100%; justify-content: center; }
+.pt-share-stop { display: flex; flex-direction: column; align-items: center; gap: 2px; text-align: center; }
+.pt-share-stop small { font-size: 0.76rem; color: var(--muted); }
+
+/* Add-photos picker: the library over the album, full screen. */
+.pt-picker { position: fixed; inset: 0; z-index: 85; background: var(--bg-1); display: flex; flex-direction: column; }
+.pt-picker-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--lg-edge); }
+.pt-picker-head b { font-size: 1rem; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pt-picker-head .pt-linkish:disabled { color: var(--muted); cursor: default; }
+.pt-picker-body { flex: 1; overflow-y: auto; padding: 8px 16px 16px; }
+.pt-picker-grid { --pt-tile-min: 84px; }
+@media (min-width: 700px) { .pt-picker-grid { --pt-tile-min: 130px; } }
+.pt-picker-grid .pt-tile { border: 0; padding: 0; font: inherit; }
+.pt-picker-grid .pt-tile.added { cursor: default; }
+.pt-picker-grid .pt-tile.added::after { content: ''; position: absolute; inset: 0; background: rgba(0,0,0,0.45); }
+.pt-picker-added { position: absolute; left: 6px; bottom: 6px; z-index: 1; font-size: 0.7rem; font-weight: 700; padding: 2px 7px; border-radius: 999px; background: rgba(0,0,0,0.5); color: #fff; }
+.pt-picker-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 16px calc(10px + env(safe-area-inset-bottom)); border-top: 1px solid var(--lg-edge); font-size: 0.84rem; color: var(--muted); }
 
 /* ---- people ---- */
 .pt-people-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 14px; }
@@ -438,13 +535,14 @@
 .pt-chip:hover { border-color: var(--accent); color: var(--accent); }
 .pt-match-cards { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
 .pt-match-card { display: flex; align-items: center; gap: 10px; padding: 10px 14px; cursor: pointer; }
-.pt-match-face { width: 40px; height: 40px; border-radius: 50%; flex: 0 0 auto; }
+.pt-match-face { width: 40px; height: 40px; border-radius: 10px; flex: 0 0 auto; object-fit: cover; display: block; }
+.pt-match-face.round { border-radius: 50%; }
 .pt-match-card b { display: block; font-size: 0.86rem; }
 .pt-match-card span { font-size: 0.76rem; color: var(--muted); }
 
 /* ---- sharing extras ---- */
 .pt-danger-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
-.pt-access-code { font-family: var(--font-label, monospace); font-weight: 700; letter-spacing: 0.12em; background: var(--accent-soft); color: var(--accent); padding: 1px 6px; border-radius: 5px; }
+.pt-access-code { font-family: var(--font-mono); font-weight: 700; letter-spacing: 0.12em; background: var(--accent-soft); color: var(--accent); padding: 1px 6px; border-radius: 5px; }
 
 /* ---- tools ---- */
 .pt-subnav { display: flex; gap: 16px; border-bottom: 1px solid var(--lg-edge); margin-bottom: 16px; overflow-x: auto; }
@@ -477,10 +575,10 @@
 .wb-tile-name { display: block; font-size: 0.72rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .wb-tile-steps { display: flex; gap: 4px; margin-top: 4px; }
 .wb-step-icon { width: 15px; height: 15px; flex: 0 0 auto; color: var(--lg-edge); }
-.wb-step-icon.done { color: #34c759; }
+.wb-step-icon.done { color: var(--success); }
 .wb-step-icon.pending { color: var(--muted); opacity: 0.6; }
-.wb-step-icon.no-data { color: #d19a00; }
-.wb-step-icon.failed { color: #ff453a; }
+.wb-step-icon.no-data { color: var(--warning); }
+.wb-step-icon.failed { color: var(--danger); }
 /* Non-color status cue: a tiny shape badge so done/failed/no-data are
    distinguishable without relying on the icon tint. */
 .wb-step { position: relative; display: inline-flex; line-height: 0; }
@@ -546,6 +644,27 @@
 .pt-trash-actions button svg { width: 18px; height: 18px; }
 .pt-trash-days { position: absolute; top: 6px; right: 6px; font-size: 0.72rem; font-weight: 700; color: #fff; background: rgba(0,0,0,0.4); border-radius: var(--r-pill); padding: 1px 6px; }
 
+/* ---- selection action bar: replaces the tab bar on phones, docks at the bottom on desktop ---- */
+.pt-action-bar { position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%); z-index: 60; display: flex; align-items: stretch; justify-content: center; gap: 4px; padding: 6px 10px; border: 1px solid var(--lg-edge); border-radius: var(--r-lg, 22px); background: var(--lg-surface-strong); backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate)); -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate)); box-shadow: 0 14px 44px rgba(0,0,0,0.28); }
+.pt-ab-btn { appearance: none; border: 0; background: none; color: var(--text); font: inherit; font-size: 0.72rem; font-weight: 600; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; min-width: 64px; min-height: 52px; padding: 4px 8px; border-radius: 12px; cursor: pointer; }
+.pt-ab-btn svg { width: 22px; height: 22px; }
+.pt-ab-btn:hover:not(:disabled) { background: var(--lg-surface-wash); }
+.pt-ab-btn:disabled { opacity: 0.4; cursor: default; }
+.pt-ab-btn.on { color: var(--like); }
+.pt-ab-btn.danger { color: var(--danger); }
+.pt-ab-btn.accent { color: var(--accent); }
+.pt-ab-count { color: var(--muted); }
+.pt-action-bar .pt-menu-anchor { display: flex; }
+.pt-action-bar .pt-menu-panel { top: auto; bottom: calc(100% + 10px); }
+.pt-fm-rate { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px 10px; border-bottom: 1px solid var(--lg-edge); margin-bottom: 4px; }
+.pt-fm-rate > span { display: inline-flex; align-items: center; gap: 8px; font-size: 0.85rem; font-weight: 600; color: var(--muted); }
+.pt-fm-rate > span svg { width: 16px; height: 16px; }
+@media (max-width: 805px) {
+  /* Edge to edge where the tab bar was, same height and safe-area padding. */
+  .pt-action-bar { left: 0; right: 0; bottom: 0; transform: none; justify-content: space-around; gap: 0; padding: 6px 4px calc(6px + env(safe-area-inset-bottom)); border-radius: 0; border-width: 1px 0 0; box-shadow: none; }
+  .pt-ab-btn { flex: 1; min-width: 0; }
+}
+
 /* ---- floating menu (centered, compact, minimal delete + options) ---- */
 .pt-floating-menu { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 60; display: flex; align-items: center; justify-content: center; gap: 12px; background: var(--text); color: var(--bg-1); padding: 12px; border-radius: var(--r-pill); box-shadow: 0 14px 44px rgba(0,0,0,0.4); }
 @media (max-width: 620px) {
@@ -582,33 +701,36 @@
 }
 
 /* ---- photo viewer (fixed, full-window) ---- */
-.pt-viewer { position: fixed; inset: 0; z-index: 80; background: #0e0d0b; color: #ece6d9; display: flex; flex-direction: column; }
+.pt-viewer { position: fixed; inset: 0; z-index: 80; background: var(--viewer-bg); color: var(--viewer-text); display: flex; flex-direction: column; }
 .pt-viewer-top { display: flex; align-items: center; gap: 12px; padding: 14px 18px; }
-.pt-viewer-back { display: inline-flex; align-items: center; gap: 6px; background: none; border: 0; color: #cfc8ba; font: inherit; font-weight: 600; cursor: pointer; }
+.pt-viewer-back { display: inline-flex; align-items: center; gap: 6px; background: none; border: 0; color: var(--viewer-muted); font: inherit; font-weight: 600; cursor: pointer; }
 .pt-viewer-back svg { width: 18px; height: 18px; }
-.pt-viewer-title { font-size: 0.9rem; color: #cfc8ba; }
-.pt-viewer-pos { margin-left: auto; font-size: 0.82rem; color: #9c9486; font-family: var(--font-label); }
+/* Place (or day) over date and time, centred like a phone's own photo viewer. */
+.pt-viewer-title { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: center; text-align: center; line-height: 1.25; }
+.pt-viewer-title b { font-size: 0.95rem; font-weight: 700; color: var(--viewer-text); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pt-viewer-title small { font-size: 0.74rem; color: var(--viewer-muted); white-space: nowrap; }
+.pt-viewer-pos { font-size: 0.82rem; color: var(--viewer-subtle); font-variant-numeric: tabular-nums; white-space: nowrap; }
 /* touch-action: none stops the browser from turning a two-finger pinch here
    into a whole-page zoom; the pinch is handled in JS to zoom the photo instead.
    The info panel re-enables panning so it can still scroll (see below). */
 .pt-viewer-stage-wrap { flex: 1; position: relative; display: flex; min-height: 0; touch-action: none; }
 .pt-viewer-info { touch-action: pan-y; }
 .pt-viewer-stage { flex: 1; display: flex; align-items: center; gap: 12px; padding: 0 18px; min-height: 0; }
-.pt-viewer-loading { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: #9c9486; font-size: 0.9rem; }
-.pt-viewer-unavailable { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; color: #ece6d9; font-size: 0.95rem; text-align: center; padding: 0 32px; }
-.pt-viewer-unavailable p { max-width: 420px; color: #c9c2b4; margin: 0; }
-.pt-viewer-unavailable button { display: inline-flex; align-items: center; gap: 8px; border: 1px solid rgba(255,255,255,0.18); border-radius: var(--r-pill); padding: 8px 18px; background: rgba(255,255,255,0.08); color: #ece6d9; cursor: pointer; font-size: 0.9rem; }
+.pt-viewer-loading { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: var(--viewer-subtle); font-size: 0.9rem; }
+.pt-viewer-unavailable { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; color: var(--viewer-text); font-size: 0.95rem; text-align: center; padding: 0 32px; }
+.pt-viewer-unavailable p { max-width: 420px; color: var(--viewer-muted); margin: 0; }
+.pt-viewer-unavailable button { display: inline-flex; align-items: center; gap: 8px; border: 1px solid rgba(255,255,255,0.18); border-radius: var(--r-pill); padding: 8px 18px; background: rgba(255,255,255,0.08); color: var(--viewer-text); cursor: pointer; font-size: 0.9rem; }
 .pt-viewer-unavailable button:hover { background: rgba(255,255,255,0.16); }
 /* Floating image controls (zoom / rotate / full-res) over the stage. */
 .pt-viewer-tools { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 4px; background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.12); border-radius: var(--r-pill); padding: 4px 8px; backdrop-filter: blur(8px); z-index: 2; }
-.pt-viewer-tools button { display: inline-grid; place-items: center; width: var(--tap-min); height: var(--tap-min); border: 0; border-radius: 50%; background: none; color: #ece6d9; cursor: pointer; }
+.pt-viewer-tools button { display: inline-grid; place-items: center; width: var(--tap-min); height: var(--tap-min); border: 0; border-radius: 50%; background: none; color: var(--viewer-text); cursor: pointer; }
 .pt-viewer-tools button:hover:not(:disabled) { background: rgba(255,255,255,0.14); }
 .pt-viewer-tools button:disabled { opacity: 0.35; cursor: default; }
 .pt-viewer-tools button.on { color: var(--accent); background: rgba(255,255,255,0.14); }
 .pt-viewer-tools button svg { width: 18px; height: 18px; }
 .pt-viewer-tools .pt-viewer-fr { font-size: 0.6rem; font-weight: 700; margin-left: 1px; }
 .pt-viewer-tools button:has(.pt-viewer-fr) { width: auto; padding: 0 8px; gap: 3px; }
-.pt-viewer-zoom-label { font-size: 0.72rem; color: #cfc8ba; font-family: var(--font-label); min-width: 40px; text-align: center; }
+.pt-viewer-zoom-label { font-size: 0.72rem; color: var(--viewer-muted); font-variant-numeric: tabular-nums; min-width: 40px; text-align: center; }
 .pt-viewer-tools-sep { width: 1px; height: 20px; background: rgba(255,255,255,0.15); margin: 0 2px; }
 .pt-viewer-fr-loading { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px; width: 22px; height: 22px; position: relative; }
 .pt-viewer-fr-ring { width: 22px; height: 22px; position: absolute; inset: 0; }
@@ -641,9 +763,9 @@
 .pt-vb-group.left { flex: 1 1 0; justify-content: flex-start; }
 .pt-vb-group.center { flex: 0 0 auto; justify-content: center; }
 .pt-vb-group.right { flex: 1 1 0; justify-content: flex-end; }
-.pt-vb-btn { display: inline-flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: var(--tap-min); min-height: var(--tap-min); background: none; border: 0; color: #ece6d9; font: inherit; font-size: 0.72rem; cursor: pointer; padding: 4px 6px; }
+.pt-vb-btn { display: inline-flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: var(--tap-min); min-height: var(--tap-min); background: none; border: 0; color: var(--viewer-text); font: inherit; font-size: 0.72rem; cursor: pointer; padding: 4px 6px; }
 .pt-vb-btn svg { width: 20px; height: 20px; }
-.pt-vb-btn.on { color: #ff6b7d; }
+.pt-vb-btn.on { color: var(--like); }
 /* Touch devices navigate by swipe, so the prev/next buttons aren't needed. */
 @media (hover: none) and (pointer: coarse) {
   .pt-viewer-nav { display: none; }
@@ -652,10 +774,6 @@
 @media (max-width: 520px) {
   .pt-vb-btn span { display: none; }
   .pt-vb-group { gap: 2px; }
-  /* 5 separate star buttons crowd into the Like button at this width --
-     collapse to one partial-fill star instead. */
-  .pt-viewer-bar .pt-stars-full { display: none; }
-  .pt-viewer-bar .pt-star-compact { display: inline-grid; place-items: center; }
 }
 .pt-more-menu button { display: block; width: 100%; text-align: left; background: none; border: 0; padding: 9px 10px; border-radius: var(--r-xs); font: inherit; font-size: 0.86rem; color: var(--text); cursor: pointer; }
 .pt-more-menu button:hover { background: var(--lg-surface-wash); }
@@ -673,7 +791,7 @@
 .pt-toast-action { background: none; border: 0; color: inherit; font: inherit; font-weight: 700; text-decoration: underline; cursor: pointer; }
 /* Error toasts read distinctly from routine confirmations (which use the
    default near-black pill) so a failure isn't mistaken for a success. */
-.pt-toast.error { background: var(--danger); color: #fff; }
+.pt-toast.error { background: var(--danger); color: var(--on-danger); }
 .pt-toast-icon { flex: 0 0 auto; width: 18px; height: 18px; }
 
 /* ---- narrow (phone) tweaks; mock-viewport is the query container ---- */
@@ -681,7 +799,6 @@
     .pt-albums { grid-template-columns: 1fr; }
     .pt-upload-label { display: none; }
     .pt-upload-btn { padding: 9px 11px; min-width: 44px; }
-    .pt-viewer-title { display: none; }
     .pt-toolbar { align-items: flex-start; }
 }
 /* The zoom/rotate toolbar floats over the top of the photo or video, covering
@@ -703,7 +820,7 @@
 /* ---- rotated video: upright controls (TurnedVideoControls.tsx) ---- */
 .pt-turned-video-play { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 2; display: grid; place-items: center; border: 0; border-radius: 50%; background: rgba(0,0,0,0.6); -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); color: #fff; cursor: pointer; }
 .pt-turned-video-play svg { width: 38%; height: 38%; margin-left: 6%; fill: currentColor; }
-.pt-turned-video-bar { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); z-index: 2; width: min(520px, calc(100% - 24px)); box-sizing: border-box; display: flex; align-items: center; gap: 6px; padding: 0 8px; background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.12); border-radius: var(--r-pill); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); color: #ece6d9; }
+.pt-turned-video-bar { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); z-index: 2; width: min(520px, calc(100% - 24px)); box-sizing: border-box; display: flex; align-items: center; gap: 6px; padding: 0 8px; background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.12); border-radius: var(--r-pill); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); color: var(--viewer-text); }
 .pt-turned-video-bar button { flex: none; display: inline-grid; place-items: center; width: var(--tap-min); height: var(--tap-min); border: 0; border-radius: 50%; background: none; color: inherit; cursor: pointer; }
 .pt-turned-video-bar button svg { width: 18px; height: 18px; }
 .pt-turned-video-bar input[type="range"] { flex: 1; min-width: 0; accent-color: var(--accent); }
@@ -711,6 +828,11 @@
 
 /* A rotated video's tile turns its thumbnail, and with it the play icon baked into it at upload.
    An upright glass badge covers that one: same centre, a little larger than its 36%. */
+/* Corner marks on tiles (the redesign's .t .lv and .t .du). */
+.pt-tile-live { position: absolute; top: 5px; left: 5px; width: 16px; height: 16px; fill: none; stroke: #fff; stroke-width: 1.75; filter: drop-shadow(0 0 2px rgba(0,0,0,0.55)); pointer-events: none; }
+.pt-tile-video { position: absolute; right: 5px; bottom: 4px; display: inline-flex; color: #fff; filter: drop-shadow(0 0 2px rgba(0,0,0,0.6)); pointer-events: none; }
+.pt-tile-video svg { width: 15px; height: 15px; }
+.pt-grid.select-mode .pt-tile-video { display: none; }
 .pt-tile-play { position: absolute; left: 50%; top: 50%; width: 40%; aspect-ratio: 1; transform: translate(-50%, -50%); border-radius: 50%; background: rgba(0,0,0,0.6); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); pointer-events: none; }
 .pt-tile-play::after { content: ""; position: absolute; left: 39%; top: 30%; width: 32%; height: 40%; background: rgba(255,255,255,0.95); clip-path: polygon(0 0, 100% 50%, 0 100%); }
 
@@ -804,10 +926,8 @@
    instead of the old bespoke banner layout. */
 .pt-public-shell .pt-public-tag {
     margin-left: auto;
-    font-family: var(--font-label);
-    font-size: 0.66rem;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
+    font-size: 0.75rem;
+    font-weight: 600;
     color: var(--muted);
     border: 1px solid var(--lg-edge);
     border-radius: var(--r-pill);
@@ -884,3 +1004,378 @@
 .pt-tile-skeleton { cursor: default; background: linear-gradient(100deg, var(--surface-2, rgba(128,128,128,.14)) 30%, var(--surface-3, rgba(128,128,128,.24)) 50%, var(--surface-2, rgba(128,128,128,.14)) 70%); background-size: 200% 100%; animation: pt-skel 1.4s ease-in-out infinite; }
 @keyframes pt-skel { to { background-position: -200% 0; } }
 @media (prefers-reduced-motion: reduce) { .pt-tile-skeleton { animation: none; } }
+
+/* ---- Albums tab: the way in to People and Explore ---- */
+.pt-browse-links { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px; margin: 0 0 18px; }
+.pt-browse-links button { display: flex; align-items: center; gap: 12px; min-height: 56px; padding: 8px 14px; border: 1px solid var(--lg-edge); border-radius: var(--r-md); background: var(--lg-surface-strong); color: var(--text); font: inherit; text-align: left; cursor: pointer; }
+.pt-browse-links button:hover { background: var(--lg-surface-wash); }
+.pt-browse-links button:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.pt-browse-links svg { width: 20px; height: 20px; flex: none; color: var(--accent); }
+.pt-browse-links span { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+.pt-browse-links b { font-size: 0.92rem; font-weight: 600; }
+.pt-browse-links small { font-size: 0.78rem; color: var(--muted); }
+.pt-browse-links .pt-browse-chev { width: 16px; height: 16px; color: var(--muted); }
+
+/* =================================================================
+   Redesign shell (docs/design-mockups/keepsake-redesign.html)
+   Phones: one header row -- page title, Upload, bell, avatar -- on the
+   plain background, no logo bar. Desktops: a sidebar for the sections
+   and a top bar with search and the same actions.
+   ================================================================= */
+.pt-shell .mock-app::before { display: none; }
+.pt-shell .ios-header {
+  margin: 0;
+  padding: 10px 14px 10px 18px;
+  gap: 8px;
+  border: 0;
+  border-radius: 0;
+  background: var(--bg-1);
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  top: 0;
+}
+.pt-shell .ios-tabs { display: none !important; }
+.pt-header-title { margin: 0; flex: 1; min-width: 0; font: 600 27px/1.1 var(--font-display); letter-spacing: -0.01em; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pt-header-search { display: none; }
+.pt-shell .app-header-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.pt-shell .pt-upload-btn { min-height: 34px; height: 34px; padding: 0 13px; gap: 6px; font-size: 13px; }
+.pt-shell .pt-upload-btn .toolbar-icon { width: 16px; height: 16px; }
+.pt-shell .pt-upload-label { display: inline !important; }
+.pt-shell .notification-bell { min-width: 34px; min-height: 34px; width: 34px; height: 34px; padding: 0; border: 0; border-radius: 50%; background: var(--lg-surface-wash); }
+.pt-shell .pt-avatar-btn { width: 34px; height: 34px; font-size: 12px; }
+
+/* The sidebar only exists on desktops. */
+.pt-side { display: none; }
+
+@container (max-width: 805px) {
+  /* The header carries the page title on phones, so pages don't repeat it. */
+  .pt-body h1.pt-page-title { display: none; }
+  .pt-gallery-toolbar > div:first-child, .pt-gallery-toolbar > .pt-toolbar-actions { display: none !important; }
+  .pt-gallery-toolbar { margin-bottom: 0; }
+  .pt-gallery-toolbar .pt-chips { width: 100%; }
+  .pt-chip-select { display: inline-flex; }
+  /* Photos run edge to edge, as in the mock-up; headings keep the page inset. */
+}
+.pt-chip-select { display: none; margin-left: auto; color: var(--accent); }
+
+@container (min-width: 806px) {
+  .pt-shell .mock-app:has(> .pt-side) { display: grid; grid-template-columns: 216px minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .pt-side { display: flex; grid-row: 1 / span 2; grid-column: 1; }
+  .pt-shell .ios-header { padding: 12px 20px; border-bottom: 1px solid var(--lg-edge); }
+  .pt-shell .mock-app:has(> .pt-side) > .ios-header { grid-column: 2; }
+  .pt-shell .mock-body { padding: 18px 20px; }
+  .pt-shell .mock-app:has(> .pt-side) > .mock-body { grid-column: 2; }
+  .pt-header-title { display: none; }
+  .pt-header-search { display: flex; align-items: center; gap: 8px; flex: 1; max-width: 440px; height: 38px; padding: 0 14px; border: 0; border-radius: 999px; background: var(--lg-surface-wash); color: var(--muted); font: inherit; font-size: 13.5px; cursor: text; text-align: left; }
+  .pt-header-search svg { width: 17px; height: 17px; flex: none; }
+  .pt-header-search span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+}
+
+.pt-side { flex-direction: column; gap: 2px; min-height: 0; overflow-y: auto; padding: 16px 10px 12px; background: var(--lg-surface); border-right: 1px solid var(--lg-edge); }
+.pt-side-logo { align-self: flex-start; display: inline-flex; padding: 2px 10px 14px; border: 0; background: none; cursor: pointer; color: var(--text); }
+.pt-side-logo .logo-wordmark { font-family: var(--font-display); font-weight: 600; font-size: 17px; }
+.pt-side-item { display: flex; align-items: center; gap: 10px; min-height: 34px; padding: 0 10px; border: 0; border-radius: 9px; background: none; color: var(--text); font: inherit; font-size: 13.5px; font-weight: 600; text-align: left; cursor: pointer; flex: none; }
+.pt-side-item > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pt-side-item svg { width: 18px; height: 18px; flex: none; color: var(--muted); }
+.pt-side-item:hover { background: var(--lg-surface-wash); }
+.pt-side-item.on { background: var(--accent-soft); color: var(--accent); }
+.pt-side-item.on svg { color: var(--accent); }
+.pt-side-item em { font-style: normal; font-size: 12px; font-weight: 500; color: var(--muted); font-variant-numeric: tabular-nums; }
+.pt-side-item:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.pt-side-thumb { width: 18px; height: 18px; border-radius: 5px; flex: none; object-fit: cover; background: var(--lg-edge); }
+.pt-side-group { font-size: 11.5px; font-weight: 700; color: var(--muted); padding: 14px 10px 4px; }
+.pt-side-foot { margin-top: auto; border-top: 1px solid var(--lg-edge); padding-top: 8px; display: flex; flex-direction: column; gap: 2px; }
+
+/* Chips as the mock-up draws them: flat fills, no outline. */
+.pt-shell .chip { border: 0; background: var(--lg-surface-wash); }
+.pt-shell .chip[aria-pressed='true'] { background: var(--text); color: var(--bg-1); }
+
+/* Albums, every width: cover cards when no album is open, the album full
+   width when one is. The app sidebar already lists albums on desktops. */
+.pt-albums-mobile-list { display: flex; padding: 0; }
+.pt-albums-mobile-list.hidden { display: none !important; }
+.pt-albums { grid-template-columns: minmax(0, 1fr); }
+.pt-album-sidebar { display: none !important; }
+.pt-albums-browse-desktop { display: none; }
+.pt-album-detail { display: none; max-height: none; overflow: visible; padding: 0; }
+.pt-albums.show-detail .pt-album-detail { display: block; }
+.pt-album-cards { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+@container (max-width: 805px) {
+  .pt-album-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+/* ---- People (redesign): named first, a prompt to name the rest, faces without boxes ---- */
+.pt-people-grid { grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 16px 8px; margin-bottom: 20px; }
+.pt-person-card { padding: 4px 2px; border: 0; background: none; gap: 2px; }
+.pt-person-card:hover { border: 0; }
+.pt-person-card:hover .pt-person-face { box-shadow: 0 0 0 3px var(--lg-edge); }
+.pt-person-card.selected, .pt-person-card.current { background: none; }
+.pt-person-card.selected .pt-person-face, .pt-person-card.current .pt-person-face { box-shadow: 0 0 0 3px var(--accent); }
+.pt-person-face-wrap { position: relative; margin-bottom: 5px; }
+.pt-person-face { width: 74px; height: 74px; display: block; }
+.pt-person-face-wrap .pt-person-check { position: absolute; right: -2px; bottom: -2px; background: var(--bg-1); }
+.pt-person-name { font-size: 0.82rem; }
+.pt-person-name.unnamed { font-weight: 600; }
+.pt-person-count { font-size: 0.72rem; }
+@container (max-width: 805px) {
+  .pt-people-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+.pt-name-banner { display: flex; align-items: center; gap: 12px; padding: 12px; margin-bottom: 16px; border-radius: 16px; background: var(--lg-surface); }
+.pt-face-stack { display: flex; padding-left: 8px; flex: none; }
+.pt-face-stack > * { width: 30px; height: 30px; border-radius: 50%; object-fit: cover; border: 2px solid var(--lg-surface); margin-left: -9px; display: block; }
+.pt-name-banner-text { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+.pt-name-banner-text b { font-size: 0.9rem; }
+.pt-name-banner-text small { font-size: 0.78rem; color: var(--muted); }
+
+/* One person: face, the name field as the heading, then their photos. */
+.pt-person-nav { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+.pt-person-nav .pt-back { margin: 0; }
+.pt-who { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 4px 0 14px; text-align: center; }
+.pt-who-face { width: 92px; height: 92px; border-radius: 50%; object-fit: cover; display: block; }
+.pt-who-name { width: 100%; max-width: 320px; text-align: center; font-size: 1.05rem; font-weight: 600; }
+.pt-who small { font-size: 0.78rem; color: var(--muted); }
+.pt-person-photos-head { display: flex; align-items: baseline; justify-content: space-between; margin: 4px 0 8px; }
+.pt-person-photos-head .pt-section-label { margin: 0; }
+.pt-merge-list { display: flex; flex-direction: column; gap: 2px; }
+.pt-merge-option { display: flex; align-items: center; gap: 12px; padding: 8px; border: 0; border-radius: 12px; background: none; color: var(--text); font: inherit; text-align: left; cursor: pointer; }
+.pt-merge-option:hover { background: var(--lg-surface-wash); }
+.pt-merge-option span { display: flex; flex-direction: column; min-width: 0; }
+.pt-merge-option b { font-size: 0.9rem; }
+.pt-merge-option small { font-size: 0.76rem; color: var(--muted); }
+.pt-merge-face { width: 40px; height: 40px; border-radius: 50%; object-fit: cover; flex: none; display: block; }
+
+/* Desktops: the grid stays, the person opens in a panel beside it. */
+.pt-people-split-list { display: none; }
+@container (min-width: 1000px) {
+  .pt-people-split { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 20px; align-items: start; }
+  .pt-people-split-list { display: block; min-width: 0; }
+  .pt-people-split-panel { position: sticky; top: 0; padding: 16px; border-radius: 18px; background: var(--lg-surface); max-height: calc(100vh - 120px); overflow-y: auto; }
+  .pt-people-split-panel .pt-back { display: none; }
+  .pt-people-split-panel .pt-person-nav { justify-content: flex-end; }
+  .pt-people-split-panel .pt-grid { --pt-tile-min: 96px !important; }
+}
+.pt-people-toolbar { flex-direction: row !important; align-items: center !important; }
+.pt-people-toolbar .pt-page-sub { margin: 0; }
+.pt-phone-only { display: none; }
+@container (max-width: 805px) {
+  .pt-phone-only { display: inline-flex; }
+  /* Inside the person route the person page has its own back link. */
+  .pt-people-split .pt-phone-only { display: none; }
+}
+@container (max-width: 805px) {
+  .pt-person .pt-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+/* ---- Notifications (redesign): grouped by day, one icon per kind, the action as a button ---- */
+.pt-shell .notification-pane { width: min(400px, 94vw); max-height: min(560px, calc(100vh - 90px)); padding: 14px 6px 8px 14px; display: flex; flex-direction: column; box-shadow: var(--lg-shadow-raised); }
+.pt-shell .notification-head { padding-right: 8px; }
+.pt-shell .notification-head .toolbar-title { font: 600 22px/1.1 var(--font-display); margin: 0; }
+.pt-shell .notification-list { display: block; max-height: none; flex: 1; min-height: 0; overflow-y: auto; padding-right: 8px; }
+.notification-day-label { margin: 10px 0 4px; font-size: 0.72rem; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.pt-shell .notification-item { display: flex; gap: 12px; align-items: flex-start; padding: 10px 8px; border: 0; border-radius: 12px; background: none; position: relative; }
+.pt-shell .notification-item.unread { background: none; border: 0; }
+.pt-shell .notification-item.unread::before { content: ''; position: absolute; left: -6px; top: 22px; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+.notification-icon { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; flex: none; background: var(--accent-soft); color: var(--accent); }
+.notification-icon svg { width: 17px; height: 17px; }
+.notification-icon.warn { background: var(--danger-soft); color: var(--danger); }
+.notification-body { flex: 1; min-width: 0; }
+.notification-top { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.pt-shell .notification-top .notification-title { font-size: 0.88rem; font-weight: 650; }
+.pt-shell .notification-top .notification-time { margin: 0; flex: none; font-variant-numeric: tabular-nums; }
+.pt-shell .notification-details { font-size: 0.8rem; line-height: 1.4; }
+.notification-acts { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.pt-shell .notification-progress-track { height: 6px; border-radius: 999px; }
+/* Phones: the panel is a page of its own, as the redesign draws it. */
+@media (max-width: 640px) {
+  .pt-shell .notification-pane { position: fixed; inset: 0; top: 0; left: 0; right: 0; width: auto; max-height: none; border-radius: 0; border: 0; padding: calc(12px + env(safe-area-inset-top)) 6px 8px 18px; z-index: 90; }
+  .pt-shell .notification-actions .notification-close { display: inline-flex; }
+}
+@media (max-width: 640px) {
+  /* The open panel sits above the tab bar. */
+  .pt-shell .mock-app > .ios-header:has(.notification-pane) { z-index: 95; }
+}
+
+/* ---- Library and sharing (redesign) ---- */
+.pt-library-cols { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; align-items: start; }
+.pt-library-main { display: flex; flex-direction: column; min-width: 0; }
+.pt-library-name { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; margin-bottom: 18px; border-radius: 16px; background: var(--lg-surface); }
+.pt-library-name > span { display: flex; flex-direction: column; min-width: 0; }
+.pt-library-name b { font: 600 19px/1.2 var(--font-display); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pt-library-name small { font-size: 0.8rem; color: var(--muted); }
+.pt-library-name .btn { gap: 6px; flex: none; }
+.pt-list { border-radius: 16px; background: var(--lg-surface); padding: 2px 14px; margin-bottom: 18px; }
+.pt-list .member-row:last-child { border-bottom: 0; }
+.pt-invite-icon { width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; flex: none; background: var(--lg-surface-wash); color: var(--muted); }
+.pt-invite-icon svg { width: 17px; height: 17px; }
+.pt-invite-open { width: 100%; justify-content: center; }
+.pt-library-danger { display: flex; flex-direction: column; align-items: center; gap: 2px; margin-top: 28px; text-align: center; }
+.pt-library-danger small { font-size: 0.76rem; color: var(--muted); }
+.pt-library-invite { display: none; }
+.pt-invite-form { display: flex; flex-direction: column; gap: 12px; }
+.pt-invite-title { margin: 0; font: 600 20px/1.2 var(--font-display); }
+.pt-sheet .pt-invite-title { display: none; }
+.pt-invite-field { display: flex; flex-direction: column; gap: 6px; }
+.pt-invite-field > span, .pt-invite-options legend { font-size: 0.8rem; font-weight: 650; color: var(--muted); }
+.pt-invite-options { border: 0; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.pt-invite-options legend { padding: 0; margin-bottom: 6px; }
+.pt-option { display: flex; gap: 12px; align-items: flex-start; padding: 12px; border: 1.5px solid var(--lg-edge); border-radius: 14px; cursor: pointer; }
+.pt-option.on { border-color: var(--accent); background: var(--accent-soft); }
+.pt-option input { margin: 2px 0 0; accent-color: var(--accent); width: 18px; height: 18px; flex: none; }
+.pt-option span { display: flex; flex-direction: column; gap: 2px; }
+.pt-option b { font-size: 0.9rem; }
+.pt-option small { font-size: 0.78rem; color: var(--muted); }
+.pt-invite-note { display: flex; gap: 8px; align-items: center; margin: 0; font-size: 0.8rem; color: var(--muted); }
+.pt-invite-note svg { width: 16px; height: 16px; flex: none; }
+.pt-invite-form .btn-primary { width: 100%; justify-content: center; gap: 7px; }
+@container (min-width: 1000px) {
+  .pt-library-cols { grid-template-columns: minmax(0, 1fr) 340px; }
+  .pt-library-invite { display: block; padding: 18px; border-radius: 18px; background: var(--lg-surface); border: 0; position: sticky; top: 0; }
+  .pt-library .pt-invite-open { display: none; }
+  .pt-library-danger { align-items: flex-start; text-align: left; }
+}
+.pt-invite-field .field { width: 100%; box-sizing: border-box; }
+
+/* ---- Shared album (redesign) ---- */
+.pt-public-shell .pt-public-header { justify-content: space-between; }
+.pt-public-tag { font-size: 0.78rem; font-weight: 600; color: var(--muted); }
+.pt-public-title { margin: 0; font: 600 30px/1.1 var(--font-display); letter-spacing: -0.01em; overflow-wrap: anywhere; }
+.pt-public-hero { display: none; }
+.pt-public-toolbar { align-items: flex-end; margin-bottom: 14px; }
+.pt-public-toolbar .btn { gap: 6px; }
+.pt-public-footer { justify-content: center; text-align: center; color: var(--muted); }
+@container (max-width: 805px) {
+  /* Phones open on the first photo with the title over it, as the redesign draws it. */
+  .pt-public-hero { display: block; position: relative; height: 300px; margin: -12px -12px 12px; overflow: hidden; }
+  .pt-public-hero img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  .pt-public-hero::after { content: ''; position: absolute; inset: 0; background: linear-gradient(180deg, transparent 40%, rgba(0,0,0,0.65)); }
+  .pt-public-hero-text { position: absolute; left: 16px; right: 16px; bottom: 14px; z-index: 1; color: #fff; }
+  .pt-public-hero-text p { margin: 4px 0 0; font-size: 0.84rem; opacity: 0.9; }
+  .pt-public-toolbar > .pt-public-head { display: none !important; }
+  .pt-public-toolbar { flex-direction: row !important; justify-content: flex-end; margin-bottom: 10px; }
+  .pt-public-toolbar .pt-toolbar-actions { width: auto !important; }
+}
+
+/* ---- Polish against the mock-up (2026-11-16) ---- */
+/* Unread notifications: a dot, as the redesign draws it; the count is in the bell's label. */
+.pt-shell .notification-badge { top: 6px; right: 7px; min-width: 0; width: 8px; height: 8px; padding: 0; border-radius: 50%; font-size: 0; line-height: 0; box-shadow: 0 0 0 2px var(--lg-surface-wash); }
+/* Confirmations: a plain dim, no blur; on phones a bottom sheet with full-width buttons, the action first. */
+.dialog-backdrop { backdrop-filter: none; -webkit-backdrop-filter: none; background: rgba(6, 6, 8, 0.62); }
+.dialog-card { backdrop-filter: none; -webkit-backdrop-filter: none; background: var(--lg-surface); border-radius: 26px; }
+@media (max-width: 640px) {
+  .dialog-backdrop { place-items: end center; padding: 8px; }
+  .dialog-card { width: 100%; border-radius: 30px; padding: 22px 18px 18px; }
+  .dialog-actions { flex-direction: column-reverse; gap: 10px; }
+  .dialog-actions .btn { width: 100%; min-height: 44px; justify-content: center; border-radius: 999px; }
+}
+
+/* Viewer, as the redesign draws it. */
+.pt-viewer-back { width: 40px; height: 40px; justify-content: center; border-radius: 50%; color: var(--viewer-text); }
+.pt-viewer-back:hover { background: rgba(255,255,255,0.08); }
+.pt-viewer-back svg { width: 22px; height: 22px; }
+.pt-vb-btn.like.on { color: var(--like); }
+.pt-vb-btn.info.on { color: var(--viewer-accent); }
+.pt-vb-btn.wide-only { display: none; }
+/* Info is part of the layout, never over the photo. */
+.pt-viewer-info { position: static; width: auto; max-height: none; flex: none; overflow-y: auto; padding: 14px 16px; background: #18181a; color: var(--viewer-text); border: 0; display: flex; flex-direction: column; gap: 14px; }
+.pt-vi-block { display: flex; flex-direction: column; gap: 3px; }
+.pt-vi-block b { font-size: 0.92rem; font-weight: 650; }
+.pt-vi-block span { font-size: 0.78rem; color: var(--viewer-muted); }
+.pt-vi-label { font-weight: 650; }
+.pt-vi-place { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-radius: 14px; background: #26262a; font-size: 0.84rem; font-weight: 600; }
+.pt-vi-place svg { width: 16px; height: 16px; color: var(--viewer-accent); flex: none; }
+.pt-vi-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.pt-vi-tags span { padding: 5px 10px; border-radius: 999px; background: #26262a; font-size: 0.74rem; font-weight: 600; }
+.pt-viewer-info .pt-viewer-info-empty { color: var(--viewer-muted); }
+@media (max-width: 805px) {
+  .pt-viewer-pos { display: none; }
+  .pt-viewer-top { padding: 8px 8px 8px 6px; }
+  .pt-viewer-top::after { content: ''; width: 40px; flex: none; } /* keeps the title centred opposite Back */
+  /* Info opens under the photo as a rounded panel; the photo moves up. */
+  .pt-viewer-stage-wrap:has(.pt-viewer-info) { flex-direction: column; }
+  .pt-viewer-stage-wrap:has(.pt-viewer-info) .pt-viewer-stage { flex: 0 1 40%; min-height: 200px; }
+  .pt-viewer-info { flex: 1 1 auto; max-height: 60%; border-radius: 22px 22px 0 0; margin-top: 10px; }
+  /* Five labelled actions, evenly spaced. */
+  .pt-viewer-bar { justify-content: space-around; background: #18181a; }
+  .pt-viewer-bar .pt-vb-group { display: contents; }
+  .pt-viewer-bar .pt-vb-btn span { display: inline; }
+  .pt-viewer-bar .pt-vb-btn { font-size: 0.66rem; font-weight: 600; }
+}
+@media (min-width: 806px) {
+  /* Desktops: title left, actions as icon buttons top right, info in a column beside the photo. */
+  .pt-viewer { display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-rows: auto minmax(0, 1fr); }
+  .pt-viewer-top { grid-column: 1; grid-row: 1; }
+  .pt-viewer-title { align-items: flex-start; text-align: left; }
+  .pt-viewer-pos { margin-left: auto; }
+  .pt-viewer-bar { grid-column: 2; grid-row: 1; background: none; padding: 10px 16px; gap: 4px; }
+  .pt-viewer-bar .pt-vb-group { display: contents; }
+  .pt-viewer-bar .pt-vb-btn { width: 38px; height: 38px; min-width: 0; min-height: 0; border-radius: 50%; padding: 0; }
+  .pt-viewer-bar .pt-vb-btn:hover { background: rgba(255,255,255,0.08); }
+  .pt-viewer-bar .pt-vb-btn span { display: none; }
+  .pt-viewer-bar .pt-vb-btn.wide-only { display: inline-flex; }
+  .pt-viewer-bar .pt-vb-btn.info.on { background: rgba(122,174,211,0.18); }
+  .pt-viewer-bar .pt-menu-panel { top: calc(100% + 8px); bottom: auto; }
+  .pt-viewer-stage-wrap { grid-column: 1 / -1; grid-row: 2; }
+  .pt-viewer-info { width: 340px; border-left: 1px solid rgba(255,255,255,0.08); }
+}
+
+/* Photos header on desktops: one row -- title, chips, size slider, Select. */
+.pt-gallery-toolbar { flex-wrap: nowrap; align-items: center; }
+.pt-gallery-toolbar > div:first-child { flex: 0 0 auto !important; align-items: baseline !important; gap: 10px !important; }
+.pt-gallery-toolbar .pt-page-sub { margin: 0; }
+.pt-gallery-toolbar .pt-chips { margin: 0 0 0 auto; flex: 0 1 auto; min-width: 0; }
+.pt-gallery-toolbar .pt-toolbar-actions { flex-wrap: nowrap; gap: 12px; }
+.pt-size-slider { display: inline-flex; align-items: center; gap: 6px; }
+.pt-size-slider input[type=range] { width: 96px; accent-color: var(--accent); }
+.pt-size-end { display: grid; place-items: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 8px; background: none; color: var(--muted); cursor: pointer; }
+.pt-size-end:hover:not(:disabled) { color: var(--text); background: var(--lg-surface-wash); }
+.pt-size-end:disabled { opacity: 0.35; cursor: default; }
+.pt-size-end svg { width: 16px; height: 16px; }
+.pt-header-search kbd { margin-left: auto; font: 600 11px var(--font-ui); color: var(--muted); border: 1px solid var(--lg-edge-strong); border-radius: 5px; padding: 1px 6px; }
+
+/* People & places, Media types: one grouped list each, rows split by hairlines. */
+.pt-browse-links { display: flex; flex-direction: column; gap: 0; border-radius: 16px; background: var(--lg-surface); overflow: hidden; margin-bottom: 18px; }
+.pt-browse-links button { border: 0; border-radius: 0; background: none; min-height: 60px; padding: 10px 12px; }
+.pt-browse-links button + button { border-top: 1px solid var(--lg-edge); }
+.pt-browse-links button:hover { background: var(--lg-surface-wash); }
+.pt-browse-thumb { width: 40px; height: 40px; border-radius: 10px; flex: none; display: grid; place-items: center; overflow: hidden; background: var(--lg-surface-wash); }
+.pt-browse-thumb svg { width: 20px; height: 20px; color: var(--accent); }
+.pt-browse-thumb.mosaic { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 1px; place-items: stretch; }
+.pt-browse-thumb.mosaic img, .pt-browse-thumb.mosaic i { width: 100%; height: 100%; object-fit: cover; display: block; background: var(--lg-edge); }
+.pt-browse-thumb.map { background: linear-gradient(28deg, transparent 46%, rgba(255,255,255,0.12) 46% 49%, transparent 49%), linear-gradient(112deg, #1c2a36 0 40%, #2a2c2a 40%); }
+.pt-browse-thumb.plain { background: none; }
+.pt-browse-thumb.plain svg { color: var(--muted); }
+/* An open album. */
+.pt-hero-back { display: none; }
+.pt-album-status.stacked { padding: 10px 12px; border-radius: 12px; background: var(--lg-surface); }
+@container (max-width: 805px) {
+  .pt-albums.show-detail ~ * .pt-back, .pt-albums-desktop-sidebar > .pt-back { display: none; }
+  .pt-hero-back { display: grid; place-items: center; position: absolute; top: 10px; left: 10px; z-index: 2; width: 36px; height: 36px; border: 0; border-radius: 50%; background: rgba(18,18,20,0.42); color: #fff; cursor: pointer; }
+  .pt-hero-back svg { width: 20px; height: 20px; }
+  .pt-album-detail .pt-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+.pt-browse-links .pt-browse-thumb { flex: none; width: 40px; height: 40px; display: grid; }
+
+/* Rating in menus and the info panel: five small stars close together. The
+   menu's own button rule (full width, padded) must not reach the stars. */
+.pt-fm-rate .pt-stars, .pt-vi-block .pt-stars { gap: 0; }
+.pt-fm-rate .pt-star, .pt-more-menu .pt-fm-rate .pt-star, .pt-vi-block .pt-star {
+  display: inline-grid; width: 34px; min-width: 34px; min-height: 40px; padding: 0; border-radius: 8px; text-align: center;
+}
+.pt-more-menu .pt-fm-rate .pt-star:hover { background: var(--lg-surface-wash); }
+.pt-vi-block .pt-stars { margin-left: -7px; }
+
+/* Phones: every photo grid runs to the screen's side edges, cancelling the
+   page's side padding (the same clamp as .mock-body); headings keep an inset. */
+@container (max-width: 805px) {
+  .pt-body .pt-grid { margin-left: calc(-1 * clamp(12px, 3vw, 20px)); margin-right: calc(-1 * clamp(12px, 3vw, 20px)); }
+  .pt-body .pt-grid .pt-day-heading { padding-left: 14px; padding-right: 14px; }
+}
+@media (max-width: 805px) {
+  .pt-picker-body .pt-picker-grid { margin-left: -16px; margin-right: -16px; }
+  .pt-picker-grid .pt-day-heading { padding-left: 14px; padding-right: 14px; }
+}
+@container (max-width: 805px) {
+  .pt-albums.show-detail .pt-album-detail { padding: 0; }
+  .pt-album-hero { margin-left: calc(-1 * clamp(12px, 3vw, 20px)) !important; margin-right: calc(-1 * clamp(12px, 3vw, 20px)) !important; margin-top: -8px !important; border-radius: 0; }
+}

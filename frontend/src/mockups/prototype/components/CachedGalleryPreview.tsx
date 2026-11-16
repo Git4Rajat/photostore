@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { HomeChrome } from './HomeChrome';
 import { homeSnapshot, type HomeSnapshot } from '../../../services/homeSnapshot';
 import { useStore } from '../store';
-import { useTileSize } from './controls';
+import { useTileSize, galleryTileKey, defaultGalleryTile } from './controls';
 
 /**
  * Stands in for the "Loading Keepsake…" screen on a return visit: the last gallery the device saw, drawn
@@ -20,7 +20,8 @@ export const useHomeSnapshot = (): HomeSnapshot | null | undefined => {
 };
 
 export const CachedGalleryPreview: React.FC<{ snapshot: HomeSnapshot }> = ({ snapshot }) => {
-    const [tileMin] = useTileSize('photostore.galleryTileSize', { min: 24 });
+    const [tileKey] = useState(galleryTileKey);
+    const [tileMin] = useTileSize(tileKey, { min: 24, default: defaultGalleryTile(24) });
     const urls = useMemo(() => {
         const map = new Map<string, string>();
         snapshot.thumbs.forEach((blob, filename) => map.set(filename, URL.createObjectURL(blob)));

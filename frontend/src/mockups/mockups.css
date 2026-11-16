@@ -18,7 +18,7 @@
 }
 .mock-seg button.active {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 /* the "loupe" mount: a phone frame in mobile mode, full-bleed in desktop */
@@ -140,15 +140,6 @@
   gap: 7px;
 }
 
-/* shared: primary CTA in the *intended* warm accent (the real .btn-primary
-   still ships a leftover iOS-blue gradient — one of the flagged fixes). */
-.btn.mock-cta {
-  background: var(--accent);
-  border-color: transparent;
-  color: #fff;
-}
-.btn.mock-cta:hover { background: color-mix(in srgb, var(--accent) 88%, black); }
-
 /* placeholder photo swatches (stand in for real thumbnails) */
 .mock-swatch { background: linear-gradient(135deg, #7a8b6f, #b7c39a); }
 .mock-swatch.s2 { background: linear-gradient(135deg, #3f5a73, #8fb4c9); }
@@ -180,7 +171,7 @@
 .share-row .lbl b { font-size: 0.88rem; font-weight: 600; }
 .share-row .lbl span { font-size: 0.76rem; color: var(--muted); }
 .share-url {
-  font-family: var(--font-label);
+  font-family: var(--font-mono);
   font-size: 0.78rem;
   background: var(--bg-2);
   border: 1px solid var(--lg-edge);
@@ -208,10 +199,8 @@
 .member-meta b { font-size: 0.9rem; font-weight: 600; }
 .member-meta span { font-size: 0.76rem; color: var(--muted); }
 .member-badge {
-  font-family: var(--font-label);
-  font-size: 0.6rem;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  font-size: 0.72rem;
+  font-weight: 700;
   padding: 3px 8px;
   border-radius: var(--r-pill);
   border: 1px solid var(--lg-edge);

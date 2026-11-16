@@ -1,8 +1,10 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft as ArrowLeftIcon, Check as CheckIcon, Sparkles as SparklesIcon, Trash2 as TrashIcon, Users as UserGroupIcon } from 'lucide-react';
+import { ArrowLeft as ArrowLeftIcon, Check as CheckIcon, MoreHorizontal as MoreIcon, Search as SearchIcon, Trash2 as TrashIcon, Users as UserGroupIcon } from 'lucide-react';
 import { useStore } from '../store';
-import { Swatch, Spinner, SelectionBar } from '../components/bits';
-import { ThumbSizeControl, useTileSize } from '../components/controls';
+import { Menu, Swatch, Spinner, SelectionBar } from '../components/bits';
+import { BottomSheet } from '../components/BottomSheet';
+import { captureWallClock } from '../../../utils/captureDate';
+import { useTileSize } from '../components/controls';
 import PhotoGrid from '../components/PhotoGrid';
 import ScrollSentinel from '../components/ScrollSentinel';
 import { FloatingSelectButton } from '../components/FloatingSelectButton';
@@ -17,13 +19,21 @@ import { plural } from '../../../utils/format';
 // unnamed duplicate clusters into someone already identified), falling back
 // to selection order if none are named.
 const MERGE_PICKER_MAX_OPTIONS = 200;
+const FIRST_SEEN_FORMAT = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'long', year: 'numeric' });
+
+/** A face in the merge list. */
+const MergeFace: React.FC<{ person: Person }> = ({ person }) => {
+    const urls = useProtectedBlobUrls(person.coverThumbnailUrl ? [person.coverThumbnailUrl] : []);
+    const src = person.coverThumbnailUrl ? urls[person.coverThumbnailUrl] : undefined;
+    return src ? <img className="pt-merge-face" src={src} alt="" /> : <Swatch swatch={person.swatch} className="pt-merge-face" />;
+};
 const pickMergeTarget = (selected: Person[]): Person => selected.find((p) => p.name) ?? selected[0];
 
 /** People — a grid of face clusters; unnamed ones are flagged for naming.
  *  "Select" mode (or a long-press on a card) lets several clusters be picked and merged into one in a
  *  single action, instead of the one-at-a-time merge on the detail page. */
 export const PeoplePage: React.FC = () => {
-    const { people, peopleLoading, peopleTotal, peopleUnnamedTotal, peopleHasMore, peopleUnavailable, loadMorePeople, navigate, mergePeopleBatch, deletePeopleBatch, fetchPeople } = useStore();
+    const { people, peopleLoading, peopleTotal, peopleUnnamedTotal, peopleHasMore, peopleUnavailable, loadMorePeople, navigate, mergePeopleBatch, deletePeopleBatch, fetchPeople, route } = useStore();
 
     // Loads people when this tab is actually visited, queued behind whatever
     // else is in flight, aborted if the user navigates away before its turn.
@@ -119,9 +129,54 @@ export const PeoplePage: React.FC = () => {
         );
     }
 
+    const renderCard = (person: Person) => {
+        const coverSrc = person.coverThumbnailUrl ? covers[person.coverThumbnailUrl] : undefined;
+        const checked = selectedSet.has(person.id);
+        return (
+            <button
+                key={person.id}
+                type="button"
+                className={`pt-person-card${checked ? ' selected' : ''}${person.id === route.params.personId ? ' current' : ''}`}
+                onClick={() => {
+                    if (longPressedRef.current) {
+                        longPressedRef.current = false;
+                        return;
+                    }
+                    if (selectMode) toggleSelect(person.id);
+                    else navigate('person', { personId: person.id });
+                }}
+                onTouchStart={() => startLongPress(person.id)}
+                onTouchMove={clearLongPress}
+                onTouchEnd={clearLongPress}
+                onTouchCancel={clearLongPress}
+                // Android opens the image context menu on a hold; the hold selects here.
+                onContextMenu={(e) => e.preventDefault()}
+            >
+                <span className="pt-person-face-wrap">
+                    {coverSrc
+                        ? <img className="pt-person-face" src={coverSrc} alt={person.name ?? 'Unnamed person'} draggable={false} />
+                        : <Swatch swatch={person.swatch} className="pt-person-face" />}
+                    {selectMode && (
+                        <span className={`pt-album-row-check pt-person-check${checked ? ' on' : ''}`} aria-hidden="true">
+                            <CheckIcon />
+                        </span>
+                    )}
+                </span>
+                <span className={`pt-person-name${person.name ? '' : ' unnamed'}`}>{person.name ?? 'Add name'}</span>
+                <span className="pt-person-count">{plural(person.faceCount ?? 0, 'photo')}</span>
+            </button>
+        );
+    };
+    // Named first, then the ones waiting for a name (the server already pages named first).
+    const named = people.filter((p) => p.name);
+    const unnamed = people.filter((p) => !p.name);
+    const firstUnnamed = unnamed[0];
+
     return (
-        <div>
-            <div className="pt-toolbar">
+        <div className="pt-people">
+            {/* Phones reach People from the Albums tab, so the way back says Albums. */}
+            <button type="button" className="pt-back pt-phone-only" onClick={() => navigate('albums')}><ArrowLeftIcon /> Albums</button>
+            <div className="pt-toolbar pt-people-toolbar">
                 <div>
                     <h1 className="pt-page-title">People</h1>
                     <p className="pt-page-sub">{peopleTotal.toLocaleString()} people{unnamedCount > 0 ? ` · ${unnamedCount} to name` : ''}</p>
@@ -132,44 +187,34 @@ export const PeoplePage: React.FC = () => {
                     </button>
                 )}
             </div>
-            <div className="pt-people-grid">
-                {people.map((person) => {
-                    const coverSrc = person.coverThumbnailUrl ? covers[person.coverThumbnailUrl] : undefined;
-                    const checked = selectedSet.has(person.id);
-                    return (
-                        <button
-                            key={person.id}
-                            type="button"
-                            className={`pt-person-card${checked ? ' selected' : ''}`}
-                            onClick={() => {
-                                if (longPressedRef.current) {
-                                    longPressedRef.current = false;
-                                    return;
-                                }
-                                if (selectMode) toggleSelect(person.id);
-                                else navigate('person', { personId: person.id });
-                            }}
-                            onTouchStart={() => startLongPress(person.id)}
-                            onTouchMove={clearLongPress}
-                            onTouchEnd={clearLongPress}
-                            onTouchCancel={clearLongPress}
-                            // Android opens the image context menu on a hold; the hold selects here.
-                            onContextMenu={(e) => e.preventDefault()}
-                        >
-                            {selectMode && (
-                                <span className={`pt-album-row-check pt-person-check${checked ? ' on' : ''}`} aria-hidden="true">
-                                    <CheckIcon />
-                                </span>
-                            )}
-                            {coverSrc
-                                ? <img className="pt-person-face" src={coverSrc} alt={person.name ?? 'Unnamed person'} draggable={false} />
-                                : <Swatch swatch={person.swatch} className="pt-person-face" />}
-                            <span className={`pt-person-name${person.name ? '' : ' unnamed'}`}>{person.name ?? 'Add name'}</span>
-                            <span className="pt-person-count">{plural(person.faceCount ?? 0, 'photo')}</span>
-                        </button>
-                    );
-                })}
-            </div>
+            {/* A prompt to name the rest: names make people searchable. */}
+            {!selectMode && unnamedCount > 0 && firstUnnamed && (
+                <div className="pt-name-banner">
+                    <span className="pt-face-stack" aria-hidden="true">
+                        {unnamed.slice(0, 3).map((p) => {
+                            const src = p.coverThumbnailUrl ? covers[p.coverThumbnailUrl] : undefined;
+                            return src ? <img key={p.id} src={src} alt="" /> : <Swatch key={p.id} swatch={p.swatch} />;
+                        })}
+                    </span>
+                    <span className="pt-name-banner-text">
+                        <b>Name {unnamedCount.toLocaleString()} more {unnamedCount === 1 ? 'person' : 'people'}</b>
+                        <small>Names make them searchable.</small>
+                    </span>
+                    <button type="button" className="btn btn-primary btn-sm" onClick={() => navigate('person', { personId: firstUnnamed.id })}>Start</button>
+                </div>
+            )}
+            {named.length > 0 && (
+                <>
+                    <h2 className="pt-section-label">Named</h2>
+                    <div className="pt-people-grid">{named.map(renderCard)}</div>
+                </>
+            )}
+            {unnamed.length > 0 && (
+                <>
+                    <h2 className="pt-section-label">Not named yet</h2>
+                    <div className="pt-people-grid">{unnamed.map(renderCard)}</div>
+                </>
+            )}
             {peopleHasMore && <ScrollSentinel onVisible={loadMorePeople} deps={people.length} />}
             {people.length > 1 && (
                 <FloatingSelectButton
@@ -208,14 +253,13 @@ export const PersonDetailPage: React.FC = () => {
     const personId = route.params.personId;
     const person = personId ? personById(personId) : undefined;
     const [draft, setDraft] = useState(person?.name ?? '');
-    const [mergeId, setMergeId] = useState('');
+    const [mergeOpen, setMergeOpen] = useState(false);
     const [mergeQuery, setMergeQuery] = useState('');
     const [mergeResults, setMergeResults] = useState<Person[]>([]);
-    const [chosenMerge, setChosenMerge] = useState<Person | null>(null);
     // The merge picker only searches once it is used (typing or focus), not on every person that is opened.
     const [mergeActive, setMergeActive] = useState(false);
     const [findingFaces, setFindingFaces] = useState(false);
-    const [personTile, setPersonTile] = useTileSize('photostore.personTileSize');
+    const [personTile] = useTileSize('photostore.personTileSize');
     const headCover = useProtectedBlobUrls(person?.coverThumbnailUrl ? [person.coverThumbnailUrl] : []);
 
     useEffect(() => {
@@ -248,12 +292,8 @@ export const PersonDetailPage: React.FC = () => {
         );
     }
 
-    // The merge picker searches on the server (name contains), so it works however many clusters
-    // exist; the chosen person always stays listed so the selection never silently disappears.
+    // The merge picker searches on the server (name contains), so it works however many clusters exist.
     const mergeMatches = mergeResults.filter((p) => p.id !== person.id);
-    const mergeOptions = mergeId && !mergeMatches.some((o) => o.id === mergeId) && chosenMerge
-        ? [...mergeMatches, chosenMerge]
-        : mergeMatches;
     const photos = personPhotosById(person.id);
     const photoCount = personPhotosHasMore(person.id)
         ? (personPhotosTotal(person.id) ?? photos?.length ?? person.faceCount ?? 0)
@@ -272,50 +312,67 @@ export const PersonDetailPage: React.FC = () => {
         navigate('people');
     };
 
+    const saveName = () => {
+        const next = draft.trim();
+        if (!next || next === person.name) return;
+        renamePerson(person.id, next);
+        toast('Name saved');
+    };
+    const firstSeen = photos && photos.length && !personPhotosHasMore(person.id)
+        ? photos.map((p) => p.captureDate).filter((d): d is string => Boolean(d)).sort()[0]
+        : undefined;
+    const firstSeenDay = firstSeen ? captureWallClock(firstSeen) : null;
+
     return (
-        <div>
-            <button type="button" className="pt-back" onClick={() => navigate('people')}><ArrowLeftIcon /> People</button>
-            <div className="pt-toolbar pt-person-toolbar">
-                <div className="pt-person-head">
-                    {coverSrc
-                        ? <img className="pt-person-head-face" src={coverSrc} alt={person.name ?? 'Unnamed person'} />
-                        : <Swatch swatch={person.swatch} className="pt-person-head-face" />}
-                    <div className="pt-person-name-row">
-                        <input
-                            className="field"
-                            value={draft}
-                            placeholder="Add a name"
-                            onChange={(e) => setDraft(e.target.value)}
-                            onKeyDown={(e) => { if (e.key === 'Enter' && draft.trim()) { renamePerson(person.id, draft.trim()); toast('Name saved'); } }}
-                        />
-                        <button type="button" className="btn mock-cta" disabled={!draft.trim()} onClick={() => { renamePerson(person.id, draft.trim()); toast('Name saved'); }}>Save</button>
-                    </div>
-                </div>
-                <div className="pt-toolbar-actions">
-                    <button
-                        type="button"
-                        className="btn"
-                        disabled={findingFaces}
-                        onClick={() => {
-                            setFindingFaces(true);
-                            void findMoreFaces(person.id).finally(() => setFindingFaces(false));
-                        }}
-                    >
-                        <SparklesIcon className="toolbar-icon" /> {findingFaces ? 'Looking…' : 'Find more faces'}
-                    </button>
-                    <button type="button" className="btn btn-danger" onClick={() => void handleDeletePerson()}><TrashIcon className="toolbar-icon" /> Delete</button>
-                </div>
-            </div>
-            <div className="pt-album-photos-head pt-person-photos-head">
-                <p className="pt-page-sub" style={{ margin: 0 }}>{photoCount.toLocaleString()} {photoCount === 1 ? 'photo' : 'photos'}</p>
-                <div className="pt-album-photos-actions">
-                    <ThumbSizeControl value={personTile} onChange={setPersonTile} />
-                    {photos && photos.length > 0 && (
-                        <button type="button" className="pt-linkish" onClick={() => setPhotoSelectMode(!photoSelectMode)}>
-                            {photoSelectMode ? 'Done' : 'Select'}
-                        </button>
+        <div className="pt-person">
+            <div className="pt-person-nav">
+                <button type="button" className="pt-back" onClick={() => navigate('people')}><ArrowLeftIcon /> People</button>
+                <Menu
+                    align="right"
+                    renderTrigger={(toggle) => (
+                        <button type="button" className="btn btn-icon btn-sm" aria-label="Person options" onClick={toggle}><MoreIcon /></button>
                     )}
-                </div>
+                >
+                    {(close) => (
+                        <div className="pt-more-menu">
+                            <button type="button" onClick={() => { close(); setMergeOpen(true); setMergeActive(true); }}>Merge with someone else…</button>
+                            <button type="button" disabled={findingFaces} onClick={() => {
+                                close();
+                                setFindingFaces(true);
+                                void findMoreFaces(person.id).finally(() => setFindingFaces(false));
+                            }}>{findingFaces ? 'Looking for more faces…' : 'Find more faces'}</button>
+                            <button type="button" className="danger" onClick={() => { close(); void handleDeletePerson(); }}>Delete person</button>
+                        </div>
+                    )}
+                </Menu>
+            </div>
+            {/* Name them right here: the field is the heading. */}
+            <div className="pt-who">
+                {coverSrc
+                    ? <img className="pt-who-face" src={coverSrc} alt={person.name ?? 'Unnamed person'} />
+                    : <Swatch swatch={person.swatch} className="pt-who-face" />}
+                <input
+                    className="field pt-who-name"
+                    value={draft}
+                    placeholder="Add a name"
+                    aria-label="Name"
+                    onChange={(e) => setDraft(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') { saveName(); (e.target as HTMLInputElement).blur(); } }}
+                    onBlur={saveName}
+                />
+                <small>
+                    {photoCount.toLocaleString()} {photoCount === 1 ? 'photo' : 'photos'}
+                    {firstSeenDay ? ` · first seen ${FIRST_SEEN_FORMAT.format(firstSeenDay)}` : ''}
+                </small>
+            </div>
+
+            <div className="pt-person-photos-head">
+                <h2 className="pt-section-label">Photos</h2>
+                {photos && photos.length > 0 && (
+                    <button type="button" className="pt-linkish" onClick={() => setPhotoSelectMode(!photoSelectMode)}>
+                        {photoSelectMode ? 'Done' : 'Select'}
+                    </button>
+                )}
             </div>
 
             {photos === undefined && personPhotosLoading ? (
@@ -327,27 +384,34 @@ export const PersonDetailPage: React.FC = () => {
                 </div>
             )}
 
-            <div className="card-glass pt-merge">
-                <div className="pt-menu-label">Merge another person into {person.name ?? 'this person'}</div>
-                <div className="pt-merge-row">
-                    <input
-                        className="field"
-                        type="search"
-                        value={mergeQuery}
-                        onChange={(e) => setMergeQuery(e.target.value)}
-                        onFocus={() => setMergeActive(true)}
-                        placeholder="Search people by name…"
-                        aria-label="Search people to merge"
-                    />
-                    <select className="field field-select" onFocus={() => setMergeActive(true)} value={mergeId} onChange={(e) => { setMergeId(e.target.value); setChosenMerge(mergeResults.find((p) => p.id === e.target.value) ?? null); }} aria-label="Person to merge">
-                        <option value="">Choose a person…</option>
-                        {mergeOptions.map((o) => (
-                            <option key={o.id} value={o.id}>{o.name ?? 'Unnamed'} · {plural(o.faceCount ?? 0, 'photo')}</option>
-                        ))}
-                    </select>
-                    <button type="button" className="btn" disabled={!mergeId} onClick={() => { mergePeople(mergeId, person.id); setMergeId(''); }}>Merge</button>
+            <BottomSheet
+                open={mergeOpen}
+                onClose={() => setMergeOpen(false)}
+                title={`Merge into ${person.name ?? 'this person'}`}
+                header={(
+                    <div className="pt-sheet-search">
+                        <SearchIcon />
+                        <input
+                            type="search"
+                            value={mergeQuery}
+                            onChange={(e) => setMergeQuery(e.target.value)}
+                            placeholder="Search people by name…"
+                            aria-label="Search people to merge"
+                        />
+                    </div>
+                )}
+            >
+                <p className="pt-sheet-intro">Their photos join {person.name ?? 'this person'}, and the two become one person.</p>
+                <div className="pt-merge-list">
+                    {mergeMatches.length === 0 && <p className="pt-grid-empty">No one matches.</p>}
+                    {mergeMatches.map((o) => (
+                        <button key={o.id} type="button" className="pt-merge-option" onClick={() => { mergePeople(o.id, person.id); setMergeOpen(false); }}>
+                            <MergeFace person={o} />
+                            <span><b>{o.name ?? 'Not named yet'}</b><small>{plural(o.faceCount ?? 0, 'photo')}</small></span>
+                        </button>
+                    ))}
                 </div>
-            </div>
+            </BottomSheet>
         </div>
     );
 };

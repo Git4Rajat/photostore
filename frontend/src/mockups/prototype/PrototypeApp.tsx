@@ -7,23 +7,17 @@ import { perf } from '../../services/perf';
 import React, { useCallback, useEffect, useState } from 'react';
 import { MemoryRouter, BrowserRouter, Routes, Route } from 'react-router-dom';
 import {
-    Plus as PlusIcon,
     Search as MagnifyingGlassIcon,
     Image as PhotoIcon,
     Images as RectangleStackIcon,
-    Users as UserGroupIcon,
-    Sparkles as SparklesIcon,
-    MoreHorizontal as EllipsisHorizontalIcon,
+    CloudUpload as UploadIcon,
     // The active-tab "solid" cue is handled by color + a heavier stroke in the
     // tab bar (Lucide is a single outline set), so the solid aliases point at
     // the same glyphs.
     Search as MagnifyingGlassIconSolid,
     Image as PhotoIconSolid,
     Images as RectangleStackIconSolid,
-    Users as UserGroupIconSolid,
-    Sparkles as SparklesIconSolid,
 } from 'lucide-react';
-import { LogoLockup } from '../../components/shared/Logo';
 import { NAV_ITEMS } from './components/HomeChrome';
 import Loading from '../../components/shared/Loading';
 import { CachedGalleryPreview, PreviewUntilGallery, useHomeSnapshot } from './components/CachedGalleryPreview';
@@ -34,6 +28,9 @@ import { NotificationBell } from '../../components/AppServiceIndicators';
 import { DialogHost } from '../../components/shared/dialogs';
 import { getActiveAccount, initAuth, isAuthEnabled, signIn, signOut } from '../../services/authClient';
 import { StoreProvider, useStore } from './store';
+
+import type { Route as AppRoute } from './types';
+import AppSidebar from './components/AppSidebar';
 import { Menu } from './components/bits';
 import CommandBar from './components/CommandBar';
 import PhotoViewer from './components/PhotoViewer';
@@ -88,24 +85,33 @@ const isConfirmLibraryCleanPath = (): boolean =>
     typeof window !== 'undefined' && window.location.pathname === '/confirm-library-clean';
 
 const NAV: { id: PageId; label: string }[] = [...NAV_ITEMS];
-// The phone tab bar holds 5 primary destinations; the remaining ones live
-// behind a "More" tab (HIG: fold overflow beyond 5 tabs into More rather than
-// dropping those destinations, which previously left Tools/Sharing unreachable
-// on mobile).
-const MOBILE_NAV = NAV.slice(0, 5);
-const MOBILE_MORE = NAV.slice(5); // Tools, Sharing
+// The phone tab bar holds the three places people live in. People and Explore
+// are reached from the Albums tab; Library & sharing, Recently Deleted and
+// Tools sit in the account menu.
+const MOBILE_NAV = NAV.slice(0, 3);
 
 const MOBILE_NAV_ICONS: Record<string, [React.ElementType, React.ElementType]> = {
     ask: [MagnifyingGlassIcon, MagnifyingGlassIconSolid],
     gallery: [PhotoIcon, PhotoIconSolid],
     albums: [RectangleStackIcon, RectangleStackIconSolid],
-    people: [UserGroupIcon, UserGroupIconSolid],
-    explore: [SparklesIcon, SparklesIconSolid],
 };
 
+const ACCOUNT_PAGES: PageId[] = ['trash', 'additional', 'tools', 'sharing'];
 const activeNavFor = (page: PageId): PageId | '' => (
-    page === 'person' ? 'people' : (page === 'trash' || page === 'additional') ? '' : page
+    page === 'person' ? 'people' : ACCOUNT_PAGES.includes(page) ? '' : page
 );
+// On a phone People and Explore live under the Albums tab.
+const activeMobileNavFor = (page: PageId): PageId | '' => {
+    const active = activeNavFor(page);
+    return active === 'people' || active === 'explore' ? 'albums' : active;
+};
+
+const PAGE_TITLES: Record<PageId, string> = {
+    gallery: 'Photos', ask: 'Search', albums: 'Albums', people: 'People', person: 'People',
+    explore: 'Places and things', sharing: 'Library', tools: 'Tools', trash: 'Recently deleted', additional: 'About',
+};
+/** What the phone header calls the page. An open album still says Albums: its cover banner carries the name. */
+const pageTitle = (route: AppRoute): string => PAGE_TITLES[route.page] ?? 'Keepsake';
 
 const Page: React.FC = () => {
     const { route } = useStore();
@@ -116,7 +122,13 @@ const Page: React.FC = () => {
         case 'gallery': return <GalleryPage />;
         case 'albums': return <AlbumsPage />;
         case 'people': return <PeoplePage />;
-        case 'person': return <PersonDetailPage />;
+        // Desktops keep the People grid beside the person; phones show the person alone.
+        case 'person': return (
+            <div className="pt-people-split">
+                <div className="pt-people-split-list"><PeoplePage /></div>
+                <aside className="pt-people-split-panel" aria-label="Person"><PersonDetailPage /></aside>
+            </div>
+        );
         case 'explore': return <ExplorePage />;
         case 'sharing': return <SharingPage />;
         case 'tools': return <ToolsPage />;
@@ -127,29 +139,44 @@ const Page: React.FC = () => {
 };
 
 const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: () => void }> = ({ theme, onTheme, onSignOut }) => {
-    const { route, navigate, toast } = useStore();
+    const { route, navigate } = useStore();
     const { requestUpload } = useAppServices();
     const active = activeNavFor(route.page);
     const account = getActiveAccount();
     const accountName = account?.name || account?.username || 'Signed in';
     const accountEmail = account?.username || '';
     const initials = initialsFor(account?.name || account?.username || '');
+    // "/" opens Search from anywhere, unless you're typing.
+    useEffect(() => {
+        const onKey = (e: KeyboardEvent) => {
+            if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return;
+            const el = e.target as HTMLElement | null;
+            if (el && (el.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName))) return;
+            e.preventDefault();
+            navigate('ask');
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+    }, [navigate]);
 
     return (
         <header className="ios-header">
-            <button type="button" className="pt-wordmark-btn" onClick={() => navigate('gallery')} aria-label="Go to Gallery">
-                <LogoLockup size={30} className="ios-header-wordmark" />
+            {/* Phones: the page's own title sits in the header row (the page hides its
+                copy). Desktops: the sidebar names the page, and the header holds search. */}
+            <h1 className="pt-header-title">{pageTitle(route)}</h1>
+            <button type="button" className="pt-header-search" onClick={() => navigate('ask')}>
+                <MagnifyingGlassIcon aria-hidden="true" /> <span>Search people, places and things</span><kbd aria-hidden="true">/</kbd>
             </button>
             <nav className="ios-tabs" aria-label="Primary navigation">
                 {NAV.map((item) => (
-                    <button key={item.id} type="button" className={`ios-tab${item.id === active ? ' active' : ''}`} onClick={() => navigate(item.id)}>
+                    <button key={item.id} type="button" className={`ios-tab${item.id === active ? ' active' : ''}`} aria-current={item.id === active ? 'page' : undefined} onClick={() => navigate(item.id)}>
                         {item.label}
                     </button>
                 ))}
             </nav>
             <div className="app-header-actions">
-                <button type="button" className="btn mock-cta pt-upload-btn" onClick={requestUpload} aria-label="Upload">
-                    <PlusIcon className="toolbar-icon" /> <span className="pt-upload-label">Upload</span>
+                <button type="button" className="btn btn-primary btn-sm pt-upload-btn" onClick={requestUpload}>
+                    <UploadIcon className="toolbar-icon" /> <span className="pt-upload-label">Upload</span>
                 </button>
 
                 <NotificationBell />
@@ -163,9 +190,10 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
                     {(close) => (
                         <div className="pt-account-menu">
                             <div className="pt-account-head"><b>{accountName}</b>{accountEmail && <span>{accountEmail}</span>}</div>
-                            <button type="button" onClick={() => { navigate('trash'); close(); }}>Recently Deleted</button>
-                            <button type="button" onClick={() => { toast('Corrupted uploads: all clear'); close(); }}>Corrupted Uploads</button>
-                            <button type="button" onClick={() => { navigate('additional'); close(); }}>Additional Info</button>
+                            <button type="button" onClick={() => { navigate('sharing'); close(); }}>Library and sharing</button>
+                            <button type="button" onClick={() => { navigate('trash'); close(); }}>Recently deleted</button>
+                            <button type="button" onClick={() => { navigate('tools'); close(); }}>Tools</button>
+                            <button type="button" onClick={() => { navigate('additional'); close(); }}>About Keepsake</button>
                             <div className="pt-account-sep" />
                             <div className="pt-account-theme">
                                 <span>Theme</span>
@@ -176,7 +204,7 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
                                 </div>
                             </div>
                             <div className="pt-account-sep" />
-                            <button type="button" onClick={() => { close(); onSignOut(); }}>Sign Out</button>
+                            <button type="button" onClick={() => { close(); onSignOut(); }}>Sign out</button>
                         </div>
                     )}
                 </Menu>
@@ -186,9 +214,10 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
 };
 
 const MobileTabbar: React.FC = () => {
-    const { route, navigate } = useStore();
-    const active = activeNavFor(route.page);
-    const moreActive = MOBILE_MORE.some((item) => item.id === route.page);
+    const { route, navigate, selection, selectMode } = useStore();
+    const active = activeMobileNavFor(route.page);
+    // While selecting, the selection's action bar takes this bar's place.
+    if (selection.length || (selectMode && (route.page === 'gallery' || route.page === 'albums'))) return null;
     return (
         <nav className="mock-tabbar" aria-label="Primary navigation (mobile)">
             {MOBILE_NAV.map((item) => {
@@ -196,30 +225,12 @@ const MobileTabbar: React.FC = () => {
                 const [Outline, Solid] = MOBILE_NAV_ICONS[item.id];
                 const Icon = isActive ? Solid : Outline;
                 return (
-                    <button key={item.id} type="button" className={isActive ? 'on' : undefined} onClick={() => navigate(item.id)}>
+                    <button key={item.id} type="button" className={isActive ? 'on' : undefined} aria-current={isActive ? 'page' : undefined} onClick={() => navigate(item.id)}>
                         <Icon className="mock-tabbar-icon" aria-hidden="true" strokeWidth={isActive ? 2.5 : 2} />
                         <span>{item.label}</span>
                     </button>
                 );
             })}
-            <Menu
-                align="right"
-                className="mock-tabbar-more"
-                renderTrigger={(toggle) => (
-                    <button type="button" className={moreActive ? 'on' : undefined} onClick={toggle} aria-haspopup="menu" aria-label="More">
-                        <EllipsisHorizontalIcon className="mock-tabbar-icon" aria-hidden="true" />
-                        <span>More</span>
-                    </button>
-                )}
-            >
-                {(close) => (
-                    <div className="pt-more-menu">
-                        {MOBILE_MORE.map((item) => (
-                            <button key={item.id} type="button" onClick={() => { navigate(item.id); close(); }}>{item.label}</button>
-                        ))}
-                    </div>
-                )}
-            </Menu>
         </nav>
     );
 };
@@ -363,6 +374,7 @@ const Shell: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
             <div className="mock-stage">
                 <div className="mock-viewport">
                     <div className="mock-app">
+                        <AppSidebar />
                         <Topbar theme={theme} onTheme={chooseTheme} onSignOut={onSignOut} />
                         <div className="mock-body pt-body">
                             <UploadPausedBanner />

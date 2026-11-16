@@ -46,13 +46,13 @@ import type {
 } from './types';
 import { routeToSearch, searchToRoute } from './routeUrl';
 
-/** The album the Albums page is showing: the one ?albumId names, or for the
- *  bare Albums tab the first album, which the detail pane previews. Undefined
- *  off the Albums page and while an explicit albumId hasn't loaded yet. */
+/** The album open on the Albums page: the one ?albumId names. The bare Albums
+ *  tab shows album cards, not an album. Undefined off the Albums page and
+ *  while an explicit albumId hasn't loaded yet. */
 export const shownAlbum = (route: Route, albums: Album[]): Album | undefined => {
     if (route.page !== 'albums') return undefined;
     const id = route.params.albumId;
-    return id ? albums.find((a) => a.id === id) : albums[0];
+    return id ? albums.find((a) => a.id === id) : undefined;
 };
 
 // ---- backend <-> prototype photo mapping -------------------------------------
@@ -82,6 +82,9 @@ const withIndexRetry = async <T,>(fetchIndex: () => Promise<T | null>): Promise<
     }
     return null;
 };
+
+const VIEWER_HISTORY_KEY = 'keepsakeViewer';
+const isViewerHistoryEntry = (): boolean => Boolean((window.history.state as Record<string, unknown> | null)?.[VIEWER_HISTORY_KEY]);
 
 // Puts `photos` back at the front of `list`, skipping any already there: a
 // restore racing a failed delete's rollback must not list a photo twice.
@@ -545,6 +548,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // final fetch always reflects whatever filters/range are current by then.
     const pendingResetRef = useRef(false);
     const [albums, setAlbums] = useState<Album[]>([]);
+    // The latest albums for callbacks that must not re-create on every list change.
+    const albumsRef = useRef<Album[]>(albums);
+    albumsRef.current = albums;
     const [albumsLoading, setAlbumsLoading] = useState<boolean>(true);
     const albumsLoadedAtRef = useRef<number | null>(null);
     const albumsFetchRef = useRef<Promise<void> | null>(null);
@@ -635,6 +641,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const [selection, setSelection] = useState<string[]>([]);
     const [selectMode, setSelectModeState] = useState<boolean>(false);
     const [viewer, setViewer] = useState<ViewerState | null>(null);
+    // Whether the viewer's history entry is live (see openViewer), and whether
+    // the next popstate is our own history.back() from closeViewer.
+    const viewerOpenRef = useRef(false);
+    const closingViewerRef = useRef(false);
     const [toasts, setToasts] = useState<Toast[]>([]);
     const toastTimers = useRef<Record<string, number>>({});
 
@@ -1108,8 +1118,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     const toast = useCallback(
         (message: string, actionLabel?: string, onAction?: () => void, tone: 'info' | 'error' = 'info') => {
-            // With a panel mounted, the bell previews it and the panel records it.
-            if (publishNotification(message, '', actionLabel && onAction ? { label: actionLabel, onClick: onAction } : undefined)) return;
+            // Confirmations ("Album renamed") show briefly and aren't saved, so the
+            // bell holds only what's worth reading again. Problems go to the bell.
+            if (tone === 'error' && publishNotification(message, '', actionLabel && onAction ? { label: actionLabel, onClick: onAction } : undefined)) return;
             const id = nextId();
             setToasts((prev) => [...prev, { id, message, actionLabel, onAction, tone }]);
             toastTimers.current[id] = window.setTimeout(() => {
@@ -1133,14 +1144,27 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         // same album) would otherwise pile up a duplicate history entry.
         const next = `${window.location.pathname}${routeToSearch({ page, params })}`;
         if (`${window.location.pathname}${window.location.search}` !== next) {
-            window.history.pushState(null, '', next);
+            // Leaving from inside the viewer: reuse its history entry rather
+            // than leaving a dead "viewer open" step behind the new page.
+            if (isViewerHistoryEntry()) window.history.replaceState(null, '', next);
+            else window.history.pushState(null, '', next);
         }
+        viewerOpenRef.current = false;
     }, []);
 
     // Back/forward: resync in-memory route state from the URL the browser
     // just navigated to, instead of only ever moving forward via navigate().
     useEffect(() => {
         const onPopState = () => {
+            // Our own history.back() from closeViewer: the viewer is already shut.
+            if (closingViewerRef.current) { closingViewerRef.current = false; return; }
+            // Back while the viewer is open closes the viewer and nothing else --
+            // the page underneath (its zoom, scroll and filters) stays as it was.
+            if (viewerOpenRef.current) {
+                viewerOpenRef.current = false;
+                setViewer(null);
+                return;
+            }
             setRoute(searchToRoute(window.location.search));
             setSelection([]);
             setSelectModeState(false);
@@ -1162,10 +1186,26 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }, []);
     const clearSelection = useCallback(() => { setSelection([]); setSelectModeState(false); }, []);
 
-    const openViewer = useCallback((ids: string[], index: number, opts?: { extendable?: boolean }) => (
-        setViewer({ ids, index, extendable: opts?.extendable })
-    ), []);
+    // The open viewer owns one history entry (same URL), so the browser's or
+    // phone's Back closes the photo instead of leaving the page under it.
+    const openViewer = useCallback((ids: string[], index: number, opts?: { extendable?: boolean }) => {
+        if (!viewerOpenRef.current) {
+            viewerOpenRef.current = true;
+            window.history.pushState({ [VIEWER_HISTORY_KEY]: true }, '', `${window.location.pathname}${window.location.search}`);
+        }
+        setViewer({ ids, index, extendable: opts?.extendable });
+    }, []);
     const closeViewer = useCallback(() => setViewer(null), []);
+    // However the viewer closed (Back button, Escape, a deletion emptying it,
+    // a page change), drop its history entry so the next Back leaves the page.
+    useEffect(() => {
+        if (viewer || !viewerOpenRef.current) return;
+        viewerOpenRef.current = false;
+        if (isViewerHistoryEntry()) {
+            closingViewerRef.current = true;
+            window.history.back();
+        }
+    }, [viewer]);
     const viewerStep = useCallback((delta: number) => {
         setViewer((prev) => {
             if (!prev) return prev;
@@ -1268,6 +1308,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 photoCount: r.photoCount,
                 updatedAt: r.updatedAt,
                 coverThumbnailUrl: r.coverFilename ? covers.get(r.coverFilename) || undefined : undefined,
+                ...(r.coverFilename ? { coverFilename: r.coverFilename } : {}),
                 isPublic: r.isPublic,
                 publicUrl: r.publicUrl || undefined,
                 publicExpiresAt: r.publicExpiresAt || undefined,
@@ -2146,14 +2187,20 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         )
             .then(() => {
                 publishLibraryChange('album-photos-removed', ['albums'], { itemCount: ids.length });
-                toast(`Removed ${ids.length} photo${ids.length > 1 ? 's' : ''} from the album`);
+                // Say where the photos still are, and offer the way back.
+                const name = albumsRef.current.find((a) => a.id === albumId)?.name;
+                toast(
+                    `Removed ${ids.length === 1 ? '1 item' : `${ids.length} items`} from ${name ? `“${name}”` : 'the album'}. ${ids.length === 1 ? 'It’s' : 'They’re'} still in Photos.`,
+                    'Undo',
+                    () => { void addPhotosToAlbum(albumId, ids); },
+                );
                 void openAlbum(albumId);
             })
             .catch(() => {
                 toast('Couldn’t remove photos from the album', undefined, undefined, 'error');
                 void openAlbum(albumId);
             });
-    }, [openAlbum, toast, clearSelection]);
+    }, [openAlbum, toast, clearSelection, addPhotosToAlbum]);
 
     type DeleteMultipleResponse = { deletedAlbums?: string[]; albumErrors?: { albumId: string; error: string }[]; success?: boolean };
 

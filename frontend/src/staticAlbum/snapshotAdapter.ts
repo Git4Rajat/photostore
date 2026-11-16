@@ -1,6 +1,6 @@
 import { AxiosError, type AxiosAdapter, type InternalAxiosRequestConfig } from 'axios';
 
-interface SnapshotManifestPhoto { n: string; rot?: number; trot?: number; video?: boolean; t?: string; p?: string }
+interface SnapshotManifestPhoto { n: string; rot?: number; trot?: number; video?: boolean; t?: string; p?: string; g?: string }
 export interface SnapshotManifest {
     name?: string; total: number; cached: number; building?: boolean; expiresAt?: string; photos: SnapshotManifestPhoto[];
 }
@@ -39,6 +39,8 @@ export const manifestToAlbumResponse = (manifest: SnapshotManifest, base: string
         // Originals (downloads, videos, photos without a cached preview) come from the real archive API.
         url: `/public/photos/${encodeURIComponent(token)}/image/${p.n.split('/').map(encodeURIComponent).join('/')}`,
         thumbnailUrl: p.t ? new URL(p.t, base).href : undefined,
+        // The sharp grid-tile image; older snapshots and photos without one have none.
+        ...(p.g ? { gridUrl: new URL(p.g, base).href } : {}),
         previewUrl: p.p ? new URL(p.p, base).href : undefined,
         rotation: p.rot || 0,
         thumbnailRotation: p.trot || 0,

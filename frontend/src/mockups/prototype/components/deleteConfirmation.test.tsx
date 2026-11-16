@@ -22,7 +22,7 @@ vi.mock('../../../services/jobNotifications', () => ({ requestJobPoll: vi.fn() }
 vi.mock('../../../services/imageClient', () => ({ useProtectedBlobUrls: () => ({}) }));
 vi.mock('../../../components/shared/dialogs', () => ({ confirmDialog: mocks.confirm, promptDialog: vi.fn() }));
 vi.mock('../media', () => ({
-    setPhotoRotation: vi.fn(), preloadMediaAccessUrls: vi.fn(), fetchPhotoMetadata: vi.fn(), downloadPhoto: vi.fn(),
+    setPhotoRotation: vi.fn(), preloadMediaAccessUrls: vi.fn(), fetchPhotoMetadata: vi.fn().mockResolvedValue(null), downloadPhoto: vi.fn(),
     useMainMedia: () => ({ url: '', loading: false, progress: 0, status: '' }),
     useVideoSource: () => ({ src: undefined, failed: false, poster: undefined, reportError: vi.fn() }),
     useLiveClipSource: () => undefined,
@@ -48,6 +48,8 @@ const expectedDialog = (count: number) => expect.objectContaining({
     message: count === 1
         ? 'It moves to Recently Deleted, where you can restore it for 30 days.'
         : 'They move to Recently Deleted, where you can restore them for 30 days.',
+    // The button names what it does, as in the redesign: "Delete 3 items".
+    confirmLabel: `Delete ${count} ${count === 1 ? 'item' : 'items'}`,
     danger: true,
 });
 
@@ -87,7 +89,7 @@ describe('delete confirmation', () => {
         mocks.confirm.mockResolvedValue(false);
         await renderWith(<CommandBar />);
         await act(async () => { store.selectMany(['a.jpg', 'b.mp4', 'c.jpg']); });
-        const trash = screen.getByRole('button', { name: 'Delete from library' });
+        const trash = screen.getByRole('button', { name: 'Delete' });
         await act(async () => { fireEvent.click(trash); });
         expect(mocks.confirm).toHaveBeenCalledWith(expectedDialog(3));
         expect(deleteCalls()).toHaveLength(0);
@@ -111,16 +113,38 @@ describe('selection menu inside an album', () => {
     });
     afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
-    it('offers Remove from album, first, for the album the bare Albums tab shows', async () => {
+    it('puts Remove first in the bar for the open album, and it keeps photos in the library', async () => {
+        render(<StoreProvider><Probe /><CommandBar /></StoreProvider>);
+        await act(async () => { await store.fetchAlbums(true); });
+        await act(async () => { store.navigate('albums', { albumId: 'a2' }); });
+        await act(async () => { store.selectMany(['a.jpg']); });
+        const buttons = Array.from(document.querySelectorAll('.pt-action-bar > button'));
+        const remove = buttons.find((b) => b.textContent?.includes('Remove'));
+        expect(remove).toBeTruthy();
+        expect(buttons.indexOf(remove!)).toBeLessThan(buttons.findIndex((b) => b.textContent?.includes('Add to album')));
+        await act(async () => { fireEvent.click(remove!); });
+        expect(mocks.post).toHaveBeenCalledWith('/albums/a2/photos/remove', { filenames: ['a.jpg'] });
+        expect(mocks.post).not.toHaveBeenCalledWith('/photos/delete', expect.anything());
+    });
+
+    it('says the photos are still in Photos, and Undo puts them back', async () => {
+        render(<StoreProvider><Probe /><CommandBar /></StoreProvider>);
+        await act(async () => { await store.fetchAlbums(true); });
+        await act(async () => { store.navigate('albums', { albumId: 'a1' }); });
+        await act(async () => { store.removePhotosFromAlbum('a1', ['a.jpg', 'c.jpg']); });
+        await waitFor(() => expect(store.toasts.some((t) => t.message === 'Removed 2 items from “Trip”. They’re still in Photos.')).toBe(true));
+        const toast = store.toasts.find((t) => t.actionLabel === 'Undo');
+        await act(async () => { toast?.onAction?.(); });
+        expect(mocks.post).toHaveBeenCalledWith('/albums/a1/photos/add', { filenames: ['a.jpg', 'c.jpg'] });
+    });
+
+    // The bare Albums tab shows album cards; no album is open to remove from.
+    it('is not offered on the bare Albums tab', async () => {
         render(<StoreProvider><Probe /><CommandBar /></StoreProvider>);
         await act(async () => { await store.fetchAlbums(true); });
         await act(async () => { store.navigate('albums', {}); });
         await act(async () => { store.selectMany(['a.jpg']); });
-        fireEvent.click(screen.getByRole('button', { name: 'More options' }));
-        const items = Array.from(document.querySelectorAll('.pt-fm-menu .pt-fm-item'));
-        expect(items[0]?.textContent).toContain('Remove from album');
-        await act(async () => { fireEvent.click(screen.getByRole('button', { name: /Remove from album/ })); });
-        expect(mocks.post).toHaveBeenCalledWith('/albums/a1/photos/remove', { filenames: ['a.jpg'] });
+        expect(screen.queryByRole('button', { name: /Remove/ })).toBeNull();
     });
 
     it('is not offered outside the Albums page', async () => {
@@ -128,7 +152,6 @@ describe('selection menu inside an album', () => {
         await act(async () => { await store.fetchAlbums(true); });
         await act(async () => { store.navigate('gallery', {}); });
         await act(async () => { store.selectMany(['a.jpg']); });
-        fireEvent.click(screen.getByRole('button', { name: 'More options' }));
-        expect(screen.queryByRole('button', { name: /Remove from album/ })).toBeNull();
+        expect(screen.queryByRole('button', { name: /Remove/ })).toBeNull();
     });
 });

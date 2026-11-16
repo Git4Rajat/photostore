@@ -123,11 +123,13 @@ def public_album(token: str):
             thumbnail_blob = app._derivative_blob_from_metadata(metadata, name, 'thumbnail', physical=physical)
         except ValueError:
             thumbnail_blob = None  # invalid receipt: the proxy route reports/handles it
-        urls = app._public_photo_urls(token, name, blob_name=physical, thumbnail_blob=thumbnail_blob)
+        urls = app._public_photo_urls(token, name, blob_name=physical, thumbnail_blob=thumbnail_blob,
+                                      grid_blob=app.grid_images.served_blob(metadata))
         photos.append({
             'filename': name,
             'url': urls['url'],
             'thumbnailUrl': urls['thumbnailUrl'],
+            **({'gridUrl': urls['gridUrl']} if urls.get('gridUrl') else {}),
             'previewUrl': urls.get('previewUrl') or '',
             'rawFullPreviewUrl': urls.get('rawFullPreviewUrl') or '',
             'rotation': app._normalize_rotation((metadata or {}).get('rotation', 0)),
@@ -138,6 +140,8 @@ def public_album(token: str):
         'album': {
             'name': entity.get('name', ''),
             'photoCount': total,
+            # When the link stops working, so the page can say so up front ('' = never).
+            'expiresAt': entity.get('publicExpiresAt') or '',
         },
         'photos': photos,
         'total': total,
@@ -211,6 +215,39 @@ def public_thumbnail(token: str, filename: str):
             return resp
         print(f"Unexpected error serving public thumbnail for {safe_name}: {str(exc)}", flush=True)
         return app.jsonify({'error': 'Thumbnail not found'}), 404
+
+@public_bp.route('/public/photos/<token>/grid/<path:filename>', methods=['GET'])
+def public_grid_image(token: str, filename: str):
+    """The sharp grid-tile image (grid_images.py), when signing a direct storage
+    URL isn't possible. Same album, expiry and access-code checks as the
+    thumbnail. A photo without one 404s rather than getting a placeholder: the
+    page's srcset only lists it when the album payload carried a gridUrl."""
+    entity = app._find_public_album_by_token(token)
+    if not entity or not app._coerce_bool(entity.get('isPublic', False)) or app._album_is_expired(entity):
+        return app.jsonify({'error': 'Not found'}), 404
+    if not app._album_grant_valid(entity, token):
+        return app.jsonify({'error': 'Not found'}), 404
+    safe_name = app._validate_media_filename(filename)
+    if not safe_name:
+        return app.jsonify({'error': 'Invalid filename'}), 400
+    if not app.album_store.contains(entity, safe_name):
+        return app.jsonify({'error': 'Not found'}), 404
+    owner_id = str(entity.get('PartitionKey') or '')
+    metadata = app._get_metadata_entity(owner_id, safe_name) if owner_id else None
+    blob = app.grid_images.served_blob(metadata)
+    if not blob or not app.blob_service_client:
+        return app.jsonify({'error': 'Not found'}), 404
+    try:
+        props = app.get_media_properties('thumbnail', blob)
+        return app._stream_media_response(
+            'thumbnail', blob, content_type=props.get('content_type') or app.GRID_CONTENT_TYPE,
+            cache_control=app._album_media_cache_control(entity, 3600), content_length=props.get('size'),
+        )
+    except Exception as exc:
+        if not app._is_missing_media_error(exc):
+            app.app.logger.warning('Public grid image failed for %s: %s', safe_name, exc)
+        return app.jsonify({'error': 'Not found'}), 404
+
 
 @public_bp.route('/public/photos/<token>/image/<path:filename>', methods=['GET'])
 def public_image(token: str, filename: str):

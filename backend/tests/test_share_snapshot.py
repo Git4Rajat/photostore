@@ -37,9 +37,10 @@ class FakeContainer:
         return SimpleNamespace(readall=lambda: self.blobs[name][0])
 
 
-def photo(name, version='v1', video=False, preview=b'P', thumb=b'T', rot=0):
+def photo(name, version='v1', video=False, preview=b'P', thumb=b'T', rot=0, grid=None):
     return ss.Photo(name, version=version, is_video=video, rotation=rot,
-                    read_thumbnail=lambda: thumb, read_preview=None if video else (lambda: preview))
+                    read_thumbnail=lambda: thumb, read_preview=None if video else (lambda: preview),
+                    read_grid=(lambda: grid) if grid is not None else None)
 
 
 def entity(**kw):
@@ -93,7 +94,25 @@ def test_build_writes_assets_then_manifest_then_page():
     assert c.uploads[-2:] == ['s/tok/manifest.json', 's/tok/index.html']
     manifest = json.loads(c.blobs['s/tok/manifest.json'][0])
     assert manifest['total'] == 2 and manifest['cached'] == 2
-    assert manifest['photos'][0] == {'n': 'a.jpg', 'rot': 0, 'trot': 0, 'video': False, 't': 't/0.jpg', 'p': 'p/0.jpg'}
+    assert manifest['photos'][0] == {'n': 'a.jpg', 'rot': 0, 'trot': 0, 'video': False, 't': 't/0.jpg', 'p': 'p/0.jpg', 'g': ''}
+
+
+def test_build_copies_grid_images_for_photos_that_have_one():
+    c = FakeContainer()
+    build(c, [photo('a.jpg', grid=b'G'), photo('b.jpg'), photo('v.mp4', video=True, grid=b'G')])
+    data, metadata, settings = c.blobs['s/tok/g/0.webp']
+    assert data == b'G' and metadata == {'v': 'v1'}
+    assert (settings['content_type'] if isinstance(settings, dict) else settings.content_type) == 'image/webp'
+    assert 's/tok/g/1.webp' not in c.blobs and 's/tok/g/2.webp' not in c.blobs   # none made / videos never
+    entries = json.loads(c.blobs['s/tok/manifest.json'][0])['photos']
+    assert [e['g'] for e in entries] == ['g/0.webp', '', '']
+
+
+def test_oversized_grid_images_are_left_out(monkeypatch):
+    monkeypatch.setattr(ss, 'GRID_MAX_BYTES', 4)
+    c = FakeContainer()
+    build(c, [photo('a.jpg', grid=b'GGGGG')])
+    assert 's/tok/g/0.webp' not in c.blobs
 
 
 def test_videos_get_a_thumbnail_but_no_preview():

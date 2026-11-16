@@ -66,6 +66,8 @@ export interface Album {
     photoCount: number;
     /** Auto-picked cover: the album's highest-rated/most-liked photo, if any. */
     coverThumbnailUrl?: string;
+    /** That cover photo's filename, so a large view (the album banner) can load its preview. */
+    coverFilename?: string;
     isPublic?: boolean;
     publicUrl?: string;
     publicExpiresAt?: string;

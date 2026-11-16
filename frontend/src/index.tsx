@@ -1,5 +1,7 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
+import '@fontsource-variable/jost';
+import '@fontsource-variable/figtree';
 import './index.css';
 import './mockups/mockups.css';
 import './mockups/prototype/prototype.css';

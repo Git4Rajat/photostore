@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
-    ArrowLeft as ArrowLeftIcon,
     RotateCcw as ArrowUturnLeftIcon,
     RotateCw as ArrowUturnRightIcon,
     ChevronLeft as ChevronLeftIcon,
@@ -36,6 +35,8 @@ export interface ViewerShellProps {
     photoKey: string;
     filename: string;
     title: string;
+    /** A second, quieter line under the title (the date and time under a place). */
+    subtitle?: string;
     index: number;
     count: number;
     /** The photo's stored orientation, in degrees. */
@@ -82,7 +83,7 @@ export const liveCorner = (natural: { w: number; h: number } | null, box: { w: n
 };
 
 const ViewerShell: React.FC<ViewerShellProps> = ({
-    photoKey, filename, title, index, count, initialRotation = 0, onRotate, onClose, onStep,
+    photoKey, filename, title, subtitle, index, count, initialRotation = 0, onRotate, onClose, onStep,
     media, videoSrc, onVideoError, videoFailed: videoFailedProp, videoPoster, liveSrc, fullRes, onToggleFullRes, onFullResFailed, showFullResControl, onDownloadOriginal, info, bar,
 }) => {
     const { url: mainSrc, loading: fullResLoading, progress: fullResProgress, status: mediaStatus } = media;
@@ -506,10 +507,13 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
     return (
         <div ref={rootRef} tabIndex={-1} className={`pt-viewer${showTools ? ' tools-visible' : ''}`} role="dialog" aria-modal="true" aria-label="Photo viewer">
             <div className="pt-viewer-top">
-                <button type="button" className="pt-viewer-back" onClick={onClose}>
-                    <ArrowLeftIcon /> Back
+                <button type="button" className="pt-viewer-back" onClick={onClose} aria-label="Back" title="Back">
+                    <ChevronLeftIcon />
                 </button>
-                <span className="pt-viewer-title">{title}</span>
+                <span className="pt-viewer-title">
+                    <b>{title}</b>
+                    {subtitle && <small>{subtitle}</small>}
+                </span>
                 <span className="pt-viewer-pos">{index + 1} / {count}</span>
             </div>
 
