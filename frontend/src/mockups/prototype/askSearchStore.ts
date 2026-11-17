@@ -29,6 +29,8 @@ export interface AskState {
     query: string;
     /** The query the results below belong to. */
     activeQuery: string;
+    /** Set when the results are an Explore place's exact members (a place filter, not a text search). */
+    activePlace: string;
     results: Photo[];
     total: number;
     hasMore: boolean;
@@ -41,7 +43,7 @@ export interface AskState {
 
 const library = () => getActiveLibraryFromToken() || '__default__';
 const empty = (): AskState => ({
-    library: library(), query: '', activeQuery: '', results: [], total: 0, hasMore: false, rankedWindow: null,
+    library: library(), query: '', activeQuery: '', activePlace: '', results: [], total: 0, hasMore: false, rankedWindow: null,
     searching: false, loadingMore: false, indexBuilding: false, scrollY: 0,
 });
 
@@ -70,7 +72,7 @@ export const setAskQuery = (query: string): void => {
         // Cleared box: drop the results, and make sure an in-flight request can't repopulate them.
         seq += 1;
         reportIndexBuilding('search', false);
-        publish({ query, activeQuery: '', results: [], total: 0, hasMore: false, rankedWindow: null,
+        publish({ query, activeQuery: '', activePlace: '', results: [], total: 0, hasMore: false, rankedWindow: null,
             searching: false, loadingMore: false, indexBuilding: false });
         return;
     }
@@ -79,14 +81,21 @@ export const setAskQuery = (query: string): void => {
 
 export const setAskScroll = (scrollY: number): void => { state = { ...state, scrollY }; };
 
-export const runAskSearch = (queryOverride?: string): void => {
+/** The request path for a search: a place filter when one is active, else the text query. */
+export const searchPath = (q: string, place: string, offset: number, limit: number): string =>
+    `/photos/search?${place ? `place=${encodeURIComponent(place)}` : `q=${encodeURIComponent(q)}`}&offset=${offset}&limit=${limit}${getCachedMediaToken() ? '&directMedia=1' : ''}`;
+
+/** Show exactly the photos behind an Explore place card (same membership as its count). */
+export const runAskPlace = (place: string): void => runAskSearch(place, place);
+
+export const runAskSearch = (queryOverride?: string, place = ''): void => {
     const trimmed = (queryOverride ?? getAskState().query).trim();
     const mine = ++seq;
     if (!trimmed) {
         setAskQuery('');
         return;
     }
-    publish({ query: queryOverride ?? state.query, activeQuery: trimmed, searching: true, loadingMore: false,
+    publish({ query: queryOverride ?? state.query, activeQuery: trimmed, activePlace: place, searching: true, loadingMore: false,
         indexBuilding: false, hasMore: false });
     void (async () => {
         // If the library's search database is still being built the server says so (searchIndexBuilding)
@@ -94,7 +103,7 @@ export const runAskSearch = (queryOverride?: string): void => {
         for (let attempt = 0; attempt < SEARCH_BUILD_RETRIES; attempt += 1) {
             try {
                 const res = await get<{ photos?: BackendPhoto[]; searchIndexBuilding?: boolean; total?: number; hasMore?: boolean; rankedWindow?: number }>(
-                    `/photos/search?q=${encodeURIComponent(trimmed)}&offset=0&limit=${SEARCH_PAGE_LIMIT}${getCachedMediaToken() ? '&directMedia=1' : ''}`,
+                    searchPath(trimmed, place, 0, SEARCH_PAGE_LIMIT),
                 );
                 if (mine !== seq) return;
                 if (res?.searchIndexBuilding && attempt < SEARCH_BUILD_RETRIES - 1) {
@@ -132,7 +141,7 @@ export const loadMoreAsk = (): void => {
     void (async () => {
         try {
             const res = await get<{ photos?: BackendPhoto[]; total?: number; hasMore?: boolean }>(
-                `/photos/search?q=${encodeURIComponent(q)}&offset=${state.results.length}&limit=${SEARCH_PAGE_LIMIT}${getCachedMediaToken() ? '&directMedia=1' : ''}`,
+                searchPath(q, current.activePlace, state.results.length, SEARCH_PAGE_LIMIT),
             );
             if (mine !== seq) return;
             const next = Array.isArray(res?.photos) ? res.photos.map(mapSearchResult) : [];

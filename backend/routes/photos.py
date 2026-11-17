@@ -814,6 +814,44 @@ def _build_search_window(
     }
 
 
+def _search_place(place: str, offset: int, limit: int):
+    """GET /photos/search?place=<Explore place label>: one page of exactly
+    the photos the Explore card counted (see search_photos)."""
+    import explore_things
+    from summary_incremental import SummarySchemaMissing
+
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+    with app.perf_instrumentation.span('search.open_db', user=user_id):
+        db = search_db.open_database(user_id)
+    if db is None:
+        if search_db.needs_build(user_id):
+            app._trigger_indexer_rebuild(user_id, reason='no-search-db')
+        return app.jsonify({'photos': [], 'total': 0, 'searchIndexBuilding': True})
+    try:
+        names, total = db.place_page(explore_things.place_keys_for_label(place), offset=offset, limit=limit)
+    except SummarySchemaMissing:
+        # A database from before the summary schema: have it compacted and say so.
+        app._trigger_indexer_rebuild(user_id, reason='no-place-summary')
+        return app.jsonify({'photos': [], 'total': 0, 'searchIndexBuilding': True})
+    app.g.direct_media = app.request.args.get('directMedia') in ('1', 'true')
+    pid_to_name, _ = app._load_people_name_index(user_id)
+    with app.perf_instrumentation.span('search.page_metadata', n=len(names)):
+        fetched = app._get_metadata_entities(user_id, names, point_reads=True)
+    page_pairs = [
+        (name, fetched.get(name)) for name in names
+        if fetched.get(name) and fetched[name].get('processing_state') != 'deleted'
+    ]
+    photos = app._build_photo_summaries_page(user_id, page_pairs, pid_to_name)
+    label = explore_things.clean_summary({'places': [{'label': place}]})['places'][0]['label']
+    payload = {'photos': photos, 'total': total, 'offset': offset, 'hasMore': offset + limit < total,
+               'matchedLocations': [label], 'place': label}
+    if search_db.is_building(user_id):
+        payload['indexPartial'] = True
+    return app.jsonify(payload)
+
+
 @photos_bp.route('/photos/search', methods=['GET'])
 @photos_bp.route('/photos/search/', methods=['GET'])
 @photos_bp.route('/api/photos/search', methods=['GET'])
@@ -827,7 +865,14 @@ def search_photos():
     # memory, which is what made the old in-memory approach OOM the 1Gi backend.
     # Browser-side search has been removed; this is the only search path.
     query = (app.request.args.get('q') or '').strip()
-    if not query:
+    # An Explore place card ("Noida, India · 3") opens a real place filter
+    # rather than a text search for its label: the text search matched every
+    # photo whose location text contained any of the words ("India" -> all 8
+    # India photos), so the count on the card and the count that opened never
+    # agreed. The filter reads the same place membership the card was counted
+    # from, so they agree by construction.
+    place = (app.request.args.get('place') or '').strip()
+    if not query and not place:
         return app.jsonify({'photos': [], 'total': 0})
 
     try:
@@ -837,6 +882,9 @@ def search_photos():
         limit = max(1, min(SEARCH_MAX_PAGE, int(app.request.args.get('limit', '24'))))
     except ValueError:
         return app.jsonify({'error': 'Invalid paging parameters.'}), 400
+
+    if place:
+        return _search_place(place, offset, limit)
 
     capture_start, capture_end = app._parse_capture_range_args()
     # Bare year in the query text ("beach 2022") narrows to that calendar year,

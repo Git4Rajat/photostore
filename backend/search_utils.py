@@ -268,6 +268,29 @@ SENSITIVE_AUTO_TAG_LABELS.update({
     'tall', 'thin', 'thinner', 'trustworthy', 'ugly', 'uneducated', 'unfriendly',
     'unprofessional', 'weirdo',
 })
+# Labels nobody wants on a family photo: bodily waste, gore, death, slurs and
+# the like. A food photo was tagged "vomit" (2026-11). Unlike the identity
+# categories above these are not about who is in the picture, just unpleasant,
+# so they get their own list -- but they are enforced through the same
+# is_sensitive_auto_tag_label() gate, which every store AND read path already
+# applies (ipwork_vision, storage_utils' vision apply, visible_tags,
+# effective_tags, the search index's _confident_tag_filter), so tags written
+# before the list existed disappear at read time without a re-run.
+UNPLEASANT_AUTO_TAG_LABELS = {
+    'vomit', 'vomiting', 'puke', 'barf', 'feces', 'faeces', 'poop', 'poo', 'excrement', 'dung', 'manure',
+    'diarrhea', 'diarrhoea', 'urine', 'urinal', 'pee', 'piss', 'toilet paper', 'sewage', 'sewer', 'spit',
+    'saliva', 'snot', 'mucus', 'phlegm', 'pus', 'blood', 'bloody', 'gore', 'gory', 'wound', 'injury',
+    'bruise', 'scar', 'rash', 'acne', 'pimple', 'wart', 'infection', 'corpse', 'cadaver', 'carcass',
+    'dead', 'death', 'morgue', 'autopsy', 'execution', 'gallows', 'guillotine', 'torture', 'slaughter',
+    'butchery', 'roadkill', 'maggot', 'maggots', 'cockroach', 'vermin', 'lice', 'flea', 'fleas',
+    'parasite', 'leech', 'garbage', 'trash', 'rubbish', 'litter', 'landfill', 'filth', 'filthy',
+    'dirty', 'grime', 'mold', 'mould', 'rot', 'rotten', 'decay', 'stench', 'stink', 'smelly',
+    'nude', 'nudity', 'naked', 'topless', 'underwear', 'lingerie', 'thong', 'erotic', 'porn',
+    'pornography', 'weapon', 'gun', 'guns', 'rifle', 'pistol', 'ammunition', 'bomb', 'explosion',
+    'drugs', 'cocaine', 'heroin', 'syringe', 'cigarette', 'smoking', 'vape', 'drunk', 'hangover',
+    'obscene', 'offensive', 'disgusting', 'gross', 'ugly', 'hideous', 'creepy', 'horror', 'nightmare',
+    'nazi', 'swastika', 'kkk', 'lynching', 'slave', 'slavery', 'genocide', 'massacre', 'warfare',
+}
 # Recalibrated alongside AI_TAG_MIN_CONFIDENCE above for raw-cosine-similarity
 # scores; deliberately looser than that stricter storage-time filter since
 # this only screens raw predictions for search-time consideration, not final
@@ -305,8 +328,25 @@ SEMANTIC_TERM_EXPANSIONS = {
 MAX_EXPANDED_TERMS_PER_TOKEN = 8
 
 
+# Singular nouns whose final "s" is part of the word. _singularize_word's
+# blind trailing-"s" strip used to turn "calculus" into "calculu" (which is
+# how a "Calculu" card ended up on Explore's Things shelf) -- English plurals
+# never end in "-us"/"-is", so those endings are left alone now. Words
+# already stored in their truncated form are repaired at read time through
+# _TRUNCATED_LONE_S_REPAIRS, so the fix needs no re-tagging.
+LONE_S_NOUNS = {
+    'abacus', 'asparagus', 'bonus', 'cactus', 'calculus', 'campus', 'census', 'chorus', 'circus',
+    'citrus', 'crocus', 'eucalyptus', 'focus', 'fungus', 'genius', 'hibiscus', 'hippopotamus',
+    'hummus', 'lotus', 'nautilus', 'nucleus', 'octopus', 'papyrus', 'platypus', 'radius', 'rhombus',
+    'sinus', 'status', 'stimulus', 'syllabus', 'terminus', 'thesaurus', 'torus', 'virus', 'walrus',
+    'axis', 'basis', 'chassis', 'clematis', 'crisis', 'iris', 'mantis', 'oasis', 'pelvis', 'tennis',
+    'trellis',
+}
+_TRUNCATED_LONE_S_REPAIRS = {word[:-1]: word for word in LONE_S_NOUNS if len(word) > 4}
+
+
 def _singularize_word(word: str) -> str:
-    if len(word) <= 3 or word.endswith('ss'):
+    if len(word) <= 3 or word.endswith(('ss', 'us', 'is')):
         return word
     if word.endswith('ies') and len(word) > 4:
         return f'{word[:-3]}y'
@@ -330,9 +370,13 @@ def _normalize_token(text: str) -> str:
     for tok in cleaned.split(' '):
         if not tok:
             continue
+        tok = _TRUNCATED_LONE_S_REPAIRS.get(tok, tok)
         mapped = TOKEN_CANONICAL_MAP.get(tok, tok)
         canonical.append(TOKEN_CANONICAL_MAP.get(mapped, _singularize_word(mapped)))
     return ' '.join(canonical)
+
+
+_UNPLEASANT_AUTO_TAG_KEYS = {_normalize_token(label) for label in UNPLEASANT_AUTO_TAG_LABELS}
 
 
 def normalize_tags(tags: List[str]) -> List[str]:
@@ -354,8 +398,13 @@ def normalize_tags(tags: List[str]) -> List[str]:
     return normalized
 
 
+def is_unpleasant_auto_tag_label(label: str) -> bool:
+    return _normalize_token(label) in _UNPLEASANT_AUTO_TAG_KEYS
+
+
 def is_sensitive_auto_tag_label(label: str) -> bool:
-    return _normalize_token(label) in SENSITIVE_AUTO_TAG_LABELS
+    normalized = _normalize_token(label)
+    return normalized in SENSITIVE_AUTO_TAG_LABELS or normalized in _UNPLEASANT_AUTO_TAG_KEYS
 
 
 def _coerce_confidence(value, source: str) -> float:
@@ -572,12 +621,20 @@ def location_tags(metadata: Dict) -> List[str]:
 
 
 def _location_metadata_tag_set(metadata: Dict) -> set:
-    return set(normalize_tags([
+    values = set(normalize_tags([
         str(metadata.get('locationCity', '')),
         str(metadata.get('locationRegion', '')),
         str(metadata.get('locationCountry', '')),
         str(metadata.get('address', '')),
     ])) | {'gps tagged', 'location metadata'}
+    if values - {'gps tagged', 'location metadata'}:
+        # Every spelling of the photo's own place ("Malmoe"/"Malmö"/"Malmo"),
+        # not just the one the row happens to store.
+        import place_names
+        values |= place_names.own_place_terms(
+            str(metadata.get('locationCity', '')), str(metadata.get('locationRegion', '')),
+            str(metadata.get('locationCountry', '')))
+    return values
 
 
 def gps_presence_tags(metadata: Dict) -> List[str]:
@@ -609,12 +666,39 @@ def strip_sensitive_auto_tags(tags: List[str], metadata: Dict) -> List[str]:
     ]
 
 
+def _has_coordinates(metadata: Dict) -> bool:
+    return bool(str(metadata.get('latitude') or '').strip()) and bool(str(metadata.get('longitude') or '').strip())
+
+
+def location_contradicting_tags(tags: List[str], metadata: Dict) -> set:
+    """Tags that name a place, country or nationality OTHER than the one the
+    photo's GPS reverse-geocoded to. CLIP guesses places from how a scene
+    looks (an aurora over Malmö came back as iceland/edmonton/canada/
+    helsinki/scandinavia/icelandic); when the photo knows where it was taken
+    those guesses are wrong by construction. Without coordinates and a
+    geocoded place nothing can be contradicted, so the set is empty and the
+    tags stay."""
+    if not _has_coordinates(metadata):
+        return set()
+    import place_names
+    return place_names.contradicting_place_tags(
+        tags,
+        city=str(metadata.get('locationCity') or ''),
+        region=str(metadata.get('locationRegion') or ''),
+        country=str(metadata.get('locationCountry') or ''),
+    )
+
+
 def strip_location_metadata_tags(tags: List[str], metadata: Dict) -> List[str]:
     location_values = _location_metadata_tag_set(metadata)
     normalized = normalize_tags(tags)
-    if not location_values:
-        return strip_sensitive_auto_tags(normalized, metadata)
-    return strip_sensitive_auto_tags([tag for tag in normalized if tag not in location_values], metadata)
+    protected = _protected_sensitive_tag_set(metadata)
+    contradicting = location_contradicting_tags([tag for tag in normalized if tag not in protected], metadata)
+    if location_values:
+        normalized = [tag for tag in normalized if tag not in location_values]
+    if contradicting:
+        normalized = [tag for tag in normalized if tag not in contradicting]
+    return strip_sensitive_auto_tags(normalized, metadata)
 
 
 def visible_tags(metadata: Dict) -> List[str]:

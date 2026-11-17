@@ -10,6 +10,7 @@ import pytest
 import app
 import search_db
 import summary_incremental as si
+import explore_things
 import summary_runtime as runtime
 from tests.test_search_db_delta import world  # real base/delta/compaction blob fixture
 from tests.test_summary_incremental import hydration
@@ -156,8 +157,9 @@ def test_random_differential_replacements_deletes_counts_and_cover_ties(tmp_path
 
 
 def test_missing_winner_no_backfill_and_multiple_normalized_occurrences(tmp_path, monkeypatch, hydration):
-    monkeypatch.setattr(app, 'parse_tags', lambda raw: ['résumé', 'resume'])
+    monkeypatch.setattr(app, 'parse_tags', lambda raw: ['café', 'cafe'])
     monkeypatch.setattr(si, 'parse_tags', app.parse_tags)
+    monkeypatch.setattr(explore_things, 'parse_tags', app.parse_tags)
     db = database(tmp_path, [row(f'p{i}', locationCity=f'city{i}') for i in range(30)])
     monkeypatch.setattr(app, '_get_metadata_entity', lambda uid, name: None if name == 'p0' else {'RowKey': name})
     equivalent(db)

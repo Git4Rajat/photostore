@@ -113,6 +113,15 @@ def _reverse_geocode_offline(latitude: str, longitude: str) -> Dict[str, str]:
 
 
 def reverse_geocode(latitude: str, longitude: str) -> Dict[str, str]:
+    """A place for these coordinates ({address, city, region, country}, or {}),
+    with city/region in local spelling: the offline GeoNames data is ASCII-
+    only ("Malmoe"), which is not a name anyone wants to see."""
+    import place_names
+    place = _reverse_geocode_raw(latitude, longitude)
+    return place_names.localize_place(place) if place else place
+
+
+def _reverse_geocode_raw(latitude: str, longitude: str) -> Dict[str, str]:
     # Offline (local K-D tree over a GeoNames city database, no network call)
     # is the default: Nominatim's public API caps at 1 req/sec globally,
     # which every concurrent ipworker thread/replica and backend replica was

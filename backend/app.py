@@ -72,6 +72,7 @@ from image_utils import (
     is_video_file,
 )
 import vision_utils
+import place_names
 from search_utils import (
     build_semantic_text,
     cosine_similarity,
@@ -2439,12 +2440,20 @@ def _location_from_metadata(metadata: Dict, exif_data: Optional[Dict[str, str]] 
         lat = lat or exif_lat
         lon = lon or exif_lon
 
+    # Local spelling at read time ("Malmoe" -> "Malmö"), so rows geocoded
+    # before maps_utils localized names need no re-geocode.
+    place = place_names.localize_place({
+        'address': metadata.get('address', ''),
+        'city': metadata.get('locationCity', ''),
+        'region': metadata.get('locationRegion', ''),
+        'country': metadata.get('locationCountry', ''),
+    })
     return {
         'latitude': lat,
         'longitude': lon,
-        'address': metadata.get('address', ''),
-        'city': metadata.get('locationCity', ''),
-        'country': metadata.get('locationCountry', ''),
+        'address': place['address'],
+        'city': place['city'],
+        'country': place['country'],
     }
 
 
@@ -9649,7 +9658,9 @@ def _smart_album_candidates(user_id: str, rule: str, metadata_rows: List[Dict]) 
             address = str(row.get('address') or '').strip()
             latitude = str(row.get('latitude') or '').strip()
             longitude = str(row.get('longitude') or '').strip()
-            label = ', '.join(part for part in (city, country) if part) or address
+            # Local spelling ("Malmö, Sweden"), keyed so every stored spelling
+            # of the same place ("Malmoe"/"Malmo") lands in one album.
+            label = place_names.place_label(city, country) if (city or country) else address
             if not label and latitude and longitude:
                 label = f'{latitude[:8]}, {longitude[:8]}'
             key = _normalize_search_phrase(label)
@@ -9823,28 +9834,24 @@ class ExploreAccumulator:
         filename = row.get('RowKey')
         if not filename:
             return
-        city = str(row.get('locationCity') or '').strip()
-        country = str(row.get('locationCountry') or '').strip()
-        address = str(row.get('address') or '').strip()
-        latitude = str(row.get('latitude') or '').strip()
-        longitude = str(row.get('longitude') or '').strip()
-        label = ', '.join(part for part in (city, country) if part) or address
-        if not label and latitude and longitude:
-            label = f'{latitude[:8]}, {longitude[:8]}'
-        place_key = _normalize_search_phrase(label)
-        if place_key:
+        # Place label/key and the Things allowlist live in explore_things so
+        # this and summary_incremental.explore_memberships stay identical.
+        import explore_things
+        place = explore_things.explore_place(row)
+        if place is not None:
+            place_key, label = place
             group = self.place_groups.setdefault(place_key, {
-                'label': _smart_album_title(label), 'count': 0, 'filename': filename,
-                'latitude': latitude, 'longitude': longitude,
+                'label': label, 'count': 0, 'filename': filename,
+                'latitude': str(row.get('latitude') or '').strip(),
+                'longitude': str(row.get('longitude') or '').strip(),
             })
             group['count'] += 1
-        terms = parse_tags(row.get('tags', '[]')) + parse_json_list(row.get('objects', '[]'))
-        for term in dict.fromkeys(terms):
-            term_key = _normalize_search_phrase(term)
+        for term in explore_things.explore_thing_tags(row):
+            term_key = explore_things.normalize_key(term)
             if not term_key:
                 continue
             group = self.thing_groups.setdefault(term_key, {
-                'label': _smart_album_title(term), 'count': 0, 'filename': filename,
+                'label': explore_things.title(term), 'count': 0, 'filename': filename,
             })
             group['count'] += 1
 

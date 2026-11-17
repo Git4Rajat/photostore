@@ -5,7 +5,7 @@ vi.mock('../../services/apiClient', () => ({ get: (...a: unknown[]) => getMock(.
 vi.mock('../../services/passwordAuthClient', () => ({ getActiveLibraryFromToken: () => 'lib-1' }));
 vi.mock('../../services/mediaToken', () => ({ getCachedMediaToken: () => null, thumbnailUrlForBlob: () => '' }));
 
-import { __resetAskForTests, getAskState, loadMoreAsk, runAskSearch, setAskQuery } from './askSearchStore';
+import { __resetAskForTests, getAskState, loadMoreAsk, runAskPlace, runAskSearch, setAskQuery } from './askSearchStore';
 
 const photo = (n: number) => ({ filename: `p${n}.jpg` });
 
@@ -45,5 +45,22 @@ describe('askSearchStore', () => {
         setAskQuery('');
         expect(getAskState().results).toEqual([]);
         expect(getAskState().activeQuery).toBe('');
+    });
+
+    it('opens a place card as a place filter, pages with it, and leaves text searches alone', async () => {
+        getMock.mockResolvedValueOnce({ photos: [photo(1)], total: 3, hasMore: true });
+        runAskPlace('Noida, India');
+        await vi.waitFor(() => expect(getAskState().searching).toBe(false));
+        expect(getMock.mock.calls[0][0]).toBe('/photos/search?place=Noida%2C%20India&offset=0&limit=120');
+        expect(getAskState().total).toBe(3);
+        getMock.mockResolvedValueOnce({ photos: [photo(2)], total: 3, hasMore: false });
+        loadMoreAsk();
+        await vi.waitFor(() => expect(getAskState().loadingMore).toBe(false));
+        expect(getMock.mock.calls[1][0]).toContain('place=Noida%2C%20India&offset=1');
+        getMock.mockResolvedValueOnce({ photos: [], total: 0, hasMore: false });
+        runAskSearch('india');
+        await vi.waitFor(() => expect(getAskState().searching).toBe(false));
+        expect(getMock.mock.calls[2][0]).toContain('q=india');
+        expect(getAskState().activePlace).toBe('');
     });
 });

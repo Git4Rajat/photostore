@@ -7,7 +7,7 @@ import type { SwatchKey } from '../types';
 import { plural } from '../../../utils/format';
 import PhotoGrid from '../components/PhotoGrid';
 import { get } from '../../../services/apiClient';
-import { getAskState, loadMoreAsk, runAskSearch, setAskQuery, setAskScroll, useAskState } from '../askSearchStore';
+import { getAskState, loadMoreAsk, runAskPlace, runAskSearch, searchPath, setAskQuery, setAskScroll, useAskState } from '../askSearchStore';
 import type { Photo as BackendPhoto } from '../../../types/uiTypes';
 
 // "Save as album" collects matches up to what one album can hold (the server enforces the real limit).
@@ -69,12 +69,18 @@ const AskPage: React.FC = () => {
     // the input box to the new place name but actually searched the
     // previous text.
     useEffect(() => {
+        const place = route.params.placeId;
+        if (place) {
+            // An Explore place card: the exact photos it counted, not a text search for its label.
+            if (getAskState().activePlace !== place) runAskPlace(place);
+            return;
+        }
         const incoming = route.params.query;
         if (incoming === undefined) return;
         if (incoming.trim() === getAskState().activeQuery) return;   // this search is already showing (or running)
         runSearch(incoming);
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [route.params.query]);
+    }, [route.params.query, route.params.placeId]);
 
     const tokens = useMemo(() => query.toLowerCase().split(/\s+/).filter(Boolean), [query]);
     const lastToken = tokens.length ? tokens[tokens.length - 1] : '';
@@ -131,7 +137,7 @@ const AskPage: React.FC = () => {
                 let more = hasMore;
                 while (more && names.length < SAVE_AS_ALBUM_MAX) {
                     const res = await get<{ photos?: BackendPhoto[]; hasMore?: boolean }>(
-                        `/photos/search?q=${encodeURIComponent(q)}&offset=${names.length}&limit=${SAVE_PAGE}`,
+                        searchPath(q, ask.activePlace, names.length, SAVE_PAGE).replace('&directMedia=1', ''),
                     );
                     const batch = (res?.photos ?? []).map((p) => p.filename);
                     if (!batch.length) break;
@@ -207,7 +213,7 @@ const AskPage: React.FC = () => {
                                 );
                             })}
                             {matchedPlaces.map((pl) => {
-                                const go = () => navigate('ask', { query: pl.name });
+                                const go = () => navigate('ask', { placeId: pl.id });
                                 return (
                                     <div key={pl.id} className="card-glass pt-match-card" onClick={go} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } }} role="button" tabIndex={0}>
                                         <MatchImage src={pl.coverThumbnailUrl ? matchCovers[pl.coverThumbnailUrl] : undefined} swatch={pl.swatch} />
