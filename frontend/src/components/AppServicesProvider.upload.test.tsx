@@ -25,6 +25,10 @@ const mocks = vi.hoisted(() => ({
     jobs: vi.fn(),
     processingMode: 'backend',
     runBrowserProcessing: vi.fn(),
+    push: undefined as undefined | { onProcessing?: () => void; onConnection?: (connected: boolean) => void },
+}));
+vi.mock('../services/indexReadyPush', () => ({
+    startIndexReadyPush: (_ready: () => void, options: typeof mocks.push) => { mocks.push = options; return () => { mocks.push = undefined; }; },
 }));
 
 vi.mock('../config/appConfig', () => ({ getRuntimeConfig: () => ({ processingMode: mocks.processingMode, browserUploadPreparation: mocks.preparationEnabled }) }));
@@ -1812,10 +1816,10 @@ describe('Server activity in the bell', () => {
         let id = '';
         act(() => { id = services.addNotification('31 items uploaded', 'They show in Photos once processed.'); });
         act(() => { services.updateNotification(id, { processing: { sessionId: 's1', since: Date.now() } }); });
-        await advance(30_000);
+        await advance(120_000);
         expect(services.notifications.find((n) => n.id === id)?.processing).toBeDefined();
         done = true;
-        await advance(30_000);
+        await advance(120_000);
         const entry = services.notifications.find((n) => n.id === id);
         expect(entry?.details).toBe('All processed in 4 minutes. 9 people found.');
         expect(entry?.processing).toBeUndefined();
@@ -1836,12 +1840,12 @@ describe('Server activity in the bell', () => {
             id = services.addNotification('Processing photos', '31 items uploaded. Processing on the server.');
             services.updateNotification(id, { processing: { sessionId: 's1', since: Date.now(), restore: { title: '31 items uploaded', details: 'They show in Photos once processed.' } } });
         });
-        await advance(30_000);
+        await advance(120_000);
         expect(services.notifications.filter((n) => n.id === id)).toHaveLength(1);
         expect(services.notifications.find((n) => n.id === id)?.title).toBe('Processing photos');
         const before = services.notifications.length;
         done = true;
-        await advance(30_000);
+        await advance(120_000);
         const entry = services.notifications.find((n) => n.id === id);
         expect(entry).toMatchObject({ title: '31 items uploaded', details: 'All processed in 4 minutes. 2 people found.' });
         expect(entry?.processing).toBeUndefined();
@@ -1862,6 +1866,52 @@ describe('Server activity in the bell', () => {
         });
         await advance(0);
         expect(services.notifications.find((n) => n.id === id)).toMatchObject({ title: '3 items uploaded', details: 'Done.' });
+    });
+
+    it('reads the processing summary on a push instead of polling while the socket is up', async () => {
+        let done = false;
+        mocks.get.mockImplementation(async (url: string) => url === '/api/upload-sessions/s1/processing'
+            ? (done ? { done: true, processedSeconds: 60, failed: 0, people: null } : { done: false, state: 'processing' })
+            : {});
+        const reads = () => mocks.get.mock.calls.filter(([url]) => url === '/api/upload-sessions/s1/processing').length;
+        render(<AppServicesProvider><Probe toolsPage={false} /></AppServicesProvider>);
+        await advance(0);
+        act(() => { mocks.push?.onConnection?.(true); });
+        let id = '';
+        act(() => {
+            id = services.addNotification('Processing photos', 'x');
+            services.updateNotification(id, { processing: { sessionId: 's1', since: Date.now(), restore: { title: '5 items uploaded', details: 'd' } } });
+        });
+        await advance(0);
+        expect(reads()).toBe(1);
+        await advance(8 * 60_000);
+        expect(reads()).toBe(1); // no 2-minute polling while the push is connected
+        done = true;
+        await act(async () => { mocks.push?.onProcessing?.(); });
+        await advance(0);
+        expect(reads()).toBe(2);
+        expect(services.notifications.find((n) => n.id === id)).toMatchObject({ title: '5 items uploaded', details: 'All processed in 1 minute.' });
+    });
+
+    it('falls back to slower polling once the push disconnects', async () => {
+        mocks.get.mockImplementation(async (url: string) => url === '/api/upload-sessions/s1/processing'
+            ? { done: false, state: 'processing' } : {});
+        const reads = () => mocks.get.mock.calls.filter(([url]) => url === '/api/upload-sessions/s1/processing').length;
+        render(<AppServicesProvider><Probe toolsPage={false} /></AppServicesProvider>);
+        await advance(0);
+        act(() => { mocks.push?.onConnection?.(true); });
+        let id = '';
+        act(() => {
+            id = services.addNotification('Processing photos', 'x');
+            services.updateNotification(id, { processing: { sessionId: 's1', since: Date.now() } });
+        });
+        await advance(0);
+        act(() => { mocks.push?.onConnection?.(false); });
+        const before = reads();
+        await advance(60_000);
+        expect(reads()).toBe(before); // slower than the old 30 s
+        await advance(60_000);
+        expect(reads()).toBe(before + 1);
     });
 
     it('stops asking when the server does not know the upload', async () => {

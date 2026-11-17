@@ -103,7 +103,11 @@ const JOB_POLL_MAX_MS = 20 * 60 * 1000;
 // Shared-album opens and ending invites: one cheap Core read per visit, no more often than this.
 const ACTIVITY_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 // A finished upload asks how processing went this often, and gives up after this long.
-const PROCESSING_POLL_MS = 30_000;
+// Fallback cadence for a watched upload's summary: slower than it used to be, since the
+// index push (see startIndexReadyPush) normally says when a wave finished. With the socket
+// up only a rare safety read remains, in case the advisory was dropped or over budget.
+const PROCESSING_POLL_MS = 2 * 60_000;
+const PROCESSING_PUSH_SAFETY_POLL_MS = 10 * 60_000;
 const PROCESSING_WATCH_MS = 3 * 60 * 60 * 1000;
 // Clustering-kind completions (people_cluster after every upload, find-faces
 // propagation after every merge) can finish many at once — a big upload fires
@@ -1467,7 +1471,16 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }, delayMs);
     }, []);
 
-    useEffect(() => startIndexReadyPush(() => scheduleDataRefresh(0)), [scheduleDataRefresh]);
+    const indexPushLiveRef = useRef(false);
+    const processingNudgeRef = useRef<(() => void) | null>(null);
+    useEffect(() => startIndexReadyPush(() => scheduleDataRefresh(0), {
+        onProcessing: () => processingNudgeRef.current?.(),
+        onConnection: (connected) => {
+            indexPushLiveRef.current = connected;
+            // Coming up may follow a missed advisory: read the summary once.
+            if (connected) processingNudgeRef.current?.();
+        },
+    }), [scheduleDataRefresh]);
 
     const flushClusterCompletions = useCallback(() => {
         if (clusterFlushTimerRef.current !== null) {
@@ -1934,8 +1947,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }, []);
 
     // A finished upload's entry gets the server's "All processed in 4 minutes. 9 people found."
-    // once the wave it joined completes: asked every 30 s while the page is in front, for a
-    // few hours at most, and picked up again after a reload.
+    // once the wave it joined completes: asked when the index push reports a finished wave, or every 2 min
+    // while the push is down (10 min safety read while it is up), for a few hours at most, and picked up again after a reload.
     const pendingProcessing = notifications
         .filter((n) => n.processing)
         .map((n) => [n.id, n.processing!.sessionId, n.processing!.since].join('|'))
@@ -1944,6 +1957,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (!pendingProcessing) return undefined;
         let disposed = false;
         let inFlight = false;
+        let lastRead = 0;
         const settle = (id: string, details?: string) => setNotifications((previous) => previous.map((n) => {
             if (n.id !== id) return n;
             const restore = n.processing?.restore;
@@ -1953,6 +1967,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const tick = async () => {
             if (disposed || inFlight || document.visibilityState !== 'visible' || !navigator.onLine) return;
             inFlight = true;
+            lastRead = Date.now();
             try {
                 for (const entry of pendingProcessing.split(',')) {
                     const [id, sessionId, since] = entry.split('|');
@@ -1979,11 +1994,17 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             }
         };
         const visible = () => { if (document.visibilityState === 'visible') void tick(); };
-        const timer = window.setInterval(() => { void tick(); }, PROCESSING_POLL_MS);
+        const timer = window.setInterval(() => {
+            if (indexPushLiveRef.current && Date.now() - lastRead < PROCESSING_PUSH_SAFETY_POLL_MS) return;
+            void tick();
+        }, PROCESSING_POLL_MS);
         document.addEventListener('visibilitychange', visible);
+        // A push (or the socket coming up, which may have missed one) reads the summary once.
+        processingNudgeRef.current = () => { void tick(); };
         void tick();
         return () => {
             disposed = true;
+            processingNudgeRef.current = null;
             window.clearInterval(timer);
             document.removeEventListener('visibilitychange', visible);
         };

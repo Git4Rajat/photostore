@@ -81,6 +81,12 @@ The browser keeps the WebSocket connection, refreshes data on a ready event, rec
 
 The existing job poller remains the recovery path for notification loss or deployments without push. It continues while jobs are active or edits have not been confirmed by an actual matching projection or authoritative source check, within its existing 20-minute polling bound. It retries refresh while unresolved edits remain. Focus/mutation nudges can restart it. Push failure never fails an otherwise successful index publication.
 
+### Processing-finished advisory
+
+The same hub, group and browser socket also carry `{type: 'processing', libraryId, waveId, state: 'done'}`, sent by `index_events.publish_processing` when a wave's completion hand-off runs. The browser reacts by reading `GET /api/upload-sessions/<id>/processing` once for each upload it is watching, so a finished upload's bell entry ("Processing photos") becomes "All processed in N minutes". The message carries no counts and the read stays authorized as usual.
+
+Budget (Free_F1, 20,000 messages/day): one message per finished wave, coalesced per (library, wave) and never per photo, so an upload costs a few messages whatever its size (a 16,000-file upload is a handful of waves). Each sending process also stops after `INDEX_EVENTS_PROCESSING_DAILY_BUDGET` (default 1,500) processing messages per UTC day, leaving the rest for index-ready pushes; nothing is sent when `INDEX_EVENTS_ENDPOINT` is unset. No extra connection is opened. While the socket is up the watched upload is read once on connect and on each push, with a 10-minute safety read; while it is down (or gated off by the foreground/index-demand rules) it is polled every 2 minutes. Both stop after the 3-hour watch cap.
+
 ## Deployment
 
 The Bicep and generated ARM template add optional `enableIndexPush`, default **true**. When enabled it provisions one Free-tier (`Free_F1`) Web PubSub unit: 20 concurrent connections and 20,000 messages/day, beyond which browsers fall back to polling. The tier is fixed at Free by design; there is no paid-tier option and assigns the resource-scoped Web PubSub Service Owner data role to indexer and cluster identities. The indexer API and its worker share the indexer identity. Backend containers receive `INDEX_EVENTS_ENDPOINT`; no service access key is exposed to the browser. The frontend runtime CSP retains the managed WebSocket origin with and without a configured API URL.

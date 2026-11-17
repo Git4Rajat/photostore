@@ -108,6 +108,7 @@ def execute_wave_handoffs(work, store, library, wave_id, send):
         try:
             import index_events
             index_events.publish(library, 'wave', wave['completionReceiptId'])
+            index_events.publish_processing(library, wave_id, 'done')
         except Exception:
             pass
         # The wave's previews are published: queue their grid images, scanning

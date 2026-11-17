@@ -6,7 +6,20 @@ import { isLikelyAuthenticated } from './jobNotifications';
 import { pendingEditScope } from './pendingEdits';
 
 // The push carries an invalidation only; index reads keep their normal authorization.
-export const startIndexReadyPush = (ready: () => void): (() => void) => {
+export interface IndexPushOptions {
+    // "A wave finished processing" advisory; the listener reads the summary, the push carries no data.
+    onProcessing?: () => void;
+    // Whether the socket is up, so pollers can slow down while it is and speed back up when it is not.
+    onConnection?: (connected: boolean) => void;
+}
+
+export const startIndexReadyPush = (ready: () => void, options: IndexPushOptions = {}): (() => void) => {
+    let live = false;
+    const report = (value: boolean) => {
+        if (live === value) return;
+        live = value;
+        options.onConnection?.(value);
+    };
     let stopped = false;
     let socket: WebSocket | null = null;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -38,6 +51,7 @@ export const startIndexReadyPush = (ready: () => void): (() => void) => {
                 if (stopped || isGated() || attempt !== generation || requestedScope !== pendingEditScope()) return;
                 clearTimeout(timer);
                 retry = 1000;
+                report(true);
                 ready(); // Recover publications missed while disconnected.
                 // Bound subscription authorization by periodically checking
                 // library access again. This renewal uses core, not indexer.
@@ -47,12 +61,15 @@ export const startIndexReadyPush = (ready: () => void): (() => void) => {
                 if (stopped || isGated() || attempt !== generation || requestedScope !== pendingEditScope()) return;
                 try {
                     const message = JSON.parse(String(event.data));
-                    if (message.type === 'index-ready' && message.libraryId === getActiveLibraryFromToken()) ready();
+                    if (message.libraryId !== getActiveLibraryFromToken()) return;
+                    if (message.type === 'index-ready') ready();
+                    else if (message.type === 'processing') options.onProcessing?.();
                 } catch { /* Ignore malformed or non-index messages. */ }
             };
             connection.onerror = () => connection.close();
             connection.onclose = () => {
                 if (attempt !== generation || stopped) return;
+                report(false);
                 clearTimeout(timer);
                 socket = null;
                 timer = setTimeout(() => void connect(), retry);
@@ -67,21 +84,21 @@ export const startIndexReadyPush = (ready: () => void): (() => void) => {
     let gated = false;
     const scopeTimer = setInterval(() => {
         if (isGated()) {
-            if (!gated) { gated = true; generation += 1; clearTimeout(timer); socket?.close(); socket = null; }
+            if (!gated) { gated = true; generation += 1; clearTimeout(timer); socket?.close(); socket = null; report(false); }
             return;
         }
         if (scope === pendingEditScope()) return;
         generation += 1;
         clearTimeout(timer);
-        socket?.close(); socket = null;
+        socket?.close(); socket = null; report(false);
         void connect();
     }, 1000);
     const foregroundReturn = onForegroundReturn(() => {
-        gated = false; generation += 1; clearTimeout(timer); socket?.close(); socket = null;
+        gated = false; generation += 1; clearTimeout(timer); socket?.close(); socket = null; report(false);
         void connect();
     });
     const indexDemandReturn = onIndexDemandReturn(() => {
-        gated = false; generation += 1; clearTimeout(timer); socket?.close(); socket = null;
+        gated = false; generation += 1; clearTimeout(timer); socket?.close(); socket = null; report(false);
         void connect();
     });
     void connect();
@@ -90,5 +107,6 @@ export const startIndexReadyPush = (ready: () => void): (() => void) => {
         indexDemandReturn();
         stopped = true; generation += 1;
         clearTimeout(timer); clearInterval(scopeTimer); socket?.close();
+        report(false);
     };
 };
