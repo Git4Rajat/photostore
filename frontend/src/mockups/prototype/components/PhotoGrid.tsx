@@ -1,7 +1,7 @@
 import React from 'react';
 import { Check as CheckIcon, Video as VideoIcon, Heart as HeartIcon, Star as StarIcon } from 'lucide-react';
 import { isVideoFilename, useStore } from '../store';
-import { tileImage, usePhotoThumbnails, useTileSizes } from '../media';
+import { tileImage, usePhotoThumbnails, useRecoveringImage, useTileSizes } from '../media';
 import { useDragSelect } from '../../../services/useDragSelect';
 import { perf } from '../../../services/perf';
 import { captureWallClock } from '../../../utils/captureDate';
@@ -35,19 +35,20 @@ export const dayHeading = (photo: Photo): string => {
 // load failure so the tile's own swatch background (mock-swatch, see the
 // parent div below) shows through instead of a broken-image icon -- keyed by
 // `src` so a later render with a corrected/ready URL gets a fresh attempt.
+// A URL whose token expired is re-signed and retried once first (useRecoveringImage).
 export const TileThumbnail: React.FC<{ src: string; srcSet?: string; sizes?: string; alt: string; style?: React.CSSProperties; className?: string }> = ({ src, srcSet, sizes, alt, style, className }) => {
-    const [broken, setBroken] = React.useState(false);
-    if (broken) return null;
+    const image = useRecoveringImage(src, srcSet);
+    if (image.broken) return null;
     return (
         <img
             className={className || 'pt-tile-img'}
-            src={src}
-            srcSet={srcSet}
-            sizes={srcSet ? sizes : undefined}
+            src={image.src}
+            srcSet={image.srcSet}
+            sizes={image.srcSet ? sizes : undefined}
             alt={alt}
             loading="lazy"
             draggable={false}
-            style={style}
+            style={image.pending ? { ...style, visibility: 'hidden' } : style}
             onLoad={(event) => {
                 const rect = event.currentTarget.getBoundingClientRect();
                 if (document.visibilityState === 'visible' && rect.width > 0 && rect.height > 0
@@ -55,7 +56,7 @@ export const TileThumbnail: React.FC<{ src: string; srcSet?: string; sizes?: str
                     perf.recordFirstGalleryPhoto();
                 }
             }}
-            onError={() => setBroken(true)}
+            onError={image.onError}
         />
     );
 };
