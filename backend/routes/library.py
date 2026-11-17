@@ -4,6 +4,8 @@ Archive also registers this blueprint temporarily for older frontend bundles.
 Whole-library operations live in library_operations.py. Shared helpers remain
 in app.py with the existing late-binding semantics.
 """
+from datetime import datetime, timedelta, timezone
+
 from flask import Blueprint
 
 import app
@@ -62,6 +64,10 @@ def library_members():
         ]
     return app.jsonify(body)
 
+def _invite_expiry():
+    return datetime.now(timezone.utc) + timedelta(seconds=app.library_utils.INVITE_TTL_SECONDS)
+
+
 @library_bp.route('/api/library/invite', methods=['POST'])
 def library_invite():
     account_id, library_id, error = app._require_owner_context()
@@ -100,6 +106,8 @@ def library_invite():
             email, invite_url,
             library_name=str(meta.get('name') or '') if target_type == 'join' else '',
             inviter=inviter_email,
+            member_count=app.library_store.member_count(library_id),
+            expires_at=_invite_expiry(),
         )
     except Exception as exc:
         app.app.logger.warning('Invite email failed: %s', exc)
@@ -147,6 +155,8 @@ def library_invite_resend():
             email, f'{base}/accept-invite?token={raw}',
             library_name=str(meta.get('name') or '') if target_type == 'join' else '',
             inviter=inviter_email,
+            member_count=app.library_store.member_count(library_id),
+            expires_at=_invite_expiry(),
         )
     except Exception as exc:
         app.app.logger.warning('Invite email failed: %s', exc)
