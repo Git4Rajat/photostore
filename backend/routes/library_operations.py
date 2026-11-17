@@ -251,6 +251,7 @@ def library_clean_request():
                 recipient_email, confirm_url,
                 library_name=str(meta.get('name') or ''),
                 requested_by=requester_email,
+                member_count=len(other_member_ids) + 1,
             )
             sent_to.append(app.email_utils.masked_recipient(recipient_email))
         except Exception as exc:
