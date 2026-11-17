@@ -1085,6 +1085,8 @@
 .pt-side-item:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 .pt-side-thumb { width: 18px; height: 18px; border-radius: 5px; flex: none; object-fit: cover; background: var(--lg-edge); }
 .pt-side-group { font-size: 11.5px; font-weight: 700; color: var(--muted); padding: 14px 10px 4px; }
+/* Every album, scrolling on its own so the sections above and the foot stay put. */
+.pt-side-albums { display: flex; flex-direction: column; gap: 2px; flex: 0 1 auto; min-height: 0; overflow-y: auto; }
 .pt-side-foot { margin-top: auto; border-top: 1px solid var(--lg-edge); padding-top: 8px; display: flex; flex-direction: column; gap: 2px; }
 
 /* Chips as the mock-up draws them: flat fills, no outline. */
@@ -1092,8 +1094,12 @@
 .pt-shell .chip[aria-pressed='true'] { background: var(--text); color: var(--bg-1); }
 
 /* Albums, every width: cover cards when no album is open, the album full
-   width when one is. The app sidebar already lists albums on desktops. */
-.pt-albums-mobile-list { display: flex; padding: 0; }
+   width when one is. The app sidebar already lists albums on desktops.
+   No height cap: the page body scrolls. The old phone max-height: 100% made a
+   long album list shrink its flex children, so the People/Places and Videos
+   links (overflow: hidden) collapsed to nothing and the last button slid under
+   the tab bar, out of scroll reach. */
+.pt-albums-mobile-list { display: flex; padding: 0; max-height: none; }
 .pt-albums-mobile-list.hidden { display: none !important; }
 .pt-albums { grid-template-columns: minmax(0, 1fr); }
 .pt-album-sidebar { display: none !important; }

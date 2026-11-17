@@ -15,8 +15,6 @@ import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQue
 import { useProtectedBlobUrls } from '../../../services/imageClient';
 import type { PageId } from '../types';
 
-const MAX_ALBUMS = 8;
-
 /**
  * The desktop sidebar from the redesign: the places you go, then media types,
  * then your albums, with Recently Deleted and Library & sharing at the foot.
@@ -33,7 +31,7 @@ export const AppSidebar: React.FC = () => {
         return () => controller.abort();
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
-    const covers = useProtectedBlobUrls(albums.slice(0, MAX_ALBUMS).map((a) => a.coverThumbnailUrl).filter((u): u is string => Boolean(u)));
+    const covers = useProtectedBlobUrls(albums.map((a) => a.coverThumbnailUrl).filter((u): u is string => Boolean(u)));
 
     const page = route.page;
     const onGallery = page === 'gallery';
@@ -65,17 +63,22 @@ export const AppSidebar: React.FC = () => {
             {item('liked', 'Liked', HeartIcon, onGallery && galleryFilters.likedOnly, () => { navigate('gallery'); setMediaFilter('all'); setGalleryLikedOnly(true); })}
 
             {albums.length > 0 && <div className="pt-side-group">Your albums</div>}
-            {albums.slice(0, MAX_ALBUMS).map((a) => {
-                const on = page === 'albums' && route.params.albumId === a.id;
-                const src = a.coverThumbnailUrl ? covers[a.coverThumbnailUrl] : undefined;
-                return (
-                    <button key={a.id} type="button" className={`pt-side-item${on ? ' on' : ''}`} aria-current={on ? 'page' : undefined} onClick={() => navigate('albums', { albumId: a.id })}>
-                        {src ? <img className="pt-side-thumb" src={src} alt="" /> : <span className="pt-side-thumb" aria-hidden="true" />}
-                        <span>{a.name}</span>
-                        {a.photoCount ? <em>{a.photoCount.toLocaleString()}</em> : null}
-                    </button>
-                );
-            })}
+            {albums.length > 0 && (
+                // Every album, in its own scrolling list (it used to stop at eight with no way to the rest).
+                <div className="pt-side-albums">
+                    {albums.map((a) => {
+                        const on = page === 'albums' && route.params.albumId === a.id;
+                        const src = a.coverThumbnailUrl ? covers[a.coverThumbnailUrl] : undefined;
+                        return (
+                            <button key={a.id} type="button" className={`pt-side-item${on ? ' on' : ''}`} aria-current={on ? 'page' : undefined} onClick={() => navigate('albums', { albumId: a.id })}>
+                                {src ? <img className="pt-side-thumb" src={src} alt="" loading="lazy" /> : <span className="pt-side-thumb" aria-hidden="true" />}
+                                <span>{a.name}</span>
+                                {a.photoCount ? <em>{a.photoCount.toLocaleString()}</em> : null}
+                            </button>
+                        );
+                    })}
+                </div>
+            )}
 
             <div className="pt-side-foot">
                 {item('deleted', 'Recently deleted', TrashIcon, page === 'trash', () => navigate('trash'))}

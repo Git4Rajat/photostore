@@ -273,19 +273,26 @@ export const AlbumsPage: React.FC = () => {
     }
 
     if (!album) {
+        // No albums (yet, or all deleted): People, Places and Videos are still reached from here.
         return (
-            <div className="pt-empty-page">
-                {albumsLoading ? <Spinner label="Loading albums…" /> : <p>No albums yet.</p>}
-                {!albumsLoading && (
-                    <div className="pt-arrive-actions">
-                        <button type="button" className="btn btn-primary" onClick={() => void handleCreate(true)}>
-                            <PlusIcon className="toolbar-icon" /> New album
-                        </button>
-                        <button type="button" className="btn" onClick={() => setSmartSheetOpen(true)} disabled={smartCreatingRule !== null}>
-                            <SparklesIcon className="toolbar-icon" /> {smartCreatingRule ? 'Creating…' : 'Smart album'}
-                        </button>
+            <div className="pt-albums-wrapper">
+                <div className="pt-albums-mobile-list">
+                    <div className="pt-empty-page">
+                        {albumsLoading ? <Spinner label="Loading albums…" /> : <p>No albums yet.</p>}
+                        {!albumsLoading && (
+                            <div className="pt-arrive-actions">
+                                <button type="button" className="btn btn-primary" onClick={() => void handleCreate(true)}>
+                                    <PlusIcon className="toolbar-icon" /> New album
+                                </button>
+                                <button type="button" className="btn" onClick={() => setSmartSheetOpen(true)} disabled={smartCreatingRule !== null}>
+                                    <SparklesIcon className="toolbar-icon" /> {smartCreatingRule ? 'Creating…' : 'Smart album'}
+                                </button>
+                            </div>
+                        )}
                     </div>
-                )}
+                    <h2 className="pt-section-label">People and places</h2>
+                    <BrowseLinks />
+                </div>
                 {smartAlbumSheet}
             </div>
         );
