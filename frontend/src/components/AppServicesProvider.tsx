@@ -5171,6 +5171,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     if (completed === filesToUpload.length || completed % 25 === 0) {
                         updateNotification(dedupNotificationId, {
                             details: `Checked ${completed}/${selectedCount} files for duplicates.`,
+                            progress: { uploadedCount: completed, totalCount: selectedCount, failedCount: 0, skippedDuplicateCount: 0 },
                         });
                     }
                 }
