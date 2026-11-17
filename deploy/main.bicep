@@ -91,10 +91,6 @@ param waveBootstrapPending bool = false
 @description('Provision managed WebSocket notifications when library indexes are published.')
 param enableIndexPush bool = true
 
-@description('Web PubSub tier for index push. Free_F1 costs nothing but caps at 20 concurrent connections and 20,000 messages/day; browsers beyond that fall back to polling. Standard_S1 lifts the caps for a fixed monthly charge.')
-@allowed(['Free_F1', 'Standard_S1'])
-param indexPushSku string = 'Free_F1'
-
 @description('Name of an existing Log Analytics workspace (in this resource group) to send Container Apps console/system logs to. Leave blank (the one-click-deploy default) for no log destination. Required on every redeploy of an EXISTING environment that already has this wired up -- the managedEnvironment resource replaces its properties wholesale, so omitting this on a redeploy silently disconnects logging even if it was set up out-of-band or by a previous deploy.')
 param logAnalyticsWorkspaceName string = ''
 
@@ -139,7 +135,6 @@ module app 'resources.bicep' = {
     dedicatedIndexWorker: dedicatedIndexWorker
     separateIndexWorker: separateIndexWorker
     enableIndexPush: enableIndexPush
-    indexPushSku: indexPushSku
     enableWaveExecution: enableWaveExecution
     enableNewWaveLibraries: enableNewWaveLibraries
     waveCapabilityId: waveCapabilityId
