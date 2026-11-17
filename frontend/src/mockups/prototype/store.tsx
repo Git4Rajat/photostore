@@ -169,8 +169,12 @@ const rowCaptureTime = (row: SortIndexRow): number => {
 
 const filterRowsForGallery = (rows: SortIndexRow[], filters: GalleryFilters): SortIndexRow[] => (
     rows.filter((row) => {
-        if (filters.rating > 0 && (Number(row.rating) || 0) < filters.rating) return false;
-        if (filters.likedOnly && (Number(row.likes) || 0) <= 0) return false;
+        // The index can lag a like or rating just saved; the edit journal holds what the user did.
+        const { rating, likes } = filters.rating > 0 || filters.likedOnly
+            ? applyPendingEdits('photo', row.filename, { rating: row.rating, likes: row.likes })
+            : row;
+        if (filters.rating > 0 && (Number(rating) || 0) < filters.rating) return false;
+        if (filters.likedOnly && (Number(likes) || 0) <= 0) return false;
         if (filters.media === 'video' && !isVideoFilename(row.filename)) return false;
         if (filters.media === 'photo' && isVideoFilename(row.filename)) return false;
         if (filters.media === 'live' && !row.gallery?.liveClip) return false;
