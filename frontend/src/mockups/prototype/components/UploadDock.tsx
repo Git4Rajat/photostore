@@ -58,7 +58,7 @@ const FailedRows: React.FC<{ files: PersistedUploadFile[]; onRetry?: () => void;
 
 export const UploadDock: React.FC = () => {
     const {
-        uploadActive, uploading, uploadProgress: progress, pendingUploadSummary, pendingUploadFailedFiles,
+        uploadActive, uploading, uploadProgress: progress, uploadCheckProgress: checking, pendingUploadSummary, pendingUploadFailedFiles,
         stopActiveUpload, retryPersistedUploadSession, discardPersistedUploadSession,
     } = useAppServices();
     const narrow = useNarrow();
@@ -92,20 +92,27 @@ export const UploadDock: React.FC = () => {
 
     if (!visible) return null;
 
-    const pct = total ? Math.round((added / total) * 100) : 0;
+    const duplicates = progress?.skippedDuplicateCount ?? 0;
+    const pct = checking
+        ? (checking.total ? Math.round((checking.checked / checking.total) * 100) : 0)
+        : total ? Math.round((added / total) * 100) : 0;
     const waiting = Math.max(0, total - added - failed);
     const timeLeft = startRef.current
         ? timeLeftLabel(Date.now() - startRef.current.at, added - startRef.current.base, waiting)
         : null;
+    const duplicatesLabel = duplicates > 0 ? `${duplicates} already in your library` : null;
     const label = uploading ? 'Uploading' : 'Finishing upload';
-    const title = !uploadActive
+    const title = checking && uploadActive
+        ? `Checking ${plural(checking.total, 'photo')}`
+        : !uploadActive
         ? (showFailed ? `${plural(failedFiles.length, 'item')} didn’t upload` : 'Upload paused')
         : total ? `${label} ${added} of ${total}` : `${label}…`;
     const sub = !uploadActive
         ? (showFailed ? 'Tap to see why' : `${plural(pendingUploadSummary?.fileCount ?? 0, 'file')} waiting`)
-        : timeLeft ?? (progress?.mbPerSecond ? `${progress.mbPerSecond.toFixed(1)} MB/s` : 'Starting…');
+        : checking ? 'Looking for ones you already have'
+        : [timeLeft ?? (progress?.mbPerSecond ? `${progress.mbPerSecond.toFixed(1)} MB/s` : 'Starting…'), duplicatesLabel].filter(Boolean).join(' · ');
 
-    const heading = uploadActive ? (uploading && total ? `Uploading ${plural(total, 'item')}` : title) : title;
+    const heading = uploadActive ? (!checking && uploading && total ? `Uploading ${plural(total, 'item')}` : title) : title;
     const pause = () => stopActiveUpload();
     const cancel = async () => {
         const ok = await confirmDialog({
@@ -162,7 +169,8 @@ export const UploadDock: React.FC = () => {
                         {uploadActive ? (
                             <>
                                 <Progress pct={pct} />
-                                {stats}
+                                {checking ? <p className="up-lede">{checking.checked} of {checking.total} checked. Photos already in your library won’t be uploaded again.</p> : stats}
+                                {!checking && duplicates > 0 ? <p className="up-fine">{duplicatesLabel}, so they were skipped.</p> : null}
                                 {keepOpen}
                                 <div className="up-btns">
                                     <Button onClick={pause}>Pause</Button>
@@ -201,7 +209,7 @@ export const UploadDock: React.FC = () => {
             {uploadActive ? (
                 <div className="up-ub">
                     <Progress pct={pct} />
-                    <div className="up-fr"><span>{added} added · {waiting} waiting</span><span>{timeLeft ?? (progress?.mbPerSecond ? `${progress.mbPerSecond.toFixed(1)} MB/s` : '')}</span></div>
+                    <div className="up-fr"><span>{checking ? `${checking.checked} of ${checking.total} checked` : `${added} added · ${waiting} waiting`}</span><span>{checking ? 'Skipping ones you have' : timeLeft ?? duplicatesLabel ?? (progress?.mbPerSecond ? `${progress.mbPerSecond.toFixed(1)} MB/s` : '')}</span></div>
                 </div>
             ) : null}
             {!collapsed ? (

@@ -724,6 +724,22 @@ describe('browser upload selection and startup', () => {
         expect(refreshRequests()[0][1]).toEqual({ reason: 'stopped' });
     });
 
+    it('shows a checking state in the dock while the selection is hashed for duplicates', async () => {
+        let releaseKnownHashes!: () => void;
+        mocks.getUpload.mockImplementation((url: string) => url === '/upload/known-hashes'
+            ? new Promise((resolve) => { releaseKnownHashes = () => resolve({ hashes: {} }); })
+            : Promise.resolve({ hashes: {} }));
+        select(filesFor(30));
+        await advance(1000);
+        expect(services.uploadCheckProgress).toEqual({ checked: 0, total: 30 });
+        expect(screen.getByText('Checking 30 photos')).toBeTruthy();
+        expect(screen.getByText('0 of 30 checked')).toBeTruthy();
+        await act(async () => { releaseKnownHashes(); });
+        await advance(3000);
+        expect(services.uploadCheckProgress).toBeNull();
+        expect(screen.queryByText('Checking 30 photos')).toBeNull();
+    });
+
     it('keeps upload progress and Stop available after notifications are cleared', async () => {
         mocks.transferred.mockImplementation((_id, _data, _size, options) => new Promise((_resolve, reject) => {
             const abort = () => reject(new Error('upload_stopped_by_user'));
