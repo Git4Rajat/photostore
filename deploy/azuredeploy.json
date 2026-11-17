@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.37.4.10188",
-      "templateHash": "9650190820944041598"
+      "templateHash": "16615466304959020560"
     }
   },
   "parameters": {
@@ -175,9 +175,20 @@
     },
     "enableIndexPush": {
       "type": "bool",
-      "defaultValue": false,
+      "defaultValue": true,
       "metadata": {
         "description": "Provision managed WebSocket notifications when library indexes are published."
+      }
+    },
+    "indexPushSku": {
+      "type": "string",
+      "defaultValue": "Free_F1",
+      "allowedValues": [
+        "Free_F1",
+        "Standard_S1"
+      ],
+      "metadata": {
+        "description": "Web PubSub tier for index push. Free_F1 costs nothing but caps at 20 concurrent connections and 20,000 messages/day; browsers beyond that fall back to polling. Standard_S1 lifts the caps for a fixed monthly charge."
       }
     },
     "logAnalyticsWorkspaceName": {
@@ -311,6 +322,9 @@
           "enableIndexPush": {
             "value": "[parameters('enableIndexPush')]"
           },
+          "indexPushSku": {
+            "value": "[parameters('indexPushSku')]"
+          },
           "enableWaveExecution": {
             "value": "[parameters('enableWaveExecution')]"
           },
@@ -346,7 +360,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.37.4.10188",
-              "templateHash": "12731848354685707274"
+              "templateHash": "10870292284444930292"
             }
           },
           "parameters": {
@@ -526,9 +540,20 @@
             },
             "enableIndexPush": {
               "type": "bool",
-              "defaultValue": false,
+              "defaultValue": true,
               "metadata": {
-                "description": "Enable managed WebSocket index-ready notifications. Adds a Web PubSub Standard unit; polling remains the fallback."
+                "description": "Enable managed WebSocket index-ready notifications. Adds a Web PubSub unit (see indexPushSku); polling remains the fallback."
+              }
+            },
+            "indexPushSku": {
+              "type": "string",
+              "defaultValue": "Free_F1",
+              "allowedValues": [
+                "Free_F1",
+                "Standard_S1"
+              ],
+              "metadata": {
+                "description": "Web PubSub tier for index push. Free_F1 costs nothing but caps at 20 concurrent connections and 20,000 messages/day; browsers beyond that fall back to polling. Standard_S1 lifts the caps for a fixed monthly charge."
               }
             },
             "sessionSecretParam": {
@@ -937,8 +962,8 @@
               "name": "[format('{0}-index-events', parameters('appName'))]",
               "location": "[parameters('location')]",
               "sku": {
-                "name": "Standard_S1",
-                "tier": "Standard",
+                "name": "[parameters('indexPushSku')]",
+                "tier": "[if(equals(parameters('indexPushSku'), 'Free_F1'), 'Free', 'Standard')]",
                 "capacity": 1
               },
               "properties": {
