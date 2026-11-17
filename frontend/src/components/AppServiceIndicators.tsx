@@ -49,6 +49,9 @@ export const groupByDay = (items: AppNotification[], now = new Date()): Array<[s
     return Array.from(groups.entries());
 };
 
+const STRIP_RETRIES = 30;
+const STRIP_RETRY_MS = 4000;
+
 /** A finished upload's few photos, as small square thumbnails. Thumbnails the
  *  loaded sort index already knows load directly; the rest are resolved in one
  *  batch. One that isn't made yet stays an empty square. */
@@ -56,24 +59,34 @@ const NotificationStrip: React.FC<{ filenames: string[] }> = ({ filenames }) => 
     const direct = (filename: string) => thumbnailUrlForBlob(getCachedSortThumb(filename));
     const [resolved, setResolved] = useState<Record<string, string>>({});
     const [broken, setBroken] = useState<Set<string>>(() => new Set());
+    const [shown, setShown] = useState<Set<string>>(() => new Set());
+    const [round, setRound] = useState(0);
     const key = filenames.join('|');
+    // Right after an upload the server is still making these thumbnails, so ask again every few
+    // seconds (for about two minutes) instead of leaving empty squares until the panel is reopened.
     useEffect(() => {
-        const need = filenames.filter((filename) => !direct(filename));
-        if (need.length === 0) return undefined;
+        const need = filenames.filter((filename) => !direct(filename) && (!resolved[filename] || broken.has(filename)));
+        if (need.length === 0 || round > STRIP_RETRIES) return undefined;
         let active = true;
-        void resolveThumbnailAccessUrls(need).then((urls) => {
-            if (active) setResolved(Object.fromEntries(Array.from(urls).filter(([, url]) => url)));
-        });
-        return () => { active = false; };
-    }, [key]); // eslint-disable-line react-hooks/exhaustive-deps
+        const timer = window.setTimeout(() => {
+            void resolveThumbnailAccessUrls(need).then((urls) => {
+                if (!active) return;
+                setResolved((prev) => ({ ...prev, ...Object.fromEntries(Array.from(urls).filter(([, url]) => url)) }));
+                setBroken((prev) => new Set(Array.from(prev).filter((filename) => !need.includes(filename))));
+                setRound((n) => n + 1);
+            });
+        }, round === 0 ? 0 : STRIP_RETRY_MS);
+        return () => { active = false; window.clearTimeout(timer); };
+    }, [key, round]); // eslint-disable-line react-hooks/exhaustive-deps
     return (
         <div className="notification-strip">
             {filenames.map((filename) => {
                 const src = direct(filename) || resolved[filename];
                 return (
-                    <span key={filename} className="notification-thumb">
+                    <span key={filename} className={`notification-thumb${src && !broken.has(filename) && shown.has(filename) ? ' ready' : ''}`}>
                         {src && !broken.has(filename) && (
-                            <img src={src} alt="" loading="lazy" decoding="async"
+                            <img key={`${filename}:${round}`} src={src} alt="" loading="lazy" decoding="async"
+                                onLoad={() => setShown((prev) => new Set(prev).add(filename))}
                                 onError={() => setBroken((prev) => new Set(prev).add(filename))} />
                         )}
                     </span>

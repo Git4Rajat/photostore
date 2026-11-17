@@ -169,8 +169,15 @@ const rowCaptureTime = (row: SortIndexRow): number => {
 
 const filterRowsForGallery = (rows: SortIndexRow[], filters: GalleryFilters): SortIndexRow[] => (
     rows.filter((row) => {
-        if (filters.rating > 0 && (Number(row.rating) || 0) < filters.rating) return false;
-        if (filters.likedOnly && (Number(row.likes) || 0) <= 0) return false;
+        // The index can lag a like or rating just saved; the edit journal holds what the user did.
+        const { rating, likes } = filters.rating > 0 || filters.likedOnly
+            ? applyPendingEdits('photo', row.filename, { rating: row.rating, likes: row.likes })
+            : row;
+        if (filters.rating > 0 && (Number(rating) || 0) < filters.rating) return false;
+        if (filters.likedOnly && (Number(likes) || 0) <= 0) return false;
+        if (filters.media === 'video' && !isVideoFilename(row.filename)) return false;
+        if (filters.media === 'photo' && isVideoFilename(row.filename)) return false;
+        if (filters.media === 'live' && !row.gallery?.liveClip) return false;
         return true;
     })
 );
@@ -313,6 +320,8 @@ export type MediaFilter = 'all' | 'photo' | 'video' | 'live';
 interface GalleryFilters {
     rating: number;
     likedOnly: boolean;
+    /** Photos, videos or Live Photos only -- applied to the index so paging and counts stay right. */
+    media: MediaFilter;
 }
 
 export interface CaptureRange {
@@ -537,11 +546,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // Never let a stale refresh raise the visible count above this ceiling.
     const photoCountCeilingRef = useRef<number | null>(null);
     const [mediaFilter, setMediaFilterState] = useState<MediaFilter>('all');
-    const [galleryFilters, setGalleryFiltersState] = useState<GalleryFilters>({ rating: 0, likedOnly: false });
+    const [galleryFilters, setGalleryFiltersState] = useState<GalleryFilters>({ rating: 0, likedOnly: false, media: 'all' });
     const [captureRange, setCaptureRangeState] = useState<CaptureRange | null>(null);
     const [timeline, setTimeline] = useState<TimelineSummary | null>(null);
     const captureRangeRef = useRef<CaptureRange | null>(null);
-    const galleryFiltersRef = useRef<GalleryFilters>({ rating: 0, likedOnly: false });
+    const galleryFiltersRef = useRef<GalleryFilters>({ rating: 0, likedOnly: false, media: 'all' });
     const photoOffsetRef = useRef(0);
     const photoLoadingRef = useRef(false);
     const photoHasMoreRef = useRef(true);
@@ -968,8 +977,6 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         void fetchPhotos(true);
     }, [fetchPhotos]);
 
-    const setMediaFilter = useCallback((filter: MediaFilter) => setMediaFilterState(filter), []);
-
     const setGalleryFilters = useCallback((filters: GalleryFilters) => {
         galleryFiltersRef.current = filters;
         setGalleryFiltersState(filters);
@@ -977,6 +984,12 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         photoHasMoreRef.current = true;
         void fetchPhotos(true);
     }, [fetchPhotos]);
+
+    const setMediaFilter = useCallback((filter: MediaFilter) => {
+        if (galleryFiltersRef.current.media === filter) return;
+        setMediaFilterState(filter);
+        setGalleryFilters({ ...galleryFiltersRef.current, media: filter });
+    }, [setGalleryFilters]);
 
     const setGalleryRating = useCallback((rating: number) => {
         const next = Math.max(0, Math.min(5, Math.floor(Number(rating) || 0)));
