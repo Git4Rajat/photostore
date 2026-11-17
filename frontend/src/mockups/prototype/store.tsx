@@ -169,7 +169,7 @@ const rowCaptureTime = (row: SortIndexRow): number => {
 
 const filterRowsForGallery = (rows: SortIndexRow[], filters: GalleryFilters): SortIndexRow[] => (
     rows.filter((row) => {
-        if (filters.rating > 0 && (Number(row.rating) || 0) !== filters.rating) return false;
+        if (filters.rating > 0 && (Number(row.rating) || 0) < filters.rating) return false;
         if (filters.likedOnly && (Number(row.likes) || 0) <= 0) return false;
         return true;
     })
@@ -308,7 +308,7 @@ interface ViewerState {
     extendable?: boolean;
 }
 
-export type MediaFilter = 'all' | 'photo' | 'video';
+export type MediaFilter = 'all' | 'photo' | 'video' | 'live';
 
 interface GalleryFilters {
     rating: number;
@@ -773,7 +773,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const range = captureRangeRef.current;
         const rangeQuery = `${range?.start ? `&captureStart=${encodeURIComponent(range.start)}` : ''}${range?.end ? `&captureEnd=${encodeURIComponent(range.end)}` : ''}`;
         const filters = galleryFiltersRef.current;
-        const filterQuery = `${filters.rating > 0 ? `&rating=${filters.rating}` : ''}${filters.likedOnly ? '&minLikes=1' : ''}`;
+        const filterQuery = `${filters.rating > 0 ? `&minRating=${filters.rating}` : ''}${filters.likedOnly ? '&minLikes=1' : ''}`;
         const token = getCachedMediaToken();
         const pageSize = token ? pageSizeForCapacity(measureGridCapacity()) : PAGE_SIZE;
         const res = await get<{ photos?: BackendPhoto[]; total?: number; indexBuilding?: boolean; indexPartial?: boolean }>(
@@ -1065,7 +1065,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 const token = getCachedMediaToken();
                 const pageSize = token ? pageSizeForCapacity(measureGridCapacity()) : PAGE_SIZE;
                 const res = await get<{ offset?: number; filename?: string; total?: number; indexBuilding?: boolean; indexPartial?: boolean }>(
-                    `/photos/date-position?date=${encodeURIComponent(clean)}${filters.rating > 0 ? `&rating=${filters.rating}` : ''}${filters.likedOnly ? '&minLikes=1' : ''}`,
+                    `/photos/date-position?date=${encodeURIComponent(clean)}${filters.rating > 0 ? `&minRating=${filters.rating}` : ''}${filters.likedOnly ? '&minLikes=1' : ''}`,
                 );
                 reportIndexBuilding('gallery', Boolean(res?.indexBuilding || res?.indexPartial));
                 if (typeof res?.total === 'number' && res.total <= 0) {
@@ -1094,7 +1094,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const galleryViewerIds = useMemo(() => {
         const list = mediaFilter === 'all'
             ? photos
-            : photos.filter((p) => (mediaFilter === 'video' ? isVideoFilename(p.filename) : !isVideoFilename(p.filename)));
+            : mediaFilter === 'live'
+                ? photos.filter((p) => Boolean(p.liveClip))
+                : photos.filter((p) => (mediaFilter === 'video' ? isVideoFilename(p.filename) : !isVideoFilename(p.filename)));
         return list.map((p) => p.id);
     }, [photos, mediaFilter]);
 
