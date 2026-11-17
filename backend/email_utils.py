@@ -252,6 +252,17 @@ def _wrap_email(*, app_name: str, heading: str, body_html: str, cta_url: Optiona
     )
 
 
+def _display_name(person: str) -> str:
+    """Name to show for a person. An email address becomes its local part, because mail
+    clients (Gmail) turn anything that looks like an address into a blue underlined link."""
+    person = (person or '').strip()
+    if '@' in person:
+        person = person.partition('@')[0].replace('.', ' ').replace('_', ' ').strip()
+        if person.islower():
+            person = person[:1].upper() + person[1:]
+    return person
+
+
 def _plural(n: int, one: str, many: str) -> str:
     return f'{n} {one if n == 1 else many}'
 
@@ -305,7 +316,7 @@ def build_invite_email(invite_url: str, *, library_name: str = '', inviter: str 
     and ``expires_at`` are optional; the lines that need them are left out or
     reworded rather than showing a guess.
     """
-    who = (inviter or '').strip() or 'Someone'
+    who = _display_name(inviter) or 'Someone'
     lib = (library_name or '').strip()
     if lib:
         subject = f'{who} invited you to {lib}'
@@ -349,7 +360,7 @@ def build_album_shared_email(album_url: str, *, album_name: str, sender: str = '
     The access code is never part of this email; when the album needs one the
     fine print says it is sent separately.
     """
-    who = (sender or '').strip() or 'Someone'
+    who = _display_name(sender) or 'Someone'
     sub = _plural(item_count, 'photo or video', 'photos and videos') if item_count is not None else 'Shared album'
     intro = (f'{who} shared this album with you. You can look through it in your browser, '
              'and download it if you like.')
@@ -377,8 +388,8 @@ def build_library_clean_email(confirm_url: str, *, to_address: str = '', library
     who asked instead of "you asked".
     """
     lib = (library_name or '').strip() or 'your library'
-    requester = (requested_by or '').strip()
-    is_requester = not requester or requester.lower() == (to_address or '').strip().lower()
+    is_requester = not requested_by.strip() or requested_by.strip().lower() == (to_address or '').strip().lower()
+    requester = _display_name(requested_by)
     intro = ('You asked to delete everything in this library.' if is_requester
              else f'{requester} asked to delete everything in this library, and it needs your confirmation too.')
     facts = []

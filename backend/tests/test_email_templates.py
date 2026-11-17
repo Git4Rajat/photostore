@@ -42,7 +42,7 @@ def test_invite_without_optional_facts_and_fresh_target():
     assert 'Someone invited you to Lib' == b['subject']
     assert ' member' not in b['html'].replace('Only members', '') and 'ends in 72 hours' in b['plainText']
     fresh = eu.build_invite_email('https://x.test/i', inviter='a@b.c')
-    assert fresh['subject'] == 'a@b.c invited you to Keepsake'
+    assert fresh['subject'] == 'A invited you to Keepsake'
 
 
 def test_invite_escapes_user_input():
@@ -95,7 +95,7 @@ def test_clean_confirmation_matches_mockup():
 
 def test_clean_confirmation_second_approver_wording():
     b = eu.build_library_clean_email('https://x.test/c', to_address='b@x.test', library_name='L', requested_by='a@x.test')
-    assert 'a@x.test asked to delete everything in this library, and it needs your confirmation too.' in b['plainText']
+    assert 'A asked to delete everything in this library, and it needs your confirmation too.' in b['plainText']
     assert 'You asked' not in b['plainText']
 
 
@@ -131,3 +131,11 @@ def test_send_uses_built_content(monkeypatch):
     assert 'https://x.test/c' in sent['content']['plainText']
     with pytest.raises(ValueError):
         eu.send_invite_email('', 'https://x.test/i')
+
+
+def test_email_addresses_are_not_shown_as_addresses():
+    # Gmail auto-links anything shaped like an address.
+    b = eu.build_invite_email('https://x.test/i', library_name='Lib', inviter='rajat.verma57@gmail.com')
+    assert '@' not in b['subject'] and '@' not in b['html'].split('</style>')[1] and '@' not in b['plainText']
+    assert b['subject'] == 'Rajat verma57 invited you to Lib'
+    assert eu._display_name('Rajat') == 'Rajat'
