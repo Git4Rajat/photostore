@@ -99,8 +99,8 @@ param waveSourceCommit string = '49b7468c38d6fb54507de32f7b12cf9a4e501b76'
 param waveBootstrapPending bool = false
 
 
-@description('Enable managed WebSocket index-ready notifications. Adds a Web PubSub Standard unit; polling remains the fallback.')
-param enableIndexPush bool = false
+@description('Enable managed WebSocket index-ready notifications. Adds a Free-tier Web PubSub unit (20 concurrent connections, 20,000 messages/day); browsers beyond the cap, and any outage, fall back to polling.')
+param enableIndexPush bool = true
 
 @description('Secret used to sign login sessions. Always auto-generated fresh at deploy time -- intentionally not persisted. Every deployment therefore signs out all existing sessions (by design: simplest and safest default). What matters is that every app which validates these tokens restarts on the SAME new value together -- see revisionSuffix below -- so a login right after a deploy finishes always works.')
 @secure()
@@ -450,7 +450,8 @@ resource workerCheckpointStorage 'Microsoft.App/managedEnvironments/storages@202
 resource indexPush 'Microsoft.SignalRService/webPubSub@2024-03-01' = if (enableIndexPush) {
   name: '${appName}-index-events'
   location: location
-  sku: { name: 'Standard_S1', tier: 'Standard', capacity: 1 }
+  // Free tier on purpose: polling covers anything beyond its caps, so a paid unit isn't worth it.
+  sku: { name: 'Free_F1', tier: 'Free', capacity: 1 }
   properties: {
     disableLocalAuth: true
     publicNetworkAccess: 'Enabled'

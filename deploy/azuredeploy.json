@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.37.4.10188",
-      "templateHash": "9650190820944041598"
+      "templateHash": "3209718863977554644"
     }
   },
   "parameters": {
@@ -175,7 +175,7 @@
     },
     "enableIndexPush": {
       "type": "bool",
-      "defaultValue": false,
+      "defaultValue": true,
       "metadata": {
         "description": "Provision managed WebSocket notifications when library indexes are published."
       }
@@ -346,7 +346,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.37.4.10188",
-              "templateHash": "12731848354685707274"
+              "templateHash": "3529620701878775825"
             }
           },
           "parameters": {
@@ -526,9 +526,9 @@
             },
             "enableIndexPush": {
               "type": "bool",
-              "defaultValue": false,
+              "defaultValue": true,
               "metadata": {
-                "description": "Enable managed WebSocket index-ready notifications. Adds a Web PubSub Standard unit; polling remains the fallback."
+                "description": "Enable managed WebSocket index-ready notifications. Adds a Free-tier Web PubSub unit (20 concurrent connections, 20,000 messages/day); browsers beyond the cap, and any outage, fall back to polling."
               }
             },
             "sessionSecretParam": {
@@ -937,8 +937,8 @@
               "name": "[format('{0}-index-events', parameters('appName'))]",
               "location": "[parameters('location')]",
               "sku": {
-                "name": "Standard_S1",
-                "tier": "Standard",
+                "name": "Free_F1",
+                "tier": "Free",
                 "capacity": 1
               },
               "properties": {
