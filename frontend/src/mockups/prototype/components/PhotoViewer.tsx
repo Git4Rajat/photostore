@@ -16,7 +16,6 @@ import ViewerShell from './ViewerShell';
 import { useStore, isVideoFilename } from '../store';
 import { useMainMedia, useVideoSource, downloadPhoto, fetchPhotoMetadata, preloadMediaAccessUrls, useLiveClipSource } from '../media';
 import type { PhotoMetadata } from '../media';
-import { isRawFilename } from '../../../utils/photoDisplay';
 import { captureWallClock } from '../../../utils/captureDate';
 
 const DAY_FORMAT = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
@@ -159,7 +158,10 @@ const PhotoViewer: React.FC = () => {
     const place = loc.city || loc.country || '';
     const title = place || dayText || photo.filename;
     const subtitle = place ? [dayText, timeText].filter(Boolean).join(' · ') : timeText;
-    const startDownload = () => void downloadPhoto(photo).then(() => toast('Download started')).catch(() => toast('Download failed', undefined, undefined, 'error'));
+    const startDownload = () => {
+        toast('Preparing download…');
+        void downloadPhoto(photo).then(() => toast('Download started')).catch(() => toast('Download failed', undefined, undefined, 'error'));
+    };
 
     return (
         <ViewerShell
@@ -185,8 +187,8 @@ const PhotoViewer: React.FC = () => {
                 setFullRes(false);
                 toast('This browser can’t show this photo’s original. Showing the preview instead.');
             }}
-            // A RAW original can't be drawn by any browser; its viewer image is already the best preview there is.
-            showFullResControl={!isVideo && !isRawFilename(photo.filename)}
+            // For a RAW, FR loads the backend's native-size embedded preview (see useMainMedia).
+            showFullResControl={!isVideo}
             onDownloadOriginal={startDownload}
             info={showInfo ? (
                     <aside className="pt-viewer-info" aria-label="Photo information">

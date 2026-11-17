@@ -299,6 +299,31 @@ def test_access_url_uses_exact_derivative_pointer_and_original_identity(blobs, m
     assert response.get_json()['url'] == 'https://storage/' + expected
 
 
+def test_access_url_download_flag_asks_for_an_attachment_sas(blobs, monkeypatch):
+    import app
+    from routes.photos import photo_access_url
+    (metadata, *_), _ = blobs
+    row = metadata.get_entity('lib', 'photo.jpg')
+    seen = []
+    monkeypatch.setattr(app, '_require_user_id', lambda: ('lib', None))
+    monkeypatch.setattr(app, '_get_metadata_entity', lambda *a: row)
+    monkeypatch.setattr(app, 'blob_service_client', object())
+    monkeypatch.setattr(app, 'account_name', 'account')
+    monkeypatch.setattr(app, '_create_stable_read_sas_url', lambda container, name, **kwargs: (seen.append(kwargs), ('https://storage/' + name, 'later'))[1])
+    with app.app.test_request_context('/api/photos/access/image/photo.jpg?download=1'):
+        photo_access_url('image', 'photo.jpg')
+    with app.app.test_request_context('/api/photos/access/image/photo.jpg'):
+        photo_access_url('image', 'photo.jpg')
+    assert seen[0] == {'download_filename': 'photo.jpg', 'attachment': True}
+    assert seen[1] == {'download_filename': 'photo.jpg'}
+
+
+def test_download_content_disposition_attachment_keeps_filename():
+    import app
+    assert app._download_content_disposition('a b.dng', attachment=True).startswith('attachment; filename="a b.dng"')
+    assert app._download_content_disposition('a.jpg').startswith('inline;')
+
+
 def test_completion_delivery_retains_exact_old_derivative_receipt_across_new_generation(blobs):
     from processing_completion import STEPS, prepare_completion, relay_completion
     from test_upload_waves import AtomicTable

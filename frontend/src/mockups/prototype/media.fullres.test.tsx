@@ -78,4 +78,22 @@ describe('useMainMedia full resolution', () => {
         await act(async () => { finish('blob:preview-2'); });
         expect(result.current.url).toBe('blob:preview-2');
     });
+
+    it('loads a RAW\'s native-size embedded preview for FR, from the backend route', async () => {
+        mocks.fetchOriginal.mockResolvedValue('blob:native');
+        const { result, rerender } = renderHook(({ fullRes }) => useMainMedia(photo('IMG_1.DNG'), fullRes), { initialProps: { fullRes: false } });
+        await waitFor(() => expect(result.current.url).toBe('blob:preview'));
+        rerender({ fullRes: true });
+        await waitFor(() => expect(result.current.url).toBe('blob:native'));
+        expect(mocks.fetchOriginal.mock.calls[0][0]).toBe('/api/photos/raw-full-preview/IMG_1.DNG');
+    });
+
+    it('keeps a RAW\'s standard preview when it has no native preview', async () => {
+        mocks.fetchOriginal.mockRejectedValue(new Error('404'));
+        const { result, rerender } = renderHook(({ fullRes }) => useMainMedia(photo('IMG_1.DNG'), fullRes), { initialProps: { fullRes: false } });
+        await waitFor(() => expect(result.current.url).toBe('blob:preview'));
+        rerender({ fullRes: true });
+        await waitFor(() => expect(result.current.loading).toBe(false));
+        expect(result.current.url).toBe('blob:preview');
+    });
 });

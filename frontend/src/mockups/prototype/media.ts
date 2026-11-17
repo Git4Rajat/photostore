@@ -363,7 +363,22 @@ export function useMainMedia(photo?: Photo | null, fullRes = false): MainMediaSt
 
         const attempt = async (retryIndex: number) => {
             try {
-                const blobUrl = await fetchFirstAvailableTier(order, filename, fallbackUrl, fullRes, controller.signal, (loadedBytes, totalBytes) => {
+                // FR on a RAW: the backend's native-size embedded preview (the original itself can't be drawn).
+                // A RAW with none (404) or a failed extraction just keeps the standard preview below.
+                let blobUrl = '';
+                if (fullRes && isRawFilename(filename)) {
+                    try {
+                        blobUrl = await fetchProtectedBlobUrlWithProgress(`/api/photos/raw-full-preview/${encodeURIComponent(filename)}`, {
+                            signal: controller.signal,
+                            onProgress: (loadedBytes, totalBytes) => {
+                                if (active) setProgress(totalBytes > 0 ? Math.min(99, Math.round((loadedBytes / totalBytes) * 100)) : 0);
+                            },
+                        });
+                    } catch {
+                        blobUrl = '';
+                    }
+                }
+                if (!blobUrl) blobUrl = await fetchFirstAvailableTier(order, filename, fallbackUrl, fullRes, controller.signal, (loadedBytes, totalBytes) => {
                     if (active) {
                         setProgress(totalBytes > 0 ? Math.min(99, Math.round((loadedBytes / totalBytes) * 100)) : 0);
                     }
@@ -527,24 +542,42 @@ const fetchDownloadBlobUrl = (photo: Photo): Promise<string> => (
     fetchFirstAvailableTier(['image', 'preview', 'thumbnail'], photo.filename, photo.thumbnailUrl, false, new AbortController().signal, () => {})
 );
 
-/** Downloads a photo's file to the user's device. Throws on failure. */
+const saveFromUrl = (href: string, filename: string, revokeAfterMs?: number) => {
+    const anchor = document.createElement('a');
+    anchor.href = href;
+    anchor.download = filename;
+    anchor.rel = 'noreferrer';
+    anchor.style.display = 'none';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    if (revokeAfterMs !== undefined) setTimeout(() => URL.revokeObjectURL(href), revokeAfterMs);
+};
+
+// A signed storage URL whose response says 'attachment' with the original
+// filename, so the browser streams the file to disk itself -- no buffering of
+// the whole original in page memory first. '' when unavailable (proxy mode,
+// not signed in yet), and the caller falls back to fetching the bytes.
+const resolveDirectDownloadUrl = async (filename: string): Promise<string> => {
+    try {
+        const response = await get<{ url?: string }>(`/api/photos/access/image/${encodeURIComponent(filename)}?download=1`);
+        return isHttpUrl(response?.url) ? String(response.url) : '';
+    } catch {
+        return '';
+    }
+};
+
+/** Downloads a photo's file to the user's device. Resolves once the browser has been handed the file; throws on failure. */
 export async function downloadPhoto(photo: Photo): Promise<void> {
+    const direct = await resolveDirectDownloadUrl(photo.filename);
+    if (direct) {
+        saveFromUrl(direct, photo.filename);
+        return;
+    }
+    // Fallback: best available tier fetched as a blob (preview/thumbnail when the original is missing).
     const objectUrl = await fetchDownloadBlobUrl(photo);
     if (!objectUrl) {
         throw new Error('No downloadable media for this photo.');
     }
-    try {
-        const anchor = document.createElement('a');
-        anchor.href = objectUrl;
-        anchor.download = photo.filename;
-        anchor.rel = 'noreferrer';
-        anchor.style.display = 'none';
-        document.body.appendChild(anchor);
-        anchor.click();
-        anchor.remove();
-    } finally {
-        setTimeout(() => URL.revokeObjectURL(objectUrl), 5000);
-    }
+    saveFromUrl(objectUrl, photo.filename, 5000);
 }
-
-

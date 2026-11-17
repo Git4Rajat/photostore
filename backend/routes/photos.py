@@ -107,10 +107,14 @@ def photo_access_url(kind: str, filename: str):
         blob_name = app._blob_name_from_metadata(metadata, safe_name)
         if kind in ('thumbnail', 'preview'):
             blob_name = app._derivative_blob_from_metadata(metadata, safe_name, kind)
+        # ?download=1: an 'attachment' URL the browser saves straight from storage
+        # (streamed natively, original filename) instead of the client buffering it.
+        as_attachment = kind == 'image' and app.request.args.get('download') in ('1', 'true')
         url, expires_at = app._create_stable_read_sas_url(
             container,
             blob_name,
             download_filename=safe_name if kind == 'image' else None,
+            **({'attachment': True} if as_attachment else {}),
         )
         return app.jsonify(app._access_url_response(url, expires_at, safe_name, kind))
     except Exception as exc:
