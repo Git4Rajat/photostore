@@ -85,6 +85,7 @@ import { AppServicesProvider, useAppServices } from './AppServicesProvider';
 import { UploadDock } from '../mockups/prototype/components/UploadDock';
 import { MAX_UPLOAD_RETRY_ATTEMPTS, UPLOAD_SESSION_STORAGE_KEY } from './browserAiShared';
 import * as largeFileHash from '../utils/largeFileHash';
+import * as browserProcessing from './browserProcessingRuntime';
 import * as uploadWaveSync from '../services/uploadWaveSync';
 
 let services: ReturnType<typeof useAppServices>;
@@ -1287,6 +1288,24 @@ describe('large upload hashing', () => {
         expect(finalizedFiles()).toHaveLength(0);
         expect(services.uploading).toBe(false);
         expect(services.pendingUploadSummary).toBeNull();
+    });
+
+    it('stops the duplicate check on Stop even when every file is small', async () => {
+        const reads = vi.spyOn(browserProcessing, 'readBlobArrayBuffer').mockImplementation(async (file: Blob) => {
+            await new Promise(resolve => setTimeout(resolve, 100));
+            return new TextEncoder().encode((file as File).name).buffer as ArrayBuffer;
+        });
+        select(filesFor(40));
+        await advance(250);
+        expect(reads.mock.calls.length).toBeGreaterThan(0);
+        act(() => services.stopActiveUpload());
+        const readsAtStop = reads.mock.calls.length;
+        await advance(3000);
+        expect(reads.mock.calls.length).toBeLessThanOrEqual(readsAtStop + 4);
+        expect(reads.mock.calls.length).toBeLessThan(40);
+        expect(initFiles()).toHaveLength(0);
+        expect(services.uploading).toBe(false);
+        expect(services.uploadCheckProgress).toBeNull();
     });
 });
 

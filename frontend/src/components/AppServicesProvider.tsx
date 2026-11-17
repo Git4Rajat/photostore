@@ -2230,11 +2230,15 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         void idbSweepOrphans((key) => !!liveId && key.startsWith(`${liveId}:`)).catch(() => undefined);
     }, [persistSession]);
 
-    const computeSha256 = async (file: File, signal?: AbortSignal): Promise<string> => (
-        file.size > LARGE_FILE_HASH_THRESHOLD
-            ? hashLargeFile(file, signal)
-            : sha256ArrayBuffer(await readBlobArrayBuffer(file))
-    );
+    const computeSha256 = async (file: File, signal?: AbortSignal): Promise<string> => {
+        // Small files take a single read with no abort hook of their own, so a
+        // cancelled upload must be caught before and after it.
+        signal?.throwIfAborted();
+        if (file.size > LARGE_FILE_HASH_THRESHOLD) return hashLargeFile(file, signal);
+        const buffer = await readBlobArrayBuffer(file);
+        signal?.throwIfAborted();
+        return sha256ArrayBuffer(buffer);
+    };
 
     // Best-effort prefetch of the library's dedup snapshot so uploadFileInChunks
     // can skip a known duplicate before staging a single byte. Until the
@@ -5128,13 +5132,23 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // Fetch the library snapshot first, then hash the complete
             // selection. Only candidates survive into the wave declaration,
             // so skipped duplicates never need /items or server bookkeeping.
-            await fetchKnownHashes();
+            // Stop must not wait on the library snapshot download.
+            const aborted = new Promise<never>((_, reject) => {
+                const rejectAborted = () => reject(dedupController.signal.reason ?? new DOMException('Aborted', 'AbortError'));
+                if (dedupController.signal.aborted) rejectAborted();
+                else dedupController.signal.addEventListener('abort', rejectAborted, { once: true });
+            });
+            aborted.catch(() => undefined);
+            await Promise.race([fetchKnownHashes(), aborted]);
+            dedupController.signal.throwIfAborted();
             const results: Array<{ file: File; sha256: string; duplicate: boolean } | undefined>
                 = new Array(filesToUpload.length);
             let cursor = 0;
             let completed = 0;
             const hashWorker = async () => {
                 for (;;) {
+                    // A stopped start hashes nothing further.
+                    dedupController.signal.throwIfAborted();
                     const index = cursor++;
                     if (index >= filesToUpload.length) return;
                     const file = filesToUpload[index];
@@ -5157,6 +5171,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     if (completed === filesToUpload.length || completed % 25 === 0) {
                         updateNotification(dedupNotificationId, {
                             details: `Checked ${completed}/${selectedCount} files for duplicates.`,
+                            progress: { uploadedCount: completed, totalCount: selectedCount, failedCount: 0, skippedDuplicateCount: 0 },
                         });
                     }
                 }
@@ -5187,6 +5202,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             }
             filesToUpload = candidates;
         } catch (error) {
+            if (uploadStopRequestedRef.current && dedupController.signal.aborted) {
+                // The user stopped the upload: stopActiveUpload already reset
+                // the running state and announced it, so this is not a failure.
+                updateNotification(dedupNotificationId, { title: 'Duplicate check stopped', details: 'Upload cancelled before any files were uploaded.' });
+                uploadStartInProgressRef.current = false;
+                return;
+            }
             const message = getUploadErrorMessage(error, 'Could not check selected files for duplicates.');
             setUploadError(message);
             setUploading(false);
