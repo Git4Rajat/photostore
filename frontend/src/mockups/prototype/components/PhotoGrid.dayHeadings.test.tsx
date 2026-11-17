@@ -15,7 +15,7 @@ vi.mock('../store', () => ({
     }),
 }));
 
-import PhotoGrid, { dayHeading } from './PhotoGrid';
+import PhotoGrid, { dayHeading, groupHeading } from './PhotoGrid';
 import type { Photo } from '../types';
 
 const photo = (filename: string, captureDate: string | null): Photo => ({
@@ -42,5 +42,22 @@ describe('PhotoGrid day headings', () => {
     it('shows no headings unless asked', () => {
         render(<PhotoGrid photos={[photo('a.jpg', '2024-10-10T22:41:00')]} />);
         expect(screen.queryAllByRole('heading')).toHaveLength(0);
+    });
+
+    it('clubs days into months and months into years as the grain coarsens', () => {
+        const photos = [
+            photo('a.jpg', '2024-10-10T22:41:00'),
+            photo('b.jpg', '2024-10-03T08:00:00'),
+            photo('c.jpg', '2024-01-27T12:00:00'),
+            photo('d.jpg', '2023-12-31T12:00:00'),
+            photo('e.jpg', null),
+        ];
+        const { unmount } = render(<PhotoGrid photos={photos} dayHeadings headingGrain="month" />);
+        expect(screen.getAllByRole('heading').map((h) => h.textContent)).toEqual([
+            groupHeading(photos[0], 'month'), groupHeading(photos[2], 'month'), groupHeading(photos[3], 'month'), 'Undated',
+        ]);
+        unmount();
+        render(<PhotoGrid photos={photos} dayHeadings headingGrain="year" />);
+        expect(screen.getAllByRole('heading').map((h) => h.textContent)).toEqual(['2024', '2023', 'Undated']);
     });
 });

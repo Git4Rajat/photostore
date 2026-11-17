@@ -18,11 +18,21 @@ export const LiveMark: React.FC = () => (
     </svg>
 );
 
-/** The day heading a photo sits under: its capture day, or "Undated". */
-export const dayHeading = (photo: Photo): string => {
+const MONTH_FORMAT = new Intl.DateTimeFormat(undefined, { month: 'long', year: 'numeric' });
+
+/** How coarsely a grid's headings group its photos. */
+export type HeadingGrain = 'day' | 'month' | 'year';
+
+/** The heading a photo sits under: its capture day, month or year, or "Undated". */
+export const groupHeading = (photo: Photo, grain: HeadingGrain = 'day'): string => {
     const day = captureWallClock(photo.captureDate ?? null);
-    return day ? DAY_FORMAT.format(day) : 'Undated';
+    if (!day) return 'Undated';
+    if (grain === 'year') return String(day.getFullYear());
+    return (grain === 'month' ? MONTH_FORMAT : DAY_FORMAT).format(day);
 };
+
+/** The day heading a photo sits under: its capture day, or "Undated". */
+export const dayHeading = (photo: Photo): string => groupHeading(photo, 'day');
 
 // Tile rotation and the thumbnail/grid-image srcset are worked out by
 // tileImage (media.ts). No down-scale is needed for a 90/270 turn: the img is
@@ -66,7 +76,7 @@ export const TileThumbnail: React.FC<{ src: string; srcSet?: string; sizes?: str
  * checkbox toggles selection (which surfaces the command bar). Rating and like
  * state show as small overlays.
  */
-const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?: React.RefObject<HTMLDivElement>; extendable?: boolean; dayHeadings?: boolean }> = ({ photos, emptyHint, extendable, dayHeadings }) => {
+const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?: React.RefObject<HTMLDivElement>; extendable?: boolean; dayHeadings?: boolean; headingGrain?: HeadingGrain }> = ({ photos, emptyHint, extendable, dayHeadings, headingGrain = 'day' }) => {
     const { selection, toggleSelect, selectMany, openViewer, selectMode, setSelectMode } = useStore();
     const thumbs = usePhotoThumbnails(photos);
     const [lastSelected, setLastSelected] = React.useState<number | null>(null);
@@ -179,8 +189,8 @@ const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?: React
                 const image = tileImage(photo, thumbs[photo.filename]);
                 // A heading spans the whole row whenever the capture day changes,
                 // so the grid reads as days rather than one undivided wall.
-                const heading = dayHeadings ? dayHeading(photo) : null;
-                const showHeading = heading !== null && (i === 0 || dayHeading(photos[i - 1]) !== heading);
+                const heading = dayHeadings ? groupHeading(photo, headingGrain) : null;
+                const showHeading = heading !== null && (i === 0 || groupHeading(photos[i - 1], headingGrain) !== heading);
                 return (
                     <React.Fragment key={photo.id}>
                     {showHeading && <h2 className="pt-day-heading">{heading}</h2>}

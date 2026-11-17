@@ -1,10 +1,10 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { SlidersHorizontal as FilterIcon, Upload as ArrowUpTrayIcon, Grid2x2 as LargePhotosIcon, Grid3x3 as SmallPhotosIcon, Image as PhotoIcon, UserPlus as UserPlusIcon } from 'lucide-react';
 import { useStore, isVideoFilename } from '../store';
 import type { CaptureRange } from '../store';
 import { useAppServices } from '../../../components/AppServicesProvider';
 import { invalidateLocalSortIndex } from '../../../services/localSortIndex';
-import PhotoGrid from '../components/PhotoGrid';
+import PhotoGrid, { type HeadingGrain } from '../components/PhotoGrid';
 import TimelineBrowser from '../components/TimelineBrowser';
 import { Spinner } from '../components/bits';
 import { FilterSentence, PhotosFilterBar, activeFilterCount as countFilters, type PhotosFilterActions, type PhotosFilterState } from '../components/PhotosFilter';
@@ -18,6 +18,22 @@ type ZoomLevel = 'days' | 'months' | 'years';
 // Months too early, so the Gallery gets its own, much smaller floor.
 const GALLERY_TILE_MIN = 24;
 const clampGalleryTile = (n: number) => Math.min(TILE_RANGE.max, Math.max(GALLERY_TILE_MIN, n));
+// Like iOS Photos, the grouping follows the tile size: as tiles shrink, the
+// per-day headings merge into per-month and then per-year ones, so one pinch
+// coarsens both together. Zooming back in reverses it.
+export const MONTH_GROUP_BELOW = 64;
+export const YEAR_GROUP_BELOW = 36;
+export const headingGrainFor = (tile: number): HeadingGrain =>
+    tile < YEAR_GROUP_BELOW ? 'year' : tile < MONTH_GROUP_BELOW ? 'month' : 'day';
+
+// The nearest ancestor that actually scrolls (.pt-body on phones, else the page).
+const scrollParentOf = (el: HTMLElement): HTMLElement | null => {
+    for (let n = el.parentElement; n; n = n.parentElement) {
+        const oy = window.getComputedStyle(n).overflowY;
+        if ((oy === 'auto' || oy === 'scroll') && n.scrollHeight > n.clientHeight) return n;
+    }
+    return null;
+};
 
 /** Gallery — the populated grid + drag-and-drop upload + the empty first-run state. */
 const GalleryPage: React.FC = () => {
@@ -42,41 +58,56 @@ const GalleryPage: React.FC = () => {
     const gridRef = useRef<HTMLDivElement>(null);
     const sentinelRef = useRef<HTMLDivElement>(null);
     const pinchRef = useRef<{ dist: number; tile: number } | null>(null);
+    // The tile held under the fingers (or the viewport centre) while the size
+    // changes, and where on screen it should stay.
+    const anchorRef = useRef<{ id: string; top: number } | null>(null);
+    const grabAnchor = (x: number, y: number) => {
+        const el = document.elementFromPoint(x, y)?.closest<HTMLElement>('[data-tile-id]');
+        anchorRef.current = el?.dataset.tileId ? { id: el.dataset.tileId, top: el.getBoundingClientRect().top } : null;
+    };
+    const grabCentreAnchor = () => grabAnchor(window.innerWidth / 2, window.innerHeight / 2);
+    const headingGrain = headingGrainFor(tileMin);
+    useLayoutEffect(() => {
+        const anchor = anchorRef.current;
+        if (!anchor || !gridRef.current) return;
+        const el = Array.from(gridRef.current.querySelectorAll<HTMLElement>('[data-tile-id]')).find((t) => t.dataset.tileId === anchor.id);
+        if (!el) return;
+        const delta = el.getBoundingClientRect().top - anchor.top;
+        if (Math.abs(delta) < 1) return;
+        const scroller = scrollParentOf(el);
+        if (scroller) scroller.scrollTop += delta; else window.scrollBy(0, delta);
+    }, [tileMin]);
     const pendingScrollIdRef = useRef<string | null>(null);
 
     // Zoom-out steps: shrink tiles until the floor, then Days → Months → Years.
     const zoomOut = () => {
         if (level === 'years') return;
         if (level === 'months') { setLevel('years'); return; }
-        if (tileMin > GALLERY_TILE_MIN) setTileMin((n) => clampGalleryTile(n - TILE_STEP));
+        if (tileMin > GALLERY_TILE_MIN) { grabCentreAnchor(); setTileMin((n) => clampGalleryTile(n - TILE_STEP)); }
         else { setFocusYear(null); setLevel('months'); }
     };
     // Zoom-in steps: Years → Months → Days, then grow tiles.
     const zoomIn = () => {
         if (level === 'years') { setLevel('months'); return; }
         if (level === 'months') { setLevel('days'); return; }
-        if (tileMin < TILE_RANGE.max) setTileMin((n) => clampGalleryTile(n + TILE_STEP));
+        if (tileMin < TILE_RANGE.max) { grabCentreAnchor(); setTileMin((n) => clampGalleryTile(n + TILE_STEP)); }
     };
     const zoomedOutFully = level === 'years';
     const zoomedInFully = level === 'days' && tileMin >= TILE_RANGE.max;
 
     const touchDistance = (t: React.TouchList) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
     const onTouchStart = (e: React.TouchEvent) => {
-        if (e.touches.length === 2) pinchRef.current = { dist: touchDistance(e.touches), tile: tileMin };
+        if (e.touches.length !== 2) return;
+        pinchRef.current = { dist: touchDistance(e.touches), tile: tileMin };
+        grabAnchor((e.touches[0].clientX + e.touches[1].clientX) / 2, (e.touches[0].clientY + e.touches[1].clientY) / 2);
     };
     const onTouchMove = (e: React.TouchEvent) => {
         if (e.touches.length !== 2 || !pinchRef.current) return;
         const ratio = touchDistance(e.touches) / pinchRef.current.dist;
         if (level === 'days') {
-            const target = Math.round(pinchRef.current.tile * ratio);
-            // Pinched in past the smallest tile => keep zooming out into Months.
-            if (ratio < 1 && target <= GALLERY_TILE_MIN) {
-                setFocusYear(null);
-                setLevel('months');
-                pinchRef.current = null;
-                return;
-            }
-            setTileMin(clampGalleryTile(target));
+            // One continuous gesture: the tile size follows the fingers and the
+            // heading grouping (day / month / year) follows the tile size.
+            setTileMin(clampGalleryTile(Math.round(pinchRef.current.tile * ratio)));
         } else if (ratio > 1.25) {
             zoomIn();
             pinchRef.current = null;
@@ -88,6 +119,22 @@ const GalleryPage: React.FC = () => {
     const onTouchEnd = (e: React.TouchEvent) => {
         if (e.touches.length < 2) pinchRef.current = null;
     };
+
+    // Desktop: ctrl/cmd + wheel (and a trackpad pinch, which browsers report the
+    // same way) resizes the tiles continuously, anchored on the pointer.
+    useEffect(() => {
+        const node = gridRef.current;
+        if (!node) return undefined;
+        const onWheel = (e: WheelEvent) => {
+            if (!e.ctrlKey && !e.metaKey) return;
+            e.preventDefault();
+            grabAnchor(e.clientX, e.clientY);
+            setTileMin((n) => clampGalleryTile(Math.round(n * Math.exp(-e.deltaY * 0.01))));
+        };
+        node.addEventListener('wheel', onWheel, { passive: false });
+        return () => node.removeEventListener('wheel', onWheel);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [level, photos.length === 0, setTileMin]);
 
     // Returning to the Gallery (a tap on the already-active tab, or a fresh
     // navigation) starts at the top again: full library, Days zoom. Mirror the
@@ -213,7 +260,7 @@ const GalleryPage: React.FC = () => {
                     max={TILE_RANGE.max}
                     step={4}
                     value={tileMin}
-                    onChange={(e) => setTileMin(clampGalleryTile(Number(e.target.value)))}
+                    onChange={(e) => { grabCentreAnchor(); setTileMin(clampGalleryTile(Number(e.target.value))); }}
                 />
             )}
             <button type="button" className="pt-size-end" aria-label="Larger photos" title="Larger photos" disabled={zoomedInFully} onClick={zoomIn}>
@@ -353,7 +400,7 @@ const GalleryPage: React.FC = () => {
                     onTouchMove={onTouchMove}
                     onTouchEnd={onTouchEnd}
                 >
-                    <PhotoGrid photos={visiblePhotos} gridRef={gridRef} extendable dayHeadings emptyHint={mediaFilter !== 'all' ? '' : undefined} />
+                    <PhotoGrid photos={visiblePhotos} gridRef={gridRef} extendable dayHeadings headingGrain={headingGrain} emptyHint={mediaFilter !== 'all' ? '' : undefined} />
                     {mediaFilter !== 'all' && visiblePhotos.length === 0 && (
                         <p className="pt-grid-empty">No {mediaFilter === 'video' ? 'videos' : 'photos'} on the loaded pages yet — scroll to load more.</p>
                     )}
