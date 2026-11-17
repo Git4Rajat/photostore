@@ -82,7 +82,7 @@ vi.mock('@azure/storage-blob', () => ({
 }));
 
 import { AppServicesProvider, useAppServices } from './AppServicesProvider';
-import { UploadDock } from './UploadDock';
+import { UploadDock } from '../mockups/prototype/components/UploadDock';
 import { MAX_UPLOAD_RETRY_ATTEMPTS, UPLOAD_SESSION_STORAGE_KEY } from './browserAiShared';
 import * as largeFileHash from '../utils/largeFileHash';
 import * as uploadWaveSync from '../services/uploadWaveSync';
@@ -733,15 +733,15 @@ describe('browser upload selection and startup', () => {
         select(filesFor(50));
         await advance(1000);
         expect(services.uploadActive).toBe(true);
-        expect(screen.getByText('Uploading 0 / 50')).toBeTruthy();
+        expect(screen.getByText('Uploading 50 items')).toBeTruthy();
         act(() => services.clearNotifications());
         expect(services.notifications).toEqual([]);
-        expect(screen.getByText('Uploading 0 / 50')).toBeTruthy();
-        fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
+        expect(screen.getByText('Uploading 50 items')).toBeTruthy();
+        fireEvent.click(screen.getByRole('button', { name: 'Pause' }));
         await advance(3000);
         expect(services.uploadActive).toBe(false);
         expect(services.uploadProgress).toBeNull();
-        expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull();
+        expect(screen.queryByRole('button', { name: 'Pause' })).toBeNull();
         expect(refreshRequests()[0][1]).toEqual({ reason: 'stopped' });
     });
 
@@ -757,11 +757,11 @@ describe('browser upload selection and startup', () => {
         expect(finalizedFiles()).toHaveLength(0);
         const attempts = mocks.transferred.mock.calls.length;
         act(() => services.clearNotifications());
-        fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
+        fireEvent.click(screen.getByRole('button', { name: 'Pause' }));
         await advance(10000);
         expect(mocks.transferred).toHaveBeenCalledTimes(attempts);
         expect(services.uploadActive).toBe(false);
-        expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull();
+        expect(screen.queryByRole('button', { name: 'Pause' })).toBeNull();
     });
 
     it.each([false,true])('stops finalization retries promptly while offline=%s', async (offline) => {
@@ -822,12 +822,12 @@ describe('browser upload selection and startup', () => {
         act(() => services.clearNotifications());
         expect(services.notifications).toEqual([]);
         expect(screen.getByText(/Finishing upload/)).toBeTruthy();
-        fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
+        fireEvent.click(screen.getByRole('button', { name: 'Pause' }));
         expect(services.queuedUploadFileCount).toBe(0);
         await act(async () => releaseFinalize());
         await advance(3000);
         expect(services.uploadActive).toBe(false);
-        expect(screen.queryByRole('button', { name: 'Stop' })).toBeNull();
+        expect(screen.queryByRole('button', { name: 'Pause' })).toBeNull();
         expect(initFiles().some(file => file.filename === 'queued.heic')).toBe(false);
     });
 
