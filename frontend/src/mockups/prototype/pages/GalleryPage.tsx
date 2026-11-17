@@ -3,7 +3,6 @@ import { SlidersHorizontal as FilterIcon, Upload as ArrowUpTrayIcon, Grid2x2 as 
 import { useStore, isVideoFilename } from '../store';
 import type { CaptureRange } from '../store';
 import { useAppServices } from '../../../components/AppServicesProvider';
-import { UploadDock } from '../../../components/UploadDock';
 import { invalidateLocalSortIndex } from '../../../services/localSortIndex';
 import PhotoGrid from '../components/PhotoGrid';
 import TimelineBrowser from '../components/TimelineBrowser';
@@ -330,8 +329,6 @@ const GalleryPage: React.FC = () => {
 
             {level === 'days' && filterSummary}
             {scopeCrumbs}
-
-            <UploadDock />
 
             {level !== 'days' && timeline ? (
                 <div onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}>
