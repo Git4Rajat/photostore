@@ -1536,3 +1536,12 @@
 .up-tray .up-uf { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px 12px 16px; border-top: 1px solid var(--lg-edge); font-size: 12px; color: var(--muted); gap: 10px; }
 .up-fbtns { display: inline-flex; gap: 10px; }
 @media (prefers-reduced-motion: reduce) { .up-prog i { transition: none; } }
+
+/* iOS Safari zooms the page when a text field under 16px gets focus (tapping Search, the album
+   picker's search, dates). Touch screens keep every field at 16px so the page never jumps. */
+@media (pointer: coarse) {
+  .mock-app input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+  .mock-app select,
+  .mock-app textarea,
+  .pt-sheet input:not([type="checkbox"]):not([type="radio"]):not([type="range"]) { font-size: max(16px, 1em) !important; }
+}
