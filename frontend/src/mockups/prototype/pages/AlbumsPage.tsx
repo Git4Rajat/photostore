@@ -31,7 +31,8 @@ import { confirmDialog, promptDialog } from '../../../components/shared/dialogs'
 import { useProtectedBlobUrls } from '../../../services/imageClient';
 import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
 import { tileImage, useMainMedia } from '../media';
-import type { Photo } from '../types';
+import { useLongPress } from '../../../services/useLongPress';
+import type { Album, Photo } from '../types';
 
 const SMART_ALBUM_RULES: Array<{ id: string; label: string; description: string; Icon: React.ComponentType<React.SVGProps<SVGSVGElement>> }> = [
     { id: 'location', label: 'By location', description: 'Places across the library', Icon: MapPinIcon },
@@ -52,6 +53,37 @@ const AlbumBanner: React.FC<{ thumb: string; photo?: Photo }> = ({ thumb, photo 
         .filter((u): u is string => Boolean(u) && !failed.includes(u as string));
     const src = candidates[0] ?? thumb;
     return <img src={src} alt="" onError={() => { if (src !== thumb) setFailed((prev) => [...prev, src]); }} />;
+};
+
+/** A cover card on the Albums tab. Touch: holding it starts selecting with this album picked,
+ *  and once selecting a hold toggles it like a tap -- the same gesture as the photo grid. */
+const AlbumCard: React.FC<{
+    album: Album;
+    cover?: string;
+    selecting: boolean;
+    checked: boolean;
+    onOpen: () => void;
+    onToggle: () => void;
+    onSelectStart: () => void;
+}> = ({ album, cover, selecting, checked, onOpen, onToggle, onSelectStart }) => {
+    const longPress = useLongPress(() => (selecting ? onToggle() : onSelectStart()));
+    return (
+        <button
+            type="button"
+            className={`pt-album-card${checked ? ' selected' : ''}`}
+            aria-pressed={selecting ? checked : undefined}
+            onClick={selecting ? onToggle : onOpen}
+            onContextMenu={(e) => e.preventDefault()}
+            {...longPress}
+        >
+            <span className="pt-album-card-cover">
+                {cover ? <img src={cover} alt="" draggable={false} /> : null}
+                {selecting && <span className={`pt-album-row-check${checked ? ' on' : ''}`} aria-hidden="true"><CheckIcon /></span>}
+            </span>
+            <b>{album.name}</b>
+            <span>{album.isPublic && <LinkIcon aria-label="Shared" />}{plural(album.photoCount, 'item')}{album.isPublic ? ' · Shared' : ''}</span>
+        </button>
+    );
 };
 
 /** Albums — list first on mobile, detail view on larger screens. */
@@ -290,7 +322,7 @@ export const AlbumsPage: React.FC = () => {
                             </div>
                         )}
                     </div>
-                    <h2 className="pt-section-label">People and places</h2>
+                    <div className="pt-section-head"><h2>People &amp; places</h2></div>
                     <BrowseLinks />
                 </div>
                 {smartAlbumSheet}
@@ -397,33 +429,30 @@ export const AlbumsPage: React.FC = () => {
                     </div>
                 </div>
                 <div className="pt-album-cards">
-                    {albums.map((a) => {
-                        const checked = selectedAlbumIds.includes(a.id);
-                        const src = a.coverThumbnailUrl ? covers[a.coverThumbnailUrl] : undefined;
-                        return (
-                            <button
-                                key={a.id}
-                                type="button"
-                                className={`pt-album-card${checked ? ' selected' : ''}`}
-                                aria-pressed={selectMode ? checked : undefined}
-                                onClick={() => (selectMode ? toggleAlbumSelect(a.id) : navigate('albums', { albumId: a.id }))}
-                            >
-                                <span className="pt-album-card-cover">
-                                    {src ? <img src={src} alt="" /> : null}
-                                    {selectMode && <span className={`pt-album-row-check${checked ? ' on' : ''}`} aria-hidden="true"><CheckIcon /></span>}
-                                </span>
-                                <b>{a.name}</b>
-                                <span>{a.isPublic && <LinkIcon aria-label="Shared" />}{plural(a.photoCount, 'item')}{a.isPublic ? ' · Shared' : ''}</span>
-                            </button>
-                        );
-                    })}
+                    {albums.map((a) => (
+                        <AlbumCard
+                            key={a.id}
+                            album={a}
+                            cover={a.coverThumbnailUrl ? covers[a.coverThumbnailUrl] : undefined}
+                            selecting={selectMode}
+                            checked={selectedAlbumIds.includes(a.id)}
+                            onOpen={() => navigate('albums', { albumId: a.id })}
+                            onToggle={() => toggleAlbumSelect(a.id)}
+                            onSelectStart={() => { setSelectMode(true); setSelectedAlbumIds([a.id]); }}
+                        />
+                    ))}
                 </div>
-                <h2 className="pt-section-label">People and places</h2>
+                <div className="pt-section-head"><h2>People &amp; places</h2></div>
                 <BrowseLinks />
                 {!selectMode && (
-                    <button type="button" className="albm-newbtn" onClick={() => setSmartSheetOpen(true)} disabled={smartCreatingRule !== null}>
-                        <SparklesIcon /> {smartCreatingRule ? 'Creating…' : 'Make a smart album'}
-                    </button>
+                    <>
+                        <div className="pt-section-head"><h2>Suggested</h2><small>Made only if you tap Create</small></div>
+                        <button type="button" className="pt-suggest" aria-label="Create a smart album" onClick={() => setSmartSheetOpen(true)} disabled={smartCreatingRule !== null}>
+                            <span className="pt-suggest-thumb" aria-hidden="true"><SparklesIcon /></span>
+                            <span className="pt-suggest-text"><b>Smart album</b><small>Keepsake builds it from places, people, dates or tags</small></span>
+                            <span className="btn btn-sm" aria-hidden="true">{smartCreatingRule ? 'Creating…' : 'Create'}</span>
+                        </button>
+                    </>
                 )}
             </div>
 
@@ -439,7 +468,6 @@ export const AlbumsPage: React.FC = () => {
                         <ArrowLeftIcon /> Back
                     </button>
                 )}
-                {!showDetail && <div className="pt-albums-browse-desktop"><BrowseLinks /></div>}
                 <div className={`pt-albums${showDetail ? ' show-detail' : ''}`}>
                     <aside className="pt-album-sidebar">
                         <div className="pt-album-list-scroll">{albumListRows}</div>
