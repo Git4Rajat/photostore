@@ -7,6 +7,9 @@
    ================================================================= */
 
 .pt-shell { height: 100vh; width: 100vw; margin: 0; padding: 0; overflow: hidden; }
+/* 100vh is the tallest the viewport gets (browser toolbars tucked away), so on a phone the bottom of the
+   scrolling body sat under the toolbar and the last controls on a page could not be reached. dvh is what is visible. */
+@supports (height: 100dvh) { .pt-shell { height: 100dvh; } }
 /* The dev toolbar was removed, so the stage fills from the very top instead of
    clearing a 50px bar (see mockups.css .mock-stage). */
 .pt-shell .mock-stage { top: 0; }
@@ -364,7 +367,6 @@
      always there, just scrolled past the whole list first. */
   .pt-album-detail { display: none; }
   .pt-albums.show-detail .pt-album-detail { display: block; padding: 8px; max-height: none; overflow-y: visible; }
-  .pt-albums-browse-desktop { display: none; }
   .pt-body { overflow-y: auto; }
 }
 .pt-album-row { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; padding: 8px; border: 0; border-radius: var(--r-sm); background: transparent; cursor: pointer; font: inherit; color: var(--text); }
@@ -387,9 +389,9 @@
 .pt-albums-head .pt-toolbar-actions { width: auto !important; margin-left: auto; }
 .pt-section-label { margin: 0 0 8px; font: 700 0.95rem/1.2 var(--font-ui); color: var(--text); }
 .pt-album-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 10px; margin-bottom: 20px; }
-.pt-album-card { appearance: none; border: 0; background: none; padding: 0; color: var(--text); font: inherit; text-align: left; cursor: pointer; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.pt-album-card { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; appearance: none; border: 0; background: none; padding: 0; color: var(--text); font: inherit; text-align: left; cursor: pointer; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .pt-album-card-cover { position: relative; aspect-ratio: 1; border-radius: var(--r-md); overflow: hidden; background: var(--lg-edge); margin-bottom: 6px; }
-.pt-album-card-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.pt-album-card-cover img { width: 100%; height: 100%; object-fit: cover; display: block; pointer-events: none; }
 .pt-album-card-cover .pt-album-row-check { position: absolute; right: 8px; bottom: 8px; background: rgba(0,0,0,0.25); border-color: #fff; }
 .pt-album-card.selected .pt-album-card-cover { box-shadow: inset 0 0 0 3px var(--accent); }
 .pt-album-card b { font-size: 0.92rem; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1103,7 +1105,6 @@
 .pt-albums-mobile-list.hidden { display: none !important; }
 .pt-albums { grid-template-columns: minmax(0, 1fr); }
 .pt-album-sidebar { display: none !important; }
-.pt-albums-browse-desktop { display: none; }
 .pt-album-detail { display: none; max-height: none; overflow: visible; padding: 0; }
 .pt-albums.show-detail .pt-album-detail { display: block; }
 .pt-album-cards { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
@@ -1376,18 +1377,31 @@
 .pt-size-end svg { width: 16px; height: 16px; }
 .pt-header-search kbd { margin-left: auto; font: 600 11px var(--font-ui); color: var(--muted); border: 1px solid var(--lg-edge-strong); border-radius: 5px; padding: 1px 6px; }
 
-/* People & places, Media types: one grouped list each, rows split by hairlines. */
-.pt-browse-links { display: flex; flex-direction: column; gap: 0; border-radius: 16px; background: var(--lg-surface); overflow: hidden; margin-bottom: 18px; }
-.pt-browse-links button { border: 0; border-radius: 0; background: none; min-height: 60px; padding: 10px 12px; }
+/* People & places: one grouped list, rows split by hairlines (docs/design-mockups, Albums tab). */
+.pt-section-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin: 18px 0 8px; }
+.pt-section-head h2 { margin: 0; font: 600 17px/1.2 var(--font-display); color: var(--text); }
+.pt-section-head small { font-size: 12px; color: var(--muted); }
+.pt-browse-links { display: flex; flex-direction: column; gap: 0; border-radius: 16px; background: var(--lg-surface); overflow: hidden; margin: 0; }
+.pt-browse-links button { border: 0; border-radius: 0; background: none; min-height: 64px; padding: 10px 14px; gap: 12px; }
 .pt-browse-links button + button { border-top: 1px solid var(--lg-edge); }
 .pt-browse-links button:hover { background: var(--lg-surface-wash); }
-.pt-browse-thumb { width: 40px; height: 40px; border-radius: 10px; flex: none; display: grid; place-items: center; overflow: hidden; background: var(--lg-surface-wash); }
+.pt-browse-links b { font-size: 14px; font-weight: 600; }
+.pt-browse-links small { font-size: 12.5px; }
+.pt-browse-thumb { width: 44px; height: 44px; border-radius: 10px; flex: none; display: grid; place-items: center; overflow: hidden; background: var(--lg-surface-wash); }
 .pt-browse-thumb svg { width: 20px; height: 20px; color: var(--accent); }
 .pt-browse-thumb.mosaic { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 1px; place-items: stretch; }
 .pt-browse-thumb.mosaic img, .pt-browse-thumb.mosaic i { width: 100%; height: 100%; object-fit: cover; display: block; background: var(--lg-edge); }
-.pt-browse-thumb.map { background: linear-gradient(28deg, transparent 46%, rgba(255,255,255,0.12) 46% 49%, transparent 49%), linear-gradient(112deg, #1c2a36 0 40%, #2a2c2a 40%); }
-.pt-browse-thumb.plain { background: none; }
-.pt-browse-thumb.plain svg { color: var(--muted); }
+.pt-browse-thumb.map { background: linear-gradient(28deg, transparent 46%, var(--map-road) 46% 49%, transparent 49%), linear-gradient(112deg, var(--map-water) 0 40%, var(--map-land) 40%); }
+/* Smart albums are a labelled suggestion, made only on tap. */
+.pt-suggest { display: flex; align-items: center; gap: 10px; width: 100%; padding: 10px; border: 1.5px dashed var(--lg-edge-strong); border-radius: 14px; background: none; color: var(--text); font: inherit; text-align: left; cursor: pointer; }
+.pt-suggest:hover:not(:disabled) { background: var(--lg-surface-wash); }
+.pt-suggest:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.pt-suggest:disabled { opacity: 0.6; cursor: default; }
+.pt-suggest-thumb { width: 44px; height: 44px; border-radius: 10px; flex: none; display: grid; place-items: center; background: var(--lg-surface-wash); color: var(--accent); }
+.pt-suggest-thumb svg { width: 20px; height: 20px; }
+.pt-suggest-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.pt-suggest-text b { font-size: 14px; font-weight: 600; }
+.pt-suggest-text small { font-size: 12.5px; color: var(--muted); }
 /* An open album. */
 .pt-hero-back { display: none; }
 .pt-album-status.stacked { padding: 10px 12px; border-radius: 12px; background: var(--lg-surface); }
@@ -1397,7 +1411,7 @@
   .pt-hero-back svg { width: 20px; height: 20px; }
   .pt-album-detail .pt-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
-.pt-browse-links .pt-browse-thumb { flex: none; width: 40px; height: 40px; display: grid; }
+.pt-browse-links .pt-browse-thumb { flex: none; width: 44px; height: 44px; display: grid; }
 
 /* Rating in menus and the info panel: five small stars close together. The
    menu's own button rule (full width, padded) must not reach the stars. */
