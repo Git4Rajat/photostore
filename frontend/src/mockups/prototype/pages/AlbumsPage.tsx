@@ -16,10 +16,10 @@ import {
     Trash2 as TrashIcon,
     Users as UserGroupIcon,
 } from 'lucide-react';
-import { isVideoFilename, shownAlbum, useStore } from '../store';
+import { isVideoFilename, shownAlbum, swatchFor, useStore } from '../store';
 import PhotoGrid from '../components/PhotoGrid';
 import ScrollSentinel from '../components/ScrollSentinel';
-import { Menu, Spinner, SelectionBar } from '../components/bits';
+import { Menu, Spinner, SelectionBar, Swatch } from '../components/bits';
 import { BrowseLinks } from '../components/BrowseLinks';
 import { ShareAlbumSheet, sharingStatus } from '../components/ShareAlbumSheet';
 import { AddPhotosPicker } from '../components/AddPhotosPicker';
@@ -77,7 +77,7 @@ const AlbumCard: React.FC<{
             {...longPress}
         >
             <span className="pt-album-card-cover">
-                {cover ? <img src={cover} alt="" draggable={false} /> : null}
+                {cover ? <img src={cover} alt="" draggable={false} /> : <Swatch swatch={swatchFor(album.id)} className="pt-album-card-swatch" />}
                 {selecting && <span className={`pt-album-row-check${checked ? ' on' : ''}`} aria-hidden="true"><CheckIcon /></span>}
             </span>
             <b>{album.name}</b>

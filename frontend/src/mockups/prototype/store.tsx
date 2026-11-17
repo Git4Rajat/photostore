@@ -7,8 +7,8 @@ import { SUGGESTIONS } from './data';
 import { get, post } from '../../services/apiClient';
 import { setPhotoRotation } from './media';
 import { failedDeleteIds } from '../../services/photoDeleteResult';
-import { clearLocalSortIndexRemovals, getLocalSortIndex, invalidateLocalSortIndex, isServerPagedLibrary, removeLocalSortIndexRows, type SortIndexRow } from '../../services/localSortIndex';
-import { getCachedMediaToken, getMediaToken, thumbnailUrlForBlob, type MediaToken } from '../../services/mediaToken';
+import { clearLocalSortIndexRemovals, getCachedSortPreview, getLocalSortIndex, invalidateLocalSortIndex, isServerPagedLibrary, removeLocalSortIndexRows, type SortIndexRow } from '../../services/localSortIndex';
+import { getCachedMediaToken, getMediaToken, previewUrlForBlob, thumbnailUrlForBlob, type MediaToken } from '../../services/mediaToken';
 import { getLocalAlbumsIndex, invalidateLocalAlbumsIndex } from '../../services/localAlbumsIndex';
 import {
     beginAlbumCreate, beginAlbumDelete, rollbackAlbumDelete, previousAlbumDeleteAttempt, clearAlbumDeleteTombstone, hasAlbumDeleteTombstone,
@@ -96,7 +96,7 @@ const prependMissing = (photos: Photo[], list: Photo[]): Photo[] => {
 
 // Stable placeholder swatch derived from the filename, so a photo shows the same
 // tint every render while its real thumbnail loads.
-const swatchFor = (filename: string): SwatchKey => {
+export const swatchFor = (filename: string): SwatchKey => {
     let hash = 0;
     for (let i = 0; i < filename.length; i += 1) {
         hash = (hash * 31 + filename.charCodeAt(i)) | 0;
@@ -262,12 +262,20 @@ interface ExploreGroup {
     longitude?: string;
 }
 
+// A cover is shown large, so it uses the photo's preview rather than its 120 px thumbnail; the
+// thumbnail stays as the fallback until the preview's name is known.
+const previewCover = (photo?: BackendPhoto): string | undefined => {
+    if (!photo) return undefined;
+    const preview = previewUrlForBlob(getCachedSortPreview(photo.filename) || photo.thumbnailBlob);
+    return preview || photo.thumbnailUrl;
+};
+
 const mapPlace = (g: ExploreGroup): Place => ({
     id: g.label,
     name: g.label,
     swatch: swatchFor(g.label),
     count: g.count,
-    coverThumbnailUrl: g.photo?.thumbnailUrl,
+    coverThumbnailUrl: previewCover(g.photo),
     latitude: g.latitude,
     longitude: g.longitude,
 });
@@ -277,7 +285,7 @@ const mapThing = (g: ExploreGroup): ThingTag => ({
     name: g.label,
     count: g.count,
     swatch: swatchFor(g.label),
-    coverThumbnailUrl: g.photo?.thumbnailUrl,
+    coverThumbnailUrl: previewCover(g.photo),
 });
 
 // Whole days left on a share link (0 = no expiry): the fallback a server that
@@ -1296,7 +1304,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             const covers = new Map<string, string>();
             const needBatch: string[] = [];
             coverFilenames.forEach((filename) => {
-                const direct = coverToken ? thumbnailUrlForBlob(thumbByName.get(filename), coverToken) : '';
+                const direct = coverToken
+                    ? previewUrlForBlob(getCachedSortPreview(filename) || thumbByName.get(filename), coverToken)
+                        || thumbnailUrlForBlob(thumbByName.get(filename), coverToken)
+                    : '';
                 if (direct) covers.set(filename, direct); else needBatch.push(filename);
             });
             if (needBatch.length) {
