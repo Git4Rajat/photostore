@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import {
+    Download as DownloadIcon,
     Heart as HeartIcon,
     ImagePlus as AddToAlbumIcon,
     MinusCircle as MinusCircleIcon,
@@ -13,6 +14,7 @@ import { Menu, Stars } from './bits';
 import { AddToAlbumSheet } from './AddToAlbumMenu';
 import { confirmDeleteItems } from './confirmDelete';
 import { shownAlbum, useStore } from '../store';
+import { downloadPhoto } from '../media';
 
 /**
  * The selection's action bar. On a phone it takes the tab bar's place (the tab
@@ -42,6 +44,19 @@ const CommandBar: React.FC = () => {
     const likeSelection = () => {
         selection.filter((id) => Boolean(photoById(id)?.liked) === allLiked).forEach((id) => toggleLike(id));
         toast(allLiked ? `Removed ${selection.length} from Likes` : `Liked ${selection.length}`);
+    };
+
+    // One file after another: browsers only allow a burst of downloads if they follow a tap, and a
+    // short gap keeps each from being dropped.
+    const downloadSelection = async () => {
+        const photos = selection.map((id) => photoById(id)).filter((p): p is NonNullable<typeof p> => Boolean(p));
+        toast(photos.length === 1 ? 'Download started' : `Downloading  items…`);
+        let failed = 0;
+        for (const photo of photos) {
+            try { await downloadPhoto(photo); } catch { failed += 1; }
+            await new Promise((resolve) => setTimeout(resolve, 400));
+        }
+        if (failed) toast(` of  couldn’t be downloaded`, undefined, undefined, 'error');
     };
 
     return (
@@ -78,6 +93,9 @@ const CommandBar: React.FC = () => {
                             <span><StarIcon /> Rate</span>
                             <Stars value={0} onRate={(n) => { ratePhotos(selection, n); toast(`Rated ${selection.length} · ${n}★`); close(); clearSelection(); }} size={20} />
                         </div>
+                        <button type="button" className="pt-fm-item" onClick={() => { close(); void downloadSelection(); }}>
+                            <DownloadIcon /> Download
+                        </button>
                         <button type="button" className="pt-fm-item" onClick={() => { navigate('tools', { filenames: selection.slice(0, 50).join(',') }); close(); }}>
                             <WrenchScrewdriverIcon /> Open in Workbench
                         </button>
