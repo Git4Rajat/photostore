@@ -5,7 +5,7 @@ import { fetchProtectedBlobUrl, fetchProtectedBlobUrlWithProgress, ProtectedFetc
 import { resolveThumbnailAccessUrls } from '../../services/thumbnailAccessCache';
 import { resolveMediaAccessUrls } from '../../services/mediaAccessCache';
 import { getCachedSortGrid, getCachedSortOriginal, getCachedSortPreview, getCachedSortThumb } from '../../services/localSortIndex';
-import { getCachedMediaToken, getMediaToken, imageUrlForBlob, previewUrlForBlob, thumbnailUrlForBlob } from '../../services/mediaToken';
+import { getCachedMediaToken, getMediaToken, imageUrlForBlob, previewUrlForBlob, resignMediaUrls, thumbnailUrlForBlob } from '../../services/mediaToken';
 import { isHttpUrl, shouldFetchScopedThumbnail } from '../../components/shared/PhotoTile';
 import { isRawFilename, isVideoFilename } from '../../utils/photoDisplay';
 import { composeTileImage, type TileImage } from '../../utils/tileImage';
@@ -97,6 +97,35 @@ export function usePhotoThumbnails(photos: Photo[]): Record<string, string> {
 }
 
 export { useTileSizes, type TileImage } from '../../utils/tileImage';
+
+interface RecoveringImage { forSrc: string; forSrcSet?: string; src: string; srcSet?: string; retried: boolean; pending: boolean; broken: boolean }
+
+/**
+ * A tile image that survives its media token expiring. On the first load error
+ * it re-signs its URLs with the current token (refreshing a stale one) and
+ * tries again; only an image that still fails, or one already carrying the
+ * current signature (a thumbnail not made yet), is given up as broken. Hidden
+ * while it retries so no broken-image icon flashes.
+ */
+export function useRecoveringImage(src: string, srcSet?: string) {
+    const [state, setState] = useState<RecoveringImage>({ forSrc: src, forSrcSet: srcSet, src, srcSet, retried: false, pending: false, broken: false });
+    // New inputs (another photo, or a URL that is ready now) start over.
+    const current = state.forSrc === src && state.forSrcSet === srcSet
+        ? state
+        : { forSrc: src, forSrcSet: srcSet, src, srcSet, retried: false, pending: false, broken: false };
+    const onError = () => {
+        if (current.retried) {
+            setState({ ...current, pending: false, broken: true });
+            return;
+        }
+        setState({ ...current, retried: true, pending: true });
+        void resignMediaUrls(current.src, current.srcSet).then((next) => {
+            setState((prev) => (prev.forSrc !== current.forSrc || prev.forSrcSet !== current.forSrcSet ? prev
+                : next ? { ...prev, ...next, pending: false } : { ...prev, pending: false, broken: true }));
+        });
+    };
+    return { src: current.src, srcSet: current.srcSet, pending: current.pending, broken: current.broken, onError };
+}
 
 /** The tile image for an app photo: its thumbnail plus its grid image, once it has one (see composeTileImage). */
 export const tileImage = (photo: Photo, thumbSrc: string | undefined): TileImage | null => composeTileImage(

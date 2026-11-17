@@ -39,13 +39,17 @@ const STORAGE_KEY = 'photostore-media-token';
 const STORED_VERSION = 3;
 // Must stay under the server's MEDIA_TOKEN_SAS_TTL_SECONDS (10 min default) --
 // a margin longer than the token's own life would make every token look
-// stale immediately. The background auto-refresh below (~9 min cadence) is
-// what actually keeps tokens from reaching this margin during active use;
-// this mainly guards the moment right after a long-idle tab resumes.
+// stale immediately. The background auto-refresh below is what actually
+// keeps tokens from reaching this margin during active use; this mainly
+// guards the moment right after a long-idle tab resumes.
 const REFRESH_MARGIN_MS = 2 * 60 * 1000;
-// Comfortably inside the server's 10-minute TTL so a refresh lands well
-// before the 2-minute staleness margin above would otherwise kick in.
-const AUTO_REFRESH_INTERVAL_MS = 9 * 60 * 1000;
+// How often a visible tab checks its token. A refresh is due once the token
+// would turn stale (REFRESH_MARGIN_MS before expiry) within two checks. This
+// used to be a plain refresh every 9 minutes, which only refetched a token that
+// was already stale: for the last minute of every 10-minute token no fresh one
+// was cached, so tiles drawn then fell back to URLs signed by an expired token
+// and stayed blank until the page was reloaded.
+const AUTO_REFRESH_CHECK_MS = 60 * 1000;
 
 let cached: MediaToken | null = null;
 let cachedKey: string | null = null;
@@ -136,29 +140,60 @@ export const invalidateMediaToken = (): void => {
 
 let autoRefreshStarted = false;
 
+const refreshDue = (): boolean => {
+    const token = getCachedMediaToken();
+    return !token || Date.parse(token.expiresAt) - Date.now() <= REFRESH_MARGIN_MS + 2 * AUTO_REFRESH_CHECK_MS;
+};
+
 /**
- * Keeps the cached media token from ever reaching its short server-side TTL
- * during active use: a background refresh every ~9 minutes while the tab is
- * visible, plus an immediate refresh the moment a backgrounded tab becomes
- * visible again (covers a tab that was hidden through an entire refresh
- * cycle). No-op while hidden -- a tab the user has walked away from makes no
- * requests at all, which is the point: the token is allowed to actually
- * expire, not kept alive forever in the background. Idempotent; call once at
- * app boot (see preloadLocalIndexes).
+ * Keeps a fresh media token cached the whole time the tab is in use: checked
+ * every minute while visible and replaced shortly before it would turn stale,
+ * plus checked the moment a backgrounded tab becomes visible again (covers a
+ * tab that was hidden through a whole token). No-op while hidden -- a tab the
+ * user has walked away from makes no requests at all, which is the point: the
+ * token is allowed to actually expire, not kept alive forever in the
+ * background. Idempotent; call once at app boot (see preloadLocalIndexes).
  */
 export const startMediaTokenAutoRefresh = (): void => {
     if (autoRefreshStarted || typeof document === 'undefined') return;
     autoRefreshStarted = true;
     const refreshIfVisible = () => {
-        if (document.visibilityState === 'visible') {
-            void getMediaToken();
+        if (document.visibilityState === 'visible' && refreshDue()) {
+            void getMediaToken(true);
         }
     };
-    setInterval(refreshIfVisible, AUTO_REFRESH_INTERVAL_MS);
+    setInterval(refreshIfVisible, AUTO_REFRESH_CHECK_MS);
     document.addEventListener('visibilitychange', refreshIfVisible);
 };
 
 const encodeBlobPath = (blob: string): string => blob.split('/').map(encodeURIComponent).join('/');
+
+const resignWith = (url: string, token: MediaToken): string => {
+    if (!url.startsWith(`${token.baseUrl}/`)) return url;
+    const query = url.indexOf('?');
+    return `${query < 0 ? url : url.slice(0, query)}?${token.sas}`;
+};
+
+/**
+ * A tile image's src/srcset re-signed with the current token, or null when
+ * nothing would change -- the URLs are not this container's, or already carry
+ * the current signature (then the image really is missing, e.g. a thumbnail
+ * still being made). Lets an <img> whose signature expired before it loaded
+ * (rendered before a token refresh, lazy-loaded after it) retry instead of
+ * staying blank until the page is reloaded.
+ */
+export const resignMediaUrls = async (src: string, srcSet?: string): Promise<{ src: string; srcSet?: string } | null> => {
+    const token = await getMediaToken();
+    if (!token) return null;
+    const nextSrc = resignWith(src, token);
+    const nextSrcSet = srcSet
+        ?.split(',').map((entry) => {
+            const [url, ...descriptor] = entry.trim().split(/\s+/);
+            return [resignWith(url, token), ...descriptor].join(' ');
+        }).join(', ');
+    if (nextSrc === src && (srcSet === undefined || nextSrcSet === srcSet.split(',').map((e) => e.trim()).join(', '))) return null;
+    return { src: nextSrc, ...(nextSrcSet !== undefined ? { srcSet: nextSrcSet } : {}) };
+};
 
 /** Direct thumbnail URL for a blob name, or '' when no token is loaded. */
 export const thumbnailUrlForBlob = (blob: string | undefined | null, token: MediaToken | null = getCachedMediaToken()): string => (

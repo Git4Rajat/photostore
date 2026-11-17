@@ -4,7 +4,7 @@ const getMock = vi.fn();
 vi.mock('./apiClient', () => ({ get: (...args: unknown[]) => getMock(...args) }));
 vi.mock('./passwordAuthClient', () => ({ getActiveLibraryFromToken: () => 'lib-1' }));
 
-import { getCachedMediaToken, getMediaToken, imageUrlForBlob, invalidateMediaToken, previewUrlForBlob, thumbnailUrlForBlob } from './mediaToken';
+import { getCachedMediaToken, getMediaToken, imageUrlForBlob, invalidateMediaToken, previewUrlForBlob, resignMediaUrls, startMediaTokenAutoRefresh, thumbnailUrlForBlob } from './mediaToken';
 
 // The server mints short-lived tokens now (MEDIA_TOKEN_SAS_TTL_SECONDS,
 // ~10 minutes) rather than day-long ones -- minutes, not hours, are the
@@ -104,4 +104,56 @@ it('builds a versioned preview from its own name with the same container token',
     expect(previewUrlForBlob('derived/v1/scope/key/thumbnail/digest.jpg', token)).toBe('');
     expect(previewUrlForBlob('physical-id', token)).toBe(
         'https://acct.blob.core.windows.net/thumbnails/preview/physical-id.jpg?sp=r&sr=c&sig=abc');
+});
+
+describe('re-signing tile URLs after the token changes', () => {
+    const base = 'https://acct.blob.core.windows.net/thumbnails';
+    beforeEach(() => {
+        getMock.mockReset();
+        invalidateMediaToken();
+        window.localStorage.clear();
+    });
+
+    it('swaps an expired signature for the current one, in src and srcset', async () => {
+        getMock.mockResolvedValue(tokenResponse());
+        const old = 'sp=r&sr=c&sig=OLD';
+        expect(await resignMediaUrls(`${base}/abc?${old}`, `${base}/abc?${old} 90w, ${base}/grid/abc.webp?${old} 400w`)).toEqual({
+            src: `${base}/abc?sp=r&sr=c&sig=abc`,
+            srcSet: `${base}/abc?sp=r&sr=c&sig=abc 90w, ${base}/grid/abc.webp?sp=r&sr=c&sig=abc 400w`,
+        });
+    });
+
+    it('gives up when the URL already carries the current signature or is not ours', async () => {
+        getMock.mockResolvedValue(tokenResponse());
+        expect(await resignMediaUrls(`${base}/abc?sp=r&sr=c&sig=abc`)).toBeNull();
+        expect(await resignMediaUrls('/api/photos/thumbnail/a.jpg')).toBeNull();
+        // Proxy mode: no token at all, nothing to re-sign with.
+        getMock.mockResolvedValue({ available: false });
+        invalidateMediaToken();
+        window.localStorage.clear();
+        expect(await resignMediaUrls(`${base}/abc?sig=OLD`)).toBeNull();
+    });
+});
+
+// The cached token turns stale two minutes before its 10-minute life ends; the
+// background refresh must replace it before then, or tiles fall back to dead URLs.
+it('keeps a fresh token cached for the whole time the tab is in use', async () => {
+    vi.useFakeTimers();
+    try {
+        getMock.mockReset().mockResolvedValue(tokenResponse(10));
+        invalidateMediaToken();
+        window.localStorage.clear();
+        await getMediaToken();
+        startMediaTokenAutoRefresh();
+        getMock.mockImplementation(async () => ({ ...tokenResponse(10), sas: 'sig=next' }));
+        for (let minute = 1; minute <= 25; minute += 1) {
+            await vi.advanceTimersByTimeAsync(60_000);
+            expect(getCachedMediaToken(), `no fresh token at minute ${minute}`).not.toBeNull();
+        }
+        // About one refresh per token life, not one per check.
+        expect(getMock.mock.calls.length).toBeGreaterThanOrEqual(3);
+        expect(getMock.mock.calls.length).toBeLessThanOrEqual(6);
+    } finally {
+        vi.useRealTimers();
+    }
 });

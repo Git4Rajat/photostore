@@ -11,7 +11,7 @@ import {
     Sparkles as SparklesIcon,
     User as UserIcon,
 } from 'lucide-react';
-import { tileImage, usePhotoThumbnails, useTileSizes, fetchPhotoMetadata } from '../media';
+import { tileImage, usePhotoThumbnails, useRecoveringImage, useTileSizes, fetchPhotoMetadata } from '../media';
 import { ThumbSizeControl, useTileSize } from './controls';
 import type { PhotoMetadata, TileImage } from '../media';
 import type { Photo } from '../types';
@@ -88,9 +88,9 @@ const WorkbenchTile: React.FC<{
     // Thumbnail URLs are attempted directly without the backend confirming the
     // blob exists first (see usePhotoThumbnails/media.ts), so a just-uploaded
     // photo's thumbnail can 404 while still generating. Hide on load failure
-    // so the tile's swatch background shows through instead of a broken icon.
-    const [thumbBroken, setThumbBroken] = useState(false);
-    useEffect(() => setThumbBroken(false), [image?.src]);
+    // so the tile's swatch background shows through instead of a broken icon,
+    // after one retry with a re-signed URL in case the token expired.
+    const shown = useRecoveringImage(image?.src ?? '', image?.srcSet);
 
     const openInfo = () => {
         onToggleInfo();
@@ -108,17 +108,17 @@ const WorkbenchTile: React.FC<{
             <button type="button" className="wb-tile-info" aria-label="Photo details" onClick={(e) => { e.stopPropagation(); openInfo(); }}>
                 <InformationCircleIcon />
             </button>
-            {image && !thumbBroken && (
+            {image && !shown.broken && (
                 <img
                     className="wb-tile-img"
-                    src={image.src}
-                    srcSet={image.srcSet}
-                    sizes={image.srcSet ? sizes : undefined}
-                    style={image.style}
+                    src={shown.src}
+                    srcSet={shown.srcSet}
+                    sizes={shown.srcSet ? sizes : undefined}
+                    style={shown.pending ? { ...image.style, visibility: 'hidden' } : image.style}
                     alt={photo.filename}
                     loading="lazy"
                     draggable={false}
-                    onError={() => setThumbBroken(true)}
+                    onError={shown.onError}
                 />
             )}
             <div className="wb-tile-foot">
