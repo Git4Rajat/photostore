@@ -38,7 +38,8 @@ export interface AppNotification {
     // A few of the photos a finished upload added (library filenames), drawn as a thumbnail strip.
     photos?: string[];
     // A finished upload still waiting on the server's "All processed in N minutes" summary.
-    processing?: { sessionId: string; since: number };
+    // `restore` is the upload wording the entry shows again if the watch ends without a summary.
+    processing?: { sessionId: string; since: number; restore?: { title: string; details: string } };
     // A pending invite about to end; the panel offers Resend.
     inviteId?: string;
     // Ephemeral (in-memory) button shown on the preview, e.g. Undo or Retry.

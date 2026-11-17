@@ -1944,8 +1944,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (!pendingProcessing) return undefined;
         let disposed = false;
         let inFlight = false;
-        const settle = (id: string) => setNotifications((previous) => previous.map((n) => (
-            n.id === id ? { ...n, processing: undefined } : n)));
+        const settle = (id: string, details?: string) => setNotifications((previous) => previous.map((n) => {
+            if (n.id !== id) return n;
+            const restore = n.processing?.restore;
+            const next = { ...n, processing: undefined, ...(restore ? restore : {}) };
+            return details === undefined ? next : { ...next, details, unread: true, timestamp: Date.now() };
+        }));
         const tick = async () => {
             if (disposed || inFlight || document.visibilityState !== 'visible' || !navigator.onLine) return;
             inFlight = true;
@@ -1960,7 +1964,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         const summary = await fetchProcessingSummary(sessionId);
                         if (disposed) return;
                         if (summary?.done && !summary.cancelled) {
-                            updateNotification(id, { details: processingSummaryText(summary), processing: undefined });
+                            settle(id, processingSummaryText(summary));
                         } else if (summary?.done) {
                             settle(id);
                         }
@@ -3787,15 +3791,21 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const waveSessionId = waveLiveEnabled() ? waveParentFor(session)?.id : undefined;
         const uploadedNotice = (): Partial<AppNotification> => {
             const newCount = totalUploaded - totalSkippedDuplicates;
+            const title = newCount > 0 ? `${plural(newCount, 'item')} uploaded` : 'Nothing new to upload';
+            const details = [
+                totalSkippedDuplicates > 0 ? `Skipped ${plural(totalSkippedDuplicates, 'duplicate')}.` : '',
+                newCount > 0 ? 'They show in Photos once processed.' : 'Everything was already in your library.',
+            ].filter(Boolean).join(' ');
+            const watched = newCount > 0 && !!waveSessionId;
             return {
-                title: newCount > 0 ? `${plural(newCount, 'item')} uploaded` : 'Nothing new to upload',
-                details: [
-                    totalSkippedDuplicates > 0 ? `Skipped ${plural(totalSkippedDuplicates, 'duplicate')}.` : '',
-                    newCount > 0 ? 'They show in Photos once processed.' : 'Everything was already in your library.',
-                ].filter(Boolean).join(' '),
+                // While the server works the entry reads "Processing photos"; the poll below
+                // turns this same entry into the final summary (the server reports no counts
+                // mid-wave, so there is no progress bar).
+                title: watched ? 'Processing photos' : title,
+                details: watched ? `${title}${totalSkippedDuplicates > 0 ? `, ${plural(totalSkippedDuplicates, 'duplicate')} skipped` : ''}. Processing on the server.` : details,
                 ...(stripPhotos.length > 0 ? { photos: [...stripPhotos] } : {}),
                 // Ask the server how processing went once the wave this upload joined completes.
-                ...(newCount > 0 && waveSessionId ? { processing: { sessionId: waveSessionId, since: Date.now() } } : {}),
+                ...(watched ? { processing: { sessionId: waveSessionId!, since: Date.now(), restore: { title, details } } } : {}),
             };
         };
         const cleanupStoppedUpload = async (latest: PersistedUploadSession): Promise<boolean> => {

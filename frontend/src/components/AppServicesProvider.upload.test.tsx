@@ -1824,6 +1824,46 @@ describe('Server activity in the bell', () => {
         expect(mocks.get.mock.calls.filter(([url]) => url === '/api/upload-sessions/s1/processing')).toHaveLength(calls);
     });
 
+    it('shows one Processing photos entry that becomes the final summary, without adding another', async () => {
+        let done = false;
+        mocks.get.mockImplementation(async (url: string) => url === '/api/upload-sessions/s1/processing'
+            ? (done ? { done: true, processedSeconds: 240, failed: 0, people: 2 } : { done: false, state: 'processing' })
+            : {});
+        render(<AppServicesProvider><Probe toolsPage={false} /></AppServicesProvider>);
+        await advance(0);
+        let id = '';
+        act(() => {
+            id = services.addNotification('Processing photos', '31 items uploaded. Processing on the server.');
+            services.updateNotification(id, { processing: { sessionId: 's1', since: Date.now(), restore: { title: '31 items uploaded', details: 'They show in Photos once processed.' } } });
+        });
+        await advance(30_000);
+        expect(services.notifications.filter((n) => n.id === id)).toHaveLength(1);
+        expect(services.notifications.find((n) => n.id === id)?.title).toBe('Processing photos');
+        const before = services.notifications.length;
+        done = true;
+        await advance(30_000);
+        const entry = services.notifications.find((n) => n.id === id);
+        expect(entry).toMatchObject({ title: '31 items uploaded', details: 'All processed in 4 minutes. 2 people found.' });
+        expect(entry?.processing).toBeUndefined();
+        expect(services.notifications).toHaveLength(before);
+    });
+
+    it('puts the upload wording back when the watch ends without a summary', async () => {
+        mocks.get.mockImplementation(async (url: string) => {
+            if (url === '/api/upload-sessions/legacy/processing') throw Object.assign(new Error('nope'), { response: { status: 404 } });
+            return {};
+        });
+        render(<AppServicesProvider><Probe toolsPage={false} /></AppServicesProvider>);
+        await advance(0);
+        let id = '';
+        act(() => {
+            id = services.addNotification('Processing photos', 'x');
+            services.updateNotification(id, { processing: { sessionId: 'legacy', since: Date.now(), restore: { title: '3 items uploaded', details: 'Done.' } } });
+        });
+        await advance(0);
+        expect(services.notifications.find((n) => n.id === id)).toMatchObject({ title: '3 items uploaded', details: 'Done.' });
+    });
+
     it('stops asking when the server does not know the upload', async () => {
         mocks.get.mockImplementation(async (url: string) => {
             if (url === '/api/upload-sessions/legacy/processing') throw Object.assign(new Error('nope'), { response: { status: 404 } });
