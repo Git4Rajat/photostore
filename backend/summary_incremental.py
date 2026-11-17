@@ -173,32 +173,20 @@ def explore_memberships(row: dict) -> tuple[Membership, ...]:
     if not isinstance(filename, str):
         raise ValueError('RowKey must be a string or absent')
 
-    def normalize(value):
-        folded = unicodedata.normalize('NFKD', str(value)).encode('ascii', 'ignore').decode('ascii')
-        return re.sub(r'\s+', ' ', re.sub(r'[^a-z0-9]+', ' ', folded.lower())).strip()
-
-    def title(value):
-        cleaned = re.sub(r'\s+', ' ', str(value or '').replace('_', ' ')).strip()
-        return cleaned.title() if cleaned.islower() else cleaned
+    import explore_things
 
     memberships = []
     if filename:
-        city = str(row.get('locationCity') or '').strip()
-        country = str(row.get('locationCountry') or '').strip()
-        address = str(row.get('address') or '').strip()
         lat = str(row.get('latitude') or '').strip()
         lon = str(row.get('longitude') or '').strip()
-        label = ', '.join(part for part in (city, country) if part) or address
-        if not label and lat and lon:
-            label = f'{lat[:8]}, {lon[:8]}'
-        key = normalize(label)
-        if key:
-            memberships.append(Membership('places', key, title(label), lat, lon))
-        terms = parse_tags(row.get('tags', '[]')) + parse_json_list(row.get('objects', '[]'))
-        for term in dict.fromkeys(terms):
-            key = normalize(term)
+        place = explore_things.explore_place(row)
+        if place is not None:
+            key, label = place
+            memberships.append(Membership('places', key, label, lat, lon))
+        for term in explore_things.explore_thing_tags(row):
+            key = explore_things.normalize_key(term)
             if key:
-                memberships.append(Membership('things', key, title(term)))
+                memberships.append(Membership('things', key, explore_things.title(term)))
     return tuple(memberships)
 
 

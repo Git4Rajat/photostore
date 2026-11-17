@@ -12,10 +12,14 @@ import app
 import search_db
 import search_utils
 import summary_incremental as si
+import explore_things
 from timeline_metadata import build_timeline_summary
 
 
 NOW = datetime(2026, 11, 1, tzinfo=timezone.utc)
+ANIMALS = ['dog', 'cat', 'bird', 'fish', 'horse', 'cow', 'sheep', 'pig', 'duck', 'goose', 'swan', 'owl', 'eagle', 'fox',
+           'wolf', 'bear', 'deer', 'frog', 'snake', 'tiger', 'lion', 'zebra', 'camel', 'whale', 'shark', 'seal', 'crab',
+           'bee', 'ant', 'spider']
 
 
 def row(name, **fields):
@@ -75,7 +79,7 @@ def test_seed_reopen_and_full_builder_semantics(tmp_path, hydration):
         assert store.timeline_summary(now=NOW)['undatedCount'] == 2
         assert store.explore_groups()['places'][0]['filename'] == 'first'
         assert store.explore_groups()['places'][0]['latitude'] == '55.01'
-        assert {g['label'].lower() for g in store.explore_groups()['things']} >= {'dog', 'photo'}
+        assert {g['label'].lower() for g in store.explore_groups()['things']} >= {'dog', 'cat'}
         assert 'two words' not in {g['label'].lower() for g in store.explore_groups()['things']}
     with si.SummaryContributionStore(path) as store:
         assert_equivalent(store, rows, hydration)
@@ -126,16 +130,16 @@ def test_timeline_cover_deletion_likes_threshold_move_and_rollover(tmp_path, hyd
 
 
 def test_stable_count_ties_follow_explicit_order_not_insert_order(tmp_path, hydration):
-    rows = [row('early', tags=['zebra', 'dog']), row('late', tags=['cat'])]
+    rows = [row('early', tags=['horse', 'dog']), row('late', tags=['cat'])]
     with si.SummaryContributionStore(str(tmp_path / 's')) as store:
         store.seed([contribution(rows[1], 20), contribution(rows[0], 10)], source_version='v1')
         assert_equivalent(store, rows, hydration)
-        assert [g['label'] for g in store.explore_groups()['things']] == ['Zebra', 'Dog', 'Cat']
-        updated = row('early', tags=['new', 'dog'])
+        assert [g['label'] for g in store.explore_groups()['things']] == ['Horse', 'Dog', 'Cat']
+        updated = row('early', tags=['bird', 'dog'])
         store.apply([(contribution(rows[0], 10), contribution(updated, 10))],
                     previous_source_version='v1', source_version='v2')
         assert_equivalent(store, [updated, rows[1]], hydration)
-        assert [g['label'] for g in store.explore_groups()['things']] == ['New', 'Dog', 'Cat']
+        assert [g['label'] for g in store.explore_groups()['things']] == ['Bird', 'Dog', 'Cat']
 
 
 def test_shared_parser_caps_and_no_added_confidence_threshold(tmp_path, monkeypatch, hydration):
@@ -148,7 +152,6 @@ def test_shared_parser_caps_and_no_added_confidence_threshold(tmp_path, monkeypa
         store.seed([contribution(metadata, 0)], source_version='v1')
         assert_equivalent(store, [metadata], hydration)
         assert store.explore_groups()['things'] == [
-            {'label': 'Abcde', 'filename': 'caps', 'count': 1},
             {'label': 'Sky', 'filename': 'caps', 'count': 1},
             {'label': 'Cat', 'filename': 'caps', 'count': 1},
         ]
@@ -157,19 +160,20 @@ def test_shared_parser_caps_and_no_added_confidence_threshold(tmp_path, monkeypa
 def test_multiple_occurrences_per_group_count_and_earliest_candidate(tmp_path, monkeypatch, hydration):
     # Preserve the accumulator's dedup-before-place-normalization behavior,
     # even if shared parsers someday return distinct spellings of one term.
-    monkeypatch.setattr(app, 'parse_tags', lambda raw: ['résumé', 'resume', 'résumé'])
+    monkeypatch.setattr(app, 'parse_tags', lambda raw: ['café', 'cafe', 'café'])
     monkeypatch.setattr(si, 'parse_tags', app.parse_tags)
+    monkeypatch.setattr(explore_things, 'parse_tags', app.parse_tags)
     metadata = row('weighted')
     with si.SummaryContributionStore(str(tmp_path / 's')) as store:
         store.seed([contribution(metadata, 0)], source_version='v1')
         assert_equivalent(store, [metadata], hydration)
-        assert store.explore_groups()['things'] == [{'label': 'Résumé', 'filename': 'weighted', 'count': 2}]
+        assert store.explore_groups()['things'] == [{'label': 'Café', 'filename': 'weighted', 'count': 2}]
         store.apply([(contribution(metadata, 0), None)], previous_source_version='v1', source_version='v2')
         assert store.explore_groups()['things'] == []
 
 
 def test_missing_metadata_does_not_refill_top_24_or_fetch_duplicates(tmp_path, monkeypatch, hydration):
-    rows = [row(f'p{p}', locationCity=f'city{p}', tags=[f'tag{p}']) for p in range(30)]
+    rows = [row(f'p{p}', locationCity=f'city{p}', tags=[ANIMALS[p]]) for p in range(30)]
     fetch, photo, _ = hydration
     fetched = []
 

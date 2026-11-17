@@ -119,7 +119,7 @@ def document_text(filename: str, row: Dict) -> str:
         exif_model = str(json.loads(row.get('exifData') or '{}').get('Model') or '')
     except Exception:
         pass
-    location = ' '.join(str(row.get(f) or '') for f in ('address', 'locationCity', 'locationRegion', 'locationCountry'))
+    location = ' '.join(_location_spellings(row))
     return ' '.join(part for part in (
         norm(filename),
         ' '.join(search_utils.effective_tags(row)),
@@ -149,16 +149,39 @@ def _cover_rank(filename: str) -> int:
     return int.from_bytes(hashlib.sha256(filename.encode('utf-8')).digest()[:8], 'big') & 0x7fffffffffffffff
 
 
-def _collect_location_terms(into: set, row: Dict) -> None:
-    for field in ('locationCity', 'locationRegion', 'locationCountry', 'address'):
-        phrase = re.sub(r'\s+', ' ', re.sub(r'[^a-z0-9]+', ' ', str(row.get(field) or '').lower())).strip()
-        if not phrase:
+def _location_spellings(row: Dict) -> List[str]:
+    """The row's place fields in every spelling a user might type: as stored,
+    local ("Malmö") and ASCII ("Malmo"), plus the GeoNames digraph form
+    ("Malmoe") -- so whichever the row stores, all of them match."""
+    import place_names
+    country = str(row.get('locationCountry') or '')
+    out: List[str] = []
+    for field in ('address', 'locationCity', 'locationRegion', 'locationCountry'):
+        value = str(row.get(field) or '')
+        if not value:
             continue
-        for part in phrase.split(' '):
-            if len(part) >= 3:
-                into.add(part)
-        if field != 'address':  # full street addresses are per-photo noise
-            into.add(phrase)
+        if field == 'address':
+            out.append(value)
+            continue
+        out.extend(place_names.place_name_variants(value, country))
+    return out
+
+
+def _collect_location_terms(into: set, row: Dict) -> None:
+    import place_names
+    country = str(row.get('locationCountry') or '')
+    for field in ('locationCity', 'locationRegion', 'locationCountry', 'address'):
+        value = str(row.get(field) or '')
+        spellings = [value] if field == 'address' else place_names.place_name_variants(value, country)
+        for spelling in spellings:
+            phrase = re.sub(r'\s+', ' ', re.sub(r'[^a-z0-9]+', ' ', place_names.ascii_fold(spelling).lower())).strip()
+            if not phrase:
+                continue
+            for part in phrase.split(' '):
+                if len(part) >= 3:
+                    into.add(part)
+            if field != 'address':  # full street addresses are per-photo noise
+                into.add(phrase)
 
 
 def row_record(row: Dict) -> Optional[Dict]:
@@ -512,6 +535,27 @@ class SearchDatabase:
     def explore_groups(self, *, limit=24) -> Dict:
         """Exact pre-hydration Explore winners over iter_smart_rows order."""
         return DatabaseSummaryAdapter(self._conn()).groups(limit)
+
+    def place_page(self, keys: Sequence[str], *, offset: int = 0, limit: int = 24) -> Tuple[List[str], int]:
+        """(filenames for one page, total) of the photos in an Explore place
+        group -- the SAME membership that produced the card's count, so the
+        number on the card is the number that opens. ``keys`` are the group
+        keys to accept (a place may be keyed under an older spelling in a
+        database built before local names). Newest capture first."""
+        wanted = [str(k) for k in keys if k]
+        if not wanted:
+            return [], 0
+        conn = self._conn()
+        if not DatabaseSummaryAdapter(conn).ready():
+            raise SummarySchemaMissing('summary schema missing: compact the search database explicitly')
+        marks = ','.join('?' * len(wanted))
+        where = (f'FROM rows WHERE rows.id IN (SELECT id FROM summary_members WHERE kind = ? AND key IN ({marks}))')
+        args: List[object] = ['places', *wanted]
+        total = int(conn.execute(f'SELECT COUNT(*) {where}', args).fetchone()[0])
+        names = [r[0] for r in conn.execute(
+            f'SELECT filename {where} ORDER BY capture_ts DESC, filename ASC LIMIT ? OFFSET ?',
+            [*args, int(limit), max(0, int(offset))])]
+        return names, total
 
     def summary_snapshot(self, *, today=None) -> Dict:
         """One committed sequence for bounded Explore winners and SQL timeline.

@@ -132,7 +132,7 @@ const ExplorePage: React.FC = () => {
                     items={places}
                     cover={(pl) => pl.coverThumbnailUrl}
                     render={(pl, src) => (
-                        <button key={pl.id} type="button" className={`pt-shelf-card wide mock-swatch ${pl.swatch}`} onClick={() => navigate('ask', { query: pl.name })}>
+                        <button key={pl.id} type="button" className={`pt-shelf-card wide mock-swatch ${pl.swatch}`} onClick={() => navigate('ask', { placeId: pl.id })}>
                             {src && <TileThumbnail key={src} src={src} alt={pl.name} className="pt-explore-cover" />}
                             <span className="pt-shelf-overlay">{pl.name}{pl.count ? ` · ${pl.count}` : ''}</span>
                         </button>

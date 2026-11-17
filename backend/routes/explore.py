@@ -26,5 +26,8 @@ def explore_summary():
     if summary is None:
         app._trigger_indexer_rebuild(user_id)
         return app.jsonify({'places': [], 'things': []})
-    return app.jsonify({'places': summary.get('places', []), 'things': summary.get('things', [])})
+    # Read-time cleanup (junk Things out, Places in local spelling), so a
+    # summary built before explore_things existed needs no rebuild.
+    import explore_things
+    return app.jsonify(explore_things.clean_summary(summary))
 
