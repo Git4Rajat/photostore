@@ -1,4 +1,4 @@
-/* =================================================================
+/* ==========================================================
    Prototype-only styles for the fully-functional Keepsake prototype.
    Loaded after index.css + mockups.css, so it reuses real tokens and the
    shared mock classes (mock-swatch, upload-dock, share-sheet, member-row,
@@ -1565,3 +1565,11 @@
 /* The floating scroll-to-top button sits over the bottom-right corner once the page is scrolled, which
    is exactly where this row's Create pill ends up at the end of Albums. Leave room to scroll past it. */
 .pt-suggest { margin-bottom: calc(var(--tap-min) + 28px); }
+=======
+
+/* The Photos selection row replaces the title row: full width, flush with the top of the scroll
+   area (sticky positions inside .mock-body's padding, so it is pulled up by that padding). */
+.pt-gallery > .pt-select-head { --pad-y: clamp(12px, 3vw, 20px); --pad-x: clamp(12px, 3vw, 20px); top: calc(-1 * var(--pad-y)); margin: calc(-1 * var(--pad-y)) calc(-1 * var(--pad-x)) 12px; padding: 0 var(--pad-x); }
+@container (min-width: 806px) {
+  .pt-gallery > .pt-select-head { --pad-y: 18px; --pad-x: 20px; }
+}
