@@ -23,6 +23,7 @@ const mount = (notifications: AppNotification[]) => {
         clearNotifications: vi.fn(() => { state.notifications = []; }),
         markAllNotificationsRead: vi.fn(() => { state.notifications = state.notifications.map((n) => ({ ...n, unread: false })); }),
         retryPersistedUploadSession: vi.fn(),
+        resendInvite: vi.fn(async () => undefined),
         uploadActive: false,
     };
     const view = render(<NotificationBell backLabel="Albums" />);
@@ -75,5 +76,17 @@ describe('notification panel', () => {
         expect(screen.getByText('Kept for 30 days')).not.toBeNull();
         act(() => { fireEvent.click(screen.getByText('Clear all')); });
         expect(services.clearNotifications).toHaveBeenCalledTimes(1);
+    });
+
+    it('offers Resend on an invite about to end, and marks shared-album opens with a link', () => {
+        const { view } = mount([
+            note({ id: 'inv', kind: 'invite', inviteId: 'inv1', title: 'Invite to d**@example.com ends tomorrow' }),
+            note({ id: 'open', kind: 'share', title: 'Someone opened “Trip”', timestamp: Date.now() - 1000 }),
+        ]);
+        act(() => { fireEvent.click(screen.getByLabelText(/^Open notifications/)); });
+        act(() => { fireEvent.click(screen.getByRole('button', { name: 'Resend' })); });
+        expect(services.resendInvite).toHaveBeenCalledWith('inv');
+        const icons = Array.from(view.container.querySelectorAll('.notification-icon')).map((icon) => icon.className);
+        expect(icons).toEqual(['notification-icon invite', 'notification-icon share']);
     });
 });

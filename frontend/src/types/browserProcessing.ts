@@ -22,8 +22,13 @@ export interface UploadProgress {
     mbPerSecond?: number;
 }
 
+/** The round icon a notification gets: problems red, then uploads, people, shared albums, invites. */
+export type NotificationKind = 'warn' | 'upload' | 'people' | 'share' | 'invite' | 'info';
+
 export interface AppNotification {
     id: string;
+    // Set when the source knows better than the title-based guess (see notificationKind).
+    kind?: NotificationKind;
     title: string;
     details: string;
     timestamp: number;
@@ -32,6 +37,10 @@ export interface AppNotification {
     uploadSessionId?: string;
     // A few of the photos a finished upload added (library filenames), drawn as a thumbnail strip.
     photos?: string[];
+    // A finished upload still waiting on the server's "All processed in N minutes" summary.
+    processing?: { sessionId: string; since: number };
+    // A pending invite about to end; the panel offers Resend.
+    inviteId?: string;
     // Ephemeral (in-memory) button shown on the preview, e.g. Undo or Retry.
     action?: { label: string; onClick: () => void };
 }

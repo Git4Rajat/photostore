@@ -19567,6 +19567,7 @@ from routes.system import system_bp
 from routes.explore import explore_bp
 from routes.index_events import index_events_bp
 from routes.upload_sessions import upload_sessions_bp
+from routes.activity import activity_bp
 
 # 2026-09-15: service splits, following the modularity work above. Each
 # split group is registered on its own dedicated container app instead of
@@ -19610,7 +19611,7 @@ else:
     # same-origin /health on core specifically wasn't worth it for zero
     # real memory/CPU savings. people_bp joined this role 2026-10-08; library
     # management joined 2026-11-02, leaving operations/public on archive.
-    for _bp in (auth_bp, photos_bp, albums_bp, system_bp, explore_bp, people_bp, library_bp, index_events_bp, upload_sessions_bp):
+    for _bp in (auth_bp, photos_bp, albums_bp, system_bp, explore_bp, people_bp, library_bp, index_events_bp, upload_sessions_bp, activity_bp):
         app.register_blueprint(_bp)
 
 # Every role answers /health (system_bp only exists on the core role; upload has its own), so the

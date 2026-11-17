@@ -120,3 +120,56 @@ def test_ambiguous_prior_send_does_not_drop_stale_directory(live_api,monkeypatch
     result=client.post('/api/upload-sessions/reconcile',json={})
     assert result.status_code==200 and len(result.json['notifications'])==1
     assert sent
+
+
+def _finish_wave(store, session, *, closed_at, completed_at, members=(), failed=0):
+    """Close the session and complete its wave directly, as the stages would."""
+    row = store._required(store.session_key(session))
+    store.table.submit_transaction([store._change(row, dict(row, state='closed', closedAt=closed_at))])
+    wave = store._required(store.wave_key(row['waveId']))
+    store.table.submit_transaction([store._change(wave, dict(wave, state='complete', stateEnteredAt=completed_at,
+                                                            failedMembers=failed))])
+    for index, filename in enumerate(members):
+        store.table.create_entity(store._row(f"e!{row['waveId']}!m!{index:04d}", kind='member', filename=filename))
+    return row['waveId']
+
+
+def test_processing_summary_waits_for_the_wave_then_counts_time_and_people(live_api, monkeypatch):
+    client, store, _, library = live_api
+    import routes.upload_sessions as routes
+    routes._summaries.clear()
+    store.open_session('summary-session', 2)
+    assert client.get('/api/upload-sessions/summary-session/processing').json == dict(done=False, state='collecting')
+    _finish_wave(store, 'summary-session', closed_at=1000.0, completed_at=1250.0,
+                 members=['a.jpg', 'b.jpg', 'c.jpg'], failed=1)
+    reads = []
+
+    def metadata(partition, names):
+        reads.append((partition, list(names)))
+        people = {'a.jpg': '["p1","p2"]', 'b.jpg': '["p2"]', 'c.jpg': ''}
+        return {name: {'peopleIds': people[name]} for name in names}
+    monkeypatch.setattr(app, '_get_metadata_entities', metadata)
+    body = client.get('/api/upload-sessions/summary-session/processing').json
+    assert body == dict(done=True, processedSeconds=250, failed=1, people=2)
+    assert reads == [('u', ['a.jpg', 'b.jpg', 'c.jpg'])]
+    # A complete wave never changes, so the answer is kept rather than recounted.
+    assert client.get('/api/upload-sessions/summary-session/processing').json == body
+    assert len(reads) == 1
+
+
+def test_processing_summary_leaves_people_out_of_big_uploads(live_api, monkeypatch):
+    client, store, _, library = live_api
+    import routes.upload_sessions as routes
+    routes._summaries.clear()
+    monkeypatch.setattr(routes, 'PEOPLE_MAX_PHOTOS', 2)
+    store.open_session('big-session', 3)
+    _finish_wave(store, 'big-session', closed_at=10.0, completed_at=70.0, members=['a.jpg', 'b.jpg', 'c.jpg'])
+    monkeypatch.setattr(app, '_get_metadata_entities', lambda *a: pytest.fail('no metadata reads past the cap'))
+    assert client.get('/api/upload-sessions/big-session/processing').json == dict(
+        done=True, processedSeconds=60, failed=0, people=None)
+
+
+def test_processing_summary_rejects_unknown_or_invalid_sessions(live_api):
+    client, *_ = live_api
+    assert client.get('/api/upload-sessions/nobody/processing').status_code == 404
+    assert client.get('/api/upload-sessions/bad%20id/processing').status_code == 400

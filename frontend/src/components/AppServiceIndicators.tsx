@@ -4,22 +4,24 @@
 // only on the public useAppServices() contract, so they can live independently
 // of the (much larger) provider component itself.
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Bell as BellIcon, ChevronLeft as BackIcon, CloudUpload as UploadIcon, RotateCw as RetryIcon, TriangleAlert as AlertIcon, Users as PeopleIcon } from 'lucide-react';
+import { Bell as BellIcon, ChevronLeft as BackIcon, CloudUpload as UploadIcon, Link as LinkIcon, Mail as MailIcon, RotateCw as RetryIcon, TriangleAlert as AlertIcon, Users as PeopleIcon } from 'lucide-react';
 import { formatMegabytesPerSecond } from './browserAiShared';
 import { formatNotificationClock, formatNotificationTime } from '../services/notificationTime';
 import { getCachedSortThumb } from '../services/localSortIndex';
 import { thumbnailUrlForBlob } from '../services/mediaToken';
 import { resolveThumbnailAccessUrls } from '../services/thumbnailAccessCache';
-import type { AppNotification } from '../types/browserProcessing';
+import type { AppNotification, NotificationKind } from '../types/browserProcessing';
 import { useAppServices } from './AppServicesProvider';
 import { useSwipeDismiss } from '../services/swipeDismiss';
 
-// Problems read red; uploads and people get their own mark; the rest a bell.
-type NotificationKind = 'warn' | 'upload' | 'people' | 'info';
-const KIND_ICONS: Record<NotificationKind, React.ElementType> = { warn: AlertIcon, upload: UploadIcon, people: PeopleIcon, info: BellIcon };
+// Problems read red; uploads, people, shared albums and invites get their own mark; the rest a bell.
+const KIND_ICONS: Record<NotificationKind, React.ElementType> = {
+    warn: AlertIcon, upload: UploadIcon, people: PeopleIcon, share: LinkIcon, invite: MailIcon, info: BellIcon,
+};
 const PROBLEM_WORDS = /\b(fail|failed|couldn.t|can.t|error|stopped|warning|limit|unavailable|reselect)\b/i;
 export const notificationKind = (n: AppNotification): NotificationKind => {
     if ((n.progress?.failedCount ?? 0) > 0 || PROBLEM_WORDS.test(`${n.title} ${n.details}`)) return 'warn';
+    if (n.kind) return n.kind;
     if (n.progress || n.uploadSessionId || /upload/i.test(n.title)) return 'upload';
     if (/\b(people|person|faces?)\b/i.test(n.title)) return 'people';
     return 'info';
@@ -91,6 +93,7 @@ export const NotificationBell: React.FC<{ backLabel?: string }> = ({ backLabel =
         clearNotifications,
         markAllNotificationsRead,
         retryPersistedUploadSession,
+        resendInvite,
         uploadActive,
     } = useAppServices();
     const [showNotifications, setShowNotifications] = useState<boolean>(false);
@@ -255,6 +258,14 @@ export const NotificationBell: React.FC<{ backLabel?: string }> = ({ backLabel =
                                                     )}
                                                     {notification.photos && notification.photos.length > 0 && (
                                                         <NotificationStrip filenames={notification.photos} />
+                                                    )}
+                                                    {notification.inviteId && (
+                                                        <div className="notification-acts">
+                                                            <button type="button" className="btn btn-soft btn-sm"
+                                                                onClick={() => void resendInvite(notification.id)}>
+                                                                Resend
+                                                            </button>
+                                                        </div>
                                                     )}
                                                     {notification.uploadSessionId && (
                                                         <div className="notification-acts">

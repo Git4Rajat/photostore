@@ -59,6 +59,50 @@ def _share_preview_cache_put(key, data):
         while _share_preview_cache_bytes > _SHARE_PREVIEW_CACHE_MAX_BYTES and _share_preview_cache:
             _share_preview_evict(next(iter(_share_preview_cache)))
 
+# "Someone opened your shared album" (the owner's bell, via /api/activity): the album
+# row carries when its link was last opened and how many visits that makes. Visitors
+# are anonymous, so one visit is any opens of one album within OPEN_WINDOW_SECONDS
+# (paging, the snapshot handing over to the full app, a reload); that also bounds
+# the writes an unauthenticated link can cause to one per album per window.
+OPEN_WINDOW_SECONDS = 15 * 60
+_recent_opens = OrderedDict()
+_recent_opens_lock = threading.Lock()
+
+
+def _record_album_open(entity) -> None:
+    if app.albums_table_client is None or not entity:
+        return
+    key = (str(entity.get('PartitionKey') or ''), str(entity.get('RowKey') or ''))
+    now = time.time()
+    with _recent_opens_lock:
+        if now - _recent_opens.get(key, 0) < OPEN_WINDOW_SECONDS:
+            return
+        _recent_opens[key] = now
+        _recent_opens.move_to_end(key)
+        while len(_recent_opens) > 2000:
+            _recent_opens.popitem(last=False)
+    try:
+        if now - float(entity.get('lastOpenedAt') or 0) < OPEN_WINDOW_SECONDS:
+            return  # Another replica already counted this visit.
+        app.albums_table_client.update_entity(
+            {'PartitionKey': key[0], 'RowKey': key[1], 'lastOpenedAt': now,
+             'openCount': int(entity.get('openCount') or 0) + 1},
+            mode=app.UpdateMode.MERGE)
+    except Exception:
+        app.app.logger.warning('Could not record a shared album open', exc_info=True)
+
+
+@public_bp.route('/api/public/albums/<token>/opened', methods=['POST'])
+def public_album_opened(token: str):
+    """Beacon from the static snapshot page, which shows the album without calling the API.
+    Always 204, so it says nothing about which tokens exist."""
+    entity = app._find_public_album_by_token(token)
+    if (entity and app._coerce_bool(entity.get('isPublic', False)) and not app._album_is_expired(entity)
+            and not app._album_access_code(entity)):
+        _record_album_open(entity)
+    return '', 204
+
+
 @public_bp.route('/public/album/<token>', methods=['GET'])
 def public_album_share_page(token: str):
     """Crawler-facing share page for a public album.
@@ -110,6 +154,8 @@ def public_album(token: str):
     except (TypeError, ValueError):
         return app.jsonify({'error': 'Invalid paging parameters.'}), 400
 
+    if offset == 0:
+        _record_album_open(entity)
     filenames, total = app.album_store.page(entity, offset, limit)
     owner_id = str(entity.get('PartitionKey') or '')
     metadata_by_name = app._get_metadata_entities(owner_id, filenames) if owner_id and filenames else {}
