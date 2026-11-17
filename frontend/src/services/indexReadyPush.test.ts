@@ -74,6 +74,21 @@ describe('index publication push', () => {
         expect(sockets).toHaveLength(2);
     });
 
+    it('reports processing advisories for the active library and the connection state', async () => {
+        const { startIndexReadyPush } = await import('./indexReadyPush');
+        const refresh = vi.fn(); const onProcessing = vi.fn(); const onConnection = vi.fn();
+        const stop = startIndexReadyPush(refresh, { onProcessing, onConnection }); await flush();
+        sockets[0].onopen?.();
+        expect(onConnection).toHaveBeenLastCalledWith(true);
+        sockets[0].onmessage?.({ data: JSON.stringify({ type: 'processing', libraryId: 'A', state: 'done' }) });
+        sockets[0].onmessage?.({ data: JSON.stringify({ type: 'processing', libraryId: 'B', state: 'done' }) });
+        expect(onProcessing).toHaveBeenCalledTimes(1);
+        expect(refresh).toHaveBeenCalledTimes(1); // only the on-connect reconcile
+        sockets[0].close();
+        expect(onConnection).toHaveBeenLastCalledWith(false);
+        stop();
+    });
+
     it('does not negotiate unauthenticated sessions', async () => {
         mocks.authenticated = false;
         const { startIndexReadyPush } = await import('./indexReadyPush');

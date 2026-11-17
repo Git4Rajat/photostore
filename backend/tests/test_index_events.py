@@ -60,3 +60,41 @@ def test_push_failure_cannot_fail_the_index_job(monkeypatch):
 def test_push_disabled_has_no_external_dependency(monkeypatch):
     monkeypatch.delenv('INDEX_EVENTS_ENDPOINT',raising=False)
     assert index_events.negotiate('A')=={'available':False}
+
+
+def _capture(monkeypatch):
+    sent = []
+    monkeypatch.setenv('INDEX_EVENTS_ENDPOINT', 'https://service')
+    monkeypatch.setattr(index_events, '_enqueue', lambda key, message: sent.append((key, message)))
+    index_events._budget.update(day=None, used=0)
+    return sent
+
+
+def test_processing_push_is_disabled_without_an_endpoint(monkeypatch):
+    monkeypatch.delenv('INDEX_EVENTS_ENDPOINT', raising=False)
+    index_events._pending.clear()
+    index_events.publish_processing('A', 'wave-1')
+    assert not index_events._pending
+
+
+def test_processing_push_coalesces_per_library_and_wave(monkeypatch):
+    monkeypatch.setenv('INDEX_EVENTS_ENDPOINT', 'https://service')
+    monkeypatch.setattr(index_events, '_running', True)  # keep the flush thread from starting
+    index_events._pending.clear()
+    index_events._budget.update(day=None, used=0)
+    for _ in range(5):
+        index_events.publish_processing('A', 'wave-1')
+    index_events.publish_processing('A', 'wave-2')
+    assert sorted(key[2] for key in index_events._pending) == ['wave-1', 'wave-2']
+    assert index_events._pending[('A', 'processing', 'wave-1')] == {
+        'type': 'processing', 'libraryId': 'A', 'waveId': 'wave-1', 'state': 'done'}
+    assert index_events._budget['used'] == 2
+    index_events._pending.clear()
+
+
+def test_processing_push_stops_at_the_daily_budget(monkeypatch):
+    sent = _capture(monkeypatch)
+    monkeypatch.setattr(index_events, 'PROCESSING_DAILY_BUDGET', 3)
+    for index in range(20):
+        index_events.publish_processing('A', f'wave-{index}')
+    assert len(sent) == 3

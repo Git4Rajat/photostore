@@ -3,12 +3,19 @@ import hashlib
 import logging
 import os
 import threading
+import time
 from functools import lru_cache
 
 _log = logging.getLogger(__name__)
 _lock = threading.Lock()
 _pending = {}
 _running = False
+# Free_F1 allows 20,000 messages/day across every sender. Index-ready pushes keep
+# most of that; processing pushes (one per finished wave, so independent of photo
+# count) get a small fixed share per sending process, after which clients simply
+# fall back to polling.
+PROCESSING_DAILY_BUDGET = int(os.getenv('INDEX_EVENTS_PROCESSING_DAILY_BUDGET', '1500'))
+_budget = {'day': None, 'used': 0}
 
 
 def enabled():
@@ -40,11 +47,35 @@ def negotiate(library):
 
 def publish(library, scope, job_id):
     """Coalesce sends without holding up publication or spawning per-edit threads."""
+    _enqueue((library, scope), {'type': 'index-ready', 'libraryId': library, 'scope': scope, 'jobId': job_id})
+
+
+def publish_processing(library, wave_id, state='done'):
+    """Advisory "a wave finished processing" for browsers watching an upload.
+
+    One message per wave transition, coalesced per (library, wave); never per
+    photo, so a 16k-file upload costs a handful of messages. Past the daily share
+    the push is skipped and browsers keep their slow polling fallback."""
+    if not enabled():
+        return
+    today = time.strftime('%Y-%m-%d', time.gmtime())
+    with _lock:
+        if _budget['day'] != today:
+            _budget.update(day=today, used=0)
+        if (library, 'processing', wave_id) not in _pending:
+            if _budget['used'] >= PROCESSING_DAILY_BUDGET:
+                return
+            _budget['used'] += 1
+    _enqueue((library, 'processing', wave_id), {
+        'type': 'processing', 'libraryId': library, 'waveId': wave_id, 'state': state})
+
+
+def _enqueue(key, message):
     if not enabled():
         return
     global _running
     with _lock:
-        _pending[library, scope] = job_id
+        _pending[key] = message
         if _running:
             return
         _running = True
@@ -58,10 +89,8 @@ def _flush():
             if not _pending:
                 _running = False
                 return
-            (library, scope), job_id = _pending.popitem()
+            (library, *_), message = _pending.popitem()
         try:
-            _client().send_to_group(group(library), {
-                'type': 'index-ready', 'libraryId': library, 'scope': scope, 'jobId': job_id,
-            }, content_type='application/json')
+            _client().send_to_group(group(library), message, content_type='application/json')
         except Exception:
             _log.warning('Index-ready push failed; clients can recover through job polling', exc_info=True)
