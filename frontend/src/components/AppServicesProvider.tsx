@@ -3651,6 +3651,19 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         // relying on that ref there would read every file back as whatever
         // stale status `normalized`/`session` captured at the start.
         const waveShadowFileOutcomes = new Map<string, Pick<PersistedUploadFile, 'status' | 'skippedDuplicate' | 'waveAcceptedFilename'>>();
+        // A few of this run's new photos, for the finished notification's thumbnail strip.
+        const stripPhotos: string[] = [];
+        const uploadedNotice = (): Partial<AppNotification> => {
+            const newCount = totalUploaded - totalSkippedDuplicates;
+            return {
+                title: newCount > 0 ? `${plural(newCount, 'item')} uploaded` : 'Nothing new to upload',
+                details: [
+                    totalSkippedDuplicates > 0 ? `Skipped ${plural(totalSkippedDuplicates, 'duplicate')}.` : '',
+                    newCount > 0 ? 'They show in Photos once processed.' : 'Everything was already in your library.',
+                ].filter(Boolean).join(' '),
+                ...(stripPhotos.length > 0 ? { photos: [...stripPhotos] } : {}),
+            };
+        };
         const cleanupStoppedUpload = async (latest: PersistedUploadSession): Promise<boolean> => {
             // Committed files may still be finalizing when Stop rejects the
             // transfer workers. Never delete their reservations/blobs while
@@ -3987,6 +4000,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         void resolveWaveShadowFile(session, settledFile);
                     }
                     if (!skippedDuplicate) {
+                        if (stripPhotos.length < 6) stripPhotos.push(waveAcceptedFilename);
                         freshlyUploadedFilenamesRef.current.add(fileMeta.name);
                         if (!prepared.clientProcessing?.thumbnail) kickOffThumbnailForFile(file, fileMeta.name, fileMeta.blobName);
                     }
@@ -4303,12 +4317,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 // Keep controls available through both finalization and retries,
                 // even when no finalization request is currently outstanding.
                 setBackgroundUploadTailActive(true);
-                updateUploadNotification({
-                    title: stillFinalizing > 0 ? 'Upload transferred' : 'Upload complete',
-                    details: stillFinalizing > 0
-                        ? `All bytes transferred. Confirming ${plural(stillFinalizing, 'file')} in the background.`
-                        : `Uploaded ${plural(totalUploaded, 'file')} successfully. Skipped duplicates: ${totalSkippedDuplicates}. Your photos will be visible in the gallery after processing.`,
-                });
+                updateUploadNotification(stillFinalizing > 0
+                    ? { title: 'Upload transferred', details: `All bytes transferred. Confirming ${plural(stillFinalizing, 'file')} in the background.` }
+                    : uploadedNotice());
             }
 
             // Lanes only stage+commit bytes now; the backend confirmation for
@@ -4446,10 +4457,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 });
                 setUploadError(null);
             } else if (totalFailed === 0 && !hasPending) {
-                updateUploadNotification({
-                    title: 'Upload complete',
-                    details: `Uploaded ${plural(totalUploaded, 'file')} successfully. Skipped duplicates: ${totalSkippedDuplicates}. Your photos will be visible in the gallery after processing.`,
-                });
+                updateUploadNotification(uploadedNotice());
                 setUploadError(null);
             } else {
                 if (latest) {

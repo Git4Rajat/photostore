@@ -27,6 +27,7 @@ const toStored = (scope: string, n: AppNotification): StoredNotification => ({
     unread: n.unread,
     progress: n.progress,
     uploadSessionId: n.uploadSessionId,
+    photos: n.photos,
     scope,
 });
 

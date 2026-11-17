@@ -525,6 +525,8 @@ describe('browser upload selection and startup', () => {
         expect(endSummaries()).toHaveLength(1);
         expect(endSummaries()[0][1]).toMatchObject({uploaded: 1, failed: 0});
         expect(services.notifications.some(n => n.title === 'Upload failed')).toBe(false);
+        // The finished entry reads as the redesign draws it, with the new photo for its thumbnail strip.
+        expect(services.notifications.find(n => n.title === '1 item uploaded')?.photos).toHaveLength(1);
         expect(services.pendingUploadSummary).toBeNull();
         expect(services.uploading).toBe(false);
     });
