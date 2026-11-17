@@ -1750,3 +1750,58 @@ it('ends Core recovery follow-ups when pending cleanup drains', async () => {
     await advance(90000);
     expect(checks).toBe(2);
 });
+
+
+describe('Server activity in the bell', () => {
+    it('turns a shared-album open into one notification, and not again after a reload', async () => {
+        const openedAt = Date.now() / 1000 - 120;
+        mocks.get.mockImplementation(async (url: string) => url === '/api/activity'
+            ? { albumOpens: [{ albumId: 'a1', name: 'Malmö nights', openedAt, opens: 1 }], invitesEnding: [] }
+            : {});
+        const first = render(<AppServicesProvider><Probe toolsPage={false} /></AppServicesProvider>);
+        await advance(0);
+        expect(services.notifications.filter((n) => n.kind === 'share').map((n) => n.title)).toEqual(['Someone opened “Malmö nights”']);
+        first.unmount();
+        render(<AppServicesProvider><Probe toolsPage={false} /></AppServicesProvider>);
+        await advance(0);
+        expect(services.notifications.some((n) => n.kind === 'share')).toBe(false);
+    });
+
+    it('fills in how processing went once the upload’s wave completes', async () => {
+        let done = false;
+        mocks.get.mockImplementation(async (url: string) => url === '/api/upload-sessions/s1/processing'
+            ? (done ? { done: true, processedSeconds: 240, failed: 0, people: 9 } : { done: false, state: 'processing' })
+            : {});
+        render(<AppServicesProvider><Probe toolsPage={false} /></AppServicesProvider>);
+        await advance(0);
+        let id = '';
+        act(() => { id = services.addNotification('31 items uploaded', 'They show in Photos once processed.'); });
+        act(() => { services.updateNotification(id, { processing: { sessionId: 's1', since: Date.now() } }); });
+        await advance(30_000);
+        expect(services.notifications.find((n) => n.id === id)?.processing).toBeDefined();
+        done = true;
+        await advance(30_000);
+        const entry = services.notifications.find((n) => n.id === id);
+        expect(entry?.details).toBe('All processed in 4 minutes. 9 people found.');
+        expect(entry?.processing).toBeUndefined();
+        const calls = mocks.get.mock.calls.filter(([url]) => url === '/api/upload-sessions/s1/processing').length;
+        await advance(120_000);
+        expect(mocks.get.mock.calls.filter(([url]) => url === '/api/upload-sessions/s1/processing')).toHaveLength(calls);
+    });
+
+    it('stops asking when the server does not know the upload', async () => {
+        mocks.get.mockImplementation(async (url: string) => {
+            if (url === '/api/upload-sessions/legacy/processing') throw Object.assign(new Error('nope'), { response: { status: 404 } });
+            return {};
+        });
+        render(<AppServicesProvider><Probe toolsPage={false} /></AppServicesProvider>);
+        await advance(0);
+        let id = '';
+        act(() => { id = services.addNotification('3 items uploaded', ''); });
+        act(() => { services.updateNotification(id, { processing: { sessionId: 'legacy', since: Date.now() } }); });
+        await advance(0);
+        const entry = services.notifications.find((n) => n.id === id);
+        expect(entry?.processing).toBeUndefined();
+        expect(entry?.details).toBe('');
+    });
+});

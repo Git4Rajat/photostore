@@ -28,6 +28,9 @@ const toStored = (scope: string, n: AppNotification): StoredNotification => ({
     progress: n.progress,
     uploadSessionId: n.uploadSessionId,
     photos: n.photos,
+    kind: n.kind,
+    processing: n.processing,
+    inviteId: n.inviteId,
     scope,
 });
 

@@ -51,6 +51,9 @@ if (root && (window as unknown as { __HOME__?: boolean }).__HOME__) {
     // but never while the viewer is open.
     const full = `${cfg.spa}/public/album/${encodeURIComponent(cfg.token)}`;
     void Promise.all([ping(`${cfg.spa}/health`), ping(`${cfg.archive}/health`)]).then(() => {
+        // The snapshot answers the album read itself, so tell the owner's bell someone opened it.
+        fetch(`${cfg.archive}/api/public/albums/${encodeURIComponent(cfg.token)}/opened`,
+            { method: 'POST', mode: 'no-cors', cache: 'no-store', keepalive: true }).catch(() => undefined);
         const timer = window.setInterval(() => {
             const m = manifest as SnapshotManifest | null;
             if (!m) return;

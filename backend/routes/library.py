@@ -115,6 +115,50 @@ def library_invite():
     # Uniform response: never reveal whether the email already had an account.
     return app.jsonify({'status': 'sent'})
 
+@library_bp.route('/api/library/invite/resend', methods=['POST'])
+def library_invite_resend():
+    """Send a pending invite again with a fresh link and a fresh 72 hours. The old link
+    stops working only once the new email has gone out, so a failed send changes nothing."""
+    account_id, library_id, error = app._require_owner_context()
+    if error:
+        return error
+    data = app.request.get_json(silent=True) or {}
+    invite_id = str(data.get('inviteId', '') or '').strip()
+    if not invite_id:
+        return app.jsonify({'error': 'inviteId is required.'}), 400
+    old = next((inv for inv in app.library_store.pending_invites(library_id)
+                if str(inv.get('RowKey') or '') == invite_id), None)
+    if old is None:
+        return app.jsonify({'error': 'That invitation is no longer pending.'}), 404
+    if not app.email_utils.is_configured():
+        return app.jsonify({'error': 'Email delivery is not configured, so invitations cannot be sent.'}), 503
+    if not app.library_store.invite_send_allowed(library_id):
+        return app.jsonify({'error': 'Too many invites sent recently. Please wait and try again.'}), 429
+    email = str(old.get('emailNorm') or '')
+    target_type = 'fresh' if str(old.get('targetType') or '') == 'fresh' else 'join'
+    raw = app.library_store.create_invite(
+        library_id=library_id, email=email, target_type=target_type, invited_by=account_id,
+    )
+    meta = app.library_store.get_library(library_id) or {}
+    inviter_email = str((app.library_store.get_user(account_id) or {}).get('email') or '')
+    base = (app.PUBLIC_APP_BASE_URL or '').rstrip('/')
+    try:
+        app.email_utils.send_invite_email(
+            email, f'{base}/accept-invite?token={raw}',
+            library_name=str(meta.get('name') or '') if target_type == 'join' else '',
+            inviter=inviter_email,
+        )
+    except Exception as exc:
+        app.app.logger.warning('Invite email failed: %s', exc)
+        fresh = next((inv for inv in app.library_store.pending_invites(library_id)
+                      if inv.get('tokenHash') == app.library_utils.hash_invite_token(raw)), None)
+        if fresh:
+            app.library_store.revoke_invite(library_id, str(fresh.get('RowKey') or ''))
+        return app.jsonify({'error': 'The invitation email could not be sent. Please try again.'}), 502
+    app.library_store.revoke_invite(library_id, invite_id)
+    app.library_store.audit(library_id, actor=account_id, action='invite-resent', target=email)
+    return app.jsonify({'status': 'sent'})
+
 @library_bp.route('/api/library/invite/revoke', methods=['POST'])
 def library_invite_revoke():
     account_id, library_id, error = app._require_owner_context()

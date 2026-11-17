@@ -1,9 +1,10 @@
 import { hasForegroundDemand, onForegroundReturn } from '../services/foregroundDemand';
 import { sessionScope } from '../services/sessionScope';
 import { acknowledgeStaleUpload, reconcileUploadSessions } from '../services/uploadSessionRecovery';
+import { activityNotifications, fetchActivity, fetchProcessingSummary, loadAnnouncedActivity, processingSummaryText, resendInvite as postInviteResend, saveAnnouncedActivity } from '../services/activityNotifications';
 import { observeExpiredWaveSession } from '../services/uploadWaveSync';
 import { waveLiveEnabled, waveShadowEnabled } from '../services/uploadWaveClient';
-import { bindWaveChild, declareWaveSelection, retryWaveOperation, pruneStaleWaveOperations } from '../services/uploadWaveOperations';
+import { bindWaveChild, declareWaveSelection, retryWaveOperation, pruneStaleWaveOperations, waveParentFor } from '../services/uploadWaveOperations';
 import { hasPendingEdits } from '../services/pendingEdits';
 import { startIndexReadyPush } from '../services/indexReadyPush';
 import { reportIndexBuilding } from '../services/indexBuilding';
@@ -99,6 +100,11 @@ import {
 const JOB_POLL_INTERVAL_MS = 6000;
 // Safety cap so a job that never reports a terminal status can't poll forever.
 const JOB_POLL_MAX_MS = 20 * 60 * 1000;
+// Shared-album opens and ending invites: one cheap Core read per visit, no more often than this.
+const ACTIVITY_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+// A finished upload asks how processing went this often, and gives up after this long.
+const PROCESSING_POLL_MS = 30_000;
+const PROCESSING_WATCH_MS = 3 * 60 * 60 * 1000;
 // Clustering-kind completions (people_cluster after every upload, find-faces
 // propagation after every merge) can finish many at once — a big upload fires
 // one background job per photo, and a bulk "approve all suggestions" fires one
@@ -297,6 +303,8 @@ interface AppServicesContextValue {
     updateNotification: (id: string, updates: Partial<AppNotification>) => void;
     clearNotifications: () => void;
     markAllNotificationsRead: () => void;
+    /** Sends the invite behind an "Invite … ends tomorrow" notification again. */
+    resendInvite: (notificationId: string) => Promise<void>;
     browserAiModelState: SharedBrowserAiModelState;
     browserAiLoadProgress: BrowserAiLoadStage | null;
     browserAiButtonDisabled: boolean;
@@ -1857,6 +1865,122 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         });
         setNotifications((prev) => prev.map((notification) => ({ ...notification, unread: false })));
     }, [notifications]);
+
+    const resendInvite = useCallback(async (notificationId: string) => {
+        const notification = notifications.find((n) => n.id === notificationId);
+        if (!notification?.inviteId) return;
+        try {
+            await postInviteResend(notification.inviteId);
+            updateNotification(notificationId, {
+                title: notification.title.replace(/ ends (today|tomorrow)$/, ' sent again'),
+                details: 'A new link went out. It works for 72 hours.',
+                inviteId: undefined,
+            });
+        } catch (error) {
+            const message = (error as { response?: { data?: { error?: string } } })?.response?.data?.error;
+            updateNotification(notificationId, { details: message || 'The invite could not be sent again. Try again in a moment.' });
+        }
+    }, [notifications, updateNotification]);
+
+    // Shared albums someone opened and invites about to end (backend/routes/activity.py):
+    // asked for on start-up and when the person comes back, at most every few minutes.
+    useEffect(() => {
+        let disposed = false;
+        let inFlight = false;
+        let lastScope = '';
+        let lastAttempt = -Infinity;
+        const check = async () => {
+            if (disposed || inFlight || !navigator.onLine || !hasForegroundDemand()) return;
+            const scope = sessionScope();
+            if (scope === lastScope && Date.now() - lastAttempt < ACTIVITY_CHECK_INTERVAL_MS) return;
+            inFlight = true;
+            try {
+                if (!await canAuthenticateRequests() || disposed || sessionScope() !== scope) return;
+                lastScope = scope;
+                lastAttempt = Date.now();
+                const activity = await fetchActivity();
+                if (disposed || sessionScope() !== scope || !activity) return;
+                const { entries, announced } = activityNotifications(activity, loadAnnouncedActivity(scope));
+                saveAnnouncedActivity(scope, announced);
+                if (entries.length > 0) {
+                    setNotifications((previous) => [
+                        ...entries.filter((entry) => !previous.some((n) => n.id === entry.id)),
+                        ...previous,
+                    ].slice(0, MAX_NOTIFICATION_HISTORY));
+                }
+            } catch {
+                // The next visit asks again.
+            } finally {
+                inFlight = false;
+            }
+        };
+        const wake = () => { void check(); };
+        const visible = () => { if (document.visibilityState === 'visible') wake(); };
+        const unsubscribe = onForegroundReturn(wake);
+        window.addEventListener('focus', wake);
+        window.addEventListener('online', wake);
+        document.addEventListener('visibilitychange', visible);
+        wake();
+        return () => {
+            disposed = true;
+            unsubscribe();
+            window.removeEventListener('focus', wake);
+            window.removeEventListener('online', wake);
+            document.removeEventListener('visibilitychange', visible);
+        };
+    }, []);
+
+    // A finished upload's entry gets the server's "All processed in 4 minutes. 9 people found."
+    // once the wave it joined completes: asked every 30 s while the page is in front, for a
+    // few hours at most, and picked up again after a reload.
+    const pendingProcessing = notifications
+        .filter((n) => n.processing)
+        .map((n) => [n.id, n.processing!.sessionId, n.processing!.since].join('|'))
+        .join(',');
+    useEffect(() => {
+        if (!pendingProcessing) return undefined;
+        let disposed = false;
+        let inFlight = false;
+        const settle = (id: string) => setNotifications((previous) => previous.map((n) => (
+            n.id === id ? { ...n, processing: undefined } : n)));
+        const tick = async () => {
+            if (disposed || inFlight || document.visibilityState !== 'visible' || !navigator.onLine) return;
+            inFlight = true;
+            try {
+                for (const entry of pendingProcessing.split(',')) {
+                    const [id, sessionId, since] = entry.split('|');
+                    if (Date.now() - Number(since) > PROCESSING_WATCH_MS) {
+                        settle(id);
+                        continue;
+                    }
+                    try {
+                        const summary = await fetchProcessingSummary(sessionId);
+                        if (disposed) return;
+                        if (summary?.done && !summary.cancelled) {
+                            updateNotification(id, { details: processingSummaryText(summary), processing: undefined });
+                        } else if (summary?.done) {
+                            settle(id);
+                        }
+                    } catch (error) {
+                        const status = (error as { response?: { status?: number } })?.response?.status;
+                        // Not a wave upload (or no longer known): nothing more to say.
+                        if (status === 400 || status === 404) settle(id);
+                    }
+                }
+            } finally {
+                inFlight = false;
+            }
+        };
+        const visible = () => { if (document.visibilityState === 'visible') void tick(); };
+        const timer = window.setInterval(() => { void tick(); }, PROCESSING_POLL_MS);
+        document.addEventListener('visibilitychange', visible);
+        void tick();
+        return () => {
+            disposed = true;
+            window.clearInterval(timer);
+            document.removeEventListener('visibilitychange', visible);
+        };
+    }, [pendingProcessing, updateNotification]);
 
     useEffect(() => {
         let disposed = false;
@@ -3653,6 +3777,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const waveShadowFileOutcomes = new Map<string, Pick<PersistedUploadFile, 'status' | 'skippedDuplicate' | 'waveAcceptedFilename'>>();
         // A few of this run's new photos, for the finished notification's thumbnail strip.
         const stripPhotos: string[] = [];
+        const waveSessionId = waveLiveEnabled() ? waveParentFor(session)?.id : undefined;
         const uploadedNotice = (): Partial<AppNotification> => {
             const newCount = totalUploaded - totalSkippedDuplicates;
             return {
@@ -3662,6 +3787,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     newCount > 0 ? 'They show in Photos once processed.' : 'Everything was already in your library.',
                 ].filter(Boolean).join(' '),
                 ...(stripPhotos.length > 0 ? { photos: [...stripPhotos] } : {}),
+                // Ask the server how processing went once the wave this upload joined completes.
+                ...(newCount > 0 && waveSessionId ? { processing: { sessionId: waveSessionId, since: Date.now() } } : {}),
             };
         };
         const cleanupStoppedUpload = async (latest: PersistedUploadSession): Promise<boolean> => {
@@ -5777,6 +5904,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         updateNotification,
         clearNotifications,
         markAllNotificationsRead,
+        resendInvite,
         browserAiModelState,
         browserAiLoadProgress,
         browserAiButtonDisabled,
@@ -5815,6 +5943,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         updateNotification,
         clearNotifications,
         markAllNotificationsRead,
+        resendInvite,
         browserAiModelState,
         browserAiLoadProgress,
         browserAiButtonDisabled,

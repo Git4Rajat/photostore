@@ -86,6 +86,12 @@ _JS = """
     });
   }
 
+  // Tells the owner someone opened the album (their bell), once the archive is awake.
+  function opened() {
+    fetch(C.archive + '/api/public/albums/' + encodeURIComponent(C.token) + '/opened',
+      { method: 'POST', mode: 'no-cors', cache: 'no-store', keepalive: true }).catch(function () {});
+  }
+
   function norm(deg) { return ((deg || 0) % 360 + 360) % 360; }
   function turn(rem) { return rem ? 'rotate(' + rem + 'deg) scale(' + (rem % 180 === 0 ? 1 : 0.74) + ')' : ''; }
 
@@ -209,6 +215,7 @@ _JS = """
   function legacy() {
   Promise.all([ping(C.spa + '/health'), ping(C.archive + '/health')]).then(function () {
     ready = true;
+    opened();
     maybeTakeOver();
   });
   fetch('manifest.json', { cache: 'no-cache' })

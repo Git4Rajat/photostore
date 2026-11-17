@@ -1,12 +1,14 @@
 """User-triggered upload recovery and durable notices, owned by Core."""
+import json
 import threading
 import time
+from collections import OrderedDict
 from itertools import islice
 from flask import Blueprint, g
 from azure.core.exceptions import AzureError
 
 import app
-from upload_waves import ShadowWaves, Conflict
+from upload_waves import ShadowWaves, Conflict, identifier
 from upload_session_registry import Sessions, configured
 
 upload_sessions_bp = Blueprint('upload_sessions', __name__)
@@ -83,6 +85,84 @@ def acknowledge_upload_notice(session):
         return app.jsonify(error='Invalid upload session'), 400
     except AzureError:
         return app.jsonify(error='Notification acknowledgment unavailable'), 503
+
+
+# A finished upload's notification says how processing went ("All processed in 4
+# minutes. 9 people found."). The browser asks about its own session until the
+# wave it joined completes; a complete wave never changes, so its answer is kept.
+PEOPLE_MAX_PHOTOS = 600
+_summaries = OrderedDict()
+_summaries_lock = threading.Lock()
+
+
+def _people_in_wave(store, library, wave_id):
+    """Distinct people in the wave's photos, from their metadata rows; None past PEOPLE_MAX_PHOTOS
+    (the count would cost a metadata read per 15 photos, so big uploads just leave it out)."""
+    rows = islice(store.table.query_entities(
+        f"PartitionKey eq '{store.partition}' and RowKey ge 'e!{wave_id}!m!' and RowKey lt 'e!{wave_id}!m!~'"),
+        PEOPLE_MAX_PHOTOS + 1)
+    names = [str(row['filename']) for row in rows if row.get('filename')]
+    if len(names) > PEOPLE_MAX_PHOTOS:
+        return None
+    people = set()
+    for metadata in app._get_metadata_entities(library, names).values():
+        try:
+            ids = json.loads((metadata or {}).get('peopleIds') or '[]')
+        except (TypeError, ValueError):
+            continue
+        if isinstance(ids, list):
+            people.update(str(person) for person in ids if person)
+    return len(people)
+
+
+def processing_summary(library, session):
+    from wave_policy import owned
+    if not owned(app.jobs_table_client, library):
+        raise LookupError('Uploads in this library are not processed in waves')
+    store = ShadowWaves(app.jobs_table_client, library)
+    row = store._get(store.session_key(identifier(session)))
+    if not row:
+        raise LookupError('Unknown upload session')
+    key = (library, row['waveId'])
+    with _summaries_lock:
+        if key in _summaries:
+            return _summaries[key]
+    wave = store._get(store.wave_key(row['waveId']))
+    if not wave:
+        raise LookupError('Unknown wave')
+    if wave['state'] == 'cancelled':
+        return dict(done=True, cancelled=True)
+    if wave['state'] != 'complete':
+        return dict(done=False, state=wave['state'])
+    started = float(row.get('closedAt') or wave.get('frozenAt') or wave['createdAt'])
+    summary = dict(done=True, processedSeconds=max(0, round(float(wave['stateEnteredAt']) - started)),
+                   failed=int(wave.get('failedMembers') or 0),
+                   people=_people_in_wave(store, library, row['waveId']))
+    with _summaries_lock:
+        _summaries[key] = summary
+        while len(_summaries) > 500:
+            _summaries.popitem(last=False)
+    return summary
+
+
+@upload_sessions_bp.route('/api/upload-sessions/<session>/processing', methods=['GET'])
+def upload_processing(session):
+    _, library, error = app._require_library_context(require_auth=True)
+    if error:
+        return error
+    # A poll, not a visit: it must not set off the recovery survey below.
+    g.upload_reconciled = True
+    try:
+        response = app.jsonify(processing_summary(library, session))
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+    except ValueError:
+        return app.jsonify(error='Invalid upload session'), 400
+    except LookupError as error:
+        return app.jsonify(error=str(error)), 404
+    except AzureError:
+        app.app.logger.warning('Upload processing summary unavailable', exc_info=True)
+        return app.jsonify(error='Processing status is temporarily unavailable'), 503
 
 
 @upload_sessions_bp.after_app_request
