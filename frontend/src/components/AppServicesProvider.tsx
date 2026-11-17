@@ -314,6 +314,8 @@ interface AppServicesContextValue {
     uploading: boolean;
     uploadActive: boolean;
     uploadProgress: UploadProgress | null;
+    /** Set while the selection is hashed to find files already in the library, before any bytes go up. */
+    uploadCheckProgress: { checked: number; total: number } | null;
     pendingUploadSummary: PendingUploadSummary | null;
     pendingUploadFailedFiles: PersistedUploadFile[];
     queuedUploadFileCount: number;
@@ -995,6 +997,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const [notifications, setNotifications] = useState<AppNotification[]>([]);
     const [uploading, setUploading] = useState<boolean>(false);
     const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
+    const [uploadCheckProgress, setUploadCheckProgress] = useState<{ checked: number; total: number } | null>(null);
     // True from the moment runUploadSession flips `uploading` false early
     // (all bytes transferred) until its background finalize/retry tail
     // actually finishes -- distinct from `uploading` specifically so the
@@ -5115,6 +5118,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             `Hashing ${plural(selectedCount, 'selected file')} before creating the upload manifest.`,
             { uploadedCount: 0, totalCount: selectedCount, failedCount: 0, skippedDuplicateCount: 0 },
         );
+        setUploadCheckProgress({ checked: 0, total: selectedCount });
         const precomputedHashes = new Map<File, string>();
         let preflightSkippedDuplicateCount = 0;
         const unreadableFileNames: string[] = [];
@@ -5149,6 +5153,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         unreadableFileNames.push(file.name);
                     }
                     completed += 1;
+                    if (completed === filesToUpload.length || completed % 10 === 0) setUploadCheckProgress({ checked: completed, total: selectedCount });
                     if (completed === filesToUpload.length || completed % 25 === 0) {
                         updateNotification(dedupNotificationId, {
                             details: `Checked ${completed}/${selectedCount} files for duplicates.`,
@@ -5191,6 +5196,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             return;
         } finally {
             uploadAbortControllersRef.current.delete(dedupController);
+            setUploadCheckProgress(null);
         }
         if (filesToUpload.length === 0) {
             setUploadProgress({ uploadedCount: 0, totalCount: 0, failedCount: 0,
@@ -5914,6 +5920,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         uploading,
         uploadActive: uploading || backgroundUploadTailActive,
         uploadProgress: uploading || backgroundUploadTailActive ? uploadProgress : null,
+        uploadCheckProgress,
         pendingUploadSummary,
         pendingUploadFailedFiles,
         queuedUploadFileCount,
@@ -5953,6 +5960,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         uploading,
         backgroundUploadTailActive,
         uploadProgress,
+        uploadCheckProgress,
         pendingUploadSummary,
         pendingUploadFailedFiles,
         queuedUploadFileCount,

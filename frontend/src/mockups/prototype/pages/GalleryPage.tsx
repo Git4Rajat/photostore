@@ -3,7 +3,6 @@ import { CalendarSearch as CalendarSearchIcon, ChevronDown as ChevronDownIcon, H
 import { useStore, isVideoFilename } from '../store';
 import type { CaptureRange, MediaFilter } from '../store';
 import { useAppServices } from '../../../components/AppServicesProvider';
-import { UploadDock } from '../../../components/UploadDock';
 import { invalidateLocalSortIndex } from '../../../services/localSortIndex';
 import PhotoGrid from '../components/PhotoGrid';
 import TimelineBrowser from '../components/TimelineBrowser';
@@ -423,8 +422,6 @@ const GalleryPage: React.FC = () => {
             )}
 
             {scopeCrumbs}
-
-            <UploadDock />
 
             {level !== 'days' && timeline ? (
                 <div onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}>
