@@ -1437,6 +1437,51 @@
   .pt-album-hero { margin-left: calc(-1 * clamp(12px, 3vw, 20px)) !important; margin-right: calc(-1 * clamp(12px, 3vw, 20px)) !important; margin-top: -8px !important; border-radius: 0; }
 }
 .pt-album-card-cover .pt-album-card-swatch { position: absolute; inset: 0; }
+/* The one-star compact rating is unused now; the menu's button rule must not bring it back as a sixth star. */
+.pt-more-menu .pt-star-compact, .pt-fm-rate .pt-star-compact, .pt-vi-block .pt-star-compact { display: none; }
+
+/* The one-star compact rating is unused now; the menu's button rule must not bring it back as a sixth star. */
+.pt-more-menu .pt-star-compact, .pt-fm-rate .pt-star-compact, .pt-vi-block .pt-star-compact { display: none; }
+
+/* ---- Photos filter: one Filter button, its panel, and a sentence saying what is on ---- */
+.pt-chips { flex-wrap: wrap; overflow: visible; row-gap: 8px; align-items: center; }
+.pt-fbar { position: relative; gap: 10px; }
+.pt-fbtn svg { width: 16px; height: 16px; flex: none; }
+.pt-fbtn.on { background: var(--accent-soft, var(--bg-accent)); color: var(--accent); }
+.pt-fcnt { display: inline-grid; place-items: center; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--accent); color: var(--on-accent); font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.pt-fmeta { margin-left: auto; font-size: 0.8rem; color: var(--muted); }
+.pt-chip-select { min-height: 34px; padding: 0 4px; }
+.pt-fsum { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 0.8rem; color: var(--muted); }
+.pt-fsum b { color: var(--text); font-weight: 600; }
+.pt-fsum .pt-linkish { margin-left: auto; font-size: 0.8rem; min-height: 0; }
+.pt-fp { display: flex; flex-direction: column; gap: 14px; }
+.pt-fp-head { display: flex; align-items: center; justify-content: space-between; }
+.pt-fp-head h4 { margin: 0; font: 600 1.1rem var(--font-display); }
+.pt-fp-head .pt-linkish:disabled { opacity: 0.5; cursor: default; }
+.pt-fp-sec { display: flex; flex-direction: column; gap: 7px; }
+.pt-fp .mock-seg { display: flex; padding: 3px; gap: 2px; overflow: visible; }
+.pt-fp .mock-seg button { flex: 1 1 0; padding: 9px 4px; border-radius: var(--r-pill); font-size: 0.85rem; }
+.pt-fp-label { font-size: 0.78rem; font-weight: 650; color: var(--muted); }
+.pt-fp-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.pt-fp-chips .chip svg { width: 14px; height: 14px; }
+.pt-fp-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 36px; font-size: 0.92rem; font-weight: 600; }
+.pt-fp-row > span { display: inline-flex; align-items: center; gap: 9px; }
+.pt-fp-row svg { width: 18px; height: 18px; color: var(--muted); }
+.pt-fp-dates { display: flex; gap: 10px; }
+.pt-fp-dates label { flex: 1; display: flex; flex-direction: column; gap: 4px; font-size: 0.78rem; color: var(--muted); }
+.pt-fp-dates input { min-height: 38px; }
+.pt-fp-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 4px; }
+.pt-fp-foot .btn { margin-left: auto; min-width: 140px; justify-content: center; }
+.pt-sheet .pt-fp-foot .btn { width: 100%; }
+.pt-fp-count { display: none; font-size: 0.85rem; color: var(--muted); }
+.pt-filter-pop { position: absolute; z-index: 30; top: calc(100% + 8px); left: 0; width: 392px; max-width: calc(100vw - 24px); padding: 16px; border-radius: 16px; background: var(--surface-popover, var(--bg-1)); box-shadow: var(--shadow-popover, 0 8px 28px rgba(0,0,0,0.18)); border: 1px solid var(--lg-edge); }
+.pt-filter-pop .pt-fp-count { display: inline; }
+@container (max-width: 805px) {
+  .pt-chips .pt-chip-select { display: inline-flex; }
+  .pt-fmeta + .pt-chip-select { margin-left: 0; }
+}
+.pt-more-menu .pt-fm-rate .pt-star, .pt-fm-menu .pt-fm-rate .pt-star { color: var(--star); }
+
 
 /* ---- Upload progress (docs/design-mockups/keepsake-redesign.html, "Upload progress") ----
    Phones: one bar above the tab bar, tap for detail in a sheet. Desktop: a tray at the bottom right. */

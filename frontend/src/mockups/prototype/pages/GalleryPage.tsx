@@ -1,19 +1,14 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { CalendarSearch as CalendarSearchIcon, ChevronDown as ChevronDownIcon, Heart as HeartIcon, SlidersHorizontal as FilterIcon, Star as StarIcon, Upload as ArrowUpTrayIcon, Grid2x2 as LargePhotosIcon, Grid3x3 as SmallPhotosIcon, Image as PhotoIcon, UserPlus as UserPlusIcon } from 'lucide-react';
+import { SlidersHorizontal as FilterIcon, Upload as ArrowUpTrayIcon, Grid2x2 as LargePhotosIcon, Grid3x3 as SmallPhotosIcon, Image as PhotoIcon, UserPlus as UserPlusIcon } from 'lucide-react';
 import { useStore, isVideoFilename } from '../store';
-import type { CaptureRange, MediaFilter } from '../store';
+import type { CaptureRange } from '../store';
 import { useAppServices } from '../../../components/AppServicesProvider';
 import { invalidateLocalSortIndex } from '../../../services/localSortIndex';
 import PhotoGrid from '../components/PhotoGrid';
 import TimelineBrowser from '../components/TimelineBrowser';
-import { Menu, Spinner } from '../components/bits';
+import { Spinner } from '../components/bits';
+import { FilterSentence, PhotosFilterBar, activeFilterCount as countFilters, type PhotosFilterActions, type PhotosFilterState } from '../components/PhotosFilter';
 import { useTileSize, TILE_RANGE, TILE_STEP, galleryTileKey, defaultGalleryTile } from '../components/controls';
-
-const MEDIA_FILTERS: { value: MediaFilter; label: string }[] = [
-    { value: 'all', label: 'All' },
-    { value: 'photo', label: 'Photos' },
-    { value: 'video', label: 'Videos' },
-];
 
 type ZoomLevel = 'days' | 'months' | 'years';
 
@@ -23,28 +18,12 @@ type ZoomLevel = 'days' | 'months' | 'years';
 // Months too early, so the Gallery gets its own, much smaller floor.
 const GALLERY_TILE_MIN = 24;
 const clampGalleryTile = (n: number) => Math.min(TILE_RANGE.max, Math.max(GALLERY_TILE_MIN, n));
-// Jump-to-date doesn't scroll through a continuous timeline -- it swaps in a
-// fresh page starting at the target date (see jumpToGalleryDate), so there's
-// nothing to actually scroll past. Without this, the swap reads as "did
-// nothing" (new content just appears at the top, no sense of having gone
-// anywhere). This class drives a brief blur/dip on the grid instead -- just
-// enough motion to sell "you went somewhere" before the correct page settles
-// in, without faking a real multi-second scroll through content that was
-// never loaded.
-const DATE_JUMP_ANIM_MS = 420;
-const formatDateJumpLabel = (value: string): string => {
-    if (!value) return 'Jump to date';
-    const [year, month, day] = value.split('-').map(Number);
-    if (!year || !month || !day) return 'Jump to date';
-    return new Intl.DateTimeFormat(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
-        .format(new Date(year, month - 1, day));
-};
 
 /** Gallery — the populated grid + drag-and-drop upload + the empty first-run state. */
 const GalleryPage: React.FC = () => {
     const {
         photos, navigate, selectMany, photosLoading, hasMorePhotos,
-        loadMorePhotos, reloadPhotos, totalPhotos, mediaFilter, setMediaFilter, galleryFilters, setGalleryRating, setGalleryLikedOnly, jumpToGalleryDate, captureRange, setCaptureRange, timeline,
+        loadMorePhotos, reloadPhotos, totalPhotos, mediaFilter, setMediaFilter, galleryFilters, setGalleryRating, setGalleryLikedOnly, captureRange, setCaptureRange, timeline,
         route, focusPhoto, selectMode, setSelectMode, selection, clearSelection,
     } = useStore();
     const { requestUpload, startUpload, uploadActive, registerUploadCompletionHandler } = useAppServices();
@@ -58,10 +37,6 @@ const GalleryPage: React.FC = () => {
     // Months, then Years (replaces the old timeline rail).
     const [level, setLevel] = useState<ZoomLevel>('days');
     const [focusYear, setFocusYear] = useState<string | null>(null);
-    const [dateJump, setDateJump] = useState('');
-    const [jumping, setJumping] = useState(false);
-    const jumpAnimTimerRef = useRef<number | null>(null);
-    useEffect(() => () => { if (jumpAnimTimerRef.current) window.clearTimeout(jumpAnimTimerRef.current); }, []);
 
     const depth = useRef(0);
     const gridRef = useRef<HTMLDivElement>(null);
@@ -200,6 +175,7 @@ const GalleryPage: React.FC = () => {
     // Client-side photo/video split over the loaded page(s).
     const visiblePhotos = useMemo(() => {
         if (mediaFilter === 'all') return photos;
+        if (mediaFilter === 'live') return photos.filter((p) => Boolean(p.liveClip));
         return photos.filter((p) => (mediaFilter === 'video' ? isVideoFilename(p.filename) : !isVideoFilename(p.filename)));
     }, [photos, mediaFilter]);
 
@@ -217,28 +193,10 @@ const GalleryPage: React.FC = () => {
     const openYear = (y: string) => { setFocusYear(y); setLevel('months'); };
     const openMonth = (range: CaptureRange, y: string) => { setFocusYear(y); setCaptureRange(range); setLevel('days'); };
     const resetToTop = () => { setLevel('days'); setFocusYear(null); setCaptureRange(null); };
-    const handleDateJump = (value: string) => {
-        setDateJump(value);
-        if (!value) return;
-        setLevel('days');
-        setFocusYear(null);
-        // Restart the "went somewhere" animation even if a previous jump's
-        // animation is still playing (rapid re-picks in the calendar).
-        if (jumpAnimTimerRef.current) window.clearTimeout(jumpAnimTimerRef.current);
-        setJumping(true);
-        jumpAnimTimerRef.current = window.setTimeout(() => setJumping(false), DATE_JUMP_ANIM_MS);
-        void jumpToGalleryDate(value).then((filename) => {
-            pendingScrollIdRef.current = filename;
-            window.requestAnimationFrame(() => scrollToTile(filename));
-        });
-    };
 
     const countLabel = totalPhotos !== null
         ? `${totalPhotos.toLocaleString()} photo${totalPhotos === 1 ? '' : 's'}`
         : `${photos.length}${hasMorePhotos ? '+' : ''} photos`;
-    const activeFilterCount = (galleryFilters.rating > 0 ? 1 : 0)
-        + (galleryFilters.likedOnly ? 1 : 0)
-        + (mediaFilter !== 'all' ? 1 : 0);
 
     // A size slider, as the redesign draws it. The small and large photo icons
     // on either side still step past the ends into Months and Years.
@@ -264,70 +222,22 @@ const GalleryPage: React.FC = () => {
         </div>
     );
 
-    // One row of chips replaces the old Filters popover: every filter is a tap
-    // away and the active ones are visible without opening anything.
-    const filterChips = (
-        <div className="pt-chips" role="group" aria-label="Filter photos">
-            {MEDIA_FILTERS.map((f) => (
-                <button key={f.value} type="button" className="chip" aria-pressed={mediaFilter === f.value} onClick={() => setMediaFilter(f.value)}>
-                    {f.label}
-                </button>
-            ))}
-            <button type="button" className="chip" aria-pressed={galleryFilters.likedOnly} onClick={() => setGalleryLikedOnly(!galleryFilters.likedOnly)}>
-                <HeartIcon className="pt-chip-icon" fill={galleryFilters.likedOnly ? 'currentColor' : 'none'} /> Liked
-            </button>
-            <Menu
-                className="pt-rating-filter"
-                align="left"
-                renderTrigger={(toggle, open) => (
-                    <button
-                        type="button"
-                        className="chip"
-                        aria-pressed={galleryFilters.rating > 0}
-                        aria-haspopup="menu"
-                        aria-expanded={open}
-                        onClick={toggle}
-                    >
-                        <StarIcon className="pt-chip-icon" fill={galleryFilters.rating > 0 ? 'currentColor' : 'none'} />
-                        {galleryFilters.rating > 0 ? `${galleryFilters.rating} star${galleryFilters.rating === 1 ? '' : 's'}` : 'Rating'}
-                        <ChevronDownIcon className="pt-chip-icon" />
-                    </button>
-                )}
-            >
-                {(close) => (
-                    <div className="pt-rating-options" aria-label="Filter by rating">
-                        {[0, 1, 2, 3, 4, 5].map((rating) => (
-                            <button
-                                key={rating}
-                                type="button"
-                                role="menuitemradio"
-                                aria-checked={galleryFilters.rating === rating}
-                                className={galleryFilters.rating === rating ? 'active' : undefined}
-                                onClick={() => { setGalleryRating(rating); close(); }}
-                            >
-                                <StarIcon className="toolbar-icon" fill={rating > 0 ? 'currentColor' : 'none'} />
-                                {rating === 0 ? 'All ratings' : `${rating} star${rating === 1 ? '' : 's'}`}
-                            </button>
-                        ))}
-                    </div>
-                )}
-            </Menu>
-            <label className="chip pt-date-chip">
-                <CalendarSearchIcon className="pt-chip-icon" aria-hidden="true" />
-                <span>{dateJump ? formatDateJumpLabel(dateJump) : 'Date'}</span>
-                <input
-                    type="date"
-                    aria-label="Jump to date"
-                    value={dateJump}
-                    min={timeline?.firstDate ?? undefined}
-                    max={timeline?.lastDate ?? undefined}
-                    onChange={(e) => handleDateJump(e.target.value)}
-                />
-            </label>
-            {/* Phones hide the title row, so Select lives at the end of the chips there. */}
-            <button type="button" className="chip pt-chip-select" onClick={() => setSelectMode(true)}>Select</button>
-        </div>
+    const filterState: PhotosFilterState = { mediaFilter, likedOnly: galleryFilters.likedOnly, rating: galleryFilters.rating, captureRange };
+    const filterActions: PhotosFilterActions = { setMediaFilter, setLikedOnly: setGalleryLikedOnly, setRating: setGalleryRating, setCaptureRange };
+    const activeFilterCount = countFilters(filterState);
+    const clearFilters = () => { setMediaFilter('all'); setGalleryLikedOnly(false); setGalleryRating(0); setCaptureRange(null); };
+    // The server counts what matches its own filters; the photo/video/live split is local, so it is only
+    // known once every page is in.
+    const matchCount = mediaFilter === 'all' ? totalPhotos : hasMorePhotos ? null : visiblePhotos.length;
+    const filterBar = (
+        <PhotosFilterBar state={filterState} actions={filterActions} matchCount={matchCount} onSelect={() => setSelectMode(true)} />
     );
+    const filterSummary = activeFilterCount > 0 ? (
+        <div className="pt-fsum">
+            <FilterSentence state={filterState} />
+            <button type="button" className="pt-linkish" onClick={clearFilters}>Clear</button>
+        </div>
+    ) : null;
 
     const scopeCrumbs = (level !== 'days' || captureRange) ? (
         <div className="pt-zoom-crumbs" aria-label="Zoom scope">
@@ -346,24 +256,20 @@ const GalleryPage: React.FC = () => {
         );
     }
 
-    if (photos.length === 0 && level === 'days' && !captureRange && !uploadActive) {
+    if (photos.length === 0 && level === 'days' && !uploadActive && !photosLoading && (activeFilterCount > 0 || !captureRange)) {
         if (activeFilterCount > 0) {
+            const noun = mediaFilter === 'video' ? 'videos' : mediaFilter === 'live' ? 'Live Photos' : 'photos';
             return (
                 <div className="pt-arrive">
+                    {/* Keep the filters in reach, so one can be dropped instead of all. */}
+                    {filterBar}
+                    {filterSummary}
                     <div className="empty-state">
                         <span className="empty-state-icon"><FilterIcon /></span>
-                        <p className="empty-state-title">No photos match your filters</p>
-                        <p className="empty-state-message">
-                            Try a different rating, like, or media type filter.
-                        </p>
+                        <p className="empty-state-title">{`No ${noun} match`}</p>
+                        <p className="empty-state-message">Try a different date or rating, or take a filter off.</p>
                         <div className="empty-state-action pt-arrive-actions">
-                            <button
-                                type="button"
-                                className="btn btn-primary"
-                                onClick={() => { setGalleryRating(0); setGalleryLikedOnly(false); setMediaFilter('all'); }}
-                            >
-                                Clear filters
-                            </button>
+                            <button type="button" className="btn btn-primary" onClick={clearFilters}>Clear filters</button>
                         </div>
                     </div>
                 </div>
@@ -409,7 +315,7 @@ const GalleryPage: React.FC = () => {
                         <p className="pt-page-sub">{countLabel}{captureRange ? ` · ${captureRange.label}` : ''}</p>
                     </div>
                     {/* One row on desktops: title, chips, size, Select. Phones keep only the chips. */}
-                    {level === 'days' && filterChips}
+                    {level === 'days' && filterBar}
                     <div className="pt-toolbar-actions">
                         {zoomControl}
                         {level === 'days' && (
@@ -421,6 +327,7 @@ const GalleryPage: React.FC = () => {
                 </div>
             )}
 
+            {level === 'days' && filterSummary}
             {scopeCrumbs}
 
             {level !== 'days' && timeline ? (
@@ -435,7 +342,7 @@ const GalleryPage: React.FC = () => {
                 </div>
             ) : (
                 <div
-                    className={`pt-drop-surface${dragging ? ' dragging' : ''}${jumping ? ' pt-date-jumping' : ''}`}
+                    className={`pt-drop-surface${dragging ? ' dragging' : ''}`}
                     ref={gridRef}
                     style={{ ['--pt-tile-min' as string]: `${tileMin}px` } as React.CSSProperties}
                     onDragEnter={(e) => { e.preventDefault(); depth.current += 1; setDragging(true); }}
@@ -446,7 +353,7 @@ const GalleryPage: React.FC = () => {
                     onTouchMove={onTouchMove}
                     onTouchEnd={onTouchEnd}
                 >
-                    <PhotoGrid photos={visiblePhotos} gridRef={gridRef} extendable dayHeadings />
+                    <PhotoGrid photos={visiblePhotos} gridRef={gridRef} extendable dayHeadings emptyHint={mediaFilter !== 'all' ? '' : undefined} />
                     {mediaFilter !== 'all' && visiblePhotos.length === 0 && (
                         <p className="pt-grid-empty">No {mediaFilter === 'video' ? 'videos' : 'photos'} on the loaded pages yet — scroll to load more.</p>
                     )}

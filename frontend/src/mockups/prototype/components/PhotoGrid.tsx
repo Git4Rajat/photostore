@@ -121,7 +121,8 @@ const PhotoGrid: React.FC<{ photos: Photo[]; emptyHint?: string; gridRef?: React
     const tileSizes = useTileSizes(gridRef, photos[0]?.id);
 
     if (!photos.length) {
-        return <p className="pt-grid-empty">{emptyHint ?? 'Nothing here yet.'}</p>;
+        // An empty hint means the page shows its own message.
+        return emptyHint === '' ? null : <p className="pt-grid-empty">{emptyHint ?? 'Nothing here yet.'}</p>;
     }
 
     const ids = photos.map((p) => p.id);
