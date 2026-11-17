@@ -1529,14 +1529,15 @@
 .up-link { background: none; border: 0; padding: 4px 2px; cursor: pointer; font: inherit; font-size: 13px; font-weight: 650; color: var(--accent); }
 .up-link.mut { color: var(--muted); font-weight: 500; }
 .up-link:disabled { opacity: 0.5; cursor: default; }
-.up-tray { right: 20px; bottom: 20px; width: 372px; max-width: calc(100vw - 40px); overflow: hidden; z-index: 70; }
+.up-tray { right: 20px; bottom: 20px; width: 372px; max-width: calc(100vw - 40px); max-height: calc(100vh - 40px); display: flex; flex-direction: column; overflow: hidden; z-index: 70; }
+.up-tray > * { flex: none; }
 .up-tray .up-uh { display: flex; align-items: center; gap: 10px; padding: 14px 10px 8px 16px; }
 .up-tray .up-uh b { flex: 1; font: 600 16px var(--font-display); }
 .up-tray .up-uh .btn-icon { width: 28px; height: 28px; min-height: 0; padding: 0; }
 .up-tray .up-uh .btn-icon svg { width: 16px; height: 16px; }
 .up-tray .up-ub { padding: 0 16px 12px; display: flex; flex-direction: column; gap: 9px; }
 .up-tray .up-fr { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--muted); }
-.up-tray .up-list { border-radius: 0; background: transparent; border-top: 1px solid var(--lg-edge); }
+.up-tray .up-list { border-radius: 0; background: transparent; border-top: 1px solid var(--lg-edge); flex: 0 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
 .up-tray .up-uf { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px 12px 16px; border-top: 1px solid var(--lg-edge); font-size: 12px; color: var(--muted); gap: 10px; }
 .up-fbtns { display: inline-flex; gap: 10px; }
 @media (prefers-reduced-motion: reduce) { .up-prog i { transition: none; } }
