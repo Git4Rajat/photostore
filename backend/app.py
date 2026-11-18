@@ -13230,18 +13230,20 @@ def _stable_delegation_key() -> Tuple['UserDelegationKey', datetime, datetime]:
         return key, starts_on, expires_on
 
 
-def _download_content_disposition(original_filename: str) -> str:
+def _download_content_disposition(original_filename: str, *, attachment: bool = False) -> str:
     """Build an 'inline' Content-Disposition that carries the ORIGINAL filename.
 
     Anonymized blobs are named with an opaque UUID, so a direct 'Save As' would
     otherwise suggest the UUID (bad UX and it leaks the internal name). 'inline'
     keeps <img> display working while giving the real filename to an explicit
     download. Emits both a plain-ASCII filename and an RFC 5987 filename* so
-    non-ASCII names survive.
+    non-ASCII names survive. ``attachment=True`` makes the browser save the file
+    instead of displaying it (the explicit Download action).
     """
     safe = re.sub(r'[\r\n"\\]', '_', str(original_filename or '')).strip() or 'photo'
     ascii_fallback = safe.encode('ascii', 'ignore').decode('ascii') or 'photo'
-    return f"inline; filename=\"{ascii_fallback}\"; filename*=UTF-8''{_urlquote(safe, safe='')}"
+    disposition = 'attachment' if attachment else 'inline'
+    return f"{disposition}; filename=\"{ascii_fallback}\"; filename*=UTF-8''{_urlquote(safe, safe='')}"
 
 
 def _create_stable_read_sas_url(
@@ -13249,6 +13251,7 @@ def _create_stable_read_sas_url(
     filename: str,
     *,
     download_filename: Optional[str] = None,
+    attachment: bool = False,
 ) -> Tuple[str, str]:
     """Read-only SAS with day-aligned validity, deterministic for the whole day.
 
@@ -13261,7 +13264,7 @@ def _create_stable_read_sas_url(
     key, starts_on, expires_on = _stable_delegation_key()
     extra_sas_kwargs = {}
     if download_filename:
-        extra_sas_kwargs['content_disposition'] = _download_content_disposition(download_filename)
+        extra_sas_kwargs['content_disposition'] = _download_content_disposition(download_filename, attachment=attachment)
     sas = generate_blob_sas(
         account_name=account_name,
         container_name=container_name,
