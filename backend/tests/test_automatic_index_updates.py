@@ -918,3 +918,89 @@ def test_a_reservation_still_gives_up_once_its_patience_runs_out(runtime, monkey
         runtime.store.begin('A', 'lexical_artifact', [], uncertain=True, owner='upload-pod')
     assert automatic.CONTROL_CAS_PATIENCE_SECONDS <= clock['now'] - 1000.0 <= automatic.CONTROL_CAS_PATIENCE_SECONDS + 1.0
     assert runtime.store.reservations('A', 'lexical_artifact') == []
+
+
+def _overlapping_requests(runtime, monkeypatch, count):
+    """`count` concurrent request scopes (one thread each) that all write before any of them exits."""
+    import threading
+    table = su.track_index_source_table(runtime.source, 'embeddings')
+    begins, finishes = [], []
+    begin, finish = automatic.CoverageStore.begin, automatic.CoverageStore.finish
+    monkeypatch.setattr(automatic.CoverageStore, 'begin',
+                        lambda self, *a, **kw: begins.append(a[:2]) or begin(self, *a, **kw))
+    monkeypatch.setattr(automatic.CoverageStore, 'finish',
+                        lambda self, *a, **kw: finishes.append(a[:2]) or finish(self, *a, **kw))
+    from wave_policy import begin_source_change, end_source_change
+    wrote = threading.Barrier(count + 1, timeout=10)
+    release = [threading.Event() for _ in range(count)]
+
+    def request(index):
+        token = begin_source_change()               # per request, as the upload route does
+        try:
+            with automatic.coalesced_source_reservations():
+                table.upsert_entity({'PartitionKey': 'A', 'RowKey': f'p{index}'})
+                wrote.wait()
+                release[index].wait(10)
+        finally:
+            end_source_change(token)
+    threads = [threading.Thread(target=request, args=(index,)) for index in range(count)]
+    for thread in threads:
+        thread.start()
+    wrote.wait()
+    return begins, finishes, release, threads
+
+
+def test_overlapping_requests_in_one_process_share_one_reservation(runtime, monkeypatch):
+    end = _wave_scope(monkeypatch)
+    try:
+        begins, finishes, release, threads = _overlapping_requests(runtime, monkeypatch, 4)
+        assert begins.count(('A', 'vector')) == 1
+        assert runtime.store.control('A', 'vector')['active'] == 1
+        for index in range(3):                      # earlier requests leave; the mark stays
+            release[index].set()
+            threads[index].join()
+        assert finishes == [] and runtime.store.control('A', 'vector')['active'] == 1
+        release[3].set()
+        threads[3].join()                           # the last one out releases it
+    finally:
+        end()
+    assert finishes.count(('A', 'vector')) == 1
+    row = runtime.store.control('A', 'vector')
+    assert row['active'] == 0 and row['fullRequired']
+    assert runtime.store.reservations('A', 'vector') == [] and automatic._SHARED == {}
+
+
+def test_requests_do_not_join_a_shared_reservation_past_its_age(runtime, monkeypatch):
+    monkeypatch.setattr(automatic, 'SHARED_RESERVATION_MAX_SECONDS', -1)
+    end = _wave_scope(monkeypatch)
+    try:
+        begins, finishes, release, threads = _overlapping_requests(runtime, monkeypatch, 3)
+        assert begins.count(('A', 'vector')) == 3
+        assert runtime.store.control('A', 'vector')['active'] == 3
+        for index, thread in enumerate(threads):
+            release[index].set()
+            thread.join()
+    finally:
+        end()
+    assert finishes.count(('A', 'vector')) == 3 and runtime.store.control('A', 'vector')['active'] == 0
+    assert automatic._SHARED == {}
+
+
+def test_a_failed_shared_begin_lets_the_next_request_open_its_own(runtime, monkeypatch):
+    table = su.track_index_source_table(runtime.source, 'embeddings')
+    end = _wave_scope(monkeypatch)
+    begin = automatic.CoverageStore.begin
+    monkeypatch.setattr(automatic.CoverageStore, 'begin',
+                        lambda self, *a, **kw: (_ for _ in ()).throw(ResourceModifiedError('lost')))
+    try:
+        with pytest.raises(ResourceModifiedError):
+            with automatic.coalesced_source_reservations():
+                table.upsert_entity({'PartitionKey': 'A', 'RowKey': 'one'})
+        assert automatic._SHARED == {}
+        monkeypatch.setattr(automatic.CoverageStore, 'begin', begin)
+        with automatic.coalesced_source_reservations():
+            table.upsert_entity({'PartitionKey': 'A', 'RowKey': 'two'})
+            assert runtime.store.control('A', 'vector')['active'] == 1
+    finally:
+        end()
+    assert runtime.store.control('A', 'vector')['active'] == 0
