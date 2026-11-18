@@ -1614,3 +1614,9 @@
 @media (max-width: 805px) {
   .pt-viewer-nav { display: none; }
 }
+
+/* Desktop: the Photos toolbar (title, Filter, size slider, Select) stays put while the grid scrolls or
+   re-lays out under the slider, instead of scrolling away mid-drag. */
+@container (min-width: 806px) {
+  .pt-gallery > .pt-gallery-toolbar { position: sticky; top: -18px; z-index: 6; background: var(--bg-1); margin: -18px 0 4px; padding: 26px 0 8px; }
+}
