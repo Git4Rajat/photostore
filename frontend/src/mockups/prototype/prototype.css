@@ -668,6 +668,8 @@
   /* While selecting, Cancel · count · Select all replaces the app header (as in the redesign),
      and sits on a solid bar so photos never show through it. */
   .pt-shell .mock-app:has(.pt-select-head) > .ios-header { display: none; }
+  /* The album's cover banner steps aside too: selecting is just the bar and the photos. */
+  .pt-album-detail:has(.pt-select-head) .pt-album-hero { display: none; }
   .pt-select-head { top: 0; margin: 0 0 8px; padding-top: calc(8px + env(safe-area-inset-top)); padding-bottom: 8px; background: var(--bg-1); }
 }
 

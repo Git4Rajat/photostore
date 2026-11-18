@@ -1,15 +1,14 @@
 import React, { useState } from 'react';
+import { Wrench as WrenchScrewdriverIcon, X as XMarkIcon } from 'lucide-react';
 import {
-    Download as DownloadIcon,
-    Heart as HeartIcon,
-    ImagePlus as AddToAlbumIcon,
-    MinusCircle as MinusCircleIcon,
-    MoreHorizontal as MoreIcon,
-    Star as StarIcon,
-    Trash2 as TrashIcon,
-    Wrench as WrenchScrewdriverIcon,
-    X as XMarkIcon,
-} from 'lucide-react';
+    AddToAlbumGlyph as AddToAlbumIcon,
+    DownloadGlyph as DownloadIcon,
+    HeartGlyph as HeartIcon,
+    MoreGlyph as MoreIcon,
+    RemoveFromAlbumGlyph as MinusCircleIcon,
+    StarGlyph as StarIcon,
+    TrashGlyph as TrashIcon,
+} from './RedesignIcons';
 import { Menu, Stars } from './bits';
 import { AddToAlbumSheet } from './AddToAlbumMenu';
 import { confirmDeleteItems } from './confirmDelete';

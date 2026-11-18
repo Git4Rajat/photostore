@@ -1,15 +1,14 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { MapPin as MapPinIcon, Wrench as WorkbenchIcon } from 'lucide-react';
 import {
-    MoreHorizontal as EllipsisHorizontalIcon,
-    ImagePlus as AddToAlbumIcon,
-    Download as DownloadIcon,
-    Trash2 as TrashIcon,
-    Heart,
-    Info as InfoIcon,
-    MapPin as MapPinIcon,
-    Star as StarIcon,
-    Wrench as WorkbenchIcon,
-} from 'lucide-react';
+    AddToAlbumGlyph as AddToAlbumIcon,
+    DownloadGlyph as DownloadIcon,
+    HeartGlyph as Heart,
+    InfoGlyph as InfoIcon,
+    MoreGlyph as EllipsisHorizontalIcon,
+    StarGlyph as StarIcon,
+    TrashGlyph as TrashIcon,
+} from './RedesignIcons';
 import { Menu, Stars } from './bits';
 import { AddToAlbumMenu } from './AddToAlbumMenu';
 import { confirmDeleteItems } from './confirmDelete';
