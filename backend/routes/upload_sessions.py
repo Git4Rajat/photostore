@@ -165,6 +165,50 @@ def upload_processing(session):
         return app.jsonify(error='Processing status is temporarily unavailable'), 503
 
 
+@upload_sessions_bp.route('/api/processing', methods=['GET'])
+def library_processing():
+    """Every wave of the library that is still processing, or finished and not dismissed.
+
+    Library-scoped rather than session-scoped, so any browser sees the same bars and a
+    long stage outlives the old 3 hour session watcher."""
+    user, library, error = app._require_library_context(require_auth=True)
+    if error:
+        return error
+    g.upload_reconciled = True
+    try:
+        from processing_progress import ProgressStore
+        from wave_policy import owned
+        if not owned(app.jobs_table_client, library):
+            return _no_store(app.jsonify(waves=[]))
+        waves = ProgressStore(ShadowWaves(app.jobs_table_client, library)).active(user)
+        return _no_store(app.jsonify(waves=waves))
+    except AzureError:
+        app.app.logger.warning('Processing progress unavailable', exc_info=True)
+        return app.jsonify(error='Processing status is temporarily unavailable'), 503
+
+
+@upload_sessions_bp.route('/api/processing/<wave>/dismiss', methods=['POST'])
+def dismiss_processing(wave):
+    user, library, error = app._require_library_context(require_auth=True)
+    if error:
+        return error
+    g.upload_reconciled = True
+    try:
+        from processing_progress import ProgressStore
+        ProgressStore(ShadowWaves(app.jobs_table_client, library)).dismiss(identifier(wave), user)
+        return _no_store(app.jsonify(ok=True))
+    except ValueError:
+        return app.jsonify(error='Invalid wave'), 400
+    except AzureError:
+        app.app.logger.warning('Processing dismissal failed', exc_info=True)
+        return app.jsonify(error='Processing status is temporarily unavailable'), 503
+
+
+def _no_store(response):
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
 @upload_sessions_bp.after_app_request
 def reconcile_on_core_access(response):
     # Authentication resolves the library on real user requests. Health probes

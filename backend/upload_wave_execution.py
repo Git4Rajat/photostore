@@ -18,8 +18,10 @@ stage.
 """
 import os
 import json
+import logging
 
 import processing_diagnostics
+from processing_progress import STAGE_OF_STATE
 
 from index_work import WorkStore
 
@@ -542,6 +544,29 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
     return observations
 
 
+def _announce_stage(library, wave_id, stage):
+    """Advisory stage-change push (budgeted); the done push is sent by the handoff code."""
+    if not stage:
+        return
+    try:
+        import index_events
+        index_events.publish_progress(library, wave_id, stage, force=True)
+    except Exception:
+        logging.getLogger(__name__).warning('Stage announcement failed for wave %s', wave_id, exc_info=True)
+
+
+def _report_vision_progress(progress_store, library, wave_id, done, total):
+    """Advisory: never lets a progress-row or push failure interrupt the stage."""
+    try:
+        import index_events
+        row, crossed = progress_store.record_vision(wave_id, done, max(total, done))
+        if crossed:
+            eta = int(row.get('etaSeconds', -1))
+            index_events.publish_progress(library, wave_id, 'vision', row['step'], None if eta < 0 else eta)
+    except Exception:
+        logging.getLogger(__name__).warning('Vision progress report failed for wave %s', wave_id, exc_info=True)
+
+
 @processing_diagnostics.vision_wave_summary
 def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
                        metadata_table, face_table, face_ids, cluster_send, *, process_source=None,
@@ -581,9 +606,13 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
         # use execution_scope's authoritative transaction guard below.
         stage_check(force=force)
     renew.boundary = lambda: renew(force=True)
+    counted = [0]  # Members finished in this wave's vision stage; rides the page checkpoint.
     def checkpoint(phase, after=''):
+        position = dict(phase=phase, after=after)
+        if counted[0]:
+            position['done'] = counted[0]
         with metrics.timer('vision_checkpoint', count_name='vision_checkpoint_calls'):
-            leases.checkpoint(ownership, 'vision:' + json.dumps(dict(phase=phase, after=after)))
+            leases.checkpoint(ownership, 'vision:' + json.dumps(position))
     def expired():
         return deadline is not None and time.monotonic() >= deadline
     def progressed():
@@ -591,6 +620,10 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
     saved = leases.row(ownership).get('progressCheckpoint', '')
     position = json.loads(saved[7:]) if saved.startswith('vision:') else {}
     phase, cursor = position.get('phase', 'sources'), position.get('after', '')
+    counted[0] = int(position.get('done') or 0)
+    from processing_progress import ProgressStore
+    progress_store = ProgressStore(store)
+    wave_total = int(store._required(store.wave_key(wave_id)).get('memberCount') or 0)
     pool = (nullcontext(source_executor) if source_executor is not None or source_workers == 1
             else ThreadPoolExecutor(max_workers=source_workers, thread_name_prefix='wave-source'))
     try:
@@ -653,6 +686,8 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
                     source_workers=source_workers, expired=expired, processed_members=processed)
                 if processed:
                     cursor = processed[-1]['RowKey']
+                    counted[0] += len(processed)
+                    _report_vision_progress(progress_store, library, wave_id, counted[0], wave_total)
                     progressed()
                 # A checkpoint covers only drained groups. Source results are
                 # durable first; interruption before this commit is replayable
@@ -682,6 +717,7 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
             return wave
         leases.complete(ownership, wave['frozenRevision'])
         wave, _ = advance_wave(work_store, store, library, wave_id)
+        _announce_stage(library, wave_id, STAGE_OF_STATE.get(wave['state']))
         if wave['state'] == 'indexing':
             release_and_relay(work_store, store, library, wave['indexPendingKey'], 'index', cluster_send)
         elif wave['state'] == 'ready':
@@ -844,6 +880,7 @@ def run_cluster_release(leases, store, library, wave_id, outbox_key, *,
                     assignment_receipt=assignment_receipt)
         with processing_diagnostics.wave_phase_scope('execution_complete'):
             leases.complete(ownership, frontier)
+        _announce_stage(library, wave_id, 'index')
         return next_wave
     finally:
         from execution_lease import OwnershipLost
