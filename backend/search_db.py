@@ -1026,6 +1026,15 @@ def pending_delta_count(manifest: Dict) -> int:
     return max(0, int(manifest.get('deltaSeq') or 0) - int(manifest.get('baseSeq') or 0))
 
 
+def compaction_cannot_free_room(manifest: Dict, max_rows_per_delta: int) -> bool:
+    """True when the last compaction folded in every published delta and there is still no capacity:
+    compacting again cannot help, so callers must stop requesting it."""
+    if 'compactedSeq' not in manifest:
+        return False
+    return (int(manifest.get('compactedSeq') or 0) == int(manifest.get('deltaSeq') or 0)
+            and available_delta_row_capacity(manifest, max_rows_per_delta) <= 0)
+
+
 def delta_budget_exceeded(manifest: Dict, adding: int) -> bool:
     base_rows = max(1, int(manifest.get('rowCount') or 0))
     return (
@@ -1289,7 +1298,10 @@ def compact_database(user_id: str) -> Optional[Dict]:
                 return None
             remaining = current_delta - applied
             rows_in_log = int(current.get('deltaRows') or 0)
+            # compactedSeq records the deltaSeq this compaction folded in, so a later search pass can tell
+            # "compaction just ran and freed nothing" from "deltas filled the budget again".
             return {**current, 'sourceVersion': new_version, 'rowCount': count, 'baseSeq': applied,
+                    'compactedSeq': applied,
                     'deltaRows': int(rows_in_log * remaining / max(1, current_delta)),
                     'updatedAt': new_version}
 

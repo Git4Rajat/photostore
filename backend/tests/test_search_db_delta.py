@@ -370,3 +370,11 @@ def test_capacity_counts_only_deltas_since_last_compaction():
     almost = {**compacted, 'baseSeq': 199}
     assert search_db.available_delta_row_capacity(almost, 5000) > 0
     assert not search_db.delta_budget_exceeded(almost, 10)
+
+
+def test_compaction_cannot_free_room_only_after_a_compaction_that_folded_everything():
+    stuck = {'rowCount': 100, 'deltaSeq': 3, 'baseSeq': 3, 'deltaRows': 10 ** 6, 'compactedSeq': 3}
+    assert search_db.compaction_cannot_free_room(stuck, 5000)
+    assert not search_db.compaction_cannot_free_room({**stuck, 'deltaSeq': 4}, 5000)   # deltas since
+    assert not search_db.compaction_cannot_free_room({**stuck, 'deltaRows': 0}, 5000)  # room exists
+    assert not search_db.compaction_cannot_free_room({k: v for k, v in stuck.items() if k != 'compactedSeq'}, 5000)
