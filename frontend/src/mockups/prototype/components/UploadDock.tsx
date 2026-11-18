@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ChevronRight, CircleAlert, CloudUpload, Image as PhotoIcon, Info, X as CloseIcon } from 'lucide-react';
+import { ChevGlyph as ChevronRight, AlertGlyph as CircleAlert, UploadGlyph as CloudUpload, PhotosGlyph as PhotoIcon, InfoGlyph as Info, CloseGlyph as CloseIcon } from './RedesignIcons';
 import { useAppServices } from '../../../components/AppServicesProvider';
 import { Button, IconButton } from '../../../components/ui/Button';
 import { confirmDialog } from '../../../components/shared/dialogs';

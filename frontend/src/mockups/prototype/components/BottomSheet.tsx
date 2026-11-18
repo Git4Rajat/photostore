@@ -1,6 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import { X as XMarkIcon } from 'lucide-react';
+import { CloseGlyph as XMarkIcon } from './RedesignIcons';
 
 /**
  * iOS-style modal sheet: rises from the bottom on phones, a centred dialog on

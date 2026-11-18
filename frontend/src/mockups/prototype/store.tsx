@@ -7,7 +7,7 @@ import { SUGGESTIONS } from './data';
 import { get, post } from '../../services/apiClient';
 import { setPhotoRotation } from './media';
 import { failedDeleteIds } from '../../services/photoDeleteResult';
-import { clearLocalSortIndexRemovals, getCachedSortPreview, getLocalSortIndex, invalidateLocalSortIndex, isServerPagedLibrary, removeLocalSortIndexRows, type SortIndexRow } from '../../services/localSortIndex';
+import { clearLocalSortIndexRemovals, getCachedSortGrid, getCachedSortPreview, getLocalSortIndex, invalidateLocalSortIndex, isServerPagedLibrary, removeLocalSortIndexRows, type SortIndexRow } from '../../services/localSortIndex';
 import { getCachedMediaToken, getMediaToken, previewUrlForBlob, thumbnailUrlForBlob, type MediaToken } from '../../services/mediaToken';
 import { getLocalAlbumsIndex, invalidateLocalAlbumsIndex } from '../../services/localAlbumsIndex';
 import {
@@ -1319,9 +1319,12 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             const covers = new Map<string, string>();
             const needBatch: string[] = [];
             coverFilenames.forEach((filename) => {
+                // Cards are a couple of hundred pixels wide: the grid-size image (or the thumbnail)
+                // loads in a fraction of the time of a 2048 px preview, and is usually already cached
+                // from the gallery. The album page swaps in the preview for its wide banner.
                 const direct = coverToken
-                    ? previewUrlForBlob(getCachedSortPreview(filename) || thumbByName.get(filename), coverToken)
-                        || thumbnailUrlForBlob(thumbByName.get(filename), coverToken)
+                    ? thumbnailUrlForBlob(getCachedSortGrid(filename) || thumbByName.get(filename), coverToken)
+                        || previewUrlForBlob(getCachedSortPreview(filename) || thumbByName.get(filename), coverToken)
                     : '';
                 if (direct) covers.set(filename, direct); else needBatch.push(filename);
             });

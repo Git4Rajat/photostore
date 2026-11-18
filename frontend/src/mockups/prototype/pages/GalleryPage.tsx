@@ -1,5 +1,5 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { SlidersHorizontal as FilterIcon, Upload as ArrowUpTrayIcon, Grid2x2 as LargePhotosIcon, Grid3x3 as SmallPhotosIcon, Image as PhotoIcon, UserPlus as UserPlusIcon } from 'lucide-react';
+import { Grid2x2 as LargePhotosIcon, Grid3x3 as SmallPhotosIcon } from 'lucide-react';
 import { useStore, isVideoFilename } from '../store';
 import type { CaptureRange } from '../store';
 import { useAppServices } from '../../../components/AppServicesProvider';
@@ -7,7 +7,8 @@ import { invalidateLocalSortIndex } from '../../../services/localSortIndex';
 import PhotoGrid, { type HeadingGrain } from '../components/PhotoGrid';
 import TimelineBrowser from '../components/TimelineBrowser';
 import { Spinner } from '../components/bits';
-import { FilterSentence, PhotosFilterBar, activeFilterCount as countFilters, type PhotosFilterActions, type PhotosFilterState } from '../components/PhotosFilter';
+import { SearchGlyph as SearchIcon, UploadGlyph as ArrowUpTrayIcon, PhotosGlyph as PhotoIcon, UserPlusGlyph as UserPlusIcon } from '../components/RedesignIcons';
+import { FilterSentence, noMatchCopy, PhotosFilterBar, activeFilterCount as countFilters, type PhotosFilterActions, type PhotosFilterState } from '../components/PhotosFilter';
 import { useTileSize, TILE_RANGE, TILE_STEP, galleryTileKey, defaultGalleryTile } from '../components/controls';
 
 type ZoomLevel = 'days' | 'months' | 'years';
@@ -77,6 +78,34 @@ const GalleryPage: React.FC = () => {
         const scroller = scrollParentOf(el);
         if (scroller) scroller.scrollTop += delta; else window.scrollBy(0, delta);
     }, [tileMin]);
+    // Entering/leaving selection mode collapses/restores the app header, which
+    // moves the grid under the finger: keep the pressed tile where it was.
+    const pressAnchorRef = useRef<{ id: string; top: number } | null>(null);
+    const rememberPress = (e: React.PointerEvent) => {
+        const el = (e.target as HTMLElement).closest<HTMLElement>('[data-tile-id]');
+        pressAnchorRef.current = el?.dataset.tileId ? { id: el.dataset.tileId, top: el.getBoundingClientRect().top } : null;
+    };
+    useLayoutEffect(() => {
+        const grid = gridRef.current;
+        if (grid && !selectMode) grid.style.marginTop = '';
+        const anchor = pressAnchorRef.current;
+        if (!anchor || !grid || !selectMode) return;
+        const settle = () => {
+            const el = Array.from(grid.querySelectorAll<HTMLElement>('[data-tile-id]')).find((t) => t.dataset.tileId === anchor.id);
+            if (!el) return;
+            const delta = el.getBoundingClientRect().top - anchor.top;
+            if (Math.abs(delta) < 1) return;
+            const scroller = scrollParentOf(el);
+            if (scroller) scroller.scrollTop += delta;
+            // At the very top there is nothing to scroll: pad the grid instead.
+            const left = el.getBoundingClientRect().top - anchor.top;
+            if (left < -1) grid.style.marginTop = `${(parseFloat(grid.style.marginTop) || 0) - left}px`;
+        };
+        settle();
+        // Sticky bars and the tab bar finish laying out a frame later.
+        const raf = requestAnimationFrame(settle);
+        return () => cancelAnimationFrame(raf);
+    }, [selectMode]);
     const pendingScrollIdRef = useRef<string | null>(null);
 
     // Zoom-out steps: shrink tiles until the floor, then Days → Months → Years.
@@ -303,18 +332,21 @@ const GalleryPage: React.FC = () => {
         );
     }
 
-    if (photos.length === 0 && level === 'days' && !uploadActive && !photosLoading && (activeFilterCount > 0 || !captureRange)) {
+    // The photo/video/Live split is local, so a filter can empty the grid while `photos` is not empty;
+    // once every page is in, that is the same "nothing matches" answer.
+    const filteredToNothing = activeFilterCount > 0 && visiblePhotos.length === 0 && photos.length > 0 && !hasMorePhotos && !photosLoading;
+    if (level === 'days' && !uploadActive && (filteredToNothing || (photos.length === 0 && !photosLoading && (activeFilterCount > 0 || !captureRange)))) {
         if (activeFilterCount > 0) {
-            const noun = mediaFilter === 'video' ? 'videos' : mediaFilter === 'live' ? 'Live Photos' : 'photos';
+            const copy = noMatchCopy(filterState);
             return (
                 <div className="pt-arrive">
                     {/* Keep the filters in reach, so one can be dropped instead of all. */}
                     {filterBar}
                     {filterSummary}
                     <div className="empty-state">
-                        <span className="empty-state-icon"><FilterIcon /></span>
-                        <p className="empty-state-title">{`No ${noun} match`}</p>
-                        <p className="empty-state-message">Try a different date or rating, or take a filter off.</p>
+                        <span className="empty-state-icon"><SearchIcon /></span>
+                        <p className="empty-state-title">{copy.title}</p>
+                        <p className="empty-state-message">{copy.hint}</p>
                         <div className="empty-state-action pt-arrive-actions">
                             <button type="button" className="btn btn-primary" onClick={clearFilters}>Clear filters</button>
                         </div>
@@ -346,7 +378,7 @@ const GalleryPage: React.FC = () => {
     const levelTitle = level === 'years' ? 'Years' : level === 'months' ? (focusYear ?? 'Months') : 'Photos';
 
     return (
-        <div className="pt-gallery">
+        <div className="pt-gallery" onPointerDownCapture={rememberPress}>
             {level === 'days' && selectMode ? (
                 // While selecting, the header becomes Cancel · count · Select all (same
                 // height as the title row, so the grid doesn't jump under the finger).

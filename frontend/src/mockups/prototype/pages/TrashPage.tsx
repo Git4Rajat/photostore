@@ -1,5 +1,6 @@
 import React, { useEffect, useRef } from 'react';
-import { Undo2 as ArrowUturnLeftIcon, Trash2 as TrashIcon } from 'lucide-react';
+import { Undo2 as ArrowUturnLeftIcon } from 'lucide-react';
+import { TrashGlyph as TrashIcon } from '../components/RedesignIcons';
 import { useStore } from '../store';
 import { tileImage, usePhotoThumbnails, useTileSizes } from '../media';
 import { TileThumbnail } from '../components/PhotoGrid';

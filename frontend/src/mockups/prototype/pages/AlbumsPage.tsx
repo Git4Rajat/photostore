@@ -1,21 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import {
-    ArrowLeft as ArrowLeftIcon,
-    ChevronLeft as ChevronLeftIcon,
-    CalendarDays as CalendarDaysIcon,
-    Check as CheckIcon,
-    Clock as ClockIcon,
-    ImagePlus as AddPhotosIcon,
-    Link as LinkIcon,
-    MapPin as MapPinIcon,
-    MoreHorizontal as MoreIcon,
-    Plus as PlusIcon,
-    Share2 as ShareIcon,
-    Sparkles as SparklesIcon,
-    Tag as TagIcon,
-    Trash2 as TrashIcon,
-    Users as UserGroupIcon,
-} from 'lucide-react';
+import { CalendarDays as CalendarDaysIcon, Sparkles as SparklesIcon, Tag as TagIcon } from 'lucide-react';
+import { BackGlyph as ArrowLeftIcon, BackGlyph as ChevronLeftIcon, CheckGlyph as CheckIcon, ClockGlyph as ClockIcon, AddToAlbumGlyph as AddPhotosIcon, LinkGlyph as LinkIcon, PinGlyph as MapPinIcon, MoreGlyph as MoreIcon, PlusGlyph as PlusIcon, ShareGlyph as ShareIcon, TrashGlyph as TrashIcon, UsersGlyph as UserGroupIcon } from '../components/RedesignIcons';
 import { isVideoFilename, shownAlbum, swatchFor, useStore } from '../store';
 import PhotoGrid from '../components/PhotoGrid';
 import ScrollSentinel from '../components/ScrollSentinel';

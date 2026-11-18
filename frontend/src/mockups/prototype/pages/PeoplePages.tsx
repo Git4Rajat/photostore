@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft as ArrowLeftIcon, Check as CheckIcon, MoreHorizontal as MoreIcon, Search as SearchIcon, Trash2 as TrashIcon, Users as UserGroupIcon } from 'lucide-react';
+import { BackGlyph as ArrowLeftIcon, CheckGlyph as CheckIcon, MoreGlyph as MoreIcon, SearchGlyph as SearchIcon, TrashGlyph as TrashIcon, UsersGlyph as UserGroupIcon } from '../components/RedesignIcons';
 import { useStore } from '../store';
 import { Menu, Swatch, Spinner, SelectionBar } from '../components/bits';
 import { BottomSheet } from '../components/BottomSheet';

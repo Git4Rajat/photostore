@@ -65,11 +65,20 @@ describe('Photos filter (one Filter button)', () => {
         render(<GalleryPage />);
         expect(screen.getByRole('button', { name: 'Filter, 3 on' })).toBeTruthy();
         const sentence = document.querySelector('.pt-fsum');
-        expect(sentence?.textContent).toContain('Videos you liked rated 4+ stars');
+        expect(sentence?.textContent).toContain('Videos you liked, rated 4+ stars');
         fireEvent.click(screen.getByRole('button', { name: 'Clear' }));
         expect(mocks.setMediaFilter).toHaveBeenCalledWith('all');
         expect(mocks.setGalleryLikedOnly).toHaveBeenCalledWith(false);
         expect(mocks.setGalleryRating).toHaveBeenCalledWith(0);
         expect(mocks.setCaptureRange).toHaveBeenCalledWith(null);
+    });
+
+    it('says which filters emptied the grid when the local photo/video split leaves nothing', () => {
+        Object.assign(mocks.state, { mediaFilter: 'video', likedOnly: true });
+        render(<GalleryPage />);
+        expect(screen.getByText('No liked videos')).toBeTruthy();
+        expect(screen.getByText('Try a different rating, or take a filter off.')).toBeTruthy();
+        fireEvent.click(screen.getByRole('button', { name: 'Clear filters' }));
+        expect(mocks.setMediaFilter).toHaveBeenCalledWith('all');
     });
 });

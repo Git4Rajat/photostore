@@ -1,4 +1,4 @@
-/* =================================================================
+/* ==========================================================
    Prototype-only styles for the fully-functional Keepsake prototype.
    Loaded after index.css + mockups.css, so it reuses real tokens and the
    shared mock classes (mock-swatch, upload-dock, share-sheet, member-row,
@@ -668,6 +668,8 @@
   /* While selecting, Cancel · count · Select all replaces the app header (as in the redesign),
      and sits on a solid bar so photos never show through it. */
   .pt-shell .mock-app:has(.pt-select-head) > .ios-header { display: none; }
+  /* The album's cover banner steps aside too: selecting is just the bar and the photos. */
+  .pt-album-detail:has(.pt-select-head) .pt-album-hero { display: none; }
   .pt-select-head { top: 0; margin: 0 0 8px; padding-top: calc(8px + env(safe-area-inset-top)); padding-bottom: 8px; background: var(--bg-1); }
 }
 
@@ -704,6 +706,8 @@
     transform: translateX(-50%);
     max-width: calc(100vw - 24px);
   }
+  /* More is the last cell: its panel hangs from the screen's right edge instead. */
+  .pt-viewer-bar .pt-vb-more .pt-menu-panel.right { left: auto; right: 0; transform: none; }
 }
 
 /* ---- photo viewer (fixed, full-window) ---- */
@@ -1341,6 +1345,8 @@
 .pt-vi-tags span { padding: 5px 10px; border-radius: 999px; background: #26262a; font-size: 0.74rem; font-weight: 600; }
 .pt-viewer-info .pt-viewer-info-empty { color: var(--viewer-muted); }
 @media (max-width: 805px) {
+  /* Four buttons on phones: Album, Workbench and Delete move into More. */
+  .pt-viewer-bar .pt-vb-btn.desk { display: none; }
   .pt-viewer-pos { display: none; }
   .pt-viewer-top { padding: 8px 8px 8px 6px; }
   .pt-viewer-top::after { content: ''; width: 40px; flex: none; } /* keeps the title centred opposite Back */
@@ -1348,12 +1354,14 @@
   .pt-viewer-stage-wrap:has(.pt-viewer-info) { flex-direction: column; }
   .pt-viewer-stage-wrap:has(.pt-viewer-info) .pt-viewer-stage { flex: 0 1 40%; min-height: 200px; }
   .pt-viewer-info { flex: 1 1 auto; max-height: 60%; border-radius: 22px 22px 0 0; margin-top: 10px; }
-  /* Labelled actions, evenly spaced, sized as the redesign's action bar draws them
-     (22px icon, 10.5px label, 3px apart). */
+  /* Seven icon buttons in equal cells, as the redesign's viewer bar draws them (22px icons, no
+     labels: each button keeps its name for screen readers). Menu anchors take a cell too, so
+     Rate and More are as wide as the rest and nothing overlaps at 375px. */
   .pt-viewer-bar { justify-content: space-around; gap: 0; padding: 9px 2px calc(9px + env(safe-area-inset-bottom)); background: #18181a; border-top: 1px solid var(--lg-edge); }
   .pt-viewer-bar .pt-vb-group { display: contents; }
-  .pt-viewer-bar .pt-vb-btn span { display: inline; }
-  .pt-viewer-bar .pt-vb-btn { flex: 1 1 0; min-width: 0; min-height: 0; gap: 3px; padding: 0; font-size: 10.5px; font-weight: 600; }
+  .pt-viewer-bar .pt-vb-btn span { display: none; }
+  .pt-viewer-bar .pt-menu-anchor { flex: 1 1 0; min-width: 0; }
+  .pt-viewer-bar .pt-vb-btn { flex: 1 1 0; min-width: 0; min-height: 44px; width: 100%; gap: 0; padding: 0; }
   .pt-viewer-bar .pt-vb-btn svg { width: 22px; height: 22px; }
 }
 @media (min-width: 806px) {
@@ -1480,7 +1488,18 @@
 .pt-fp-row svg { width: 18px; height: 18px; color: var(--muted); }
 .pt-fp-dates { display: flex; gap: 10px; }
 .pt-fp-dates label { flex: 1; display: flex; flex-direction: column; gap: 4px; font-size: 0.78rem; color: var(--muted); }
-.pt-fp-dates input { min-height: 38px; }
+.pt-fp-dates label { min-width: 0; font-weight: 600; }
+.pt-fp-dates input {
+  appearance: none; -webkit-appearance: none; box-sizing: border-box; width: 100%; min-width: 0; min-height: 44px;
+  position: relative; padding: 0 18px; border: 1px solid var(--lg-edge); border-radius: 999px;
+  background: var(--lg-surface-wash); color: var(--text); font: inherit; font-size: 0.9rem; font-weight: 500;
+  text-align: left; color-scheme: inherit;
+}
+.pt-fp-dates input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-color: transparent; }
+.pt-fp-dates input::-webkit-date-and-time-value { text-align: left; }
+.pt-fp-dates input[value=""]:not(:focus)::-webkit-datetime-edit { color: transparent; }
+/* No calendar icon: the whole pill opens the picker. */
+.pt-fp-dates input::-webkit-calendar-picker-indicator { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
 .pt-fp-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 4px; }
 .pt-fp-foot .btn { margin-left: auto; min-width: 140px; justify-content: center; }
 .pt-sheet .pt-fp-foot .btn { width: 100%; }
@@ -1561,3 +1580,43 @@
 /* The floating scroll-to-top button sits over the bottom-right corner once the page is scrolled, which
    is exactly where this row's Create pill ends up at the end of Albums. Leave room to scroll past it. */
 .pt-suggest { margin-bottom: calc(var(--tap-min) + 28px); }
+
+/* The Photos selection row replaces the title row: full width, flush with the top of the scroll
+   area (sticky positions inside .mock-body's padding, so it is pulled up by that padding). */
+.pt-gallery > .pt-select-head { --pad-y: clamp(12px, 3vw, 20px); --pad-x: clamp(12px, 3vw, 20px); top: calc(-1 * var(--pad-y)); margin: calc(-1 * var(--pad-y)) calc(-1 * var(--pad-x)) 12px; padding: 0 var(--pad-x); }
+@container (min-width: 806px) {
+  .pt-gallery > .pt-select-head { --pad-y: 18px; --pad-x: 20px; }
+}
+
+/* Inside an album on a phone the detail pane has no padding of its own, so the row is pulled out
+   of .mock-body's padding exactly like the Photos one above. */
+@container (max-width: 805px) {
+  .pt-album-detail > .pt-select-head { --pad: clamp(12px, 3vw, 20px); top: calc(-1 * var(--pad)); margin: calc(-1 * var(--pad)) calc(-1 * var(--pad)) 12px; padding: 0 var(--pad); }
+}
+
+@media (min-width: 806px) {
+  .pt-more-menu .phone-only { display: none; }
+  /* In the Gallery the menu holds only phone items, so desktops drop the empty More button. */
+  .pt-viewer-bar .phone-menu-only { display: none; }
+}
+
+/* The viewer's Rate popover is just the five stars (as the redesign draws it): no heading, no divider. */
+.pt-viewer-bar .pt-menu-panel:has(.pt-fm-rate.solo) { min-width: 0; padding: 4px 6px; border-radius: 999px; }
+.pt-fm-rate.solo { padding: 0; margin: 0; border-bottom: 0; }
+
+/* The photo fills the whole stage (the image is contained inside it, so nothing is cropped): no
+   padding, no rounded box, and the prev/next buttons float over it instead of taking width. */
+.pt-viewer-stage { position: relative; padding: 0; gap: 0; }
+.pt-viewer-photo { height: 100%; border-radius: 0; }
+.pt-viewer-stage > .pt-viewer-nav { position: absolute; top: 50%; transform: translateY(-50%); z-index: 2; background: rgba(0,0,0,0.45); }
+.pt-viewer-stage > .pt-viewer-nav.prev { left: 14px; }
+.pt-viewer-stage > .pt-viewer-nav.next { right: 14px; }
+@media (max-width: 805px) {
+  .pt-viewer-nav { display: none; }
+}
+
+/* Desktop: the Photos toolbar (title, Filter, size slider, Select) stays put while the grid scrolls or
+   re-lays out under the slider, instead of scrolling away mid-drag. */
+@container (min-width: 806px) {
+  .pt-gallery > .pt-gallery-toolbar { position: sticky; top: -18px; z-index: 6; background: var(--bg-1); margin: -18px 0 4px; padding: 26px 0 8px; }
+}

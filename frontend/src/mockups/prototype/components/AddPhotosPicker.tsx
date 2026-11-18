@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Check as CheckIcon } from 'lucide-react';
+import { CheckGlyph as CheckIcon } from './RedesignIcons';
 import { useStore } from '../store';
 import { tileImage, usePhotoThumbnails } from '../media';
 import { TileThumbnail, dayHeading } from './PhotoGrid';

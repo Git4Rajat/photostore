@@ -1,14 +1,5 @@
 import React, { useEffect } from 'react';
-import {
-    Heart as HeartIcon,
-    Image as PhotoIcon,
-    Images as AlbumsIcon,
-    MapPin as MapPinIcon,
-    Trash2 as TrashIcon,
-    Users as UsersIcon,
-    UserPlus as LibraryIcon,
-    Video as VideoIcon,
-} from 'lucide-react';
+import { HeartGlyph as HeartIcon, PhotosGlyph as PhotoIcon, AlbumsGlyph as AlbumsIcon, PinGlyph as MapPinIcon, TrashGlyph as TrashIcon, UsersGlyph as UsersIcon, UserPlusGlyph as LibraryIcon, VideoGlyph as VideoIcon } from './RedesignIcons';
 import { LogoLockup } from '../../../components/shared/Logo';
 import { useStore } from '../store';
 import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';

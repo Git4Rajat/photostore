@@ -1,5 +1,5 @@
 import React from 'react';
-import { ChevronRight as ChevronRightIcon, Users as UserGroupIcon } from 'lucide-react';
+import { ChevGlyph as ChevronRightIcon, UsersGlyph as UserGroupIcon } from './RedesignIcons';
 import { useStore } from '../store';
 import { useProtectedBlobUrls } from '../../../services/imageClient';
 import { plural } from '../../../utils/format';

@@ -1,7 +1,7 @@
 // The Photos page's one Filter button and the panel behind it, as the redesign draws it: a sheet on
 // phones, a popover under the button on wide screens. See docs/design-mockups (One Filter button).
 import React, { useEffect, useRef, useState } from 'react';
-import { Heart as HeartIcon, Star as StarIcon } from 'lucide-react';
+import { HeartGlyph as HeartIcon, SlidersGlyph as FilterIcon, StarGlyph as StarIcon } from './RedesignIcons';
 import { BottomSheet } from './BottomSheet';
 import type { CaptureRange, MediaFilter } from '../store';
 
@@ -19,15 +19,6 @@ export interface PhotosFilterActions {
     setRating: (value: number) => void;
     setCaptureRange: (range: CaptureRange | null) => void;
 }
-
-// The redesign's own sliders glyph (two short rules, a knob on each), not the stock three-rule one.
-const FilterIcon: React.FC<React.SVGProps<SVGSVGElement>> = (props) => (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.75} strokeLinecap="round" strokeLinejoin="round" {...props}>
-        <path d="M4 7.5h9M17 7.5h3M4 16.5h3M11 16.5h9" />
-        <circle cx="15" cy="7.5" r="2" />
-        <circle cx="9" cy="16.5" r="2" />
-    </svg>
-);
 
 const MEDIA: { value: MediaFilter; label: string }[] = [
     { value: 'all', label: 'All' },
@@ -57,9 +48,21 @@ export const FilterSentence: React.FC<{ state: PhotosFilterState }> = ({ state }
     const tail = [
         state.likedOnly ? 'you liked' : '',
         state.rating > 0 ? `rated ${state.rating}${state.rating === 5 ? '' : '+'} stars` : '',
-        state.captureRange ? `· ${state.captureRange.label}` : '',
-    ].filter(Boolean).join(' ');
+        state.captureRange ? (state.captureRange.label === LAST_30_DAYS ? 'last 30 days' : state.captureRange.label) : '',
+    ].filter(Boolean).join(', ');
     return <span><b>{mediaNoun(state.mediaFilter)}</b>{tail ? ` ${tail}` : ''}</span>;
+};
+
+/** Title and hint for an empty result, naming the filters that caused it, e.g. "No liked videos lately". */
+export const noMatchCopy = (state: PhotosFilterState): { title: string; hint: string } => {
+    const noun = state.mediaFilter === 'video' ? 'videos' : state.mediaFilter === 'live' ? 'Live Photos' : 'photos';
+    const parts = ['No', state.likedOnly ? 'liked' : '', noun];
+    if (state.rating > 0) parts.push(`rated ${state.rating}${state.rating === 5 ? '' : '+'} stars`);
+    if (state.captureRange) parts.push(state.captureRange.label === LAST_30_DAYS ? 'lately' : `in ${state.captureRange.label}`);
+    return {
+        title: parts.filter(Boolean).join(' '),
+        hint: state.captureRange ? 'Try a longer time range, or take a filter off.' : 'Try a different rating, or take a filter off.',
+    };
 };
 
 const useWide = (): boolean => {
