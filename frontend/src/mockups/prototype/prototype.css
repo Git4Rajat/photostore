@@ -1586,3 +1586,7 @@
 @media (min-width: 806px) {
   .pt-more-menu .phone-only { display: none; }
 }
+
+/* The viewer's Rate popover is just the five stars (as the redesign draws it): no heading, no divider. */
+.pt-viewer-bar .pt-menu-panel:has(.pt-fm-rate.solo) { min-width: 0; padding: 4px 6px; border-radius: 999px; }
+.pt-fm-rate.solo { padding: 0; margin: 0; border-bottom: 0; }

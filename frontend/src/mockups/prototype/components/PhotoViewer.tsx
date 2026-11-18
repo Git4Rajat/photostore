@@ -246,8 +246,7 @@ const PhotoViewer: React.FC = () => {
                     >
                         {(close) => (
                             <div className="pt-more-menu">
-                                <div className="pt-fm-rate">
-                                    <span><StarIcon /> Your rating</span>
+                                <div className="pt-fm-rate solo">
                                     <Stars value={photo.rating} onRate={(n) => { ratePhotos([photo.id], n); close(); }} size={22} />
                                 </div>
                             </div>
