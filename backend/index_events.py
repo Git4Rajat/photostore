@@ -79,7 +79,7 @@ def publish_progress(library, wave_id, stage, step=None, eta_seconds=None, *, fo
     """Advisory step/stage change for a wave's progress bar; the GET stays authoritative.
 
     `force` (stage changes) skips the per-library gap but never the daily budget."""
-    if not enabled() or os.getenv('PROCESSING_PROGRESS_PUSH', '').strip().lower() not in ('1', 'true', 'yes'):
+    if not enabled() or os.getenv('PROCESSING_PROGRESS_PUSH', 'true').strip().lower() in ('0', 'false', 'no', 'off'):
         return False
     now = time.time()
     today = time.strftime('%Y-%m-%d', time.gmtime(now))

@@ -91,13 +91,14 @@ def test_routes_are_library_scoped_and_dismiss_persists(live_api):
     assert client.get('/api/processing').json == {'waves': []}
 
 
-def test_publish_progress_is_off_by_default_budgeted_and_spaced(monkeypatch):
+def test_publish_progress_is_on_by_default_budgeted_and_spaced(monkeypatch):
     sent = []
     monkeypatch.setenv('INDEX_EVENTS_ENDPOINT', 'https://example')
     monkeypatch.setattr(index_events, '_enqueue', lambda key, message: sent.append(message))
     index_events._progress.update(day=None, used=0, last={})
+    monkeypatch.setenv('PROCESSING_PROGRESS_PUSH', 'false')
     assert not index_events.publish_progress('lib', 'w', 'vision', 1)
-    monkeypatch.setenv('PROCESSING_PROGRESS_PUSH', 'true')
+    monkeypatch.delenv('PROCESSING_PROGRESS_PUSH')
     assert index_events.publish_progress('lib', 'w', 'vision', 1)
     assert not index_events.publish_progress('lib', 'w', 'vision', 2)  # inside the 30 s gap
     assert index_events.publish_progress('lib', 'w', 'cluster', force=True)  # stage change skips the gap
