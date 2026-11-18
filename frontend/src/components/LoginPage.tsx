@@ -1,10 +1,11 @@
 import React, { useState } from 'react';
-import { ArrowLeft as ArrowLeftIcon, LogIn as ArrowRightOnRectangleIcon } from 'lucide-react';
+import { ArrowLeft as ArrowLeftIcon, LogIn as ArrowRightOnRectangleIcon, Mail as MailIcon, TriangleAlert as AlertIcon } from 'lucide-react';
 import { Link, useNavigate } from 'react-router-dom';
 import { setUserId } from '../services/apiClient';
 import { getRuntimeConfig } from '../config/appConfig';
 import * as passwordAuth from '../services/passwordAuthClient';
 import AuthShell from './shared/AuthShell';
+import AuthField from './shared/AuthField';
 
 interface LoginPageProps {
     authEnabled: boolean;
@@ -21,18 +22,28 @@ const isPasswordMode = (): boolean => (getRuntimeConfig().authMode || '').toLowe
 // validate the address, so guard it on the client).
 const isValidEmail = (value: string): boolean => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(value.trim());
 
+const FIELD_IDS = { email: 'owner-email', password: 'owner-password' };
+
 const PasswordLogin: React.FC<{ onAuthenticated?: () => Promise<void> }> = ({ onAuthenticated }) => {
     const [email, setEmail] = useState(() => passwordAuth.getEmailHint());
     const [password, setPassword] = useState('');
     const [pending, setPending] = useState(false);
     const [errorMessage, setErrorMessage] = useState('');
-    const [resetSent, setResetSent] = useState(false);
+    // Which fields the message is about: a failed sign-in does not say which half was wrong, so both are marked.
+    const [badFields, setBadFields] = useState<Array<'email' | 'password'>>([]);
+    const [sentTo, setSentTo] = useState('');
+
+    const fail = (message: string, fields: Array<'email' | 'password'>) => {
+        setErrorMessage(message);
+        setBadFields(fields);
+    };
 
     const handleLogin = async (event: React.FormEvent) => {
         event.preventDefault();
         setErrorMessage('');
+        setBadFields([]);
         if (!isValidEmail(email)) {
-            setErrorMessage('Enter a valid email address.');
+            fail('Enter a valid email address.', ['email']);
             return;
         }
         setPending(true);
@@ -49,7 +60,9 @@ const PasswordLogin: React.FC<{ onAuthenticated?: () => Promise<void> }> = ({ on
             // place (see clientDataReset.ts / the 2026-10-17 account-switch bug).
             window.location.assign('/');
         } catch (error) {
-            setErrorMessage(error instanceof Error ? error.message : 'Sign in failed.');
+            // What was typed stays; only the message and the field marks change.
+            const message = error instanceof Error ? error.message : passwordAuth.SIGN_IN_FAILED_MESSAGE;
+            fail(message, message === passwordAuth.SIGN_IN_FAILED_MESSAGE ? ['email', 'password'] : []);
         } finally {
             setPending(false);
         }
@@ -57,54 +70,76 @@ const PasswordLogin: React.FC<{ onAuthenticated?: () => Promise<void> }> = ({ on
 
     const handleForgot = async () => {
         setErrorMessage('');
-        setResetSent(false);
+        setBadFields([]);
         if (!isValidEmail(email)) {
-            setErrorMessage('Enter a valid email above first, then tap "Forgot password?".');
+            fail('Enter your email address first, then choose Forgot password.', ['email']);
             return;
         }
         try {
             await passwordAuth.requestPasswordReset(email.trim());
+        } catch {
+            // Swallowed on purpose: the outcome must not change what the page says.
         } finally {
             // Always show the same confirmation regardless of outcome so we
             // never reveal whether an address is actually on file.
-            setResetSent(true);
+            setSentTo(email.trim());
         }
     };
 
+    if (sentTo) {
+        return (
+            <div className="auth-center">
+                <span className="auth-bigicon"><MailIcon aria-hidden="true" /></span>
+                <h2>Check your email</h2>
+                <p className="auth-note">
+                    If {sentTo} has an account, we've sent a link to choose a new password. It works for one hour.
+                </p>
+                <button type="button" className="auth-btn top" onClick={() => setSentTo('')}>Back to sign in</button>
+                <p className="auth-note">
+                    Nothing after a few minutes? Check spam, or{' '}
+                    <button type="button" className="auth-link" onClick={handleForgot}>send it again</button>.
+                </p>
+            </div>
+        );
+    }
+
     return (
-        <form className="local-login" onSubmit={handleLogin}>
-            <label htmlFor="owner-email">Email</label>
-            <input
-                id="owner-email"
-                className="field"
+        <form className="auth-form" onSubmit={handleLogin} noValidate>
+            {errorMessage && (
+                <p className="auth-msg box" role="alert" id="auth-error">
+                    <AlertIcon aria-hidden="true" />
+                    <span>{errorMessage}</span>
+                </p>
+            )}
+            <AuthField
+                id={FIELD_IDS.email}
+                label="Email address"
                 type="email"
                 autoComplete="username"
                 value={email}
-                onChange={(e) => setEmail(e.target.value)}
+                onChange={setEmail}
                 autoFocus={!email}
+                invalid={badFields.includes('email')}
+                describedBy={errorMessage ? 'auth-error' : undefined}
             />
-            <label htmlFor="owner-password">Password</label>
-            <input
-                id="owner-password"
-                className="field"
+            <AuthField
+                id={FIELD_IDS.password}
+                label="Password"
                 type="password"
                 autoComplete="current-password"
                 value={password}
-                onChange={(e) => setPassword(e.target.value)}
+                onChange={setPassword}
                 autoFocus={Boolean(email)}
+                invalid={badFields.includes('password')}
+                describedBy={errorMessage ? 'auth-error' : undefined}
+                labelAction={(
+                    <button type="button" className="auth-link" onClick={handleForgot} disabled={pending}>
+                        Forgot password?
+                    </button>
+                )}
             />
-            {errorMessage && <p className="status error">{errorMessage}</p>}
-            {resetSent && (
-                <p className="status success">
-                    If password recovery is set up and an email is on file, a reset link is on its way.
-                    Check your inbox (and spam folder).
-                </p>
-            )}
-            <button type="submit" className="btn btn-primary" disabled={pending || !password}>
+            <button type="submit" className="auth-btn top" disabled={pending || !password}>
                 {pending ? 'Signing in…' : 'Sign in'}
-            </button>
-            <button type="button" className="btn btn-link auth-page-link" onClick={handleForgot} disabled={pending}>
-                Forgot password?
             </button>
         </form>
     );
@@ -137,47 +172,39 @@ const LoginPage: React.FC<LoginPageProps> = ({ authEnabled, authReady, displayNa
     };
 
     return (
-        <AuthShell kicker="ACCESS" title="Welcome back" tagline>
+        <AuthShell title="Welcome back" subtitle="Sign in to your photos and videos.">
             {passwordMode ? (
                 <>
-                    {authReady && displayName ? (
-                        <p className="status success">You are signed in as {displayName}.</p>
-                    ) : (
-                        <p className="status">Enter your password to continue to your photo library.</p>
-                    )}
+                    {authReady && displayName && <p className="auth-note ok">You are signed in as {displayName}.</p>}
                     <PasswordLogin onAuthenticated={onAuthenticated} />
-                    <Link className="btn btn-soft auth-page-link auth-page-back" to="/">
-                        <ArrowLeftIcon className="toolbar-icon" />
-                        <span>Back to gallery</span>
-                    </Link>
+                    <div className="auth-foot">Invited by someone? Open the link in your invite email.</div>
                 </>
             ) : !authEnabled ? (
                 <>
-                    <p className="status">Authentication is currently disabled for this deployment. Use local sign-in below.</p>
-                    <div className="local-login">
-                        <label htmlFor="local-user">Username</label>
-                        <input id="local-user" className="field" type="text" value={localUser} onChange={(e) => setLocalUser(e.target.value)} />
-                        <button type="button" className="btn btn-primary" onClick={handleSignIn} disabled={pending}>
+                    <p className="auth-note">Authentication is currently disabled for this deployment. Use local sign-in below.</p>
+                    <div className="auth-form">
+                        <AuthField id="local-user" label="Username" value={localUser} onChange={setLocalUser} />
+                        <button type="button" className="auth-btn top" onClick={handleSignIn} disabled={pending}>
                             Continue
                         </button>
                     </div>
                 </>
             ) : (
                 <>
-                    {!authReady && <p className="status">Preparing sign-in flow…</p>}
-                    {authReady && displayName && (
-                        <p className="status success">You are signed in as {displayName}.</p>
+                    {!authReady && <p className="auth-note">Preparing sign-in flow…</p>}
+                    {authReady && displayName && <p className="auth-note ok">You are signed in as {displayName}.</p>}
+                    {authReady && !displayName && <p className="auth-note">Sign in with your Microsoft account to continue to your photo library.</p>}
+                    {errorMessage && (
+                        <p className="auth-msg box" role="alert"><AlertIcon aria-hidden="true" /><span>{errorMessage}</span></p>
                     )}
-                    {authReady && !displayName && <p className="status">Sign in with your Microsoft account to continue to your photo library.</p>}
-                    {errorMessage && <p className="status error">{errorMessage}</p>}
-                    <div className="auth-page-actions">
-                        <button type="button" className="btn btn-primary" onClick={handleSignIn} disabled={!authReady || pending}>
-                            <ArrowRightOnRectangleIcon className="toolbar-icon" />
+                    <div className="auth-form">
+                        <button type="button" className="auth-btn top" onClick={handleSignIn} disabled={!authReady || pending}>
+                            <ArrowRightOnRectangleIcon aria-hidden="true" width={18} height={18} />
                             <span>{pending ? 'Signing in…' : displayName ? 'Use a different account' : 'Sign in with Microsoft'}</span>
                         </button>
-                        <Link className="btn btn-soft auth-page-link" to="/">
-                            <ArrowLeftIcon className="toolbar-icon" />
-                            <span>Back to gallery</span>
+                        <Link className="auth-link quiet auth-back" to="/">
+                            <ArrowLeftIcon aria-hidden="true" />
+                            Back to gallery
                         </Link>
                     </div>
                 </>

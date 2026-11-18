@@ -1,7 +1,10 @@
 import React, { useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import * as library from '../services/libraryClient';
+import { Check as CheckIcon, Plus as PlusIcon, TriangleAlert as AlertIcon } from 'lucide-react';
 import AuthShell from './shared/AuthShell';
+import AuthField from './shared/AuthField';
+import { MIN_PASSWORD_LENGTH } from './shared/passwordRules';
 
 // Public page reached from the "accept your invitation" link in an invite email:
 //   /accept-invite?token=<token>
@@ -46,8 +49,8 @@ const AcceptInvitePage: React.FC = () => {
         setErrorMessage('');
         const needsPassword = Boolean(info?.needsPassword);
         if (needsPassword) {
-            if (password.length < 8) {
-                setErrorMessage('Password must be at least 8 characters.');
+            if (password.length < MIN_PASSWORD_LENGTH) {
+                setErrorMessage(`Password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
                 return;
             }
             if (password !== confirm) {
@@ -72,59 +75,54 @@ const AcceptInvitePage: React.FC = () => {
             ? 'start using Keepsake'
             : 'join this library';
 
+    const needsPassword = Boolean(info?.needsPassword);
+    const longEnough = password.length >= MIN_PASSWORD_LENGTH;
+    const matches = confirm.length > 0 && password === confirm;
+    const problem = (text: string) => (
+        <p className="auth-msg box" role="alert"><AlertIcon aria-hidden="true" /><span>{text}</span></p>
+    );
+
     return (
-        <AuthShell kicker="INVITATION" title="Accept your invitation">
+        <AuthShell title="Accept your invitation">
             {!token ? (
-                <p className="status error">This link is missing its invitation token.</p>
+                problem('This link is missing its invitation token.')
             ) : loading ? (
-                <p className="status">Checking your invitation…</p>
+                <p className="auth-note">Checking your invitation…</p>
             ) : !info?.valid ? (
-                <p className="status error">This invitation is invalid or has expired. Ask for a new one.</p>
+                problem('This invitation is invalid or has expired. Ask for a new one.')
             ) : done ? (
-                <>
-                    <p className="status success">You're all set. Welcome to Keepsake!</p>
+                <div className="auth-center">
+                    <p className="auth-note ok">You're all set. Welcome to Keepsake!</p>
                     {/* Hard navigation so the app re-bootstraps auth state from the
                         session token the acceptance just stored. */}
-                    <button type="button" className="btn btn-primary" onClick={() => { window.location.href = '/'; }}>
+                    <button type="button" className="auth-btn top" onClick={() => { window.location.href = '/'; }}>
                         Go to your photos
                     </button>
-                </>
+                </div>
             ) : (
-                <form className="local-login" onSubmit={handleSubmit}>
-                    <p className="status">
+                <form className="auth-form" onSubmit={handleSubmit} noValidate>
+                    <p className="auth-note">
                         {info.email ? <strong>{info.email}</strong> : 'You'} — you've been invited to {targetLabel}.
                     </p>
-                    {info.needsPassword ? (
+                    {errorMessage && problem(errorMessage)}
+                    {needsPassword ? (
                         <>
-                            <label htmlFor="invite-password">Choose a password</label>
-                            <input
-                                id="invite-password"
-                                className="field"
-                                type="password"
-                                autoComplete="new-password"
-                                value={password}
-                                onChange={(e) => setPassword(e.target.value)}
-                            />
-                            <label htmlFor="invite-confirm">Confirm password</label>
-                            <input
-                                id="invite-confirm"
-                                className="field"
-                                type="password"
-                                autoComplete="new-password"
-                                value={confirm}
-                                onChange={(e) => setConfirm(e.target.value)}
-                            />
+                            <AuthField id="invite-password" label="Choose a password" type="password" autoComplete="new-password" value={password} onChange={setPassword} />
+                            <AuthField id="invite-confirm" label="Confirm password" type="password" autoComplete="new-password" value={confirm} onChange={setConfirm} />
+                            <ul className="auth-rules" aria-label="Password rules">
+                                <li className={longEnough ? 'ok' : undefined}>{longEnough ? <CheckIcon aria-hidden="true" /> : <PlusIcon aria-hidden="true" />}At least {MIN_PASSWORD_LENGTH} characters</li>
+                                <li className={matches ? 'ok' : undefined}>{matches ? <CheckIcon aria-hidden="true" /> : <PlusIcon aria-hidden="true" />}Both passwords match</li>
+                            </ul>
                         </>
                     ) : (
-                        <p className="status">
+                        <p className="auth-note">
                             To accept, make sure you're signed in as {info.email || 'the invited account'}.
                         </p>
                     )}
-                    {errorMessage && <p className="status error">{errorMessage}</p>}
                     <button
                         type="submit"
-                        className="btn btn-primary"
-                        disabled={pending || (Boolean(info.needsPassword) && (!password || !confirm))}
+                        className="auth-btn"
+                        disabled={pending || (needsPassword && (!longEnough || !matches))}
                     >
                         {pending ? 'Accepting…' : 'Accept invitation'}
                     </button>
@@ -132,7 +130,7 @@ const AcceptInvitePage: React.FC = () => {
                         only knows the /accept-invite route (see PrototypeApp). */}
                     <button
                         type="button"
-                        className="btn btn-link auth-page-link"
+                        className="auth-link quiet auth-back"
                         onClick={() => { window.location.href = '/login'; }}
                     >
                         Back to sign in

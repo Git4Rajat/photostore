@@ -18,16 +18,18 @@ from urllib.parse import urlsplit
 _CSS = """
 :root{color-scheme:dark}
 *{box-sizing:border-box}
-body{margin:0;background:#0c0c0e;color:#f4f4f6;font:15px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-header{position:sticky;top:0;z-index:2;display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:rgba(12,12,14,.88);backdrop-filter:blur(10px)}
-.brand{font-weight:700;letter-spacing:.2px}
-.full{color:#4da2ff;font-weight:600;text-decoration:none;font-size:14px}
+body{margin:0;background:#131316;color:#ede7da;font:15px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+header{position:sticky;top:0;z-index:2;display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:rgba(19,19,22,.88);backdrop-filter:blur(10px)}
+.brand{display:inline-flex;align-items:center;gap:7px;font-weight:600;font-size:14px}
+.mark{display:grid;place-items:center;width:22px;height:22px;border-radius:7px;background:#7aaed3;color:#0c1924}
+.mark svg{width:13px;height:13px;fill:currentColor}
+.full{color:#7aaed3;font-weight:600;text-decoration:none;font-size:14px}
 main{padding:8px 16px 40px;max-width:1400px;margin:0 auto}
 h1{margin:12px 0 4px;font-size:24px}
 .sub{margin:0 0 12px;color:#b8b8c2}
 .status{display:flex;align-items:center;gap:10px;color:#b8b8c2;margin:8px 0 16px;min-height:22px}
 .status[hidden]{display:none}
-.spin{width:16px;height:16px;border-radius:50%;border:2px solid rgba(77,162,255,.25);border-top-color:#4da2ff;animation:r .8s linear infinite;flex:none}
+.spin{width:16px;height:16px;border-radius:50%;border:2px solid rgba(122,174,211,.25);border-top-color:#7aaed3;animation:r .8s linear infinite;flex:none}
 @keyframes r{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion:reduce){.spin{animation-duration:2.4s}}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:4px}
@@ -40,7 +42,7 @@ h1{margin:12px 0 4px;font-size:24px}
 .lb button{position:absolute;background:rgba(30,30,36,.75);color:#fff;border:0;border-radius:50%;width:44px;height:44px;font-size:22px;cursor:pointer}
 .lb .x{top:12px;right:12px}.lb .p{left:12px;top:50%;margin-top:-22px}.lb .n{right:12px;top:50%;margin-top:-22px}
 .lb .cap{position:absolute;left:0;right:0;bottom:0;padding:12px 16px;background:linear-gradient(transparent,rgba(0,0,0,.7));text-align:center;font-size:13px}
-.lb .cap a{color:#4da2ff;font-weight:600;text-decoration:none}
+.lb .cap a{color:#7aaed3;font-weight:600;text-decoration:none}
 .lb .dl{position:absolute;top:12px;right:68px;width:auto;height:44px;border-radius:22px;padding:0 16px;font-size:14px;display:flex;align-items:center;color:#fff;text-decoration:none;background:rgba(30,30,36,.75)}
 .lb .dl[hidden]{display:none}
 .msg{padding:48px 0;text-align:center;color:#b8b8c2}
@@ -350,7 +352,7 @@ def render(meta: Dict[str, str], *, token: str, spa_url: str, archive_url: str, 
         f'<meta name="twitter:title" content="{title}" /><meta name="twitter:description" content="{description}" />'
         f'<meta name="twitter:image" content="{image_attr}" />'
         f'<style>{_CSS}</style></head><body>'
-        '<header><span class="brand">Keepsake</span><span><a id="full" class="full" href="#">Open full album to download</a></span></header>'
+        '<header><span class="brand"><span class="mark"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19.5s-7-4.3-7-9.4A3.9 3.9 0 0 1 12 7.8a3.9 3.9 0 0 1 7 2.3c0 5.1-7 9.4-7 9.4z"/></svg></span>Keepsake</span><span><a id="full" class="full" href="#">Open full album to download</a></span></header>'
         f'<main><h1 id="title">{title}</h1><p id="sub" class="sub">{description}</p>'
         '<div id="status" class="status"><span class="spin" aria-hidden="true"></span><span id="statusText">Opening shared album…</span></div>'
         '<div id="grid" class="grid"></div>'

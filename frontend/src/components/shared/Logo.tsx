@@ -6,38 +6,23 @@ interface LogoProps {
     title?: string;
 }
 
-// The Keepsake mark: a photo card with a heart (a "kept memory") on a
-// brand-blue badge. Mirrors /favicon.svg. Colors are fixed brand colors
-// (not currentColor) so the mark reads identically in light and dark themes.
-// A per-instance gradient id keeps multiple inline copies from colliding.
-export const Logo: React.FC<LogoProps> = ({ size = 28, className, title = 'Keepsake' }) => {
-    const gid = React.useId();
-    return (
-        <svg
-            className={className}
-            width={size}
-            height={size}
-            viewBox="0 0 64 64"
-            role="img"
-            aria-label={title}
-            xmlns="http://www.w3.org/2000/svg"
-        >
-            <defs>
-                <linearGradient id={gid} x1="0" y1="0" x2="1" y2="1">
-                    <stop offset="0" stopColor="#3b82f6" />
-                    <stop offset="1" stopColor="#1450c0" />
-                </linearGradient>
-            </defs>
-            <rect width="64" height="64" rx="15" fill={`url(#${gid})`} />
-            <rect x="21" y="15" width="26" height="26" rx="6" fill="#ffffff" opacity="0.32" transform="rotate(9 34 28)" />
-            <rect x="16" y="18" width="32" height="32" rx="6" fill="#ffffff" />
-            <path
-                d="M32 41c-6-4.5-10.5-8-10.5-12 0-2.7 2-4.5 4.3-4.5 2.1 0 4.1 1.3 6.2 3.9 2.1-2.6 4.1-3.9 6.2-3.9 2.3 0 4.3 1.8 4.3 4.5 0 4-4.5 7.5-10.5 12z"
-                fill="#1e6ae1"
-            />
+// The Keepsake mark from the redesign: a small solid heart (a "kept memory")
+// on an accent-coloured rounded square. Colours come from --accent /
+// --on-accent, so it follows the light and dark themes like the rest of the
+// UI. Mirrors /favicon.svg; the box and glyph keep the mock's 22px/7px and
+// 48px/15px proportions at any size.
+export const Logo: React.FC<LogoProps> = ({ size = 28, className, title = 'Keepsake' }) => (
+    <span
+        className={`ks-mark${className ? ` ${className}` : ''}`}
+        style={{ width: size, height: size, borderRadius: Math.round(size * 0.31) }}
+        role="img"
+        aria-label={title}
+    >
+        <svg width={size * 0.56} height={size * 0.56} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path d="M12 19.5s-7-4.3-7-9.4A3.9 3.9 0 0 1 12 7.8a3.9 3.9 0 0 1 7 2.3c0 5.1-7 9.4-7 9.4z" />
         </svg>
-    );
-};
+    </span>
+);
 
 interface LogoLockupProps {
     size?: number;
@@ -46,10 +31,10 @@ interface LogoLockupProps {
     subtitle?: string;
 }
 
-// Mark + "Keepsake" wordmark, with an optional tagline underneath. Used on the
-// login screen and anywhere a full brand lockup is warranted.
+// Mark + "Keepsake" wordmark, with an optional tagline underneath. Used in the
+// app and shared-album headers and anywhere a full brand lockup is warranted.
 export const LogoLockup: React.FC<LogoLockupProps> = ({
-    size = 40,
+    size = 28,
     className,
     tagline = false,
     subtitle = 'An elegant home for your memories.',

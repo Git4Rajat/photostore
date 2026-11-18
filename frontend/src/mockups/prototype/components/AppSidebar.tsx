@@ -52,7 +52,7 @@ export const AppSidebar: React.FC = () => {
     return (
         <aside className="pt-side" aria-label="Sections">
             <button type="button" className="pt-side-logo" onClick={() => go('gallery')} aria-label="Go to Photos">
-                <LogoLockup size={26} />
+                <LogoLockup size={22} />
             </button>
             {item('photos', 'Photos', PhotoIcon, plainGallery, () => go('gallery'), totalPhotos)}
             {item('albums', 'Albums', AlbumsIcon, page === 'albums', () => navigate('albums'), albums.length)}
