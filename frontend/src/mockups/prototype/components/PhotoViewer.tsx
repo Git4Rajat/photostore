@@ -11,7 +11,7 @@ import {
     TrashGlyph as TrashIcon,
 } from './RedesignIcons';
 import { Menu, Stars } from './bits';
-import { AddToAlbumMenu } from './AddToAlbumMenu';
+import { AddToAlbumMenu, AddToAlbumSheet } from './AddToAlbumMenu';
 import { confirmDeleteItems } from './confirmDelete';
 import ViewerShell from './ViewerShell';
 import { useStore, isVideoFilename } from '../store';
@@ -106,6 +106,7 @@ const PhotoViewer: React.FC = () => {
 
     const [fullRes, setFullRes] = useState(false);
     const [showInfo, setShowInfo] = useState(false);
+    const [albumSheetOpen, setAlbumSheetOpen] = useState(false);
     const [meta, setMeta] = useState<PhotoMetadata | null>(null);
 
     // Reset per-photo state, flushing any pending rotation for the photo being
@@ -259,16 +260,17 @@ const PhotoViewer: React.FC = () => {
                         photoIds={[photo.id]}
                         align="right"
                         renderTrigger={(toggle) => (
-                            <button type="button" className="pt-vb-btn" title="Add to album" onClick={toggle}>
+                            <button type="button" className="pt-vb-btn desk" title="Add to album" onClick={toggle}>
                                 <AddToAlbumIcon /> <span>Album</span>
                             </button>
                         )}
                     />
-                    <button type="button" className="pt-vb-btn" title="Open in Workbench" onClick={() => navigate('tools', { filenames: photo.filename })}>
+                    <button type="button" className="pt-vb-btn desk" title="Open in Workbench" onClick={() => navigate('tools', { filenames: photo.filename })}>
                         <WorkbenchIcon /> <span>Workbench</span>
                     </button>
                     <Menu
                         align="right"
+                        className="pt-vb-more"
                         renderTrigger={(toggle) => (
                             <button type="button" className="pt-vb-btn" title="More" onClick={toggle}>
                                 <EllipsisHorizontalIcon /> <span>More</span>
@@ -277,6 +279,9 @@ const PhotoViewer: React.FC = () => {
                     >
                         {(close) => (
                             <div className="pt-more-menu">
+                                {/* Phones keep the bar to Like, Rate, Info and More; the rest live here. */}
+                                <button type="button" className="phone-only" onClick={() => { close(); setAlbumSheetOpen(true); }}>Add to album</button>
+                                <button type="button" className="phone-only" onClick={() => { close(); navigate('tools', { filenames: photo.filename }); }}>Open in Workbench</button>
                                 <button type="button" onClick={() => { close(); startDownload(); }}>Download</button>
                                 {route.page !== 'gallery' && (
                                     <button
@@ -296,16 +301,18 @@ const PhotoViewer: React.FC = () => {
                                         Show in Gallery
                                     </button>
                                 )}
+                                <button type="button" className="phone-only danger" onClick={() => { close(); void confirmDeleteItems(1).then((ok) => { if (ok) deletePhotos([photo.id]); }); }}>Delete</button>
                             </div>
                         )}
                     </Menu>
+                    <AddToAlbumSheet open={albumSheetOpen} onClose={() => setAlbumSheetOpen(false)} photoIds={[photo.id]} />
                 </div>
                 <div className="pt-vb-group right">
                     {/* Desktops show Download in the toolbar; phones keep it under More. */}
                     <button type="button" className="pt-vb-btn wide-only" title="Download original" onClick={startDownload}>
                         <DownloadIcon /> <span>Download</span>
                     </button>
-                    <button type="button" className="pt-vb-btn" title="Delete" onClick={() => void confirmDeleteItems(1).then((ok) => { if (ok) deletePhotos([photo.id]); })}>
+                    <button type="button" className="pt-vb-btn desk" title="Delete" onClick={() => void confirmDeleteItems(1).then((ok) => { if (ok) deletePhotos([photo.id]); })}>
                         <TrashIcon /> <span>Delete</span>
                     </button>
                 </div>
