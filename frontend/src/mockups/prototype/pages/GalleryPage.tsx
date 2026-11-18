@@ -86,9 +86,10 @@ const GalleryPage: React.FC = () => {
         pressAnchorRef.current = el?.dataset.tileId ? { id: el.dataset.tileId, top: el.getBoundingClientRect().top } : null;
     };
     useLayoutEffect(() => {
-        const anchor = pressAnchorRef.current;
-        if (!anchor || !gridRef.current) return;
         const grid = gridRef.current;
+        if (grid && !selectMode) grid.style.marginTop = '';
+        const anchor = pressAnchorRef.current;
+        if (!anchor || !grid || !selectMode) return;
         const settle = () => {
             const el = Array.from(grid.querySelectorAll<HTMLElement>('[data-tile-id]')).find((t) => t.dataset.tileId === anchor.id);
             if (!el) return;
@@ -96,6 +97,9 @@ const GalleryPage: React.FC = () => {
             if (Math.abs(delta) < 1) return;
             const scroller = scrollParentOf(el);
             if (scroller) scroller.scrollTop += delta;
+            // At the very top there is nothing to scroll: pad the grid instead.
+            const left = el.getBoundingClientRect().top - anchor.top;
+            if (left < -1) grid.style.marginTop = `${(parseFloat(grid.style.marginTop) || 0) - left}px`;
         };
         settle();
         // Sticky bars and the tab bar finish laying out a frame later.
