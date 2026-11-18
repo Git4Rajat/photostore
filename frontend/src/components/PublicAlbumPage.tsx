@@ -648,7 +648,7 @@ const PublicAlbumPage: React.FC<{ fullAlbumUrl?: string }> = ({ fullAlbumUrl }) 
                 <div className="mock-viewport">
                     <div className="mock-app">
                         <header className={`ios-header pt-public-header${headerCollapsed ? ' is-collapsed' : ''}`}>
-                            <LogoLockup size={26} className="ios-header-wordmark" />
+                            <LogoLockup size={22} className="ios-header-wordmark" />
                             <span className="pt-public-tag">Shared album</span>
                         </header>
 

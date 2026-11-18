@@ -4,8 +4,8 @@
   "description": "Your own private photo library. Your memories stay yours.",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#f7f4ef",
-  "theme_color": "#1e6ae1",
+  "background_color": "#f5f1ea",
+  "theme_color": "#2f5d82",
   "icons": [
     {
       "src": "/favicon.svg",

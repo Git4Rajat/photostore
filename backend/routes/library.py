@@ -270,7 +270,10 @@ def library_invite_accept():
             app.library_store.create_user(email=email, password_hash=app.password_auth.hash_password(password), user_id=account_id, exclusive=True)
         except app.library_utils.EmailAlreadyRegistered:
             return app.jsonify({'error': 'An account for this email was just created. Please sign in and open the link again.'}), 409
-        app.library_store.ensure_personal_library(account_id, name=email)
+        # Only the "start their own library" invite names the library; a joiner's own
+        # personal library keeps the email as its name.
+        own_name = str(data.get('libraryName', '') or '').strip()[:100] if target_type != 'join' else ''
+        app.library_store.ensure_personal_library(account_id, name=own_name or email)
         new_account = True
 
     if target_type == 'join':

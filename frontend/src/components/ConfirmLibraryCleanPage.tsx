@@ -68,7 +68,7 @@ const ConfirmLibraryCleanPage: React.FC = () => {
     };
 
     return (
-        <AuthShell kicker="LIBRARY CLEANUP" title={status?.status === 'pending' ? 'Confirm library cleanup' : 'Library cleanup status'}>
+        <AuthShell title={status?.status === 'pending' ? 'Confirm library cleanup' : 'Library cleanup status'}>
             {!token ? (
                 <p className="status error">This link is missing its confirmation token.</p>
             ) : (

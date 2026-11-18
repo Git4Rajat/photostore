@@ -1,31 +1,44 @@
 import React from 'react';
-import { LogoLockup } from './Logo';
+import { Logo, LogoLockup } from './Logo';
+import './AuthShell.css';
 
 interface AuthShellProps {
-    // Short mono/uppercase label above the title (e.g. "ACCESS", "INVITATION").
-    kicker: string;
     title: string;
-    // Show the brand tagline under the wordmark (used on the sign-in screen).
-    tagline?: boolean;
+    // One calm line under the title (the mock-up's "Sign in to your photos and videos.").
+    subtitle?: string;
+    // Confirmation screens: the mock-up shows only the centred message (which carries its own heading).
+    bare?: boolean;
     children: React.ReactNode;
 }
 
-// Shared full-viewport layout for the signed-out auth screens — sign-in, accept
-// invite, reset password and confirm-cleanup. Centers a glass card over the
-// app's warm "Light Table" backdrop so these pages read as the same product as
-// the main prototype UI instead of a bare browser form floating at the top of
-// the page.
-const AuthShell: React.FC<AuthShellProps> = ({ kicker, title, tagline = false, children }) => (
+// Tones for the desktop picture panel. The sign-in page is signed out, so it cannot show the
+// library's own photos; soft blocks in the theme's colours stand in for the mock-up's photo wall.
+const ART_TILES = ['a s2', 'b', 'c', 'd s2', 'e', 'f', 'g s2', 'h', 'i'];
+
+// Shared full-viewport layout for the signed-out auth screens: sign-in, accept invite, reset
+// password and confirm-cleanup. Phones get the mock-up's single column (mark, title, form); from
+// 900px the left half shows pictures and the form keeps its own width on the right.
+const AuthShell: React.FC<AuthShellProps> = ({ title, subtitle, bare = false, children }) => (
     <div className="auth-screen">
-        <div className="auth-screen-backdrop" aria-hidden="true">
-            <span className="auth-blob auth-blob-1" />
-            <span className="auth-blob auth-blob-2" />
-        </div>
-        <main className="auth-page card-glass" role="main">
-            <LogoLockup size={44} tagline={tagline} className="auth-logo" />
-            <p className="additional-kicker auth-kicker">{kicker}</p>
-            <h1 className="auth-page-title">{title}</h1>
-            {children}
+        <aside className="auth-art" aria-hidden="true">
+            <div className="auth-art-grid">
+                {ART_TILES.map((tile) => <span key={tile} className={`auth-art-tile ${tile}`} />)}
+            </div>
+            <div className="auth-art-caption">
+                <b>Every photo you've kept, in one private place.</b>
+                <span>Yours and your family's. Nobody else can see it.</span>
+            </div>
+        </aside>
+        <main className="auth-pane" role="main">
+            <div className="auth-box">
+                <div className={`auth-brand${bare ? ' bare' : ''}`}>
+                    {!bare && <Logo size={48} className="auth-brand-mark" />}
+                    <LogoLockup size={22} className="auth-brand-lockup" />
+                    {!bare && <h1 className="auth-title">{title}</h1>}
+                    {!bare && subtitle && <p className="auth-subtitle">{subtitle}</p>}
+                </div>
+                {children}
+            </div>
         </main>
     </div>
 );

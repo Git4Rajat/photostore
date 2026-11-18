@@ -147,18 +147,23 @@ export const getInviteInfo = async (token: string): Promise<InviteInfo> => {
 export const acceptInvite = async (
     token: string,
     password?: string,
+    // Names the new account's own library (only used for "start their own library" invites).
+    libraryName?: string,
 ): Promise<{ activeLibraryId: string; newAccount: boolean }> => {
+    const body: Record<string, string> = { token };
+    if (password) body.password = password;
+    if (password && libraryName?.trim()) body.libraryName = libraryName.trim();
     const response = await authedFetch(
         '/api/library/invite/accept',
-        { method: 'POST', body: JSON.stringify(password ? { token, password } : { token }) },
+        { method: 'POST', body: JSON.stringify(body) },
         false,
     );
     if (!response.ok) {
         throw new Error(await parseError(response, 'Could not accept this invitation.'));
     }
-    const body = await response.json();
-    storeTokenIfPresent(body);
-    return { activeLibraryId: String(body.activeLibraryId || ''), newAccount: Boolean(body.newAccount) };
+    const result = await response.json();
+    storeTokenIfPresent(result);
+    return { activeLibraryId: String(result.activeLibraryId || ''), newAccount: Boolean(result.newAccount) };
 };
 
 export const switchLibrary = async (libraryId: string): Promise<string> => {

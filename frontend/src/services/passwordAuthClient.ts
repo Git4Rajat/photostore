@@ -145,14 +145,20 @@ const parseError = async (response: Response, fallback: string): Promise<string>
     }
 };
 
+// One sentence for a failed sign-in, whichever half was wrong: the sign-in page shows it as is.
+export const SIGN_IN_FAILED_MESSAGE = "That email or password isn't right. Try again, or reset your password.";
+
 export const login = async (email: string, password: string): Promise<void> => {
     const response = await fetch(url('/auth/login'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password }),
     });
+    if (response.status === 401) {
+        throw new Error(SIGN_IN_FAILED_MESSAGE);
+    }
     if (!response.ok) {
-        throw new Error(await parseError(response, 'Incorrect password.'));
+        throw new Error(await parseError(response, SIGN_IN_FAILED_MESSAGE));
     }
     const body = await response.json();
     if (!body?.token) {

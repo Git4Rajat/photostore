@@ -10109,8 +10109,8 @@ body {{
   margin: 0;
   display: grid;
   place-items: center;
-  background: #f7f4ef;
-  color: #1a1a1a;
+  background: #f5f1ea;
+  color: #1d1a16;
   font: 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }}
 main {{
@@ -10125,12 +10125,21 @@ main {{
   height: 72px;
   margin-bottom: 16px;
 }}
+.badge {{
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  border-radius: 15px;
+  background: #2f5d82;
+  color: #ffffff;
+}}
 .ring {{
   position: absolute;
   inset: 0;
   border-radius: 50%;
-  border: 3px solid rgba(30, 106, 225, 0.15);
-  border-top-color: #1e6ae1;
+  border: 3px solid rgba(47, 93, 130, 0.12);
+  border-top-color: #2f5d82;
   animation: spin 0.8s linear infinite;
 }}
 h1 {{
@@ -10142,28 +10151,24 @@ p {{
   color: #555;
 }}
 a {{
-  color: #1e6ae1;
+  color: #2f5d82;
   font-weight: 700;
 }}
 @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
 @media (prefers-reduced-motion: reduce) {{ .ring {{ animation-duration: 2.4s; }} }}
 @media (prefers-color-scheme: dark) {{
-  body {{ background: #0c0c0e; color: #f4f4f6; }}
-  p {{ color: #b8b8c2; }}
-  .ring {{ border-color: rgba(77, 162, 255, 0.2); border-top-color: #4da2ff; }}
+  body {{ background: #131316; color: #ede7da; }}
+  p {{ color: #a39b8c; }}
+  a {{ color: #7aaed3; }}
+  .badge {{ background: #7aaed3; color: #0c1924; }}
+  .ring {{ border-color: rgba(122, 174, 211, 0.16); border-top-color: #7aaed3; }}
 }}
 </style>
 </head>
 <body>
 <main>
   <span class="mark" aria-hidden="true">
-    <svg width="52" height="52" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
-      <defs><linearGradient id="badge" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3b82f6" /><stop offset="1" stop-color="#1450c0" /></linearGradient></defs>
-      <rect width="64" height="64" rx="15" fill="url(#badge)" />
-      <rect x="21" y="15" width="26" height="26" rx="6" fill="#ffffff" opacity="0.32" transform="rotate(9 34 28)" />
-      <rect x="16" y="18" width="32" height="32" rx="6" fill="#ffffff" />
-      <path d="M32 41c-6-4.5-10.5-8-10.5-12 0-2.7 2-4.5 4.3-4.5 2.1 0 4.1 1.3 6.2 3.9 2.1-2.6 4.1-3.9 6.2-3.9 2.3 0 4.3 1.8 4.3 4.5 0 4-4.5 7.5-10.5 12z" fill="#1e6ae1" />
-    </svg>
+    <span class="badge"><svg width="27" height="27" viewBox="0 0 24 24" fill="currentColor"><path d="M12 19.5s-7-4.3-7-9.4A3.9 3.9 0 0 1 12 7.8a3.9 3.9 0 0 1 7 2.3c0 5.1-7 9.4-7 9.4z" /></svg></span>
     <span class="ring"></span>
   </span>
   <h1>Opening shared album</h1>

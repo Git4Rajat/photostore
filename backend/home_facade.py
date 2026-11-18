@@ -14,17 +14,19 @@ import json
 from urllib.parse import urlsplit
 
 _CSS = """
-:root{color-scheme:light dark;--bg:#f7f4ef;--fg:#1a1a1a;--mut:#6a6a6a;--tile:#e6e2da;--hi:#f1eee8;--acc:#1e6ae1}
-@media (prefers-color-scheme:dark){:root{--bg:#0c0c0e;--fg:#f4f4f6;--mut:#a0a0aa;--tile:#1b1b20;--hi:#25252b;--acc:#4da2ff}}
+:root{color-scheme:light dark;--bg:#f5f1ea;--fg:#1d1a16;--mut:#665f54;--tile:#ebe5da;--hi:#fffdf9;--acc:#2f5d82;--on:#ffffff}
+@media (prefers-color-scheme:dark){:root{--bg:#131316;--fg:#ede7da;--mut:#a39b8c;--tile:#1c1c20;--hi:#27272c;--acc:#7aaed3;--on:#0c1924}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
 header{display:flex;align-items:center;gap:20px;padding:12px 16px}
-.brand{font-weight:700;font-size:20px;letter-spacing:-.01em}
+.brand{display:inline-flex;align-items:center;gap:8px;font-weight:600;font-size:17px;letter-spacing:-.01em}
+.mark{display:grid;place-items:center;width:26px;height:26px;border-radius:8px;background:var(--acc);color:var(--on)}
+.mark svg{width:15px;height:15px;fill:currentColor}
 nav{display:flex;gap:16px;color:var(--mut);font-size:14px;overflow:hidden;white-space:nowrap}
 main{padding:8px 16px 40px;max-width:1400px;margin:0 auto}
 h1{margin:12px 0 4px;font-size:24px}
 .sub{display:flex;align-items:center;gap:10px;margin:0 0 16px;color:var(--mut)}
-.spin{width:16px;height:16px;border-radius:50%;border:2px solid rgba(30,106,225,.2);border-top-color:var(--acc);animation:r .8s linear infinite;flex:none}
+.spin{width:16px;height:16px;border-radius:50%;border:2px solid color-mix(in srgb,var(--acc) 18%,transparent);border-top-color:var(--acc);animation:r .8s linear infinite;flex:none}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:6px}
 .t{aspect-ratio:1;border-radius:6px;background:linear-gradient(100deg,var(--tile) 30%,var(--hi) 50%,var(--tile) 70%);background-size:200% 100%;animation:s 1.4s ease-in-out infinite}
 @keyframes r{to{transform:rotate(360deg)}}
@@ -123,11 +125,11 @@ def render(spa_url: str) -> str:
     return (
         '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8" />'
         '<meta name="viewport" content="width=device-width, initial-scale=1.0" />'
-        '<meta name="robots" content="noindex" /><meta name="theme-color" content="#1e6ae1" />'
+        '<meta name="robots" content="noindex" /><meta name="theme-color" content="#f5f1ea" />'
         '<title>Keepsake</title>'
         f'<meta http-equiv="Content-Security-Policy" content="{csp}" />'
         f'<style>{_CSS}</style></head><body>'
-        '<header><span class="brand">Keepsake</span><nav aria-hidden="true"><span>Ask</span><span>Gallery</span><span>Albums</span>'
+        '<header><span class="brand"><span class="mark"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19.5s-7-4.3-7-9.4A3.9 3.9 0 0 1 12 7.8a3.9 3.9 0 0 1 7 2.3c0 5.1-7 9.4-7 9.4z"/></svg></span>Keepsake</span><nav aria-hidden="true"><span>Ask</span><span>Gallery</span><span>Albums</span>'
         '<span>People</span><span>Explore</span><span>Tools</span></nav></header>'
         '<main><h1>Gallery</h1><p class="sub" role="status"><span class="spin" aria-hidden="true"></span>Opening your library…</p>'
         f'<div class="grid" aria-hidden="true">{tiles}</div>'
