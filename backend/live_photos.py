@@ -10,7 +10,9 @@ video of at most ``LIVE_CLIP_MAX_SECONDS`` that carries one counts too. Pairing 
 identifier, which both halves carry (the photo in its maker notes, decoded by the browser's exiftool), then the
 capture time within ``CAPTURE_TOLERANCE`` seconds among files sharing a base name (a clip's recording starts up
 to ~5 s before its still is taken), then -- while a photo's EXIF is not processed yet -- the exact name and the
-files' modified times. Export renames copies (``IMG_1234 (2).MOV``) and uploads de-duplicate names
+files' modified times. Whichever half finalizes second looks for the other across the library, and a still
+looks once more when its EXIF is first read with the identifier, so halves uploaded in separate batches pair in
+either order. Export renames copies (``IMG_1234 (2).MOV``) and uploads de-duplicate names
 (``IMG_1234-1a2b3c4d.HEIC``), so the base name drops both suffixes.
 
 Measured on 2,000 photos and 830 videos of a real "Export Unmodified Originals" folder against Apple's

@@ -924,6 +924,8 @@ def metadata_updates_affect_sort_index(updates: Dict) -> bool:
 DURABLE_INDEX_UPDATES = bool(os.getenv('INDEX_MAINTENANCE_QUEUE_NAME', '').strip())
 METADATA_INDEX_REQUEST_HOOK = None
 PEOPLE_EMBEDDING_MODEL_VERSION_HOOK = None
+# app.attach_live_photo_after_upload: pairs a Live Photo's still once its EXIF is read (see live_photos.py).
+LIVE_PHOTO_EXIF_HOOK = None
 
 
 def track_index_source_table(table, source):
@@ -11316,21 +11318,41 @@ def apply_client_processing_results_for_file(
             _unstick_claimed_steps_still_running(user_id, filename, claimed_steps, str(exc))
         raise
     if consolidated:
-        return timed_call('persistence', _commit_worker_processing_results,
-                          user_id, filename, baseline, metadata, batch, lease_owner,
-                          require_unexpired=expected_processing_revision is not None)
-    if browser_consolidated:
-        return timed_call('persistence', _commit_browser_processing_results,
-                          user_id, filename, baseline, metadata, batch)
-    exif_updates = {key: metadata.get(key) for key in _EXIF_RESULT_FIELDS
-                    if metadata.get(key) != exif_baseline[key]}
-    timed_call('persistence', refresh_metadata_entity, user_id, filename, {
-        **exif_updates,
-        'processing_lease_owner': '',
-        'processing_lease': '',
-        'processing_lease_expires_at': '',
-    })
-    return metadata
+        result = timed_call('persistence', _commit_worker_processing_results,
+                            user_id, filename, baseline, metadata, batch, lease_owner,
+                            require_unexpired=expected_processing_revision is not None)
+    elif browser_consolidated:
+        result = timed_call('persistence', _commit_browser_processing_results,
+                            user_id, filename, baseline, metadata, batch)
+    else:
+        exif_updates = {key: metadata.get(key) for key in _EXIF_RESULT_FIELDS
+                        if metadata.get(key) != exif_baseline[key]}
+        timed_call('persistence', refresh_metadata_entity, user_id, filename, {
+            **exif_updates,
+            'processing_lease_owner': '',
+            'processing_lease': '',
+            'processing_lease_expires_at': '',
+        })
+        result = metadata
+    _pair_live_photo_after_exif(user_id, filename, exif_baseline['exifData'], result)
+    return result
+
+
+def _pair_live_photo_after_exif(user_id, filename, exif_before, row):
+    """A Live Photo's still whose EXIF was just read. When it finalized after its clip, before its EXIF was read
+    (always so when processing runs in the worker), only the exact name and modified time could pair it; Apple's
+    content identifier can now. Only the first read showing the identifier looks; never fails the result."""
+    def content_id(raw):
+        exif = _safe_json_load(raw)
+        return exif.get('ContentIdentifier') if isinstance(exif, dict) else None
+
+    hook = LIVE_PHOTO_EXIF_HOOK
+    if hook is None or not isinstance(row, dict) or not content_id(row.get('exifData')) or content_id(exif_before):
+        return
+    try:
+        hook(user_id, filename, row)
+    except Exception:
+        _LOGGER.warning('Live Photo pairing after EXIF failed for %s', filename, exc_info=True)
 
 
 def qualify_completed_processing(user_id, filename, lease):
