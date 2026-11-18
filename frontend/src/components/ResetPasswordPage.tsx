@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import * as passwordAuth from '../services/passwordAuthClient';
-import { Check as CheckIcon, Plus as PlusIcon, TriangleAlert as AlertIcon } from 'lucide-react';
+import { Check as CheckIcon, Link2Off as LinkOffIcon, Plus as PlusIcon, TriangleAlert as AlertIcon } from 'lucide-react';
 import AuthShell from './shared/AuthShell';
 import AuthField from './shared/AuthField';
 import { MIN_PASSWORD_LENGTH } from './shared/passwordRules';
@@ -16,6 +16,8 @@ const ResetPasswordPage: React.FC = () => {
     const [pending, setPending] = useState(false);
     const [errorMessage, setErrorMessage] = useState('');
     const [done, setDone] = useState(false);
+    // The server refused the token (used, expired or never issued): say so and point back to sign-in.
+    const [linkEnded, setLinkEnded] = useState(false);
     // Hard navigation: this page can render under a router that only knows
     // the /reset-password route (see PrototypeApp).
     const goToSignIn = () => { window.location.href = '/login'; };
@@ -36,7 +38,12 @@ const ResetPasswordPage: React.FC = () => {
             await passwordAuth.resetPassword(token, newPassword);
             setDone(true);
         } catch (error) {
-            setErrorMessage(error instanceof Error ? error.message : 'Could not reset password.');
+            const message = error instanceof Error ? error.message : 'Could not reset password.';
+            if (/invalid or has expired/i.test(message)) {
+                setLinkEnded(true);
+            } else {
+                setErrorMessage(message);
+            }
         } finally {
             setPending(false);
         }
@@ -46,9 +53,18 @@ const ResetPasswordPage: React.FC = () => {
     const matches = confirm.length > 0 && newPassword === confirm;
 
     return (
-        <AuthShell title="Choose a new password" subtitle="You'll use it the next time you sign in.">
-            {!token ? (
-                <p className="auth-msg box" role="alert"><AlertIcon aria-hidden="true" /><span>This link is missing its reset token. Request a new reset email from the sign-in page.</span></p>
+        <AuthShell
+            title={!token || linkEnded ? 'Password reset' : 'Choose a new password'}
+            subtitle={!token || linkEnded ? undefined : "You'll use it the next time you sign in."}
+        >
+            {!token || linkEnded ? (
+                <div className="auth-center">
+                    <span className="auth-bigicon"><LinkOffIcon aria-hidden="true" /></span>
+                    <h2>This link no longer works</h2>
+                    <p className="auth-note">It may have expired, or it has already been used.</p>
+                    <p className="auth-note">Ask for a new one from the sign-in page.</p>
+                    <button type="button" className="auth-btn top" onClick={goToSignIn}>Back to sign in</button>
+                </div>
             ) : done ? (
                 <div className="auth-center">
                     <p className="auth-note ok">Your password has been reset. You can now sign in.</p>

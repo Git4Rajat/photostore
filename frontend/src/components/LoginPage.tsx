@@ -24,14 +24,13 @@ const isValidEmail = (value: string): boolean => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.te
 
 const FIELD_IDS = { email: 'owner-email', password: 'owner-password' };
 
-const PasswordLogin: React.FC<{ onAuthenticated?: () => Promise<void> }> = ({ onAuthenticated }) => {
-    const [email, setEmail] = useState(() => passwordAuth.getEmailHint());
+const PasswordLogin: React.FC<{ initialEmail?: string; onAuthenticated?: () => Promise<void>; onResetSent: (email: string) => void }> = ({ initialEmail, onAuthenticated, onResetSent }) => {
+    const [email, setEmail] = useState(() => initialEmail || passwordAuth.getEmailHint());
     const [password, setPassword] = useState('');
     const [pending, setPending] = useState(false);
     const [errorMessage, setErrorMessage] = useState('');
     // Which fields the message is about: a failed sign-in does not say which half was wrong, so both are marked.
     const [badFields, setBadFields] = useState<Array<'email' | 'password'>>([]);
-    const [sentTo, setSentTo] = useState('');
 
     const fail = (message: string, fields: Array<'email' | 'password'>) => {
         setErrorMessage(message);
@@ -82,26 +81,9 @@ const PasswordLogin: React.FC<{ onAuthenticated?: () => Promise<void> }> = ({ on
         } finally {
             // Always show the same confirmation regardless of outcome so we
             // never reveal whether an address is actually on file.
-            setSentTo(email.trim());
+            onResetSent(email.trim());
         }
     };
-
-    if (sentTo) {
-        return (
-            <div className="auth-center">
-                <span className="auth-bigicon"><MailIcon aria-hidden="true" /></span>
-                <h2>Check your email</h2>
-                <p className="auth-note">
-                    If {sentTo} has an account, we've sent a link to choose a new password. It works for one hour.
-                </p>
-                <button type="button" className="auth-btn top" onClick={() => setSentTo('')}>Back to sign in</button>
-                <p className="auth-note">
-                    Nothing after a few minutes? Check spam, or{' '}
-                    <button type="button" className="auth-link" onClick={handleForgot}>send it again</button>.
-                </p>
-            </div>
-        );
-    }
 
     return (
         <form className="auth-form" onSubmit={handleLogin} noValidate>
@@ -145,10 +127,36 @@ const PasswordLogin: React.FC<{ onAuthenticated?: () => Promise<void> }> = ({ on
     );
 };
 
+const ResetSent: React.FC<{ email: string; onBack: () => void }> = ({ email, onBack }) => {
+    const resend = async () => {
+        try {
+            await passwordAuth.requestPasswordReset(email);
+        } catch {
+            // Same page whatever happens, so nothing about the address leaks.
+        }
+    };
+    return (
+        <div className="auth-center">
+            <span className="auth-bigicon"><MailIcon aria-hidden="true" /></span>
+            <h2>Check your email</h2>
+            <p className="auth-note">
+                If {email} has an account, we've sent a link to choose a new password. It works for one hour.
+            </p>
+            <button type="button" className="auth-btn top" onClick={onBack}>Back to sign in</button>
+            <p className="auth-note">
+                Nothing after a few minutes? Check spam, or{' '}
+                <button type="button" className="auth-link" onClick={resend}>send it again</button>.
+            </p>
+        </div>
+    );
+};
+
 const LoginPage: React.FC<LoginPageProps> = ({ authEnabled, authReady, displayName, onSignIn, onAuthenticated }) => {
     const [pending, setPending] = useState(false);
     const [errorMessage, setErrorMessage] = useState('');
     const [localUser, setLocalUser] = useState('');
+    const [sentTo, setSentTo] = useState('');
+    const [lastEmail, setLastEmail] = useState('');
     const navigate = useNavigate();
     const passwordMode = isPasswordMode();
 
@@ -171,12 +179,20 @@ const LoginPage: React.FC<LoginPageProps> = ({ authEnabled, authReady, displayNa
         }
     };
 
+    if (passwordMode && sentTo) {
+        return (
+            <AuthShell title="Check your email" bare>
+                <ResetSent email={sentTo} onBack={() => { setLastEmail(sentTo); setSentTo(''); }} />
+            </AuthShell>
+        );
+    }
+
     return (
         <AuthShell title="Welcome back" subtitle="Sign in to your photos and videos.">
             {passwordMode ? (
                 <>
                     {authReady && displayName && <p className="auth-note ok">You are signed in as {displayName}.</p>}
-                    <PasswordLogin onAuthenticated={onAuthenticated} />
+                    <PasswordLogin initialEmail={lastEmail} onAuthenticated={onAuthenticated} onResetSent={setSentTo} />
                     <div className="auth-foot">Invited by someone? Open the link in your invite email.</div>
                 </>
             ) : !authEnabled ? (

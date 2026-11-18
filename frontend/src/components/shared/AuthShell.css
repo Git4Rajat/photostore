@@ -39,6 +39,8 @@
 }
 
 .auth-brand-lockup { display: none; }
+.auth-brand.bare { padding: 0; }
+.auth-brand.bare + .auth-center { margin-top: 16vh; }
 
 .auth-title {
   margin: 8px 0 0;
@@ -246,6 +248,7 @@
   .auth-brand { align-items: flex-start; gap: 0; padding: 0; text-align: left; }
   .auth-brand-mark { display: none; }
   .auth-brand-lockup { display: inline-flex; margin-bottom: 14px; gap: 7px; }
+  .auth-brand.bare > .auth-brand-lockup { margin-bottom: 0; }
   .auth-brand-lockup .logo-wordmark { font-family: var(--font-display); font-size: 14px; font-weight: 600; }
   .auth-title { margin: 0 0 14px; font-size: 32px; }
   .auth-subtitle { max-width: none; font-size: 14px; }
