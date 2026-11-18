@@ -171,7 +171,7 @@ def list_albums():
     for row in rows:
         if app._coerce_bool(row.get('deleted')):
             continue
-        cover = app._album_cover_thumbnail_url(user_id, app.album_store.sample(row, 50))
+        cover = app._album_cover_thumbnail_url(user_id, app.album_store.sample(row, 50), row)
         albums.append(app._album_entity_to_payload(row, cover_thumbnail_url=cover))
     return app.jsonify({'albums': albums})
 
@@ -232,7 +232,7 @@ def get_album(album_id: str):
         return app.jsonify({'error': 'Failed to load album'}), 500
     if not entity or app._coerce_bool(entity.get('deleted')):
         return app.jsonify({'error': 'Album not found'}), 404
-    cover = app._album_cover_thumbnail_url(user_id, app.album_store.sample(entity, 50))
+    cover = app._album_cover_thumbnail_url(user_id, app.album_store.sample(entity, 50), entity)
     payload = app._album_entity_to_payload(entity, cover_thumbnail_url=cover)
     # Optional paging: ?offset=&limit= returns just that window of the album (in album order), so a
     # big album opens on its first screenful instead of after every photo has been looked up.
@@ -506,6 +506,7 @@ def autocreate_albums():
         except app.album_store.AlbumTooLarge:
             filenames, truncated = app.album_store.fit(filenames)     # no members table: keep what fits
             app.album_store.write_filenames(entity, filenames)
+            app.album_store.choose_cover(entity, filenames)
         app._save_album_entity(entity)
         payload = app._album_entity_to_payload(entity)
         # `count` is the number of albums made (always 1); `photoCount` is what the user sees.

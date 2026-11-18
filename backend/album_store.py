@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 CHUNK_UTF16_UNITS = 28000      # < 32K, leaves headroom for escaping
 MAX_CHUNKS = 14                # ~392K UTF-16 units ~= 784 KB, under the 1 MB row limit
@@ -124,6 +124,59 @@ _POOL = 8
 def configure(members_table) -> None:
     global _MEMBERS
     _MEMBERS = members_table
+
+
+# --- cover ---------------------------------------------------------------------------------------
+#
+# An album's cover is chosen ONCE (rating -> likes -> recency -> filename, by the picker the app wires in)
+# and stored on the row as ``coverFilename``. Nothing recomputes it afterwards, so likes, ratings,
+# uploads and index rebuilds can no longer make it change. It is re-chosen only when it has to be: the
+# album had no cover yet (new/empty/legacy) or its cover photo left the album.
+
+def _library_picker(user_id: str, names: List[str]) -> str:
+    """rating -> likes -> recency -> filename over the library's local database; '' while it is not ready."""
+    import search_db
+    db = search_db.open_database(user_id)
+    if db is None:
+        return ''
+    best = db.top_rated(names, limit=1)
+    return best[0] if best else ''
+
+
+_COVER_PICKER: Optional[Callable[[str, List[str]], str]] = _library_picker
+
+
+def configure_cover_picker(picker: Optional[Callable[[str, List[str]], str]]) -> None:
+    """``picker(user_id, filenames)`` returns the best cover among them ('' if it cannot decide)."""
+    global _COVER_PICKER
+    _COVER_PICKER = picker
+
+
+def cover_of(entity: Dict) -> str:
+    return str(entity.get('coverFilename') or '')
+
+
+def pick_cover(user_id: str, names: List[str]) -> str:
+    names = [n for n in dict.fromkeys(names) if n]
+    if not names:
+        return ''
+    if _COVER_PICKER is not None:
+        try:
+            best = _COVER_PICKER(user_id, names)
+            if best:
+                return best
+        except Exception:
+            pass
+    return ''
+
+
+def choose_cover(entity: Dict, names: List[str]) -> None:
+    """Set ``entity['coverFilename']`` from ``names``; keeps the old value if nothing can be picked."""
+    picked = pick_cover(str(entity.get('PartitionKey') or ''), names)
+    if picked:
+        entity['coverFilename'] = picked
+    elif not names:
+        entity['coverFilename'] = ''
 
 
 def members_available() -> bool:
@@ -256,6 +309,8 @@ def add(entity: Dict, names: List[str]) -> List[str]:
         new = [n for n in names if n not in have]
         _write_members(entity, new)
         entity['photoCount'] = count(entity) + len(new)
+        if not cover_of(entity):
+            choose_cover(entity, new)
         return new
     current = read_filenames(entity)
     have = set(current)
@@ -263,11 +318,13 @@ def add(entity: Dict, names: List[str]) -> List[str]:
     combined = current + new
     if _MEMBERS is not None and len(combined) > INLINE_MAX_PHOTOS:
         _promote(entity, combined)
-        return new
-    try:
-        write_filenames(entity, combined)
-    except AlbumTooLarge:
-        _promote(entity, combined)
+    else:
+        try:
+            write_filenames(entity, combined)
+        except AlbumTooLarge:
+            _promote(entity, combined)
+    if not cover_of(entity):
+        choose_cover(entity, combined)
     return new
 
 
@@ -282,12 +339,17 @@ def remove(entity: Dict, names: List[str]) -> List[str]:
         pk = _pk(entity)
         _transact([('delete', {'PartitionKey': pk, 'RowKey': n}) for n in gone])
         entity['photoCount'] = max(0, count(entity) - len(gone))
+        if cover_of(entity) in gone:
+            choose_cover(entity, sample(entity))
         return gone
     current = read_filenames(entity)
     drop = set(names)
     gone = [n for n in current if n in drop]
     if gone:
-        write_filenames(entity, [n for n in current if n not in drop])
+        remaining = [n for n in current if n not in drop]
+        write_filenames(entity, remaining)
+        if cover_of(entity) in gone:
+            choose_cover(entity, remaining)
     return gone
 
 
@@ -295,11 +357,12 @@ def set_all(entity: Dict, names: List[str]) -> None:
     """Replace the whole list on a NEW entity (creation paths)."""
     if _MEMBERS is not None and len(names) > INLINE_MAX_PHOTOS:
         _promote(entity, names)
-        return
-    try:
-        write_filenames(entity, names)
-    except AlbumTooLarge:
-        _promote(entity, names)
+    else:
+        try:
+            write_filenames(entity, names)
+        except AlbumTooLarge:
+            _promote(entity, names)
+    choose_cover(entity, names)
 
 
 def delete_members(entity: Dict) -> None:

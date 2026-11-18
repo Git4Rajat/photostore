@@ -7204,6 +7204,30 @@ def _album_share_fields(row: Dict) -> Dict[str, object]:
     }
 
 
+def _album_cover_for_index(row: Dict, names: List[str], albums_table_client, *, strict: bool = False) -> str:
+    """The album's stored cover. Covers are chosen once (album_store) and never recomputed here, so
+    an index rebuild cannot change them. A row with none yet (created before covers were stored) gets
+    one chosen from its photos and persisted -- once. Nothing is persisted when no choice can be made
+    (library database not ready): the first photo stands in, and the choice is made on a later build."""
+    stored = album_store.cover_of(row)
+    if stored:
+        return stored
+    if not names:
+        return ''
+    album_store.choose_cover(row, names)
+    picked = album_store.cover_of(row)
+    if not picked:
+        if strict:
+            raise RuntimeError('Album cover search produced no result')
+        return names[0]
+    try:
+        albums_table_client.update_entity(
+            {'PartitionKey': row['PartitionKey'], 'RowKey': row['RowKey'], 'coverFilename': picked}, mode='merge')
+    except Exception:
+        _LOGGER.warning('Could not persist album cover for %s', row.get('RowKey'), exc_info=True)
+    return picked
+
+
 def _build_user_albums_index_snapshot(user_id: str, source_version: str) -> Optional[LexicalIndexSnapshot]:
     albums_table_client = _CTX.get('albums_table_client')
     if albums_table_client is None:
@@ -7216,28 +7240,6 @@ def _build_user_albums_index_snapshot(user_id: str, source_version: str) -> Opti
         # dirty:false state (see refresh_user_sort_index's identical note).
         return None
 
-    # Covers come from the library database (highest rating, then most likes, then newest): a SQL
-    # lookup per album, so memory does not grow with the library. Without a database yet the first
-    # photo in album order stands in. (This used to load every photo's sort-index row into a dict --
-    # hundreds of MB at a million photos.)
-    import search_db
-    try:
-        library_db = search_db.open_database(user_id)
-    except Exception:
-        library_db = None
-
-    def _cover(names: List[str]) -> str:
-        if not names:
-            return ''
-        if library_db is not None:
-            try:
-                best = library_db.top_rated(names, limit=1)
-                if best:
-                    return best[0]
-            except Exception:
-                _LOGGER.warning('Album cover lookup failed', exc_info=True)
-        return names[0]
-
     trimmed_rows: List[Dict[str, object]] = []
     for row in rows:
         album_id = str(row.get('RowKey') or '').strip()
@@ -7245,12 +7247,14 @@ def _build_user_albums_index_snapshot(user_id: str, source_version: str) -> Opti
             continue
         if str(row.get('deleted') or '').strip().lower() in ('true', '1'):
             continue
-        filenames = album_store.sample(row) if album_store.is_table_backed(row) else album_store.read_filenames(row)
+        # Names are only read for an album that has no stored cover yet.
+        filenames = [] if album_store.cover_of(row) else (
+            album_store.sample(row) if album_store.is_table_backed(row) else album_store.read_filenames(row))
         trimmed_rows.append({
             'albumId': album_id,
             'name': str(row.get('name') or ''),
             'photoCount': album_store.count(row),
-            'coverFilename': _cover(filenames),
+            'coverFilename': _album_cover_for_index(row, filenames, albums_table_client),
             'updatedAt': str(row.get('updatedAt') or ''),
             **_album_share_fields(row),
         })
@@ -7286,22 +7290,6 @@ def _incremental_albums_index_snapshot(
             return index_merge_diagnostics.record('albums', 'search_database_unavailable')
         return None  # Readiness check recorded the precise reason.
 
-    def _cover(names: List[str]) -> str:
-        if not names:
-            return ''
-        if library_db is not None:
-            try:
-                best = library_db.top_rated(names, limit=1)
-                if best:
-                    return best[0]
-            except Exception:
-                if incremental_only:
-                    raise
-                pass
-        if incremental_only:
-            raise RuntimeError('Album cover search produced no result')
-        return names[0] if names else ''
-
     # Fetch only affected albums
     try:
         affected_rows = {}
@@ -7334,7 +7322,7 @@ def _incremental_albums_index_snapshot(
             'albumId': album_id,
             'name': str(row.get('name') or ''),
             'photoCount': album_store.count(row),
-            'coverFilename': _cover(filenames),
+            'coverFilename': _album_cover_for_index(row, filenames, albums_table_client, strict=incremental_only),
             'updatedAt': str(row.get('updatedAt') or ''),
             **_album_share_fields(row),
         }

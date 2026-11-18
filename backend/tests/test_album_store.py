@@ -106,7 +106,7 @@ def _album_world(monkeypatch, count=50):
     monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('u1', None))
     monkeypatch.setattr(app, '_albums_table_available', lambda: True)
     monkeypatch.setattr(app, '_load_album_entity', lambda uid, aid, **kwargs: entity)
-    monkeypatch.setattr(app, '_album_cover_thumbnail_url', lambda uid, names: '')
+    monkeypatch.setattr(app, '_album_cover_thumbnail_url', lambda uid, names, entity=None: '')
     monkeypatch.setattr(app, '_load_people_name_index', lambda uid: ({}, {}))
     monkeypatch.setattr(app, '_build_photo_summaries_page', lambda uid, items, pn: [{'filename': n} for n, _ in items])
     return meta, names
