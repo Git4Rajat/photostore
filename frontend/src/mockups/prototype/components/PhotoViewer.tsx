@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Wrench as WorkbenchIcon } from 'lucide-react';
 import {
     AddToAlbumGlyph as AddToAlbumIcon,
-    BenchGlyph as WorkbenchIcon,
     PinGlyph as MapPinIcon,
     DownloadGlyph as DownloadIcon,
     HeartGlyph as Heart,
