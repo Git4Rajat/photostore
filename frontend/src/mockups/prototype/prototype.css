@@ -1488,7 +1488,16 @@
 .pt-fp-row svg { width: 18px; height: 18px; color: var(--muted); }
 .pt-fp-dates { display: flex; gap: 10px; }
 .pt-fp-dates label { flex: 1; display: flex; flex-direction: column; gap: 4px; font-size: 0.78rem; color: var(--muted); }
-.pt-fp-dates input { min-height: 38px; }
+.pt-fp-dates label { min-width: 0; font-weight: 600; }
+.pt-fp-dates input {
+  appearance: none; -webkit-appearance: none; box-sizing: border-box; width: 100%; min-width: 0; min-height: 44px;
+  padding: 0 12px; border: 1px solid var(--lg-edge); border-radius: var(--r-sm, 12px);
+  background: var(--lg-surface-wash); color: var(--text); font: inherit; font-size: 0.9rem; font-weight: 500;
+  text-align: left; color-scheme: inherit;
+}
+.pt-fp-dates input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-color: transparent; }
+.pt-fp-dates input::-webkit-date-and-time-value { text-align: left; }
+.pt-fp-dates input::-webkit-calendar-picker-indicator { opacity: 0.7; cursor: pointer; }
 .pt-fp-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 4px; }
 .pt-fp-foot .btn { margin-left: auto; min-width: 140px; justify-content: center; }
 .pt-sheet .pt-fp-foot .btn { width: 100%; }
