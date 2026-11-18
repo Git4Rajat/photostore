@@ -78,6 +78,30 @@ const GalleryPage: React.FC = () => {
         const scroller = scrollParentOf(el);
         if (scroller) scroller.scrollTop += delta; else window.scrollBy(0, delta);
     }, [tileMin]);
+    // Entering/leaving selection mode collapses/restores the app header, which
+    // moves the grid under the finger: keep the pressed tile where it was.
+    const pressAnchorRef = useRef<{ id: string; top: number } | null>(null);
+    const rememberPress = (e: React.PointerEvent) => {
+        const el = (e.target as HTMLElement).closest<HTMLElement>('[data-tile-id]');
+        pressAnchorRef.current = el?.dataset.tileId ? { id: el.dataset.tileId, top: el.getBoundingClientRect().top } : null;
+    };
+    useLayoutEffect(() => {
+        const anchor = pressAnchorRef.current;
+        if (!anchor || !gridRef.current) return;
+        const grid = gridRef.current;
+        const settle = () => {
+            const el = Array.from(grid.querySelectorAll<HTMLElement>('[data-tile-id]')).find((t) => t.dataset.tileId === anchor.id);
+            if (!el) return;
+            const delta = el.getBoundingClientRect().top - anchor.top;
+            if (Math.abs(delta) < 1) return;
+            const scroller = scrollParentOf(el);
+            if (scroller) scroller.scrollTop += delta;
+        };
+        settle();
+        // Sticky bars and the tab bar finish laying out a frame later.
+        const raf = requestAnimationFrame(settle);
+        return () => cancelAnimationFrame(raf);
+    }, [selectMode]);
     const pendingScrollIdRef = useRef<string | null>(null);
 
     // Zoom-out steps: shrink tiles until the floor, then Days → Months → Years.
@@ -350,7 +374,7 @@ const GalleryPage: React.FC = () => {
     const levelTitle = level === 'years' ? 'Years' : level === 'months' ? (focusYear ?? 'Months') : 'Photos';
 
     return (
-        <div className="pt-gallery">
+        <div className="pt-gallery" onPointerDownCapture={rememberPress}>
             {level === 'days' && selectMode ? (
                 // While selecting, the header becomes Cancel · count · Select all (same
                 // height as the title row, so the grid doesn't jump under the finger).
