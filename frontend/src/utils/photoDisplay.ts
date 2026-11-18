@@ -22,6 +22,24 @@ const SUPPORTED_HEIC_EXTENSIONS = ['heic', 'heif', 'hif'] as const;
 // always needs a backend-converted JPEG preview.
 const SUPPORTED_JXL_EXTENSIONS = ['jxl'] as const;
 
+// Every extension the server accepts for upload: must equal ALLOWED_EXTENSIONS
+// in backend/image_utils.py (backend/tests/test_upload_extension_parity.py
+// checks it). Anything else, e.g. the .aae edit sidecars Apple Photos exports
+// beside edited originals, is rejected at upload init on every attempt, so the
+// selection handler drops it before registration instead of counting it failed.
+export const UPLOADABLE_EXTENSIONS = new Set<string>([
+    // Browser-native and Pillow-decoded stills
+    'jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif', 'tif', 'tiff', 'heic', 'heif', 'hif', 'jxl',
+    // RAW, including the backend-only formats excluded from SUPPORTED_RAW_EXTENSIONS above
+    '3fr', 'ari', 'arw', 'bay', 'cap', 'cr2', 'cr3', 'crw', 'dcr', 'dcs', 'dng', 'drf',
+    'eip', 'erf', 'fff', 'gpr', 'iiq', 'k25', 'kdc', 'lri', 'mdc', 'mef', 'mos', 'mrw',
+    'nef', 'nrw', 'orf', 'ori', 'pef', 'ptx', 'pxn', 'raf', 'raw', 'rw2', 'rwl', 'rwz',
+    'sr2', 'srf', 'srw', 'sti', 'x3f',
+    // Video
+    '3g2', '3gp', 'asf', 'avi', 'braw', 'crm', 'flv', 'm2ts', 'm2v', 'm4v', 'mkv', 'mov',
+    'mp4', 'mpeg', 'mpg', 'mts', 'mxf', 'nev', 'ogv', 'r3d', 'ts', 'vob', 'webm', 'wmv',
+]);
+
 const RAW_EXTENSIONS = new Set<string>(SUPPORTED_RAW_EXTENSIONS);
 const VIDEO_EXTENSIONS = new Set<string>(SUPPORTED_VIDEO_EXTENSIONS);
 const HEIC_EXTENSIONS = new Set<string>(SUPPORTED_HEIC_EXTENSIONS);
@@ -50,6 +68,8 @@ export const getFileExtension = (filename: string): string => {
     const match = /\.([^.]+)$/.exec(filename || '');
     return match ? match[1].toLowerCase() : '';
 };
+
+export const isUploadableFilename = (filename: string): boolean => UPLOADABLE_EXTENSIONS.has(getFileExtension(filename));
 
 export const isRawFilename = (filename: string): boolean => RAW_EXTENSIONS.has(getFileExtension(filename));
 
