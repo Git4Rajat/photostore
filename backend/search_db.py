@@ -1020,10 +1020,16 @@ DELTA_MAX_ROW_FRACTION = float(os.getenv('SEARCH_DB_DELTA_MAX_ROW_FRACTION', '0.
 DELTA_MIN_ROW_BUDGET = int(os.getenv('SEARCH_DB_DELTA_MIN_ROW_BUDGET', '5000'))
 
 
+def pending_delta_count(manifest: Dict) -> int:
+    """Deltas published since the last compaction. ``deltaSeq`` is a lifetime counter that compaction
+    keeps (it only advances ``baseSeq``), so the budget must be measured against the difference."""
+    return max(0, int(manifest.get('deltaSeq') or 0) - int(manifest.get('baseSeq') or 0))
+
+
 def delta_budget_exceeded(manifest: Dict, adding: int) -> bool:
     base_rows = max(1, int(manifest.get('rowCount') or 0))
     return (
-        int(manifest.get('deltaSeq') or 0) >= DELTA_MAX_COUNT
+        pending_delta_count(manifest) >= DELTA_MAX_COUNT
         or (int(manifest.get('deltaRows') or 0) + adding) > max(DELTA_MIN_ROW_BUDGET, DELTA_MAX_ROW_FRACTION * base_rows)
     )
 
@@ -1036,7 +1042,7 @@ def available_delta_row_capacity(manifest: Dict, max_rows_per_delta: int) -> int
     count/fraction bounds without making an oversized import an all-or-nothing
     operation.
     """
-    remaining_deltas = DELTA_MAX_COUNT - int(manifest.get('deltaSeq') or 0)
+    remaining_deltas = DELTA_MAX_COUNT - pending_delta_count(manifest)
     if remaining_deltas <= 0:
         return 0
     base_rows = max(1, int(manifest.get('rowCount') or 0))

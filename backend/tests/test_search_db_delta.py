@@ -357,3 +357,16 @@ def test_available_delta_capacity_bounds_a_100k_import_without_rejecting_progres
     assert search_db.available_delta_row_capacity(manifest, 5000) == 32500
     assert search_db.available_delta_row_capacity({**manifest, 'deltaRows': 32000}, 5000) == 500
     assert search_db.available_delta_row_capacity({**manifest, 'deltaSeq': 200}, 5000) == 0
+
+
+def test_capacity_counts_only_deltas_since_last_compaction():
+    # deltaSeq is a lifetime counter; compaction advances baseSeq to it and leaves it in place.
+    compacted = {'rowCount': 12268, 'deltaSeq': 200, 'deltaRows': 0, 'baseSeq': 200}
+    assert search_db.available_delta_row_capacity(compacted, 5000) > 0
+    assert not search_db.delta_budget_exceeded(compacted, 10)
+    pending = {**compacted, 'baseSeq': 0}
+    assert search_db.available_delta_row_capacity(pending, 5000) == 0
+    assert search_db.delta_budget_exceeded(pending, 10)
+    almost = {**compacted, 'baseSeq': 199}
+    assert search_db.available_delta_row_capacity(almost, 5000) > 0
+    assert not search_db.delta_budget_exceeded(almost, 10)
