@@ -1603,3 +1603,11 @@
 /* The viewer's Rate popover is just the five stars (as the redesign draws it): no heading, no divider. */
 .pt-viewer-bar .pt-menu-panel:has(.pt-fm-rate.solo) { min-width: 0; padding: 4px 6px; border-radius: 999px; }
 .pt-fm-rate.solo { padding: 0; margin: 0; border-bottom: 0; }
+
+/* Phones: the photo runs edge to edge (swipe navigates, so no side buttons), instead of floating
+   in a rounded box with margins. */
+@media (max-width: 805px) {
+  .pt-viewer-stage { padding: 0; gap: 0; }
+  .pt-viewer-nav { display: none; }
+  .pt-viewer-photo { height: 100%; border-radius: 0; }
+}
