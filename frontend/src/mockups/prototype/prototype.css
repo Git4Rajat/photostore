@@ -1604,10 +1604,13 @@
 .pt-viewer-bar .pt-menu-panel:has(.pt-fm-rate.solo) { min-width: 0; padding: 4px 6px; border-radius: 999px; }
 .pt-fm-rate.solo { padding: 0; margin: 0; border-bottom: 0; }
 
-/* Phones: the photo runs edge to edge (swipe navigates, so no side buttons), instead of floating
-   in a rounded box with margins. */
+/* The photo fills the whole stage (the image is contained inside it, so nothing is cropped): no
+   padding, no rounded box, and the prev/next buttons float over it instead of taking width. */
+.pt-viewer-stage { position: relative; padding: 0; gap: 0; }
+.pt-viewer-photo { height: 100%; border-radius: 0; }
+.pt-viewer-stage > .pt-viewer-nav { position: absolute; top: 50%; transform: translateY(-50%); z-index: 2; background: rgba(0,0,0,0.45); }
+.pt-viewer-stage > .pt-viewer-nav.prev { left: 14px; }
+.pt-viewer-stage > .pt-viewer-nav.next { right: 14px; }
 @media (max-width: 805px) {
-  .pt-viewer-stage { padding: 0; gap: 0; }
   .pt-viewer-nav { display: none; }
-  .pt-viewer-photo { height: 100%; border-radius: 0; }
 }
