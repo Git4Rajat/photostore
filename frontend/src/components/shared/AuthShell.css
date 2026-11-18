@@ -101,6 +101,7 @@
 }
 
 .auth-field:focus-within { box-shadow: var(--focus-ring); }
+.auth-field.ro input { color: var(--muted); }
 .auth-field.err, .auth-field.err:focus-within { box-shadow: 0 0 0 2px var(--danger); }
 
 .auth-field input {

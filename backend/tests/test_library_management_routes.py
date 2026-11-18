@@ -81,3 +81,22 @@ def test_cleanup_snapshot_does_not_reconcile_or_enqueue(management, monkeypatch)
         response = client.get(path, headers=headers('owner'))
         assert response.status_code == 200
         assert response.get_json()['cleanupInfo']['lastCleanupPhotosDeleted'] == 12
+
+
+def test_new_account_own_library_invite_names_the_library(management):
+    store, client = management
+    token = store.create_invite(library_id='owner', email='neha@example.com', target_type='fresh', invited_by='owner')
+    accepted = client.post('/api/library/invite/accept', json={'token': token, 'password': 'long-enough-1', 'libraryName': '  Neha family  '})
+    assert accepted.status_code == 200
+    neha = store.get_user_by_email('neha@example.com')['RowKey']
+    assert store.get_library(neha)['name'] == 'Neha family'
+
+
+def test_new_account_invite_library_name_defaults_to_email_and_is_ignored_when_joining(management):
+    store, client = management
+    fresh = store.create_invite(library_id='owner', email='a@example.com', target_type='fresh', invited_by='owner')
+    assert client.post('/api/library/invite/accept', json={'token': fresh, 'password': 'long-enough-1'}).status_code == 200
+    assert store.get_library(store.get_user_by_email('a@example.com')['RowKey'])['name'] == 'a@example.com'
+    join = store.create_invite(library_id='owner', email='b@example.com', target_type='join', invited_by='owner')
+    assert client.post('/api/library/invite/accept', json={'token': join, 'password': 'long-enough-1', 'libraryName': 'Nope'}).status_code == 200
+    assert store.get_library(store.get_user_by_email('b@example.com')['RowKey'])['name'] == 'b@example.com'

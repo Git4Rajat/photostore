@@ -13,12 +13,14 @@ interface AuthFieldProps {
     // Sits on the label row, right-aligned ("Forgot password?").
     labelAction?: React.ReactNode;
     describedBy?: string;
+    // Shown but not editable (an invited email address).
+    readOnly?: boolean;
 }
 
 // A labelled field from the sign-in mock-up: the label stays above the input, an invalid field is
 // ringed, and a password field gets the eye that shows what was typed.
 const AuthField: React.FC<AuthFieldProps> = ({
-    id, label, type = 'text', value, onChange, autoComplete, autoFocus, invalid = false, labelAction, describedBy,
+    id, label, type = 'text', value, onChange, autoComplete, autoFocus, invalid = false, labelAction, describedBy, readOnly = false,
 }) => {
     const [shown, setShown] = useState(false);
     const isPassword = type === 'password';
@@ -28,7 +30,7 @@ const AuthField: React.FC<AuthFieldProps> = ({
                 <label htmlFor={id}>{label}</label>
                 {labelAction}
             </div>
-            <div className={`auth-field${invalid ? ' err' : ''}`}>
+            <div className={`auth-field${invalid ? ' err' : ''}${readOnly ? ' ro' : ''}`}>
                 <input
                     id={id}
                     type={isPassword && shown ? 'text' : type}
@@ -36,6 +38,7 @@ const AuthField: React.FC<AuthFieldProps> = ({
                     onChange={(e) => onChange(e.target.value)}
                     autoComplete={autoComplete}
                     autoFocus={autoFocus}
+                    readOnly={readOnly}
                     aria-invalid={invalid || undefined}
                     aria-describedby={describedBy}
                     autoCapitalize="none"
