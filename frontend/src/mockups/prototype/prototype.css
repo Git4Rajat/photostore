@@ -1350,12 +1350,14 @@
   .pt-viewer-stage-wrap:has(.pt-viewer-info) { flex-direction: column; }
   .pt-viewer-stage-wrap:has(.pt-viewer-info) .pt-viewer-stage { flex: 0 1 40%; min-height: 200px; }
   .pt-viewer-info { flex: 1 1 auto; max-height: 60%; border-radius: 22px 22px 0 0; margin-top: 10px; }
-  /* Labelled actions, evenly spaced, sized as the redesign's action bar draws them
-     (22px icon, 10.5px label, 3px apart). */
+  /* Seven icon buttons in equal cells, as the redesign's viewer bar draws them (22px icons, no
+     labels: each button keeps its name for screen readers). Menu anchors take a cell too, so
+     Rate and More are as wide as the rest and nothing overlaps at 375px. */
   .pt-viewer-bar { justify-content: space-around; gap: 0; padding: 9px 2px calc(9px + env(safe-area-inset-bottom)); background: #18181a; border-top: 1px solid var(--lg-edge); }
   .pt-viewer-bar .pt-vb-group { display: contents; }
-  .pt-viewer-bar .pt-vb-btn span { display: inline; }
-  .pt-viewer-bar .pt-vb-btn { flex: 1 1 0; min-width: 0; min-height: 0; gap: 3px; padding: 0; font-size: 10.5px; font-weight: 600; }
+  .pt-viewer-bar .pt-vb-btn span { display: none; }
+  .pt-viewer-bar .pt-menu-anchor { flex: 1 1 0; min-width: 0; }
+  .pt-viewer-bar .pt-vb-btn { flex: 1 1 0; min-width: 0; min-height: 44px; width: 100%; gap: 0; padding: 0; }
   .pt-viewer-bar .pt-vb-btn svg { width: 22px; height: 22px; }
 }
 @media (min-width: 806px) {

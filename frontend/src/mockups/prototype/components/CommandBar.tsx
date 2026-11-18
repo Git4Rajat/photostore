@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
-import { Wrench as WrenchScrewdriverIcon, X as XMarkIcon } from 'lucide-react';
+import { X as XMarkIcon } from 'lucide-react';
 import {
     AddToAlbumGlyph as AddToAlbumIcon,
+    BenchGlyph as WrenchScrewdriverIcon,
     DownloadGlyph as DownloadIcon,
     HeartGlyph as HeartIcon,
     MoreGlyph as MoreIcon,

@@ -18,7 +18,7 @@
 .auth-pane {
   display: flex;
   justify-content: center;
-  padding: max(env(safe-area-inset-top), 4px) 24px max(env(safe-area-inset-bottom), 24px);
+  padding: max(env(safe-area-inset-top), 4px) max(24px, env(safe-area-inset-right)) max(env(safe-area-inset-bottom), 24px) max(24px, env(safe-area-inset-left));
 }
 
 .auth-box {
@@ -254,4 +254,11 @@
   .auth-title { margin: 0 0 14px; font-size: 32px; }
   .auth-subtitle { max-width: none; font-size: 14px; }
   .auth-foot { margin-top: 0; }
+}
+
+/* Paint the document the same flat colour, so the areas behind the status bar, the home indicator
+   and the browser's address bar match the screen instead of showing the app's gradient. */
+html:has(.auth-screen),
+html:has(.auth-screen) body {
+  background: var(--bg-1);
 }

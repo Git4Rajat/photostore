@@ -26,3 +26,6 @@ export const InfoGlyph = make(<><circle cx="12" cy="12" r="8.5" /><path d="M12 1
 export const StarGlyph = make(<path d="M12 4l2.4 5 5.4.6-4 3.7 1.1 5.4L12 16l-4.9 2.7 1.1-5.4-4-3.7 5.4-.6z" />);
 export const DownloadGlyph = make(<><path d="M12 4v11M7.5 10.5L12 15l4.5-4.5" /><path d="M5 19.5h14" /></>);
 export const SlidersGlyph = make(<><path d="M4 7.5h9M17 7.5h3M4 16.5h3M11 16.5h9" /><circle cx="15" cy="7.5" r="2" /><circle cx="9" cy="16.5" r="2" /></>);
+export const BenchGlyph = make(<path d="M7 3.5v13.5h13.5M3.5 7H17v13.5" />);
+export const SearchGlyph = make(<><circle cx="11" cy="11" r="6.5" /><path d="M16 16l4.5 4.5" /></>);
+export const PinGlyph = make(<><path d="M12 20.5s-6.5-5.7-6.5-10.7a6.5 6.5 0 0 1 13 0c0 5-6.5 10.7-6.5 10.7z" /><circle cx="12" cy="9.8" r="2.3" /></>);
