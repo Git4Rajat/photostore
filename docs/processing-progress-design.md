@@ -155,7 +155,7 @@ per wave.
 
 1. Backend: write `progress` with the vision page checkpoint; add `GET /api/processing`
    and dismiss. No behaviour change for clients that do not call it.
-2. Publish step events behind `PROCESSING_PROGRESS_PUSH` (default off), with the
+2. Publish step events with `PROCESSING_PROGRESS_PUSH` on by default (`false` turns it off), with the
    budget and min-interval guards and a diagnostics event per send/skip.
 3. Frontend store and bar; keep the polling fallback until push is verified live.
 4. Add cluster/index fractions only if their counters are cheap (decision after step 3
