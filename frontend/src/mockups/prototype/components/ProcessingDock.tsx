@@ -11,6 +11,7 @@ import {
 // Socket up: one safety read now and then. Socket down: follow the bar closely, but only while it is on screen.
 const POLL_WITH_PUSH_MS = 2 * 60_000;
 const POLL_WITHOUT_PUSH_MS = 20_000;
+const AFTER_UPLOAD_WATCH_MS = 15 * 60_000;
 const STEPS: Array<'vision' | 'cluster' | 'index'> = ['vision', 'cluster', 'index'];
 const STEP_COPY: Record<'vision' | 'cluster' | 'index', string> = {
     vision: 'Spotting places, things and text so they can be tagged',
@@ -58,16 +59,29 @@ export const ProcessingDock: React.FC = () => {
         return () => { off(); document.removeEventListener('visibilitychange', visible); };
     }, [load]);
 
+    // An upload that ends (finished, paused, or cancelled) starts server work this page has not
+    // heard about yet, and the push socket may be down: read right away, then keep looking for a while.
+    const [watchUntil, setWatchUntil] = useState(0);
+    const wasUploading = useRef(false);
+    useEffect(() => {
+        if (uploadActive) { wasUploading.current = true; return; }
+        if (!wasUploading.current) return;
+        wasUploading.current = false;
+        setWatchUntil(Date.now() + AFTER_UPLOAD_WATCH_MS);
+        void load();
+    }, [uploadActive, load]);
+
     const wave = waves.find((candidate) => candidate.stage !== 'done') ?? waves[0];
     const running = Boolean(wave && wave.stage !== 'done');
+    const watching = running || watchUntil > Date.now();
     useEffect(() => {
-        if (!running) return undefined;
+        if (!watching) return undefined;
         const timer = window.setInterval(() => {
             void load();
             tick((value) => value + 1); // "taking longer" is time-based
         }, isProcessingPushLive() ? POLL_WITH_PUSH_MS : POLL_WITHOUT_PUSH_MS);
         return () => window.clearInterval(timer);
-    }, [running, load]);
+    }, [watching, load]);
 
     // The upload bar owns the screen while files are still going up.
     if (!wave || uploadActive) return null;

@@ -65,6 +65,8 @@ def dispatch_outbox(work_store, store, library, outbox_key, destination):
     scope = f'wave-{destination}:{outbox["waveId"]}:{digest(outbox_key)}'
     work_store.request(library, scope, advance=False)
     store.set_dispatchable(outbox_key, dispatchable=True)
+    if destination == 'vision':
+        _announce_queued(store, outbox['waveId'], wave)
     return True
 
 
@@ -542,6 +544,18 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
     metrics.add(vision_qualification_verify_ms=(time.monotonic() - verification_started) * 1000)
     metrics.add(vision_settlement_ms=(time.monotonic() - settlement_started) * 1000)
     return observations
+
+
+def _announce_queued(store, wave_id, wave):
+    """Make a wave visible to the progress bar as soon as its vision work is queued.
+
+    Without this the bar waits for the first page of photos to finish, which on a cold
+    vision app can be minutes after an upload ends or is cancelled."""
+    try:
+        from processing_progress import ProgressStore
+        ProgressStore(store).record_vision(wave_id, 0, int(wave.get('memberCount') or 0), force=True)
+    except Exception:
+        logging.getLogger(__name__).warning('Queued progress row failed for wave %s', wave_id, exc_info=True)
 
 
 def _announce_stage(library, wave_id, stage):

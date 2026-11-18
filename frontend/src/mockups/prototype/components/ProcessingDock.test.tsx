@@ -36,6 +36,18 @@ describe('ProcessingDock', () => {
         expect(api.dismissProcessingWave).toHaveBeenCalledWith('w');
     });
 
+    it('reads again when an upload ends, so a cancelled upload shows its processing', async () => {
+        services.uploadActive = true;
+        api.fetchProcessingWaves.mockResolvedValue([]);
+        const view = render(<ProcessingDock />);
+        await waitFor(() => expect(api.fetchProcessingWaves).toHaveBeenCalledTimes(1));
+        api.fetchProcessingWaves.mockResolvedValue([wave({ done: 0, total: 40 })]);
+        services.uploadActive = false;
+        view.rerender(<ProcessingDock />);
+        await waitFor(() => expect(screen.getByText('Getting your photos ready')).toBeTruthy());
+        expect(api.fetchProcessingWaves).toHaveBeenCalledTimes(2);
+    });
+
     it('stays out of the way while files are still uploading', async () => {
         services.uploadActive = true;
         api.fetchProcessingWaves.mockResolvedValue([wave({ done: 1, total: 10 })]);

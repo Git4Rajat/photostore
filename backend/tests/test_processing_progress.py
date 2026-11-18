@@ -106,3 +106,12 @@ def test_publish_progress_is_on_by_default_budgeted_and_spaced(monkeypatch):
     assert not index_events.publish_progress('lib', 'w', 'index', force=True)  # budget is never skipped
     assert [m['stage'] for m in sent] == ['vision', 'cluster']
     assert sent[0]['type'] == 'processing-progress' and 'etaSeconds' in sent[0]
+
+
+def test_a_wave_is_visible_as_soon_as_its_vision_work_is_queued(live_api):
+    import upload_wave_execution as execution
+    _, store, _, _ = live_api
+    wave_row(store, 'w1', state='processing_pending')
+    execution._announce_queued(store, 'w1', store._get(store.wave_key('w1')))
+    waves = ProgressStore(store).active('alice')
+    assert [(w['stage'], w['done'], w['total'], w['etaSeconds']) for w in waves] == [('vision', 0, 200, None)]
