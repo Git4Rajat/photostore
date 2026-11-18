@@ -970,6 +970,60 @@ def wave_assignment_coverage(user, face_table, person_table, check, *, max_faces
 _COALESCED = ContextVar('automatic_coalesced_reservations', default=None)
 
 
+# A process-wide mark is joined by every overlapping coalesced scope instead
+# of each request opening its own: during a 16k-file upload dozens of
+# requests raced on the same control rows (31% of transactions lost), and the
+# losers failed whole upload batches. Rotate well inside the stale reaper's
+# window so a continuously busy process never holds a mark the reaper claims.
+SHARED_RESERVATION_MAX_SECONDS = float(os.getenv('INDEX_SHARED_RESERVATION_MAX_SECONDS', '300'))
+_SHARED_LOCK = threading.Lock()
+_SHARED = {}
+
+
+class _SharedMark:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.reservation = None
+        self.started = 0.0
+        self.holders = 0
+        self.failed = False
+
+
+def _join_shared(store, user, kind, *, deleted, operation):
+    key = (id(store.table), user, kind)
+    with _SHARED_LOCK:
+        mark = _SHARED.get(key)
+        if mark is None or (mark.reservation is not None
+                            and time.monotonic() - mark.started > SHARED_RESERVATION_MAX_SECONDS):
+            mark = _SharedMark()
+            _SHARED[key] = mark
+        # Counted before begin, so the mark cannot be finished under a joiner.
+        mark.holders += 1
+    try:
+        with mark.lock:
+            if mark.reservation is None:
+                mark.reservation = store.begin(
+                    user, kind, [], uncertain=True, deleted=deleted,
+                    owner=os.getenv('CONTAINER_APP_NAME') or os.getenv('HOSTNAME') or 'source_writer',
+                    operation=operation)
+                mark.started = time.monotonic()
+    except BaseException:
+        _leave_shared(store, user, kind, key, mark, failed=True)
+        raise
+    return key, mark
+
+
+def _leave_shared(store, user, kind, key, mark, *, failed):
+    with _SHARED_LOCK:
+        mark.holders -= 1
+        mark.failed = mark.failed or failed
+        last = mark.holders == 0
+        if last and _SHARED.get(key) is mark:
+            del _SHARED[key]
+    if last and mark.reservation is not None:
+        store.finish(user, kind, reservation_id=mark.reservation, failed=mark.failed)
+
+
 class _CoalescedReservations:
     """One durable reservation per (library, kind) for a whole wave source.
 
@@ -977,7 +1031,8 @@ class _CoalescedReservations:
     the per-write reservation carries no information a single open reservation
     does not. The reservation is persisted before the first write and stays
     active until the scope exits; a SIGKILL leaves it orphaned and fail-closed,
-    exactly as a mid-write crash does today.
+    exactly as a mid-write crash does today. Overlapping scopes in this process
+    share it (see _join_shared); the last one to exit finishes it.
     """
     def __init__(self):
         self.lock = threading.Lock()
@@ -988,10 +1043,8 @@ class _CoalescedReservations:
         with self.lock:
             if (user, kind) in self.held:
                 return
-            self.held[(user, kind)] = configured_store().begin(
-                user, kind, [], uncertain=True, deleted=deleted,
-                owner=os.getenv('CONTAINER_APP_NAME') or os.getenv('HOSTNAME') or 'source_writer',
-                operation=operation)
+            self.held[(user, kind)] = _join_shared(configured_store(), user, kind,
+                                                   deleted=deleted, operation=operation)
 
     def fail(self, keys):
         with self.lock:
@@ -1021,12 +1074,12 @@ def coalesced_source_reservations():
         failures = []
         if scope.held:
             store = configured_store()
-            for (user, kind), res_id in list(scope.held.items()):
+            for (user, kind), (key, mark) in list(scope.held.items()):
                 try:
-                    store.finish(user, kind, reservation_id=res_id,
-                                 failed=body_error is not None or (user, kind) in scope.failed)
+                    _leave_shared(store, user, kind, key, mark,
+                                  failed=body_error is not None or (user, kind) in scope.failed)
                 except BaseException as error:
-                    error.add_note(f'Coalesced source finish failed: library={user!r}, kind={kind}, reservation={res_id}')
+                    error.add_note(f'Coalesced source finish failed: library={user!r}, kind={kind}, reservation={mark.reservation}')
                     failures.append(error)
         if failures:
             finalization = BaseExceptionGroup('Coalesced source finalization failed; retry required', failures)
