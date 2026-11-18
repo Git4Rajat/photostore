@@ -8,6 +8,7 @@ import {
     Info as InfoIcon,
     MapPin as MapPinIcon,
     Star as StarIcon,
+    Wrench as WorkbenchIcon,
 } from 'lucide-react';
 import { Menu, Stars } from './bits';
 import { AddToAlbumMenu } from './AddToAlbumMenu';
@@ -232,6 +233,23 @@ const PhotoViewer: React.FC = () => {
                     <button type="button" className={`pt-vb-btn like${photo.liked ? ' on' : ''}`} aria-pressed={photo.liked} title="Like" onClick={() => toggleLike(photo.id)}>
                         <Heart fill={photo.liked ? 'currentColor' : 'none'} /> <span>Like</span>
                     </button>
+                    <Menu
+                        align="right"
+                        renderTrigger={(toggle) => (
+                            <button type="button" className={`pt-vb-btn rate${photo.rating ? ' on' : ''}`} title="Rate" onClick={toggle}>
+                                <StarIcon fill={photo.rating ? 'currentColor' : 'none'} /> <span>Rate</span>
+                            </button>
+                        )}
+                    >
+                        {(close) => (
+                            <div className="pt-more-menu">
+                                <div className="pt-fm-rate">
+                                    <span><StarIcon /> Your rating</span>
+                                    <Stars value={photo.rating} onRate={(n) => { ratePhotos([photo.id], n); close(); }} size={22} />
+                                </div>
+                            </div>
+                        )}
+                    </Menu>
                     <button type="button" className={`pt-vb-btn info${showInfo ? ' on' : ''}`} aria-pressed={showInfo} title="Info" onClick={() => setShowInfo((v) => !v)}>
                         <InfoIcon /> <span>Info</span>
                     </button>
@@ -244,6 +262,9 @@ const PhotoViewer: React.FC = () => {
                             </button>
                         )}
                     />
+                    <button type="button" className="pt-vb-btn" title="Open in Workbench" onClick={() => navigate('tools', { filenames: photo.filename })}>
+                        <WorkbenchIcon /> <span>Workbench</span>
+                    </button>
                     <Menu
                         align="right"
                         renderTrigger={(toggle) => (
@@ -254,12 +275,7 @@ const PhotoViewer: React.FC = () => {
                     >
                         {(close) => (
                             <div className="pt-more-menu">
-                                <div className="pt-fm-rate">
-                                    <span><StarIcon /> Rating</span>
-                                    <Stars value={photo.rating} onRate={(n) => ratePhotos([photo.id], n)} size={20} />
-                                </div>
                                 <button type="button" onClick={() => { close(); startDownload(); }}>Download</button>
-                                <button type="button" onClick={() => { close(); navigate('tools', { filenames: photo.filename }); }}>Open in Workbench</button>
                                 {route.page !== 'gallery' && (
                                     <button
                                         type="button"

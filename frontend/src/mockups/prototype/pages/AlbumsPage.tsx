@@ -33,6 +33,7 @@ import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQue
 import { tileImage, useMainMedia } from '../media';
 import { useLongPress } from '../../../services/useLongPress';
 import type { Album, Photo } from '../types';
+import { albumDisplayName } from '../../../utils/albumName';
 
 const SMART_ALBUM_RULES: Array<{ id: string; label: string; description: string; Icon: React.ComponentType<React.SVGProps<SVGSVGElement>> }> = [
     { id: 'location', label: 'By location', description: 'Places across the library', Icon: MapPinIcon },
@@ -80,7 +81,7 @@ const AlbumCard: React.FC<{
                 {cover ? <img src={cover} alt="" draggable={false} /> : <Swatch swatch={swatchFor(album.id)} className="pt-album-card-swatch" />}
                 {selecting && <span className={`pt-album-row-check${checked ? ' on' : ''}`} aria-hidden="true"><CheckIcon /></span>}
             </span>
-            <b>{album.name}</b>
+            <b>{albumDisplayName(album.name)}</b>
             <span>{album.isPublic && <LinkIcon aria-label="Shared" />}{plural(album.photoCount, 'item')}{album.isPublic ? ' · Shared' : ''}</span>
         </button>
     );
@@ -179,7 +180,7 @@ export const AlbumsPage: React.FC = () => {
     const confirmDeleteAlbum = async () => {
         if (!album) return;
         const confirmed = await confirmDialog({
-            title: `Delete “${album.name}”?`,
+            title: `Delete “${albumDisplayName(album.name)}”?`,
             message: 'The photos inside stay in your library — only the album is removed.',
             confirmLabel: 'Delete',
             danger: true,
@@ -388,7 +389,7 @@ export const AlbumsPage: React.FC = () => {
                             <span className="pt-album-row-cover empty" />
                         )}
                         <span className="pt-album-row-meta">
-                            <b>{a.name}</b>
+                            <b>{albumDisplayName(a.name)}</b>
                             <span>{plural(a.photoCount, 'item')}{a.isPublic ? ' · Shared' : ''}</span>
                         </span>
                     </button>
@@ -482,7 +483,7 @@ export const AlbumsPage: React.FC = () => {
                                 <ChevronLeftIcon />
                             </button>
                             <div className="pt-album-hero-text">
-                                <h1 className="pt-album-hero-name">{album.name}</h1>
+                                <h1 className="pt-album-hero-name">{albumDisplayName(album.name)}</h1>
                                 <p>{plural(album.photoCount, 'item')}{span ? ` · ${span}` : ''}</p>
                             </div>
                         </div>

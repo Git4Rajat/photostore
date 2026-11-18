@@ -663,8 +663,12 @@
 .pt-fm-rate > span svg { width: 16px; height: 16px; }
 @media (max-width: 805px) {
   /* Edge to edge where the tab bar was, same height and safe-area padding. */
-  .pt-action-bar { left: 0; right: 0; bottom: 0; transform: none; justify-content: space-around; gap: 0; padding: 6px 4px calc(6px + env(safe-area-inset-bottom)); border-radius: 0; border-width: 1px 0 0; box-shadow: none; }
-  .pt-ab-btn { flex: 1; min-width: 0; }
+  .pt-action-bar { left: 0; right: 0; bottom: 0; transform: none; justify-content: space-around; gap: 0; padding: 9px 2px calc(9px + env(safe-area-inset-bottom)); border-radius: 0; border-width: 1px 0 0; box-shadow: none; }
+  .pt-ab-btn { flex: 1; min-width: 0; min-height: 0; padding: 0; font-size: 10.5px; }
+  /* While selecting, Cancel · count · Select all replaces the app header (as in the redesign),
+     and sits on a solid bar so photos never show through it. */
+  .pt-shell .mock-app:has(.pt-select-head) > .ios-header { display: none; }
+  .pt-select-head { top: 0; margin: 0 0 8px; padding-top: calc(8px + env(safe-area-inset-top)); padding-bottom: 8px; background: var(--bg-1); }
 }
 
 /* ---- floating menu (centered, compact, minimal delete + options) ---- */
@@ -1322,6 +1326,7 @@
 .pt-viewer-back:hover { background: rgba(255,255,255,0.08); }
 .pt-viewer-back svg { width: 22px; height: 22px; }
 .pt-vb-btn.like.on { color: var(--like); }
+.pt-vb-btn.rate.on { color: var(--star); }
 .pt-vb-btn.info.on { color: var(--viewer-accent); }
 .pt-vb-btn.wide-only { display: none; }
 /* Info is part of the layout, never over the photo. */
@@ -1343,11 +1348,13 @@
   .pt-viewer-stage-wrap:has(.pt-viewer-info) { flex-direction: column; }
   .pt-viewer-stage-wrap:has(.pt-viewer-info) .pt-viewer-stage { flex: 0 1 40%; min-height: 200px; }
   .pt-viewer-info { flex: 1 1 auto; max-height: 60%; border-radius: 22px 22px 0 0; margin-top: 10px; }
-  /* Five labelled actions, evenly spaced. */
-  .pt-viewer-bar { justify-content: space-around; background: #18181a; }
+  /* Labelled actions, evenly spaced, sized as the redesign's action bar draws them
+     (22px icon, 10.5px label, 3px apart). */
+  .pt-viewer-bar { justify-content: space-around; gap: 0; padding: 9px 2px calc(9px + env(safe-area-inset-bottom)); background: #18181a; border-top: 1px solid var(--lg-edge); }
   .pt-viewer-bar .pt-vb-group { display: contents; }
   .pt-viewer-bar .pt-vb-btn span { display: inline; }
-  .pt-viewer-bar .pt-vb-btn { font-size: 0.66rem; font-weight: 600; }
+  .pt-viewer-bar .pt-vb-btn { flex: 1 1 0; min-width: 0; min-height: 0; gap: 3px; padding: 0; font-size: 10.5px; font-weight: 600; }
+  .pt-viewer-bar .pt-vb-btn svg { width: 22px; height: 22px; }
 }
 @media (min-width: 806px) {
   /* Desktops: title left, actions as icon buttons top right, info in a column beside the photo. */

@@ -50,13 +50,13 @@ const CommandBar: React.FC = () => {
     // short gap keeps each from being dropped.
     const downloadSelection = async () => {
         const photos = selection.map((id) => photoById(id)).filter((p): p is NonNullable<typeof p> => Boolean(p));
-        toast(photos.length === 1 ? 'Download started' : `Downloading  items…`);
+        toast(photos.length === 1 ? 'Download started' : `Downloading ${photos.length} items…`);
         let failed = 0;
         for (const photo of photos) {
             try { await downloadPhoto(photo); } catch { failed += 1; }
             await new Promise((resolve) => setTimeout(resolve, 400));
         }
-        if (failed) toast(` of  couldn’t be downloaded`, undefined, undefined, 'error');
+        if (failed) toast(`${failed} of ${photos.length} couldn’t be downloaded`, undefined, undefined, 'error');
     };
 
     return (
@@ -83,21 +83,34 @@ const CommandBar: React.FC = () => {
                 align="right"
                 renderTrigger={(toggle) => (
                     <button type="button" className="pt-ab-btn" disabled={none} onClick={toggle}>
-                        <MoreIcon /> <span>More</span>
+                        <StarIcon /> <span>Rate</span>
                     </button>
                 )}
             >
                 {(close) => (
                     <div className="pt-fm-menu">
                         <div className="pt-fm-rate">
-                            <span><StarIcon /> Rate</span>
-                            <Stars value={0} onRate={(n) => { ratePhotos(selection, n); toast(`Rated ${selection.length} · ${n}★`); close(); clearSelection(); }} size={20} />
+                            <span><StarIcon /> Rate {selection.length > 1 ? `${selection.length} items` : 'item'}</span>
+                            <Stars value={0} onRate={(n) => { ratePhotos(selection, n); toast(`Rated ${selection.length} · ${n}★`); close(); clearSelection(); }} size={22} />
                         </div>
+                    </div>
+                )}
+            </Menu>
+            <button type="button" className="pt-ab-btn" disabled={none} onClick={() => navigate('tools', { filenames: selection.slice(0, 50).join(',') })}>
+                <WrenchScrewdriverIcon /> <span>Workbench</span>
+            </button>
+            <Menu
+                align="right"
+                renderTrigger={(toggle) => (
+                    <button type="button" className="pt-ab-btn" disabled={none} onClick={toggle}>
+                        <MoreIcon /> <span>More</span>
+                    </button>
+                )}
+            >
+                {(close) => (
+                    <div className="pt-fm-menu">
                         <button type="button" className="pt-fm-item" onClick={() => { close(); void downloadSelection(); }}>
                             <DownloadIcon /> Download
-                        </button>
-                        <button type="button" className="pt-fm-item" onClick={() => { navigate('tools', { filenames: selection.slice(0, 50).join(',') }); close(); }}>
-                            <WrenchScrewdriverIcon /> Open in Workbench
                         </button>
                     </div>
                 )}

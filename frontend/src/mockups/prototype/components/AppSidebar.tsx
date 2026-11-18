@@ -14,6 +14,7 @@ import { useStore } from '../store';
 import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
 import { useProtectedBlobUrls } from '../../../services/imageClient';
 import type { PageId } from '../types';
+import { albumDisplayName } from '../../../utils/albumName';
 
 /**
  * The desktop sidebar from the redesign: the places you go, then media types,
@@ -72,7 +73,7 @@ export const AppSidebar: React.FC = () => {
                         return (
                             <button key={a.id} type="button" className={`pt-side-item${on ? ' on' : ''}`} aria-current={on ? 'page' : undefined} onClick={() => navigate('albums', { albumId: a.id })}>
                                 {src ? <img className="pt-side-thumb" src={src} alt="" loading="lazy" /> : <span className="pt-side-thumb" aria-hidden="true" />}
-                                <span>{a.name}</span>
+                                <span>{albumDisplayName(a.name)}</span>
                                 {a.photoCount ? <em>{a.photoCount.toLocaleString()}</em> : null}
                             </button>
                         );

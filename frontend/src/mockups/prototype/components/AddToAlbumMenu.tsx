@@ -4,6 +4,7 @@ import { BottomSheet } from './BottomSheet';
 import { useStore } from '../store';
 import { useProtectedBlobUrls } from '../../../services/imageClient';
 import { promptDialog } from '../../../components/shared/dialogs';
+import { albumDisplayName } from '../../../utils/albumName';
 
 /**
  * Controlled "Add to album" bottom sheet: lists every album (with a search
@@ -34,7 +35,7 @@ export const AddToAlbumSheet: React.FC<{
 
     const filtered = useMemo(() => {
         const q = query.trim().toLowerCase();
-        return q ? albums.filter((a) => a.name.toLowerCase().includes(q)) : albums;
+        return q ? albums.filter((a) => albumDisplayName(a.name).toLowerCase().includes(q)) : albums;
     }, [albums, query]);
 
     const createNew = () => {
@@ -86,7 +87,7 @@ export const AddToAlbumSheet: React.FC<{
                             <span className="pt-sheet-album-cover empty" />
                         )}
                         <span className="pt-sheet-album-meta">
-                            <b>{a.name}</b>
+                            <b>{albumDisplayName(a.name)}</b>
                             <span>{a.photoCount} photo{a.photoCount === 1 ? '' : 's'}</span>
                         </span>
                     </button>
