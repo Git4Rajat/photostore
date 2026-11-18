@@ -1,13 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import {
-    RotateCcw as ArrowUturnLeftIcon,
-    RotateCw as ArrowUturnRightIcon,
-    ChevronLeft as ChevronLeftIcon,
-    ChevronRight as ChevronRightIcon,
-    Download as DownloadIcon,
-    ZoomOut as MagnifyingGlassMinusIcon,
-    ZoomIn as MagnifyingGlassPlusIcon,
-} from 'lucide-react';
+import { RotateCcw as ArrowUturnLeftIcon, RotateCw as ArrowUturnRightIcon, ZoomOut as MagnifyingGlassMinusIcon, ZoomIn as MagnifyingGlassPlusIcon } from 'lucide-react';
+import { BackGlyph as ChevronLeftIcon, ChevGlyph as ChevronRightIcon, DownloadGlyph as DownloadIcon } from './RedesignIcons';
 import { Spinner } from './bits';
 import { TurnedVideoControls } from './TurnedVideoControls';
 

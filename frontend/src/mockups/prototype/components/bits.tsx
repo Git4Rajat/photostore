@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Star, X as XMarkIcon } from 'lucide-react';
+import { StarGlyph as Star, CloseGlyph as XMarkIcon } from './RedesignIcons';
 import type { SwatchKey } from '../types';
 
 /** Shared floating multi-select action bar — one consistent bottom-center pill

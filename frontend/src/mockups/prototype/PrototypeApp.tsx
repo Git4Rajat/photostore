@@ -7,18 +7,9 @@ import { subscribeLibraryChanges } from '../../services/libraryChanges';
 import { perf } from '../../services/perf';
 import React, { useCallback, useEffect, useState } from 'react';
 import { MemoryRouter, BrowserRouter, Routes, Route } from 'react-router-dom';
-import {
-    Search as MagnifyingGlassIcon,
-    Image as PhotoIcon,
-    Images as RectangleStackIcon,
-    CloudUpload as UploadIcon,
-    // The active-tab "solid" cue is handled by color + a heavier stroke in the
-    // tab bar (Lucide is a single outline set), so the solid aliases point at
-    // the same glyphs.
-    Search as MagnifyingGlassIconSolid,
-    Image as PhotoIconSolid,
-    Images as RectangleStackIconSolid,
-} from 'lucide-react';
+// The active-tab "solid" cue is colour plus a heavier stroke in the tab bar (the redesign is a single
+// outline set), so the solid aliases point at the same glyphs.
+import { SearchGlyph as MagnifyingGlassIcon, PhotosGlyph as PhotoIcon, AlbumsGlyph as RectangleStackIcon, UploadGlyph as UploadIcon, PhotosGlyph as PhotoIconSolid, AlbumsGlyph as RectangleStackIconSolid, SearchGlyph as MagnifyingGlassIconSolid } from './components/RedesignIcons';
 import { NAV_ITEMS } from './components/HomeChrome';
 import Loading from '../../components/shared/Loading';
 import { CachedGalleryPreview, PreviewUntilGallery, useHomeSnapshot } from './components/CachedGalleryPreview';

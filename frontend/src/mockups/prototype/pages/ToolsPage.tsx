@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { Maximize2 as ArrowsPointingOutIcon, Info as InformationCircleIcon } from 'lucide-react';
+import { Maximize2 as ArrowsPointingOutIcon } from 'lucide-react';
+import { InfoGlyph as InformationCircleIcon } from '../components/RedesignIcons';
 import { useStore } from '../store';
 import WorkbenchGrid from '../components/WorkbenchGrid';
 import StuckWavesCard from '../components/StuckWavesCard';

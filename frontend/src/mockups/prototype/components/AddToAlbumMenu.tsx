@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Plus as PlusIcon, Search as SearchIcon } from 'lucide-react';
+import { PlusGlyph as PlusIcon, SearchGlyph as SearchIcon } from './RedesignIcons';
 import { BottomSheet } from './BottomSheet';
 import { useStore } from '../store';
 import { useProtectedBlobUrls } from '../../../services/imageClient';

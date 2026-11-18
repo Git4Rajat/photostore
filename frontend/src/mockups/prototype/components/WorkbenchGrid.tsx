@@ -1,16 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import {
-    CircleCheck as CheckCircleSolid,
-    Search as MagnifyingGlassIcon,
-    Camera as CameraIcon,
-    FileSearch as DocumentMagnifyingGlassIcon,
-    FileText as DocumentTextIcon,
-    Info as InformationCircleIcon,
-    MapPin as MapPinIcon,
-    Copy as Square2StackIcon,
-    Sparkles as SparklesIcon,
-    User as UserIcon,
-} from 'lucide-react';
+import { CircleCheck as CheckCircleSolid, Camera as CameraIcon, FileSearch as DocumentMagnifyingGlassIcon, FileText as DocumentTextIcon, Sparkles as SparklesIcon, User as UserIcon } from 'lucide-react';
+import { SearchGlyph as MagnifyingGlassIcon, InfoGlyph as InformationCircleIcon, PinGlyph as MapPinIcon, CopyGlyph as Square2StackIcon } from './RedesignIcons';
 import { tileImage, usePhotoThumbnails, useRecoveringImage, useTileSizes, fetchPhotoMetadata } from '../media';
 import { ThumbSizeControl, useTileSize } from './controls';
 import type { PhotoMetadata, TileImage } from '../media';

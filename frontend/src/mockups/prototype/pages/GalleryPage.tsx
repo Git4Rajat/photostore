@@ -1,5 +1,5 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { Upload as ArrowUpTrayIcon, Grid2x2 as LargePhotosIcon, Grid3x3 as SmallPhotosIcon, Image as PhotoIcon, UserPlus as UserPlusIcon } from 'lucide-react';
+import { Grid2x2 as LargePhotosIcon, Grid3x3 as SmallPhotosIcon } from 'lucide-react';
 import { useStore, isVideoFilename } from '../store';
 import type { CaptureRange } from '../store';
 import { useAppServices } from '../../../components/AppServicesProvider';
@@ -7,7 +7,7 @@ import { invalidateLocalSortIndex } from '../../../services/localSortIndex';
 import PhotoGrid, { type HeadingGrain } from '../components/PhotoGrid';
 import TimelineBrowser from '../components/TimelineBrowser';
 import { Spinner } from '../components/bits';
-import { SearchGlyph as SearchIcon } from '../components/RedesignIcons';
+import { SearchGlyph as SearchIcon, UploadGlyph as ArrowUpTrayIcon, PhotosGlyph as PhotoIcon, UserPlusGlyph as UserPlusIcon } from '../components/RedesignIcons';
 import { FilterSentence, noMatchCopy, PhotosFilterBar, activeFilterCount as countFilters, type PhotosFilterActions, type PhotosFilterState } from '../components/PhotosFilter';
 import { useTileSize, TILE_RANGE, TILE_STEP, galleryTileKey, defaultGalleryTile } from '../components/controls';
 

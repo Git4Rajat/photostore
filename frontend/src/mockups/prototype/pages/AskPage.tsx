@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Search as MagnifyingGlassIcon, Plus as PlusIcon } from 'lucide-react';
+import { SearchGlyph as MagnifyingGlassIcon, PlusGlyph as PlusIcon } from '../components/RedesignIcons';
 import { useStore } from '../store';
 import { Swatch } from '../components/bits';
 import { useProtectedBlobUrls } from '../../../services/imageClient';

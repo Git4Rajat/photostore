@@ -1,5 +1,5 @@
 import React from 'react';
-import { CloudUpload as UploadIcon } from 'lucide-react';
+import { UploadGlyph as UploadIcon } from './RedesignIcons';
 
 /** Primary navigation, shared by the live header and the read-only home previews. */
 export const NAV_ITEMS = [

@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Check, ListChecks } from 'lucide-react';
+import { ListChecks } from 'lucide-react';
+import { CheckGlyph as Check } from './RedesignIcons';
 
 // Same thresholds as ScrollToTopButton: eligible once scrolled this far, and
 // only revealed after scrolling has settled so it never sits over content

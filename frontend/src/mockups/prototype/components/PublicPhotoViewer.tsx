@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Download as DownloadIcon } from 'lucide-react';
+import { DownloadGlyph as DownloadIcon } from './RedesignIcons';
 import ViewerShell from './ViewerShell';
 import { isVideoFilename } from '../../../utils/photoDisplay';
 import { resolveApiUrl } from '../../../services/apiClient';

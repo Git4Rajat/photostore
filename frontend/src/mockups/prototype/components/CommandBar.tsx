@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Wrench as WrenchScrewdriverIcon, X as XMarkIcon } from 'lucide-react';
+import { Wrench as WrenchScrewdriverIcon } from 'lucide-react';
 import {
     AddToAlbumGlyph as AddToAlbumIcon,
     DownloadGlyph as DownloadIcon,
@@ -7,8 +7,7 @@ import {
     MoreGlyph as MoreIcon,
     RemoveFromAlbumGlyph as MinusCircleIcon,
     StarGlyph as StarIcon,
-    TrashGlyph as TrashIcon,
-} from './RedesignIcons';
+    TrashGlyph as TrashIcon, CloseGlyph as XMarkIcon } from './RedesignIcons';
 import { Menu, Stars } from './bits';
 import { AddToAlbumSheet } from './AddToAlbumMenu';
 import { confirmDeleteItems } from './confirmDelete';

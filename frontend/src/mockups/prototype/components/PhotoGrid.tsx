@@ -1,5 +1,5 @@
 import React from 'react';
-import { Check as CheckIcon, Video as VideoIcon, Heart as HeartIcon, Star as StarIcon } from 'lucide-react';
+import { CheckGlyph as CheckIcon, VideoGlyph as VideoIcon, HeartGlyph as HeartIcon, StarGlyph as StarIcon } from './RedesignIcons';
 import { isVideoFilename, useStore } from '../store';
 import { tileImage, usePhotoThumbnails, useRecoveringImage, useTileSizes } from '../media';
 import { useDragSelect } from '../../../services/useDragSelect';

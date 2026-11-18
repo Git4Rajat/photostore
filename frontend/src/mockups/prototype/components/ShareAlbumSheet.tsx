@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Copy as CopyIcon, Link as LinkIcon, Lock as LockIcon, RefreshCw as RefreshIcon } from 'lucide-react';
+import { CopyGlyph as CopyIcon, LinkGlyph as LinkIcon, LockGlyph as LockIcon, RefreshGlyph as RefreshIcon } from './RedesignIcons';
 import { BottomSheet } from './BottomSheet';
 import { useStore } from '../store';
 import { plural } from '../../../utils/format';

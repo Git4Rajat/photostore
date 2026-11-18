@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { Clock as ClockIcon, Mail as MailIcon, Pencil as PencilIcon, Send as SendIcon, UserPlus as UserPlusIcon } from 'lucide-react';
+import { Send as SendIcon } from 'lucide-react';
+import { ClockGlyph as ClockIcon, MailGlyph as MailIcon, PencilGlyph as PencilIcon, UserPlusGlyph as UserPlusIcon } from '../components/RedesignIcons';
 import { BottomSheet } from '../components/BottomSheet';
 import { useStore } from '../store';
 import { Avatar, Spinner } from '../components/bits';

@@ -1,5 +1,5 @@
 import React from 'react';
-import { CircleAlert as ExclamationCircleIcon } from 'lucide-react';
+import { AlertGlyph as ExclamationCircleIcon } from './RedesignIcons';
 import { useStore } from '../store';
 import type { Toast } from '../types';
 import { useSwipeDismiss } from '../../../services/swipeDismiss';
