@@ -96,7 +96,10 @@ const openSessionOnce = async (child: PersistedUploadSession): Promise<void> => 
         const previous = loadWaveOperation(parent.resumedFromSessionId, parent.scope);
         if (!previous) return;
         await ensureOpened(previous);
-        if (!stateFor(previous.id).opened) return;
+        // An expired predecessor (lease lapsed, or Core reported it closed)
+        // is never reopened, but the server still accepts it as the link.
+        const prior = stateFor(previous.id);
+        if (!prior.opened && !prior.expired) return;
     }
     const opened = parent.resumedFromSessionId
         ? await openWaveShadowSession(parent.id, declaredCountFor(parent), parent.resumedFromSessionId)

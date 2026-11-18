@@ -108,6 +108,7 @@ export const NotificationBell: React.FC<{ backLabel?: string }> = ({ backLabel =
         retryPersistedUploadSession,
         resendInvite,
         uploadActive,
+        retryingUpload,
     } = useAppServices();
     const [showNotifications, setShowNotifications] = useState<boolean>(false);
     // Opening the panel marks everything read (and acknowledges stale uploads),
@@ -282,7 +283,7 @@ export const NotificationBell: React.FC<{ backLabel?: string }> = ({ backLabel =
                                                     )}
                                                     {notification.uploadSessionId && (
                                                         <div className="notification-acts">
-                                                            <button type="button" className="btn btn-primary btn-sm" disabled={uploadActive}
+                                                            <button type="button" className="btn btn-primary btn-sm" disabled={uploadActive || retryingUpload}
                                                                 onClick={() => void retryPersistedUploadSession(notification.uploadSessionId)}>
                                                                 <RetryIcon aria-hidden="true" />Retry unfinished files
                                                             </button>

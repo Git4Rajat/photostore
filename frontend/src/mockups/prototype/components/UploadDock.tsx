@@ -58,7 +58,7 @@ const FailedRows: React.FC<{ files: PersistedUploadFile[]; onRetry?: () => void;
 
 export const UploadDock: React.FC = () => {
     const {
-        uploadActive, uploading, uploadProgress: progress, uploadCheckProgress: checking, pendingUploadSummary, pendingUploadFailedFiles,
+        uploadActive, uploading, retryingUpload, uploadProgress: progress, uploadCheckProgress: checking, pendingUploadSummary, pendingUploadFailedFiles,
         stopActiveUpload, retryPersistedUploadSession, discardPersistedUploadSession,
     } = useAppServices();
     const narrow = useNarrow();
@@ -127,6 +127,8 @@ export const UploadDock: React.FC = () => {
         stopActiveUpload();
     };
     const retry = () => { void retryPersistedUploadSession(); };
+    const busy = uploading || retryingUpload;
+    const retryLabel = retryingUpload ? 'Retrying…' : showFailed ? 'Try again' : 'Resume';
     const skip = () => { void discardPersistedUploadSession(); };
 
     const icon = (
@@ -181,8 +183,8 @@ export const UploadDock: React.FC = () => {
                             <>
                                 {showFailed ? failureLede : <p className="up-lede">{plural(pendingUploadSummary?.fileCount ?? 0, 'file')} still waiting.</p>}
                                 {showFailed ? <FailedRows files={failedFiles} /> : null}
-                                <Button variant="primary" className="up-wide" onClick={retry} disabled={uploading}>{showFailed ? 'Try again' : 'Resume'}</Button>
-                                <Button className="up-wide" onClick={skip} disabled={uploading}>
+                                <Button variant="primary" className="up-wide" onClick={retry} disabled={busy}>{retryLabel}</Button>
+                                <Button className="up-wide" onClick={skip} disabled={busy}>
                                     {showFailed ? `Skip ${failedFiles.length === 1 ? 'this one' : `these ${failedFiles.length}`}` : 'Discard'}
                                 </Button>
                             </>
@@ -215,7 +217,7 @@ export const UploadDock: React.FC = () => {
             {!collapsed ? (
                 <>
                     {!uploadActive ? <div className="up-ub">{showFailed ? failureLede : <p className="up-lede">{plural(pendingUploadSummary?.fileCount ?? 0, 'file')} still waiting.</p>}</div> : null}
-                    {showFailed ? <FailedRows files={failedFiles} onRetry={retry} retryDisabled={uploading} /> : null}
+                    {showFailed ? <FailedRows files={failedFiles} onRetry={retry} retryDisabled={busy} /> : null}
                     <div className="up-uf">
                         {uploadActive ? (
                             <>
@@ -227,8 +229,8 @@ export const UploadDock: React.FC = () => {
                             </>
                         ) : (
                             <>
-                                <button type="button" className="up-link mut" onClick={skip} disabled={uploading}>{showFailed ? 'Skip these' : 'Discard'}</button>
-                                <Button variant="primary" size="sm" onClick={retry} disabled={uploading}>{showFailed ? 'Try again' : 'Resume'}</Button>
+                                <button type="button" className="up-link mut" onClick={skip} disabled={busy}>{showFailed ? 'Skip these' : 'Discard'}</button>
+                                <Button variant="primary" size="sm" onClick={retry} disabled={busy}>{retryLabel}</Button>
                             </>
                         )}
                     </div>
