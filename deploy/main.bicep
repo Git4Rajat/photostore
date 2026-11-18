@@ -52,7 +52,7 @@ param processingMode string = 'backend'
 param coreImage string = 'ghcr.io/git4rajat/photostore-backend@sha256:e464f65603442be0d4b899e25b2b85759f7b17d237f92bc84f78aecef65ecc90'
 
 @description('Public web (frontend) image. Defaults to an immutable @sha256 digest, never :latest, same as coreImage above.')
-param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:1eecf6cfd40f1474abc2826d1c5e0c121fa4fceccec17f55e0d9c8bcebf30f42'
+param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:682d1ca4755ab143edd2bb8ee5786ce9377339a4b4f3f7cbe29f14bf0e9ded78'
 
 @description('Public vision (server-side image processing) image. Only pulled/deployed when processingMode is "backend" or "both". Same digest-pinning guidance as coreImage applies.')
 param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker@sha256:c27c22c3dc1b29231fbad6f93f7ee49b21daa7abe839c14470369cfe6a860b76'
@@ -85,7 +85,7 @@ param waveCapabilityId string = '1250601265cb502414af0f98378fa244c41e3788589a9fb
 @description('Earlier release certificates this release may replace in place (set by the release pin job).')
 param waveCompatibleCapabilities string = 'e78c3f2147cfb7471553d75c51c435238ad2457ce503b7a6db61dc0fec442e99,5a21e2362c9d5bd5333f380418fee4631de8364205481e382389c3ceb1711118,fb59a2713da8010e549933b46d8dc2b3b47e753b348ca4172c2698b3b5c77d7b,44f61092fa4ab14c7d5fa8d6fc56ccc482e7b33531af8412232dccfe002afb47,4af0d34aaaf9ef979abaafc3cff044e2372887347ceb2cb491b3fe0a2f3fb8b4,d421fbb91b0e3492891d5570b55a5ce59fc146c1fa524763c43fc77529bf2cf9,f230dfabdbf8336d684e2fc87df591aea622638db8c7f10e3a43ba39d7b03ba2,a09b5f520611c246e6e4b29b19b412ab144b156a3c09e7656cf9170654ff44de'
 @description('Source commit of the pinned release (set by the release pin job).')
-param waveSourceCommit string = '99413559752259b8ecc0732605523b230c7bd8a6'
+param waveSourceCommit string = '6b35c43d25b821098ac86346a86eecd8cea39341'
 param waveBootstrapPending bool = false
 
 @description('Provision managed WebSocket notifications when library indexes are published.')
