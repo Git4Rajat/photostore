@@ -42,16 +42,22 @@ describe('Photos filter (one Filter button)', () => {
         expect(screen.queryByRole('button', { name: 'Videos' })).toBeNull();
         fireEvent.click(screen.getByRole('button', { name: 'Filter' }));
         const panel = screen.getByRole('dialog', { name: 'Filter photos' });
+        // Choices wait for Show: nothing changes behind the sheet while tapping around.
         fireEvent.click(within(panel).getByRole('button', { name: 'Videos' }));
-        expect(mocks.setMediaFilter).toHaveBeenCalledWith('video');
         fireEvent.click(within(panel).getByRole('button', { name: 'Live' }));
-        expect(mocks.setMediaFilter).toHaveBeenCalledWith('live');
         fireEvent.click(within(panel).getByRole('switch', { name: 'Liked only' }));
-        expect(mocks.setGalleryLikedOnly).toHaveBeenCalledWith(true);
         fireEvent.click(within(panel).getByRole('button', { name: /4\+/ }));
-        expect(mocks.setGalleryRating).toHaveBeenCalledWith(4);
         fireEvent.click(within(panel).getByRole('button', { name: 'This year' }));
+        expect(mocks.setMediaFilter).not.toHaveBeenCalled();
+        expect(mocks.setGalleryLikedOnly).not.toHaveBeenCalled();
+        expect(mocks.setGalleryRating).not.toHaveBeenCalled();
+        expect(mocks.setCaptureRange).not.toHaveBeenCalled();
+        fireEvent.click(within(panel).getByRole('button', { name: 'Show results' }));
+        expect(mocks.setMediaFilter).toHaveBeenCalledWith('live');
+        expect(mocks.setGalleryLikedOnly).toHaveBeenCalledWith(true);
+        expect(mocks.setGalleryRating).toHaveBeenCalledWith(4);
         expect(mocks.setCaptureRange).toHaveBeenCalledWith(expect.objectContaining({ label: 'This year' }));
+        expect(screen.queryByRole('dialog', { name: 'Filter photos' })).toBeNull();
     });
 
     it('counts what is on and says it in one sentence with a Clear beside it', () => {

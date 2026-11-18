@@ -6,6 +6,7 @@ import { TileThumbnail } from '../components/PhotoGrid';
 import { Swatch } from '../components/bits';
 import { plural } from '../../../utils/format';
 import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
+import { albumDisplayName } from '../../../utils/albumName';
 
 const SHELF_PAGE = 16;
 
@@ -161,8 +162,8 @@ const ExplorePage: React.FC = () => {
                     cover={(a) => a.coverThumbnailUrl}
                     render={(a, src) => (
                         <button key={a.id} type="button" className="pt-shelf-card wide album" onClick={() => navigate('albums', { albumId: a.id })}>
-                            {src && <TileThumbnail key={src} src={src} alt={a.name} className="pt-explore-cover" />}
-                            <span className="pt-shelf-overlay">{a.name} · {a.photoCount}</span>
+                            {src && <TileThumbnail key={src} src={src} alt={albumDisplayName(a.name)} className="pt-explore-cover" />}
+                            <span className="pt-shelf-overlay">{albumDisplayName(a.name)} · {a.photoCount}</span>
                         </button>
                     )}
                 />

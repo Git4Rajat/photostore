@@ -133,7 +133,7 @@ describe('index-backed gallery', () => {
     it('rating a selection from the selection bar ends select mode', async () => {
         render(<StoreProvider><Probe /><CommandBar /></StoreProvider>);
         act(() => { store.setSelectMode(true); store.selectMany(['p1.jpg', 'p2.jpg']); });
-        fireEvent.click(screen.getByRole('button', { name: 'More' }));
+        fireEvent.click(screen.getByRole('button', { name: 'Rate' }));
         await act(async () => { fireEvent.click(screen.getByRole('button', { name: '4 stars' })); });
         expect(mocks.post).toHaveBeenCalledWith('/photos/rate-multiple', { filenames: ['p1.jpg', 'p2.jpg'], rating: 4 });
         expect(store.selectMode).toBe(false);

@@ -1,7 +1,7 @@
 // The Photos page's one Filter button and the panel behind it, as the redesign draws it: a sheet on
 // phones, a popover under the button on wide screens. See docs/design-mockups (One Filter button).
 import React, { useEffect, useRef, useState } from 'react';
-import { Heart as HeartIcon, SlidersHorizontal as FilterIcon, Star as StarIcon } from 'lucide-react';
+import { Heart as HeartIcon, Star as StarIcon } from 'lucide-react';
 import { BottomSheet } from './BottomSheet';
 import type { CaptureRange, MediaFilter } from '../store';
 
@@ -19,6 +19,15 @@ export interface PhotosFilterActions {
     setRating: (value: number) => void;
     setCaptureRange: (range: CaptureRange | null) => void;
 }
+
+// The redesign's own sliders glyph (two short rules, a knob on each), not the stock three-rule one.
+const FilterIcon: React.FC<React.SVGProps<SVGSVGElement>> = (props) => (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.75} strokeLinecap="round" strokeLinejoin="round" {...props}>
+        <path d="M4 7.5h9M17 7.5h3M4 16.5h3M11 16.5h9" />
+        <circle cx="15" cy="7.5" r="2" />
+        <circle cx="9" cy="16.5" r="2" />
+    </svg>
+);
 
 const MEDIA: { value: MediaFilter; label: string }[] = [
     { value: 'all', label: 'All' },
@@ -66,30 +75,58 @@ const useWide = (): boolean => {
     return wide;
 };
 
+const sameRange = (a: CaptureRange | null, b: CaptureRange | null): boolean => (
+    (a?.start ?? '') === (b?.start ?? '') && (a?.end ?? '') === (b?.end ?? '') && (a?.label ?? '') === (b?.label ?? '')
+);
+const sameFilters = (a: PhotosFilterState, b: PhotosFilterState): boolean => (
+    a.mediaFilter === b.mediaFilter && a.likedOnly === b.likedOnly && a.rating === b.rating && sameRange(a.captureRange, b.captureRange)
+);
+
+// On a phone the choices are held here as a draft and only applied when Show is tapped, so tapping
+// around never reshuffles the photos behind the sheet. As a desktop popover (`live`) each choice
+// applies at once, as the redesign draws it, so the photos behind update while it stays open.
 const Panel: React.FC<{
     state: PhotosFilterState;
     actions: PhotosFilterActions;
     matchCount: number | null;
+    live: boolean;
     onDone: () => void;
-}> = ({ state, actions, matchCount, onDone }) => {
-    const count = activeFilterCount(state);
+}> = ({ state, actions, matchCount, live, onDone }) => {
+    const [draft, setDraft] = useState<PhotosFilterState>(state);
+    const count = activeFilterCount(draft);
+    const dirty = !live && !sameFilters(draft, state);
     const [choosing, setChoosing] = useState(Boolean(state.captureRange && ![LAST_30_DAYS, THIS_YEAR].includes(state.captureRange.label)));
     const [from, setFrom] = useState(state.captureRange?.start ?? '');
     const [to, setTo] = useState(state.captureRange?.end ?? '');
-    const label = state.captureRange?.label;
-    const anyTime = !state.captureRange && !choosing;
+    const label = draft.captureRange?.label;
+    const anyTime = !draft.captureRange && !choosing;
 
-    const pickRange = (next: CaptureRange | null) => { setChoosing(false); actions.setCaptureRange(next); };
+    const applyTo = (target: PhotosFilterState) => {
+        if (target.mediaFilter !== state.mediaFilter) actions.setMediaFilter(target.mediaFilter);
+        if (target.likedOnly !== state.likedOnly) actions.setLikedOnly(target.likedOnly);
+        if (target.rating !== state.rating) actions.setRating(target.rating);
+        if (!sameRange(target.captureRange, state.captureRange)) actions.setCaptureRange(target.captureRange);
+    };
+    const patch = (next: Partial<PhotosFilterState>) => {
+        const target = { ...draft, ...next };
+        setDraft(target);
+        if (live) applyTo(target);
+    };
+    const pickRange = (next: CaptureRange | null) => { setChoosing(false); patch({ captureRange: next }); };
     const last30 = () => { const start = new Date(); start.setDate(start.getDate() - 30); pickRange({ start: iso(start), label: LAST_30_DAYS }); };
     const thisYear = () => pickRange({ start: `${new Date().getFullYear()}-01-01`, label: THIS_YEAR });
     const custom = (start: string, end: string) => {
         setFrom(start);
         setTo(end);
-        actions.setCaptureRange(start || end ? { ...(start ? { start } : {}), ...(end ? { end } : {}), label: customRangeLabel(start, end) } : null);
+        patch({ captureRange: start || end ? { ...(start ? { start } : {}), ...(end ? { end } : {}), label: customRangeLabel(start, end) } : null });
     };
     const clearAll = () => {
-        actions.setMediaFilter('all'); actions.setLikedOnly(false); actions.setRating(0); pickRange(null); setFrom(''); setTo('');
+        const cleared: PhotosFilterState = { mediaFilter: 'all', likedOnly: false, rating: 0, captureRange: null };
+        setDraft(cleared);
+        setChoosing(false); setFrom(''); setTo('');
+        if (live) applyTo(cleared);
     };
+    const apply = () => { applyTo(draft); onDone(); };
 
     return (
         <div className="pt-fp">
@@ -101,7 +138,7 @@ const Panel: React.FC<{
                 <span className="pt-fp-label">Show</span>
                 <div className="mock-seg" role="group" aria-label="Show">
                     {MEDIA.map((m) => (
-                        <button key={m.value} type="button" className={state.mediaFilter === m.value ? 'active' : undefined} aria-pressed={state.mediaFilter === m.value} onClick={() => actions.setMediaFilter(m.value)}>
+                        <button key={m.value} type="button" className={draft.mediaFilter === m.value ? 'active' : undefined} aria-pressed={draft.mediaFilter === m.value} onClick={() => patch({ mediaFilter: m.value })}>
                             {m.label}
                         </button>
                     ))}
@@ -109,7 +146,7 @@ const Panel: React.FC<{
             </div>
             <div className="pt-fp-row">
                 <span><HeartIcon aria-hidden="true" />Liked only</span>
-                <button type="button" role="switch" aria-checked={state.likedOnly} aria-label="Liked only" className={`pt-switch${state.likedOnly ? ' on' : ''}`} onClick={() => actions.setLikedOnly(!state.likedOnly)}><span aria-hidden="true" /></button>
+                <button type="button" role="switch" aria-checked={draft.likedOnly} aria-label="Liked only" className={`pt-switch${draft.likedOnly ? ' on' : ''}`} onClick={() => patch({ likedOnly: !draft.likedOnly })}><span aria-hidden="true" /></button>
             </div>
             <div className="pt-fp-sec">
                 <span className="pt-fp-label">Date</span>
@@ -130,16 +167,16 @@ const Panel: React.FC<{
                 <span className="pt-fp-label">Rating</span>
                 <div className="pt-fp-chips">
                     {RATINGS.map((r) => (
-                        <button key={r} type="button" className="chip" aria-pressed={state.rating === r} onClick={() => actions.setRating(r)}>
+                        <button key={r} type="button" className="chip" aria-pressed={draft.rating === r} onClick={() => patch({ rating: r })}>
                             {r === 0 ? 'Any' : <><StarIcon aria-hidden="true" />{r === 5 ? '5' : `${r}+`}</>}
                         </button>
                     ))}
                 </div>
             </div>
             <div className="pt-fp-foot">
-                {matchCount !== null && <span className="pt-fp-count">{matchCount.toLocaleString()} item{matchCount === 1 ? '' : 's'}</span>}
-                <button type="button" className="btn btn-primary" onClick={onDone}>
-                    {matchCount === null ? 'Done' : `Show ${matchCount.toLocaleString()} item${matchCount === 1 ? '' : 's'}`}
+                {!dirty && matchCount !== null && <span className="pt-fp-count">{matchCount.toLocaleString()} item{matchCount === 1 ? '' : 's'}</span>}
+                <button type="button" className="btn btn-primary" onClick={apply}>
+                    {dirty ? 'Show results' : matchCount === null ? 'Done' : `Show ${matchCount.toLocaleString()} item${matchCount === 1 ? '' : 's'}`}
                 </button>
             </div>
         </div>
@@ -168,7 +205,7 @@ export const PhotosFilterBar: React.FC<{
         return () => { document.removeEventListener('mousedown', onDown); document.removeEventListener('keydown', onKey); };
     }, [open, wide]);
 
-    const panel = <Panel state={state} actions={actions} matchCount={matchCount} onDone={() => setOpen(false)} />;
+    const panel = <Panel key={open ? 'open' : 'closed'} state={state} actions={actions} matchCount={matchCount} live={wide} onDone={() => setOpen(false)} />;
     return (
         <div className="pt-chips pt-fbar" role="group" aria-label="Filter photos" ref={wrapRef}>
             <button
