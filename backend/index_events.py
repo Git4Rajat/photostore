@@ -16,6 +16,11 @@ _running = False
 # fall back to polling.
 PROCESSING_DAILY_BUDGET = int(os.getenv('INDEX_EVENTS_PROCESSING_DAILY_BUDGET', '1500'))
 _budget = {'day': None, 'used': 0}
+# Progress steps (about 15 per wave) are the cheapest thing to drop: past the share
+# or inside the per-library gap, clients simply keep their polling fallback.
+PROGRESS_DAILY_BUDGET = int(os.getenv('INDEX_EVENTS_PROGRESS_DAILY_BUDGET', '3000'))
+PROGRESS_MIN_GAP_SECONDS = float(os.getenv('INDEX_EVENTS_PROGRESS_MIN_GAP_SECONDS', '30'))
+_progress = {'day': None, 'used': 0, 'last': {}}
 
 
 def enabled():
@@ -68,6 +73,29 @@ def publish_processing(library, wave_id, state='done'):
             _budget['used'] += 1
     _enqueue((library, 'processing', wave_id), {
         'type': 'processing', 'libraryId': library, 'waveId': wave_id, 'state': state})
+
+
+def publish_progress(library, wave_id, stage, step=None, eta_seconds=None, *, force=False):
+    """Advisory step/stage change for a wave's progress bar; the GET stays authoritative.
+
+    `force` (stage changes) skips the per-library gap but never the daily budget."""
+    if not enabled() or os.getenv('PROCESSING_PROGRESS_PUSH', 'true').strip().lower() in ('0', 'false', 'no', 'off'):
+        return False
+    now = time.time()
+    today = time.strftime('%Y-%m-%d', time.gmtime(now))
+    with _lock:
+        if _progress['day'] != today:
+            _progress.update(day=today, used=0, last={})
+        if _progress['used'] >= PROGRESS_DAILY_BUDGET:
+            return False
+        if not force and now - _progress['last'].get(library, 0) < PROGRESS_MIN_GAP_SECONDS:
+            return False
+        _progress['used'] += 1
+        _progress['last'][library] = now
+    _enqueue((library, 'progress', wave_id), {
+        'type': 'processing-progress', 'libraryId': library, 'waveId': wave_id,
+        'stage': stage, 'step': step, 'etaSeconds': eta_seconds})
+    return True
 
 
 def _enqueue(key, message):

@@ -1620,3 +1620,30 @@
 @container (min-width: 806px) {
   .pt-gallery > .pt-gallery-toolbar { position: sticky; top: -18px; z-index: 6; background: var(--bg-1); margin: -18px 0 4px; padding: 26px 0 8px; }
 }
+
+/* ---- Background processing progress (docs/processing-progress-design.md) ---- */
+.pd-bar { bottom: calc(76px + env(safe-area-inset-bottom)); }
+@media (min-width: 806px) { .pd-bar { left: auto; right: 20px; bottom: 20px; width: 372px; } }
+.pd-seg { display: flex; gap: 4px; }
+.pd-seg i { flex: 1; height: 6px; border-radius: 3px; background: var(--lg-surface-wash); position: relative; overflow: hidden; display: block; }
+.pd-seg i.done { background: var(--accent); }
+.pd-seg i.now { background: var(--accent-soft); }
+.pd-seg i b { position: absolute; inset: 0 auto 0 0; width: 0; border-radius: 3px; background: var(--accent); transition: width 0.3s ease; }
+.pd-seg i b.slide { width: 40%; animation: pd-slide 1.6s ease-in-out infinite; }
+@keyframes pd-slide { 0% { transform: translateX(-100%); } 100% { transform: translateX(250%); } }
+.pd-spin { width: 14px; height: 14px; border-radius: 50%; border: 2px solid currentColor; border-top-color: transparent; animation: pd-rot 1s linear infinite; }
+@keyframes pd-rot { to { transform: rotate(360deg); } }
+.pd-x { all: unset; position: absolute; top: 8px; right: 8px; width: 28px; height: 28px; display: grid; place-items: center; color: var(--muted); cursor: pointer; border-radius: 50%; }
+.pd-x:focus-visible { outline: 2px solid var(--accent); }
+.pd-x svg { width: 16px; height: 16px; }
+.pd-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 12px; }
+.pd-step { display: flex; align-items: center; gap: 12px; }
+.pd-dot { width: 28px; height: 28px; border-radius: 50%; flex: none; display: grid; place-items: center; background: var(--lg-surface-wash); color: var(--muted); font-size: 12px; font-weight: 700; }
+.pd-dot svg { width: 15px; height: 15px; }
+.pd-step.done .pd-dot { background: var(--accent); color: var(--on-accent); }
+.pd-step.now .pd-dot { background: var(--accent-soft); color: var(--accent); }
+.pd-txt { flex: 1; min-width: 0; }
+.pd-txt b { display: block; font-size: 13.5px; }
+.pd-txt span { display: block; font-size: 12px; color: var(--muted); }
+.pd-tag { font-size: 12px; color: var(--muted); }
+@media (prefers-reduced-motion: reduce) { .pd-seg i b.slide, .pd-spin { animation: none; } .pd-seg i b { transition: none; } }

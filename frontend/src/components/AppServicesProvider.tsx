@@ -51,6 +51,7 @@ import {
 } from './browserAiShared';
 import { FILE_ACCEPT_FILTER, getFileExtension, isUploadableFilename, isVideoFilename, requiresBackendPreview, shouldSkipConvertedRawPreview } from '../utils/photoDisplay';
 import { plural } from '../utils/format';
+import { setProcessingPushLive, signalProcessing } from '../services/processingProgress';
 import { shouldSuppressLeaseWarning } from '../utils/processingLease';
 import { BackgroundKeepAlive } from '../services/backgroundKeepAlive';
 import { getUnattendedConcurrencyBonus, reportBrowserProcessingOutcome } from '../services/unattendedProcessingScaler';
@@ -1485,9 +1486,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const indexPushLiveRef = useRef(false);
     const processingNudgeRef = useRef<(() => void) | null>(null);
     useEffect(() => startIndexReadyPush(() => scheduleDataRefresh(0), {
-        onProcessing: () => processingNudgeRef.current?.(),
+        onProcessing: () => { processingNudgeRef.current?.(); signalProcessing(); },
+        onProgress: () => signalProcessing(),
         onConnection: (connected) => {
             indexPushLiveRef.current = connected;
+            setProcessingPushLive(connected);
             // Coming up may follow a missed advisory: read the summary once.
             if (connected) processingNudgeRef.current?.();
         },

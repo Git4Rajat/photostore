@@ -9,6 +9,8 @@ import { pendingEditScope } from './pendingEdits';
 export interface IndexPushOptions {
     // "A wave finished processing" advisory; the listener reads the summary, the push carries no data.
     onProcessing?: () => void;
+    // A step or stage change of a wave's progress bar; advisory, the summary read is authoritative.
+    onProgress?: (message: { waveId: string; stage: string; step?: number | null; etaSeconds?: number | null }) => void;
     // Whether the socket is up, so pollers can slow down while it is and speed back up when it is not.
     onConnection?: (connected: boolean) => void;
 }
@@ -64,6 +66,7 @@ export const startIndexReadyPush = (ready: () => void, options: IndexPushOptions
                     if (message.libraryId !== getActiveLibraryFromToken()) return;
                     if (message.type === 'index-ready') ready();
                     else if (message.type === 'processing') options.onProcessing?.();
+                    else if (message.type === 'processing-progress') options.onProgress?.(message);
                 } catch { /* Ignore malformed or non-index messages. */ }
             };
             connection.onerror = () => connection.close();

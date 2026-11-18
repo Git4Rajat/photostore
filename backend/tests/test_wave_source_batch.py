@@ -305,7 +305,7 @@ def test_deadline_checkpoints_only_the_processed_prefix(world, monkeypatch):
     row = leases._get(leases.key(store.library, wave, 'vision'))
     position = json.loads(row['progressCheckpoint'][7:])
     first = store._page(f'e!{wave}!m!')[0]
-    assert position == dict(phase='sources', after=first['RowKey'])
+    assert position == dict(phase='sources', after=first['RowKey'], done=1)
     for _ in range(4):
         run(world, metadata, wave, key, process, deadline=clock[0] + 5)
     assert len(calls) == len(set(calls)) == 4
@@ -860,7 +860,7 @@ def test_rolling_deadline_drains_admitted_sources_without_charging_tail(world, m
     assert len(store._page('source-attempt!')) == 2
     members = store._page(f'e!{wave}!m!')
     row = leases._get(leases.key(store.library, wave, 'vision'))
-    assert json.loads(row['progressCheckpoint'][7:]) == dict(phase='sources', after=members[1]['RowKey'])
+    assert json.loads(row['progressCheckpoint'][7:]) == dict(phase='sources', after=members[1]['RowKey'], done=2)
     assert [m['outcome'] for m in members] == ['settled', 'settled', 'pending', 'pending', 'pending']
 
 
