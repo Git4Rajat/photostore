@@ -2361,16 +2361,31 @@ def _album_access_code_gate(entity: Dict, token: str, provided: str):
     return jsonify({'codeRequired': True, 'retryAfterSeconds': 0}), 401
 
 
-def _album_cover_thumbnail_url(user_id: str, filenames: List[str]) -> str:
-    """Picks the album's cover: the highest-rated (then most-liked) photo it
-    contains, so an album with any curated favorites shows one instead of a
-    blank placeholder. The ranking is a SQL lookup over the library's local
-    SQLite database (flat memory, however big the album or the library) and only
-    the few top candidates are point-read to find one with a usable thumbnail."""
-    if not filenames:
+def _album_cover_thumbnail_url(user_id: str, filenames: List[str], entity: Optional[Dict] = None) -> str:
+    """The album's cover thumbnail. The cover is the photo stored on the album row (chosen once, see
+    album_store), so it does not change between opens. A row without one (created before covers were
+    stored) gets one chosen and persisted here, once. The few top candidates are point-read to find one
+    with a usable thumbnail only when no stored cover applies."""
+    if not filenames and not (entity and album_store.cover_of(entity)):
         return ''
     import search_db
     try:
+        if entity is not None:
+            if not album_store.cover_of(entity):
+                album_store.choose_cover(entity, filenames)
+                if album_store.cover_of(entity) and albums_table_client is not None:
+                    try:
+                        albums_table_client.update_entity({
+                            'PartitionKey': entity['PartitionKey'], 'RowKey': entity['RowKey'],
+                            'coverFilename': album_store.cover_of(entity)}, mode='merge')
+                    except Exception:
+                        app.logger.warning('Could not persist album cover', exc_info=True)
+            stored = album_store.cover_of(entity)
+            if stored:
+                row = _get_metadata_entities(user_id, [stored]).get(stored)
+                if row and row.get('processing_state') != 'deleted':
+                    return _thumbnail_url_from_metadata(row, stored)
+                return ''
         db = search_db.open_database(user_id)
         if db is None:
             return ''
