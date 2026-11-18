@@ -12707,6 +12707,17 @@ def _drain_incremental_search_db(user_id: str, scope: str, *, max_names: Optiona
             continue
         if status == 'needs_full':
             if INDEX_MAINTENANCE_QUEUE_NAME:
+                search_db.invalidate_manifest_cache(user_id)
+                manifest = search_db.load_manifest(user_id)
+                if search_db.compaction_cannot_free_room(manifest, storage_utils_module.SEARCH_DB_DELTA_CHUNK):
+                    # The last compaction already folded in every delta and capacity is still 0: another
+                    # compact would just re-enqueue this search pass and keep the index worker awake forever.
+                    worker_logger.warning(
+                        'Search compaction cannot free delta capacity for %s; not re-enqueueing compact '
+                        '(deltaSeq=%s baseSeq=%s deltaRows=%s rowCount=%s)', user_id,
+                        manifest.get('deltaSeq'), manifest.get('baseSeq'), manifest.get('deltaRows'),
+                        manifest.get('rowCount'))
+                    return {'status': 'stalled', 'reason': 'compaction-cannot-free-capacity'}
                 if enqueue_index_build(user_id, reason='search-delta-capacity', scope='compact') == 'unavailable':
                     raise RuntimeError('Could not schedule search compaction')
                 return {'status': 'deferred', 'nextScope': 'compact'}
@@ -12888,6 +12899,11 @@ def _run_index_build_job(user_id: str, job_id: str, scope: str = 'full') -> None
                 if bad:
                     raise RuntimeError(f'index build produced no {", ".join(bad)} index')
                 result = _drain_incremental_search_db(user_id, scope) if scope in index_updates.SEARCH_SCOPES else {}
+                if result.get('status') == 'stalled':
+                    # Dirty ids stay set; the next real change or an explicit retry may try again.
+                    _upsert_job_status(job_id, user_id, INDEX_BUILD_JOB_TYPE, 'failed',
+                                       error='Search compaction cannot free delta capacity; not retrying automatically')
+                    return
                 # Keep IDs until every dependency succeeds: losing them on a
                 # Search retry would turn a targeted People repair into a scan.
                 if dirty_people:

@@ -357,3 +357,24 @@ def test_available_delta_capacity_bounds_a_100k_import_without_rejecting_progres
     assert search_db.available_delta_row_capacity(manifest, 5000) == 32500
     assert search_db.available_delta_row_capacity({**manifest, 'deltaRows': 32000}, 5000) == 500
     assert search_db.available_delta_row_capacity({**manifest, 'deltaSeq': 200}, 5000) == 0
+
+
+def test_capacity_counts_only_deltas_since_last_compaction():
+    # deltaSeq is a lifetime counter; compaction advances baseSeq to it and leaves it in place.
+    compacted = {'rowCount': 12268, 'deltaSeq': 200, 'deltaRows': 0, 'baseSeq': 200}
+    assert search_db.available_delta_row_capacity(compacted, 5000) > 0
+    assert not search_db.delta_budget_exceeded(compacted, 10)
+    pending = {**compacted, 'baseSeq': 0}
+    assert search_db.available_delta_row_capacity(pending, 5000) == 0
+    assert search_db.delta_budget_exceeded(pending, 10)
+    almost = {**compacted, 'baseSeq': 199}
+    assert search_db.available_delta_row_capacity(almost, 5000) > 0
+    assert not search_db.delta_budget_exceeded(almost, 10)
+
+
+def test_compaction_cannot_free_room_only_after_a_compaction_that_folded_everything():
+    stuck = {'rowCount': 100, 'deltaSeq': 3, 'baseSeq': 3, 'deltaRows': 10 ** 6, 'compactedSeq': 3}
+    assert search_db.compaction_cannot_free_room(stuck, 5000)
+    assert not search_db.compaction_cannot_free_room({**stuck, 'deltaSeq': 4}, 5000)   # deltas since
+    assert not search_db.compaction_cannot_free_room({**stuck, 'deltaRows': 0}, 5000)  # room exists
+    assert not search_db.compaction_cannot_free_room({k: v for k, v in stuck.items() if k != 'compactedSeq'}, 5000)

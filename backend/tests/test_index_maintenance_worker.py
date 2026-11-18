@@ -312,3 +312,39 @@ def test_successful_edit_does_not_repeat_artifact_gc(worker, monkeypatch):
     monkeypatch.setattr(app, '_cleanup_completed_index_artifacts',
                         lambda *a: pytest.fail('GC belongs to its independent recovery cadence'))
     assert app._run_index_maintenance_payload(worker.sent[0]) == 'intent_completed'
+
+
+def _manifest(monkeypatch, manifest):
+    import search_db
+    monkeypatch.setattr(search_db, 'load_manifest', lambda user: manifest)
+    monkeypatch.setattr(app, 'refresh_user_search_db_incremental', lambda user: {'status': 'needs_full'})
+
+
+def test_search_compact_cycle_stops_when_compaction_cannot_free_capacity(worker, monkeypatch):
+    # A compaction folded in every delta (compactedSeq == deltaSeq) yet capacity is still 0.
+    _manifest(monkeypatch, {'rowCount': 100, 'deltaSeq': 7, 'baseSeq': 7, 'deltaRows': 100000, 'compactedSeq': 7})
+    assert app._drain_incremental_search_db('A', 'search')['status'] == 'stalled'
+    assert worker.sent == []                      # no further compact job
+
+
+def test_search_still_defers_to_compaction_when_new_deltas_filled_the_budget(worker, monkeypatch):
+    # Normal flow: compaction freed room, then 200 fresh deltas filled it again.
+    _manifest(monkeypatch, {'rowCount': 100, 'deltaSeq': 400, 'baseSeq': 200, 'deltaRows': 0, 'compactedSeq': 200})
+    assert app._drain_incremental_search_db('A', 'search')['status'] == 'deferred'
+    assert worker.sent[0]['scope'] == 'compact'
+
+
+def test_search_defers_to_first_compaction_without_a_marker(worker, monkeypatch):
+    _manifest(monkeypatch, {'rowCount': 100, 'deltaSeq': 200, 'baseSeq': 0, 'deltaRows': 0})
+    assert app._drain_incremental_search_db('A', 'search')['status'] == 'deferred'
+    assert worker.sent[0]['scope'] == 'compact'
+
+
+def test_stalled_search_marks_the_job_failed_not_done(worker, monkeypatch):
+    monkeypatch.setattr(app, '_drain_incremental_search_db', lambda *a, **k: {'status': 'stalled'})
+    monkeypatch.setattr(app, 'prime_all_user_indexes_sequentially', lambda *a, **k: [])
+    monkeypatch.setattr(app, 'require_catalog_owner', lambda **k: None, raising=False)
+    app.enqueue_index_build('A', scope='search')
+    app._run_index_build_job('A', 'job1', 'search')
+    final = [s for s in worker.statuses if s[0][3] in ('done', 'failed')]
+    assert final and final[-1][0][3] == 'failed' and 'capacity' in final[-1][1]['error']
