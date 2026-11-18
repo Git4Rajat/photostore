@@ -269,7 +269,7 @@ const PhotoViewer: React.FC = () => {
                     </button>
                     <Menu
                         align="right"
-                        className="pt-vb-more"
+                        className={`pt-vb-more${route.page === 'gallery' ? ' phone-menu-only' : ''}`}
                         renderTrigger={(toggle) => (
                             <button type="button" className="pt-vb-btn" title="More" onClick={toggle}>
                                 <EllipsisHorizontalIcon /> <span>More</span>
@@ -281,7 +281,7 @@ const PhotoViewer: React.FC = () => {
                                 {/* Phones keep the bar to Like, Rate, Info and More; the rest live here. */}
                                 <button type="button" className="phone-only" onClick={() => { close(); setAlbumSheetOpen(true); }}>Add to album</button>
                                 <button type="button" className="phone-only" onClick={() => { close(); navigate('tools', { filenames: photo.filename }); }}>Open in Workbench</button>
-                                <button type="button" onClick={() => { close(); startDownload(); }}>Download</button>
+                                <button type="button" className="phone-only" onClick={() => { close(); startDownload(); }}>Download</button>
                                 {route.page !== 'gallery' && (
                                     <button
                                         type="button"

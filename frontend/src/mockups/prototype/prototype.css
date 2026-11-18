@@ -1585,6 +1585,8 @@
 
 @media (min-width: 806px) {
   .pt-more-menu .phone-only { display: none; }
+  /* In the Gallery the menu holds only phone items, so desktops drop the empty More button. */
+  .pt-viewer-bar .phone-menu-only { display: none; }
 }
 
 /* The viewer's Rate popover is just the five stars (as the redesign draws it): no heading, no divider. */
