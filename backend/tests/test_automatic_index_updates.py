@@ -884,3 +884,37 @@ def test_an_upload_request_shares_one_reservation_per_kind(runtime, monkeypatch)
         assert automatic._COALESCED.get() is None
     assert begun == [('A', 'lexical_artifact')] and finished == [('A', 'lexical_artifact')]
     assert runtime.store.control('A', 'lexical_artifact')['active'] == 0
+
+
+def _contend_control_row(runtime, monkeypatch, losses):
+    """Fail the next `losses` control-row transactions as a concurrent writer would, on a fake clock."""
+    clock = {'now': 1000.0}
+    monkeypatch.setattr(automatic.time, 'monotonic', lambda: clock['now'])
+    monkeypatch.setattr(automatic.time, 'sleep', lambda seconds: clock.__setitem__('now', clock['now'] + seconds))
+    real = runtime.store.table.submit_transaction
+    lost = {'count': 0}
+
+    def contended(ops, *args, **kwargs):
+        if lost['count'] < losses:
+            lost['count'] += 1
+            raise ResourceModifiedError('control row changed')
+        return real(ops, *args, **kwargs)
+    monkeypatch.setattr(runtime.store.table, 'submit_transaction', contended)
+    return clock, lost
+
+
+def test_a_reservation_outlasts_a_long_burst_of_control_row_races(runtime, monkeypatch):
+    # 40 straight losses: the old 20-try limit failed the upload request here.
+    clock, lost = _contend_control_row(runtime, monkeypatch, 40)
+    res = runtime.store.begin('A', 'lexical_artifact', [], uncertain=True, owner='upload-pod')
+    assert lost['count'] == 40 and clock['now'] - 1000.0 <= automatic.CONTROL_CAS_PATIENCE_SECONDS
+    assert runtime.store.control('A', 'lexical_artifact')['active'] == 1
+    assert [r['reservationId'] for r in runtime.store.reservations('A', 'lexical_artifact')] == [res]
+
+
+def test_a_reservation_still_gives_up_once_its_patience_runs_out(runtime, monkeypatch):
+    clock, _ = _contend_control_row(runtime, monkeypatch, 10**6)
+    with pytest.raises(ResourceModifiedError):
+        runtime.store.begin('A', 'lexical_artifact', [], uncertain=True, owner='upload-pod')
+    assert automatic.CONTROL_CAS_PATIENCE_SECONDS <= clock['now'] - 1000.0 <= automatic.CONTROL_CAS_PATIENCE_SECONDS + 1.0
+    assert runtime.store.reservations('A', 'lexical_artifact') == []

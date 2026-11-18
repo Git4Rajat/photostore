@@ -419,6 +419,11 @@ def partition(user, kind):
     return 'automatic-' + hashlib.sha256(f'{user}\0{kind}'.encode()).hexdigest()
 
 
+# How long one reservation change keeps retrying the shared control row before
+# giving up. Upload requests wait this long at most; a loss fails the request.
+CONTROL_CAS_PATIENCE_SECONDS = float(os.getenv('INDEX_COVERAGE_CAS_PATIENCE_SECONDS', '20'))
+
+
 def _lost_control_race(error):
     """_change gave up after its CAS retries on the shared control row (an ETag conflict, which Azure
     reports inside a batch as 412)."""
@@ -482,7 +487,9 @@ class CoverageStore:
             pages = [[]]
         result = None
         for page_index, page in enumerate(pages):
-            for attempt in range(20):
+            deadline = time.monotonic() + CONTROL_CAS_PATIENCE_SECONDS
+            attempt = 0
+            while True:
                 current = self.ensure(user, kind)
                 row = dict(current, revision=uuid.uuid4().hex)
                 if page_index == 0:
@@ -498,17 +505,19 @@ class CoverageStore:
                     result = row
                     break
                 except (ResourceModifiedError, ResourceExistsError):
-                    if attempt == 19:
+                    if time.monotonic() >= deadline:
                         raise
                 except Exception as error:
                     # Azure reports an ETag conflict inside a batch this way.
-                    if getattr(error, 'status_code', None) != 412 or attempt == 19:
+                    if getattr(error, 'status_code', None) != 412 or time.monotonic() >= deadline:
                         raise
-                # Immediate CAS retries repeatedly lose to the same hot
-                # coverage control row during upload fanout. Keep the durable
-                # reservation and bounded retry policy, but yield long enough
-                # for the winning transaction to publish its next ETag.
-                time.sleep(random.uniform(0.001, min(0.25, 0.002 * (2 ** attempt))))
+                # Every upload request and Vision write races on this one row
+                # per (library, kind). A 16k-file upload kept losing for longer
+                # than the old 20 tries (~1.5 s), failing whole init batches
+                # with "Upload reservation failed". Full jitter up to 1 s
+                # spreads the writers out; give up only after the patience.
+                time.sleep(random.uniform(0.001, min(1.0, 0.01 * (2 ** min(attempt, 7)))))
+                attempt += 1
         return result
 
     def begin(self, user, kind, ids, *, uncertain=False, deleted=False,
