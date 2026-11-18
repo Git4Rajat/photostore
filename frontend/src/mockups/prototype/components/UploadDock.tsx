@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ChevGlyph as ChevronRight, AlertGlyph as CircleAlert, UploadGlyph as CloudUpload, PhotosGlyph as PhotoIcon, InfoGlyph as Info, CloseGlyph as CloseIcon } from './RedesignIcons';
+import { ChevGlyph as ChevronRight, AlertGlyph as CircleAlert, UploadGlyph as CloudUpload, PhotosGlyph as PhotoIcon, InfoGlyph as Info, CloseGlyph as CloseIcon, CheckGlyph } from './RedesignIcons';
 import { useAppServices } from '../../../components/AppServicesProvider';
 import { Button, IconButton } from '../../../components/ui/Button';
 import { confirmDialog } from '../../../components/shared/dialogs';
@@ -24,9 +24,41 @@ const useNarrow = (): boolean => {
     return narrow;
 };
 
-const Progress: React.FC<{ pct: number; bad?: boolean }> = ({ pct, bad }) => (
-    <div className={`up-prog${bad ? ' bad' : ''}`} role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct} aria-label="Upload progress">
-        <i style={{ width: `${pct}%` }} />
+const Progress: React.FC<{ pct?: number; bad?: boolean }> = ({ pct, bad }) => (
+    <div
+        className={`up-prog${bad ? ' bad' : ''}${pct === undefined ? ' ind' : ''}`}
+        role="progressbar"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={pct}
+        aria-label="Upload progress"
+    >
+        <i style={pct === undefined ? undefined : { width: `${pct}%` }} />
+    </div>
+);
+
+// How long "Skip" can be undone before the failed files are really dropped.
+export const SKIP_UNDO_MS = 6000;
+
+type Acting = 'pause' | 'cancel' | 'retry' | null;
+type Outcome = { kind: 'cancelled'; added: number; notAdded: number };
+
+/** The one-line result that replaces the dock after cancel / skip, with a single action and an optional dismiss. */
+const ResultBar: React.FC<{
+    narrow: boolean;
+    bad?: boolean;
+    title: string;
+    sub: string;
+    action?: { label: string; onClick: () => void; disabled?: boolean };
+    onDismiss?: () => void;
+}> = ({ narrow, bad, title, sub, action, onDismiss }) => (
+    <div className={`up-dock up-result ${narrow ? 'up-bar' : 'up-tray'}`} role="status" aria-live="polite">
+        <div className="up-rr">
+            <span className={`up-ico${bad ? ' bad' : ''}`}>{bad ? <CircleAlert aria-hidden="true" /> : <CheckGlyph aria-hidden="true" />}</span>
+            <span className="up-t"><b>{title}</b><span>{sub}</span></span>
+            {action ? <button type="button" className="up-link" onClick={action.onClick} disabled={action.disabled}>{action.label}</button> : null}
+            {onDismiss ? <IconButton label="Dismiss" variant="link" size="sm" onClick={onDismiss}><CloseIcon aria-hidden="true" /></IconButton> : null}
+        </div>
     </div>
 );
 
@@ -58,15 +90,25 @@ const FailedRows: React.FC<{ files: PersistedUploadFile[]; onRetry?: () => void;
 
 export const UploadDock: React.FC = () => {
     const {
-        uploadActive, uploading, retryingUpload, uploadProgress: progress, uploadCheckProgress: checking, pendingUploadSummary, pendingUploadFailedFiles,
-        stopActiveUpload, retryPersistedUploadSession, discardPersistedUploadSession,
+        uploadActive, uploading, uploadProgress: progress, uploadCheckProgress: checking, pendingUploadSummary, pendingUploadFailedFiles,
+        stopActiveUpload, retryPersistedUploadSession, discardPersistedUploadSession, requestUpload,
     } = useAppServices();
     const narrow = useNarrow();
     const [sheetOpen, setSheetOpen] = useState(false);
     const [collapsed, setCollapsed] = useState(false);
     const [hidden, setHidden] = useState(false);
+    // The action the user just tapped. Set synchronously on the click so a second tap is ignored
+    // and the button already says what is happening, before the services have caught up.
+    const [acting, setActing] = useState<Acting>(null);
     const [cancelling, setCancelling] = useState(false);
+    const [outcome, setOutcome] = useState<Outcome | null>(null);
+    const [skipped, setSkipped] = useState<{ count: number } | null>(null);
+    // How many files the last "Try again" started with, so the result can say how many worked.
+    const [retryOf, setRetryOf] = useState<number | null>(null);
     const startRef = useRef<{ at: number; base: number } | null>(null);
+    const cancelSnapshotRef = useRef({ added: 0, notAdded: 0 });
+    const discardingRef = useRef(false);
+    const skipTimerRef = useRef<number | null>(null);
 
     const added = progress?.uploadedCount ?? 0;
     const total = progress?.totalCount ?? 0;
@@ -74,21 +116,38 @@ export const UploadDock: React.FC = () => {
     const pending = !uploadActive && (pendingUploadSummary?.fileCount ?? 0) > 0;
     const failedFiles = pendingUploadFailedFiles;
     const showFailed = pending && failedFiles.length > 0;
-    const visible = uploadActive ? !hidden : pending;
+    const visible = cancelling || skipped || outcome ? true : uploadActive ? !hidden : pending;
 
     useEffect(() => {
         if (!uploadActive) { startRef.current = null; setHidden(false); return; }
         if (!startRef.current) startRef.current = { at: Date.now(), base: added };
+        setOutcome(null);
     }, [uploadActive, added]);
 
-    // Cancel = pause, then drop what is left once the pause has landed.
+    // A pause has landed once the upload is no longer active.
+    useEffect(() => { if (acting === 'pause' && !uploadActive) setActing(null); }, [acting, uploadActive]);
+
+    // Everything is finished or dropped: forget the last retry.
+    useEffect(() => { if (!pending && !uploadActive) setRetryOf(null); }, [pending, uploadActive]);
+
+    // Cancel = pause, then drop what is left once the pause has landed, then say how it ended.
     useEffect(() => {
-        if (!cancelling || uploadActive) return;
-        setCancelling(false);
-        if (pendingUploadSummary) void discardPersistedUploadSession();
+        if (!cancelling || uploadActive || discardingRef.current) return;
+        discardingRef.current = true;
+        void (async () => {
+            if (pendingUploadSummary) await discardPersistedUploadSession();
+            discardingRef.current = false;
+            setCancelling(false);
+            setActing(null);
+            setSheetOpen(false);
+            setOutcome({ kind: 'cancelled', ...cancelSnapshotRef.current });
+        })();
     }, [cancelling, uploadActive, pendingUploadSummary, discardPersistedUploadSession]);
 
     useEffect(() => { if (!visible) setSheetOpen(false); }, [visible]);
+
+    // Leaving with a skip pending drops nothing: the files stay in the retry list.
+    useEffect(() => () => { if (skipTimerRef.current !== null) window.clearTimeout(skipTimerRef.current); }, []);
 
     if (!visible) return null;
 
@@ -101,35 +160,100 @@ export const UploadDock: React.FC = () => {
         ? timeLeftLabel(Date.now() - startRef.current.at, added - startRef.current.base, waiting)
         : null;
     const duplicatesLabel = duplicates > 0 ? `${duplicates} already in your library` : null;
+    const retrying = retryOf !== null && uploadActive;
     const label = uploading ? 'Uploading' : 'Finishing upload';
-    const title = checking && uploadActive
+    const worked = retryOf === null ? 0 : Math.max(0, retryOf - failedFiles.length);
+    const title = cancelling
+        ? 'Cancelling upload'
+        : checking && uploadActive
         ? `Checking ${plural(checking.total, 'photo')}`
+        : retrying
+        ? 'Trying again'
         : !uploadActive
-        ? (showFailed ? `${plural(failedFiles.length, 'item')} didn’t upload` : 'Upload paused')
+        ? (showFailed ? `${plural(failedFiles.length, retryOf === null ? 'item' : 'item')} ${retryOf === null ? 'didn’t' : 'still didn’t'} upload` : 'Upload paused')
         : total ? `${label} ${added} of ${total}` : `${label}…`;
-    const sub = !uploadActive
-        ? (showFailed ? 'Tap to see why' : `${plural(pendingUploadSummary?.fileCount ?? 0, 'file')} waiting`)
+    const sub = cancelling
+        ? 'Photos already added stay in your library'
+        : !uploadActive
+        ? (showFailed ? (retryOf === null ? 'Tap to see why' : `${worked} of ${retryOf} worked this time`) : `${plural(pendingUploadSummary?.fileCount ?? 0, 'file')} waiting`)
         : checking ? 'Looking for ones you already have'
         : [timeLeft ?? (progress?.mbPerSecond ? `${progress.mbPerSecond.toFixed(1)} MB/s` : 'Starting…'), duplicatesLabel].filter(Boolean).join(' · ');
 
-    const heading = uploadActive ? (!checking && uploading && total ? `Uploading ${plural(total, 'item')}` : title) : title;
-    const pause = () => stopActiveUpload();
+    const heading = cancelling || retrying ? title : uploadActive ? (!checking && uploading && total ? `Uploading ${plural(total, 'item')}` : title) : title;
+
+    const pause = () => {
+        if (acting) return;
+        setActing('pause');
+        stopActiveUpload();
+    };
     const cancel = async () => {
+        if (acting) return;
+        setActing('cancel');
+        const stays = added;
+        const notAdded = Math.max(0, total - added);
         const ok = await confirmDialog({
             title: 'Cancel this upload?',
-            message: 'Files already added stay in Photos. The rest won’t be uploaded.',
+            message: `The ${plural(stays, 'photo')} already added stay in your library. The other ${notAdded} won’t be uploaded.`,
             confirmLabel: 'Cancel upload',
             cancelLabel: 'Keep uploading',
             danger: true,
         });
-        if (!ok) return;
+        if (!ok) { setActing(null); return; }
+        cancelSnapshotRef.current = { added: stays, notAdded };
         setCancelling(true);
+        if (narrow) setSheetOpen(true);
         stopActiveUpload();
     };
-    const retry = () => { void retryPersistedUploadSession(); };
-    const busy = uploading || retryingUpload;
-    const retryLabel = retryingUpload ? 'Retrying…' : showFailed ? 'Try again' : 'Resume';
-    const skip = () => { void discardPersistedUploadSession(); };
+    const retry = async () => {
+        if (acting) return;
+        setActing('retry');
+        setRetryOf(failedFiles.length || pendingUploadSummary?.fileCount || null);
+        try {
+            await retryPersistedUploadSession();
+        } finally {
+            setActing(null);
+        }
+    };
+    // Skip takes effect on screen at once; the files are really dropped once the undo window has passed.
+    const skip = () => {
+        if (skipped || acting) return;
+        setSkipped({ count: failedFiles.length || pendingUploadSummary?.fileCount || 0 });
+        skipTimerRef.current = window.setTimeout(() => {
+            skipTimerRef.current = null;
+            void discardPersistedUploadSession().finally(() => { setSkipped(null); setRetryOf(null); });
+        }, SKIP_UNDO_MS);
+    };
+    const undoSkip = () => {
+        if (skipTimerRef.current !== null) window.clearTimeout(skipTimerRef.current);
+        skipTimerRef.current = null;
+        setSkipped(null);
+    };
+    const busy = uploading || acting !== null;
+    const retryLabel = acting === 'retry' ? 'Trying again…' : showFailed ? 'Try again' : 'Resume';
+    const pauseLabel = acting === 'pause' ? 'Pausing…' : 'Pause';
+    const cancelLabel = acting === 'cancel' ? 'Cancelling…' : 'Cancel upload';
+
+    if (skipped) {
+        return (
+            <ResultBar
+                narrow={narrow}
+                title={`${plural(skipped.count, 'item')} skipped`}
+                sub="You can choose them again later"
+                action={{ label: 'Undo', onClick: undoSkip }}
+            />
+        );
+    }
+    if (outcome && !cancelling && !uploadActive) {
+        return (
+            <ResultBar
+                narrow={narrow}
+                title="Cancelled"
+                sub={`${outcome.added} added, ${outcome.notAdded} not`}
+                action={{ label: 'Choose again', onClick: () => { setOutcome(null); requestUpload(); } }}
+                onDismiss={() => setOutcome(null)}
+            />
+        );
+    }
 
     const icon = (
         <span className={`up-ico${!uploadActive && showFailed ? ' bad' : ''}`}>
@@ -152,38 +276,51 @@ export const UploadDock: React.FC = () => {
             <p className="up-fine">If Try again can’t find them, choose Upload and pick the same photos again. Files already added are skipped.</p>
         </>
     );
+    const retryingLede = retrying ? <p className="up-lede">{added} of {total} retried. {added} worked, {failed} failed again.</p> : null;
+    const cancellingBody = (
+        <>
+            <Progress />
+            <p className="up-lede">Stopping the last few files and clearing {cancelSnapshotRef.current.notAdded} from the list.</p>
+            <div className="up-stats up-stats-2">
+                <div className="up-stat"><b>{cancelSnapshotRef.current.added}</b><span>Stay added</span></div>
+                <div className="up-stat"><b>{cancelSnapshotRef.current.notAdded}</b><span>To clear</span></div>
+            </div>
+            <p className="up-note"><Info aria-hidden="true" /><span>Photos already added are never removed. You can close this page.</span></p>
+        </>
+    );
 
     // One bar on phones; tapping it opens the detail in a sheet.
     if (narrow) {
-                return (
+        return (
             <>
                 <div className="up-dock up-bar">
                     <button type="button" className="up-head" onClick={() => setSheetOpen(true)} aria-label={`${title}. ${sub}. Show details`}>
                         {icon}
                         <span className="up-t"><b>{title}</b><span>{sub}</span></span>
-                        {uploadActive ? <span className="up-pct">{pct}%</span> : null}
+                        {uploadActive && !cancelling ? <span className="up-pct">{pct}%</span> : null}
                         <ChevronRight className="up-chev" aria-hidden="true" />
                     </button>
-                    {uploadActive ? <Progress pct={pct} /> : null}
+                    {uploadActive || cancelling ? <Progress pct={cancelling ? undefined : pct} /> : null}
                 </div>
                 <BottomSheet open={sheetOpen} onClose={() => setSheetOpen(false)} title={heading}>
                     <div className="up-sheet">
-                        {uploadActive ? (
+                        {cancelling ? cancellingBody : uploadActive ? (
                             <>
                                 <Progress pct={pct} />
+                                {retryingLede}
                                 {checking ? <p className="up-lede">{checking.checked} of {checking.total} checked. Photos already in your library won’t be uploaded again.</p> : stats}
                                 {!checking && duplicates > 0 ? <p className="up-fine">{duplicatesLabel}, so they were skipped.</p> : null}
                                 {keepOpen}
                                 <div className="up-btns">
-                                    <Button onClick={pause}>Pause</Button>
-                                    <Button onClick={() => void cancel()}>Cancel upload</Button>
+                                    <Button onClick={pause} disabled={acting !== null}>{pauseLabel}</Button>
+                                    <Button onClick={() => void cancel()} disabled={acting !== null}>{cancelLabel}</Button>
                                 </div>
                             </>
                         ) : (
                             <>
                                 {showFailed ? failureLede : <p className="up-lede">{plural(pendingUploadSummary?.fileCount ?? 0, 'file')} still waiting.</p>}
                                 {showFailed ? <FailedRows files={failedFiles} /> : null}
-                                <Button variant="primary" className="up-wide" onClick={retry} disabled={busy}>{retryLabel}</Button>
+                                <Button variant="primary" className="up-wide" onClick={() => void retry()} disabled={busy} aria-busy={acting === 'retry'}>{retryLabel}</Button>
                                 <Button className="up-wide" onClick={skip} disabled={busy}>
                                     {showFailed ? `Skip ${failedFiles.length === 1 ? 'this one' : `these ${failedFiles.length}`}` : 'Discard'}
                                 </Button>
@@ -204,38 +341,45 @@ export const UploadDock: React.FC = () => {
                 <IconButton label={collapsed ? 'Expand' : 'Collapse'} variant="link" size="sm" onClick={() => setCollapsed((c) => !c)} aria-expanded={!collapsed}>
                     <ChevronRight style={{ transform: `rotate(${collapsed ? -90 : 90}deg)` }} aria-hidden="true" />
                 </IconButton>
-                {uploadActive ? (
+                {uploadActive && !cancelling ? (
                     <IconButton label="Hide" variant="link" size="sm" onClick={() => setHidden(true)}><CloseIcon aria-hidden="true" /></IconButton>
                 ) : null}
             </div>
-            {uploadActive ? (
-                <div className="up-ub">
-                    <Progress pct={pct} />
-                    <div className="up-fr"><span>{checking ? `${checking.checked} of ${checking.total} checked` : `${added} added · ${waiting} waiting`}</span><span>{checking ? 'Skipping ones you have' : timeLeft ?? duplicatesLabel ?? (progress?.mbPerSecond ? `${progress.mbPerSecond.toFixed(1)} MB/s` : '')}</span></div>
-                </div>
-            ) : null}
-            {!collapsed ? (
+            {cancelling ? (
+                !collapsed ? <div className="up-ub">{cancellingBody}</div> : null
+            ) : (
                 <>
-                    {!uploadActive ? <div className="up-ub">{showFailed ? failureLede : <p className="up-lede">{plural(pendingUploadSummary?.fileCount ?? 0, 'file')} still waiting.</p>}</div> : null}
-                    {showFailed ? <FailedRows files={failedFiles} onRetry={retry} retryDisabled={busy} /> : null}
-                    <div className="up-uf">
-                        {uploadActive ? (
-                            <>
-                                <span>Keep this tab open until it finishes.</span>
-                                <span className="up-fbtns">
-                                    <button type="button" className="up-link" onClick={pause}>Pause</button>
-                                    <button type="button" className="up-link mut" onClick={() => void cancel()}>Cancel</button>
-                                </span>
-                            </>
-                        ) : (
-                            <>
-                                <button type="button" className="up-link mut" onClick={skip} disabled={busy}>{showFailed ? 'Skip these' : 'Discard'}</button>
-                                <Button variant="primary" size="sm" onClick={retry} disabled={busy}>{retryLabel}</Button>
-                            </>
-                        )}
-                    </div>
+                    {uploadActive ? (
+                        <div className="up-ub">
+                            <Progress pct={pct} />
+                            {retryingLede}
+                            <div className="up-fr"><span>{checking ? `${checking.checked} of ${checking.total} checked` : `${added} added · ${waiting} waiting`}</span><span>{checking ? 'Skipping ones you have' : timeLeft ?? duplicatesLabel ?? (progress?.mbPerSecond ? `${progress.mbPerSecond.toFixed(1)} MB/s` : '')}</span></div>
+                        </div>
+                    ) : null}
+                    {!collapsed ? (
+                        <>
+                            {!uploadActive ? <div className="up-ub">{showFailed ? failureLede : <p className="up-lede">{plural(pendingUploadSummary?.fileCount ?? 0, 'file')} still waiting.</p>}</div> : null}
+                            {showFailed ? <FailedRows files={failedFiles} onRetry={() => void retry()} retryDisabled={busy} /> : null}
+                            <div className="up-uf">
+                                {uploadActive ? (
+                                    <>
+                                        <span>Keep this tab open until it finishes.</span>
+                                        <span className="up-fbtns">
+                                            <button type="button" className="up-link" onClick={pause} disabled={acting !== null}>{pauseLabel}</button>
+                                            <button type="button" className="up-link mut" onClick={() => void cancel()} disabled={acting !== null}>{acting === 'cancel' ? 'Cancelling…' : 'Cancel'}</button>
+                                        </span>
+                                    </>
+                                ) : (
+                                    <>
+                                        <button type="button" className="up-link mut" onClick={skip} disabled={busy}>{showFailed ? 'Skip these' : 'Discard'}</button>
+                                        <Button variant="primary" size="sm" onClick={() => void retry()} disabled={busy} aria-busy={acting === 'retry'}>{retryLabel}</Button>
+                                    </>
+                                )}
+                            </div>
+                        </>
+                    ) : null}
                 </>
-            ) : null}
+            )}
         </div>
     );
 };
