@@ -1647,3 +1647,18 @@
 .pd-txt span { display: block; font-size: 12px; color: var(--muted); }
 .pd-tag { font-size: 12px; color: var(--muted); }
 @media (prefers-reduced-motion: reduce) { .pd-seg i b.slide, .pd-spin { animation: none; } .pd-seg i b { transition: none; } }
+
+/* Upload dock: pending actions, cancelling, one-line results */
+.up-prog.ind i { width: 40%; animation: up-ind 1.2s ease-in-out infinite; }
+@keyframes up-ind { 0% { transform: translateX(-100%); } 100% { transform: translateX(250%); } }
+@media (prefers-reduced-motion: reduce) { .up-prog.ind i { animation: none; width: 100%; opacity: 0.5; } }
+.up-stats-2 { grid-template-columns: repeat(2, 1fr); }
+.up-result.up-tray { width: 372px; }
+.up-rr { display: flex; align-items: center; gap: 11px; }
+.up-result.up-tray .up-rr { padding: 12px 10px 12px 16px; }
+.up-rr .btn-icon { width: 28px; height: 28px; min-height: 0; padding: 0; flex: none; }
+.up-rr .btn-icon svg { width: 16px; height: 16px; }
+.up-dock button:disabled, .up-dock .btn:disabled { opacity: 0.55; cursor: default; }
+.up-dock .btn[aria-busy="true"]::before { content: ""; width: 12px; height: 12px; margin-right: 8px; border-radius: 50%; border: 2px solid currentColor; border-right-color: transparent; display: inline-block; vertical-align: -2px; animation: up-spin 0.8s linear infinite; }
+@keyframes up-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .up-dock .btn[aria-busy="true"]::before { animation: none; } }
