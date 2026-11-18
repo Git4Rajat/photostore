@@ -4,7 +4,7 @@ import { acknowledgeStaleUpload, reconcileUploadSessions } from '../services/upl
 import { activityNotifications, fetchActivity, fetchProcessingSummary, loadAnnouncedActivity, processingSummaryText, resendInvite as postInviteResend, saveAnnouncedActivity } from '../services/activityNotifications';
 import { observeExpiredWaveSession } from '../services/uploadWaveSync';
 import { waveLiveEnabled, waveShadowEnabled } from '../services/uploadWaveClient';
-import { bindWaveChild, declareWaveSelection, retryWaveOperation, pruneStaleWaveOperations, waveParentFor } from '../services/uploadWaveOperations';
+import { bindWaveChild, declareWaveSelection, retryWaveOperation, pruneStaleWaveOperations, sameWaveLineage, waveParentFor } from '../services/uploadWaveOperations';
 import { hasPendingEdits } from '../services/pendingEdits';
 import { startIndexReadyPush } from '../services/indexReadyPush';
 import { reportIndexBuilding } from '../services/indexBuilding';
@@ -316,6 +316,8 @@ interface AppServicesContextValue {
     browserAiButtonClass: string;
     loadBrowserAiModel: () => Promise<SharedBrowserAiModelState>;
     uploading: boolean;
+    /** A Retry is checking cached files or reopening the upload; further clicks are ignored. */
+    retryingUpload: boolean;
     uploadActive: boolean;
     uploadProgress: UploadProgress | null;
     /** Set while the selection is hashed to find files already in the library, before any bytes go up. */
@@ -1203,6 +1205,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }
     const discardedUploadSessionIdsRef = useRef<Set<string>>(new Set());
     const isResumingUploadRef = useRef<boolean>(false);
+    const retryInFlightRef = useRef<boolean>(false);
+    const [retryingUpload, setRetryingUpload] = useState<boolean>(false);
     const uploadRunGenerationRef = useRef<number>(0);
     const uploadStartInProgressRef = useRef<boolean>(false);
     const uploadSourceFilesRef = useRef<Map<string, File>>(new Map());
@@ -4869,7 +4873,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
     const retryPersistedUploadSession = useCallback(async (sessionId?: string) => {
         let session = pendingUploadSessionRef.current || pendingUploadSession || loadPersistedSession();
-        if (sessionId && sessionId !== (session?.waveOperationId || session?.id)) {
+        // A notice may name any session of this checkpoint's retry chain (an
+        // abandoned sibling retry included), not only the newest one.
+        if (sessionId && sessionId !== (session?.waveOperationId || session?.id)
+            && !(session?.waveOperationId && sameWaveLineage(sessionId, session.waveOperationId, session.waveScope || ''))) {
             addNotification('Reselect unfinished files', 'The retry checkpoint for this upload is unavailable on this device. Use Upload to select the unfinished files again.');
             return;
         }
@@ -4878,74 +4885,85 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         // background finalize/retry tail (guarded by isResumingUploadRef) can
         // still be running -- calling runUploadSession again here while that's
         // true would just silently no-op against its own re-entrancy guard.
-        if (!session || uploading || isResumingUploadRef.current || uploadDiscardInProgressRef.current) {
+        if (!session || uploading || isResumingUploadRef.current || uploadDiscardInProgressRef.current
+            || retryInFlightRef.current) {
             return;
         }
-        const unfinishedFiles = session.files.filter((file) => file.status !== 'done');
-        // Throttled the same way as cacheUploadFilesForResume: an unfinished
-        // batch of 1000+ files, most missing from uploadSourceFilesRef after a
-        // reload, used to fire that many simultaneous idbGet calls via a bare
-        // Promise.all -- the same IndexedDB-connection burst iOS Safari can't
-        // handle, just on the read side this time.
-        const cacheChecks: Array<{ file: PersistedUploadFile; hasCachedBlob: boolean }> = new Array(unfinishedFiles.length);
-        let cacheCheckCursor = 0;
-        const cacheCheckWorker = async () => {
-            while (true) {
-                const index = cacheCheckCursor;
-                cacheCheckCursor += 1;
-                if (index >= unfinishedFiles.length) {
-                    return;
+        // One retry at a time. The cache check below can take seconds, and every
+        // click that slipped past the guards above used to open its own linked
+        // server session; only one of them could run, the rest expired unused.
+        retryInFlightRef.current = true;
+        setRetryingUpload(true);
+        try {
+            const unfinishedFiles = session.files.filter((file) => file.status !== 'done');
+            // Throttled the same way as cacheUploadFilesForResume: an unfinished
+            // batch of 1000+ files, most missing from uploadSourceFilesRef after a
+            // reload, used to fire that many simultaneous idbGet calls via a bare
+            // Promise.all -- the same IndexedDB-connection burst iOS Safari can't
+            // handle, just on the read side this time.
+            const cacheChecks: Array<{ file: PersistedUploadFile; hasCachedBlob: boolean }> = new Array(unfinishedFiles.length);
+            let cacheCheckCursor = 0;
+            const cacheCheckWorker = async () => {
+                while (true) {
+                    const index = cacheCheckCursor;
+                    cacheCheckCursor += 1;
+                    if (index >= unfinishedFiles.length) {
+                        return;
+                    }
+                    const file = unfinishedFiles[index];
+                    const hasCachedBlob = uploadSourceFilesRef.current.has(file.key)
+                        || uploadHandlesRef.current.has(file.key)
+                        || Boolean(await idbGet(file.key).catch(() => null));
+                    cacheChecks[index] = { file, hasCachedBlob };
                 }
-                const file = unfinishedFiles[index];
-                const hasCachedBlob = uploadSourceFilesRef.current.has(file.key)
-                    || uploadHandlesRef.current.has(file.key)
-                    || Boolean(await idbGet(file.key).catch(() => null));
-                cacheChecks[index] = { file, hasCachedBlob };
+            };
+            await Promise.all(Array.from(
+                { length: Math.min(IDB_RESUME_CACHE_CONCURRENCY, unfinishedFiles.length) },
+                () => cacheCheckWorker(),
+            ));
+            const missingCachedFiles = cacheChecks.filter((item) => !item.hasCachedBlob).map((item) => item.file);
+            const retryableFiles = cacheChecks.filter((item) => item.hasCachedBlob).map((item) => item.file);
+            if (retryableFiles.length === 0) {
+                addNotification('Reselect files', `${plural(missingCachedFiles.length, 'file')} need to be selected again before retry.`);
+                setUploadError('Upload files are no longer cached. Use Upload to reselect those files, then retry.');
+                return;
             }
-        };
-        await Promise.all(Array.from(
-            { length: Math.min(IDB_RESUME_CACHE_CONCURRENCY, unfinishedFiles.length) },
-            () => cacheCheckWorker(),
-        ));
-        const missingCachedFiles = cacheChecks.filter((item) => !item.hasCachedBlob).map((item) => item.file);
-        const retryableFiles = cacheChecks.filter((item) => item.hasCachedBlob).map((item) => item.file);
-        if (retryableFiles.length === 0) {
-            addNotification('Reselect files', `${plural(missingCachedFiles.length, 'file')} need to be selected again before retry.`);
-            setUploadError('Upload files are no longer cached. Use Upload to reselect those files, then retry.');
-            return;
+            if (missingCachedFiles.length > 0) {
+                addNotification('Partial retry', `${plural(retryableFiles.length, 'cached file')} will retry. Still to reselect: ${plural(missingCachedFiles.length, 'file')}.`);
+            }
+            // The authoritative cap. Every caller of retryPersistedUploadSession --
+            // the mount-effect auto-resume, the manual Retry button, and any other
+            // path that resumes a paused session -- funnels through here, so none
+            // of them need their own gating: a manual click is just as capable of
+            // refreshing the backend's finalize lease and blocking Discard forever
+            // as the automatic path was. Checked here, right
+            // before the call that actually touches the server, so a session that
+            // never got this far (missing cache, already uploading) never spends
+            // one of its attempts. claimUploadRetryAttempt checks-and-increments
+            // atomically (via navigator.locks where available) so two tabs racing
+            // the same stuck session can't both slip through on the same count.
+            if (!await claimUploadRetryAttempt(localStorage, session.id)) {
+                // The attempt that just hit the cap may itself have refreshed the
+                // backend's finalize lease (see claimUploadRetryAttempt's comment),
+                // so Discard can keep failing with "finalization still in flight"
+                // for up to ~10 more minutes even though retrying has stopped --
+                // don't imply Discard will succeed right away.
+                addNotification('Retry limit reached', 'This upload has been retried too many times without finishing. Use Discard to start over -- it may need a few minutes to take effect if the server is still finishing the last attempt.');
+                setUploadError('This upload could not finish after multiple retries. Use Discard -- if it reports the server is still finishing, wait a few minutes and discard again.');
+                return;
+            }
+            uploadStopRequestedRef.current = false;
+            const retryableKeys = new Set(retryableFiles.map((file) => file.key));
+            session = retryWaveOperation(session);
+            persistSession(session);
+            // Open now; runUploadSession bulk-registers the retryable manifest
+            // immediately before starting its workers.
+            await ensureWaveShadowSessionAdmitted(session);
+            await runUploadSession(session, { resumed: true, fileKeys: retryableKeys });
+        } finally {
+            retryInFlightRef.current = false;
+            setRetryingUpload(false);
         }
-        if (missingCachedFiles.length > 0) {
-            addNotification('Partial retry', `${plural(retryableFiles.length, 'cached file')} will retry. Still to reselect: ${plural(missingCachedFiles.length, 'file')}.`);
-        }
-        // The authoritative cap. Every caller of retryPersistedUploadSession --
-        // the mount-effect auto-resume, the manual Retry button, and any other
-        // path that resumes a paused session -- funnels through here, so none
-        // of them need their own gating: a manual click is just as capable of
-        // refreshing the backend's finalize lease and blocking Discard forever
-        // as the automatic path was. Checked here, right
-        // before the call that actually touches the server, so a session that
-        // never got this far (missing cache, already uploading) never spends
-        // one of its attempts. claimUploadRetryAttempt checks-and-increments
-        // atomically (via navigator.locks where available) so two tabs racing
-        // the same stuck session can't both slip through on the same count.
-        if (!await claimUploadRetryAttempt(localStorage, session.id)) {
-            // The attempt that just hit the cap may itself have refreshed the
-            // backend's finalize lease (see claimUploadRetryAttempt's comment),
-            // so Discard can keep failing with "finalization still in flight"
-            // for up to ~10 more minutes even though retrying has stopped --
-            // don't imply Discard will succeed right away.
-            addNotification('Retry limit reached', 'This upload has been retried too many times without finishing. Use Discard to start over -- it may need a few minutes to take effect if the server is still finishing the last attempt.');
-            setUploadError('This upload could not finish after multiple retries. Use Discard -- if it reports the server is still finishing, wait a few minutes and discard again.');
-            return;
-        }
-        uploadStopRequestedRef.current = false;
-        const retryableKeys = new Set(retryableFiles.map((file) => file.key));
-        session = retryWaveOperation(session);
-        persistSession(session);
-        // Open now; runUploadSession bulk-registers the retryable manifest
-        // immediately before starting its workers.
-        await ensureWaveShadowSessionAdmitted(session);
-        await runUploadSession(session, { resumed: true, fileKeys: retryableKeys });
     }, [addNotification, loadPersistedSession, pendingUploadSession, persistSession, runUploadSession, setUploadError, uploading]);
 
     const discardPersistedUploadSession = useCallback(async () => {
@@ -5971,6 +5989,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         browserAiButtonClass,
         loadBrowserAiModel,
         uploading,
+        retryingUpload,
         uploadActive: uploading || backgroundUploadTailActive,
         uploadProgress: uploading || backgroundUploadTailActive ? uploadProgress : null,
         uploadCheckProgress,
@@ -6011,6 +6030,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         browserAiButtonClass,
         loadBrowserAiModel,
         uploading,
+        retryingUpload,
         backgroundUploadTailActive,
         uploadProgress,
         uploadCheckProgress,

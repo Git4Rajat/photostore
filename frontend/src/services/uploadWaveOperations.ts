@@ -172,7 +172,8 @@ export const retireWaveOperation = (session: PersistedUploadSession): void => {
     const parent = loadWaveOperation(session.waveOperationId, session.waveScope!);
     if (!parent || parent.closed) return;
     const receipt: Operation = { id: parent.id, scope: parent.scope, createdAt: parent.createdAt,
-        declaredCount: parent.declaredCount, closed: true, files: [] };
+        declaredCount: parent.declaredCount, closed: true, files: [],
+        ...(parent.resumedFromSessionId ? { resumedFromSessionId: parent.resumedFromSessionId } : {}) };
     if (!persist(receipt)) return;
     operations.set(key(parent.scope, parent.id), receipt);
     outcomes.delete(key(parent.scope, parent.id));
@@ -180,6 +181,24 @@ export const retireWaveOperation = (session: PersistedUploadSession): void => {
         try { localStorage.removeItem(storageKey); } catch { /* Receipt is already durable. */ }
     }
 };
+
+const lineageRoot = (id: string, scope: string): string => {
+    const seen = new Set<string>();
+    let current = id;
+    while (!seen.has(current)) {
+        seen.add(current);
+        const previous = loadWaveOperation(current, scope)?.resumedFromSessionId;
+        if (!previous) break;
+        current = previous;
+    }
+    return current;
+};
+
+// True when both sessions descend from the same original selection on this
+// device -- e.g. a stale-upload notice for one retry and the checkpoint now
+// held by a sibling or later retry. Unknown sessions only match themselves.
+export const sameWaveLineage = (a: string, b: string, scope: string): boolean =>
+    a === b || lineageRoot(a, scope) === lineageRoot(b, scope);
 
 export const waveParentResolved = (session: PersistedUploadSession): boolean => {
     if (!session.waveOperationId) return true;

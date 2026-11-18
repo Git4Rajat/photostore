@@ -1348,6 +1348,75 @@ describe('upload wave shadow protocol wiring', () => {
         });
     });
 
+    const failTwoOfSix = (blockItems: () => boolean) => {
+        vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
+        mocks.getUpload.mockImplementation(async (url) => url === '/upload/waves/protocol' ? { protocol: 'live' } : { hashes: {} });
+        mocks.idbGet.mockImplementation(async () => new File(['x'], 'cached.heic'));
+        const failing = new Set(['original-1.heic', 'original-3.heic']);
+        const original = mocks.postUpload.getMockImplementation()!;
+        mocks.postUpload.mockImplementation(async (url: string, payload: any) => {
+            if (url.endsWith('/items') && blockItems()) throw { response: { data: { error: 'Library cleanup is in progress' } } };
+            if (url === '/upload/finalize-batch') {
+                return { results: payload.files.map((file: any) => failing.has(file.filename)
+                    ? { filename: file.filename, error: 'Upload reservation failed' }
+                    : { filename: file.filename, complete: true, duplicates: [] }) };
+            }
+            return original(url, payload);
+        });
+        return failing;
+    };
+
+    it('ignores repeated Retry clicks while the first retry is still starting', async () => {
+        const failing = failTwoOfSix(() => false);
+        select(filesFor(6));
+        await advance(20000);
+        expect(services.pendingUploadSummary?.fileCount).toBe(2);
+        failing.clear();
+        const opensBefore = opens().length;
+        const finalizedBefore = finalizedFiles().length;
+        act(() => { void services.retryPersistedUploadSession(); });
+        expect(services.retryingUpload).toBe(true);
+        act(() => { void services.retryPersistedUploadSession(); });
+        act(() => { void services.retryPersistedUploadSession(); });
+        await advance(20000);
+        expect(opens().slice(opensBefore)).toHaveLength(1);
+        expect(finalizedFiles().slice(finalizedBefore).map(file => file.filename).sort()).toEqual(['original-1.heic', 'original-3.heic']);
+        expect(services.retryingUpload).toBe(false);
+        expect(services.pendingUploadSummary).toBeNull();
+    });
+
+    it('resumes this device\'s upload from a notice about an earlier abandoned retry, after a reload', async () => {
+        let blocked = false;
+        const failing = failTwoOfSix(() => blocked);
+        select(filesFor(6));
+        await advance(20000);
+        failing.clear();
+        blocked = true;
+        const opensBefore = opens().length;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            act(() => { void services.retryPersistedUploadSession(); });
+            await advance(4000);
+        }
+        const [first, second] = opens().slice(opensBefore).map(([, body]) => body.sessionId);
+        expect(second).toBeDefined();
+        blocked = false;
+        // Reload, then Core reports both abandoned retries.
+        cleanup();
+        uploadWaveSync.__resetWaveShadowStateForTests();
+        mocks.post.mockImplementation(async (url: string) => url === '/api/upload-sessions/reconcile'
+            ? { notifications: [first, second].map(sessionId => ({ sessionId, waveId: 'w', affectedCount: 2, closedAt: Date.now() / 1000 })) }
+            : {});
+        render(<AppServicesProvider><Probe toolsPage={false} /></AppServicesProvider>);
+        await advance(1000);
+        const finalizedBefore = finalizedFiles().length;
+        act(() => { void services.retryPersistedUploadSession(first); });
+        await advance(20000);
+        expect(services.notifications.some(n => n.title === 'Reselect unfinished files')).toBe(false);
+        expect(opens().at(-1)?.[1]).toMatchObject({ declaredCount: 2, resumedFromSessionId: second });
+        expect(finalizedFiles().slice(finalizedBefore).map(file => file.filename).sort()).toEqual(['original-1.heic', 'original-3.heic']);
+        expect(services.pendingUploadSummary).toBeNull();
+    });
+
     it('opens, registers, resolves, and closes the shadow session for a normal completed upload', async () => {
         select(filesFor(2));
         await advance(4000);
