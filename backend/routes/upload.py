@@ -201,6 +201,17 @@ def health_check():
         'uses_managed_identity': app.credential is not None,
     })
 
+
+def _invalid_filename_error(raw_filename) -> dict:
+    """A safe name with a type the server never accepts (e.g. Apple Photos'
+    .aae edit sidecars) gets a code the browser treats as permanent, so it
+    drops the file instead of failing and retrying it."""
+    name = str(raw_filename or '').strip()
+    if app._is_safe_path_segment(name) and not app.allowed_file(name):
+        return {'error': 'Unsupported file type', 'code': 'unsupported_file_type'}
+    return {'error': 'Invalid filename'}
+
+
 @upload_bp.route('/upload/init', methods=['POST'])
 @upload_bp.route('/upload/init/', methods=['POST'])
 @upload_bp.route('/api/upload/init', methods=['POST'])
@@ -224,7 +235,7 @@ def init_upload():
     expected_hash = (data.get('sha256') or '').strip()
 
     if not filename:
-        return app.jsonify({'error': 'Invalid filename'}), 400
+        return app.jsonify(_invalid_filename_error(data.get('filename', ''))), 400
     if total_size <= 0:
         return app.jsonify({'error': 'Invalid totalSize'}), 400
     if total_size > app.MAX_UPLOAD_FILE_BYTES:
@@ -375,7 +386,7 @@ def init_upload_batch():
         total_size = int(item.get('totalSize', 0) or 0)
         expected_hash = str(item.get('sha256') or '').strip()
         if not filename:
-            parsed.append({'index': idx, 'error': 'Invalid filename'})
+            parsed.append({'index': idx, **_invalid_filename_error(item.get('filename', ''))})
             continue
         if total_size <= 0 or total_size > app.MAX_UPLOAD_FILE_BYTES:
             parsed.append({'index': idx, 'filename': filename, 'error': 'Invalid totalSize'})

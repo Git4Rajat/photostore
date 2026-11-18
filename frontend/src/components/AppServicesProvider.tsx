@@ -49,7 +49,7 @@ import {
     isConstrainedUploadDevice,
     isUploadStoppedError,
 } from './browserAiShared';
-import { FILE_ACCEPT_FILTER, isVideoFilename, requiresBackendPreview, shouldSkipConvertedRawPreview } from '../utils/photoDisplay';
+import { FILE_ACCEPT_FILTER, getFileExtension, isUploadableFilename, isVideoFilename, requiresBackendPreview, shouldSkipConvertedRawPreview } from '../utils/photoDisplay';
 import { plural } from '../utils/format';
 import { shouldSuppressLeaseWarning } from '../utils/processingLease';
 import { BackgroundKeepAlive } from '../services/backgroundKeepAlive';
@@ -372,6 +372,13 @@ export const useAppServices = () => {
         throw new Error('useAppServices must be used inside AppServicesProvider.');
     }
     return context;
+};
+
+// Init rejected the file's type (see _validate_media_filename): permanent,
+// unlike the transient failures auto-retry exists for.
+const isUnsupportedFileTypeError = (err: unknown): boolean => {
+    const failure = err as { code?: unknown; response?: { data?: { code?: unknown } } } | null | undefined;
+    return failure?.code === 'unsupported_file_type' || failure?.response?.data?.code === 'unsupported_file_type';
 };
 
 const getUploadErrorMessage = (err: unknown, fallback: string): string => {
@@ -2560,7 +2567,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         if (result && !result.error) {
                             req.resolve(result);
                         } else {
-                            req.reject(new Error(result?.error || 'Batch init failed for this file.'));
+                            req.reject(Object.assign(new Error(result?.error || 'Batch init failed for this file.'), { code: result?.code }));
                         }
                     });
                 })
@@ -3709,6 +3716,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const totalCount = session.files.length;
         let totalUploaded = session.files.filter((file) => file.status === 'done').length;
         let totalFailed = 0;
+        let totalUnsupported = 0;
         let totalSkippedDuplicates = session.files.filter((file) => file.skippedDuplicate).length
             + (options.preflightSkippedDuplicateCount || 0);
         const previouslyUploaded = totalUploaded;
@@ -4054,6 +4062,17 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // need to report a file as failed the same way, just from
             // different points in the (now-decoupled) per-file pipeline.
             const markFileFailed = async (fileMeta: PersistedUploadFile, resolvedFile: File | null, err: unknown) => {
+                if (isUnsupportedFileTypeError(err)) {
+                    // The server rejects this extension on every attempt, so a
+                    // retry can't help: settle the wave item and drop the file
+                    // from the session instead of leaving it failed and retried.
+                    totalUnsupported += 1;
+                    waveShadowFileOutcomes.set(fileMeta.key, { status: 'failed', skippedDuplicate: false });
+                    void resolveWaveShadowFile(session, { ...fileMeta, status: 'failed' });
+                    await releaseCachedUploadFile(fileMeta.key);
+                    removePersistedFile(fileMeta.key);
+                    return;
+                }
                 totalFailed += 1;
                 let previewDataUrl: string | undefined;
                 if (resolvedFile && failedPreviewCount < MAX_FAILED_FILE_PREVIEWS) {
@@ -4639,6 +4658,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 setUploadError(totalFailed > 0
                     ? 'Some files failed to upload. Retry cached files or reselect missing files.'
                     : 'Some files still need to be reselected before retry.'
+                );
+            }
+
+            if (totalUnsupported > 0) {
+                addNotification(
+                    'Some files skipped',
+                    `${plural(totalUnsupported, 'file')} skipped: the server doesn't accept that file type, so they weren't retried.`,
                 );
             }
 
@@ -5590,11 +5616,28 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         const pickerOpenedAt = pickerOpenedAtRef.current;
         pickerOpenedAtRef.current = null;
         const pickerOpenDurationMs = pickerOpenedAt !== null ? Date.now() - pickerOpenedAt : null;
-        const selectedFiles = event.target.files ? Array.from(event.target.files) : [];
+        const pickedFiles = event.target.files ? Array.from(event.target.files) : [];
         perf.recordSpan('upload.picker.change', pickerOpenDurationMs ?? 0, {
-            rows: selectedFiles.length,
-            bytes: selectedFiles.reduce((sum, file) => sum + file.size, 0),
+            rows: pickedFiles.length,
+            bytes: pickedFiles.reduce((sum, file) => sum + file.size, 0),
         });
+        // The accept filter is only a hint: "All Files" or a whole exported
+        // folder still hands over sidecars such as Apple Photos' .aae edit
+        // files, which the server rejects on every attempt. Drop them here so
+        // they never register, fail, or get retried.
+        const selectedFiles = pickedFiles.filter((file) => isUploadableFilename(file.name));
+        const skippedFiles = pickedFiles.length - selectedFiles.length;
+        if (skippedFiles > 0) {
+            const skippedExtensions = Array.from(new Set(
+                pickedFiles
+                    .filter((file) => !isUploadableFilename(file.name))
+                    .map((file) => (getFileExtension(file.name) ? `.${getFileExtension(file.name)}` : 'no extension')),
+            ));
+            const message = `Skipped ${skippedFiles.toLocaleString()} ${skippedFiles === 1 ? 'file that isn\'t a photo or video' : 'files that aren\'t photos or videos'}`
+                + ` (${skippedExtensions.slice(0, 5).join(', ')}${skippedExtensions.length > 5 ? ', ...' : ''}).`;
+            addNotification('Some files skipped', message);
+            showToast(message, { timeout: 8000, panel: false });
+        }
         if (selectedFiles.length > MAX_MOBILE_SELECTION_SIZE && isConstrainedUploadDevice()) {
             console.warn('Rejected oversized mobile upload selection.', {
                 count: selectedFiles.length,
@@ -5625,10 +5668,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // mobile-safari-large-batch-upload-crash). A console breadcrumb
             // costs nothing for ordinary users but gives the next devtools
             // session something HAR alone can't show.
-            console.warn('Upload picker closed with no files selected.', {
-                rawFileListLength: event.target.files?.length ?? null,
-                pickerOpenDurationMs,
-            });
+            if (pickedFiles.length === 0) {
+                console.warn('Upload picker closed with no files selected.', {
+                    rawFileListLength: event.target.files?.length ?? null,
+                    pickerOpenDurationMs,
+                });
+            }
             // A deliberate Cancel dismisses the picker almost instantly. The
             // picker sitting open far longer than that and STILL coming back
             // empty is the one case where "no files" is very unlikely to be
@@ -5636,7 +5681,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // with a picker that just closed and nothing else. See
             // PICKER_LIKELY_FAILED_THRESHOLD_MS's own comment.
             if (
-                pickerOpenDurationMs !== null
+                pickedFiles.length === 0
+                && pickerOpenDurationMs !== null
                 && pickerOpenDurationMs > PICKER_LIKELY_FAILED_THRESHOLD_MS
                 && isConstrainedUploadDevice()
             ) {
