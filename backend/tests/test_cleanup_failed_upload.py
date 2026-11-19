@@ -122,3 +122,41 @@ def test_stale_pre_rename_row_deletes_row_but_preserves_shared_blob(metadata_tab
     assert result['metadataAction'] == 'deleted'
     with pytest.raises(Exception):
         metadata_table.get_entity('lib-A', 'IMG_0051.heic')
+
+
+def test_completed_row_keeps_a_pending_blob_adopted_by_a_renamed_photo(metadata_table, monkeypatch):
+    """2026-11-18: IMG_1456.HEIC clashed at finalize and was saved as
+    IMG_1456-06d9f4a3.HEIC on its reserved blob, leaving that blob as the old
+    row's pending marker. A later duplicate of the same file cleaned up the old
+    row and deleted the renamed photo's original."""
+    _seed_row(
+        metadata_table, 'owner', 'IMG_1456.HEIC',
+        anonymousImageId='older-photo', fileHash='old', mimeType='image/heic',
+        pendingAnonymousBlob='adopted-blob', upload_started_at='2026-11-18T14:08:39+00:00',
+    )
+    deleted, unmapped = [], []
+    monkeypatch.setattr(app, '_delete_photo_blobs_if_present', lambda name, extra=None: deleted.append(name) or [])
+    monkeypatch.setattr(app, 'delete_image_name_mapping', lambda library, blob: unmapped.append(blob))
+    monkeypatch.setattr(app, 'original_filename_for_anonymous_id',
+                        lambda library, blob: 'IMG_1456-06d9f4a3.HEIC' if blob == 'adopted-blob' else None)
+
+    result = app._cleanup_failed_upload('owner', 'IMG_1456.HEIC')
+
+    assert deleted == [] and unmapped == []
+    assert result['metadataAction'] == 'trackingCleared'
+    stored = metadata_table.get_entity('owner', 'IMG_1456.HEIC')
+    assert 'pendingAnonymousBlob' not in stored and stored['anonymousImageId'] == 'older-photo'
+
+
+def test_completed_row_still_deletes_a_truly_orphaned_pending_blob(metadata_table, monkeypatch):
+    _seed_row(
+        metadata_table, 'owner', 'IMG_2000.HEIC',
+        anonymousImageId='older-photo', fileHash='old', mimeType='image/heic',
+        pendingAnonymousBlob='staged-duplicate', upload_started_at='2026-11-18T14:08:39+00:00',
+    )
+    deleted = []
+    monkeypatch.setattr(app, '_delete_photo_blobs_if_present', lambda name, extra=None: deleted.append(name) or [])
+
+    app._cleanup_failed_upload('owner', 'IMG_2000.HEIC')
+
+    assert deleted == ['staged-duplicate']

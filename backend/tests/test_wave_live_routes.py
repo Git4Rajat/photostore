@@ -578,3 +578,54 @@ def test_finalize_binding_mismatch_after_write_is_not_reported_as_transient(live
     assert response.json['code']=='wave_binding_conflict'
     assert response.json['fields']==['photoId','processingRevision']
     assert 'Retry-After' not in response.headers
+
+
+def _complete_wave_with_failed_members(store, metadata, revisions):
+    """A finished wave whose members gave up; metadata rows carry the given current revisions."""
+    from wave_settlement import settle
+    session=store.open_session('s',len(revisions))
+    store.register('s',[dict(itemId=f'i{n}',filename=f'p{n}.jpg') for n in range(len(revisions))])
+    for n in range(len(revisions)):
+        session=store.resolve('s',f'i{n}',outcome='accepted',photo_id=f'photo{n}',processing_revision=f'rev{n}',
+                              filename=f'p{n}.jpg',required_steps=['ocr'])
+    store.close('s',session['manifestRevision'],'close-s')
+    wave=session['waveId']
+    for member in store._page(f'e!{wave}!m!'):
+        settle(store,wave,member,'failed_exhausted','required_step_retries_exhausted',witness=dict(attempts=3))
+    for n,current in enumerate(revisions):
+        if current is not None:
+            metadata.create_entity(dict(PartitionKey='u',RowKey=f'p{n}.jpg',anonymousImageId=f'photo{n}',
+                                        processingRevision=current,processing_state='active'))
+    row=store._required(store.wave_key(wave))
+    store.table.submit_transaction([store._change(row,dict(row,state='complete',failedMembers=len(revisions)))])
+    return wave
+
+
+def test_owner_can_retry_a_finished_waves_failed_photos_once(live_api,monkeypatch):
+    client,store,metadata,library=live_api
+    import routes.upload_wave_shadow as routes
+    monkeypatch.setattr(routes,'_drive',lambda *args:True)
+    retried=[]
+    monkeypatch.setattr(app,'_enqueue_processing_steps',
+        lambda library,filename,steps,force=False:retried.append((filename,force)) or {s:{'status':'wave_owned'} for s in steps})
+    # p0 still on the failed generation, p1 already reprocessed, p2's row is gone.
+    wave=_complete_wave_with_failed_members(store,metadata,['rev0','rev1-newer',None])
+
+    listed=client.get('/upload/waves/live/attention').json['waves']
+    assert [dict(waveId=w['waveId'],failedMembers=w.get('failedMembers')) for w in listed]==[dict(waveId=wave,failedMembers=3)]
+
+    result=client.post(f'/upload/waves/live/{wave}/repair',json=dict(action='retry-failed')).json
+    assert (result['retried'],result['skipped'],result['failedRetries'],result['after'])==(1,2,0,'')
+    assert retried==[('p0.jpg',True)]
+    # Done once: the wave no longer asks for attention.
+    assert client.get('/upload/waves/live/attention').json['waves']==[]
+
+
+def test_retry_failed_refuses_a_foreign_cursor_and_non_owners(live_api,monkeypatch):
+    client,store,metadata,library=live_api
+    import routes.upload_wave_shadow as routes
+    monkeypatch.setattr(routes,'_drive',lambda *args:True)
+    wave=_complete_wave_with_failed_members(store,metadata,['rev0'])
+    assert client.post(f'/upload/waves/live/{wave}/repair',json=dict(action='retry-failed',after='wave!x')).status_code==400
+    monkeypatch.setattr(app,'library_store',SimpleNamespace(is_owner=lambda account,lib:False))
+    assert client.post(f'/upload/waves/live/{wave}/repair',json=dict(action='retry-failed')).status_code==409

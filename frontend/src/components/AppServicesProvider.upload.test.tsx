@@ -1318,6 +1318,39 @@ describe('large upload hashing', () => {
 // uploadWaveSync.ts. These calls are entirely best-effort: they must never
 // block, delay, or fail the real upload, which the last test in this block
 // exercises directly.
+describe('unsupported files at selection', () => {
+    const withSidecars = () => [
+        ...filesFor(2),
+        new File(['x'], 'IMG_O9346.AAE', { type: '' }),
+        new File(['y'], 'IMG_O9347.aae', { type: '' }),
+    ];
+
+    it('drops sidecars handed over by drag-and-drop before anything registers', async () => {
+        render(<AppServicesProvider><Probe /></AppServicesProvider>);
+        act(() => { void services.startUpload(withSidecars()); });
+        await advance(4000);
+        expect(initFiles().map((file: { filename: string }) => file.filename).sort()).toEqual(['original-0.heic', 'original-1.heic']);
+        expect(services.notifications.find(n => n.title === 'Some files skipped')?.details).toContain('Skipped 2 files');
+        expect(services.pendingUploadSummary).toBeNull();
+    });
+
+    it('offers only photo and video types in the File System Access picker and drops the rest', async () => {
+        const picked = withSidecars();
+        const picker = vi.fn().mockResolvedValue(picked.map(file => ({
+            kind: 'file', name: file.name, getFile: async () => file,
+            queryPermission: async () => 'granted', requestPermission: async () => 'granted',
+        })));
+        vi.stubGlobal('showOpenFilePicker', picker);
+        const view = render(<AppServicesProvider><Probe /></AppServicesProvider>);
+        fireEvent.click(view.getByText('Upload'));
+        await advance(4000);
+        const accept = picker.mock.calls[0][0].types[0].accept['image/*'];
+        expect(accept).toEqual(expect.arrayContaining(['.heic', '.cr3', '.mov']));
+        expect(accept).not.toContain('.aae');
+        expect(initFiles().map((file: { filename: string }) => file.filename).sort()).toEqual(['original-0.heic', 'original-1.heic']);
+    });
+});
+
 describe('upload wave shadow protocol wiring', () => {
     let waveUUIDSequence = 0;
     const shadowCalls = (suffix: string) => mocks.postUpload.mock.calls

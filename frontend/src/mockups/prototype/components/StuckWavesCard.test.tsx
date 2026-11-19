@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { canRetry, describeWave } from './StuckWavesCard';
+import { canRetry, describeWave, failedPhotoCount } from './StuckWavesCard';
 
 describe('StuckWavesCard helpers', () => {
     it('offers retry only for a failed or unqueued stage', () => {
@@ -18,5 +18,13 @@ describe('StuckWavesCard helpers', () => {
             .toBe('Failed in vision after 6 attempts');
         expect(describeWave({ state: 'ready', health: { state: 'blocked', blockedByWaveId: 'w1' } }))
             .toBe('Waiting for an earlier wave (w1) to publish');
+    });
+
+    it('offers to retry the failed photos of a finished wave, never a stage retry', () => {
+        const finished = { waveId: 'w2', state: 'complete', failedMembers: 30 };
+        expect(failedPhotoCount(finished)).toBe(30);
+        expect(canRetry(finished)).toBe(false);
+        expect(describeWave(finished)).toBe('Finished, but 30 photos failed processing');
+        expect(failedPhotoCount({ state: 'processing', failedMembers: 3 })).toBe(0);
     });
 });
