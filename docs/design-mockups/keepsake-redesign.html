@@ -172,6 +172,7 @@ figcaption b { display: block; color: var(--b-fg); font-size: 15px; margin-botto
 .pad { padding: 0 16px; }
 .t { aspect-ratio: 1; position: relative; border-radius: 3px; overflow: hidden; max-width: 100%; }
 .t .lv { position: absolute; top: 4px; left: 4px; width: 15px; height: 15px; color: var(--on-photo); filter: drop-shadow(0 0 2px var(--photo-shadow)); }
+.t .du .i { width: 15px; height: 15px; stroke-width: 2; filter: drop-shadow(0 0 2px var(--photo-shadow)); }
 .t .du { position: absolute; right: 5px; bottom: 3px; font-size: 10px; font-weight: 700; color: var(--on-photo); text-shadow: 0 0 3px var(--photo-shadow); font-variant-numeric: tabular-nums; }
 .t .ck { position: absolute; right: 5px; bottom: 5px; width: 21px; height: 21px; border-radius: 50%; border: 1.5px solid var(--on-photo); background: var(--glass); display: grid; place-items: center; color: transparent; z-index: 2; }
 .t .ck .i { width: 13px; height: 13px; stroke-width: 2.6; }
@@ -489,6 +490,183 @@ figure.xl { width: 100%; max-width: 1120px; }
 .shd { height: 600px; background: var(--bg); position: relative; overflow: hidden; display: flex; flex-direction: column; }
 .shd .float { left: 50%; right: auto; width: 440px; transform: translateX(-50%); bottom: 22px; }
 
+/* Action bars with six or seven buttons, rating popover */
+.actbar.six .act { min-width: 0; flex: 1; font-size: 10px; }
+.vbar.seven { padding-left: 4px; padding-right: 4px; }
+.vbar.seven .act { min-width: 0; flex: 1; }
+.vbar.seven .act .i { width: 22px; height: 22px; }
+.starpop { position: absolute; left: 58px; bottom: 82px; z-index: 5; display: flex; gap: 6px; padding: 10px 14px; border-radius: 999px; background: var(--v-chip); color: var(--v-fg); box-shadow: 0 10px 30px -8px rgba(0,0,0,.7), 0 0 0 1px var(--v-line); }
+.starpop .i { width: 24px; height: 24px; }
+.starpop .f { fill: var(--v-accent); stroke: var(--v-accent); }
+.starpop::after { content: ""; position: absolute; left: 22px; bottom: -6px; width: 12px; height: 12px; background: var(--v-chip); transform: rotate(45deg); }
+
+/* Filter */
+.fbar { display: flex; align-items: center; gap: 10px; padding: 0 16px 8px; flex: none; }
+.fbar .meta { margin-left: auto; font-size: 12.5px; color: var(--muted); }
+.btn.on { background: var(--accent-soft); color: var(--accent); }
+.cnt { min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--accent); color: var(--on-accent); font-size: 11px; font-weight: 700; display: grid; place-items: center; font-variant-numeric: tabular-nums; }
+.fsum { display: flex; align-items: center; gap: 8px; padding: 0 16px 8px; font-size: 12.5px; color: var(--muted); flex: none; }
+.fsum b { color: var(--fg); font-weight: 600; }
+.fsum .link { margin-left: auto; font-size: 12.5px; }
+.fsec { display: flex; flex-direction: column; gap: 7px; }
+.fsec .chipwrap { display: flex; flex-wrap: wrap; gap: 6px; }
+.frow { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 36px; font-size: 14px; font-weight: 600; }
+.frow span { display: flex; align-items: center; gap: 9px; }
+.frow .i { color: var(--muted); width: 18px; height: 18px; }
+.fhead { display: flex; justify-content: space-between; align-items: center; }
+.pop.flt { top: 112px; right: 150px; width: 392px; gap: 14px; }
+.pop.flt::before { right: auto; left: 262px; }
+.pop.flt .pf { padding-top: 4px; }
+
+/* Sign in */
+.lgn { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 4px 24px 0; gap: 14px; overflow: hidden; }
+.lg-brand { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 26px 0 8px; text-align: center; }
+.lg-brand .mark { width: 48px; height: 48px; border-radius: 15px; }
+.lg-brand .mark .i { width: 26px; height: 26px; }
+.lg-brand h3 { margin: 8px 0 0; font: 600 28px/1.1 var(--font-display); letter-spacing: -.01em; }
+.lg-brand p { margin: 0; color: var(--muted); font-size: 13.5px; max-width: 28ch; }
+.fg { display: flex; flex-direction: column; gap: 6px; }
+.fg .lblr { display: flex; justify-content: space-between; align-items: baseline; }
+.fg .lblr .link { font-size: 12.5px; }
+.field .i { width: 18px; height: 18px; color: var(--muted); }
+.field.err { box-shadow: 0 0 0 2px var(--danger); background: var(--surface); }
+.fmsg { display: flex; gap: 7px; align-items: flex-start; font-size: 12.5px; color: var(--danger); }
+.fmsg .i { width: 15px; height: 15px; margin-top: 1px; }
+.fmsg.box { background: var(--danger-soft); padding: 10px 12px; border-radius: 12px; }
+.rules { display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; color: var(--muted); }
+.rules div { display: flex; gap: 7px; align-items: center; }
+.rules .i { width: 15px; height: 15px; }
+.rules .ok { color: var(--fg); }
+.rules .ok .i { color: var(--accent); }
+.lg-foot { margin-top: auto; padding: 0 0 6px; text-align: center; font-size: 12px; color: var(--muted); }
+.lgd { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr); height: 580px; background: var(--bg); }
+.lgd-art { position: relative; overflow: hidden; display: grid; grid-template-columns: repeat(3, 1fr); grid-template-rows: repeat(4, 1fr); grid-auto-flow: dense; gap: 6px; padding: 6px; }
+.lgd-art .t { aspect-ratio: auto; border-radius: 10px; }
+.lgd-art .s2 { grid-row: span 2; }
+.lgd-art::after { content: ""; position: absolute; inset: 0; background: linear-gradient(180deg, transparent 30%, rgba(0,0,0,.78) 100%); }
+.lgd-cap { position: absolute; left: 30px; right: 30px; bottom: 28px; z-index: 1; color: var(--on-photo); }
+.lgd-cap b { display: block; font: 600 28px/1.1 var(--font-display); max-width: 20ch; margin-bottom: 4px; }
+.lgd-cap span { font-size: 13.5px; opacity: .9; }
+.lgd-form { display: flex; align-items: center; justify-content: center; padding: 30px; }
+.lgd-form .box { width: 100%; max-width: 340px; display: flex; flex-direction: column; gap: 14px; }
+.lgd-form .mk { margin-bottom: 14px; }
+.lgd-form h3 { margin: 0; font: 600 32px/1.1 var(--font-display); letter-spacing: -.01em; }
+.lgd-form p { margin: 0; color: var(--muted); font-size: 14px; }
+
+/* Upload progress */
+.upbar { position: absolute; left: 12px; right: 12px; bottom: 88px; z-index: 4; background: var(--surface); border-radius: 18px; box-shadow: var(--shadow), 0 0 0 1px var(--line); padding: 11px 14px 12px; display: flex; flex-direction: column; gap: 9px; }
+.upbar .ur { display: flex; align-items: center; gap: 11px; }
+.ui { width: 34px; height: 34px; border-radius: 50%; background: var(--accent-soft); color: var(--accent); display: grid; place-items: center; flex: none; }
+.ui .i { width: 17px; height: 17px; }
+.ui.bad { background: var(--danger-soft); color: var(--danger); }
+.ut { flex: 1; min-width: 0; }
+.ut b { display: block; font-size: 13.5px; }
+.ut span { display: block; font-size: 12px; color: var(--muted); }
+.pct { font-size: 12.5px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--muted); }
+.prog.lg { height: 6px; border-radius: 3px; }
+.prog.lg i { border-radius: 3px; }
+.prog.bad i { background: var(--danger); }
+.ustats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.us { background: var(--surface-2); border-radius: 12px; padding: 8px 10px; }
+.us b { display: block; font: 600 20px/1.1 var(--font-display); font-variant-numeric: tabular-nums; }
+.us span { font-size: 11.5px; color: var(--muted); }
+.us.bad b { color: var(--danger); }
+.ulist { background: var(--bg); border-radius: 14px; overflow: hidden; }
+.ulist .row { padding: 8px 10px; gap: 10px; }
+.ulist .th { width: 36px; height: 36px; border-radius: 8px; }
+.ulist .prog { width: 54px; flex: none; }
+.ulist .ok { color: var(--accent); width: 18px; height: 18px; }
+.ulist .why { color: var(--danger); }
+.utray { position: absolute; right: 20px; bottom: 20px; width: 372px; z-index: 6; background: var(--surface); border-radius: 18px; box-shadow: var(--shadow), 0 0 0 1px var(--line); overflow: hidden; }
+.utray .uh { display: flex; align-items: center; gap: 10px; padding: 14px 14px 8px 16px; }
+.utray .uh b { flex: 1; font: 600 16px var(--font-display); }
+.utray .uh .ibtn { width: 28px; height: 28px; }
+.utray .ub { padding: 0 16px 12px; display: flex; flex-direction: column; gap: 9px; }
+.utray .ub .fr { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--muted); }
+.utray .ulist { border-radius: 0; background: transparent; border-top: 1px solid var(--line); }
+.utray .uf { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px 12px 16px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); gap: 10px; }
+
+/* After upload: processing steps */
+.seg3 { display: flex; gap: 4px; }
+.seg3 i { flex: 1; height: 6px; border-radius: 3px; background: var(--surface-2); display: block; position: relative; overflow: hidden; }
+.seg3 i.d { background: var(--accent); }
+.seg3 i.n { background: var(--accent-soft); }
+.seg3 i.n::after { content: ""; position: absolute; inset: 0; width: 40%; border-radius: 3px; background: var(--accent); animation: slide 1.6s ease-in-out infinite; }
+@keyframes slide { 0% { transform: translateX(-100%); } 100% { transform: translateX(250%); } }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .seg3 i.n::after { animation: none; width: 100%; opacity: .5; } .sdot.now::after { animation: none; } }
+.steps { display: flex; flex-direction: column; }
+.step { display: flex; gap: 12px; padding: 0 0 14px; position: relative; }
+.step:last-child { padding-bottom: 0; }
+.step:not(:last-child)::before { content: ""; position: absolute; left: 13px; top: 28px; bottom: 0; width: 2px; background: var(--line-strong); }
+.step.done:not(:last-child)::before { background: var(--accent); }
+.sdot { width: 28px; height: 28px; border-radius: 50%; flex: none; display: grid; place-items: center; background: var(--surface-2); color: var(--muted); font-size: 12px; font-weight: 700; position: relative; z-index: 1; }
+.sdot .i { width: 15px; height: 15px; stroke-width: 2.4; }
+.step.done .sdot { background: var(--accent); color: var(--on-accent); }
+.step.now .sdot { background: var(--accent-soft); color: var(--accent); }
+.step.now .sdot::after { content: ""; position: absolute; inset: -2px; border-radius: 50%; border: 2px solid transparent; border-top-color: var(--accent); animation: spin 1.1s linear infinite; }
+.step.bad .sdot { background: var(--danger-soft); color: var(--danger); }
+.step b { display: block; font-size: 14px; line-height: 1.3; padding-top: 4px; }
+.step span.sub { display: block; font-size: 12.5px; color: var(--muted); }
+.step.wait b { color: var(--muted); font-weight: 600; }
+.step .rt2 { flex: 1; min-width: 0; }
+.step .tag2 { font-size: 11.5px; font-weight: 700; color: var(--accent); padding-top: 6px; white-space: nowrap; }
+.step.done .tag2 { color: var(--muted); font-weight: 600; }
+.utray .steps { padding: 4px 16px 14px; }
+
+/* Several uploads in processing */
+.seg3 i.x { background: var(--danger); }
+.seg3 i.s { background: var(--line-strong); }
+.pill.bad { background: var(--danger-soft); color: var(--danger); }
+.pill.mut { background: var(--surface-2); color: var(--muted); }
+.wb { background: var(--bg); border-radius: 14px; padding: 12px 13px; display: flex; flex-direction: column; gap: 8px; }
+.wb.bad { box-shadow: 0 0 0 1.5px var(--danger); }
+.wb .wbh { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.wb .wbh b { font-size: 13.5px; }
+.wb .wbh span.m { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.wb .wbh .x { color: var(--muted); width: 16px; height: 16px; }
+.wb .line { font-size: 12.5px; color: var(--muted); display: flex; gap: 7px; align-items: flex-start; }
+.wb .line .i { width: 15px; height: 15px; margin-top: 1px; }
+.wb .line.bad { color: var(--danger); }
+.wb .line.ok .i { color: var(--accent); }
+.wb .line.fgc { color: var(--fg); }
+.wb .acts { display: flex; gap: 8px; }
+.wb.dim { opacity: .75; }
+.steps.sm .step { padding-bottom: 7px; }
+.steps.sm .step:not(:last-child)::before { left: 10px; top: 22px; }
+.steps.sm .sdot { width: 22px; height: 22px; font-size: 11px; }
+.steps.sm .sdot .i { width: 12px; height: 12px; }
+.steps.sm .step b { padding-top: 2px; font-size: 13px; }
+.steps.sm .step span.sub { display: none; }
+.steps.sm .step.now span.sub, .steps.sm .step.bad span.sub { display: block; font-size: 12px; }
+.steps.sm .tag2 { padding-top: 3px; font-size: 11px; }
+.wlist { display: flex; flex-direction: column; gap: 8px; overflow: hidden; }
+.wsh { display: flex; justify-content: space-between; align-items: baseline; }
+.utray.wide { width: 392px; max-height: 548px; }
+.utray .wlist { padding: 0 12px 12px; }
+
+/* Emails */
+.mail { flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
+.mh2 { display: flex; gap: 10px; align-items: center; padding: 6px 16px 10px; flex: none; }
+.mh2 .mark { width: 38px; height: 38px; border-radius: 50%; }
+.mh2 .mark .i { width: 18px; height: 18px; }
+.mh2 b { display: block; font-size: 14px; line-height: 1.25; }
+.mh2 div span { font-size: 12px; color: var(--muted); }
+.mh2 em { margin-left: auto; font-style: normal; font-size: 12px; color: var(--muted); align-self: flex-start; }
+.msub { font: 600 19px/1.25 var(--font-display); padding: 0 16px 12px; flex: none; }
+.em { margin: 0 12px; background: var(--surface); border-radius: 18px; padding: 20px 18px 16px; display: flex; flex-direction: column; gap: 13px; overflow: hidden; }
+.em .mk { font-size: 15px; }
+.em h4 { margin: 0; font: 600 23px/1.2 var(--font-display); text-wrap: balance; }
+.em p { margin: 0; font-size: 13.5px; }
+.em .fine { color: var(--muted); font-size: 12px; }
+.em .cover { height: 124px; border-radius: 12px; position: relative; overflow: hidden; }
+.em .cover .hero-t { left: 14px; bottom: 10px; }
+.em .cover .hero-t h3 { font-size: 20px; }
+.em .cover::after { content: ""; position: absolute; inset: 0; background: linear-gradient(180deg, transparent 35%, var(--photo-scrim) 100%); }
+.em .cover .hero-t { z-index: 1; color: var(--on-photo); }
+.em hr { border: 0; border-top: 1px solid var(--line); margin: 2px 0; }
+.em .facts { background: var(--bg); }
+
 /* Photo placeholders: painted, so the page needs no image files */
 .ph-aurora { background: radial-gradient(circle at 78% 80%, #ffd28a 0 1.4%, transparent 2.2%), radial-gradient(circle at 71% 82%, #ffe2a8 0 1.2%, transparent 2%), radial-gradient(circle at 86% 78%, #ffcf7a 0 1.4%, transparent 2.2%), radial-gradient(circle at 64% 81%, #ffd99a 0 1%, transparent 1.8%), radial-gradient(ellipse 70% 26% at 55% 52%, rgba(98,230,160,.6), transparent 70%), radial-gradient(ellipse 50% 28% at 30% 30%, rgba(170,120,230,.42), transparent 70%), linear-gradient(180deg, #1b1733 0%, #272a4c 32%, #2e5a55 56%, #0f1517 74%, #08090b 100%); }
 .ph-forest { background: radial-gradient(ellipse 40% 22% at 50% 64%, rgba(220,232,236,.35), transparent 70%), linear-gradient(180deg, #cdd6d8 0%, #a9b6b2 22%, #4b5b45 38%, #24321f 58%, #4a5b62 60%, #26323a 100%); }
@@ -560,6 +738,8 @@ figure.xl { width: 100%; max-width: 1120px; }
   <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
   <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></symbol>
   <symbol id="i-moon" viewBox="0 0 24 24"><path d="M19.5 14.5A7.5 7.5 0 0 1 9.5 4.5a7.5 7.5 0 1 0 10 10z"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="2.8"/></symbol>
+  <symbol id="i-bench" viewBox="0 0 24 24"><path d="M7 3.5v13.5h13.5M3.5 7H17v13.5"/></symbol>
   <symbol id="i-keep" viewBox="0 0 24 24"><path d="M12 19.5s-7-4.3-7-9.4A3.9 3.9 0 0 1 12 7.8a3.9 3.9 0 0 1 7 2.3c0 5.1-7 9.4-7 9.4z"/></symbol>
 </svg>
 
@@ -567,7 +747,7 @@ figure.xl { width: 100%; max-width: 1120px; }
   <div class="wrap">
     <div class="brand"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span>Keepsake <small>redesign</small></div>
     <nav class="nav" aria-label="Sections">
-      <a href="#system">System</a><a href="#gallery">Gallery</a><a href="#albums">Albums</a><a href="#people">People</a><a href="#notifications">Notifications</a><a href="#invites">Invites</a><a href="#shared-static">Shared · instant</a><a href="#shared-full">Shared · full</a><a href="#desktop">Desktop</a>
+      <a href="#system">System</a><a href="#gallery">Gallery</a><a href="#filter">Filter</a><a href="#albums">Albums</a><a href="#people">People</a><a href="#notifications">Notifications</a><a href="#invites">Invites</a><a href="#login">Sign in</a><a href="#upload">Upload</a><a href="#processing">After upload</a><a href="#upload-actions">Cancel &amp; retry</a><a href="#emails">Emails</a><a href="#shared-static">Shared · instant</a><a href="#shared-full">Shared · full</a><a href="#desktop">Desktop</a>
     </nav>
     <button class="tbtn" id="theme" type="button"><svg class="i"><use href="#i-sun"/></svg><span>Light mode</span></button>
   </div>
@@ -576,7 +756,7 @@ figure.xl { width: 100%; max-width: 1120px; }
 <main class="wrap">
   <section class="intro">
     <h1>Keepsake, redesigned</h1>
-    <p>These screens redraw seven parts of the app using the 57 findings from our review: the gallery, albums, people, notifications, invites, and the shared album in its instant and full versions. <strong>Nothing in the app has changed.</strong></p>
+    <p>These screens redraw eleven parts of the app using the 57 findings from our review: the gallery and its filter, albums, people, notifications, invites, sign in, the upload progress bar, the emails Keepsake sends, and the shared album in its instant and full versions. <strong>Nothing in the app has changed.</strong></p>
     <p>Places, dates and counts come from your library. People's names, email addresses and the “Lisbon 2022” album are examples. The numbers under each screen point to the findings they fix. Use the button at the top to see every screen in the other theme. The last section shows the same screens on a desktop browser.</p>
   </section>
 
@@ -652,7 +832,7 @@ figure.xl { width: 100%; max-width: 1120px; }
               <span class="me">RA</span>
             </div>
           </div>
-          <div class="chips"><span class="chip on">All</span><span class="chip">Photos</span><span class="chip">Videos</span><span class="chip">Liked</span><span class="chip"><svg class="i"><use href="#i-calendar"/></svg>Date</span></div>
+          <div class="fbar"><span class="btn sm"><svg class="i"><use href="#i-sliders"/></svg>Filter</span><span class="meta">31 items</span></div>
           <div class="content">
             <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
             <div class="g c4" data-tiles="aurora forest field*L tunnel shot notif portrait garden"></div>
@@ -663,7 +843,7 @@ figure.xl { width: 100%; max-width: 1120px; }
           </div>
           <div class="tabs" data-tabs="photos"></div>
         </div></div>
-        <figcaption><b>Photos tab</b>Four across with 2&nbsp;px gaps fits twice as many photos, served at full sharpness. Videos show their length and Live Photos a small mark. Upload has its own icon and label.<span class="refs">Fixes #7 #18 #20 #33 #48 #51</span></figcaption>
+        <figcaption><b>Photos tab</b>Four across with 2&nbsp;px gaps fits twice as many photos, served at full sharpness. Videos and Live Photos each get a small mark in the corner. Upload has its own icon and label.<span class="refs">Fixes #7 #18 #20 #33 #48 #51</span></figcaption>
       </figure>
 
       <figure class="shot">
@@ -676,10 +856,34 @@ figure.xl { width: 100%; max-width: 1120px; }
             <div class="day"><b>27 January 2024</b><span>Malmö</span></div>
             <div class="g c4" data-tiles="food*L*s snow*L*s"></div>
           </div>
-          <div class="actbar">
-            <span class="act"><svg class="i"><use href="#i-share"/></svg>Share</span>
-            <span class="act"><svg class="i"><use href="#i-addalbum"/></svg>Add to album</span>
+          <div class="actbar six">
+            <span class="act"><svg class="i"><use href="#i-addalbum"/></svg>Album</span>
             <span class="act"><svg class="i"><use href="#i-heart"/></svg>Like</span>
+            <span class="act"><svg class="i"><use href="#i-star"/></svg>Rate</span>
+            <span class="act"><svg class="i"><use href="#i-bench"/></svg>Workbench</span>
+            <span class="act"><svg class="i"><use href="#i-more"/></svg>More</span>
+            <span class="act dan"><svg class="i"><use href="#i-trash"/></svg>Delete</span>
+            <i class="home"></i>
+          </div>
+        </div></div>
+        <figcaption><b>Selecting</b>Selected photos get a filled check and an outline. Actions replace the tab bar instead of sitting on top of it: Album, Like, Rate, Workbench, More (which holds Download) and Delete. There is no per-photo Share, because sharing is done from an album.<span class="refs">Fixes #1 #8</span></figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="selhdr"><span class="link">Cancel</span><b>3 selected</b><span class="link">Select all</span></div>
+          <div class="content">
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4" data-tiles="aurora*S forest*s field*L*S tunnel*s shot*s notif*s portrait*S garden*s"></div>
+            <div class="day"><b>27 January 2024</b><span>Malmö</span></div>
+            <div class="g c4" data-tiles="food*L*s snow*L*s"></div>
+          </div>
+          <div class="actbar six">
+            <span class="act"><svg class="i"><use href="#i-addalbum"/></svg>Album</span>
+            <span class="act"><svg class="i"><use href="#i-heart"/></svg>Like</span>
+            <span class="act"><svg class="i"><use href="#i-star"/></svg>Rate</span>
+            <span class="act"><svg class="i"><use href="#i-bench"/></svg>Workbench</span>
             <span class="act"><svg class="i"><use href="#i-more"/></svg>More</span>
             <span class="act dan"><svg class="i"><use href="#i-trash"/></svg>Delete</span>
             <i class="home"></i>
@@ -693,7 +897,7 @@ figure.xl { width: 100%; max-width: 1120px; }
             <span class="btn wide">Cancel</span>
           </div>
         </div></div>
-        <figcaption><b>Selecting and deleting</b>Selected photos get a filled check and an outline. Actions replace the tab bar instead of sitting on top of it. Delete always asks and says where the photos go.<span class="refs">Fixes #1 #8 #50</span></figcaption>
+        <figcaption><b>Deleting</b>Delete always asks, and says where the photos go and for how long.<span class="refs">Fixes #50</span></figcaption>
       </figure>
 
       <figure class="shot">
@@ -711,16 +915,153 @@ figure.xl { width: 100%; max-width: 1120px; }
             <div class="cam"><b>iPhone 15 Pro Max</b><span>Ultra Wide · 13 mm · f/2.2 · 1/2 s · ISO 3200</span><span>4032 × 3024</span></div>
             <div class="tags"><span>Aurora</span><span>Night sky</span><span>Coast</span><span>City lights</span></div>
           </div>
-          <div class="vbar">
-            <span class="act"><svg class="i"><use href="#i-share"/></svg>Share</span>
-            <span class="act"><svg class="i"><use href="#i-heart"/></svg>Like</span>
-            <span class="act pri"><svg class="i"><use href="#i-info"/></svg>Info</span>
-            <span class="act"><svg class="i"><use href="#i-addalbum"/></svg>Album</span>
-            <span class="act"><svg class="i"><use href="#i-trash"/></svg>Delete</span>
+          <div class="vbar seven">
+            <span class="act" title="Like"><svg class="i"><use href="#i-heart"/></svg></span>
+            <span class="act" title="Rate"><svg class="i"><use href="#i-star"/></svg></span>
+            <span class="act pri" title="Info"><svg class="i"><use href="#i-info"/></svg></span>
+            <span class="act" title="Add to album"><svg class="i"><use href="#i-addalbum"/></svg></span>
+            <span class="act" title="Open in Workbench"><svg class="i"><use href="#i-bench"/></svg></span>
+            <span class="act" title="More"><svg class="i"><use href="#i-more"/></svg></span>
+            <span class="act" title="Delete"><svg class="i"><use href="#i-trash"/></svg></span>
             <i class="home"></i>
           </div>
         </div></div>
-        <figcaption><b>Viewer with info open</b>The title is the place and time, not the filename. Info shows a map, camera details with units, and tags that agree with where the photo was taken. Share is in the toolbar, while Download and rating move into More.<span class="refs">Fixes #9 #21 #22 #23 #24 #45</span></figcaption>
+        <figcaption><b>Viewer with info open</b>The title is the place and time, not the filename. Info shows a map, camera details with units, and tags. Tags come from automatic recognition, so they are suggestions and can occasionally be wrong. Seven icon buttons fit in a row, each with a name for screen readers: Like, Rate, Info, Add to album, Open in Workbench, More and Delete. Download is in More.<span class="refs">Fixes #9 #21 #22 #23 #24 #45</span></figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr vw">
+          <div class="sb" data-sb></div>
+          <div class="vtop">
+            <span class="ibtn ghost"><svg class="i"><use href="#i-back"/></svg></span>
+            <div class="vt"><b>Malmö</b><span>10 Oct 2024 · 22:41</span></div>
+            <span class="ibtn ghost"><svg class="i"><use href="#i-more"/></svg></span>
+          </div>
+          <div class="vphoto ph-aurora"><span class="livechip"><svg class="i"><use href="#i-live"/></svg>LIVE</span></div>
+          <div class="vinfo" style="opacity:.5"><div class="irow"><b>Thursday, 10 October 2024</b><span>22:41 · IMG_1073.HEIC · 3.1 MB</span></div></div>
+          <div class="starpop"><svg class="i f"><use href="#i-star"/></svg><svg class="i f"><use href="#i-star"/></svg><svg class="i f"><use href="#i-star"/></svg><svg class="i"><use href="#i-star"/></svg><svg class="i"><use href="#i-star"/></svg></div>
+          <div class="vbar seven">
+            <span class="act" title="Like"><svg class="i"><use href="#i-heart"/></svg></span>
+            <span class="act pri" title="Rate"><svg class="i"><use href="#i-star"/></svg></span>
+            <span class="act" title="Info"><svg class="i"><use href="#i-info"/></svg></span>
+            <span class="act" title="Add to album"><svg class="i"><use href="#i-addalbum"/></svg></span>
+            <span class="act" title="Open in Workbench"><svg class="i"><use href="#i-bench"/></svg></span>
+            <span class="act" title="More"><svg class="i"><use href="#i-more"/></svg></span>
+            <span class="act" title="Delete"><svg class="i"><use href="#i-trash"/></svg></span>
+            <i class="home"></i>
+          </div>
+        </div></div>
+        <figcaption><b>Rating a photo</b>Rate is a button in the bar. It opens a row of five stars above it, and tapping a star sets the rating.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ========== FILTER ========== -->
+  <section class="sec" id="filter">
+    <div class="sec-head">
+      <h2>One Filter button</h2>
+      <p class="lede">The row of All, Photos, Videos, Liked and Date becomes a single Filter button. Everything you can narrow by sits in one panel, the button shows how many filters are on, and the photos get that row of space back. Search stays where it is.</p>
+    </div>
+    <div class="frames">
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="btn sm pri"><svg class="i"><use href="#i-upload"/></svg>Upload</span><span class="ibtn dot"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="fbar"><span class="btn sm"><svg class="i"><use href="#i-sliders"/></svg>Filter</span><span class="meta">31 items</span></div>
+          <div class="content">
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4" data-tiles="aurora forest field*L tunnel shot notif portrait garden"></div>
+            <div class="day"><b>27 January 2024</b><span>Malmö</span></div>
+            <div class="g c4" data-tiles="food*L snow*L"></div>
+            <div class="day"><b>1 January 2024</b><span>Rotterdam</span></div>
+            <div class="g c4" data-tiles="fire*V1 fire2*V1 fire3*V2 wedding*L city memoji*L indoor*V7 notes"></div>
+          </div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>Nothing filtered</b>One quiet button where five chips used to be. The item count sits opposite it, so you always know how much you're looking at.</figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3></div>
+          <div class="scrim"></div>
+          <div class="sheet tall" style="top:60px;gap:13px">
+            <div class="grab"></div>
+            <div class="fhead"><h4>Filter</h4><span class="link mut">Clear all</span></div>
+            <div class="fsec"><span class="lbl">Show</span><div class="seg"><span>All</span><span>Photos</span><span class="on">Videos</span><span>Live</span></div></div>
+            <div class="frow"><span><svg class="i"><use href="#i-heart"/></svg>Liked only</span><i class="tg on"></i></div>
+            <div class="fsec"><span class="lbl">Date</span><div class="chipwrap"><span class="chip on">Any time</span><span class="chip">Last 30 days</span><span class="chip">This year</span><span class="chip"><svg class="i"><use href="#i-calendar"/></svg>Choose dates</span></div></div>
+            <div class="fsec"><span class="lbl">Rating</span><div class="chipwrap"><span class="chip on">Any</span><span class="chip"><svg class="i"><use href="#i-star"/></svg>3+</span><span class="chip"><svg class="i"><use href="#i-star"/></svg>4+</span><span class="chip"><svg class="i"><use href="#i-star"/></svg>5</span></div></div>
+            <span class="btn pri wide" style="margin-top:2px">Show results</span>
+          </div>
+        </div></div>
+        <figcaption><b>The panel</b>One sheet holds every way to narrow the photos, in the order people reach for them. Media type is a single choice, Liked is an on/off switch, and Date, Place and Rating are quick picks. Choices are held until you tap the button, which says "Show results" while changes are waiting and "Show N items" when nothing is pending. Place is planned for later, once places can be searched.</figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="btn sm pri"><svg class="i"><use href="#i-upload"/></svg>Upload</span><span class="ibtn dot"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="fbar"><span class="btn sm on"><svg class="i"><use href="#i-sliders"/></svg>Filter<span class="cnt">2</span></span><span class="meta">3 of 31 items</span></div>
+          <div class="fsum"><span><b>Videos</b> you liked</span><span class="link">Clear</span></div>
+          <div class="content">
+            <div class="day"><b>1 January 2024</b><span>Rotterdam</span></div>
+            <div class="g c4" data-tiles="fire*V1 fire3*V2 indoor*V7"></div>
+          </div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>Filters on</b>The button turns blue and shows how many filters are active. One plain sentence says what you're looking at, with Clear right beside it, so it's never a mystery why photos are missing.</figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="btn sm pri"><svg class="i"><use href="#i-upload"/></svg>Upload</span><span class="ibtn dot"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="fbar"><span class="btn sm on"><svg class="i"><use href="#i-sliders"/></svg>Filter<span class="cnt">3</span></span><span class="meta">0 of 31 items</span></div>
+          <div class="fsum"><span><b>Videos</b> you liked, <b>last 30 days</b></span><span class="link">Clear</span></div>
+          <div class="center">
+            <span class="bigicon"><svg class="i"><use href="#i-search"/></svg></span>
+            <h3>No liked videos lately</h3>
+            <p>Try a longer time range, or take a filter off.</p>
+            <span class="btn pri" style="margin-top:4px">Clear filters</span>
+          </div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>Nothing matches</b>An empty result says which filters caused it and offers the way out, instead of a blank screen.</figcaption>
+      </figure>
+
+      <figure class="shot xl" style="width:100%;max-width:1120px">
+        <div class="scrollx"><div class="browser app">
+          <div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/photos</div></div>
+          <div class="dapp" style="height:680px">
+            <aside class="side" data-side="photos"></aside>
+            <div class="dmain">
+              <div class="dtop" data-dtop></div>
+              <div class="dbody">
+                <div class="dph">
+                  <h3>Photos<small>31 items</small></h3>
+                  <div class="dctl">
+                    <span class="btn sm on"><svg class="i"><use href="#i-sliders"/></svg>Filter<span class="cnt">2</span></span>
+                    <span class="zoom" title="Photo size"><svg class="i"><use href="#i-photos"/></svg><span class="track"><i></i><b></b></span><svg class="i"><use href="#i-photos"/></svg></span>
+                    <span class="link">Select</span>
+                  </div>
+                </div>
+                <div class="dday"><b>1 January 2024</b><span>Rotterdam · videos you liked</span></div>
+                <div class="g c8 dgrid" data-tiles="fire*V1 fire3*V2 indoor*V7"></div>
+              </div>
+              <div class="pop flt">
+                <div class="fhead"><h4 style="margin:0;font:600 18px var(--font-display)">Filter</h4><span class="link mut">Clear all</span></div>
+                <div class="fsec"><span class="lbl">Show</span><div class="seg"><span>All</span><span>Photos</span><span class="on">Videos</span><span>Live</span></div></div>
+                <div class="frow"><span><svg class="i"><use href="#i-heart"/></svg>Liked only</span><i class="tg on"></i></div>
+                <div class="fsec"><span class="lbl">Date</span><div class="chipwrap"><span class="chip on">Any time</span><span class="chip">Last 30 days</span><span class="chip">This year</span><span class="chip"><svg class="i"><use href="#i-calendar"/></svg>Choose dates</span></div></div>
+                    <div class="fsec"><span class="lbl">Rating</span><div class="chipwrap"><span class="chip on">Any</span><span class="chip"><svg class="i"><use href="#i-star"/></svg>3+</span><span class="chip"><svg class="i"><use href="#i-star"/></svg>4+</span><span class="chip"><svg class="i"><use href="#i-star"/></svg>5</span></div></div>
+                <div class="pf"><span class="lbl" style="font-weight:500">3 of 31 items</span><span class="btn pri">Done</span></div>
+              </div>
+            </div>
+          </div>
+        </div></div>
+        <figcaption><b>On a desktop browser</b>The same panel opens as a popover under the button. Here each choice applies straight away and the photos behind it update, so the count is always current. Place is planned for later. Press Esc or click away to close it.</figcaption>
       </figure>
     </div>
   </section>
@@ -780,7 +1121,7 @@ figure.xl { width: 100%; max-width: 1120px; }
           </div>
           <div class="tabs" data-tabs="albums"></div>
         </div></div>
-        <figcaption><b>An album</b>The cover sets the mood. Whether the album is shared, and until when, is always on screen, so nobody has to guess what “Sharing on” means.<span class="refs">Fixes #4 #46</span></figcaption>
+        <figcaption><b>An album</b>The cover sets the mood. It is picked once, from the album's highest-rated and then most-liked photos, and stays put after that. Whether the album is shared, and until when, is always on screen, so nobody has to guess what “Sharing on” means.<span class="refs">Fixes #4 #46</span></figcaption>
       </figure>
 
       <figure class="shot">
@@ -831,15 +1172,17 @@ figure.xl { width: 100%; max-width: 1120px; }
             <div class="g c3" data-tiles="aurora*s food*L*S fire*L*s snow*L*s"></div>
           </div>
           <div class="toast"><span>Removed 1 item from Malmö nights. It's still in Photos.</span><b>Undo</b></div>
-          <div class="actbar">
+          <div class="actbar six">
             <span class="act pri"><svg class="i"><use href="#i-rmalbum"/></svg>Remove</span>
-            <span class="act"><svg class="i"><use href="#i-share"/></svg>Share</span>
-            <span class="act"><svg class="i"><use href="#i-addalbum"/></svg>Add to album</span>
+            <span class="act"><svg class="i"><use href="#i-heart"/></svg>Like</span>
+            <span class="act"><svg class="i"><use href="#i-star"/></svg>Rate</span>
+            <span class="act"><svg class="i"><use href="#i-bench"/></svg>Workbench</span>
+            <span class="act"><svg class="i"><use href="#i-more"/></svg>More</span>
             <span class="act dan"><svg class="i"><use href="#i-trash"/></svg>Delete</span>
             <i class="home"></i>
           </div>
         </div></div>
-        <figcaption><b>Removing from an album</b>Inside an album the first action is “Remove”, which keeps the photo in your library, however you got here. Delete stays red and asks first. Undo works.<span class="refs">Fixes #2 #3 #4</span></figcaption>
+        <figcaption><b>Removing from an album</b>Inside an album the first action is “Remove”, which keeps the photo in your library, however you got here. While you select, the cover banner is hidden so the photos have the whole screen. Delete stays red and asks first. Undo works.<span class="refs">Fixes #2 #3 #4</span></figcaption>
       </figure>
     </div>
   </section>
@@ -848,7 +1191,7 @@ figure.xl { width: 100%; max-width: 1120px; }
   <section class="sec" id="people">
     <div class="sec-head">
       <h2>People</h2>
-      <p class="lede">Here the job is naming and correcting people. You name someone where you see them, confirm look-alikes Keepsake suggests, and take a wrong photo out with one action.</p>
+      <p class="lede">Here the job is naming and correcting people. You name someone where you see them, confirm look-alikes Keepsake suggests, and, in a later version, take a wrong photo out with one action.</p>
     </div>
     <div class="frames">
       <figure class="shot">
@@ -900,13 +1243,11 @@ figure.xl { width: 100%; max-width: 1120px; }
             <div class="g c3 pad" data-tiles="field*L*s tunnel*S"></div>
           </div>
           <div class="actbar">
-            <span class="act pri"><svg class="i"><use href="#i-userx"/></svg>Not this person</span>
-            <span class="act"><svg class="i"><use href="#i-photos"/></svg>Use as cover</span>
-            <span class="act"><svg class="i"><use href="#i-share"/></svg>Share</span>
+            <span class="act pri"><svg class="i"><use href="#i-photos"/></svg>Use as cover</span>
             <i class="home"></i>
           </div>
         </div></div>
-        <figcaption><b>One person</b>You type the name right on the page. Suggested look-alikes can be merged even before anyone is named. A photo that isn't them comes out with “Not this person”.<span class="refs">Fixes #12</span></figcaption>
+        <figcaption><b>One person</b>You type the name right on the page. Suggested look-alikes can be merged even before anyone is named. Taking a photo out of a person (“Not this person”) is planned for later, because the app can only rename and merge people today.<span class="refs">Fixes #12</span></figcaption>
       </figure>
     </div>
   </section>
@@ -966,6 +1307,26 @@ figure.xl { width: 100%; max-width: 1120px; }
           <div class="homebar"><i class="home"></i></div>
         </div></div>
         <figcaption><b>Notifications</b>Grouped by day, each with the one action it needs. Problems are red and say what went wrong. Real events like a finished upload finally show up here.<span class="refs">Fixes #34 #36</span></figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Photos</span><span class="link">Mark all read</span></div>
+          <div class="hdr" style="padding-top:0"><h3 class="ttl">Notifications</h3></div>
+          <div class="content">
+            <div class="gl">Today</div>
+            <div class="nt unread">
+              <span class="ni"><svg class="i"><use href="#i-refresh"/></svg></span>
+              <div class="nb">
+                <div class="top2"><b>Processing photos</b><span class="ntime">01:12</span></div>
+                <p>This takes a few minutes. We'll update this when it's done.</p>
+              </div>
+            </div>
+          </div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>While processing</b>Keepsake can't say how many photos are done, so this entry has no progress bar and no "x of y". It updates by itself into "All processed in 4 minutes. 9 people found." when the work finishes.</figcaption>
       </figure>
 
       <figure class="shot">
@@ -1068,6 +1429,818 @@ figure.xl { width: 100%; max-width: 1120px; }
           <div class="homebar"><i class="home"></i></div>
         </div></div>
         <figcaption><b>What they receive</b>It says who invited them, to what, and what happens next. If the link has expired or is broken, it says so and links to sign in, instead of mentioning a missing “token”.<span class="refs">Fixes #47</span></figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ========== SIGN IN ========== -->
+  <section class="sec" id="login">
+    <div class="sec-head">
+      <h2>Sign in</h2>
+      <p class="lede">The first thing anyone sees. One short form, labels that stay put, and error messages that say what to do next. On a desktop the photos get the left half.</p>
+    </div>
+    <div class="frames">
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="lgn">
+            <div class="lg-brand"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span><h3>Welcome back</h3><p>Sign in to your photos and videos.</p></div>
+            <div class="fg"><span class="lbl">Email address</span><div class="field"><span>rajat@example.com</span></div></div>
+            <div class="fg"><div class="lblr"><span class="lbl">Password</span><span class="link">Forgot password?</span></div><div class="field focus"><span>••••••••••••</span><i class="caret"></i><svg class="i"><use href="#i-eye"/></svg></div></div>
+            <span class="btn pri wide" style="margin-top:6px">Sign in</span>
+            <div class="lg-foot">Invited by someone? Open the link in your invite email.</div>
+          </div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>Sign in</b>Labels sit above the fields instead of disappearing as you type. “Forgot password?” is beside the password, where people look for it. The eye shows what you typed. The logo is the same blue mark everywhere, including the browser tab and the app icons.<span class="refs">Fixes #47</span></figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="lgn">
+            <div class="lg-brand"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span><h3>Welcome back</h3><p>Sign in to your photos and videos.</p></div>
+            <div class="fmsg box"><svg class="i"><use href="#i-alert"/></svg><span>That email or password isn't right. Try again, or reset your password.</span></div>
+            <div class="fg"><span class="lbl">Email address</span><div class="field err"><span>rajat@example.com</span></div></div>
+            <div class="fg"><div class="lblr"><span class="lbl">Password</span><span class="link">Forgot password?</span></div><div class="field err"><span>••••••••</span><svg class="i"><use href="#i-eye"/></svg></div></div>
+            <span class="btn pri wide" style="margin-top:6px">Sign in</span>
+          </div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>When it goes wrong</b>The message names the problem and the way out, in the same words everywhere, and doesn't reveal which half was wrong. Both fields are marked, and what you typed stays.<span class="refs">Fixes #47</span></figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="center">
+            <span class="bigicon"><svg class="i"><use href="#i-mail"/></svg></span>
+            <h3>Check your email</h3>
+            <p>If rajat@example.com has an account, we've sent a link to choose a new password. It works for one hour.</p>
+            <span class="btn pri wide" style="margin-top:6px">Back to sign in</span>
+            <p style="font-size:12.5px">Nothing after a few minutes? Check spam, or <span class="link" style="font-size:12.5px">send it again</span>.</p>
+          </div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>Reset link sent</b>It says what happens next and for how long, and always gives a way back. The same wording is used whether or not the address has an account.<span class="refs">Fixes #47</span></figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="lgn">
+            <div class="lg-brand"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span><h3>Set up your library</h3><p>Rajat invited you. This will be your own library, separate from theirs.</p></div>
+            <div class="fg"><span class="lbl">Email address</span><div class="field" style="color:var(--muted)"><span>dev@example.com</span><svg class="i"><use href="#i-lock"/></svg></div></div>
+            <div class="fg"><span class="lbl">Library name (optional)</span><div class="field"><span class="ph" style="color:var(--muted)">Your email address, if left empty</span></div></div>
+            <div class="fg"><span class="lbl">Password</span><div class="field focus"><span>••••••••••••</span><i class="caret"></i><svg class="i"><use href="#i-eye"/></svg></div></div>
+            <div class="rules"><div class="ok"><svg class="i"><use href="#i-check"/></svg>At least 8 characters</div></div>
+            <span class="btn pri wide" style="margin-top:4px">Create library</span>
+          </div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>Joining with their own library</b>This is the page someone sees after choosing “Their own library” on an invite. Their email comes from the invite and can't be changed. The library name is optional, and left empty it is their email address. The only password rule is eight characters.</figcaption>
+      </figure>
+
+      <figure class="shot xl" style="width:100%;max-width:1120px">
+        <div class="scrollx"><div class="browser app">
+          <div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/sign-in</div></div>
+          <div class="lgd">
+            <div class="lgd-art">
+              <div class="t ph-aurora s2"></div><div class="t ph-forest"></div><div class="t ph-field"></div><div class="t ph-tunnel s2"></div><div class="t ph-sea"></div><div class="t ph-rocks"></div><div class="t ph-wedding s2"></div><div class="t ph-road"></div><div class="t ph-garden"></div>
+              <div class="lgd-cap"><b>Every photo you've kept, in one private place.</b><span>Yours and your family's. Nobody else can see it.</span></div>
+            </div>
+            <div class="lgd-form"><div class="box">
+              <span class="mk"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span>Keepsake</span>
+              <h3>Welcome back</h3>
+              <p>Sign in to your photos and videos.</p>
+              <div class="fg"><span class="lbl">Email address</span><div class="field"><span>rajat@example.com</span></div></div>
+              <div class="fg"><div class="lblr"><span class="lbl">Password</span><span class="link">Forgot password?</span></div><div class="field"><span class="ph">Enter your password</span><svg class="i"><use href="#i-eye"/></svg></div></div>
+              <span class="btn pri wide" style="margin-top:4px">Sign in</span>
+            </div></div>
+          </div>
+        </div></div>
+        <figcaption><b>On a desktop browser</b>The left half shows photos from the library, so the page already feels like yours. The form keeps its own comfortable width on the right instead of stretching across the screen.<span class="refs">Fixes #47</span></figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ========== UPLOAD ========== -->
+  <section class="sec" id="upload">
+    <div class="sec-head">
+      <h2>Upload progress</h2>
+      <p class="lede">While files are going up, you can keep browsing. A small bar at the bottom, on every page, says how far along it is and how long is left. Tap it for detail. You can pause and pick up later. If something fails, it says which files and why, and offers one button to try again. When it finishes, the bell tells you.</p>
+    </div>
+    <div class="frames">
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="ibtn"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="content">
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+            <div class="day"><b>27 January 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="food*L snow*L fire road"></div>
+          </div>
+          <div class="upbar">
+            <div class="ur"><span class="ui"><svg class="i"><use href="#i-search"/></svg></span><div class="ut"><b>Checking 840 photos</b><span>Looking for ones you already have</span></div><span class="pct">42%</span><svg class="i" style="color:var(--muted);transform:rotate(-90deg)"><use href="#i-chev"/></svg></div>
+            <div class="prog lg"><i style="width:42%"></i></div>
+          </div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>First, checking</b>Before anything is sent, every photo you chose is compared with the library so nothing is uploaded twice. The bar says what's happening in plain words and shows how far along it is.</figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3></div>
+          <div class="scrim"></div>
+          <div class="sheet tall" style="gap:12px;top:96px">
+            <div class="grab"></div>
+            <h4>Checking 840 photos</h4>
+            <div class="prog lg"><i style="width:42%"></i></div>
+            <p>353 of 840 checked. Photos already in your library won't be uploaded again.</p>
+            <div style="display:flex;gap:8px"><span class="btn" style="flex:1">Pause</span><span class="btn" style="flex:1">Cancel upload</span></div>
+          </div>
+        </div></div>
+        <figcaption><b>The detail while checking</b>Just the progress line and one sentence explaining why it's waiting. The Added, Waiting and To retry counts appear once uploading starts, and Pause and Cancel work from here too.</figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="ibtn">
+            <svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="content">
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+            <div class="day"><b>27 January 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="food*L snow*L fire road"></div>
+          </div>
+          <div class="upbar">
+            <div class="ur"><span class="ui"><svg class="i"><use href="#i-upload"/></svg></span><div class="ut"><b>Uploading 128 of 700</b><span>About 12 minutes left · 140 already in your library</span></div><span class="pct">15%</span><svg class="i" style="color:var(--muted);transform:rotate(-90deg)"><use href="#i-chev"/></svg></div>
+            <div class="prog lg"><i style="width:15%"></i></div>
+          </div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>While it uploads</b>One bar above the tabs with the count, a time estimate and a percentage. It appears on every page, never covers the photos you're looking at, and tapping it opens the detail. The estimate says "Less than a minute left" or "About N minutes left", and shows the speed in MB/s until there is enough to estimate from.<span class="refs">Fixes #29</span></figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3></div>
+          <div class="scrim"></div>
+          <div class="sheet tall" style="gap:12px;top:96px">
+            <div class="grab"></div>
+            <h4>Uploading 700 items</h4>
+            <div class="prog lg"><i style="width:15%"></i></div>
+            <div class="ustats"><div class="us"><b>128</b><span>Added</span></div><div class="us"><b>704</b><span>Waiting</span></div><div class="us bad"><b>8</b><span>To retry</span></div></div>
+            <p class="note"><svg class="i"><use href="#i-check"/></svg><span>140 already in your library, so they were skipped.</span></p>
+            <p class="note"><svg class="i"><use href="#i-info"/></svg><span>Keep this page open until it finishes. If you close it, uploading stops and can continue from where it left off.</span></p>
+            <div style="display:flex;gap:8px"><span class="btn" style="flex:1">Pause</span><span class="btn" style="flex:1">Cancel upload</span></div>
+          </div>
+        </div></div>
+        <figcaption><b>The detail</b>Plain counts for what is added, waiting and needs another try, a progress line, and an honest note about closing the page. Pause stops the upload and keeps it so it can be resumed. Cancel upload asks first, then stops and discards what is left.</figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3></div>
+          <div class="scrim"></div>
+          <div class="sheet tall" style="gap:12px;top:96px">
+            <div class="grab"></div>
+            <h4>8 items didn't upload</h4>
+            <p>The other 832 were added. These just need another try.</p>
+            <div class="ulist">
+              <div class="row"><span class="th ph-tunnel"></span><div class="rt"><b>IMG_4301.HEIC</b><span class="why">The connection dropped</span></div></div>
+              <div class="row"><span class="th ph-snow"></span><div class="rt"><b>IMG_4302.HEIC</b><span class="why">The connection dropped</span></div></div>
+              <div class="row"><span class="th ph-notes"></span><div class="rt"><b>IMG_4344.PNG</b><span class="why">The server was busy</span></div></div>
+              <div class="row"><span class="th ph-fire2"></span><div class="rt"><b>IMG_4390.MOV</b><span class="why">This file couldn't be read</span></div></div>
+              <div class="row" style="justify-content:center;padding:9px"><span class="link mut" style="font-size:12.5px">Show 4 more</span></div>
+            </div>
+            <span class="btn pri wide">Try again</span>
+            <span class="btn wide">Skip these 8</span>
+            <p class="note"><svg class="i"><use href="#i-info"/></svg><span>If Try again can't find a file, choose the same photos again.</span></p>
+          </div>
+        </div></div>
+        <figcaption><b>When some fail</b>The bar says "8 items didn't upload" and "Tap to see why". The sheet lists reasons in everyday words, four at a time with "Show 4 more", and one button retries them all. Nothing is dropped silently.</figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="ibtn dot">
+            <svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="content">
+            <div class="day"><b>Today</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="aurora*L forest field tunnel shot notif portrait garden"></div>
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="food snow fire road"></div>
+          </div>
+          <div class="upbar">
+            <div class="ur"><span class="ui"><svg class="i"><use href="#i-clock"/></svg></span><div class="ut"><b>Upload paused</b><span>128 of 840 added</span></div><span class="link" style="font-size:13px">Resume</span><span class="link mut" style="font-size:13px">Discard</span></div>
+            <div class="prog lg"><i style="width:15%"></i></div>
+          </div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>Paused</b>A paused upload stays in the same bar, so it isn't forgotten. Resume carries on where it stopped, and Discard drops the rest. When an upload finishes, the bell reports it with a dot.<span class="refs">Fixes #34</span></figcaption>
+      </figure>
+
+      <figure class="shot xl" style="width:100%;max-width:1120px">
+        <div class="scrollx"><div class="browser app">
+          <div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/photos</div></div>
+          <div class="dapp">
+            <aside class="side" data-side="photos"></aside>
+            <div class="dmain">
+              <div class="dtop" data-dtop></div>
+              <div class="dbody">
+                <div class="dph"><h3>Photos<small>31 items</small></h3></div>
+                <div class="dday"><b>10 October 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+                <div class="dday"><b>27 January 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="food*L snow*L fire wedding city memoji indoor notes"></div>
+              </div>
+              <div class="utray">
+                <div class="uh"><span class="ui"><svg class="i"><use href="#i-upload"/></svg></span><b>Uploading 700 items</b><span class="ibtn ghost"><svg class="i" style="transform:rotate(90deg)"><use href="#i-chev"/></svg></span><span class="ibtn ghost"><svg class="i"><use href="#i-close"/></svg></span></div>
+                <div class="ub">
+                  <div class="prog lg"><i style="width:15%"></i></div>
+                  <div class="fr"><span>128 added · 564 waiting</span><span>About 12 minutes left</span></div>
+                </div>
+                <div class="ulist">
+                  <div class="row"><span class="ui bad"><svg class="i"><use href="#i-alert"/></svg></span><div class="rt"><b>8 items didn't upload</b><span class="why">Tap to see why</span></div><span class="link" style="font-size:13px">Retry</span></div>
+                </div>
+                <div class="uf"><span>Keep this tab open until it finishes.</span><span class="link" style="font-size:13px">Pause</span></div>
+              </div>
+            </div>
+          </div>
+        </div></div>
+        <figcaption><b>On a desktop browser</b>The same information in a tray at the bottom right, on every page. It shows counts, the progress line and a keep-open note, with Pause beside it. Retry runs the whole paused session again, and the X hides the tray for this upload only.<span class="refs">Fixes #29</span></figcaption>
+      </figure>
+
+      <figure class="shot xl" style="width:100%;max-width:1120px">
+        <div class="scrollx"><div class="browser app">
+          <div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/photos</div></div>
+          <div class="dapp">
+            <aside class="side" data-side="photos"></aside>
+            <div class="dmain">
+              <div class="dtop" data-dtop></div>
+              <div class="dbody">
+                <div class="dph"><h3>Photos<small>31 items</small></h3></div>
+                <div class="dday"><b>10 October 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+                <div class="dday"><b>27 January 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="food*L snow*L fire wedding city memoji indoor notes"></div>
+              </div>
+              <div class="utray">
+                <div class="uh"><span class="ui"><svg class="i"><use href="#i-search"/></svg></span><b>Checking 840 photos</b><span class="ibtn ghost"><svg class="i" style="transform:rotate(90deg)"><use href="#i-chev"/></svg></span><span class="ibtn ghost"><svg class="i"><use href="#i-close"/></svg></span></div>
+                <div class="ub">
+                  <div class="prog lg"><i style="width:42%"></i></div>
+                  <div class="fr"><span>353 of 840 checked</span><span>Skipping ones you have</span></div>
+                </div>
+                <div class="uf"><span>Keep this tab open until it finishes.</span><span class="link" style="font-size:13px">Pause</span></div>
+              </div>
+            </div>
+          </div>
+        </div></div>
+        <figcaption><b>On a desktop browser, while checking</b>The tray starts with the checking step: how many photos have been looked at, and a note that ones you already have are skipped. It switches to the upload tray above once sending begins.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ========== AFTER UPLOAD ========== -->
+  <section class="sec" id="processing">
+    <div class="sec-head">
+      <h2>After the upload: getting photos ready</h2>
+      <p class="lede">Once the last photo is uploaded, Keepsake still has work to do before search and people are complete. The same bar keeps going through it, so one place answers "is it finished yet?". The three background jobs get plain names, and the bar says which of three steps it is on.</p>
+    </div>
+    <div class="sys">
+      <div class="card"><h3>Reading your photos</h3><p>Spotting places, things and text in each photo so it can be tagged. <b style="color:var(--b-fg)">(was: Vision)</b></p></div>
+      <div class="card"><h3>Finding people</h3><p>Matching the same face across photos, so each person has one page. <b style="color:var(--b-fg)">(was: Clustering)</b></p></div>
+      <div class="card"><h3>Getting search ready</h3><p>Making every photo findable by a few typed words. <b style="color:var(--b-fg)">(was: Indexing)</b></p></div>
+    </div>
+    <div class="frames">
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="ibtn"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="content">
+            <div class="day"><b>Today</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="food snow fire road"></div>
+          </div>
+          <div class="upbar">
+            <div class="ur"><span class="ui"><svg class="i"><use href="#i-refresh"/></svg></span><div class="ut"><b>Getting your photos ready</b><span>Step 1 of 3 · Reading your photos</span></div><svg class="i" style="color:var(--muted);transform:rotate(-90deg)"><use href="#i-chev"/></svg></div>
+            <div class="seg3"><i class="n"></i><i></i><i></i></div>
+          </div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>The bar carries on</b>When uploading ends, the bar doesn't vanish. It becomes "Getting your photos ready" with three segments, one per step. Keepsake can't say how many photos are done, so the current segment just moves and no percentage is shown.</figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3></div>
+          <div class="scrim"></div>
+          <div class="sheet tall" style="gap:14px;top:96px">
+            <div class="grab"></div>
+            <h4>Getting your photos ready</h4>
+            <p>Your photos are safe. These steps make search and people work.</p>
+            <div class="steps">
+              <div class="step done"><span class="sdot"><svg class="i"><use href="#i-check"/></svg></span><div class="rt2"><b>Uploaded</b><span class="sub">840 photos are safe in your library</span></div><span class=tag2>Done</span></div>
+              <div class="step now"><span class="sdot">1</span><div class="rt2"><b>Reading your photos</b><span class="sub">Spotting places, things and text so they can be tagged</span></div><span class=tag2>In progress</span></div>
+              <div class="step wait"><span class="sdot">2</span><div class="rt2"><b>Finding people</b><span class="sub">Matching the same faces across your photos</span></div></div>
+              <div class="step wait"><span class="sdot">3</span><div class="rt2"><b>Getting search ready</b><span class="sub">So you can find any photo by typing a few words</span></div></div>
+            </div>
+            <p class="note"><svg class="i"><use href="#i-info"/></svg><span>You can close this page. This carries on by itself, and we'll tell you in Notifications when it's done.</span></p>
+            <span class="btn wide">Hide</span>
+          </div>
+        </div></div>
+        <figcaption><b>The detail</b>A short list in the order things happen. Finished steps are ticked, the current one moves, and the rest wait. Each step says in one line what it gives you. It also says you don't need to keep the page open for this part.</figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3></div>
+          <div class="scrim"></div>
+          <div class="sheet tall" style="gap:14px;top:96px">
+            <div class="grab"></div>
+            <h4>Getting your photos ready</h4>
+            <p>Your photos are safe. These steps make search and people work.</p>
+            <div class="steps">
+              <div class="step done"><span class="sdot"><svg class="i"><use href="#i-check"/></svg></span><div class="rt2"><b>Uploaded</b><span class="sub">840 photos are safe in your library</span></div><span class=tag2>Done</span></div>
+              <div class="step done"><span class="sdot"><svg class="i"><use href="#i-check"/></svg></span><div class="rt2"><b>Reading your photos</b><span class="sub">Places, things and text spotted</span></div><span class=tag2>Done</span></div>
+              <div class="step done"><span class="sdot"><svg class="i"><use href="#i-check"/></svg></span><div class="rt2"><b>Finding people</b><span class="sub">9 people found</span></div><span class=tag2>Done</span></div>
+              <div class="step now"><span class="sdot">3</span><div class="rt2"><b>Getting search ready</b><span class="sub">So you can find any photo by typing a few words</span></div><span class=tag2>In progress</span></div>
+            </div>
+            <p class="note"><svg class="i"><use href="#i-info"/></svg><span>You can close this page. This carries on by itself, and we'll tell you in Notifications when it's done.</span></p>
+            <span class="btn wide">Hide</span>
+          </div>
+        </div></div>
+        <figcaption><b>Last step</b>Finished steps keep their result ("9 people found"), so there is already something to look at while search is still getting ready.</figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="ibtn dot"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="content">
+            <div class="day"><b>Today</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="aurora*L forest field tunnel shot notif portrait garden"></div>
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="food snow fire road"></div>
+          </div>
+          <div class="upbar">
+            <div class="ur"><span class="ui"><svg class="i"><use href="#i-check"/></svg></span><div class="ut"><b>All photos are ready</b><span>Done in 4 minutes · 9 people found</span></div><span class="link" style="font-size:13px">Name them</span><svg class="i" style="color:var(--muted)"><use href="#i-close"/></svg></div>
+            <div class="seg3"><i class="d"></i><i class="d"></i><i class="d"></i></div>
+          </div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>Finished</b>All three segments fill, the bar says how long it took and what was found, and offers the one next step. It stays until you dismiss it, and the same news lands in Notifications.</figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3></div>
+          <div class="scrim"></div>
+          <div class="sheet tall" style="gap:14px;top:96px">
+            <div class="grab"></div>
+            <h4>Getting your photos ready</h4>
+            <p>Most of it worked. One thing needs another try.</p>
+            <div class="steps">
+              <div class="step done"><span class="sdot"><svg class="i"><use href="#i-check"/></svg></span><div class="rt2"><b>Uploaded</b><span class="sub">840 photos are safe in your library</span></div><span class=tag2>Done</span></div>
+              <div class="step bad"><span class="sdot"><svg class="i"><use href="#i-alert"/></svg></span><div class="rt2"><b>Reading your photos</b><span class="sub">1 video couldn't be read. Its format isn't supported yet.</span></div><span class=tag2>Try again</span></div>
+              <div class="step now"><span class="sdot">2</span><div class="rt2"><b>Finding people</b><span class="sub">Matching the same faces across your photos</span></div><span class=tag2>In progress</span></div>
+              <div class="step wait"><span class="sdot">3</span><div class="rt2"><b>Getting search ready</b><span class="sub">So you can find any photo by typing a few words</span></div></div>
+            </div>
+            <span class="btn wide">Hide</span>
+          </div>
+        </div></div>
+        <figcaption><b>When a step has a problem</b>The step with the problem turns red, says what went wrong in everyday words, and has its own Try again. The other steps carry on instead of waiting.</figcaption>
+      </figure>
+
+      <figure class="shot xl" style="width:100%;max-width:1120px">
+        <div class="scrollx"><div class="browser app">
+          <div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/photos</div></div>
+          <div class="dapp">
+            <aside class="side" data-side="photos"></aside>
+            <div class="dmain">
+              <div class="dtop" data-dtop></div>
+              <div class="dbody">
+                <div class="dph"><h3>Photos<small>31 items</small></h3></div>
+                <div class="dday"><b>10 October 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+                <div class="dday"><b>27 January 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="food*L snow*L fire wedding city memoji indoor notes"></div>
+              </div>
+              <div class="utray">
+                <div class="uh"><span class="ui"><svg class="i"><use href="#i-refresh"/></svg></span><b>Getting your photos ready</b><span class="ibtn ghost"><svg class="i" style="transform:rotate(90deg)"><use href="#i-chev"/></svg></span><span class="ibtn ghost"><svg class="i"><use href="#i-close"/></svg></span></div>
+                <div class="ub"><div class="seg3"><i class="d"></i><i class="n"></i><i></i></div><div class="fr"><span>Step 2 of 3</span><span>Usually a few minutes</span></div></div>
+                <div class="steps">
+                <div class="step done"><span class="sdot"><svg class="i"><use href="#i-check"/></svg></span><div class="rt2"><b>Uploaded</b><span class="sub">840 photos are safe in your library</span></div><span class=tag2>Done</span></div>
+                <div class="step done"><span class="sdot"><svg class="i"><use href="#i-check"/></svg></span><div class="rt2"><b>Reading your photos</b><span class="sub">Places, things and text spotted</span></div><span class=tag2>Done</span></div>
+                <div class="step now"><span class="sdot">2</span><div class="rt2"><b>Finding people</b><span class="sub">Matching the same faces across your photos</span></div><span class=tag2>In progress</span></div>
+                <div class="step wait"><span class="sdot">3</span><div class="rt2"><b>Getting search ready</b><span class="sub">So you can find any photo by typing a few words</span></div></div>
+            </div>
+                <div class="uf"><span>You can close this tab. This carries on by itself.</span><span class="link" style="font-size:13px">Hide</span></div>
+              </div>
+            </div>
+          </div>
+        </div></div>
+        <figcaption><b>On a desktop browser</b>The tray from the upload becomes the progress for the three steps, with the same plain names, the same three segments and the same "you can close this" note.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="ibtn"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="content">
+            <div class="day"><b>Today</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="food snow fire road"></div>
+          </div>
+          <div class="upbar">
+            <div class="ur"><span class="ui"><svg class="i"><use href="#i-refresh"/></svg></span><div class="ut"><b>Getting your photos ready</b><span>Reading your photos · 1 more waiting</span></div><svg class="i" style="color:var(--muted);transform:rotate(-90deg)"><use href="#i-chev"/></svg></div>
+            <div class="seg3"><i class="n"></i><i></i><i></i></div>
+          </div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>Two uploads: one running, one waiting</b>There is still only one bar, showing the upload that is running. A small "1 more waiting" tag on the right says there is another, and tapping the bar opens both. The tag disappears when nothing is waiting.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="ibtn"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="content">
+            <div class="day"><b>Today</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="food snow fire road"></div>
+          </div>
+          <div class="upbar">
+            <div class="ur"><span class="ui"><svg class="i"><use href="#i-refresh"/></svg></span><div class="ut"><b>Getting 2 uploads ready</b><span>Earliest: Finding people</span></div><span class="pct">~45%</span><svg class="i" style="color:var(--muted);transform:rotate(-90deg)"><use href="#i-chev"/></svg></div>
+            <div class="seg3"><i class="d"></i><i class="n"></i><i></i></div>
+          </div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>Two uploads running together</b>When more than one is moving, the bar combines them: "Getting 2 uploads ready", one rough percentage marked with "~", and the step of the earliest upload. The sheet still shows each upload on its own, so nothing is hidden by the combined number.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3></div>
+          <div class="scrim"></div>
+          <div class="sheet tall" style="gap:12px;top:96px">
+            <div class="grab"></div>
+            <h4>Getting your photos ready</h4>
+            <p>Your photos are safe. Oldest upload first.</p>
+            <div class="wlist"><div class="wb "><div class="wbh"><b>Upload from 09:12</b><span class="m">840 photos</span></div><div class="steps sm"><div class="step now"><span class="sdot">1</span><div class="rt2"><b>Reading your photos</b><span class="sub">About 40 minutes left</span></div><span class=tag2>In progress</span></div><div class="step wait"><span class="sdot">2</span><div class="rt2"><b>Finding people</b><span class="sub"></span></div></div><div class="step wait"><span class="sdot">3</span><div class="rt2"><b>Getting search ready</b><span class="sub"></span></div></div></div></div><div class="wb dim"><div class="wbh"><b>Upload from 14:30</b><span class="m">120 photos</span></div><div class="steps sm"><div class="step wait"><span class="sdot">1</span><div class="rt2"><b>Reading your photos</b><span class="sub"></span></div></div><div class="step wait"><span class="sdot">2</span><div class="rt2"><b>Finding people</b><span class="sub"></span></div></div><div class="step wait"><span class="sdot">3</span><div class="rt2"><b>Getting search ready</b><span class="sub"></span></div></div></div><div class="line"><svg class="i"><use href="#i-clock"/></svg><span>Waiting for the upload above to finish.</span></div></div></div>
+            <p class="note"><svg class="i"><use href="#i-info"/></svg><span>You can close this page. This carries on by itself.</span></p><span class="btn wide">Hide</span>
+          </div>
+        </div></div>
+        <figcaption><b>One block per upload</b>Each upload has its own block: when it was added, how many photos, and its own three steps. Oldest is first. The one that is waiting says so and shows its steps as not started. The note about closing the page appears once, at the bottom.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3></div>
+          <div class="scrim"></div>
+          <div class="sheet tall" style="gap:12px;top:96px">
+            <div class="grab"></div>
+            <h4>Getting your photos ready</h4>
+            
+            <div class="wlist"><div class="wb "><div class="wbh"><b>Upload from 14:30</b><span class="m">120 photos</span></div><div class="steps sm"><div class="step done"><span class="sdot"><svg class="i"><use href="#i-check"/></svg></span><div class="rt2"><b>Reading your photos</b><span class="sub"></span></div><span class=tag2>Done</span></div><div class="step now"><span class="sdot">2</span><div class="rt2"><b>Finding people</b><span class="sub"></span></div><span class=tag2>In progress</span></div><div class="step wait"><span class="sdot">3</span><div class="rt2"><b>Getting search ready</b><span class="sub"></span></div></div></div></div><div class="wb "><div class="wbh"><b>Upload from 09:12</b><span class="m">840 photos</span><svg class="i x"><use href="#i-close"/></svg></div><div class="line ok fgc"><svg class="i"><use href="#i-check"/></svg><span>Done in 4 minutes · 9 people found</span></div><div class="line bad"><svg class="i"><use href="#i-alert"/></svg><span>56 photos couldn't be processed. They're still in your library, just not searchable yet.</span></div><div class="acts"><span class="btn sm">Show them</span></div></div><div class="wb "><div class="wbh"><b>Upload from 08:40</b><span class="m">31 photos</span><svg class="i x"><use href="#i-close"/></svg></div><div class="line ok fgc"><svg class="i"><use href="#i-check"/></svg><span>Done in 2 minutes · 3 people found</span></div></div></div>
+            <span class="btn wide">Hide</span>
+          </div>
+        </div></div>
+        <figcaption><b>Running, plus finished ones</b>Finished uploads sit under the running one with their result. One that finished with some photos not processed says how many, says they are still in the library, and says what the effect is. Each finished block has an X to dismiss it.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="ibtn"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="content">
+            <div class="day"><b>Today</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="food snow fire road"></div>
+          </div>
+          <div class="upbar">
+            <div class="ur"><span class="ui bad"><svg class="i"><use href="#i-alert"/></svg></span><div class="ut"><b>Something got stuck</b><span>2 more uploads are waiting. Your photos are safe.</span></div><span class="link" style="font-size:13px">Details</span></div>
+            <div class="seg3"><i class="d"></i><i class="x"></i><i></i></div>
+          </div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>A problem wins the bar</b>If an upload failed, the bar shows that instead of progress, with no percentage. It says plainly that later uploads are waiting behind it and that the photos are safe. The failing segment is red.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3></div>
+          <div class="scrim"></div>
+          <div class="sheet tall" style="gap:12px;top:96px">
+            <div class="grab"></div>
+            <h4>Getting your photos ready</h4>
+            <p>Your photos are safe. One upload needs another try.</p>
+            <div class="wlist"><div class="wb bad"><div class="wbh"><b>Upload from 09:12</b><span class="m">840 photos</span></div><div class="steps sm"><div class="step done"><span class="sdot"><svg class="i"><use href="#i-check"/></svg></span><div class="rt2"><b>Reading your photos</b><span class="sub"></span></div><span class=tag2>Done</span></div><div class="step bad"><span class="sdot"><svg class="i"><use href="#i-alert"/></svg></span><div class="rt2"><b>Finding people</b><span class="sub">We tried several times and couldn't finish this step.</span></div><span class=tag2>Stopped</span></div><div class="step wait"><span class="sdot">3</span><div class="rt2"><b>Getting search ready</b><span class="sub"></span></div></div></div><div class="acts"><span class="btn sm pri">Try again</span></div></div><div class="wb dim"><div class="wbh"><b>Upload from 14:30</b><span class="m">120 photos</span></div><div class="steps sm"><div class="step wait"><span class="sdot">1</span><div class="rt2"><b>Reading your photos</b><span class="sub"></span></div></div><div class="step wait"><span class="sdot">2</span><div class="rt2"><b>Finding people</b><span class="sub"></span></div></div><div class="step wait"><span class="sdot">3</span><div class="rt2"><b>Getting search ready</b><span class="sub"></span></div></div></div><div class="line"><svg class="i"><use href="#i-clock"/></svg><span>Waiting for the upload above. It will start once that is sorted.</span></div></div><div class="wb dim"><div class="wbh"><b>Upload from 16:05</b><span class="m">56 photos</span></div><div class="steps sm"><div class="step wait"><span class="sdot">1</span><div class="rt2"><b>Reading your photos</b><span class="sub"></span></div></div><div class="step wait"><span class="sdot">2</span><div class="rt2"><b>Finding people</b><span class="sub"></span></div></div><div class="step wait"><span class="sdot">3</span><div class="rt2"><b>Getting search ready</b><span class="sub"></span></div></div></div><div class="line"><svg class="i"><use href="#i-clock"/></svg><span>Waiting for the upload above to finish.</span></div></div></div>
+            <span class="btn wide">Hide</span>
+          </div>
+        </div></div>
+        <figcaption><b>A stopped upload, with others behind it</b>The upload that failed gets a red outline, the step that stopped, and its own Try again. The ones behind it say what they are waiting for, so nobody wonders why nothing is moving.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="ibtn"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="content">
+            <div class="day"><b>Today</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="food snow fire road"></div>
+          </div>
+          <div class="upbar">
+            <div class="ur"><span class="ui"><svg class="i"><use href="#i-clock"/></svg></span><div class="ut"><b>Taking longer than usual</b><span>Nothing has moved for 10 minutes. It may start again by itself.</span></div><span class="link" style="font-size:13px">Details</span></div>
+            <div class="seg3"><i class="d"></i><i class="s"></i><i></i></div>
+          </div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>Slow, not failed</b>When nothing has moved for a while but nothing has failed, the bar says it is taking longer and that it may start again on its own. It is calmer than the failed version: neutral colour, no red, and still no percentage.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3></div>
+          <div class="scrim"></div>
+          <div class="sheet tall" style="gap:12px;top:96px">
+            <div class="grab"></div>
+            <h4>Getting your photos ready</h4>
+            <p><span class="wsh"><span>5 uploads</span><span class="link" style="font-size:13px">Clear finished</span></span></p>
+            <div class="wlist"><div class="wb "><div class="wbh"><b>Upload from 09:12</b><span class="m">840 photos</span></div><div class="steps sm"><div class="step done"><span class="sdot"><svg class="i"><use href="#i-check"/></svg></span><div class="rt2"><b>Reading your photos</b><span class="sub"></span></div><span class=tag2>Done</span></div><div class="step done"><span class="sdot"><svg class="i"><use href="#i-check"/></svg></span><div class="rt2"><b>Finding people</b><span class="sub"></span></div><span class=tag2>Done</span></div><div class="step now"><span class="sdot">3</span><div class="rt2"><b>Getting search ready</b><span class="sub"></span></div><span class=tag2>In progress</span></div></div></div><div class="wb dim"><div class="wbh"><b>Upload from 11:20</b><span class="m">60 photos</span></div><div class="line"><svg class="i"><use href="#i-clock"/></svg><span>Waiting for the upload above to finish.</span></div></div><div class="wb dim"><div class="wbh"><b>Upload from 14:30</b><span class="m">120 photos</span></div><div class="line"><svg class="i"><use href="#i-clock"/></svg><span>Waiting for the upload above to finish.</span></div></div><div class="wb "><div class="wbh"><b>Upload from 08:40</b><span class="m">31 photos</span><svg class="i x"><use href="#i-close"/></svg></div><div class="line ok fgc"><svg class="i"><use href="#i-check"/></svg><span>Done in 2 minutes · 3 people found</span></div></div><div class="wb "><div class="wbh"><b>Upload from 07:15</b><span class="m">12 photos</span><svg class="i x"><use href="#i-close"/></svg></div><div class="line ok fgc"><svg class="i"><use href="#i-check"/></svg><span>Done in 1 minute · 1 person found</span></div></div></div>
+            
+          </div>
+        </div></div>
+        <figcaption><b>Three or more uploads</b>Only the running upload shows its steps. The waiting ones shrink to one line each, and finished ones keep a single line with an X. "Clear finished" removes them all at once. The list scrolls inside the sheet if there are many.</figcaption>
+      </figure>
+      <figure class="shot" style="width:336px"><div class="card" style="margin-top:0"><h3>Notifications</h3><p>Each upload that finishes adds <b style="color:var(--b-fg)">one</b> entry to the bell, with its own result. Progress itself never becomes a notification, however many uploads are running, and dismissing a finished block here does not delete its entry.</p></div></figure>
+      <figure class="shot xl" style="width:100%;max-width:1120px">
+        <div class="scrollx"><div class="browser app">
+          <div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/photos</div></div>
+          <div class="dapp" style="height:680px">
+            <aside class="side" data-side="photos"></aside>
+            <div class="dmain">
+              <div class="dtop" data-dtop></div>
+              <div class="dbody">
+                <div class="dph"><h3>Photos<small>31 items</small></h3></div>
+                <div class="dday"><b>10 October 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+                <div class="dday"><b>27 January 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="food*L snow*L fire wedding city memoji indoor notes"></div>
+              </div>
+              <div class="utray wide">
+                <div class="uh"><span class="ui"><svg class="i"><use href="#i-refresh"/></svg></span><b>Getting your photos ready</b><span class="pill">1 more waiting</span><span class="ibtn ghost"><svg class="i"><use href="#i-close"/></svg></span></div>
+                <div class="wlist"><div class="wb "><div class="wbh"><b>Upload from 09:12</b><span class="m">840 photos</span></div><div class="steps sm"><div class="step now"><span class="sdot">1</span><div class="rt2"><b>Reading your photos</b><span class="sub">Reading 312 of 840 · about 40 minutes left</span></div><span class=tag2>In progress</span></div><div class="step wait"><span class="sdot">2</span><div class="rt2"><b>Finding people</b><span class="sub"></span></div></div><div class="step wait"><span class="sdot">3</span><div class="rt2"><b>Getting search ready</b><span class="sub"></span></div></div></div></div><div class="wb dim"><div class="wbh"><b>Upload from 14:30</b><span class="m">120 photos</span></div><div class="line"><svg class="i"><use href="#i-clock"/></svg><span>Waiting for the upload above to finish.</span></div></div><div class="wb "><div class="wbh"><b>Upload from 08:40</b><span class="m">31 photos</span><svg class="i x"><use href="#i-close"/></svg></div><div class="line ok fgc"><svg class="i"><use href="#i-check"/></svg><span>Done in 2 minutes · 3 people found</span></div></div></div>
+                <div class="uf"><span>You can close this tab. This carries on by itself.</span><span class="link" style="font-size:13px">Hide</span></div>
+              </div>
+            </div>
+          </div>
+        </div></div>
+        <figcaption><b>On a desktop browser: several uploads</b>The tray lists each upload as a block, oldest first, with the running one expanded, the waiting one shrunk to a line, and finished ones dismissible. A "1 more waiting" tag in the header covers the collapsed state.</figcaption>
+      </figure>
+      <figure class="shot xl" style="width:100%;max-width:1120px">
+        <div class="scrollx"><div class="browser app">
+          <div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/photos</div></div>
+          <div class="dapp" style="height:680px">
+            <aside class="side" data-side="photos"></aside>
+            <div class="dmain">
+              <div class="dtop" data-dtop></div>
+              <div class="dbody">
+                <div class="dph"><h3>Photos<small>31 items</small></h3></div>
+                <div class="dday"><b>10 October 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+                <div class="dday"><b>27 January 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="food*L snow*L fire wedding city memoji indoor notes"></div>
+              </div>
+              <div class="utray wide">
+                <div class="uh"><span class="ui bad"><svg class="i"><use href="#i-alert"/></svg></span><b>Something got stuck</b><span class="ibtn ghost"><svg class="i"><use href="#i-close"/></svg></span></div>
+                <div class="ub"><div class="seg3"><i class="d"></i><i class="x"></i><i></i></div><div class="fr"><span>2 more uploads are waiting</span><span>Your photos are safe</span></div></div>
+                <div class="wlist"><div class="wb bad"><div class="wbh"><b>Upload from 09:12</b><span class="m">840 photos</span></div><div class="steps sm"><div class="step done"><span class="sdot"><svg class="i"><use href="#i-check"/></svg></span><div class="rt2"><b>Reading your photos</b><span class="sub"></span></div><span class=tag2>Done</span></div><div class="step bad"><span class="sdot"><svg class="i"><use href="#i-alert"/></svg></span><div class="rt2"><b>Finding people</b><span class="sub">We tried several times and couldn't finish this step.</span></div><span class=tag2>Stopped</span></div><div class="step wait"><span class="sdot">3</span><div class="rt2"><b>Getting search ready</b><span class="sub"></span></div></div></div><div class="acts"><span class="btn sm pri">Try again</span></div></div><div class="wb dim"><div class="wbh"><b>Upload from 14:30</b><span class="m">120 photos</span></div><div class="line"><svg class="i"><use href="#i-clock"/></svg><span>Waiting for the upload above.</span></div></div></div>
+              </div>
+            </div>
+          </div>
+        </div></div>
+        <figcaption><b>On a desktop browser: a stopped upload</b>The header turns red and says what is happening in one line, with the segments and "2 more uploads are waiting. Your photos are safe." The stopped upload has its own Try again.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ========== CANCEL, RETRY, SKIP ========== -->
+  <section class="sec" id="upload-actions">
+    <div class="sec-head">
+      <h2>Cancelling, retrying and skipping</h2>
+      <p class="lede">When you stop an upload or deal with the files that failed, the bar doesn't just vanish. It shows what is happening, how far along it is, and what you're left with, so you can tell it worked.</p>
+    </div>
+    <div class="frames">
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3></div>
+          <div class="scrim"></div>
+          <div class="sheet" style="gap:12px">
+            <div class="grab"></div>
+            <h4>Cancel this upload?</h4>
+            <p>The 128 photos already added stay in your library. The other 712 won't be uploaded.</p>
+            <span class="btn dan wide">Cancel upload</span>
+            <span class="btn wide">Keep uploading</span>
+          </div>
+        </div></div>
+        <figcaption><b>Cancel asks first</b>It says what stays (the photos already added) and what doesn't, in numbers. The red button names the action, and the safe choice is just as big.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3></div>
+          <div class="scrim"></div>
+          <div class="sheet tall" style="gap:12px;top:96px">
+            <div class="grab"></div>
+            <h4>Cancelling upload</h4>
+            <div class="prog lg"><i style="width:68%"></i></div>
+            <p>Stopping the last few files and clearing 712 from the list. 486 done.</p>
+            <div class="ustats"><div class="us"><b>128</b><span>Stay added</span></div><div class="us"><b>486</b><span>Cleared</span></div><div class="us"><b>226</b><span>To clear</span></div></div>
+            <p class="note"><svg class="i"><use href="#i-info"/></svg><span>Photos already added are never removed. You can close this page.</span></p>
+          </div>
+        </div></div>
+        <figcaption><b>Cancelling</b>Cancelling takes a moment, so it shows progress: how many are cleared and how many are left. The photos already added are confirmed as staying. The bar is still there if you close the sheet.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="ibtn"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="content">
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+            <div class="day"><b>27 January 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="food*L snow*L fire road"></div>
+          </div>
+          <div class="upbar">
+            <div class="ur"><span class="ui"><svg class="i"><use href="#i-check"/></svg></span><div class="ut"><b>Cancelled</b><span>128 added, 712 not</span></div><span class="link" style="font-size:13px">Choose again</span><svg class="i" style="color:var(--muted)"><use href="#i-close"/></svg></div>
+          </div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>Cancelled</b>A clear ending: how many were added and how many weren't, with a way to choose the photos again. It can be dismissed with the X.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3></div>
+          <div class="scrim"></div>
+          <div class="sheet tall" style="gap:12px;top:96px">
+            <div class="grab"></div>
+            <h4>Trying again</h4>
+            <div class="prog lg"><i style="width:37%"></i></div>
+            <p>3 of 8 retried. 3 worked, 0 failed again.</p>
+            <div class="ulist">
+              <div class="row"><span class="th ph-tunnel"></span><div class="rt"><b>IMG_4301.HEIC</b><span>Added</span></div><svg class="i ok"><use href="#i-check"/></svg></div>
+              <div class="row"><span class="th ph-snow"></span><div class="rt"><b>IMG_4302.HEIC</b><span>Added</span></div><svg class="i ok"><use href="#i-check"/></svg></div>
+              <div class="row"><span class="th ph-notes"></span><div class="rt"><b>IMG_4344.PNG</b><span>Added</span></div><svg class="i ok"><use href="#i-check"/></svg></div>
+              <div class="row"><span class="th ph-fire2"></span><div class="rt"><b>IMG_4390.MOV</b><span>Trying now…</span></div></div>
+            </div>
+            <div style="display:flex;gap:8px"><span class="btn" style="flex:1">Pause</span><span class="btn" style="flex:1">Cancel upload</span></div>
+          </div>
+        </div></div>
+        <figcaption><b>Trying again</b>Try again opens the same bar with a count and a progress line. Files that worked get a tick as they finish, and the one in progress says "Trying now". Pause and Cancel are still there.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="ibtn"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="content">
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+            <div class="day"><b>27 January 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="food*L snow*L fire road"></div>
+          </div>
+          <div class="upbar">
+            <div class="ur"><span class="ui bad"><svg class="i"><use href="#i-alert"/></svg></span><div class="ut"><b>2 items still didn't upload</b><span>6 of 8 worked this time</span></div><span class="link" style="font-size:13px">Try again</span></div>
+          </div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>After a retry</b>The result is stated plainly: 6 of 8 worked, 2 still didn't. The bar offers Try again once more instead of hiding the leftovers.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="ibtn"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="content">
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+            <div class="day"><b>27 January 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="food*L snow*L fire road"></div>
+          </div>
+          <div class="upbar">
+            <div class="ur"><span class="ui"><svg class="i"><use href="#i-check"/></svg></span><div class="ut"><b>2 items skipped</b><span>You can choose them again later</span></div><span class="link" style="font-size:13px">Undo</span><svg class="i" style="color:var(--muted)"><use href="#i-close"/></svg></div>
+          </div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>Skipping</b>Skip these removes the failed files from the list straight away. The bar confirms how many were skipped, says the rest were added, and offers Undo for a moment, because skipping can't be seen by looking at the photos.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ========== EMAILS ========== -->
+  <section class="sec" id="emails">
+    <div class="sec-head">
+      <h2>Emails</h2>
+      <p class="lede">Keepsake sends four kinds of email. Each one says who it's from and why in the first line, has exactly one button, and says how long the link works and what to do if you weren't expecting it. They're shown here in a mail app. Each also has a plain-text version with the same words and the link on its own line.</p>
+    </div>
+    <div class="frames">
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Inbox</span><span class="ibtn ghost"><svg class="i"><use href="#i-trash"/></svg></span></div>
+          <div class="mail">
+            <div class="mh2"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span><div><b>Keepsake</b><span>to dev@example.com</span></div><em>14:02</em></div>
+            <div class="msub">Rajat invited you to Verma family</div>
+            <div class="em">
+              <span class="mk"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span>Keepsake</span>
+              <h4>Rajat invited you to join Verma family</h4>
+              <p>You'll see the family's 31 photos and videos and can add your own.</p>
+              <div class="facts"><div><svg class="i"><use href="#i-users"/></svg>2 members</div><div><svg class="i"><use href="#i-lock"/></svg>Private. Only members can see it.</div></div>
+              <span class="btn pri wide">Accept invite</span>
+              <p class="fine">This link works once and ends on 14 Nov at 01:00. Not expecting this? Ignore this email and nothing happens.</p>
+            </div>
+          </div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>Invite</b>The subject already says who and what. The page it opens is the one shown in Invites, so what you read and what you tap match.<span class="refs">Fixes #47</span></figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Inbox</span><span class="ibtn ghost"><svg class="i"><use href="#i-trash"/></svg></span></div>
+          <div class="mail">
+            <div class="mh2"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span><div><b>Keepsake</b><span>to rajat@example.com</span></div><em>09:15</em></div>
+            <div class="msub">Reset your Keepsake password</div>
+            <div class="em">
+              <span class="mk"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span>Keepsake</span>
+              <h4>Choose a new password</h4>
+              <p>Someone asked to reset the password for rajat@example.com. If that was you, choose a new one below.</p>
+              <span class="btn pri wide">Choose a new password</span>
+              <p class="fine">The link works once and ends in 1 hour.</p>
+              <hr>
+              <p class="fine">Didn't ask for this? Ignore this email. Your password stays the same.</p>
+            </div>
+          </div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>Reset password</b>It names the account it applies to, and reassures people who didn't ask for it. If the link has ended, its page says so and links straight back to sign in.<span class="refs">Fixes #47</span></figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Inbox</span><span class="ibtn ghost"><svg class="i"><use href="#i-trash"/></svg></span></div>
+          <div class="mail">
+            <div class="mh2"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span><div><b>Rajat via Keepsake</b><span>to dev@example.com</span></div><em>Yesterday</em></div>
+            <div class="msub">Rajat shared “Malmö nights” with you</div>
+            <div class="em">
+              <span class="mk"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span>Keepsake</span>
+              <div class="cover ph-aurora"><div class="hero-t"><h3>Malmö nights</h3><span>4 photos and videos</span></div></div>
+              <p>Rajat shared this album with you. You can look through it in your browser, and download it if you like.</p>
+              <span class="btn pri wide">View album</span>
+              <p class="fine">The link works until 14 Dec. This album also needs an access code, which Rajat will send you separately.</p>
+            </div>
+          </div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>Album shared</b>A cover picture and the album's name, so it's recognisable in the inbox. It states when the link ends and that the access code arrives separately, so the code is never in the same email as the link.</figcaption>
+      </figure>
+
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Inbox</span><span class="ibtn ghost"><svg class="i"><use href="#i-trash"/></svg></span></div>
+          <div class="mail">
+            <div class="mh2"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span><div><b>Keepsake</b><span>to rajat@example.com</span></div><em>16:40</em></div>
+            <div class="msub">Confirm deleting Verma family</div>
+            <div class="em">
+              <span class="mk"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span>Keepsake</span>
+              <h4>Confirm you want to delete Verma family</h4>
+              <p>You asked to delete everything in this library.</p>
+              <div class="facts"><div><svg class="i"><use href="#i-photos"/></svg>31 photos and videos</div><div><svg class="i"><use href="#i-albums"/></svg>2 albums</div><div><svg class="i"><use href="#i-users"/></svg>Access for 2 members</div></div>
+              <p><b>This can't be undone.</b> Nothing is deleted until you tap the button.</p>
+              <span class="btn dan wide">Delete everything</span>
+              <p class="fine">The link ends in 30 minutes. If you didn't ask for this, ignore it and change your password.</p>
+            </div>
+          </div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>Delete confirmation</b>The only email with a red button. It lists exactly what will go, says plainly that it's permanent, and expires quickly. Ignoring it does nothing.<span class="refs">Fixes #13 #46</span></figcaption>
       </figure>
     </div>
   </section>
@@ -1195,7 +2368,7 @@ figure.xl { width: 100%; max-width: 1120px; }
                 <div class="dph">
                   <h3>Photos<small>31 items</small></h3>
                   <div class="dctl">
-                    <span class="chip on">All</span><span class="chip">Photos</span><span class="chip">Videos</span><span class="chip">Liked</span><span class="chip"><svg class="i"><use href="#i-calendar"/></svg>Date</span>
+                    <span class="btn sm"><svg class="i"><use href="#i-sliders"/></svg>Filter</span>
                     <span class="zoom" title="Photo size"><svg class="i"><use href="#i-photos"/></svg><span class="track"><i></i><b></b></span><svg class="i"><use href="#i-photos"/></svg></span>
                     <span class="link">Select</span>
                   </div>
@@ -1224,9 +2397,10 @@ figure.xl { width: 100%; max-width: 1120px; }
                 <span class="ibtn"><svg class="i"><use href="#i-back"/></svg></span>
                 <div class="vt"><b>Malmö</b><span>Thursday, 10 October 2024 · 22:41</span></div>
                 <div class="dv-acts">
-                  <span class="ibtn"><svg class="i"><use href="#i-share"/></svg></span>
                   <span class="ibtn"><svg class="i"><use href="#i-heart"/></svg></span>
+                  <span class="ibtn"><svg class="i"><use href="#i-star"/></svg></span>
                   <span class="ibtn"><svg class="i"><use href="#i-addalbum"/></svg></span>
+                  <span class="ibtn"><svg class="i"><use href="#i-bench"/></svg></span>
                   <span class="ibtn" style="position:relative"><svg class="i"><use href="#i-download"/></svg><span class="tip">Download original</span></span>
                   <span class="ibtn"><svg class="i"><use href="#i-trash"/></svg></span>
                   <span class="ibtn on"><svg class="i"><use href="#i-info"/></svg></span>
@@ -1252,7 +2426,7 @@ figure.xl { width: 100%; max-width: 1120px; }
             </aside>
           </div>
         </div></div>
-        <figcaption><b>Viewer</b>The photo takes the middle of the screen, and info sits beside it instead of covering it. Every icon button has a tooltip, the arrow keys move between photos, and the filmstrip shows where you are. Rating lives in the info panel, out of the main toolbar.<span class="refs">Fixes #9 #22 #23 #24 #45</span></figcaption>
+        <figcaption><b>Viewer</b>The photo takes the middle of the screen, and info sits beside it instead of covering it. Every icon button has a tooltip, the arrow keys move between photos, and the filmstrip shows where you are. Rate and Open in Workbench are buttons in the toolbar, and the rating also shows in the info panel.<span class="refs">Fixes #9 #22 #23 #24 #45</span></figcaption>
       </figure>
 
       <figure class="shot xl">
@@ -1330,7 +2504,7 @@ figure.xl { width: 100%; max-width: 1120px; }
                   </div>
                   <div class="lbl">Photos · 1 selected</div>
                   <div class="g c3" data-tiles="field*L*s tunnel*S"></div>
-                  <div style="display:flex;gap:8px"><span class="btn sm"><svg class="i"><use href="#i-userx"/></svg>Not this person</span><span class="btn sm">Use as cover</span></div>
+                  <div style="display:flex;gap:8px"><span class="btn sm">Use as cover</span></div>
                 </aside>
               </div>
             </div>
@@ -1460,7 +2634,7 @@ figure.xl { width: 100%; max-width: 1120px; }
     }).join('') + '<i class="home"></i>';
   });
 
-  // Tile tokens: name*flags. L = Live, V<n> = video of n seconds, S = selected, s = selectable,
+  // Tile tokens: name*flags. L = Live, V<n> = video, S = selected, s = selectable,
   // A = already in album, H = hover with select and download, x = still loading.
   $('[data-tiles]').forEach(function (el) {
     el.innerHTML = el.getAttribute('data-tiles').trim().split(/\s+/).map(function (tok) {
@@ -1469,7 +2643,7 @@ figure.xl { width: 100%; max-width: 1120px; }
       var cls = 't ph-' + k, inner = '';
       f.forEach(function (x) {
         if (x === 'L') inner += '<span class="lv">' + icon('live') + '</span>';
-        else if (x[0] === 'V') inner += '<span class="du">0:0' + x.slice(1) + '</span>';
+        else if (x[0] === 'V') inner += '<span class="du">' + icon('video') + '</span>';
         else if (x === 'S') { cls += ' sel'; inner += '<span class="ck">' + icon('check') + '</span>'; }
         else if (x === 's') inner += '<span class="ck">' + icon('check') + '</span>';
         else if (x === 'A') { cls += ' in'; inner += '<span class="tag">Added</span>'; }
