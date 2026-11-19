@@ -148,8 +148,12 @@ export interface WaveShadowResolution {
     filename?: string;
 }
 
+// adoptedItems lists failed/cancelled reports the server resolved as members
+// instead, because it already stores those exact bytes.
+export interface WaveAdoptedItem { itemId: string; outcome: 'accepted' | 'duplicate'; filename: string }
+
 export const resolveWaveShadowItems = (sessionId: string, items: WaveShadowResolution[]) =>
-    callShadow<{ manifestRevision: string; state?: string }>(
+    callShadow<{ manifestRevision: string; state?: string; adoptedItems?: WaveAdoptedItem[] }>(
         `${base()}/sessions/${encodeURIComponent(sessionId)}/resolve-batch`,
         async () => ({ items: await Promise.all(items.map(async item => ({
             ...item, itemId: await wireItemId(item.itemId),

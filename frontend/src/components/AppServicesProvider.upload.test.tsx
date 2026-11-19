@@ -1036,6 +1036,33 @@ describe('browser upload selection and startup', () => {
         expect(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)).toBeNull();
     });
 
+    it('settles a resumed file the server already stores without staging or finalizing it again', async () => {
+        // A finalize that stored the photo but never reached the browser.
+        // Resuming must not reserve a new blob on the finished photo's row.
+        const file = filesFor(1)[0];
+        mocks.idbGet.mockResolvedValue(file);
+        localStorage.setItem(UPLOAD_SESSION_STORAGE_KEY, JSON.stringify({
+            id: 'stored', createdAt: Date.now(), files: [{
+                key: 'stored:0', name: file.name, size: file.size, type: file.type,
+                lastModified: file.lastModified, uploadedBytes: file.size, skippedDuplicate: false,
+                status: 'finalizing', uploadId: file.name, blobName: `blob-${file.name}`,
+                blockIds: [btoa('block-00000000')], chunkSizeBytes: file.size,
+            }],
+        }));
+        const original = mocks.postUpload.getMockImplementation()!;
+        mocks.postUpload.mockImplementation(async (url: string, payload: any) => url === '/upload/init'
+            ? { alreadyStored: true, uploadId: payload.uploadId, filename: 'original-0-0123abcd.heic',
+                duplicates: [{ filename: 'original-0-0123abcd.heic', type: 'exact' }] }
+            : original(url, payload));
+        render(<AppServicesProvider><Probe /></AppServicesProvider>);
+        await advance(4000);
+        expect(mocks.postUpload.mock.calls.filter(([url]) => url === '/upload/init')).toHaveLength(1);
+        expect(mocks.committed).not.toHaveBeenCalled();
+        expect(finalizedFiles()).toHaveLength(0);
+        expect(services.pendingUploadSummary).toBeNull();
+        expect(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)).toBeNull();
+    });
+
     it('resumes 100 paused files and also uploads the other 200 from a broader reselection', async () => {
         const files = filesFor(300);
         mocks.transferred.mockRejectedValue(new Error('Test transfer failure'));
@@ -1461,6 +1488,37 @@ describe('upload wave shadow protocol wiring', () => {
         expect(finalizedFiles().slice(finalizedBefore).map(file => file.filename).sort()).toEqual(['original-1.heic', 'original-3.heic']);
         expect(services.retryingUpload).toBe(false);
         expect(services.pendingUploadSummary).toBeNull();
+    });
+
+    it.each([true, false])('a finalize that never gets its reply settles from the server\'s proof (stored=%s)', async (stored) => {
+        // 2026-11-19: finalize stored the photo, then lost its wave binding
+        // to contention and answered 503 on every retry. The browser called
+        // the photo failed although the server held it.
+        vi.stubEnv('VITE_UPLOAD_WAVE_EXECUTION_ENABLED', 'true');
+        mocks.getUpload.mockImplementation(async (url) => url === '/upload/waves/protocol' ? { protocol: 'live' } : { hashes: {} });
+        mocks.idbGet.mockImplementation(async () => new File(['x'], 'cached.heic'));
+        const original = mocks.postUpload.getMockImplementation()!;
+        mocks.postUpload.mockImplementation(async (url: string, payload: any) => {
+            if (url === '/upload/finalize-batch') throw { response: { status: 503, data: { code: 'wave_admission_retry' } } };
+            if (url.endsWith('/resolve-batch') && stored && payload.items.some((item: any) => item.outcome === 'failed')) {
+                return { manifestRevision: 'rev-adopted', adoptedItems: payload.items.map((item: any) => (
+                    { itemId: item.itemId, outcome: 'accepted', filename: 'original-0-0123abcd.heic' })) };
+            }
+            return original(url, payload);
+        });
+        select(filesFor(1));
+        await advance(180000);
+        // Finalize really was retried to exhaustion before the browser asked.
+        expect(finalizedFiles().length).toBeGreaterThanOrEqual(8);
+        expect(resolutionCalls().filter(([, item]) => item.outcome === 'failed')).toHaveLength(1);
+        const retrying = services.notifications.some(n => n.title === 'Retrying failed files');
+        if (stored) {
+            expect(retrying).toBe(false);
+            expect(services.uploadActive).toBe(false);
+            expect(services.pendingUploadSummary).toBeNull();
+        } else {
+            expect(retrying).toBe(true);
+        }
     });
 
     it('resumes this device\'s upload from a notice about an earlier abandoned retry, after a reload', async () => {

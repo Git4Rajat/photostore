@@ -118,7 +118,7 @@ class Sessions:
             stale=bool((parent or {}).get('leaseExpiredAt')),
             cancelled=(parent or {}).get('abandonCancelledCount', 0))
 
-    def reconcile_one(self, store, entry, drive):
+    def reconcile_one(self, store, entry, drive, adopt=None):
         if entry.get('claimUntil', 0) > self.clock():
             return True
         session = entry['sessionId']
@@ -156,7 +156,7 @@ class Sessions:
                 from wave_settlement import abandon
                 for _ in range(20):
                     parent = abandon(store, session, parent['manifestRevision'],
-                                     reason=parent.get('abandonReason', 'Upload inactive'))
+                                     reason=parent.get('abandonReason', 'Upload inactive'), adopt=adopt)
                     if parent['state'] != 'open':
                         break
                 if parent['state'] == 'open':
@@ -172,7 +172,7 @@ class Sessions:
                 state = 'OPEN' if parent and parent['state'] == 'open' and not parent.get('abandoning') else 'STOPPING'
                 self.table.submit_transaction([self.change(current, dict(current, state=state, claimUntil=0, claimToken=''))])
 
-    def reconcile(self, store, drive, *, budget_seconds=2):
+    def reconcile(self, store, drive, *, budget_seconds=2, adopt=None):
         started = time.monotonic()
         cursor = self.get('survey')
         after = (cursor or {}).get('after', '')
@@ -183,7 +183,7 @@ class Sessions:
                 pending = True
                 break
             try:
-                pending = self.reconcile_one(store, row, drive) or pending
+                pending = self.reconcile_one(store, row, drive, adopt) or pending
             except (Conflict, ResourceModifiedError, ResourceExistsError, TableTransactionError) as error:
                 import processing_diagnostics
                 processing_diagnostics.emit('upload_session_reconcile_deferred',

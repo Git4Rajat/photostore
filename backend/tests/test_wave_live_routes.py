@@ -277,14 +277,14 @@ def test_batch_resolution_partial_failure_is_retryable(live_api, monkeypatch):
     root = '/upload/waves/live/sessions'
     client.post(root, json=dict(sessionId='retry', declaredCount=2))
     client.post(root + '/retry/items', json=dict(items=[dict(itemId=k, filename=k+'.jpg') for k in 'ab']))
-    original = upload_wave_shadow.resolve_source
+    original = upload_wave_shadow.resolve_sources
     failed = [False]
-    def resolve(store, table, session, item, *args):
-        if item == 'b' and not failed[0]:
+    def resolve(store, table, session, sources, **kwargs):
+        if sources[0][0] == 'b' and not failed[0]:
             failed[0] = True
             raise AzureError('lost storage response')
-        return original(store, table, session, item, *args)
-    monkeypatch.setattr(upload_wave_shadow, 'resolve_source', resolve)
+        return original(store, table, session, sources, **kwargs)
+    monkeypatch.setattr(upload_wave_shadow, 'resolve_sources', resolve)
     body = dict(items=[dict(itemId=k, outcome='failed') for k in 'ab'])
     assert client.post(root + '/retry/resolve-batch', json=body).status_code == 503
     assert store._required('session!retry')['resolvedCount'] == 1
@@ -629,3 +629,124 @@ def test_retry_failed_refuses_a_foreign_cursor_and_non_owners(live_api,monkeypat
     assert client.post(f'/upload/waves/live/{wave}/repair',json=dict(action='retry-failed',after='wave!x')).status_code==400
     monkeypatch.setattr(app,'library_store',SimpleNamespace(is_owner=lambda account,lib:False))
     assert client.post(f'/upload/waves/live/{wave}/repair',json=dict(action='retry-failed')).status_code==409
+
+
+# --- Stored photos must never end up outside every wave (2026-11-19) ---------
+# A 10k upload stored 51 photos whose wave binding then lost its control-row
+# CAS. The browser reported them failed, discard cancelled them, and a resume
+# reserved a fresh blob on the finished rows. These pin the server-side proof.
+
+def _stored(metadata, hashes, name, sha, photo):
+    metadata.create_entity(dict(PartitionKey='u', RowKey=name, anonymousImageId=photo,
+        processingRevision='r-' + photo, fileHash=sha))
+    hashes.create_entity(dict(PartitionKey='u', RowKey=sha, filename=name))
+
+
+def _reserve(store, session, items):
+    store.open_session(session, len(items))
+    store.register(session, [dict(itemId=item, filename=name) for item, name, _sha in items])
+    for item, _name, sha in items:
+        if sha:
+            store.table.rows[store.partition, store.item_key(session, item)]['sourceHash'] = sha
+
+
+@pytest.fixture
+def hash_index(monkeypatch):
+    hashes = RuntimeTable()
+    monkeypatch.setattr(app, 'hash_index_table_client', hashes)
+    return hashes
+
+
+def test_browser_failure_report_for_a_stored_photo_joins_the_wave(live_api, hash_index):
+    client, store, metadata, _ = live_api
+    _stored(metadata, hash_index, 'a.jpg', 'a' * 64, 'pa')
+    _stored(metadata, hash_index, 'b-0123abcd.jpg', 'b' * 64, 'pb')
+    _stored(metadata, hash_index, 'elsewhere.jpg', 'c' * 64, 'pc')
+    _reserve(store, 's', [('a', 'a.jpg', 'a' * 64), ('b', 'b.jpg', 'b' * 64),
+                          ('c', 'c.jpg', 'c' * 64), ('d', 'd.jpg', 'd' * 64), ('e', 'e.jpg', '')])
+    body = dict(items=[dict(itemId=k, outcome='failed') for k in 'abcde'])
+    response = client.post('/upload/waves/live/sessions/s/resolve-batch', json=body)
+    assert response.status_code == 200, response.json
+    assert sorted((a['itemId'], a['outcome'], a['filename']) for a in response.json['adoptedItems']) == [
+        ('a', 'accepted', 'a.jpg'), ('b', 'accepted', 'b-0123abcd.jpg'), ('c', 'duplicate', 'elsewhere.jpg')]
+    outcome = lambda item: store._required(store.item_key('s', item))['outcome']
+    assert [outcome(k) for k in 'abcde'] == ['accepted', 'accepted', 'duplicate', 'failed', 'failed']
+    assert store.status(store._required('session!s')['waveId'])['memberCount'] == 3
+
+
+def test_stale_hash_index_entry_is_not_proof_of_a_stored_photo(live_api, hash_index):
+    client, store, metadata, _ = live_api
+    _stored(metadata, hash_index, 'a.jpg', 'a' * 64, 'pa')
+    metadata.rows['u', 'a.jpg']['fileHash'] = 'f' * 64  # replaced since indexing
+    _reserve(store, 's', [('a', 'a.jpg', 'a' * 64)])
+    response = client.post('/upload/waves/live/sessions/s/resolve',
+                           json=dict(itemId='a', outcome='failed'))
+    assert response.status_code == 200 and 'adoptedItems' not in response.json
+    assert store._required(store.item_key('s', 'a'))['outcome'] == 'failed'
+
+
+def test_unreadable_hash_index_fails_the_report_instead_of_stranding_the_photo(live_api, hash_index, monkeypatch):
+    from azure.core.exceptions import AzureError
+    client, store, metadata, _ = live_api
+    _stored(metadata, hash_index, 'a.jpg', 'a' * 64, 'pa')
+    _reserve(store, 's', [('a', 'a.jpg', 'a' * 64)])
+    def unavailable(*_args, **_kwargs): raise AzureError('index unavailable')
+    monkeypatch.setattr(hash_index, 'get_entity', unavailable)
+    response = client.post('/upload/waves/live/sessions/s/resolve-batch',
+                           json=dict(items=[dict(itemId='a', outcome='failed')]))
+    assert response.status_code == 503
+    assert store._required(store.item_key('s', 'a'))['outcome'] == 'reserved'
+
+
+def test_discard_adopts_stored_reservations_and_cancels_only_unfinished_uploads(live_api, hash_index, monkeypatch):
+    client, store, metadata, _ = live_api
+    _stored(metadata, hash_index, 'a.jpg', 'a' * 64, 'pa')
+    _reserve(store, 's', [('a', 'a.jpg', 'a' * 64), ('b', 'b.jpg', 'b' * 64), ('c', 'c.jpg', '')])
+    cleaned = []
+    monkeypatch.setattr(app, '_cleanup_failed_upload', lambda library, name: cleaned.append(name))
+    manifest = store._required('session!s')['manifestRevision']
+    response = client.post('/upload/waves/live/sessions/s/abandon',
+                           json=dict(manifestRevision=manifest, reason='Desktop lost'))
+    assert response.status_code == 200, response.json
+    outcome = lambda item: store._required(store.item_key('s', item))['outcome']
+    assert [outcome(k) for k in 'abc'] == ['accepted', 'cancelled', 'cancelled']
+    assert sorted(cleaned) == ['b.jpg', 'c.jpg']  # never the stored photo's tracking
+    assert store.status(store._required('session!s')['waveId'])['memberCount'] == 1
+
+
+def test_lease_expiry_adopts_stored_reservations_before_cancelling(live_api, hash_index):
+    import time
+    from upload_session_registry import Sessions
+    from upload_session_fakes import RegistryTable
+    from routes.upload_wave_shadow import stored_reservation_adopter
+    _client, live_store, metadata, _ = live_api
+    now = [time.time()]
+    store = ShadowWaves(live_store.table, 'u', clock=lambda: now[0])
+    directory = Sessions(RegistryTable(), store.library, clock=store.clock)
+    _stored(metadata, hash_index, 'a.jpg', 'a' * 64, 'pa')
+    directory.track('s')
+    store.open_session('s', 2, lease_seconds=300)
+    store.register('s', [dict(itemId='a', filename='a.jpg'), dict(itemId='b', filename='b.jpg')])
+    for item, sha in (('a', 'a' * 64), ('b', 'b' * 64)):
+        store.table.rows[store.partition, store.item_key('s', item)]['sourceHash'] = sha
+    now[0] += 3600  # the browser went away; no heartbeat renews the lease
+    directory.reconcile(store, lambda *_: None, adopt=stored_reservation_adopter(store))
+    outcome = lambda item: store._required(store.item_key('s', item))['outcome']
+    assert [outcome(k) for k in 'ab'] == ['accepted', 'cancelled']
+    assert store._required('session!s')['state'] == 'abandoned'
+
+
+def test_resumed_init_for_already_stored_bytes_answers_without_reserving(live_api, hash_index, monkeypatch):
+    client, store, metadata, _ = live_api
+    _stored(metadata, hash_index, 'a-0123abcd.jpg', 'a' * 64, 'pa')
+    _reserve(store, 's', [('a', 'a.jpg', '')])
+    monkeypatch.setattr(app, '_library_cleanup_block_reason', lambda *_: None)
+    monkeypatch.setattr(app, '_mark_upload_activity_heartbeat', lambda *_: None)
+    def forbidden(*_a, **_k): pytest.fail('A stored source must not get a new blob reservation')
+    monkeypatch.setattr(app, 'reset_upload_tracking_and_reserve_blob', forbidden)
+    response = client.post('/upload/init', json=dict(filename='a.jpg', totalSize=10, sha256='a' * 64,
+        directToBlob=True, uploadId='earlier-upload', waveSessionId='s', waveItemId='a'))
+    assert response.status_code == 200, response.json
+    assert response.json['alreadyStored'] and response.json['filename'] == 'a-0123abcd.jpg'
+    assert 'blobUrl' not in response.json
+    assert 'pendingAnonymousBlob' not in metadata.get_entity('u', 'a-0123abcd.jpg')

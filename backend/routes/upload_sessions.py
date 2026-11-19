@@ -48,7 +48,8 @@ def reconcile(library):
             if getattr(error, 'status_code', None) not in (409, 412):
                 raise
         migrating = not marker['complete']
-    pending = sessions.reconcile(store, lambda wave: _drive(store, wave))
+    from routes.upload_wave_shadow import stored_reservation_adopter
+    pending = sessions.reconcile(store, lambda wave: _drive(store, wave), adopt=stored_reservation_adopter(store))
     return dict(notifications=sessions.notices(), pending=pending or migrating)
 
 
