@@ -332,6 +332,11 @@ interface AppServicesContextValue {
     startUpload: (filesToUpload: File[], handlesToUpload?: Map<File, FileSystemFileHandle>) => Promise<void>;
     resumeAllPendingUploads: () => Promise<void>;
     stopActiveUpload: () => void;
+    // Pause: let files already uploading finish and form their wave, start none, keep the rest for Resume.
+    pauseActiveUpload: () => void;
+    pausingUpload: boolean;
+    // Cancel: drop every file that never started; files that failed stay for Try again.
+    cancelRemainingUpload: () => Promise<void>;
     retryPersistedUploadSession: (sessionId?: string) => Promise<void>;
     discardPersistedUploadSession: () => Promise<void>;
     registerUploadCompletionHandler: (handler: () => void | Promise<void>) => () => void;
@@ -1229,6 +1234,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // (cacheUploadFilesForResume persists these handles there too).
     const uploadHandlesRef = useRef<Map<string, FileSystemFileHandle>>(new Map());
     const uploadStopRequestedRef = useRef<boolean>(false);
+    // Pause/Cancel: no new file is started, but files already in flight finish and the wave is formed.
+    const uploadDrainRequestedRef = useRef<boolean>(false);
+    const [pausingUpload, setPausingUpload] = useState(false);
     const uploadDiscardInProgressRef = useRef(false);
     const uploadAbortControllersRef = useRef<Set<AbortController>>(new Set());
     // A hash is claimed until its leader reaches durable server finalization.
@@ -4240,7 +4248,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             let nextFileIndex = 0;
             const worker = async () => {
                 while (true) {
-                    if (uploadStopRequestedRef.current) {
+                    if (uploadStopRequestedRef.current || uploadDrainRequestedRef.current) {
                         return;
                     }
                     const currentIndex = nextFileIndex;
@@ -4528,7 +4536,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // most transient failures (a flaky connection, a brief 503) into a
             // non-event instead of a stuck paused session.
             let autoRetryRound = 0;
-            while (autoRetryRound < AUTO_RETRY_MAX_ROUNDS && !uploadStopRequestedRef.current) {
+            while (autoRetryRound < AUTO_RETRY_MAX_ROUNDS && !uploadStopRequestedRef.current && !uploadDrainRequestedRef.current) {
                 const latestForRetry = uploadSessionRef.current || normalized;
                 const retryCandidates = latestForRetry.files.filter((retryFile) => (
                     retryFile.status === 'failed'
@@ -4758,6 +4766,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 }
                 uploadAbortControllersRef.current.clear();
                 uploadStopRequestedRef.current = false;
+                uploadDrainRequestedRef.current = false;
+                setPausingUpload(false);
                 // Recompute keep-alive state now that the transfer has ended (on
                 // every exit path -- success, stopped, or errored): resumes the
                 // background processing pull, and releases the wake lock if there
@@ -4982,6 +4992,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 return;
             }
             uploadStopRequestedRef.current = false;
+            uploadDrainRequestedRef.current = false;
             const retryableKeys = new Set(retryableFiles.map((file) => file.key));
             session = retryWaveOperation(session);
             persistSession(session);
@@ -5081,6 +5092,35 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 : 'Cancelling active requests and cleaning up unfinished files.',
         );
     }, [addNotification, uploading]);
+
+    const pauseActiveUpload = useCallback(() => {
+        if ((!uploading && !isResumingUploadRef.current && !uploadStartInProgressRef.current) || uploadDrainRequestedRef.current) return;
+        // While files are still being checked nothing is in flight, so a plain stop loses nothing.
+        if (uploadCheckProgress) { stopActiveUpload(); return; }
+        uploadDrainRequestedRef.current = true;
+        setPausingUpload(true);
+        queuedUploadBatchesRef.current.forEach(files => { void cancelQueuedWaveSelection(files).catch(() => undefined); });
+        queuedUploadBatchesRef.current = [];
+        setQueuedUploadFileCount(0);
+        addNotification('Pausing upload', 'Finishing the files already uploading, then pausing.');
+    }, [addNotification, stopActiveUpload, uploading, uploadCheckProgress]);
+
+    const cancelRemainingUpload = useCallback(async () => {
+        const session = pendingUploadSessionRef.current || pendingUploadSession;
+        if (!session) return;
+        const failed = session.files.filter((file) => file.status === 'failed');
+        if (failed.length === 0) {
+            await discardPersistedUploadSession();
+            return;
+        }
+        const dropped = session.files.filter((file) => file.status !== 'done' && file.status !== 'failed');
+        const droppedKeys = new Set(dropped.map((file) => file.key));
+        const kept = { ...session, files: session.files.filter((file) => !droppedKeys.has(file.key)) };
+        persistSession(kept);
+        setPendingUploadSessionLive(kept);
+        dropped.forEach((file) => { uploadHandlesRef.current.delete(file.key); void releaseCachedUploadFile(file.key); });
+        addNotification('Upload cancelled', `${plural(dropped.length, 'file')} won't be uploaded. ${plural(failed.length, 'file')} failed and can be retried.`);
+    }, [addNotification, discardPersistedUploadSession, pendingUploadSession, persistSession, releaseCachedUploadFile, setPendingUploadSessionLive]);
 
     // Best-effort resume cache: writes each file's bytes into IndexedDB so an
     // interrupted upload can resume after a page reload (uploadSourceFilesRef
@@ -5207,6 +5247,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
         uploadStartInProgressRef.current = true;
         uploadStopRequestedRef.current = false;
+        uploadDrainRequestedRef.current = false;
+        setPausingUpload(false);
         setUploading(true);
         setUploadProgress({
             uploadedCount: 0,
@@ -6057,6 +6099,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         startUpload,
         resumeAllPendingUploads,
         stopActiveUpload,
+        pauseActiveUpload,
+        pausingUpload,
+        cancelRemainingUpload,
         retryPersistedUploadSession,
         discardPersistedUploadSession,
         registerUploadCompletionHandler,
@@ -6098,6 +6143,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         startUpload,
         resumeAllPendingUploads,
         stopActiveUpload,
+        pauseActiveUpload,
+        pausingUpload,
+        cancelRemainingUpload,
         retryPersistedUploadSession,
         discardPersistedUploadSession,
         registerUploadCompletionHandler,
