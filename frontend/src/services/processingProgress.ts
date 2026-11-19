@@ -18,6 +18,11 @@ export interface ProcessingWave {
     etaSeconds?: number | null;
     processedSeconds?: number;
     failed?: number;
+    // Running waves: photos already given up on, and what is wrong with the wave itself.
+    failedMembers?: number;
+    problem?: 'failed' | 'blocked' | 'stalled';
+    noProgressSeconds?: number;
+    blockedBy?: string;
 }
 
 export interface ProcessingPush {
@@ -85,6 +90,20 @@ export const takingLonger = (wave: ProcessingWave, now: number): boolean => {
     if (wave.stage === 'done' || wave.etaSeconds === null || wave.etaSeconds === undefined || wave.etaSeconds < 0) return false;
     return now / 1000 - wave.stageEnteredAt > Math.max(wave.etaSeconds, 60) * TAKING_LONGER_FACTOR;
 };
+
+// What the person is told when the wave is not simply moving. `failed` is the server giving up
+// after its retries; `stalled` is no movement for a long while; `blocked` waits on an earlier upload.
+export const problemText = (wave: ProcessingWave): string | null => {
+    if (wave.stage === 'done') {
+        return wave.failed ? `${wave.failed} ${wave.failed === 1 ? 'photo' : 'photos'} couldn’t be processed` : null;
+    }
+    if (wave.problem === 'failed') return `${STAGE_TITLES[wave.stage]} stopped after several tries`;
+    if (wave.problem === 'blocked') return 'Waiting for an earlier upload to finish processing';
+    if (wave.problem === 'stalled') return `Nothing has moved for ${Math.max(1, Math.round((wave.noProgressSeconds ?? 0) / 60))} min`;
+    return null;
+};
+export const isTrouble = (wave: ProcessingWave): boolean => wave.problem === 'failed' || wave.problem === 'stalled'
+    || (wave.stage === 'done' && Boolean(wave.failed));
 
 // Tiny channel so the push socket owned by AppServicesProvider can reach the dock.
 type Listener = () => void;
