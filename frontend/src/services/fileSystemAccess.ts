@@ -1,3 +1,4 @@
+import { UPLOAD_PICKER_TYPES } from '../utils/photoDisplay';
 // File System Access API support (Chrome/Edge desktop only -- unsupported in
 // Safari and Firefox, and not exposed on any mobile browser). Where available,
 // it replaces the plain <input type="file"> picker for the initial upload
@@ -25,6 +26,7 @@ interface FileSystemFileHandle {
 type OpenFilePickerOptions = {
     multiple?: boolean;
     excludeAcceptAllOption?: boolean;
+    types?: Array<{ description?: string; accept: Record<string, string[]> }>;
 };
 
 declare global {
@@ -57,10 +59,9 @@ export interface PickedUploadFile {
 // Returns [] both when the user cancels (AbortError) and when the picker
 // throws for any other reason -- callers already have the classic
 // <input type="file"> as a fallback UI, so there's no separate error state to
-// surface here. No `types` filter is passed: many RAW extensions (.cr3, .nef,
-// ...) have no well-known MIME type to key an extension filter off of, and
-// duplicating photoDisplay.ts's extension lists here isn't worth it just to
-// pre-select a dropdown filter that defaults to "All Files" either way.
+// surface here. The `types` filter lists every uploadable extension so files
+// such as .aae sidecars are not selectable by default; startUpload still drops
+// anything unsupported picked through "All files".
 export const pickUploadFilesViaFileSystemAccess = async (): Promise<PickedUploadFile[]> => {
     if (!isFileSystemAccessSupported()) {
         return [];
@@ -69,6 +70,7 @@ export const pickUploadFilesViaFileSystemAccess = async (): Promise<PickedUpload
         const handles = await window.showOpenFilePicker!({
             multiple: true,
             excludeAcceptAllOption: false,
+            types: UPLOAD_PICKER_TYPES,
         });
         return await Promise.all(handles.map(async (handle) => ({
             file: await handle.getFile(),
