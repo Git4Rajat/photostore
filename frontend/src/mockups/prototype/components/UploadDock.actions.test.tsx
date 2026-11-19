@@ -90,4 +90,16 @@ describe('UploadDock actions', () => {
         await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Cancel' })); });
         expect((screen.getByRole('button', { name: 'Pause' }) as HTMLButtonElement).disabled).toBe(false);
     });
+
+    it('Pause and Cancel work again once a resumed upload is running', () => {
+        const { rerender } = render(<UploadDock />);
+        fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+        // The retry call lasts the whole upload, so it has not returned here.
+        setServices({ uploadActive: true, uploading: true, uploadProgress: { uploadedCount: 1, totalCount: 5, failedCount: 0 }, pendingUploadFailedFiles: [] });
+        rerender(<UploadDock />);
+        expect((screen.getByRole('button', { name: 'Pause' }) as HTMLButtonElement).disabled).toBe(false);
+        expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(false);
+        fireEvent.click(screen.getByRole('button', { name: 'Pause' }));
+        expect(services.pauseActiveUpload).toHaveBeenCalledTimes(1);
+    });
 });
