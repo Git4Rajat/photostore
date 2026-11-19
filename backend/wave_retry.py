@@ -4,6 +4,8 @@ Waves run in order: a later wave waits for the earlier one, so a blocked wave ca
 helped by a retry and only a wave that is itself failed or idle can unblock the others.
 `retry_stuck` re-queues every such wave, oldest first. The Tools repair action and the
 processing bar share `retry_stage`, so both do exactly the same thing."""
+import logging
+
 from upload_waves import Conflict, digest
 
 IDLE_RETRY_SECONDS = 600  # frontend StuckWavesCard.IDLE_RETRY_SECONDS
@@ -73,6 +75,13 @@ def retry_stuck(store, drive):
         except Conflict as error:  # a worker took it between the list and the click
             skipped.append(dict(waveId=wave_id, reason='working', detail=str(error)))
             continue
-        drive(wave_id)
-        retried.append(dict(waveId=wave_id, stage=stage))
+        # The stage is queued durably by now. If relaying it fails, the recovery sweep relays it
+        # later; that must not stop the other waves from being retried or hide that this one was.
+        item = dict(waveId=wave_id, stage=stage)
+        try:
+            drive(wave_id)
+        except Exception:
+            logging.getLogger(__name__).warning('Relay after retry failed for wave %s', wave_id, exc_info=True)
+            item['relayPending'] = True
+        retried.append(item)
     return dict(retried=retried, skipped=skipped)

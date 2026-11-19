@@ -85,3 +85,17 @@ def test_the_bar_offers_retry_to_the_owner_and_tells_members_to_ask(live_api, mo
     assert wave['retryable'] is False and wave['askOwner'] is True
     monkeypatch.setattr(wave_health, 'status', lambda s, w: dict(health=health(state='blocked')))
     assert 'retryable' not in client.get('/api/processing').json['waves'][0]
+
+
+def test_a_failing_relay_does_not_stop_the_other_waves_or_hide_the_retry(monkeypatch):
+    waves = [dict(waveId=name, createdAt=order, health=health(state='failed', reason='dispatch_exhausted'))
+             for order, name in enumerate('ab')]
+    monkeypatch.setattr(wave_retry, 'unfinished', lambda store: waves)
+    monkeypatch.setattr(wave_retry, 'retry_stage', lambda store, wave_id, current: 'vision')
+
+    def drive(wave_id):
+        if wave_id == 'a':
+            raise RuntimeError('No-work proof does not cover sealed intake')
+    result = wave_retry.retry_stuck(None, drive)
+    assert [item['waveId'] for item in result['retried']] == ['a', 'b']
+    assert result['retried'][0]['relayPending'] is True and 'relayPending' not in result['retried'][1]
