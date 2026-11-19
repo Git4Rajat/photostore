@@ -38,6 +38,7 @@ import {
     discardWaveShadowSession,
     stopWaveShadowSession,
     resolveWaveShadowFile,
+    reportFailedWaveFile,
 } from './uploadWaveSync';
 
 function session(count: number, id: string): PersistedUploadSession {
@@ -204,6 +205,39 @@ describe('resolveWaveShadowFile', () => {
         const s = session(1, 'sess-unregistered');
         await resolveWaveShadowFile(s, { ...s.files[0], status: 'done' });
         expect(mocks.resolve).not.toHaveBeenCalled();
+    });
+});
+
+describe('reportFailedWaveFile', () => {
+    it('returns the stored photo when the server adopts the failure report', async () => {
+        const s = session(2, 'sess-adopt');
+        await registerWaveItemsBatch(s, s.files);
+        mocks.resolve.mockResolvedValueOnce({ manifestRevision: 'rev-adopt',
+            adoptedItems: [{ itemId: 'wire:sess-adopt:0', outcome: 'accepted', filename: 'original-0-0123abcd.heic' }] });
+        await expect(reportFailedWaveFile(s, s.files[0]))
+            .resolves.toEqual({ filename: 'original-0-0123abcd.heic', outcome: 'accepted' });
+        expect(mocks.resolve).toHaveBeenCalledWith('sess-adopt', s.files[0].key, 'failed', undefined);
+        // The report resolved the item; the later failed-file path must not resolve it again.
+        await resolveWaveShadowFile(s, { ...s.files[0], status: 'failed' });
+        expect(mocks.resolve).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns null when the server confirms the file is not stored', async () => {
+        const s = session(1, 'sess-really-failed');
+        await registerWaveItemsBatch(s, s.files);
+        await expect(reportFailedWaveFile(s, s.files[0])).resolves.toBeNull();
+        expect(mocks.resolve).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns null without poisoning admission when the report itself fails', async () => {
+        const s = session(2, 'sess-report-error');
+        await registerWaveItemsBatch(s, s.files);
+        mocks.resolve.mockRejectedValueOnce(new Error('offline'));
+        await expect(reportFailedWaveFile(s, s.files[0])).resolves.toBeNull();
+        await expect(registerWaveItemsBatch(s, s.files)).resolves.toBeInstanceOf(Map);
+        // Still unresolved, so the cleanup pass reports it.
+        await resolveWaveShadowFile(s, { ...s.files[0], status: 'failed' });
+        expect(mocks.resolve).toHaveBeenCalledTimes(2);
     });
 });
 

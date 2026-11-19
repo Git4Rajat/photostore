@@ -260,6 +260,24 @@ def init_upload():
             timed_call('cleanup', app._cleanup_failed_upload, user_id, filename)
         except Exception:
             pass
+    if (not is_fresh_upload and expected_hash and app.hash_index_table_client is not None
+            and app.metadata_table_client is not None):
+        # A resume after a finalize that stored the photo but never reached the
+        # browser (503, lost reply). Reserving again would put a fresh pending
+        # blob on the finished photo's row and send the browser to stage into
+        # it; answer with the stored photo so the browser settles it as done.
+        from upload_wave_shadow import stored_filename_lookup
+        stored = timed_call('dedup', lambda: stored_filename_lookup(
+            app.hash_index_table_client, app.metadata_table_client, user_id)(expected_hash))
+        if stored:
+            return app.jsonify({
+                'alreadyStored': True,
+                'uploadId': upload_id,
+                'filename': stored,
+                'originalFilename': filename,
+                'duplicates': [{'filename': stored, 'type': 'exact', 'hash': expected_hash}],
+                'totalSize': total_size,
+            })
 
     # Reserve the anonymous blob name the browser will upload to. Persisted on the
     # metadata row (durable + replica-safe) and REUSED on a resumed /upload/init so

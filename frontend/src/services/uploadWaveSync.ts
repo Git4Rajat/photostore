@@ -267,6 +267,41 @@ export const resolveWaveShadowFile = (session: PersistedUploadSession, file: Per
     });
 };
 
+// A finalize that ran out of retries may still have stored the photo: the
+// server commits the photo before binding it to the wave, and only the binding
+// failed. Report the failure now, in order, and let the server -- which can
+// prove whether it holds these bytes -- answer. Resolves to the stored filename
+// when it adopted the photo, or null when the file really failed (or the
+// report could not be made; the cleanup pass resolves it later either way).
+export const reportFailedWaveFile = async (session: PersistedUploadSession, file: PersistedUploadFile)
+    : Promise<{ filename: string; outcome: 'accepted' | 'duplicate' } | null> => {
+    let stored: { filename: string; outcome: 'accepted' | 'duplicate' } | null = null;
+    await serialized(session, async () => {
+        const parent = waveParentFor(session);
+        if (!parent || !waveFileBelongs(session, file)) return;
+        const state = stateFor(parent.id);
+        const itemKey = file.waveItemKey || file.key;
+        if (state.closed || state.expired || state.discarding || state.resolved.has(itemKey)
+            || !state.registeredItems.has(itemKey)) return;
+        try {
+            const result = await resolveWaveShadowItems(parent.id, [{ itemId: itemKey, outcome: 'failed' }]);
+            if (!result) return;
+            state.manifestRevision = result.manifestRevision;
+            state.resolved.add(itemKey);
+            recordWaveItemResolved(session, file);
+            const adopted = result.adoptedItems?.[0];
+            if (adopted?.filename) stored = { filename: adopted.filename, outcome: adopted.outcome };
+            if (result.state === 'closed') {
+                state.closed = true;
+                retireWaveOperation(session);
+            }
+        } catch {
+            // Not an admission failure: leave the item for the cleanup pass.
+        }
+    });
+    return stored;
+};
+
 // The live finalize response proves that the backend already resolved this item.
 // Verify its binding before using it; old servers fall back to explicit resolve.
 export const acknowledgeWaveFinalizedFile = (session: PersistedUploadSession, file: PersistedUploadFile,

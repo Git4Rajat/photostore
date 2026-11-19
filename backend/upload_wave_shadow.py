@@ -5,6 +5,7 @@ current persisted data, never qualified production completion receipts.
 """
 import json
 import math
+import re
 
 from azure.core.exceptions import ResourceNotFoundError
 
@@ -38,16 +39,96 @@ def resolve_source(store, metadata_table, session, item, outcome, filename):
     return resolve_sources(store, metadata_table, session, [(item, outcome, filename)])
 
 
-def resolve_sources(store, metadata_table, session, sources):
-    """Resolve a bounded set of finalized sources with one wave mutation."""
+def _stored_outcome(item_filename, stored_filename):
+    """accepted when this item's own upload created the stored photo -- under
+    its filename, or the NAME-xxxxxxxx.ext rename a filename clash gives it --
+    otherwise duplicate of a photo some other upload created."""
+    if stored_filename == item_filename:
+        return 'accepted'
+    stem, dot, ext = item_filename.rpartition('.')
+    if not dot:
+        stem, ext = item_filename, ''
+    renamed = re.fullmatch(re.escape(stem) + r'-[0-9a-f]{8}' + (re.escape('.' + ext) if dot else ''),
+                           stored_filename)
+    return 'accepted' if renamed else 'duplicate'
+
+
+def stored_source(item, find_stored):
+    """(outcome, filename) when the library already holds this reservation's
+    exact bytes, else None.
+
+    A reservation binds the source SHA-256 at admission. Finalize stores the
+    photo and its hash-index entry before the wave binding is written, so a
+    finalize whose binding lost (503, lost reply, browser gave up) leaves the
+    photo stored with its item still reserved. The browser can then report it
+    failed or the session be discarded; neither may leave that stored photo
+    outside every wave. find_stored(sha) returns the finalized filename
+    holding those bytes (see storage_utils.detect_duplicates), or ''.
+    """
+    sha = item.get('sourceHash') or ''
+    if not sha or find_stored is None:
+        return None
+    filename = find_stored(sha)
+    if not filename:
+        return None
+    return _stored_outcome(item.get('filename') or '', filename), filename
+
+
+def stored_filename_lookup(hash_index_table, metadata_table, library):
+    """find_stored for stored_source: the finalized filename holding these
+    exact bytes, or '' when the library proves it holds none.
+
+    Unlike storage_utils.detect_duplicates (a best-effort dedup hint), storage
+    errors propagate. Treating an unreadable index as "not stored" would let a
+    discard cancel a photo that is stored.
+    """
+    def find(sha):
+        if hash_index_table is None:
+            raise Conflict('Stored-source lookup is unavailable')
+        try:
+            filename = str(hash_index_table.get_entity(library, sha).get('filename') or '')
+        except ResourceNotFoundError:
+            return ''
+        if not filename:
+            return ''
+        try:
+            row = metadata_table.get_entity(library, filename)
+        except ResourceNotFoundError:
+            return ''
+        # The index row is written by finalize after the metadata row, and a
+        # stale index entry (deleted or replaced photo) must not count.
+        if (row.get('fileHash') != sha or row.get('processing_state') == 'deleted'
+                or not row.get('anonymousImageId')):
+            return ''
+        return filename
+    return find
+
+
+def resolve_sources(store, metadata_table, session, sources, *, find_stored=None):
+    """Resolve a bounded set of finalized sources with one wave mutation.
+
+    With find_stored, a failed/cancelled report for a reservation whose bytes
+    the library already stores resolves that source as a member instead (see
+    stored_source). The result lists those items under adoptedItems.
+    """
     if not isinstance(sources, list) or not 0 < len(sources) <= MAX_PAGE:
         raise ValueError('Expected 1-20 finalized sources')
     from table_reads import read_entities
+    items = read_entities(store.table, store.partition,
+        [store.item_key(session, item) for item, _outcome, _filename in sources], workers=2)
+    adopted = {}
+    if find_stored is not None:
+        for item, outcome, _filename in sources:
+            previous = items.get(store.item_key(session, item))
+            if outcome in ('failed', 'cancelled') and previous is not None and previous['outcome'] == 'reserved':
+                found = stored_source(previous, find_stored)
+                if found:
+                    adopted[item] = found
+    sources = [(item, *adopted[item]) if item in adopted else (item, outcome, filename)
+               for item, outcome, filename in sources]
     filenames = [filename for _item, outcome, filename in sources
                  if outcome in ('accepted', 'duplicate')]
     rows = read_entities(metadata_table, store.library, filenames, workers=4)
-    items = read_entities(store.table, store.partition,
-        [store.item_key(session, item) for item, _outcome, _filename in sources], workers=2)
     resolutions = []
     for item, outcome, filename in sources:
         if outcome not in ('accepted', 'duplicate'):
@@ -56,10 +137,13 @@ def resolve_sources(store, metadata_table, session, sources):
         row = rows.get(filename)
         if row is None:
             raise Conflict('Finalized photo not found')
+        if item in adopted and row.get('fileHash') != items[store.item_key(session, item)].get('sourceHash'):
+            raise Conflict('Stored source changed while it was being adopted')
         # A duplicate resolves to an already-finalized canonical row; a pending
         # reservation left on it by a concurrent upload of the same filename is
         # irrelevant to that finalized source and must not block admission.
-        photo, revision, _qualified = source_identity(row, allow_pending=outcome == 'duplicate')
+        # The same holds for an adopted source: its bytes are proven stored.
+        photo, revision, _qualified = source_identity(row, allow_pending=outcome == 'duplicate' or item in adopted)
         previous = items.get(store.item_key(session, item))
         if previous is None:
             raise Conflict('Unknown session, member or wave')
@@ -71,7 +155,24 @@ def resolve_sources(store, metadata_table, session, sources):
         resolutions.append(dict(item=item, outcome=outcome, filename=filename,
             photo_id=photo, processing_revision=revision,
             required_steps=required_steps_for_media(is_video_file(filename))))
-    return store.resolve_many(session, resolutions)
+    result = store.resolve_many(session, resolutions)
+    if adopted:
+        result = dict(result, adoptedItems=[dict(itemId=item, outcome=outcome, filename=filename)
+                                            for item, (outcome, filename) in adopted.items()])
+    return result
+
+
+def adopt_stored_reservations(store, metadata_table, session, reservations, find_stored):
+    """Resolve still-reserved items whose bytes are already stored as members,
+    so a discard or lease expiry that follows cancels only true unfinished
+    uploads. Returns the adopted item ids."""
+    found = [(item['itemId'], stored) for item in reservations
+             if item['outcome'] == 'reserved' and (stored := stored_source(item, find_stored))]
+    for offset in range(0, len(found), MAX_PAGE):
+        page = found[offset:offset + MAX_PAGE]
+        resolve_sources(store, metadata_table, session,
+                        [(item, outcome, filename) for item, (outcome, filename) in page])
+    return [item for item, _stored in found]
 
 
 def observe_source(store, member, metadata_table, face_table, face_ids):

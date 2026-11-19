@@ -13,7 +13,7 @@ import { startMediaTokenAutoRefresh } from '../services/mediaToken';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { get, getUpload, postTools, postUpload, resolveApiUrl } from '../services/apiClient';
 import { addJustUploaded, drawLocalThumbnail, setJustUploadedThumbnail } from '../services/justUploaded';
-import { heartbeatWaveSession, quiesceWaveShadowSession, discardWaveShadowSession, stopWaveShadowSession, registerWaveItemsBatch, waveIdentityFor, ensureOpened as ensureWaveShadowSessionAdmitted, finalizeWaveShadowSession, resolveWaveShadowFile, acknowledgeWaveFinalizedFile, cancelQueuedWaveSelection } from '../services/uploadWaveSync';
+import { heartbeatWaveSession, quiesceWaveShadowSession, discardWaveShadowSession, stopWaveShadowSession, registerWaveItemsBatch, waveIdentityFor, ensureOpened as ensureWaveShadowSessionAdmitted, finalizeWaveShadowSession, resolveWaveShadowFile, reportFailedWaveFile, acknowledgeWaveFinalizedFile, cancelQueuedWaveSelection } from '../services/uploadWaveSync';
 import { hashLargeFile, LARGE_FILE_HASH_THRESHOLD } from '../utils/largeFileHash';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
 import { getRuntimeConfig } from '../config/appConfig';
@@ -2413,6 +2413,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     return;
                 }
                 inFlight=true;
+                const startedAt=Date.now();
                 try {
                     finish(null,await postUpload(url, payload));
                 } catch (err) {
@@ -2421,6 +2422,15 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         finish(new Error(UPLOAD_STOPPED_ERROR));
                         return;
                     }
+                    // The transport logs every request as attempt 0; this is
+                    // the retry history of one batch, so a file's path to
+                    // "failed" can be reconstructed from the logs.
+                    const status=(err as {status?: number; response?: {status?: number}})?.status
+                        ?? (err as {response?: {status?: number}})?.response?.status;
+                    perf.recordSpan('upload.gated_request.failed', Date.now()-startedAt, {
+                        path: url, attempt, status: status ?? 0, files: Array.isArray(payload?.files) ? payload.files.length : 1,
+                        final: attempt >= MAX_FINALIZE_RETRIES - 1 || !isRetriableUploadError(err),
+                    });
                     if (attempt >= MAX_FINALIZE_RETRIES - 1 || !isRetriableUploadError(err)) {
                         finish(err);
                         return;
@@ -3459,6 +3469,18 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 }, options?.signal)
                 : await requestBatchedInit(options!.fileMeta!, options!.session!, file.size, sha256);
             options?.onInitLatencyMs?.(performance.now() - initStartedAt);
+            if (initResponse?.alreadyStored === true && typeof initResponse.filename === 'string' && initResponse.filename) {
+                // A resume whose earlier finalize stored the photo but never
+                // got its reply back (a 503 or a lost response). The server
+                // holds these exact bytes, so there is nothing to stage:
+                // settle the file as done instead of re-uploading or failing.
+                knownHashesRef.current.set(sha256, initResponse.filename);
+                if (hashClaim && activeUploadHashClaimsRef.current.get(sha256) === hashClaim) {
+                    activeUploadHashClaimsRef.current.delete(sha256);
+                    hashClaim.settle({ finalized: true, filename: initResponse.filename });
+                }
+                return { skippedDuplicate: true, filename: initResponse.filename };
+            }
             const blobName = typeof initResponse?.blobName === 'string' ? initResponse.blobName : '';
             if (typeof initResponse?.uploadId === 'string' && initResponse.uploadId) {
                 options?.onUploadInitialized?.(initResponse.uploadId, blobName, sha256, initResponse);
@@ -4181,53 +4203,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         ...prepared,
                     });
                     const skippedDuplicate = Array.isArray(completeResponse?.duplicates) && completeResponse.duplicates.length > 0;
-
-                    totalUploaded += 1;
-                    if (skippedDuplicate) {
-                        totalSkippedDuplicates += 1;
-                    }
-                    updatePersistedFile(fileMeta.key, {
-                        status: 'done',
-                        uploadedBytes: fileMeta.size,
-                        skippedDuplicate,
-                        error: undefined,
-                    });
-                    const waveAcceptedFilename = completeResponse?.filename || fileMeta.name;
-                    knownHashesRef.current.set(staged.sha256, waveAcceptedFilename);
-                    if (activeUploadHashClaimsRef.current.get(staged.sha256) === staged.hashClaim) {
-                        activeUploadHashClaimsRef.current.delete(staged.sha256);
-                        staged.hashClaim.settle({ finalized: true, filename: waveAcceptedFilename });
-                    }
-                    waveShadowFileOutcomes.set(fileMeta.key, { status: 'done', skippedDuplicate, waveAcceptedFilename });
-                    updatePersistedFile(fileMeta.key, { waveAcceptedFilename });
-                    const settledFile = { ...fileMeta, status: 'done' as const, skippedDuplicate, waveAcceptedFilename };
-                    if (completeResponse?.waveResolution) {
-                        void acknowledgeWaveFinalizedFile(session, settledFile, completeResponse.waveResolution);
-                    } else {
-                        void resolveWaveShadowFile(session, settledFile);
-                    }
-                    if (!skippedDuplicate) {
-                        if (stripPhotos.length < 6) stripPhotos.push(waveAcceptedFilename);
-                        freshlyUploadedFilenamesRef.current.add(fileMeta.name);
-                        showJustUploaded(waveAcceptedFilename, file);
-                        if (!prepared.clientProcessing?.thumbnail) kickOffThumbnailForFile(file, fileMeta.name, fileMeta.blobName);
-                    }
-                    // Source bytes must outlive the checkpoint that marks them
-                    // done (see releaseCachedUploadFile), so this checkpoint
-                    // entry is only dropped AFTER that checkpoint+IDB cleanup
-                    // has happened, not before.
-                    await releaseCachedUploadFile(fileMeta.key);
-                    removePersistedFile(fileMeta.key);
-                    updateUploadNotification({
-                        title: 'Upload in progress',
-                        details: `Uploaded ${totalUploaded}/${plural(totalCount, 'file')}. Skipped duplicates: ${totalSkippedDuplicates}.`,
-                        progress: {
-                            uploadedCount: totalUploaded,
-                            totalCount,
-                            failedCount: totalFailed,
-                            skippedDuplicateCount: totalSkippedDuplicates,
-                            mbPerSecond: currentUploadRate(),
-                        },
+                    await settleStoredFile(skippedDuplicate, completeResponse?.filename || fileMeta.name, {
+                        waveResolution: completeResponse?.waveResolution,
+                        kickThumbnail: !prepared.clientProcessing?.thumbnail,
                     });
                 } catch (err) {
                     if (activeUploadHashClaimsRef.current.get(staged.sha256) === staged.hashClaim) {
@@ -4248,9 +4226,75 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         // re-stage them, just re-attempt finalize).
                         return;
                     }
+                    // Out of retries without a definitive "no" (503s, lost
+                    // replies): the server may have stored the photo and only
+                    // failed to bind it to the wave. Ask before calling it failed.
+                    const stored = waveLiveEnabled() && isRetriableUploadError(err)
+                        ? await reportFailedWaveFile(session, fileMeta) : null;
+                    if (stored) {
+                        await settleStoredFile(stored.outcome === 'duplicate', stored.filename, { alreadyResolved: true });
+                        return;
+                    }
                     await markFileFailed(fileMeta, file, err);
                 } finally {
                     uploadAbortControllersRef.current.delete(controller);
+                }
+
+                // Everything a stored file needs once the server holds it: from a
+                // finalize reply, or from the server adopting it after the
+                // finalize reply was lost (alreadyResolved: the report itself
+                // resolved the wave item).
+                async function settleStoredFile(skippedDuplicate: boolean, waveAcceptedFilename: string,
+                    { waveResolution, alreadyResolved = false, kickThumbnail = false }: {
+                        waveResolution?: { sessionId: string; itemId: string; manifestRevision: string; state: string };
+                        alreadyResolved?: boolean; kickThumbnail?: boolean;
+                    } = {}): Promise<void> {
+                    totalUploaded += 1;
+                    if (skippedDuplicate) {
+                        totalSkippedDuplicates += 1;
+                    }
+                    updatePersistedFile(fileMeta.key, {
+                        status: 'done',
+                        uploadedBytes: fileMeta.size,
+                        skippedDuplicate,
+                        error: undefined,
+                    });
+                    knownHashesRef.current.set(staged.sha256, waveAcceptedFilename);
+                    if (activeUploadHashClaimsRef.current.get(staged.sha256) === staged.hashClaim) {
+                        activeUploadHashClaimsRef.current.delete(staged.sha256);
+                        staged.hashClaim.settle({ finalized: true, filename: waveAcceptedFilename });
+                    }
+                    waveShadowFileOutcomes.set(fileMeta.key, { status: 'done', skippedDuplicate, waveAcceptedFilename });
+                    updatePersistedFile(fileMeta.key, { waveAcceptedFilename });
+                    const settledFile = { ...fileMeta, status: 'done' as const, skippedDuplicate, waveAcceptedFilename };
+                    if (waveResolution) {
+                        void acknowledgeWaveFinalizedFile(session, settledFile, waveResolution);
+                    } else if (!alreadyResolved) {
+                        void resolveWaveShadowFile(session, settledFile);
+                    }
+                    if (!skippedDuplicate) {
+                        if (stripPhotos.length < 6) stripPhotos.push(waveAcceptedFilename);
+                        freshlyUploadedFilenamesRef.current.add(fileMeta.name);
+                        showJustUploaded(waveAcceptedFilename, file);
+                        if (kickThumbnail) kickOffThumbnailForFile(file, fileMeta.name, fileMeta.blobName);
+                    }
+                    // Source bytes must outlive the checkpoint that marks them
+                    // done (see releaseCachedUploadFile), so this checkpoint
+                    // entry is only dropped AFTER that checkpoint+IDB cleanup
+                    // has happened, not before.
+                    await releaseCachedUploadFile(fileMeta.key);
+                    removePersistedFile(fileMeta.key);
+                    updateUploadNotification({
+                        title: 'Upload in progress',
+                        details: `Uploaded ${totalUploaded}/${plural(totalCount, 'file')}. Skipped duplicates: ${totalSkippedDuplicates}.`,
+                        progress: {
+                            uploadedCount: totalUploaded,
+                            totalCount,
+                            failedCount: totalFailed,
+                            skippedDuplicateCount: totalSkippedDuplicates,
+                            mbPerSecond: currentUploadRate(),
+                        },
+                    });
                 }
             };
 

@@ -24,6 +24,22 @@ def _public(row):
     return result
 
 
+def _find_stored(store):
+    # Older deployments without the hash index keep the previous behavior.
+    if app.metadata_table_client is None or app.hash_index_table_client is None:
+        return None
+    return source.stored_filename_lookup(app.hash_index_table_client, app.metadata_table_client, store.library)
+
+
+def stored_reservation_adopter(store):
+    """abandon(adopt=...) for this library: adopt reservations already stored."""
+    find_stored = _find_stored(store)
+    if find_stored is None:
+        return None
+    return lambda session, reservations: source.adopt_stored_reservations(
+        store, app.metadata_table_client, session, reservations, find_stored)
+
+
 def endpoint(function):
     @wraps(function)
     def wrapped(*args, **kwargs):
@@ -194,10 +210,14 @@ def register_routes(blueprint):
             raise ValueError('Duplicate itemId')
         # Partial commits are safe to replay after a lost response or failure.
         # Acknowledge only when every item has been durably resolved.
+        find_stored = _find_stored(store)
+        adopted = []
         for item in items:
-            result = source.resolve_source(store, app.metadata_table_client, session,
-                item['itemId'], item['outcome'], item.get('filename', ''))
-        return close_resolved_intake(store, result) if '/waves/live/' in app.request.path else result
+            result = source.resolve_sources(store, app.metadata_table_client, session,
+                [(item['itemId'], item['outcome'], item.get('filename', ''))], find_stored=find_stored)
+            adopted.extend(result.get('adoptedItems', ()))
+        result = close_resolved_intake(store, result) if '/waves/live/' in app.request.path else result
+        return dict(result, adoptedItems=adopted) if adopted else result
 
     @blueprint.route('/upload/waves/live/sessions/<session>/resolve', methods=['POST'])
     @blueprint.route('/upload/waves/shadow/sessions/<session>/resolve', methods=['POST'])
@@ -208,9 +228,11 @@ def register_routes(blueprint):
         filename = app._validate_media_filename(data.get('filename', ''))
         if data['outcome'] in ('accepted', 'duplicate') and not filename:
             raise ValueError('Finalized filename required')
-        result=source.resolve_source(store, app.metadata_table_client, session,
-                                     data['itemId'], data['outcome'], filename)
-        return close_resolved_intake(store,result) if '/waves/live/' in app.request.path else result
+        result=source.resolve_sources(store, app.metadata_table_client, session,
+                                      [(data['itemId'], data['outcome'], filename)], find_stored=_find_stored(store))
+        adopted=result.get('adoptedItems')
+        result=close_resolved_intake(store,result) if '/waves/live/' in app.request.path else result
+        return dict(result,adoptedItems=adopted) if adopted else result
 
     @blueprint.route('/upload/waves/live/sessions/<session>/close', methods=['POST'])
     @blueprint.route('/upload/waves/shadow/sessions/<session>/close', methods=['POST'])
@@ -248,7 +270,7 @@ def register_routes(blueprint):
             for name in filenames:
                 app._cleanup_failed_upload(store.library,name)
         result=abandon(store,session,data.get('manifestRevision',parent['manifestRevision']),reason=reason,
-                       on_cancelled=release_tracking)
+                       on_cancelled=release_tracking,adopt=stored_reservation_adopter(store))
         _drive(store,result['waveId'])
         from upload_session_registry import finish
         finish(store, result)

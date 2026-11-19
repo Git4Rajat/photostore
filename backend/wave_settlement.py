@@ -292,17 +292,28 @@ def fence_discard(store,session,*,reason,resumed_from='',absent_only=False):
 FINALIZE_DISCARD_GRACE_SECONDS = 30
 
 
-def abandon(store,session,manifest_revision,*,reason,on_cancelled=None):
+def abandon(store,session,manifest_revision,*,reason,on_cancelled=None,adopt=None):
     """Operator-confirmed stop, one bounded reservation page per call.
     on_cancelled(filenames) runs after a page commits, to release the
     per-file upload tracking (pending blob reservations) of cancelled items.
     Resolved sources remain members; unknown/missing reservations are cancelled,
     not counted as successfully processed. A stale revision fails before changes.
+    adopt(session,reservations) first resolves reservations whose bytes are
+    already stored (see upload_wave_shadow.adopt_stored_reservations): a
+    finalize can store the photo and then lose its wave binding, and cancelling
+    that reservation would strand a stored photo outside every wave.
     """
     if not isinstance(reason,str) or not reason.strip() or len(reason)>256:raise ValueError('Abandonment reason required')
     parent=store._required(store.session_key(session))
     if parent['manifestRevision']!=manifest_revision:raise Conflict('Abandonment revision is stale')
     if parent['state']!='open':return dict(parent)
+    if adopt is not None:
+        page=store._page('item!'+session+'!',parent.get('abandonCursor',''))
+        if adopt(session,[item for item in page if item['outcome']=='reserved' and item.get('sourceHash')]):
+            # Adoption advanced the manifest; this page's cancellation must
+            # fence against the session as it now stands.
+            parent=store._required(store.session_key(session))
+            manifest_revision=parent['manifestRevision']
     def advance():
         old=store._required(store.session_key(session))
         cancelled[:]=[]
