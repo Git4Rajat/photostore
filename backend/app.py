@@ -11142,12 +11142,15 @@ def _library_clean_failure_reason(error: BaseException) -> str:
 
     The two refusals that come before anything is deleted get a reason a user
     can act on; anything else keeps the generic text."""
-    from automatic_index_updates import OperatorFenced, QuiescenceTimeout
+    from automatic_index_updates import OperatorFenced, QuiescenceTimeout, SourceBusy
     if isinstance(error, QuiescenceTimeout):
         return ('This library was still updating its indexes. Nothing was deleted; '
                 'try again in a few minutes.')
     if isinstance(error, OperatorFenced):
         return 'An administrator has paused index updates for this library. Nothing was deleted.'
+    if isinstance(error, SourceBusy):
+        return ('An index update started while the clean was running, so it stopped early. '
+                'Try again in a few minutes; the clean resumes where it left off.')
     return 'Library clean failed'
 
 
@@ -12217,6 +12220,9 @@ def _run_tag_index_maintenance_payload(payload):
             # ACKing them. A failed send falls through to receipt retention.
             store.notify(key, _send_tag_index_wakeup)
             return 'tag_index_noop'
+        # A fenced library (e.g. a library clean's self-quiesce) must not see a live lease
+        # from this worker, even briefly: the clean's per-round proof fails on any lease.
+        automatic.check_source_admission(library)
         # An old wake intentionally claims the latest revision of this SAME job.
         try:
             claim = store.claim(key)
@@ -12274,7 +12280,9 @@ def _run_tag_index_maintenance_payload(payload):
             delay = INDEX_BARRIER_RECOVERY_SECONDS
             store.release(claim, deferred=True, retry_delay=delay, retry_reason='barrier_wait')
         try:
-            sent = store.notify(key, _send_tag_index_wakeup)
+            # Without a claim nothing set notBefore, so delay the wake here or it redelivers at once.
+            sent = store.notify(key, _send_tag_index_wakeup,
+                                minimum_delay=0 if claim is not None else INDEX_BARRIER_RECOVERY_SECONDS)
             if not sent:
                 current = store._get(key)
                 if current and (float(current.get('wakeUntil') or 0) > store.clock() or current.get('wakeReceipt')):
@@ -12322,6 +12330,17 @@ def _run_index_maintenance_payload(payload):
     key = index_work.WorkStore.key(library, scope)
     if payload.get('maintenanceKey') != key:
         raise ValueError('Maintenance identity mismatch')
+    try:
+        # Refuse before claiming: a fenced library's clean fails its proof on any live lease.
+        automatic.check_source_admission(library)
+    except automatic.SourceBusy:
+        try:
+            if not store.notify(key, _send_index_wakeup, minimum_delay=INDEX_BARRIER_RECOVERY_SECONDS):
+                return 'retry'
+        except Exception:
+            worker_logger.warning('Fenced maintenance wakeup retained for recovery', exc_info=True)
+            return 'retry'
+        return 'deferred'
     try:
         claim = store.claim(key)
     except index_work.WorkLeased:
@@ -16847,7 +16866,8 @@ def _handle_clustering_queue_payload(payload: Dict, job_id: str, user_id: str, j
             if library_store is not None:
                 library_store.set_cleanup_failed(target_library_id, reason)
             if job_id:
-                _upsert_job_status(job_id, user_id, 'library_clean', 'failed', error=reason, libraryId=target_library_id)
+                _upsert_job_status(job_id, user_id, 'library_clean', 'failed', error=reason, libraryId=target_library_id,
+                                   errorDetail=f'{type(exc).__name__}: {exc}'[:500])
         finally:
             stop_heartbeat.set()
             heartbeat_thread.join(timeout=5)
