@@ -2,7 +2,7 @@ import { schedulePendingEditsReconciliation, subscribeSourceEdits } from '../../
 import { publishNotification } from '../../services/notificationSink';
 import { applyPendingEdits, beginPendingEdit, confirmPendingEdit, rollbackPendingEdit, pendingEditScope, pendingEditReadTokens, pendingPeopleEnrichmentIds, hasSourceConfirmation, savePendingEdits, applyPendingPhotoCollection } from '../../services/pendingEdits';
 import { onIndexReady, reportIndexBuilding } from '../../services/indexBuilding';
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { SUGGESTIONS } from './data';
 import { get, post } from '../../services/apiClient';
 import { setPhotoRotation } from './media';
@@ -28,6 +28,7 @@ import type { PersonFace } from '../../types/people';
 import { isNamedLabel } from '../../utils/people';
 import { plural } from '../../utils/format';
 import { captureWallClock } from '../../utils/captureDate';
+import { isLiveClipName, isLiveStillName, liveBaseStem, listJustUploaded, removeJustUploaded, settleJustUploaded, subscribeJustUploaded, type JustUploadedEntry } from '../../services/justUploaded';
 import type { Photo as BackendPhoto } from '../../types/uiTypes';
 import type {
     Album,
@@ -92,6 +93,28 @@ const prependMissing = (photos: Photo[], list: Photo[]): Photo[] => {
     const present = new Set(list.map((p) => p.id));
     const missing = photos.filter((p) => !present.has(p.id));
     return missing.length ? [...missing, ...list] : list;
+};
+
+// A photo this browser just uploaded that the indexes do not cover yet. It carries
+// only what the browser knows; the real row replaces it once the index has the file.
+const justUploadedPhoto = (e: JustUploadedEntry): Photo => {
+    const valid = captureWallClock(e.captureDate);
+    return {
+        id: e.filename,
+        filename: e.filename,
+        swatch: swatchFor(e.filename),
+        dateLabel: valid ? `${MONTHS[valid.getMonth()]} ${valid.getDate()}, ${valid.getFullYear()}` : 'Undated',
+        year: valid ? valid.getFullYear() : 0,
+        rating: 0,
+        liked: false,
+        placeId: null,
+        personIds: [],
+        tags: [],
+        thumbnailUrl: e.thumbnailUrl ?? '',
+        captureDate: e.captureDate,
+        processing: { thumbnail: 'pending' },
+        pendingIndex: true,
+    };
 };
 
 // Stable placeholder swatch derived from the filename, so a photo shows the same
@@ -538,7 +561,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const [route, setRoute] = useState<Route>(() => (
         typeof window === 'undefined' ? { page: 'gallery', params: {} } : searchToRoute(window.location.search)
     ));
-    const [photos, setPhotos] = useState<Photo[]>([]);
+    // Photos the gallery's own fetches produced. `photos` (below) is this plus the
+    // just-uploaded overlay; every setPhotos edit applies to the fetched list only.
+    const [indexedPhotos, setPhotos] = useState<Photo[]>([]);
     const [photosLoading, setPhotosLoading] = useState<boolean>(true);
     const [hasMorePhotos, setHasMorePhotos] = useState<boolean>(true);
     const [totalPhotos, setTotalPhotos] = useState<number | null>(null);
@@ -550,6 +575,21 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const [captureRange, setCaptureRangeState] = useState<CaptureRange | null>(null);
     const [timeline, setTimeline] = useState<TimelineSummary | null>(null);
     const captureRangeRef = useRef<CaptureRange | null>(null);
+    const justUploaded = useSyncExternalStore(subscribeJustUploaded, listJustUploaded, listJustUploaded);
+    // The overlay is only correct for the unfiltered, undated gallery: a rating/liked
+    // filter or date window would show photos that do not match it.
+    const overlayApplies = galleryFilters.rating === 0 && !galleryFilters.likedOnly && galleryFilters.media === 'all' && !captureRange;
+    const overlayExtra = useMemo<JustUploadedEntry[]>(() => {
+        if (!overlayApplies || !justUploaded.length) return [];
+        const have = new Set(indexedPhotos.map((p) => p.id));
+        // A clip whose still is already in the gallery is that still's Live Photo, not a video.
+        const stills = new Set(indexedPhotos.filter((p) => isLiveStillName(p.filename)).map((p) => liveBaseStem(p.filename)));
+        return justUploaded.filter((e) => !have.has(e.filename) && !(isLiveClipName(e.filename) && stills.has(liveBaseStem(e.filename))));
+    }, [overlayApplies, justUploaded, indexedPhotos]);
+    const photos = useMemo<Photo[]>(
+        () => (overlayExtra.length ? [...overlayExtra.map(justUploadedPhoto), ...indexedPhotos] : indexedPhotos),
+        [overlayExtra, indexedPhotos],
+    );
     const galleryFiltersRef = useRef<GalleryFilters>({ rating: 0, likedOnly: false, media: 'all' });
     const photoOffsetRef = useRef(0);
     const photoLoadingRef = useRef(false);
@@ -1596,6 +1636,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     const removeFromEverywhere = useCallback((ids: string[]) => {
         const set = new Set(ids);
+        removeJustUploaded(ids);
         setPhotos((prev) => prev.filter((p) => !set.has(p.id)));
         setExtraPhotos((prev) => {
             let changed = false;
@@ -2943,6 +2984,29 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         return () => window.clearTimeout(timer);
     }, [peopleUnavailable, fetchPeople, people.length]);
 
+    // Handover from the just-uploaded overlay to the index-backed list. Runs after every
+    // fetched-list change, so it also follows the reload an index-ready event starts. Only a
+    // sort index that actually contains a filename may retire its overlay tile; a server-paged
+    // library has no whole-library index to ask, so there only the loaded pages retire it.
+    // Keyed on the fetched list only: a new upload is by definition not indexed yet, so
+    // re-checking the whole sort index on every added file would be pure cost.
+    const justUploadedRef = useRef(justUploaded);
+    justUploadedRef.current = justUploaded;
+    useEffect(() => {
+        const pending = justUploadedRef.current;
+        if (!pending.length) return;
+        const loaded = new Set(indexedPhotos.map((p) => p.id));
+        const landed = pending.filter((e) => loaded.has(e.filename)).map((e) => e.filename);
+        if (landed.length) removeJustUploaded(landed);
+        if (isServerPagedLibrary()) return;
+        void settleJustUploaded(async (names) => {
+            const rows = await getLocalSortIndex();
+            if (!rows) return null;
+            const have = new Set(rows.map((r) => r.filename));
+            return new Set(names.filter((n) => have.has(n)));
+        });
+    }, [indexedPhotos]);
+
     // The server finished preparing the library: pull in what was missing while it built.
     useEffect(() => onIndexReady(() => {
         reloadPhotos();
@@ -2976,7 +3040,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             toasts,
             photosLoading,
             hasMorePhotos,
-            totalPhotos,
+            totalPhotos: totalPhotos == null ? null : totalPhotos + overlayExtra.length,
             loadMorePhotos,
             reloadPhotos,
             applyExternalPhotoDeleteCount: applyPhotoDeleteCount,
@@ -3069,7 +3133,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         [
             route, photos, albums, people, members, pendingInvites, libraryName, isOwner, maxMembers, membersLoading,
             placesState, thingsState, trash, trashLoading, albumTrash, albumTrashLoading, selection, selectMode, viewer, toasts,
-            photosLoading, hasMorePhotos, totalPhotos, loadMorePhotos, reloadPhotos, applyPhotoDeleteCount,
+            photosLoading, hasMorePhotos, totalPhotos, overlayExtra.length, loadMorePhotos, reloadPhotos, applyPhotoDeleteCount,
             mediaFilter, setMediaFilter, galleryFilters, setGalleryRating, setGalleryLikedOnly, jumpToGalleryDate, captureRange, setCaptureRange, timeline,
             exploreLoading, reloadExplore, fetchExplore,
             photoById, photosByIds, albumById, personById, registerPhotos, navigate, toggleSelect, selectMany,
