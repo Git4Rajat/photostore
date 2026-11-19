@@ -12,7 +12,7 @@ import { preloadLocalIndexes } from '../services/preloadLocalIndexes';
 import { startMediaTokenAutoRefresh } from '../services/mediaToken';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { get, getUpload, postTools, postUpload, resolveApiUrl } from '../services/apiClient';
-import { addJustUploaded, drawLocalThumbnail, setJustUploadedThumbnail } from '../services/justUploaded';
+import { addJustUploaded } from '../services/justUploaded';
 import { heartbeatWaveSession, quiesceWaveShadowSession, discardWaveShadowSession, stopWaveShadowSession, registerWaveItemsBatch, waveIdentityFor, ensureOpened as ensureWaveShadowSessionAdmitted, finalizeWaveShadowSession, resolveWaveShadowFile, reportFailedWaveFile, acknowledgeWaveFinalizedFile, cancelQueuedWaveSelection } from '../services/uploadWaveSync';
 import { hashLargeFile, LARGE_FILE_HASH_THRESHOLD } from '../utils/largeFileHash';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
@@ -513,10 +513,10 @@ const SINGLE_PUT_UPLOAD_MAX_BYTES = 8 * MB;
 // cleared the moment it ends either way) -- a fast file's loop finishes before
 // the first tick, so the common case never sends anything extra.
 // Show a just-finalized upload in the gallery before any index covers it (see
-// services/justUploaded). The tile appears at once; its thumbnail is drawn in the browser.
+// services/justUploaded). The tile is a swatch until the index has the photo: decoding every
+// file again here would compete with hashing, transfer and preparation for the main thread.
 const showJustUploaded = (filename: string, file: File): void => {
     addJustUploaded({ filename, captureDate: Number.isFinite(file.lastModified) && file.lastModified > 0 ? new Date(file.lastModified).toISOString() : null });
-    void drawLocalThumbnail(file).then((url) => { if (url) setJustUploadedThumbnail(filename, url); });
 };
 
 const UPLOAD_TRANSFER_HEARTBEAT_MS = 90_000;

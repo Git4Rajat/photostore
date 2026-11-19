@@ -22,8 +22,9 @@ type Stored = JustUploadedEntry & { scope: string };
 
 export const JUST_UPLOADED_TTL_MS = 6 * 60 * 60 * 1000;
 export const JUST_UPLOADED_MAX = 500;
-const LOCAL_THUMB_EDGE = 240;
-const LOCAL_THUMB_MAX_SOURCE_BYTES = 40 * 1024 * 1024;
+// Listeners hear about additions at most this often. Every notification re-renders the whole
+// store, and an upload finalizes files far faster than the screen needs to change.
+export const JUST_UPLOADED_NOTIFY_MS = 500;
 
 const entries = new Map<string, Stored>();
 const listeners = new Set<() => void>();
@@ -31,6 +32,8 @@ let snapshot: JustUploadedEntry[] = [];
 let snapshotScope = '';
 let version = 0;
 let snapshotVersion = -1;
+let lastNotifyAt = 0;
+let notifyTimer: ReturnType<typeof setTimeout> | null = null;
 
 // Live Photos upload as a still plus a short clip that the server later attaches to the still
 // (backend/live_photos.py). The browser cannot read Apple's pairing tags at finalize, so it
@@ -48,7 +51,19 @@ export const isLiveStillName = (filename: string): boolean => STILL_EXTENSIONS.h
 export const isLiveClipName = (filename: string): boolean => CLIP_EXTENSIONS.has(extensionOf(filename));
 
 const keyOf = (scope: string, filename: string): string => `${scope}\u0000${filename}`;
-const emit = (): void => { version += 1; listeners.forEach((l) => l()); };
+const notify = (): void => {
+    if (notifyTimer !== null) { clearTimeout(notifyTimer); notifyTimer = null; }
+    lastNotifyAt = Date.now();
+    listeners.forEach((l) => l());
+};
+// Leading edge fires at once (the first photo shows immediately); a burst after it is coalesced
+// into one trailing notification. Removals pass `immediate`: they are rare and the user waits on them.
+const emit = (immediate = false): void => {
+    version += 1;
+    if (immediate || Date.now() - lastNotifyAt >= JUST_UPLOADED_NOTIFY_MS) { notify(); return; }
+    if (notifyTimer === null) notifyTimer = setTimeout(notify, JUST_UPLOADED_NOTIFY_MS - (Date.now() - lastNotifyAt));
+};
+export const flushJustUploaded = (): void => { if (notifyTimer !== null) notify(); };
 const revoke = (entry: Stored): void => {
     if (entry.thumbnailUrl?.startsWith('blob:')) {
         try { URL.revokeObjectURL(entry.thumbnailUrl); } catch { /* not a real object URL */ }
@@ -99,22 +114,6 @@ export const addJustUploaded = (entry: { filename: string; captureDate?: string 
     emit();
 };
 
-/** Attach a thumbnail drawn after the entry was added (drawing is async). */
-export const setJustUploadedThumbnail = (filename: string, thumbnailUrl: string): void => {
-    const entry = entries.get(keyOf(sessionScope(), filename));
-    if (!entry) {
-        // Removed (index took over, or deleted) while the thumbnail was drawing.
-        try { URL.revokeObjectURL(thumbnailUrl); } catch { /* ignore */ }
-        return;
-    }
-    if (entry.thumbnailUrl) {
-        try { URL.revokeObjectURL(thumbnailUrl); } catch { /* ignore */ }
-        return;
-    }
-    entry.thumbnailUrl = thumbnailUrl;
-    emit();
-};
-
 export const removeJustUploaded = (filenames: Iterable<string>): void => {
     const scope = sessionScope();
     let changed = false;
@@ -127,7 +126,7 @@ export const removeJustUploaded = (filenames: Iterable<string>): void => {
             changed = true;
         }
     }
-    if (changed) emit();
+    if (changed) emit(true);
 };
 
 export const listJustUploaded = (now = Date.now()): JustUploadedEntry[] => {
@@ -172,40 +171,6 @@ export const settleJustUploaded = async (
     return confirmed.length;
 };
 
-let drawing: Promise<unknown> = Promise.resolve();
-
-/**
- * Draws a small thumbnail in the browser, one at a time so an upload burst does
- * not stack decodes. Resolves undefined for anything the browser cannot decode
- * (HEIC/RAW/video on most browsers) or that is too large to be worth it.
- */
-export const drawLocalThumbnail = (file: Blob): Promise<string | undefined> => {
-    const task = drawing.then(async () => {
-        if (typeof createImageBitmap !== 'function' || typeof document === 'undefined') return undefined;
-        if (!file.type.startsWith('image/') || file.size > LOCAL_THUMB_MAX_SOURCE_BYTES) return undefined;
-        try {
-            const bitmap = await createImageBitmap(file);
-            try {
-                const scale = Math.min(1, LOCAL_THUMB_EDGE / Math.max(bitmap.width, bitmap.height));
-                const canvas = document.createElement('canvas');
-                canvas.width = Math.max(1, Math.round(bitmap.width * scale));
-                canvas.height = Math.max(1, Math.round(bitmap.height * scale));
-                const ctx = canvas.getContext('2d');
-                if (!ctx) return undefined;
-                ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-                const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.7));
-                return blob ? URL.createObjectURL(blob) : undefined;
-            } finally {
-                bitmap.close?.();
-            }
-        } catch {
-            return undefined;
-        }
-    });
-    drawing = task.catch(() => undefined);
-    return task;
-};
-
 export const __resetJustUploadedForTests = (): void => {
     entries.clear();
     listeners.clear();
@@ -213,5 +178,6 @@ export const __resetJustUploadedForTests = (): void => {
     snapshotScope = '';
     snapshotVersion = -1;
     version = 0;
-    drawing = Promise.resolve();
+    lastNotifyAt = 0;
+    if (notifyTimer !== null) { clearTimeout(notifyTimer); notifyTimer = null; }
 };
