@@ -5149,7 +5149,29 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         ));
     };
 
-    const startUpload = useCallback(async (filesToUpload: File[], handlesToUpload?: Map<File, FileSystemFileHandle>) => {
+    // The accept filter is only a hint: "All Files", a whole exported folder,
+    // the File System Access picker and drag-and-drop all hand over sidecars
+    // such as Apple Photos' .aae edit files, which the server rejects on every
+    // attempt. Drop them before anything registers, fails, or gets retried.
+    const dropUnsupportedUploadFiles = useCallback((files: File[]): File[] => {
+        const kept = files.filter((file) => isUploadableFilename(file.name));
+        const skippedFiles = files.length - kept.length;
+        if (skippedFiles > 0) {
+            const skippedExtensions = Array.from(new Set(
+                files
+                    .filter((file) => !isUploadableFilename(file.name))
+                    .map((file) => (getFileExtension(file.name) ? `.${getFileExtension(file.name)}` : 'no extension')),
+            ));
+            const message = `Skipped ${skippedFiles.toLocaleString()} ${skippedFiles === 1 ? 'file that isn\'t a photo or video' : 'files that aren\'t photos or videos'}`
+                + ` (${skippedExtensions.slice(0, 5).join(', ')}${skippedExtensions.length > 5 ? ', ...' : ''}).`;
+            addNotification('Some files skipped', message);
+            showToast(message, { timeout: 8000, panel: false });
+        }
+        return kept;
+    }, [addNotification]);
+
+    const startUpload = useCallback(async (selectedUploadFiles: File[], handlesToUpload?: Map<File, FileSystemFileHandle>) => {
+        let filesToUpload = dropUnsupportedUploadFiles(selectedUploadFiles);
         if (filesToUpload.length === 0) {
             return;
         }
@@ -5486,6 +5508,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         addNotification,
         cleanupUnfinishedUploadArtifacts,
         clearPersistedSession,
+        dropUnsupportedUploadFiles,
         persistSession,
         warmBackend,
         warmEndpoint,
@@ -5624,23 +5647,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             rows: pickedFiles.length,
             bytes: pickedFiles.reduce((sum, file) => sum + file.size, 0),
         });
-        // The accept filter is only a hint: "All Files" or a whole exported
-        // folder still hands over sidecars such as Apple Photos' .aae edit
-        // files, which the server rejects on every attempt. Drop them here so
-        // they never register, fail, or get retried.
-        const selectedFiles = pickedFiles.filter((file) => isUploadableFilename(file.name));
-        const skippedFiles = pickedFiles.length - selectedFiles.length;
-        if (skippedFiles > 0) {
-            const skippedExtensions = Array.from(new Set(
-                pickedFiles
-                    .filter((file) => !isUploadableFilename(file.name))
-                    .map((file) => (getFileExtension(file.name) ? `.${getFileExtension(file.name)}` : 'no extension')),
-            ));
-            const message = `Skipped ${skippedFiles.toLocaleString()} ${skippedFiles === 1 ? 'file that isn\'t a photo or video' : 'files that aren\'t photos or videos'}`
-                + ` (${skippedExtensions.slice(0, 5).join(', ')}${skippedExtensions.length > 5 ? ', ...' : ''}).`;
-            addNotification('Some files skipped', message);
-            showToast(message, { timeout: 8000, panel: false });
-        }
+        const selectedFiles = dropUnsupportedUploadFiles(pickedFiles);
         if (selectedFiles.length > MAX_MOBILE_SELECTION_SIZE && isConstrainedUploadDevice()) {
             console.warn('Rejected oversized mobile upload selection.', {
                 count: selectedFiles.length,
@@ -5792,6 +5799,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }, [
         addNotification,
         attachSelectedFilesToPendingSession,
+        dropUnsupportedUploadFiles,
         enqueueUploadFilesInBatches,
         loadPersistedSession,
         pendingUploadSession,

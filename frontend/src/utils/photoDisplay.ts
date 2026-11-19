@@ -40,6 +40,14 @@ export const UPLOADABLE_EXTENSIONS = new Set<string>([
     'mp4', 'mpeg', 'mpg', 'mts', 'mxf', 'nev', 'ogv', 'r3d', 'ts', 'vob', 'webm', 'wmv',
 ]);
 
+// Chrome's File System Access picker greys out everything else by default
+// (the "All files" option stays available). Chrome matches on these
+// extensions, so RAW and video types without a well-known MIME still work.
+export const UPLOAD_PICKER_TYPES = [{
+    description: 'Photos and videos',
+    accept: { 'image/*': Array.from(UPLOADABLE_EXTENSIONS, (extension) => `.${extension}`) },
+}];
+
 const RAW_EXTENSIONS = new Set<string>(SUPPORTED_RAW_EXTENSIONS);
 const VIDEO_EXTENSIONS = new Set<string>(SUPPORTED_VIDEO_EXTENSIONS);
 const HEIC_EXTENSIONS = new Set<string>(SUPPORTED_HEIC_EXTENSIONS);
