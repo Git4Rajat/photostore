@@ -678,8 +678,9 @@ def location_contradicting_tags(tags: List[str], metadata: Dict) -> set:
     those guesses are wrong by construction. Without coordinates and a
     geocoded place nothing can be contradicted, so the set is empty and the
     tags stay."""
-    if not _has_coordinates(metadata):
-        return set()
+    # A geocoded city/country can only have come from GPS (even when the
+    # coordinates live only in EXIF, not in latitude/longitude), so the place
+    # itself is the signal; contradicting_place_tags returns nothing without one.
     import place_names
     return place_names.contradicting_place_tags(
         tags,

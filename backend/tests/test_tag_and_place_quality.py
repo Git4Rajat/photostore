@@ -58,8 +58,17 @@ def test_tags_naming_the_photos_own_place_survive_in_any_spelling():
     assert 'iceland' not in search_utils.visible_tags(_malmo())
 
 
-def test_without_gps_or_place_nothing_is_contradicted():
-    assert 'iceland' in search_utils.visible_tags(_malmo(latitude='', longitude=''))
+def test_geocoded_place_alone_is_enough_when_coordinates_live_in_exif():
+    assert 'iceland' not in search_utils.visible_tags(_malmo(latitude='', longitude=''))
+
+
+def test_halmstad_selfie_drops_geneva_islamabad_bollywood_pakistan():
+    tags = ['selfie', 'couple', 'date', 'geneva', 'islamabad', 'bollywood', 'pakistan']
+    row = {'tags': json.dumps(tags), 'locationCity': 'Halmstad', 'locationCountry': 'Sweden'}
+    assert search_utils.visible_tags(row) == ['selfie', 'couple', 'date']
+
+
+def test_without_a_geocoded_place_nothing_is_contradicted():
     row = _malmo(locationCity='', locationCountry='')
     assert 'iceland' in search_utils.visible_tags(row)
 
