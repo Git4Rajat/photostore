@@ -84,7 +84,7 @@ def install(blueprint):
             data=app.request.get_json(silent=True) or {}
             files=data.get('files') if operation.endswith('-batch') else [data]
             if not isinstance(files,list) or not files:raise ValueError('Upload reservations required')
-            bindings=[wave_policy.validate_admission(store,item,finalizing=True) for item in files]
+            bindings=wave_policy.validate_admissions(store,files,finalizing=True)
             if operation.startswith('finalize'):
                 g.wave_finalize_replays={binding:replay for binding,item in zip(bindings,files)
                     if (replay:=_verified_replay(store,binding,item,app.metadata_table_client)) is not None}
@@ -115,15 +115,16 @@ def install(blueprint):
             replays=getattr(g,'wave_finalize_replays',{})
             for session_id,group in grouped.items():
                 pending=[value for value in group if value[1] not in replays]
-                # Azure Table transactions allow 100 operations. resolve_many
-                # bounds a page to 20 so even all-new member/source bindings
-                # plus the shared control/session/wave rows fit atomically.
+                # Concurrent finalizes of one session share its wave rows;
+                # they take turns committing pages of up to 20 bindings (the
+                # most that fit one transaction) instead of racing for them.
                 session=None
-                for offset in range(0,len(pending),20):
-                    page=pending[offset:offset+20]
-                    session=resolve_sources(store,app.metadata_table_client,session_id,
+                if pending:
+                    from wave_write_combiner import combine
+                    session=combine((id(store.table),store.library,session_id),
                         [(binding[1],'duplicate' if entry.get('duplicates') else 'accepted',entry['filename'])
-                         for _index,binding,entry in page])
+                         for _index,binding,entry in pending],
+                        lambda page:resolve_sources(store,app.metadata_table_client,session_id,page))
                 if session is None:
                     session=store._required(store.session_key(session_id))
                 session=close_resolved_intake(store,session)
