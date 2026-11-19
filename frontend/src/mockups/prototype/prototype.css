@@ -1667,3 +1667,15 @@
 .pd-seg.idle i b.slide { animation: none; width: 0; }
 .pd-actions { display: flex; justify-content: flex-end; }
 .pd-retry { font-weight: 600; }
+.pd-more { display: block; color: var(--muted); }
+.pd-wlist { display: flex; flex-direction: column; gap: 12px; max-height: 50vh; overflow-y: auto; }
+.pd-wb { border: 1px solid var(--lg-surface-wash); border-radius: 12px; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+.pd-wb.dim { opacity: 0.7; }
+.pd-wb.bad { border-color: var(--danger); }
+.pd-wbh { display: flex; align-items: center; gap: 8px; font-size: 13.5px; }
+.pd-wbh span { color: var(--muted); font-size: 12px; }
+.pd-wx { all: unset; margin-left: auto; width: 24px; height: 24px; display: grid; place-items: center; color: var(--muted); cursor: pointer; border-radius: 50%; }
+.pd-wx:focus-visible { outline: 2px solid var(--accent); }
+.pd-wx svg { width: 14px; height: 14px; }
+.pd-line { margin: 0; font-size: 13px; }
+.pd-clear { align-self: flex-start; }

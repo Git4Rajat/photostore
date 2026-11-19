@@ -26,6 +26,8 @@ export interface ProcessingWave {
     // A retry can unblock this wave (owner), or could if the library owner pressed it (member).
     retryable?: boolean;
     askOwner?: boolean;
+    // Client-only: this wave was just retried, so an old "nothing has moved" reading no longer applies.
+    retriedRecently?: boolean;
 }
 
 export interface RetryResult {
@@ -134,3 +136,33 @@ export const onProcessingSignal = (listener: Listener): (() => void) => {
 export const signalProcessing = (): void => listeners.forEach((listener) => listener());
 export const setProcessingPushLive = (live: boolean): void => { pushLive = live; if (live) signalProcessing(); };
 export const isProcessingPushLive = (): boolean => pushLive;
+
+// One block per upload: the ones still running oldest first (the oldest is the one everything
+// else waits for), then finished ones, newest first.
+export const orderWaves = (waves: ProcessingWave[]): ProcessingWave[] => [
+    ...waves.filter((wave) => wave.stage !== 'done').sort((a, b) => a.startedAt - b.startedAt),
+    ...waves.filter((wave) => wave.stage === 'done').sort((a, b) => b.startedAt - a.startedAt),
+];
+
+export const isWaiting = (wave: ProcessingWave): boolean => wave.stage !== 'done'
+    && (wave.state === 'waiting_predecessor' || wave.problem === 'blocked');
+
+// The wave the bar speaks for: a problem wins, then the one actually running, then the oldest
+// unfinished, and only when everything is finished the latest finished one.
+export const leadWave = (ordered: ProcessingWave[]): ProcessingWave | undefined => {
+    const open = ordered.filter((wave) => wave.stage !== 'done');
+    return open.find((wave) => wave.problem && wave.problem !== 'blocked')
+        ?? open.find((wave) => !isWaiting(wave)) ?? open[0] ?? ordered[0];
+};
+
+export const uploadLabel = (wave: ProcessingWave): string => {
+    const time = new Date(wave.startedAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return `Upload from ${time}`;
+};
+
+// Retried a moment ago: the stuck reading is stale until a worker reports again.
+export const STALL_HOLD_MS = 10 * 60_000;
+export const holdStalled = (wave: ProcessingWave, retriedAt: number | undefined, now: number): ProcessingWave => (
+    wave.problem === 'stalled' && retriedAt !== undefined && now - retriedAt < STALL_HOLD_MS
+        ? { ...wave, problem: undefined, noProgressSeconds: undefined, retriedRecently: true }
+        : wave);
