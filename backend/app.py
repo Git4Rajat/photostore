@@ -16092,7 +16092,17 @@ def _cleanup_failed_upload(user_id: str, filename: str, upload_id: str = '') -> 
             # Clearing only the tracking columns orphaned that staged blob.
             pending_blob = str(metadata.get('pendingAnonymousBlob') or '').strip()
             permanent_blob = str(metadata.get('anonymousImageId') or '').strip()
-            if pending_blob and pending_blob != permanent_blob:
+            # The pending blob may not be staged leftovers: a name clash at
+            # finalize promotes it to the original of a RENAMED row and leaves
+            # this pre-rename row's marker behind. A later duplicate of the same
+            # file then cleaned up here and deleted that photo's original
+            # (78 photos on photostore-rg, 2026-11-18). Same owner check as the
+            # never-finalized branch below.
+            owner = original_filename_for_anonymous_id(user_id, pending_blob) if pending_blob else None
+            if pending_blob and pending_blob != permanent_blob and owner and owner != filename:
+                app.logger.warning('Skipped deleting blob %s during cleanup of %s: now owned by %s.',
+                                   pending_blob, filename, owner)
+            elif pending_blob and pending_blob != permanent_blob:
                 cleanup['errors'].extend(_delete_photo_blobs_if_present(pending_blob))
                 try:
                     delete_image_name_mapping(user_id, pending_blob)

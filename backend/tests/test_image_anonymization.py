@@ -308,3 +308,14 @@ def test_reserve_then_finalize_roundtrip_promotes_and_clears(finalize_ctx):
     assert row['anonymousImageId'] == reserved
     assert 'pendingAnonymousBlob' not in row  # transient marker cleared
     assert image_names.get_entity('lib-A', reserved)['original_filename'] == 'vacation.jpg'
+
+
+def test_reserve_does_not_reuse_a_blob_adopted_by_a_renamed_photo(finalize_ctx, monkeypatch):
+    """A name clash at finalize promotes the reservation to a renamed row. A
+    re-upload of the same file under the old name must get a fresh blob, not
+    stage into (and later clean up) the renamed photo's original."""
+    first = storage_utils.reserve_pending_anonymous_blob('lib-A', 'IMG_1456.HEIC', 'h-same')
+    monkeypatch.setattr(storage_utils, 'original_filename_for_anonymous_id',
+                        lambda library, blob: 'IMG_1456-06d9f4a3.HEIC' if blob == first else None)
+    second = storage_utils.reserve_pending_anonymous_blob('lib-A', 'IMG_1456.HEIC', 'h-same')
+    assert second != first
