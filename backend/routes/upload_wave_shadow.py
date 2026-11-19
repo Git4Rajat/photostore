@@ -87,6 +87,48 @@ def endpoint(function):
     return wrapped
 
 
+FAILURES_RETRIED_PREFIX='failures-retried!'
+RETRY_FAILED_PAGE=20
+
+
+def _retry_failed_members(store,wave,after):
+    """Force a fresh processing generation for one page of members that gave up.
+
+    Only the generation that failed is retried: a photo since deleted, replaced
+    or already retried keeps its current state. The last page records a marker
+    so the Tools page stops offering the retry for this wave.
+    """
+    from processing_generation import REQUIRED_STEPS
+    prefix=f'e!{wave}!m!'
+    if not isinstance(after,str) or (after and not after.startswith(prefix)):
+        raise ValueError('Invalid retry cursor')
+    store.status(wave)  # Validates the wave belongs to this library.
+    retried=skipped=failed=0
+    rows=store._page(prefix,after,size=RETRY_FAILED_PAGE)
+    for member in rows:
+        after=member['RowKey']
+        if member.get('outcome')!='failed_exhausted':
+            continue
+        try:
+            row=app.metadata_table_client.get_entity(store.library,member['filename'])
+        except ResourceNotFoundError:
+            skipped+=1;continue
+        if (row.get('processing_state')=='deleted' or (row.get('anonymousImageId'),row.get('processingRevision'))
+                !=(member['photoId'],member['processingRevision'])):
+            skipped+=1;continue
+        result=app._enqueue_processing_steps(store.library,member['filename'],list(REQUIRED_STEPS),force=True)
+        if any(value.get('status')=='error' for value in result.values()):failed+=1
+        else:retried+=1
+    finished=len(rows)<RETRY_FAILED_PAGE
+    if finished and not failed:
+        def mark():
+            old=store._get(FAILURES_RETRIED_PREFIX+wave)
+            store.table.submit_transaction([store._change(old,store._row(FAILURES_RETRIED_PREFIX+wave,
+                waveId=wave,retriedAt=store.clock())),*store._policy_guard()])
+        store._retry(mark)
+    return dict(retried=retried,skipped=skipped,failedRetries=failed,after='' if finished else after)
+
+
 def register_routes(blueprint):
     @blueprint.route('/upload/waves/live/sessions', methods=['POST'])
     @blueprint.route('/upload/waves/shadow/sessions', methods=['POST'])
@@ -231,6 +273,10 @@ def register_routes(blueprint):
             key=(current.get('visionPendingKey') if stage=='vision' else
                 'shadow-cluster!'+wave if stage=='cluster' else current.get('indexPendingKey'))
             stage_work_store(store.table).request(store.library,f'wave-{stage}:{wave}:{digest(key)}',advance=True)
+        elif action=='retry-failed':
+            result=_retry_failed_members(store,wave,data.get('after',''))
+            _drive(store,wave)
+            return dict(store.status(wave),**result)
         else:
             member=store._required(f'e!{wave}!m!'+digest([data['photoId'],data['processingRevision']]))
             if action=='confirm-missing':
@@ -273,7 +319,8 @@ def register_routes(blueprint):
     @endpoint
     def wave_attention(store, data):
         """Unfinished waves (not collecting, complete or cancelled) with their health, so the Tools page can
-        show which ones are failed or blocked and offer a stage retry. Bounded: a few pages, 25 results."""
+        show which ones are failed or blocked and offer a stage retry, plus finished waves whose failed photos
+        have not been retried yet. Bounded: a few pages, 25 results."""
         from wave_health import status
         waves, after = [], ''
         for _ in range(10):
@@ -282,9 +329,15 @@ def register_routes(blueprint):
                 break
             after = rows[-1]['RowKey']
             for row in rows:
-                if row.get('state') in ('collecting', 'complete', 'cancelled'):
+                wave_id = row['RowKey'][len('wave!'):]
+                if (row.get('state') == 'complete' and int(row.get('failedMembers') or 0)
+                        and store._get(FAILURES_RETRIED_PREFIX + wave_id) is None):
+                    # Finished, but some photos gave up: offer to retry them.
+                    waves.append(dict(waveId=wave_id, state='complete', failedMembers=int(row['failedMembers'])))
+                elif row.get('state') in ('collecting', 'complete', 'cancelled'):
                     continue
-                waves.append(_public(status(store, row['RowKey'][len('wave!'):])))
+                else:
+                    waves.append(_public(status(store, wave_id)))
                 if len(waves) >= 25:
                     return dict(waves=waves, truncated=True)
         return dict(waves=waves, truncated=False)
