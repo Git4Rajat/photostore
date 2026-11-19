@@ -1665,3 +1665,5 @@
 .pd-seg.bad i.now { background: var(--danger-soft); }
 .pd-seg.bad i.now b { background: var(--danger); }
 .pd-seg.idle i b.slide { animation: none; width: 0; }
+.pd-actions { display: flex; justify-content: flex-end; }
+.pd-retry { font-weight: 600; }

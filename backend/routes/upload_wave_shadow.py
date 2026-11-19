@@ -221,16 +221,8 @@ def register_routes(blueprint):
         current=store._required(store.wave_key(wave));action=data['action']
         from upload_waves import digest
         if action=='retry-stage':
-            from upload_wave_execution import stage_work_store
-            from execution_lease import ExecutionLeases
-            stage=('vision' if current['state'] in ('processing_pending','processing') else
-                'cluster' if current['state']=='ready' else 'index' if current['state']=='indexing' else None)
-            if stage is None:raise Conflict('Wave has no retryable stage')
-            lease=store._get(ExecutionLeases.key(store.library,wave,stage))
-            if lease and lease.get('leaseUntil',0)>store.clock():raise Conflict('Stage owner is still active')
-            key=(current.get('visionPendingKey') if stage=='vision' else
-                'shadow-cluster!'+wave if stage=='cluster' else current.get('indexPendingKey'))
-            stage_work_store(store.table).request(store.library,f'wave-{stage}:{wave}:{digest(key)}',advance=True)
+            from wave_retry import retry_stage
+            retry_stage(store,wave,current)
         else:
             member=store._required(f'e!{wave}!m!'+digest([data['photoId'],data['processingRevision']]))
             if action=='confirm-missing':
@@ -288,6 +280,17 @@ def register_routes(blueprint):
                 if len(waves) >= 25:
                     return dict(waves=waves, truncated=True)
         return dict(waves=waves, truncated=False)
+
+    @blueprint.route('/upload/waves/live/retry-stuck', methods=['POST'])
+    @endpoint
+    def wave_retry_stuck(store, data):
+        """The processing bar's Retry: re-queue every stuck wave that is not itself waiting on an
+        earlier one, oldest first. Same repair as the Tools card, chosen on the server."""
+        account,_,error=app._require_library_context(require_auth=True)
+        if error or not app.library_store.is_owner(account,store.library):
+            raise Conflict('Only the library owner may repair a wave')
+        from wave_retry import retry_stuck
+        return retry_stuck(store,lambda wave:_drive(store,wave))
 
     @blueprint.route('/upload/waves/live/<wave>/failures', methods=['GET'])
     @endpoint

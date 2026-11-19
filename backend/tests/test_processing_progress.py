@@ -16,8 +16,8 @@ class Clock:
 
 
 def wave_row(store, wave_id, state='processing', **fields):
-    store.table.create_entity(store._row(store.wave_key(wave_id), waveId=wave_id, state=state,
-        createdAt=900.0, stateEnteredAt=950.0, memberCount=200, **fields))
+    row = dict(waveId=wave_id, state=state, createdAt=900.0, stateEnteredAt=950.0, memberCount=200)
+    store.table.create_entity(store._row(store.wave_key(wave_id), **dict(row, **fields)))
 
 
 def test_steps_are_tenths_and_capped():

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { clampMonotonic, etaLabel, overallFraction, stepNumber, takingLonger, type ProcessingWave } from './processingProgress';
+import { clampMonotonic, etaLabel, overallFraction, retryOutcomeText, stepNumber, takingLonger, type ProcessingWave } from './processingProgress';
 
 const wave = (extra: Partial<ProcessingWave>): ProcessingWave => ({
     waveId: 'w', stage: 'vision', state: 'processing', startedAt: 0, stageEnteredAt: 0, ...extra,
@@ -34,5 +34,12 @@ describe('processing progress', () => {
         expect(takingLonger(wave({ etaSeconds: 300, stageEnteredAt: 0 }), 700_000)).toBe(true);
         expect(takingLonger(wave({ etaSeconds: 300, stageEnteredAt: 0 }), 200_000)).toBe(false);
         expect(takingLonger(wave({ etaSeconds: null }), 9_999_999)).toBe(false);
+    });
+
+    it('explains what a retry did, or why it did nothing', () => {
+        expect(retryOutcomeText({ retried: [{ waveId: 'a', stage: 'vision' }], skipped: [] })).toMatch(/Retry queued/);
+        expect(retryOutcomeText({ retried: [], skipped: [{ waveId: 'a', reason: 'working' }] })).toMatch(/still being worked on/);
+        expect(retryOutcomeText({ retried: [], skipped: [{ waveId: 'a', reason: 'blocked' }] })).toMatch(/earlier upload/);
+        expect(retryOutcomeText({ retried: [], skipped: [] })).toBe('Nothing needed retrying.');
     });
 });
