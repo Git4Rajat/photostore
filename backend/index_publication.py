@@ -196,6 +196,95 @@ def require_catalog_guard(library, guard):
     guard.check()
 
 
+# Dirty-manifest writes deferred while a catalog publication holds the lease.
+# A publication pins its aliases' ETags for the whole build (BuildGuard), so a
+# concurrent touch_user_*_index_state write to the same manifest fails the
+# publication with 412 at its final write -- on every retry while bulk metadata
+# writes keep touching (seen live 2026-11-19: one wave's search scope failed
+# for 25+ minutes). Writers record a marker instead; the lease holder replays
+# the touches once it releases the lease.
+DEFERRED_DIRTY_SUFFIX = '.deferred-dirty'
+CATALOG_LEASE_CHECK_TTL_SECONDS = 1.0
+_LEASE_STATE = {}
+_LEASE_STATE_LOCK = threading.Lock()
+_REPLAYING = ContextVar('catalog_deferred_dirty_replay', default=False)
+
+
+def catalog_lock_blob_name(library):
+    import hashlib
+    return 'catalog-publication-locks/' + hashlib.sha256(library.encode()).hexdigest() + '.json'
+
+
+def _deferred_dirty_blob_name(library):
+    return catalog_lock_blob_name(library)[:-len('.json')] + DEFERRED_DIRTY_SUFFIX
+
+
+def catalog_lease_held(blobs, container, library, *, fresh=False):
+    """Whether any worker holds this library's catalog lease right now.
+    Cached briefly per process: every photo write touches several manifests."""
+    now = time.monotonic()
+    if not fresh:
+        with _LEASE_STATE_LOCK:
+            cached = _LEASE_STATE.get(library)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+    try:
+        props = blobs.get_blob_client(container=container, blob=catalog_lock_blob_name(library)).get_blob_properties()
+        held = getattr(getattr(props, 'lease', None), 'state', None) == 'leased'
+    except ResourceNotFoundError:
+        held = False
+    with _LEASE_STATE_LOCK:
+        _LEASE_STATE[library] = (now + CATALOG_LEASE_CHECK_TTL_SECONDS, held)
+    return held
+
+
+def defer_dirty_touch(blobs, container, library):
+    """True when the caller must skip its manifest write: a publication holds
+    the lease and the touch is recorded for replay. Fails open (False)."""
+    if _REPLAYING.get() or blobs is None or not container:
+        return False
+    try:
+        if not catalog_lease_held(blobs, container, library):
+            return False
+        marker = blobs.get_blob_client(container=container, blob=_deferred_dirty_blob_name(library))
+        marker.upload_blob(b'1', overwrite=True)
+        # The holder replays only markers it sees after releasing; if it
+        # released meanwhile, apply the touch here instead of stranding it.
+        if catalog_lease_held(blobs, container, library, fresh=True):
+            return True
+        _take_deferred_dirty(blobs, container, library)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning('Catalog dirty deferral failed for %s', library, exc_info=True)
+    return False
+
+
+def _take_deferred_dirty(blobs, container, library):
+    try:
+        blobs.get_blob_client(container=container, blob=_deferred_dirty_blob_name(library)).delete_blob()
+        return True
+    except ResourceNotFoundError:
+        return False
+
+
+def replay_deferred_dirty(blobs, container, library):
+    """Run by the lease holder after release: re-dirty what changed mid-build."""
+    with _LEASE_STATE_LOCK:
+        _LEASE_STATE.pop(library, None)
+    try:
+        if not _take_deferred_dirty(blobs, container, library):
+            return
+        import storage_utils
+        token = _REPLAYING.set(True)
+        try:
+            storage_utils.replay_catalog_dirty_touches(library)
+        finally:
+            _REPLAYING.reset(token)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning('Deferred catalog dirty replay failed for %s', library, exc_info=True)
+
+
 @contextmanager
 def catalog_serialization(table,library,blobs,container, *, require_real=False):
     """Universal renewable library lock, held BEFORE base capture through commit.
@@ -218,9 +307,7 @@ def catalog_serialization(table,library,blobs,container, *, require_real=False):
             raise RuntimeError('Real catalog serialization storage unavailable')
         yield None
         return
-    import hashlib
-    probe = blobs.get_blob_client(container=container, blob='catalog-publication-locks/' +
-                                  hashlib.sha256(library.encode()).hexdigest() + '.json')
+    probe = blobs.get_blob_client(container=container, blob=catalog_lock_blob_name(library))
     if not callable(getattr(probe, 'acquire_lease', None)):
         if require_real:
             raise RuntimeError('Real catalog lease required')
@@ -228,29 +315,35 @@ def catalog_serialization(table,library,blobs,container, *, require_real=False):
         return
     from clustering_lease import BlobLibraryLeaseFactory, RetryableLibraryLeaseError
     factory=BlobLibraryLeaseFactory(blobs,container,namespace='catalog-publication-locks')
-    with ExitStack() as stack:
-        # A contending lease is valid for at most BlobLibraryLeaseFactory's
-        # own max duration (60s), whether its holder is still alive and
-        # renewing it or died right after a renewal. Retry past that worst
-        # case (margin added) with capped exponential backoff instead of
-        # failing the whole (often expensive, worker-side) caller on the
-        # first collision -- almost all contention, including an abandoned
-        # lease, clears well within this window.
-        deadline=time.monotonic()+65
-        attempt=0
-        while True:
+    acquired=False
+    try:
+        with ExitStack() as stack:
+            # A contending lease is valid for at most BlobLibraryLeaseFactory's
+            # own max duration (60s), whether its holder is still alive and
+            # renewing it or died right after a renewal. Retry past that worst
+            # case (margin added) with capped exponential backoff instead of
+            # failing the whole (often expensive, worker-side) caller on the
+            # first collision -- almost all contention, including an abandoned
+            # lease, clears well within this window.
+            deadline=time.monotonic()+65
+            attempt=0
+            while True:
+                try:
+                    guard=stack.enter_context(factory(library))
+                    acquired=True
+                    break
+                except RetryableLibraryLeaseError:
+                    remaining=deadline-time.monotonic()
+                    if remaining<=0:raise
+                    attempt+=1
+                    time.sleep(min(2**attempt,8,remaining))
+            token=_CATALOG.set((library, guard))
             try:
-                guard=stack.enter_context(factory(library))
-                break
-            except RetryableLibraryLeaseError:
-                remaining=deadline-time.monotonic()
-                if remaining<=0:raise
-                attempt+=1
-                time.sleep(min(2**attempt,8,remaining))
-        token=_CATALOG.set((library, guard))
-        try:
-            guard.check();yield guard;guard.check()
-        finally:_CATALOG.reset(token)
+                guard.check();yield guard;guard.check()
+            finally:_CATALOG.reset(token)
+    finally:
+        if acquired:
+            replay_deferred_dirty(blobs,container,library)
 
 
 def serialize_catalog(function):
