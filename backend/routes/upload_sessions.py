@@ -180,7 +180,8 @@ def library_processing():
         from wave_policy import owned
         if not owned(app.jobs_table_client, library):
             return _no_store(app.jsonify(waves=[]))
-        waves = ProgressStore(ShadowWaves(app.jobs_table_client, library)).active(user)
+        waves = ProgressStore(ShadowWaves(app.jobs_table_client, library)).active(
+            user, can_repair=bool(app.library_store.is_owner(user, library)))
         return _no_store(app.jsonify(waves=waves))
     except AzureError:
         app.app.logger.warning('Processing progress unavailable', exc_info=True)

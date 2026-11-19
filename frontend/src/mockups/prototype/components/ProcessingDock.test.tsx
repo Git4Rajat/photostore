@@ -3,18 +3,19 @@ import { render, screen, waitFor, cleanup } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const services = vi.hoisted(() => ({ uploadActive: false }));
-const api = vi.hoisted(() => ({ fetchProcessingWaves: vi.fn(), dismissProcessingWave: vi.fn(() => Promise.resolve()) }));
+const api = vi.hoisted(() => ({ fetchProcessingWaves: vi.fn(), dismissProcessingWave: vi.fn(() => Promise.resolve()), retryStuckProcessing: vi.fn() }));
 
 vi.mock('../../../components/AppServicesProvider', () => ({ useAppServices: () => services }));
 vi.mock('../../../services/processingProgress', async (importOriginal) => ({
     ...(await importOriginal<typeof import('../../../services/processingProgress')>()),
     fetchProcessingWaves: api.fetchProcessingWaves,
     dismissProcessingWave: api.dismissProcessingWave,
+    retryStuckProcessing: api.retryStuckProcessing,
 }));
 
 import ProcessingDock from './ProcessingDock';
 
-afterEach(() => { cleanup(); services.uploadActive = false; api.fetchProcessingWaves.mockReset(); });
+afterEach(() => { cleanup(); services.uploadActive = false; api.fetchProcessingWaves.mockReset(); api.retryStuckProcessing.mockReset(); });
 
 const wave = (extra: object) => ({ waveId: 'w', stage: 'vision', state: 'processing', startedAt: 0, stageEnteredAt: Date.now() / 1000, ...extra });
 
@@ -73,6 +74,31 @@ describe('ProcessingDock', () => {
         render(<ProcessingDock />);
         await waitFor(() => expect(screen.getByText('Photos are ready, some had problems')).toBeTruthy());
         expect(screen.getByText(/56 photos couldn’t be processed/)).toBeTruthy();
+    });
+
+    it('retries on click and then waits instead of letting the button be pressed again', async () => {
+        api.fetchProcessingWaves.mockResolvedValue([wave({ stage: 'cluster', state: 'ready', problem: 'failed', retryable: true })]);
+        api.retryStuckProcessing.mockResolvedValue({ retried: [{ waveId: 'w', stage: 'cluster' }], skipped: [] });
+        render(<ProcessingDock />);
+        const button = await screen.findByRole('button', { name: 'Retry' });
+        button.click();
+        await waitFor(() => expect(screen.getByRole('button', { name: 'Retry queued' })).toBeTruthy());
+        expect((screen.getByRole('button', { name: 'Retry queued' }) as HTMLButtonElement).disabled).toBe(true);
+        expect(api.retryStuckProcessing).toHaveBeenCalledTimes(1);
+    });
+
+    it('offers no Retry when nothing can be unblocked, and tells members to ask the owner', async () => {
+        api.fetchProcessingWaves.mockResolvedValue([wave({ problem: 'blocked' })]);
+        const view = render(<ProcessingDock />);
+        await waitFor(() => expect(screen.getByText('Waiting for an earlier upload to finish processing')).toBeTruthy());
+        expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
+        view.unmount();
+        api.fetchProcessingWaves.mockResolvedValue([wave({ problem: 'failed', askOwner: true })]);
+        render(<ProcessingDock />);
+        const head = await screen.findByRole('button', { name: /Show details/ });
+        head.click();
+        await waitFor(() => expect(screen.getByText('Ask the library owner to retry this.')).toBeTruthy());
+        expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
     });
 
     it('stays out of the way while files are still uploading', async () => {

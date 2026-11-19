@@ -1,4 +1,4 @@
-import { get, post } from './apiClient';
+import { get, post, postUpload } from './apiClient';
 
 // Estimated background progress after an upload (backend/processing_progress.py).
 // The server owns the state; GET /api/processing is authoritative and a push only
@@ -23,6 +23,14 @@ export interface ProcessingWave {
     problem?: 'failed' | 'blocked' | 'stalled';
     noProgressSeconds?: number;
     blockedBy?: string;
+    // A retry can unblock this wave (owner), or could if the library owner pressed it (member).
+    retryable?: boolean;
+    askOwner?: boolean;
+}
+
+export interface RetryResult {
+    retried: Array<{ waveId: string; stage: string }>;
+    skipped: Array<{ waveId: string; reason: 'blocked' | 'working' | 'waiting' }>;
 }
 
 export interface ProcessingPush {
@@ -37,6 +45,16 @@ const REQUEST = { singleAttempt: true, timeout: 15000 };
 export const fetchProcessingWaves = async (): Promise<ProcessingWave[]> => {
     const body = await get<{ waves?: ProcessingWave[] }>('/api/processing', REQUEST);
     return Array.isArray(body?.waves) ? body.waves : [];
+};
+
+// One click: the server re-queues every stuck wave that is not itself waiting on an earlier one.
+export const retryStuckProcessing = () => postUpload<RetryResult>('/upload/waves/live/retry-stuck', {});
+
+export const retryOutcomeText = (result: RetryResult): string => {
+    if (result.retried.length) return 'Retry queued. Later uploads will start once this one is done.';
+    if (result.skipped.some((item) => item.reason === 'working')) return 'It is still being worked on. Give it a few minutes.';
+    if (result.skipped.some((item) => item.reason === 'blocked')) return 'Waiting for an earlier upload, so there is nothing to retry yet.';
+    return 'Nothing needed retrying.';
 };
 
 export const dismissProcessingWave = (waveId: string) => post(

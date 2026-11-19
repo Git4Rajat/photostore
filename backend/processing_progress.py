@@ -103,7 +103,7 @@ class ProgressStore:
         self._seen[wave_id] = row
         return dict(row, RowKey=key), step != old_step and (total >= SMALL_WAVE or force)
 
-    def _health(self, wave_id, wave):
+    def _health(self, wave_id, wave, can_repair=False):
         """Advisory: a health read that fails just means no problem is reported."""
         out = dict(failedMembers=int(wave.get('failedMembers') or 0))
         try:
@@ -112,6 +112,10 @@ class ProgressStore:
         except Exception:
             return out
         problem = problem_of(health)
+        from wave_retry import retryable
+        if retryable(health):
+            # Only the library owner can repair; others are told to ask.
+            out.update(retryable=can_repair, askOwner=not can_repair)
         if problem:
             out.update(problem=problem, noProgressSeconds=int(float(health.get('noProgressSeconds') or 0)),
                        dispatchAttempts=int(health.get('dispatchAttempts') or 0))
@@ -129,7 +133,7 @@ class ProgressStore:
         except ResourceNotFoundError:
             return False
 
-    def active(self, user):
+    def active(self, user, can_repair=False):
         """Waves worth showing: still running, or finished within the retention window and
         not dismissed by this user. Stages read from the wave state, so a wave whose vision
         stage wrote nothing (no faces, empty) still appears while it indexes."""
@@ -155,7 +159,7 @@ class ProgressStore:
                 item.update(done=int(row.get('done') or 0), total=int(row.get('total') or 0),
                             etaSeconds=None if int(row.get('etaSeconds', -1)) < 0 else int(row['etaSeconds']))
             if not complete:
-                item.update(self._health(wave_id, wave))
+                item.update(self._health(wave_id, wave, can_repair))
             if complete:
                 item.update(processedSeconds=max(0, round(float(wave['stateEnteredAt']) - float(
                     wave.get('frozenAt') or wave['createdAt']))), failed=int(wave.get('failedMembers') or 0))
