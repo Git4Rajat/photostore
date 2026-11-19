@@ -368,7 +368,9 @@ def test_intake_close_and_vision_marker_commit_together_and_reopen_invalidates_e
     assert store.status(wave)['visionPendingKey'] != marker['RowKey']
 
 
-def test_retry_exhaustion_cannot_partially_commit_intake(world):
+def test_retry_exhaustion_cannot_partially_commit_intake(world, monkeypatch):
+    import upload_waves
+    monkeypatch.setattr(upload_waves, 'MUTATION_PATIENCE_SECONDS', 0)
     store, table, _ = world
     attempts = []
     original = table.submit_transaction
@@ -489,6 +491,7 @@ def test_storage_contention_is_distinct_and_records_failed_operation(world, monk
     from upload_waves import MutationContention
     store, _, _ = world
     events = []
+    monkeypatch.setattr(upload_waves, 'MUTATION_PATIENCE_SECONDS', 0)
     monkeypatch.setattr(upload_waves.time, 'sleep', lambda seconds: None)
     monkeypatch.setattr(processing_diagnostics, 'emit', lambda name, **fields: events.append((name, fields)))
     def conflict(): raise ResourceModifiedError('ETag changed')
@@ -499,3 +502,40 @@ def test_storage_contention_is_distinct_and_records_failed_operation(world, monk
     assert events[0][1]['operation'].endswith('.conflict')
     assert events[0][1]['attempts'] == MAX_RETRIES
     assert isinstance(caught.value.__cause__, ResourceModifiedError)
+
+
+def _fake_clock(monkeypatch):
+    import upload_waves
+    now = [1000.0]
+    monkeypatch.setattr(upload_waves.time, 'monotonic', lambda: now[0])
+    monkeypatch.setattr(upload_waves.time, 'sleep', lambda seconds: now.__setitem__(0, now[0] + seconds))
+    return now
+
+
+def test_a_wave_mutation_outlasts_a_long_burst_of_control_row_races(world, monkeypatch):
+    # A 10k-file upload made finalize lose the control row more than 16 times
+    # in a row; the photo was stored but its wave item was reported failed.
+    from upload_waves import MAX_RETRIES
+    store, _, _ = world
+    _fake_clock(monkeypatch)
+    attempts = []
+    def competing_write():
+        attempts.append(1)
+        if len(attempts) <= MAX_RETRIES * 3:
+            raise ResourceModifiedError('another finalize committed')
+        return 'committed'
+    assert store._retry(competing_write) == 'committed'
+    assert len(attempts) == MAX_RETRIES * 3 + 1
+
+
+def test_a_wave_mutation_still_gives_up_once_its_patience_runs_out(world, monkeypatch):
+    import upload_waves
+    from upload_waves import MutationContention
+    store, _, _ = world
+    now = _fake_clock(monkeypatch)
+    started = now[0]
+    def conflict(): raise ResourceModifiedError('ETag changed')
+    with pytest.raises(MutationContention):
+        store._retry(conflict)
+    waited = now[0] - started
+    assert upload_waves.MUTATION_PATIENCE_SECONDS <= waited < upload_waves.MUTATION_PATIENCE_SECONDS + 1
