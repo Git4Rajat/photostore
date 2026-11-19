@@ -2578,9 +2578,36 @@ def _mark_index_rebuild_completed(user_id: str, kind: str) -> None:
         _INDEX_REBUILD_LAST_COMPLETED_AT[(user_id, kind)] = datetime.now(timezone.utc)
 
 
+
+def _defer_manifest_touch(user_id: str) -> bool:
+    """Skip a dirty-manifest write while a catalog publication holds this
+    library's lease; it is replayed on release (see
+    index_publication.defer_dirty_touch)."""
+    import index_publication
+    return index_publication.defer_dirty_touch(
+        _CTX.get('blob_service_client'), _lexical_index_container_name(), user_id)
+
+
+def replay_catalog_dirty_touches(user_id: str) -> None:
+    """Re-dirty every manifest a publication pins, after touches were deferred
+    during it. Over-dirtying is safe; a lost touch would leave stale indexes."""
+    key = str(user_id or '').strip()
+    if not key:
+        return
+    for kind in ('vector', 'lexical', 'sort', 'access', 'albums'):
+        _clear_manifest_dirty_flag(key, kind)
+    touch_user_vector_index_state(key)
+    touch_user_lexical_index_state(key)
+    if not sort_index_skipped(key):
+        touch_user_sort_index_state(key, touch_albums=False)
+    touch_user_access_index_state(key)
+    touch_user_albums_index_state(key)
+
 def touch_user_vector_index_state(user_id: str, *, embedding_version: Optional[str] = None) -> str:
     key = str(user_id or '').strip()
     if not key:
+        return ''
+    if _defer_manifest_touch(key):
         return ''
     if _manifest_already_marked_dirty(key, 'vector'):
         return ''
@@ -4921,6 +4948,8 @@ def touch_user_lexical_index_state(user_id: str) -> str:
     key = str(user_id or '').strip()
     if not key:
         return ''
+    if _defer_manifest_touch(key):
+        return ''
     # Snapshot upgrades do not clear the shared dirty latch. Each touch must
     # still dirty/fence a newly upgraded snapshot, including repeated touches
     # during the SAME shared catalog dirty period.
@@ -5790,6 +5819,8 @@ def touch_user_sort_index_state(user_id: str, *, touch_albums: bool = True) -> s
     manifest blob, independent of the lexical one."""
     key = str(user_id or '').strip()
     if not key:
+        return ''
+    if _defer_manifest_touch(key):
         return ''
     if _manifest_already_marked_dirty(key, 'sort'):
         return ''
@@ -6677,6 +6708,8 @@ def touch_user_access_index_state(user_id: str) -> str:
     key = str(user_id or '').strip()
     if not key:
         return ''
+    if _defer_manifest_touch(key):
+        return ''
     if _manifest_already_marked_dirty(key, 'access'):
         return ''
     source_version = datetime.now(timezone.utc).isoformat()
@@ -7047,6 +7080,8 @@ def touch_user_albums_index_state(user_id: str) -> str:
     the search manifests once per processing step."""
     key = str(user_id or '').strip()
     if not key:
+        return ''
+    if _defer_manifest_touch(key):
         return ''
     if _manifest_already_marked_dirty(key, 'albums'):
         return ''

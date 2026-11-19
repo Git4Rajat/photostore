@@ -10971,7 +10971,9 @@ def _delete_library_lock_blobs(library_id: str) -> None:
     if blob_service_client is None:
         return
     name = hashlib.sha256(library_id.encode('utf-8')).hexdigest() + '.json'
+    from index_publication import DEFERRED_DIRTY_SUFFIX
     for container, blob in ((BLOB_LEXICAL_INDEX_CONTAINER, 'catalog-publication-locks/' + name),
+                            (BLOB_LEXICAL_INDEX_CONTAINER, 'catalog-publication-locks/' + name[:-len('.json')] + DEFERRED_DIRTY_SUFFIX),
                             (BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER, 'faiss-assignment-locks/' + name)):
         try:
             blob_service_client.get_blob_client(container=container, blob=blob).delete_blob()
