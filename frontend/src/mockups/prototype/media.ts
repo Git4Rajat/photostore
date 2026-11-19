@@ -29,6 +29,9 @@ const directThumbnailSource = (photo: Photo): string | undefined => {
     if (!photo.thumbnailUrl) {
         return undefined;
     }
+    if (photo.thumbnailUrl.startsWith('blob:')) {
+        return photo.thumbnailUrl;
+    }
     return isHttpUrl(photo.thumbnailUrl) ? photo.thumbnailUrl : resolveApiUrl(photo.thumbnailUrl);
 };
 
@@ -48,6 +51,8 @@ export function usePhotoThumbnails(photos: Photo[]): Record<string, string> {
             return;
         }
         const need = photos
+            // A not-yet-indexed upload has no server thumbnail to mint a URL for.
+            .filter((p) => !p.pendingIndex)
             .filter((p) => shouldFetchScopedThumbnail(p.filename, p.thumbnailUrl))
             .filter((p) => !thumbnailUrlForBlob(getCachedSortThumb(p.filename), getCachedMediaToken()))
             .map((p) => p.filename)
@@ -81,6 +86,8 @@ export function usePhotoThumbnails(photos: Photo[]): Record<string, string> {
         const tokenUrl = thumbnailUrlForBlob(getCachedSortThumb(photo.filename), getCachedMediaToken());
         if (tokenUrl) {
             out[photo.filename] = tokenUrl;
+        } else if (photo.pendingIndex) {
+            if (photo.thumbnailUrl) out[photo.filename] = photo.thumbnailUrl;
         } else if (shouldFetchScopedThumbnail(photo.filename, photo.thumbnailUrl)) {
             const url = scoped[photo.filename];
             if (url) {

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import random
 import time
@@ -27,6 +28,12 @@ MAX_PAGE = 20
 # per-item transaction fan-out is larger.
 REGISTER_MAX_PAGE = 90
 MAX_RETRIES = 16
+# How long a wave mutation keeps retrying the shared library control row once
+# MAX_RETRIES attempts have lost. Every finalize in a large upload resolves its
+# items through that one row; at ~350 files/min a quarter of finalize-batch
+# requests lost 16 races in a row (~1-2 s) and failed with 503 even though
+# the photos themselves were stored. Same patience as index coverage (#209).
+MUTATION_PATIENCE_SECONDS = float(os.getenv('UPLOAD_WAVE_MUTATION_PATIENCE_SECONDS', '20'))
 EMPTY_DIGEST = hashlib.sha256(b'upload-wave-shadow-v1').hexdigest()
 
 
@@ -119,7 +126,8 @@ class ShadowWaves:
 
     def _retry(self, action):
         started = time.monotonic()
-        for attempt in range(MAX_RETRIES):
+        attempt = 0
+        while True:
             try:
                 return action()
             except (ResourceExistsError, ResourceModifiedError) as error:
@@ -128,18 +136,19 @@ class ShadowWaves:
                 if error.status_code not in (409, 412):
                     raise
                 conflict = error
-            if attempt + 1 == MAX_RETRIES:
+            attempt += 1
+            if attempt >= MAX_RETRIES and time.monotonic() - started >= MUTATION_PATIENCE_SECONDS:
                 import processing_diagnostics
                 processing_diagnostics.emit('wave_mutation_contention',
-                    operation=getattr(action, '__qualname__', type(action).__name__).replace('.<locals>.', '.').replace('<lambda>', 'lambda')[-80:], attempts=MAX_RETRIES,
+                    operation=getattr(action, '__qualname__', type(action).__name__).replace('.<locals>.', '.').replace('<lambda>', 'lambda')[-80:], attempts=attempt,
                     milliseconds=(time.monotonic() - started) * 1000,
                     status=getattr(conflict, 'status_code', None),
                     transaction_index=getattr(conflict, 'index', None))
                 raise MutationContention('Concurrent wave mutation; retry the request') from conflict
             # Immediate retries can repeatedly lose to another request on the
             # library control row. Yield with bounded jitter; still fail closed
-            # after MAX_RETRIES rather than weakening the conditional commit.
-            time.sleep(random.uniform(0.001, min(0.5, 0.002 * (2 ** attempt))))
+            # after the patience rather than weakening the conditional commit.
+            time.sleep(random.uniform(0.001, min(0.5, 0.002 * (2 ** min(attempt - 1, 8)))))
 
     def _page(self, prefix, after='', *, size=MAX_PAGE):
         # RowKey range + service paging: never materialize an entire library.
