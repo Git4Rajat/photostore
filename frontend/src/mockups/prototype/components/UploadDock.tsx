@@ -91,7 +91,7 @@ const FailedRows: React.FC<{ files: PersistedUploadFile[]; onRetry?: () => void;
 export const UploadDock: React.FC = () => {
     const {
         uploadActive, uploading, uploadProgress: progress, uploadCheckProgress: checking, pendingUploadSummary, pendingUploadFailedFiles,
-        stopActiveUpload, retryPersistedUploadSession, discardPersistedUploadSession, requestUpload,
+        pauseActiveUpload, cancelRemainingUpload, retryPersistedUploadSession, discardPersistedUploadSession, requestUpload,
     } = useAppServices();
     const narrow = useNarrow();
     const [sheetOpen, setSheetOpen] = useState(false);
@@ -130,19 +130,20 @@ export const UploadDock: React.FC = () => {
     // Everything is finished or dropped: forget the last retry.
     useEffect(() => { if (!pending && !uploadActive) setRetryOf(null); }, [pending, uploadActive]);
 
-    // Cancel = pause, then drop what is left once the pause has landed, then say how it ended.
+    // Cancel = pause (files in flight finish and form their wave), then drop what never started once the
+    // pause has landed; files that failed stay for Try again. Then say how it ended.
     useEffect(() => {
         if (!cancelling || uploadActive || discardingRef.current) return;
         discardingRef.current = true;
         void (async () => {
-            if (pendingUploadSummary) await discardPersistedUploadSession();
+            if (pendingUploadSummary) await cancelRemainingUpload();
             discardingRef.current = false;
             setCancelling(false);
             setActing(null);
             setSheetOpen(false);
             setOutcome({ kind: 'cancelled', ...cancelSnapshotRef.current });
         })();
-    }, [cancelling, uploadActive, pendingUploadSummary, discardPersistedUploadSession]);
+    }, [cancelling, uploadActive, pendingUploadSummary, cancelRemainingUpload]);
 
     useEffect(() => { if (!visible) setSheetOpen(false); }, [visible]);
 
@@ -184,7 +185,7 @@ export const UploadDock: React.FC = () => {
     const pause = () => {
         if (acting) return;
         setActing('pause');
-        stopActiveUpload();
+        pauseActiveUpload();
     };
     const cancel = async () => {
         if (acting) return;
@@ -202,7 +203,7 @@ export const UploadDock: React.FC = () => {
         cancelSnapshotRef.current = { added: stays, notAdded };
         setCancelling(true);
         if (narrow) setSheetOpen(true);
-        stopActiveUpload();
+        pauseActiveUpload();
     };
     const retry = async () => {
         if (acting) return;

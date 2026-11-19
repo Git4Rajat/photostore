@@ -16,7 +16,7 @@ const setServices = (over: Record<string, unknown>) => {
     Object.assign(services, {
         uploadActive: false, uploading: false, uploadProgress: null, uploadCheckProgress: null,
         pendingUploadSummary: { fileCount: 2, failedCount: 2 }, pendingUploadFailedFiles: [failedFile(1), failedFile(2)],
-        stopActiveUpload: vi.fn(), retryPersistedUploadSession: vi.fn(() => new Promise<void>(() => undefined)),
+        pauseActiveUpload: vi.fn(), cancelRemainingUpload: vi.fn(() => Promise.resolve()), stopActiveUpload: vi.fn(), retryPersistedUploadSession: vi.fn(() => new Promise<void>(() => undefined)),
         discardPersistedUploadSession: vi.fn(() => Promise.resolve()), requestUpload: vi.fn(),
     }, over);
 };
@@ -64,7 +64,7 @@ describe('UploadDock actions', () => {
         setServices({ uploadActive: true, uploading: true, uploadProgress: { uploadedCount: 3, totalCount: 10, failedCount: 0 }, pendingUploadFailedFiles: [] });
         render(<UploadDock />);
         fireEvent.click(screen.getByRole('button', { name: 'Pause' }));
-        expect(services.stopActiveUpload).toHaveBeenCalledTimes(1);
+        expect(services.pauseActiveUpload).toHaveBeenCalledTimes(1);
         expect((screen.getByRole('button', { name: 'Pausing…' }) as HTMLButtonElement).disabled).toBe(true);
         expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(true);
     });

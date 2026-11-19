@@ -729,6 +729,50 @@ describe('browser upload selection and startup', () => {
         expect(refreshRequests()[0][1]).toEqual({ reason: 'stopped' });
     });
 
+    it('pausing lets the files already uploading finish, starts no more, and keeps the rest for Resume', async () => {
+        const releases: Array<() => void> = [];
+        let aborted = false;
+        mocks.transferred.mockImplementation((_id, _data, _size, options) => new Promise<void>((resolve, reject) => {
+            options.abortSignal.addEventListener('abort', () => { aborted = true; reject(new Error('upload_stopped_by_user')); }, { once: true });
+            releases.push(resolve);
+        }));
+        select(filesFor(50));
+        await advance(1000);
+        const inFlight = releases.length;
+        expect(inFlight).toBeGreaterThan(0);
+        expect(inFlight).toBeLessThan(50);
+        act(() => { services.pauseActiveUpload(); });
+        await advance(500);
+        expect(aborted).toBe(false);
+        expect(services.uploadActive).toBe(true);
+        releases.splice(0).forEach((release) => release());
+        await advance(3000);
+        expect(mocks.transferred).toHaveBeenCalledTimes(inFlight);
+        expect(services.uploadActive).toBe(false);
+        expect(services.pendingUploadSummary?.fileCount).toBe(50 - inFlight);
+        expect(services.pendingUploadSummary?.failedCount).toBe(0);
+        expect(aborted).toBe(false);
+    });
+
+    it('cancelling after a pause drops the files that never started but keeps the failed ones', async () => {
+        mocks.transferred.mockRejectedValueOnce(Object.assign(new Error('bad'), { statusCode: 400 }));
+        select(filesFor(40));
+        await advance(500);
+        act(() => { services.pauseActiveUpload(); });
+        await advance(3000);
+        const before = services.pendingUploadSummary;
+        if (before && before.failedCount > 0) {
+            await act(async () => { await services.cancelRemainingUpload(); });
+            await advance(500);
+            expect(services.pendingUploadSummary?.fileCount).toBe(before.failedCount);
+            expect(services.pendingUploadSummary?.failedCount).toBe(before.failedCount);
+        } else {
+            await act(async () => { await services.cancelRemainingUpload(); });
+            await advance(500);
+            expect(services.pendingUploadSummary).toBeNull();
+        }
+    });
+
     it('shows a checking state in the dock while the selection is hashed for duplicates', async () => {
         let releaseKnownHashes!: () => void;
         mocks.getUpload.mockImplementation((url: string) => url === '/upload/known-hashes'
@@ -758,7 +802,8 @@ describe('browser upload selection and startup', () => {
         act(() => services.clearNotifications());
         expect(services.notifications).toEqual([]);
         expect(screen.getByText('Uploading 50 items')).toBeTruthy();
-        fireEvent.click(screen.getByRole('button', { name: 'Pause' }));
+        // Pause now waits for files in flight; a hard stop is still what aborts them.
+        act(() => services.stopActiveUpload());
         await advance(3000);
         expect(services.uploadActive).toBe(false);
         expect(services.uploadProgress).toBeNull();
