@@ -1611,7 +1611,9 @@ def get_photo_metadata(filename: str):
             'liked': user_id in liked_by,
             'tags': app.visible_tags(metadata),
             'rotation': app._normalize_rotation(metadata.get('rotation', 0)),
-            'objects': app.parse_json_list(metadata.get('objects', '[]')),
+            # Same location/sensitive filtering as 'tags': the info panel shows both lists together.
+            'objects': __import__('search_utils').strip_location_metadata_tags(
+                app.parse_json_list(metadata.get('objects', '[]')), metadata),
             'ocrText': metadata.get('ocrText', ''),
             'caption': metadata.get('caption', ''),
             'exifData': exif_data,
