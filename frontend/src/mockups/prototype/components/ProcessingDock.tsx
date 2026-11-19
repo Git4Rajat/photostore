@@ -1,11 +1,11 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { CheckGlyph, CloseGlyph, ChevGlyph } from './RedesignIcons';
+import { AlertGlyph, CheckGlyph, CloseGlyph, ChevGlyph } from './RedesignIcons';
 import { useAppServices } from '../../../components/AppServicesProvider';
 import BottomSheet from './BottomSheet';
 import { plural } from '../../../utils/format';
 import {
-    STAGE_TITLES, clampMonotonic, dismissProcessingWave, etaLabel, fetchProcessingWaves, isProcessingPushLive,
-    onProcessingSignal, stepNumber, takingLonger, type ProcessingStage, type ProcessingWave,
+    STAGE_TITLES, clampMonotonic, dismissProcessingWave, etaLabel, fetchProcessingWaves, isProcessingPushLive, isTrouble,
+    onProcessingSignal, problemText, stepNumber, takingLonger, type ProcessingStage, type ProcessingWave,
 } from '../../../services/processingProgress';
 
 // Socket up: one safety read now and then. Socket down: follow the bar closely, but only while it is on screen.
@@ -25,14 +25,30 @@ const stepState = (wave: ProcessingWave, step: ProcessingStage): 'done' | 'now' 
 };
 
 const subline = (wave: ProcessingWave, now: number): string => {
+    const problem = problemText(wave);
     if (wave.stage === 'done') {
         const minutes = Math.max(1, Math.round((wave.processedSeconds ?? 0) / 60));
-        return `Done in ${plural(minutes, 'minute')}`;
+        return [`Done in ${plural(minutes, 'minute')}`, problem].filter(Boolean).join(' · ');
     }
     const base = `Step ${stepNumber(wave.stage)} of 3 · ${STAGE_TITLES[wave.stage]}`;
+    if (wave.problem === 'blocked') return problem as string;
+    if (problem) return `${base} · ${problem}`;
     if (takingLonger(wave, now)) return `${base} · taking longer than expected`;
     const eta = wave.stage === 'vision' ? etaLabel(wave.etaSeconds) : null;
     return eta ? `${base} · ${eta}` : base;
+};
+
+const headline = (wave: ProcessingWave): string => {
+    if (wave.stage === 'done') return wave.failed ? 'Photos are ready, some had problems' : 'All photos are ready';
+    if (wave.problem === 'failed') return 'Photo processing hit a problem';
+    if (wave.problem === 'stalled') return 'Photo processing has stopped moving';
+    return 'Getting your photos ready';
+};
+
+const ADVICE: Record<string, string> = {
+    failed: 'We stopped after several tries. Your photos are safe in your library, but search and people may be incomplete until this is retried from Tools.',
+    stalled: 'Your photos are safe. This is taking much longer than usual, and we are still watching it.',
+    blocked: 'Your photos are safe. This upload is queued behind an earlier one and starts when that one is done.',
 };
 
 export const ProcessingDock: React.FC = () => {
@@ -92,7 +108,8 @@ export const ProcessingDock: React.FC = () => {
         setWaves((previous) => previous.filter((candidate) => candidate.waveId !== wave.waveId));
         void dismissProcessingWave(wave.waveId).catch(() => undefined);
     };
-    const title = finished ? 'All photos are ready' : 'Getting your photos ready';
+    const title = headline(wave);
+    const trouble = isTrouble(wave);
     const sub = subline(wave, Date.now());
     const pct = Math.round(fraction * 100);
 
@@ -100,13 +117,15 @@ export const ProcessingDock: React.FC = () => {
         <>
             <div className="up-dock up-bar pd-bar" role="region" aria-label="Photo processing">
                 <button type="button" className="up-head" onClick={() => setOpen(true)} aria-label={`${title}. ${sub}. Show details`}>
-                    <span className="up-ico">{finished ? <CheckGlyph aria-hidden="true" /> : <span className="pd-spin" aria-hidden="true" />}</span>
+                    <span className={`up-ico${trouble ? ' bad' : ''}`}>
+                        {trouble ? <AlertGlyph aria-hidden="true" /> : finished ? <CheckGlyph aria-hidden="true" /> : wave.problem === 'blocked' ? <ChevGlyph aria-hidden="true" /> : <span className="pd-spin" aria-hidden="true" />}
+                    </span>
                     <span className="up-t"><b>{title}</b><span>{sub}</span></span>
-                    {finished ? null : <span className="up-pct">{pct}%</span>}
+                    {finished || wave.problem ? null : <span className="up-pct">{pct}%</span>}
                     <ChevGlyph className="up-chev" aria-hidden="true" />
                 </button>
                 {finished ? <button type="button" className="pd-x" onClick={dismiss} aria-label="Dismiss"><CloseGlyph aria-hidden="true" /></button> : null}
-                <div className="pd-seg" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct} aria-label="Processing progress (estimated)">
+                <div className={`pd-seg${trouble ? ' bad' : ''}${wave.problem ? ' idle' : ''}`} role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct} aria-label="Processing progress (estimated)">
                     {STEPS.map((step) => {
                         const state = stepState(wave, step);
                         const within = step === 'vision' && state === 'now' && wave.total ? Math.min(1, (wave.done ?? 0) / wave.total) : null;
@@ -128,12 +147,14 @@ export const ProcessingDock: React.FC = () => {
                                 <li key={step} className={`pd-step ${state}`}>
                                     <span className="pd-dot">{state === 'done' ? <CheckGlyph aria-hidden="true" /> : index + 1}</span>
                                     <span className="pd-txt"><b>{STAGE_TITLES[step]}</b><span>{STEP_COPY[step]}</span></span>
-                                    <span className="pd-tag">{state === 'done' ? 'Done' : state === 'now' ? 'In progress' : ''}</span>
+                                    <span className="pd-tag">{state === 'done' ? 'Done' : state === 'now' ? (wave.problem === 'failed' ? 'Stopped' : wave.problem === 'stalled' ? 'Stuck' : wave.problem === 'blocked' ? 'Waiting' : 'In progress') : ''}</span>
                                 </li>
                             );
                         })}
                     </ol>
-                    {finished ? null : <p className="up-fine">Estimated. You can close this page: this carries on by itself, and we'll tell you in Notifications when it's done.</p>}
+                    {wave.problem ? <p className="up-lede">{ADVICE[wave.problem]}</p> : null}
+                    {wave.failedMembers ? <p className="up-fine">{plural(wave.failedMembers, 'photo')} couldn’t be processed so far.</p> : null}
+                    {finished || wave.problem === 'failed' ? null : <p className="up-fine">Estimated. You can close this page: this carries on by itself, and we'll tell you in Notifications when it's done.</p>}
                     {wave.failed ? <p className="up-fine">{plural(wave.failed, 'photo')} couldn’t be processed.</p> : null}
                 </div>
             </BottomSheet>

@@ -48,6 +48,33 @@ describe('ProcessingDock', () => {
         expect(api.fetchProcessingWaves).toHaveBeenCalledTimes(2);
     });
 
+    it('says so when the server gave up on a stage instead of showing it as in progress', async () => {
+        api.fetchProcessingWaves.mockResolvedValue([wave({ stage: 'cluster', state: 'ready', problem: 'failed', failedMembers: 4 })]);
+        render(<ProcessingDock />);
+        await waitFor(() => expect(screen.getByText('Photo processing hit a problem')).toBeTruthy());
+        expect(screen.getByText(/Finding people stopped after several tries/)).toBeTruthy();
+        expect(screen.queryByText('Getting your photos ready')).toBeNull();
+        expect(screen.queryByText(/%$/)).toBeNull();
+    });
+
+    it('says when it is waiting on an earlier upload, and when nothing has moved', async () => {
+        api.fetchProcessingWaves.mockResolvedValue([wave({ problem: 'blocked' })]);
+        const view = render(<ProcessingDock />);
+        await waitFor(() => expect(screen.getByText('Waiting for an earlier upload to finish processing')).toBeTruthy());
+        view.unmount();
+        api.fetchProcessingWaves.mockResolvedValue([wave({ problem: 'stalled', noProgressSeconds: 1500 })]);
+        render(<ProcessingDock />);
+        await waitFor(() => expect(screen.getByText('Photo processing has stopped moving')).toBeTruthy());
+        expect(screen.getByText(/Nothing has moved for 25 min/)).toBeTruthy();
+    });
+
+    it('tells the person when a finished wave left photos unprocessed', async () => {
+        api.fetchProcessingWaves.mockResolvedValue([wave({ stage: 'done', state: 'complete', processedSeconds: 600, failed: 56 })]);
+        render(<ProcessingDock />);
+        await waitFor(() => expect(screen.getByText('Photos are ready, some had problems')).toBeTruthy());
+        expect(screen.getByText(/56 photos couldn’t be processed/)).toBeTruthy();
+    });
+
     it('stays out of the way while files are still uploading', async () => {
         services.uploadActive = true;
         api.fetchProcessingWaves.mockResolvedValue([wave({ done: 1, total: 10 })]);

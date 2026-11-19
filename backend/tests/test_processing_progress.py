@@ -115,3 +115,30 @@ def test_a_wave_is_visible_as_soon_as_its_vision_work_is_queued(live_api):
     execution._announce_queued(store, 'w1', store._get(store.wave_key('w1')))
     waves = ProgressStore(store).active('alice')
     assert [(w['stage'], w['done'], w['total'], w['etaSeconds']) for w in waves] == [('vision', 0, 200, None)]
+
+
+def test_a_failed_blocked_or_idle_wave_is_reported_not_called_in_progress(live_api, monkeypatch):
+    import wave_health
+    _, store, _, _ = live_api
+    wave_row(store, 'w1', failedMembers=3, lastProgressAt=900.0, updatedAt=900.0)
+    ProgressStore(store).record_vision('w1', 50, 200, force=True)
+    pg = ProgressStore(store)
+    health = {}
+    monkeypatch.setattr(wave_health, 'status', lambda s, w: dict(health=health))
+
+    def only():
+        return pg.active('alice')[0]
+
+    health.update(state='processing', noProgressSeconds=30)
+    assert 'problem' not in only() and only()['failedMembers'] == 3
+    health.update(state='pending', noProgressSeconds=progress.STALL_SECONDS)
+    assert only()['problem'] == 'stalled' and only()['noProgressSeconds'] == progress.STALL_SECONDS
+    health.update(state='blocked', blockedByWaveId='older', noProgressSeconds=5)
+    assert only()['problem'] == 'blocked' and only()['blockedBy'] == 'older'
+    health.update(state='failed', reason='dispatch_exhausted', dispatchAttempts=6)
+    assert only()['problem'] == 'failed' and only()['dispatchAttempts'] == 6
+
+    def broken(*args):
+        raise RuntimeError('unavailable')
+    monkeypatch.setattr(wave_health, 'status', broken)
+    assert 'problem' not in only()

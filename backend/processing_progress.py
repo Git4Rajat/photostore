@@ -18,6 +18,8 @@ RATE_ALPHA = 0.3
 MIN_SAMPLES = 3
 SMALL_WAVE = 50
 RETAIN_SECONDS = 24 * 3600
+# Nothing moved for this long while the stage is not failed: say so instead of "in progress".
+STALL_SECONDS = 600
 MAX_ROWS = 200
 STAGE_OF_STATE = {'processing_pending': 'vision', 'processing': 'vision',
                   'ready': 'cluster', 'indexing': 'index'}
@@ -38,6 +40,17 @@ def eta_bucket(seconds):
         if seconds <= bucket:
             return bucket
     return ETA_BUCKETS[-1]
+
+
+def problem_of(health):
+    """What the person should be told is wrong, from wave_health.status()'s health block."""
+    if health.get('state') == 'failed':
+        return 'failed'
+    if health.get('state') == 'blocked':
+        return 'blocked'
+    if health.get('state') in ('pending', 'processing') and float(health.get('noProgressSeconds') or 0) >= STALL_SECONDS:
+        return 'stalled'
+    return None
 
 
 def progress_key(wave_id):
@@ -90,6 +103,22 @@ class ProgressStore:
         self._seen[wave_id] = row
         return dict(row, RowKey=key), step != old_step and (total >= SMALL_WAVE or force)
 
+    def _health(self, wave_id, wave):
+        """Advisory: a health read that fails just means no problem is reported."""
+        out = dict(failedMembers=int(wave.get('failedMembers') or 0))
+        try:
+            from wave_health import status
+            health = status(self.store, wave_id)['health']
+        except Exception:
+            return out
+        problem = problem_of(health)
+        if problem:
+            out.update(problem=problem, noProgressSeconds=int(float(health.get('noProgressSeconds') or 0)),
+                       dispatchAttempts=int(health.get('dispatchAttempts') or 0))
+            if problem == 'blocked':
+                out['blockedBy'] = health.get('blockedByWaveId')
+        return out
+
     def dismiss(self, wave_id, user):
         self._upsert(dismiss_key(wave_id, user), waveId=wave_id, dismissedAt=self.clock())
 
@@ -125,6 +154,8 @@ class ProgressStore:
             if stage == 'vision':
                 item.update(done=int(row.get('done') or 0), total=int(row.get('total') or 0),
                             etaSeconds=None if int(row.get('etaSeconds', -1)) < 0 else int(row['etaSeconds']))
+            if not complete:
+                item.update(self._health(wave_id, wave))
             if complete:
                 item.update(processedSeconds=max(0, round(float(wave['stateEnteredAt']) - float(
                     wave.get('frozenAt') or wave['createdAt']))), failed=int(wave.get('failedMembers') or 0))
