@@ -142,3 +142,14 @@ def test_a_failed_blocked_or_idle_wave_is_reported_not_called_in_progress(live_a
         raise RuntimeError('unavailable')
     monkeypatch.setattr(wave_health, 'status', broken)
     assert 'problem' not in only()
+
+
+def test_a_wave_waiting_behind_an_earlier_one_is_listed_after_it(live_api):
+    _, store, _, _ = live_api
+    pg = ProgressStore(store, clock=Clock())
+    wave_row(store, 'w1')
+    pg.record_vision('w1', 10, 100, force=True)
+    wave_row(store, 'w2', state='waiting_predecessor', memberCount=30)
+    waves = pg.active('alice')
+    assert [(w['waveId'], w['stage'], w['done'], w['total']) for w in waves] == [('w1', 'vision', 0 + 10, 100), ('w2', 'vision', 0, 30)]
+    assert waves[1]['state'] == 'waiting_predecessor'

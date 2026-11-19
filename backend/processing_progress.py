@@ -23,6 +23,7 @@ STALL_SECONDS = 600
 MAX_ROWS = 200
 STAGE_OF_STATE = {'processing_pending': 'vision', 'processing': 'vision',
                   'ready': 'cluster', 'indexing': 'index'}
+QUEUED_STATES = ('waiting_predecessor', 'processing_pending', 'processing')
 # Coarse buckets, in seconds: the rounding is what keeps a rough estimate honest.
 ETA_BUCKETS = (60, 120, 300, 600, 900, 1800, 3600, 7200)
 
@@ -163,5 +164,22 @@ class ProgressStore:
             if complete:
                 item.update(processedSeconds=max(0, round(float(wave['stateEnteredAt']) - float(
                     wave.get('frozenAt') or wave['createdAt']))), failed=int(wave.get('failedMembers') or 0))
+            out.append(item)
+        out.extend(self._queued(user, {item['waveId'] for item in out}, can_repair))
+        return out
+
+    def _queued(self, user, listed, can_repair):
+        """Waves lined up behind an earlier one (or not yet started) have no progress row, so
+        they are read from the wave rows: they appear as vision, 0 of N, waiting their turn."""
+        out = []
+        for row in self.store._page('wave!', size=MAX_ROWS):
+            wave_id = row['RowKey'][len('wave!'):]
+            if wave_id in listed or row.get('state') not in QUEUED_STATES:
+                continue
+            item = dict(waveId=wave_id, stage='vision', state=row['state'], done=0,
+                        total=int(row.get('memberCount') or 0), etaSeconds=None,
+                        startedAt=float(row.get('createdAt') or 0),
+                        stageEnteredAt=float(row.get('stateEnteredAt') or 0))
+            item.update(self._health(wave_id, row, can_repair))
             out.append(item)
         return out

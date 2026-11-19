@@ -108,4 +108,49 @@ describe('ProcessingDock', () => {
         await waitFor(() => expect(api.fetchProcessingWaves).toHaveBeenCalled());
         expect(screen.queryByText('Getting your photos ready')).toBeNull();
     });
+
+    it('speaks for the running upload and says how many are waiting behind it', async () => {
+        api.fetchProcessingWaves.mockResolvedValue([
+            wave({ waveId: 'b', startedAt: 2, state: 'waiting_predecessor', done: 0, total: 30 }),
+            wave({ waveId: 'a', startedAt: 1, done: 50, total: 100 }),
+        ]);
+        render(<ProcessingDock />);
+        await waitFor(() => expect(screen.getByText('Getting your photos ready')).toBeTruthy());
+        expect(screen.getByText('1 more upload is waiting')).toBeTruthy();
+        expect(screen.getByText('35%')).toBeTruthy();
+    });
+
+    it('lets a problem win the bar and says the photos are safe', async () => {
+        api.fetchProcessingWaves.mockResolvedValue([
+            wave({ waveId: 'a', startedAt: 1, stage: 'cluster', state: 'ready', problem: 'failed', retryable: true }),
+            wave({ waveId: 'b', startedAt: 2, state: 'waiting_predecessor', problem: 'blocked' }),
+            wave({ waveId: 'c', startedAt: 3, state: 'waiting_predecessor', problem: 'blocked' }),
+        ]);
+        render(<ProcessingDock />);
+        await waitFor(() => expect(screen.getByText('Photo processing hit a problem')).toBeTruthy());
+        expect(screen.getByText('2 more uploads are waiting. Your photos are safe.')).toBeTruthy();
+    });
+
+    it('stops saying nothing has moved right after a retry', async () => {
+        api.fetchProcessingWaves.mockResolvedValue([wave({ problem: 'stalled', noProgressSeconds: 1500, retryable: true })]);
+        api.retryStuckProcessing.mockResolvedValue({ retried: [{ waveId: 'w', stage: 'vision' }], skipped: [] });
+        render(<ProcessingDock />);
+        await waitFor(() => expect(screen.getByText('Photo processing has stopped moving')).toBeTruthy());
+        screen.getByText('Retry').click();
+        await waitFor(() => expect(screen.getByText('Getting your photos ready')).toBeTruthy());
+        expect(screen.getByText(/retried, waiting for it to start/)).toBeTruthy();
+    });
+
+    it('clears all finished uploads at once from the sheet', async () => {
+        api.fetchProcessingWaves.mockResolvedValue([
+            wave({ waveId: 'a', startedAt: 1, stage: 'done', state: 'complete', processedSeconds: 60 }),
+            wave({ waveId: 'b', startedAt: 2, stage: 'done', state: 'complete', processedSeconds: 60 }),
+        ]);
+        render(<ProcessingDock />);
+        await waitFor(() => expect(screen.getByText('All photos are ready')).toBeTruthy());
+        screen.getByRole('button', { name: /Show details/ }).click();
+        await waitFor(() => expect(screen.getByText('Clear finished')).toBeTruthy());
+        screen.getByText('Clear finished').click();
+        await waitFor(() => expect(api.dismissProcessingWave).toHaveBeenCalledTimes(2));
+    });
 });
