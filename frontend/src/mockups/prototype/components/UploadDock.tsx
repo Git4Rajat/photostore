@@ -127,6 +127,9 @@ export const UploadDock: React.FC = () => {
     // A pause has landed once the upload is no longer active.
     useEffect(() => { if (acting === 'pause' && !uploadActive) setActing(null); }, [acting, uploadActive]);
 
+    // Resume has started once the upload is active again; from then on Pause and Cancel are available.
+    useEffect(() => { if (acting === 'retry' && uploadActive) setActing(null); }, [acting, uploadActive]);
+
     // Everything is finished or dropped: forget the last retry.
     useEffect(() => { if (!pending && !uploadActive) setRetryOf(null); }, [pending, uploadActive]);
 
@@ -212,7 +215,8 @@ export const UploadDock: React.FC = () => {
         try {
             await retryPersistedUploadSession();
         } finally {
-            setActing(null);
+            // The call above lasts the whole resumed upload; Pause or Cancel tapped meanwhile must keep their state.
+            setActing(a => (a === 'retry' ? null : a));
         }
     };
     // Skip takes effect on screen at once; the files are really dropped once the undo window has passed.
