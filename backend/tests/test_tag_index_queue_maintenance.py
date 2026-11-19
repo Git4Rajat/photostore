@@ -343,6 +343,25 @@ def test_source_busy_is_durable_visibility_retry_without_exhausting_budget(env):
     assert env.store._get(key) is None
 
 
+def test_fenced_library_never_sees_a_tag_work_lease(env, monkeypatch):
+    """A clean's proof fails on any live lease, so a fenced library's wake is deferred before claiming."""
+    env.runtime.store.begin('A', 'tag_embedding', ['one'])
+    msg = message(env)
+    key = json.loads(msg.content)['maintenanceKey']
+    claims = []
+    real_claim = index_work.WorkStore.claim
+    monkeypatch.setattr(index_work.WorkStore, 'claim', lambda self, k: claims.append(k) or real_claim(self, k))
+
+    def fenced(user):
+        raise automatic.SourceBusy('Library writers fenced for operator quiescence')
+    monkeypatch.setattr(automatic, 'check_source_admission', fenced)
+    assert app._process_ipwork_message(msg) == 'tag_index_deferred'
+    row = env.store._get(key)
+    assert not claims and not row['failed'] and not row.get('owner') and float(row.get('leaseUntil') or 0) == 0
+    # The replacement wake is delayed, not redelivered at once.
+    assert env.queue.sent[-1][1]['visibility_timeout'] == app.INDEX_BARRIER_RECOVERY_SECONDS
+
+
 def test_duplicate_tag_wakes_are_acked_without_failure_or_renewing_live_owner(env, monkeypatch):
     msg = message(env)
     key = json.loads(msg.content)['maintenanceKey']
