@@ -178,33 +178,76 @@ def enroll_new(table,library,metadata=None):
     store._retry(commit)
 
 
+# Item bindings committed per transaction: Azure Table allows 100 operations,
+# and a binding page also writes the control, policy and session rows plus
+# an optional execution guard.
+ADMISSION_PAGE=90
+
+
 def validate_admission(store,data,*,finalizing=False):
-    session,item=data.get('waveSessionId',''),data.get('waveItemId','')
-    old=store._required(store.item_key(session,item))
+    return validate_admissions(store,[data],finalizing=finalizing)[0]
+
+
+def validate_admissions(store,files,*,finalizing=False):
+    """Bind each upload to its reservation's source bytes, one transaction per
+    session page instead of one per file.
+
+    Every wave transaction rewrites the library's control and policy rows, so
+    a 10k-file upload binding each file on its own made init the dominant
+    writer of those rows. That pushed finalize's wave bindings past their
+    CAS retries (2026-11-19). A page keeps the same fences: the control and
+    policy rows (structural changes, cleanup), the session row (closure,
+    lease) and each item's ETag (one binding per source). It does not advance
+    the control revision: bindings change no wave manifest row, the rows
+    whose concurrent change that revision restarts readiness scans for.
+    """
     from upload_session_lease import active, LEASE_SECONDS
-    if old['filename']!=data.get('filename'):raise Conflict('Upload differs from its reservation')
-    sha=data.get('sha256','')
-    if not isinstance(sha,str) or len(sha)!=64 or any(c not in '0123456789abcdef' for c in sha):
-        raise ValueError('Wave upload requires a source SHA-256')
-    def bind():
-        row=store._required(old['RowKey'])
-        current_parent=store._required(store.session_key(session))
-        if row['outcome'] in ('cancelled','failed') or (
-                not active(current_parent,store.clock()) and row['outcome']=='reserved'):
-            raise Conflict('Upload intake is closed')
-        if row.get('sourceHash'):
-            if row['sourceHash']!=sha:raise Conflict('Upload reservation cannot change source bytes')
-            if not finalizing:return
-            # Init already reserves ten minutes for this exact source. Avoid
-            # making every finalize/retry compete for the library control row
-            # just to extend an otherwise healthy reservation by a few seconds.
-            if row.get('finalizeLeaseUntil',0)-store.clock()>=120:return
-        control=store._required('control')
-        store._commit(control,[store._change(current_parent,dict(current_parent,lastRequestAt=store.clock(),
-            **({'leaseExpiresAt':store.clock()+LEASE_SECONDS} if current_parent.get('leaseExpiresAt') else {}))),store._change(row,dict(row,sourceHash=sha,
-            finalizeLeaseUntil=store.clock()+600 if finalizing else 0))])
-    store._retry(bind)
-    return session,item
+    from table_reads import read_entities
+    bindings=[(data.get('waveSessionId',''),data.get('waveItemId',''),data) for data in files]
+    for session in dict.fromkeys(binding[0] for binding in bindings):
+        requested={}
+        for binding_session,item,data in bindings:
+            if binding_session==session:
+                requested.setdefault(item,[]).append(data)
+        items=list(requested)
+        for offset in range(0,len(items),ADMISSION_PAGE):
+            page=items[offset:offset+ADMISSION_PAGE]
+            def bind(page=page,session=session):
+                keys=[store.item_key(session,item) for item in page]
+                rows=read_entities(store.table,store.partition,keys,workers=4)
+                parent=store._required(store.session_key(session))
+                changes=[]
+                for item,key in zip(page,keys):
+                    row=rows.get(key)
+                    if row is None:raise Conflict('Unknown session, member or wave')
+                    shas=set()
+                    for data in requested[item]:
+                        if row['filename']!=data.get('filename'):raise Conflict('Upload differs from its reservation')
+                        sha=data.get('sha256','')
+                        if not isinstance(sha,str) or len(sha)!=64 or any(c not in '0123456789abcdef' for c in sha):
+                            raise ValueError('Wave upload requires a source SHA-256')
+                        shas.add(sha)
+                    if len(shas)>1:raise Conflict('Upload reservation cannot change source bytes')
+                    sha=shas.pop()
+                    if row['outcome'] in ('cancelled','failed') or (
+                            not active(parent,store.clock()) and row['outcome']=='reserved'):
+                        raise Conflict('Upload intake is closed')
+                    if row.get('sourceHash'):
+                        if row['sourceHash']!=sha:raise Conflict('Upload reservation cannot change source bytes')
+                        if not finalizing:continue
+                        # Init already reserves ten minutes for this exact source. Avoid
+                        # making every finalize/retry compete for the library control row
+                        # just to extend an otherwise healthy reservation by a few seconds.
+                        if row.get('finalizeLeaseUntil',0)-store.clock()>=120:continue
+                    changes.append(store._change(row,dict(row,sourceHash=sha,
+                        finalizeLeaseUntil=store.clock()+600 if finalizing else 0)))
+                if not changes:return
+                control=store._required('control')
+                store._commit(control,[store._change(parent,dict(parent,lastRequestAt=store.clock(),
+                    **({'leaseExpiresAt':store.clock()+LEASE_SECONDS} if parent.get('leaseExpiresAt') else {}))),*changes],
+                    advance=False)
+            store._retry(bind)
+    return [(session,item) for session,item,_data in bindings]
 
 
 def legacy_message_suppressed(table,library,payload):

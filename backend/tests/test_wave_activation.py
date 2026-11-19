@@ -350,5 +350,46 @@ def test_live_admission_reuses_healthy_lease_without_control_write():
     with pytest.raises(Conflict):policy.validate_admission(store,dict(data,sha256='b'*64),finalizing=True)
     now[0]+=500
     policy.validate_admission(store,data,finalizing=True)
-    assert store._required('control')['revision']!=initial
+    # The renewal is written, but a binding changes no wave manifest row, so it
+    # must not restart readiness scans by advancing the control revision.
+    assert store._required('control')['revision']==initial
     assert store._required(store.item_key('s','i'))['finalizeLeaseUntil']==now[0]+600
+
+
+def test_an_init_batch_binds_all_its_files_in_one_transaction():
+    # 2026-11-19: binding each file of a 10k upload on its own made init the
+    # main writer of the shared control/policy rows.
+    table=RuntimeTable();store=active(table)
+    store.open_session('s',150)
+    store.register('s',[dict(itemId=f'i{n}',filename=f'{n}.jpg') for n in range(90)])
+    store.register('s',[dict(itemId=f'i{n}',filename=f'{n}.jpg') for n in range(90,150)])
+    commits=[]
+    original=table.submit_transaction
+    table.submit_transaction=lambda ops:(commits.append(len(ops)),original(ops))[1]
+    revision=store._required('control')['revision']
+    files=[dict(filename=f'{n}.jpg',sha256='a'*64,waveSessionId='s',waveItemId=f'i{n}') for n in range(150)]
+    assert policy.validate_admissions(store,files,finalizing=True)==[('s',f'i{n}') for n in range(150)]
+    assert len(commits)==2 and max(commits)<=100
+    assert all(store._required(store.item_key('s',f'i{n}'))['sourceHash']=='a'*64 for n in range(150))
+    assert store._required('control')['revision']==revision
+    commits.clear()
+    policy.validate_admissions(store,files,finalizing=True)  # healthy leases: no writes at all
+    assert commits==[]
+
+
+def test_one_bad_file_in_an_init_batch_binds_none_of_its_page():
+    table=RuntimeTable();store=active(table)
+    store.open_session('s',2);store.register('s',[dict(itemId='a',filename='a.jpg'),dict(itemId='b',filename='b.jpg')])
+    files=[dict(filename='a.jpg',sha256='a'*64,waveSessionId='s',waveItemId='a'),
+           dict(filename='renamed.jpg',sha256='b'*64,waveSessionId='s',waveItemId='b')]
+    with pytest.raises(Conflict,match='differs'):policy.validate_admissions(store,files,finalizing=True)
+    assert not store._required(store.item_key('s','a')).get('sourceHash')
+
+
+def test_the_same_item_twice_in_one_batch_must_name_the_same_bytes():
+    table=RuntimeTable();store=active(table)
+    store.open_session('s',1);store.register('s',[dict(itemId='a',filename='a.jpg')])
+    same=dict(filename='a.jpg',sha256='a'*64,waveSessionId='s',waveItemId='a')
+    assert policy.validate_admissions(store,[same,same],finalizing=True)==[('s','a'),('s','a')]
+    with pytest.raises(Conflict):
+        policy.validate_admissions(store,[same,dict(same,sha256='b'*64)],finalizing=True)
