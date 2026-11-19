@@ -40,6 +40,8 @@ export interface Photo {
     rotation?: number;
     thumbnailRotation?: number;
     likes?: number;
+    /** Uploaded from this browser but not in any index yet; the tile shows what the browser knows. */
+    pendingIndex?: boolean;
     captureDate?: string | null;
     /** A Live Photo: filename of its attached motion clip (played over the still in the viewer). */
     liveClip?: string;
