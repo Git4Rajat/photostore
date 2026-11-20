@@ -27,6 +27,7 @@ const mocks = vi.hoisted(() => ({
     jobs: vi.fn(),
     processingMode: 'backend',
     runBrowserProcessing: vi.fn(),
+    profile: vi.fn(),
     push: undefined as undefined | { onProcessing?: () => void; onConnection?: (connected: boolean) => void },
 }));
 vi.mock('../services/indexReadyPush', () => ({
@@ -65,6 +66,11 @@ vi.mock('../services/backgroundKeepAlive', () => ({
     },
 }));
 vi.mock('../services/toast', () => ({ showToast: mocks.toast }));
+vi.mock('./browserAiShared', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('./browserAiShared')>();
+    mocks.profile.mockImplementation(actual.getAdaptiveUploadProfile);
+    return { ...actual, getAdaptiveUploadProfile: mocks.profile };
+});
 vi.mock('../services/perf', () => ({ perf: { recordSpan: mocks.span, span: (_name: string, run: () => unknown) => run() } }));
 vi.mock('./browserProcessingRuntime', () => ({
     idbPut: vi.fn().mockResolvedValue(undefined),
@@ -1561,6 +1567,20 @@ describe('upload wave shadow protocol wiring', () => {
         expect(opens().at(-1)?.[1]).toMatchObject({ declaredCount: 2, resumedFromSessionId: second });
         expect(finalizedFiles().slice(finalizedBefore).map(file => file.filename).sort()).toEqual(['original-1.heic', 'original-3.heic']);
         expect(services.pendingUploadSummary).toBeNull();
+    });
+
+    it('hands a resumed run\'s lane sizing the last measured latency and only the files still to send', async () => {
+        const failing = failTwoOfSix(() => false);
+        select(filesFor(6));
+        await advance(20000);
+        failing.clear();
+        mocks.profile.mockClear();
+        act(() => { void services.retryPersistedUploadSession(); });
+        await advance(20000);
+        expect(mocks.profile).toHaveBeenCalledTimes(1);
+        const [files, options] = mocks.profile.mock.calls[0];
+        expect(files).toHaveLength(2);
+        expect(options).toHaveProperty('measuredRttMs');
     });
 
     it('opens, registers, resolves, and closes the shadow session for a normal completed upload', async () => {
