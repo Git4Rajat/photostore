@@ -8054,6 +8054,7 @@ def _people_index_rows_from_scan(
             unnamed_counter += 1
 
         active_face_ids: List[str] = []
+        active_photo_keys = set()
         cover_face_id = ''
         cover_filename = ''
         cover_bbox: Dict[str, object] = {}
@@ -8085,6 +8086,7 @@ def _people_index_rows_from_scan(
                     source_deleted_seen = True
                     continue
                 active_face_ids.append(face_id)
+                active_photo_keys.add(str(face.get('filename') or '') or face_id)
                 score = _people_index_face_preview_priority(face)
                 if cover_score is None or score > cover_score:
                     cover_score = score
@@ -8115,7 +8117,9 @@ def _people_index_rows_from_scan(
             'autoName': not raw_name,
             'name': name,
             'isNamed': is_named,
-            'faceCount': len(active_face_ids),
+            # The tile says "N photos" and the person page lists distinct photos, so count photos
+            # (two faces of one person in the same photo are one photo), not faces.
+            'faceCount': len(active_photo_keys),
             'coverFaceId': cover_face_id,
             'coverFilename': cover_filename,
             'coverBbox': cover_bbox,
