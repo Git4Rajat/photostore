@@ -102,4 +102,20 @@ describe('UploadDock actions', () => {
         fireEvent.click(screen.getByRole('button', { name: 'Pause' }));
         expect(services.pauseActiveUpload).toHaveBeenCalledTimes(1);
     });
+
+    it('resuming a plain pause reads as a continuation, not a retry', () => {
+        setServices({ pendingUploadSummary: { fileCount: 280, failedCount: 0 }, pendingUploadFailedFiles: [] });
+        const { rerender } = render(<UploadDock />);
+        fireEvent.click(screen.getByRole('button', { name: 'Resume' }));
+        expect(screen.queryByText(/Trying again|retried/)).toBeNull();
+        setServices({ uploadActive: true, uploading: true, uploadProgress: { uploadedCount: 120, totalCount: 400, failedCount: 0 }, pendingUploadFailedFiles: [] });
+        rerender(<UploadDock />);
+        expect(screen.getByText('Resuming upload…')).toBeTruthy();
+        expect(screen.getByText(/Picking up where you left off · 280 files left/)).toBeTruthy();
+        expect(screen.queryByText(/retried/)).toBeNull();
+        setServices({ uploadActive: true, uploading: true, uploadProgress: { uploadedCount: 135, totalCount: 400, failedCount: 0 }, pendingUploadFailedFiles: [] });
+        rerender(<UploadDock />);
+        expect(screen.getByText('Uploading 135 of 400')).toBeTruthy();
+        expect(screen.getByText('135 added · 265 waiting')).toBeTruthy();
+    });
 });
