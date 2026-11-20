@@ -219,11 +219,10 @@ def library_clean_request():
 
     data = app.request.get_json(silent=True) or {}
     if app.AUTH_MODE == 'password':
-        password = str(data.get('password', '') or '')
-        account = app.library_store.get_user(account_id) or {}
-        stored_hash = str(account.get('passwordHash') or '')
-        if not stored_hash or not app.password_auth.verify_password(password, stored_hash):
-            return app.jsonify({'error': 'Incorrect password.'}), 401
+        # The password itself is checked on core (/api/library/verify-password); this only
+        # accepts the signed proof of that check.
+        if not app._library_clean_reauth_valid(str(data.get('proof', '') or ''), account_id, library_id):
+            return app.jsonify({'error': 'Please confirm your password again.', 'code': 'reauth_required'}), 401
 
     if not app.library_store.clean_request_send_allowed(library_id):
         return app.jsonify({'error': 'Too many attempts recently. Please wait and try again.'}), 429

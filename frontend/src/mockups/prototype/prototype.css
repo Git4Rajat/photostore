@@ -929,6 +929,28 @@
 .pt-sheet-rule-text b { font-size: 0.92rem; }
 .pt-sheet-rule-text small { color: var(--muted); font-size: 0.78rem; }
 
+/* ---- Delete everything in this library: warning, password, check your inbox ---- */
+.pt-clean { display: flex; flex-direction: column; gap: 12px; padding: 4px 4px 0; }
+.pt-clean p { margin: 0; font-size: 0.92rem; line-height: 1.5; color: var(--muted); }
+.pt-clean p b { color: var(--text); }
+.pt-clean .btn { width: 100%; justify-content: center; gap: 8px; }
+.pt-clean-icon { width: 44px; height: 44px; border-radius: 50%; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent); }
+.pt-clean-icon.bad { background: var(--danger-soft); color: var(--danger); }
+.pt-clean-icon svg { width: 22px; height: 22px; }
+.pt-clean-fg { display: flex; flex-direction: column; gap: 6px; }
+.pt-clean-fg label { font-size: 0.8rem; font-weight: 650; color: var(--text); }
+.pt-clean-field { position: relative; }
+.pt-clean-field .field { width: 100%; padding-right: var(--tap-min); }
+.pt-clean-field .field[aria-invalid="true"] { border-color: var(--danger); }
+.pt-clean-field .field:disabled { opacity: 0.6; }
+.pt-clean-eye { position: absolute; right: 0; top: 0; bottom: 0; width: var(--tap-min); display: grid; place-items: center; border: 0; background: none; color: var(--muted); cursor: pointer; border-radius: 50%; }
+.pt-clean-eye[aria-pressed="true"] { color: var(--text); }
+.pt-clean-eye svg { width: 20px; height: 20px; }
+.pt-clean-error { display: flex; align-items: flex-start; gap: 6px; color: var(--danger) !important; font-size: 0.82rem !important; }
+.pt-clean-error svg { width: 16px; height: 16px; flex: 0 0 auto; margin-top: 1px; }
+.pt-clean .btn:disabled { opacity: 0.6; cursor: default; }
+.pt-clean .btn .pt-spinner { width: 16px; height: 16px; border-color: rgba(255,255,255,0.4); border-top-color: #fff; }
+
 /* ---- public shared album (standalone page, its own app-shell chrome) ----
    Rendered directly under #root by PrototypeApp's public-link branch, outside
    the signed-in Shell -- so it recreates the .mock-app shell here (warm blob

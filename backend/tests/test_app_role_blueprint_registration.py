@@ -71,6 +71,7 @@ def test_core_role_serves_management_but_not_archive_operations():
         '/api/library/invite', '/api/library/invite/info',
         '/api/library/invite/accept', '/api/library/invite/revoke',
         '/api/library/members/remove', '/api/library/leave',
+        '/api/library/verify-password',  # the delete-library password check answers from core
     } <= paths
     assert not {
         '/api/library', '/api/library/export/manifest',

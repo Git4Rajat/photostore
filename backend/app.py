@@ -2316,6 +2316,30 @@ def _sign_album_grant(token: str, access_code: str, expires_at: Optional[int] = 
     return f'{int(expires_at)}.{digest}'
 
 
+# Proof that the owner re-entered their password in the "Delete everything" dialog. The
+# password is checked by core (POST /api/library/verify-password), which hands back this
+# short-lived signed proof; the archive's clean request only checks the signature, so the
+# slow archive never touches a password and a direct call can't skip the check.
+LIBRARY_CLEAN_REAUTH_TTL_SECONDS = 5 * 60
+
+
+def _library_clean_reauth_proof(account_id: str, library_id: str, expires_at: Optional[int] = None) -> str:
+    """``<expiry>.<hmac>``, bound to this account and library; the expiry is signed."""
+    if expires_at is None:
+        expires_at = int(time.time()) + LIBRARY_CLEAN_REAUTH_TTL_SECONDS
+    key = hmac.new(SESSION_SECRET.encode('utf-8'), b'library-clean-reauth-v1', hashlib.sha256).digest()
+    message = f'{account_id}:{library_id}:{int(expires_at)}'.encode('utf-8')
+    return f'{int(expires_at)}.{hmac.new(key, message, hashlib.sha256).hexdigest()}'
+
+
+def _library_clean_reauth_valid(proof: str, account_id: str, library_id: str) -> bool:
+    expiry_text, _, _ = str(proof or '').partition('.')
+    if not expiry_text.isdigit() or int(expiry_text) < time.time():
+        return False
+    expected = _library_clean_reauth_proof(account_id, library_id, int(expiry_text))
+    return hmac.compare_digest(str(proof).encode('utf-8'), expected.encode('utf-8'))
+
+
 def _album_media_cache_control(entity: Dict, max_age: int) -> str:
     """Code-protected albums must not land in shared caches, where the next
     visitor would be served the media without presenting a grant."""

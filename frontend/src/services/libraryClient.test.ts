@@ -41,7 +41,7 @@ it('routes all management actions to core and retains authentication headers', a
 
 it('routes deletion, cleanup and both download mechanisms to archive', async () => {
     await library.deleteLibrary();
-    await library.requestLibraryClean('password');
+    await library.requestLibraryClean('proof');
     await library.confirmLibraryClean('token');
     await library.getLibraryCleanStatus('job');
     await library.getLibraryCleanConfirmationStatus('token');
@@ -53,6 +53,29 @@ it('routes deletion, cleanup and both download mechanisms to archive', async () 
     for (const [url] of fetchMock.mock.calls) expect(url).toMatch(/^https:\/\/archive\/api\/library/);
     expect(fetchMock.mock.calls[0][1].method).toBe('DELETE');
     expect(mocks.publish).toHaveBeenCalledWith('library-cleanup', expect.any(Array), expect.objectContaining({ jobId: 'job', notifyCurrentTab: true }));
+});
+
+it('checks the delete-library password on core, apart from the archive request that carries its proof', async () => {
+    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ proof: 'signed' }) });
+    expect(await library.verifyLibraryPassword('pw')).toBe('signed');
+    expect(fetchMock.mock.calls[0][0]).toBe('https://core/api/library/verify-password');
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ password: 'pw' });
+
+    await library.requestLibraryClean('signed');
+    expect(fetchMock.mock.calls[1][0]).toBe('https://archive/api/library/clean/request');
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({ proof: 'signed' });
+});
+
+it('tells a wrong password from other failures, and a failed send from an expired proof', async () => {
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 401, json: async () => ({ error: 'Incorrect password.' }) });
+    await expect(library.verifyLibraryPassword('bad')).rejects.toBeInstanceOf(library.WrongPasswordError);
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 429, json: async () => ({ error: 'Too many attempts. Please wait and try again.' }) });
+    await expect(library.verifyLibraryPassword('bad')).rejects.toThrow('Too many attempts.');
+
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 401, json: async () => ({ error: 'Please confirm your password again.', code: 'reauth_required' }) });
+    await expect(library.requestLibraryClean('old')).rejects.toMatchObject({ status: 401, code: 'reauth_required' });
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 502, json: async () => ({ error: 'Could not send confirmation email(s). Please try again.' }) });
+    await expect(library.requestLibraryClean('ok')).rejects.toMatchObject({ status: 502 });
 });
 
 it('allows token-bound invitation info/accept without a signed-in session', async () => {

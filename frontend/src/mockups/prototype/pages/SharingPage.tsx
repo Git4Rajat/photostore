@@ -9,6 +9,9 @@ import * as library from '../../../services/libraryClient';
 import { getRuntimeConfig } from '../../../config/appConfig';
 import { confirmDialog, promptDialog } from '../../../components/shared/dialogs';
 import DownloadLibrary from '../components/DownloadLibrary';
+import DeleteLibraryDialog from '../components/DeleteLibraryDialog';
+import { cleanSendNotice } from '../components/cleanSendNotice';
+import { publishNotification } from '../../../services/notificationSink';
 import { enqueueBackgroundRequest } from '../../../services/backgroundRequestQueue';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -61,7 +64,7 @@ const InviteForm: React.FC<{
 const SharingPage: React.FC = () => {
     const {
         members, pendingInvites, libraryName, isOwner, maxMembers, membersLoading,
-        fetchMembers, invite, revokeInvite, removeMember, renameLibrary, toast, totalPhotos,
+        fetchMembers, invite, revokeInvite, removeMember, renameLibrary, toast, totalPhotos, albums,
     } = useStore();
     const [inviteOpen, setInviteOpen] = useState(false);
     const passwordMode = (getRuntimeConfig().authMode || '').toLowerCase() === 'password';
@@ -111,29 +114,26 @@ const SharingPage: React.FC = () => {
         if (next && next.trim()) renameLibrary(next.trim());
     };
 
-    const cleanLibrary = async () => {
-        const confirmed = await confirmDialog({
-            title: 'Clean library?',
-            message: 'This removes ALL photos and videos from this library. You’ll get an emailed link to confirm before anything is actually deleted.',
-            confirmLabel: 'Continue',
-            danger: true,
-        });
-        if (!confirmed) return;
-        let password: string | undefined;
-        if (passwordMode) {
-            const entered = await promptDialog({
-                title: 'Confirm it’s you',
-                message: 'Re-enter your password to start the cleanup.',
-                label: 'Password',
-                type: 'password',
-                confirmLabel: 'Confirm',
-            });
-            if (!entered) return;
-            password = entered;
-        }
-        void library.requestLibraryClean(password)
-            .then((res) => toast(res.sentTo?.length ? `Confirmation link sent to ${res.sentTo.join(', ')}` : 'Cleanup confirmation requested'))
-            .catch((err) => toast(err instanceof Error ? err.message : 'Couldn’t start cleanup', undefined, undefined, 'error'));
+    // "Delete everything": the dialog checks the password and starts the email; this
+    // reports how the send went once the owner has pressed OK.
+    const [cleanOpen, setCleanOpen] = useState(false);
+    const [cleanStart, setCleanStart] = useState<'warn' | 'password'>('warn');
+    const ownerEmail = members.find((m) => m.isSelf)?.email || '';
+    const otherMembers = members.filter((m) => !m.isSelf).map((m) => m.email || m.userId);
+    // The result lands in Notifications (a toast only where there is no panel).
+    const reportCleanSend = (outcome: Promise<library.CleanRequestResult>, proof?: string) => {
+        const who = otherMembers.length === 1 ? otherMembers[0] : 'Another member';
+        const publish = (result: library.CleanRequestResult | unknown) => {
+            const notice = cleanSendNotice(result, who);
+            const action = notice.action === 'retry'
+                ? { label: 'Try again', onClick: () => reportCleanSend(library.requestLibraryClean(proof), proof) }
+                : notice.action === 'reauth'
+                    ? { label: 'Confirm', onClick: () => { setCleanStart('password'); setCleanOpen(true); } }
+                    : undefined;
+            if (publishNotification(notice.title, notice.details, action)) return;
+            toast(notice.details ? `${notice.title}. ${notice.details}` : notice.title, action?.label, action?.onClick, notice.action ? 'error' : 'info');
+        };
+        void outcome.then(publish, publish);
     };
 
     const name = libraryName || 'Your library';
@@ -221,7 +221,7 @@ const SharingPage: React.FC = () => {
                     {/* The destructive option sits apart, at the bottom. */}
                     {isOwner && (
                         <div className="pt-library-danger">
-                            <button type="button" className="pt-linkish danger" onClick={() => void cleanLibrary()}>Delete everything in this library…</button>
+                            <button type="button" className="pt-linkish danger" onClick={() => { setCleanStart('warn'); setCleanOpen(true); }}>Delete everything in this library…</button>
                             <small>Removes every photo for every member. Asks for {passwordMode ? 'your password and ' : ''}an email confirmation first.</small>
                         </div>
                     )}
@@ -230,6 +230,19 @@ const SharingPage: React.FC = () => {
                 {/* Desktops keep the invite form beside the list; phones open it as a sheet. */}
                 {isOwner && <aside className="pt-library-invite card-glass" aria-label="Invite someone">{inviteForm}</aside>}
             </div>
+
+            <DeleteLibraryDialog
+                open={cleanOpen}
+                startAt={cleanStart}
+                onClose={() => setCleanOpen(false)}
+                libraryName={libraryName}
+                totalPhotos={totalPhotos}
+                albumCount={albums.length}
+                passwordMode={passwordMode}
+                ownerEmail={ownerEmail}
+                otherMembers={otherMembers}
+                onSendStarted={reportCleanSend}
+            />
 
             <BottomSheet open={inviteOpen} onClose={() => setInviteOpen(false)} title="Invite someone">
                 {inviteForm}
