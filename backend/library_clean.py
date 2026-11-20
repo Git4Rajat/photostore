@@ -400,6 +400,10 @@ REGISTRY = [
     # those purges miss.
     Prefix('people_embedding_index', lambda lib: f'faiss-source-revisions/{sha256(lib)}', phase=5,
            note='FAISS source revision'),
+    # Each upload wave copies the published index artifacts it proves under wave-projections/<digest(library)>/
+    # (wave_catalog._copy). The index purges above do not know that prefix, so a clean left every copy behind.
+    *[Prefix(container, lambda lib: f'wave-projections/{wave_digest(lib)}/', phase=5, note='wave projection copies')
+      for container in ('vector_index', 'lexical_index', 'people_embedding_index', 'tag_embedding_index')],
     Keep('vector_index', 'delete_user_vector_index_data, purge_immutable_artifacts'),
     Keep('lexical_index', 'delete_user_lexical_index_data, purge_immutable_artifacts'),
     Keep('tag_embedding_index', 'delete_user_tag_embedding_index_data, purge_immutable_artifacts'),
@@ -714,6 +718,73 @@ class Run:
             if left:
                 residue[entry.label()] = left
         return residue
+
+
+# --- orphan blob sweep -------------------------------------------------------------------------------
+
+ORPHAN_MIN_AGE = 7 * 24 * 3600
+# The names one photo id takes in the thumbnails container (clean_photos deletes the same four).
+_DERIVATIVES = (('metadata/', '.bin'), ('grid/', '.webp'), ('preview/', '.jpg'))
+
+
+def photo_blob_id(name):
+    """The photo id a blob name belongs to, or None for a name that is not per-photo (derived/..., staging, ...)."""
+    for prefix, suffix in _DERIVATIVES:
+        if name.startswith(prefix) and name.endswith(suffix):
+            return name[len(prefix):-len(suffix)]
+    return name if name and '/' not in name else None
+
+
+def referenced_photo_ids(stores):
+    """Every photo id any library's metadata row names (anonymized id, or the filename for legacy rows)."""
+    metadata = stores.table('metadata')
+    ids = set()
+    if metadata is None:
+        return ids
+    # Non-photo partitions (system rows) only add names no blob has, so nothing is skipped.
+    for row in listed(lambda: metadata.list_entities(select=['RowKey', 'anonymousImageId'], results_per_page=PAGE)):
+        ids.add(str(row.get('anonymousImageId') or '').strip() or str(row.get('RowKey') or ''))
+    return ids
+
+
+def find_orphan_blobs(stores, *, older_than=ORPHAN_MIN_AGE, now=None):
+    """(container key, blob name) of per-photo blobs no metadata row names and that are older than `older_than`
+    seconds. A clean finds a photo's blobs through its metadata row, so blobs whose row is already gone (an
+    interrupted upload, an earlier partial clean) are out of its reach; this finds them. The age floor keeps
+    blobs of uploads still writing their rows, and an unknown age is never an orphan. It reads every library's
+    metadata, so run it as an operator action, not inside one library's clean."""
+    now = time.time() if now is None else now
+    referenced = referenced_photo_ids(stores)
+    found = []
+    for key in ('images', 'thumbnails'):
+        container = stores.container(key)
+        if container is None:
+            continue
+        for blob in listed(container.list_blobs):
+            modified = getattr(blob, 'last_modified', None)
+            blob_id = photo_blob_id(blob.name)
+            if modified is None or blob_id is None or blob_id in referenced:
+                continue
+            if now - modified.timestamp() >= older_than:
+                found.append((key, blob.name))
+    return found
+
+
+def sweep_orphan_blobs(stores, *, older_than=ORPHAN_MIN_AGE, delete=False, now=None):
+    """Count the orphan blobs per container; with delete=True also remove them in batch requests, checking the
+    caller's fence proof before each batch."""
+    orphans = find_orphan_blobs(stores, older_than=older_than, now=now)
+    counts = Counter(key for key, _ in orphans)
+    if delete:
+        by_container = defaultdict(list)
+        for key, name in orphans:
+            by_container[key].append(name)
+        for key, names in by_container.items():
+            container = stores.container(key)
+            for page in pages(names, BLOB_BATCH):
+                stores.check()
+                container.delete_blobs(*page, delete_snapshots='include', raise_on_any_failure=False)
+    return dict(counts)
 
 
 def run(library_id, stores, *, workers=WORKERS):

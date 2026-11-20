@@ -482,3 +482,75 @@ def test_publication_claims_are_found_by_library_in_two_queries(monkeypatch):
     jobs.upsert_entity({'PartitionKey': PARTITION, 'RowKey': 'k2', 'libraryId': LIB,
                         'leaseUntil': _time.time() - 1})
     automatic._check_publication_claims(LIB)  # an expired claim does not
+
+
+# --- wave projections and orphan blobs --------------------------------------------------------------------
+
+def test_clean_removes_wave_projection_copies_of_the_index_containers_and_only_its_own():
+    tables, blobs = world()
+    seed(tables, blobs, LIB, anon_prefix='a')
+    mine = f'wave-projections/{library_clean.wave_digest(LIB)}/ob/x/sha'
+    theirs = f'wave-projections/{library_clean.wave_digest(OTHER)}/ob/x/sha'
+    containers = {**CONTAINERS, 'lexical_index': 'lexical-index', 'vector_index': 'vector-index',
+                  'tag_embedding_index': 'tag-embedding-index'}
+    for container in ('lexical-index', 'vector-index', 'tag-embedding-index', 'people-embedding-index'):
+        blobs.put(container, mine, theirs)
+    library_clean.run(LIB, library_clean.Stores(tables=tables, blobs=blobs, containers=containers,
+                                                delete_snapshot=delete_snapshot))
+    for container in ('lexical-index', 'vector-index', 'tag-embedding-index', 'people-embedding-index'):
+        assert set(blobs.blobs[container]) == {theirs}
+
+
+def test_the_app_hands_the_clean_the_index_containers_it_prefixes():
+    handed = app._library_clean_stores(LIB, None)
+    assert {'vector_index', 'lexical_index', 'people_embedding_index', 'tag_embedding_index'} <= set(handed.containers)
+
+
+class AgedContainer(Container):
+    def list_blobs(self, name_starts_with=''):
+        return [SimpleNamespace(name=name, last_modified=self.service.ages[name])
+                for name in sorted(self.blobs) if name.startswith(name_starts_with)]
+
+
+def orphan_world():
+    from datetime import datetime, timezone
+    tables, blobs = world()
+    tables['metadata'].list_entities = lambda select=None, **kw: [dict(r) for r in tables['metadata'].rows.values()]
+    blobs.ages = defaultdict(lambda: datetime.fromtimestamp(0, timezone.utc))
+    blobs.get_container_client = lambda name: AgedContainer(blobs, name)
+    return tables, blobs
+
+
+def test_orphan_sweep_finds_per_photo_blobs_no_metadata_row_names():
+    tables, blobs = orphan_world()
+    tables['metadata'].upsert_entity({'PartitionKey': LIB, 'RowKey': 'IMG_1.HEIC', 'anonymousImageId': 'kept'})
+    tables['metadata'].upsert_entity({'PartitionKey': LIB, 'RowKey': 'legacy.jpg'})
+    blobs.put('images', 'kept', 'orphan', 'legacy.jpg')
+    blobs.put('thumbnails', 'kept', 'grid/kept.webp', 'grid/orphan.webp', 'metadata/orphan.bin', 'preview/orphan.jpg',
+              'derived/v1/abc/x.webp', 'processing-staging/v1/abc/y')
+    found = library_clean.find_orphan_blobs(stores(tables, blobs), now=10 ** 9)
+    assert sorted(found) == [('images', 'orphan'), ('thumbnails', 'grid/orphan.webp'),
+                             ('thumbnails', 'metadata/orphan.bin'), ('thumbnails', 'preview/orphan.jpg')]
+
+
+def test_orphan_sweep_spares_recent_blobs_and_blobs_of_unknown_age():
+    tables, blobs = orphan_world()
+    blobs.put('images', 'fresh', 'old')
+    from datetime import datetime, timezone
+    blobs.ages['fresh'] = datetime.fromtimestamp(10 ** 9 - 60, timezone.utc)
+    assert library_clean.find_orphan_blobs(stores(tables, blobs), now=10 ** 9) == [('images', 'old')]
+    blobs.put('thumbnails', 'unknown')
+    plain = Blobs()
+    plain.put('images', 'unknown')
+    assert library_clean.find_orphan_blobs(stores(tables, plain), now=10 ** 9) == []
+
+
+def test_orphan_sweep_only_deletes_when_asked_and_checks_the_fence_per_batch():
+    tables, blobs = orphan_world()
+    blobs.put('images', *[f'o{i}' for i in range(300)])
+    checks = []
+    held = stores(tables, blobs, check=lambda: checks.append(1))
+    assert library_clean.sweep_orphan_blobs(held, now=10 ** 9) == {'images': 300}
+    assert len(blobs.blobs['images']) == 300 and not blobs.batches
+    assert library_clean.sweep_orphan_blobs(held, delete=True, now=10 ** 9) == {'images': 300}
+    assert not blobs.blobs['images'] and blobs.batches == [('images', 256), ('images', 44)] and len(checks) == 2

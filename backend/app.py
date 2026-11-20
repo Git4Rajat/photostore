@@ -10939,6 +10939,8 @@ def _library_clean_stores(library_id: str, check) -> 'library_clean.Stores':
         'images': BLOB_IMAGE_CONTAINER, 'thumbnails': BLOB_THUMBNAIL_CONTAINER, 'covers': BLOB_COVER_CONTAINER,
         'exports': BLOB_EXPORTS_CONTAINER, 'merge_payloads': BLOB_MERGE_PAYLOADS_CONTAINER,
         'people_embedding_index': BLOB_PEOPLE_EMBEDDING_INDEX_CONTAINER, 'web': share_snapshot.WEB_CONTAINER,
+        'vector_index': BLOB_VECTOR_INDEX_CONTAINER, 'lexical_index': BLOB_LEXICAL_INDEX_CONTAINER,
+        'tag_embedding_index': BLOB_TAG_EMBEDDING_INDEX_CONTAINER,
     }
     job_id = _LIBRARY_CLEAN_JOB.get()
 
