@@ -136,6 +136,7 @@ it goes. Kinds:
 | `photoalbumtokens` PK = token (from album rows), plus `$web/s/<token>/` via `share_snapshot.delete` | child_partitions + blob prefix | 2, before albums | **no** |
 | `photofilenameowners` PK = filename, RK = library | point delete per photo (phase 1); `RowKey eq library` sweep (phase 4) | 1, 4 | yes |
 | `photojobs` PK = library (keep `library_clean` rows) | library_partition with keep filter | 2 | yes |
+| `lexical-index`, `vector-index`, `tag-embedding-index`, `people-embedding-index` prefix `wave-projections/<digest(library)>/` | blob prefix (copies each upload wave makes of the published index artifacts; the index purges do not cover them) | 5 | no |
 | `photojobs` PK `upload-wave-shadow-<digest(library)>` | keep: its per-photo deletion proofs are what a late writer settles against | — | kept |
 | `photojobs` PK `processing-artifacts-<digest(library)>` | derived_partition | 3 | 50/20 per call |
 | `photojobs` `index-maintenance-pending`, `index-model-tag-pending` rows with `libraryId` | index_rows (`purge_automatic_state`) | 5 | yes |
@@ -279,7 +280,10 @@ The legacy tests (`test_library_shadow_cleanup.py`, `test_library_clean_shared_n
 2. Running Clean library again removes most residue earlier cleans left: face embeddings, export zips, preview
    cache, the hash-keyed partitions, and public snapshots (found through token rows that still name the
    library). Anonymized blobs a legacy clean skipped for shared filenames cannot be found again once their
-   metadata is gone; that needs a separate blob sweep.
+   metadata is gone; `library_clean.sweep_orphan_blobs` is that sweep: an operator action over all libraries (it
+   reads every metadata row), dry run by default, and it only takes blobs older than seven days so an upload still
+   writing its rows is safe. It is deliberately not part of a clean: it would also take blobs of stored photos
+   another library has not yet joined to a wave.
 3. Delete `_legacy_library_clean` and `_cleanup_library_shadow_rows` after the legacy release.
 
 ## Decisions
