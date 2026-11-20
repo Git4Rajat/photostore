@@ -47,12 +47,14 @@ describe('just-uploaded overlay store', () => {
         expect(names()).toEqual(['a.jpg']);
     });
 
-    it('caps a huge burst by dropping the oldest and revoking their thumbnails', () => {
+    it('past the tile cap the oldest lose their tile and thumbnail but still count and hand over', async () => {
         for (let i = 0; i < JUST_UPLOADED_MAX + 3; i += 1) addJustUploaded({ filename: `f${i}.jpg`, thumbnailUrl: `blob:t${i}` }, T0 + i);
-        expect(listJustUploaded()).toHaveLength(JUST_UPLOADED_MAX);
-        expect(names()).not.toContain('f0.jpg');
+        expect(listJustUploaded()).toHaveLength(JUST_UPLOADED_MAX + 3);
+        expect(listJustUploaded().filter((e) => e.compact).map((e) => e.filename).sort()).toEqual(['f0.jpg', 'f1.jpg', 'f2.jpg']);
         expect(names()[0]).toBe(`f${JUST_UPLOADED_MAX + 2}.jpg`);
         expect(revoked).toEqual(['blob:t0', 'blob:t1', 'blob:t2']);
+        await settleJustUploaded(async () => new Set(['f0.jpg']));
+        expect(names()).not.toContain('f0.jpg');
     });
 
     it('expires entries after the TTL without notifying during a read', () => {
