@@ -37,6 +37,12 @@ describe('ProcessingDock', () => {
         expect(api.dismissProcessingWave).toHaveBeenCalledWith('w');
     });
 
+    it('counts the whole time since the upload started, not just the processing after it', async () => {
+        api.fetchProcessingWaves.mockResolvedValue([wave({ stage: 'done', state: 'complete', startedAt: 1000, stageEnteredAt: 1000 + 64 * 60, processedSeconds: 11 * 60 })]);
+        render(<ProcessingDock />);
+        await waitFor(() => expect(screen.getByText(/Done in 64 minutes/)).toBeTruthy());
+    });
+
     it('reads again when an upload ends, so a cancelled upload shows its processing', async () => {
         services.uploadActive = true;
         api.fetchProcessingWaves.mockResolvedValue([]);
