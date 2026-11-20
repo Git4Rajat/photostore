@@ -80,6 +80,9 @@ export interface PersistedUploadSession {
     id: string;
     createdAt: number;
     files: PersistedUploadFile[];
+    /** Files already finished and dropped from `files`; a resumed run adds them back into its counts. */
+    completedCount?: number;
+    completedSkippedCount?: number;
 }
 
 export interface UploadProfile {
