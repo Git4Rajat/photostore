@@ -587,7 +587,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         return justUploaded.filter((e) => !have.has(e.filename) && !(isLiveClipName(e.filename) && stills.has(liveBaseStem(e.filename))));
     }, [overlayApplies, justUploaded, indexedPhotos]);
     const photos = useMemo<Photo[]>(
-        () => (overlayExtra.length ? [...overlayExtra.map(justUploadedPhoto), ...indexedPhotos] : indexedPhotos),
+        () => (overlayExtra.length ? [...overlayExtra.filter((e) => !e.compact).map(justUploadedPhoto), ...indexedPhotos] : indexedPhotos),
         [overlayExtra, indexedPhotos],
     );
     const galleryFiltersRef = useRef<GalleryFilters>({ rating: 0, likedOnly: false, media: 'all' });

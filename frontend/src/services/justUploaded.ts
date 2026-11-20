@@ -16,11 +16,14 @@ export interface JustUploadedEntry {
     /** Local `blob:` thumbnail drawn in the browser; absent for formats it cannot decode. */
     thumbnailUrl?: string;
     addedAt: number;
+    /** Past the tile cap: no tile is drawn, but it still counts and still hands over by name. */
+    compact?: boolean;
 }
 
 type Stored = JustUploadedEntry & { scope: string };
 
 export const JUST_UPLOADED_TTL_MS = 6 * 60 * 60 * 1000;
+/** Most overlay tiles drawn at once; entries beyond it are kept by name so the count stays right. */
 export const JUST_UPLOADED_MAX = 500;
 // Listeners hear about additions at most this often. Every notification re-renders the whole
 // store, and an upload finalizes files far faster than the screen needs to change.
@@ -108,12 +111,13 @@ export const addJustUploaded = (entry: { filename: string; captureDate?: string 
         removeJustUploaded(mine0.filter((e) => isLiveClipName(e.filename) && liveBaseStem(e.filename) === stem).map((e) => e.filename));
     }
     entries.set(key, { scope, filename: entry.filename, captureDate: entry.captureDate ?? null, thumbnailUrl: entry.thumbnailUrl, addedAt: now });
-    // Bounded: a huge burst drops the OLDEST overlay rows, which the index will
-    // cover first anyway. Nothing is lost server-side.
-    const mine = Array.from(entries.values()).filter((e) => e.scope === scope);
-    for (let i = 0; i < mine.length - JUST_UPLOADED_MAX; i += 1) {
-        revoke(mine[i]);
-        entries.delete(keyOf(scope, mine[i].filename));
+    // Bounded tiles: a huge burst turns the OLDEST rows into name-only entries (no thumbnail,
+    // no tile). They keep counting and still hand over to the index by name.
+    const tiled = Array.from(entries.values()).filter((e) => e.scope === scope && !e.compact);
+    for (let i = 0; i < tiled.length - JUST_UPLOADED_MAX; i += 1) {
+        revoke(tiled[i]);
+        tiled[i].thumbnailUrl = undefined;
+        tiled[i].compact = true;
     }
     emit();
 };

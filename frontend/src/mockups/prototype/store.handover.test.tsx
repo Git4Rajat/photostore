@@ -82,6 +82,15 @@ describe('upload overlay -> index handover', () => {
         expect(store.totalPhotos).toBe((total ?? 0) + 1);
     });
 
+    it('keeps counting past the tile cap while only drawing the newest tiles', async () => {
+        await mount();
+        const total = store.totalPhotos ?? 0;
+        const before = store.photos.length;
+        act(() => { for (let i = 0; i < 700; i += 1) addJustUploaded({ filename: `burst${i}.jpg`, captureDate: null }); });
+        expect(store.totalPhotos).toBe(total + 700);
+        expect(store.photos).toHaveLength(before + 500);
+    });
+
     it('works when the library is still empty/unindexed (first upload into a new library)', async () => {
         env.index.mockResolvedValue([]);
         await mount();
