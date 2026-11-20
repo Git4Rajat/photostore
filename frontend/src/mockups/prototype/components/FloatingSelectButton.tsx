@@ -1,12 +1,7 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React from 'react';
 import { ListChecks } from 'lucide-react';
 import { CheckGlyph as Check } from './RedesignIcons';
-
-// Same thresholds as ScrollToTopButton: eligible once scrolled this far, and
-// only revealed after scrolling has settled so it never sits over content
-// mid-gesture.
-const SHOW_AFTER_PX = 400;
-const SETTLE_MS = 150;
+import { useScrollSettle } from './useScrollSettle';
 
 /**
  * Floating "Select" / "Done" toggle for pages with a photo grid. The page's own
@@ -29,33 +24,8 @@ export const FloatingSelectButton: React.FC<{
     grid?: string;
     hideOnTouch?: boolean;
 }> = ({ selectMode, onToggle, suppressed = false, noun = 'photos', grid = '.pt-grid', hideOnTouch = false }) => {
-    const [visible, setVisible] = useState(false);
-    const settleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-    useEffect(() => {
-        const container = document.querySelector<HTMLElement>('.pt-body');
-        if (!container) {
-            return undefined;
-        }
-        const onScroll = () => {
-            if (settleTimer.current) {
-                clearTimeout(settleTimer.current);
-            }
-            setVisible(false);
-            if (container.scrollTop <= SHOW_AFTER_PX) {
-                return;
-            }
-            // Only offer it where there is something to select on the current page.
-            settleTimer.current = setTimeout(() => setVisible(Boolean(container.querySelector(grid))), SETTLE_MS);
-        };
-        container.addEventListener('scroll', onScroll, { passive: true });
-        return () => {
-            container.removeEventListener('scroll', onScroll);
-            if (settleTimer.current) {
-                clearTimeout(settleTimer.current);
-            }
-        };
-    }, [grid]);
+    // Only offer it where there is something to select on the current page.
+    const visible = useScrollSettle(() => Boolean(document.querySelector('.pt-body')?.querySelector(grid)));
 
     // `suppressed`: another control already occupies this corner (the app's bottom selection bar,
     // which has its own close button, covers it once something is selected).

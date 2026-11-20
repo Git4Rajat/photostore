@@ -1,12 +1,7 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React from 'react';
 import { ArrowUp } from 'lucide-react';
 import { useFloatingClearance } from './useFloatingClearance';
-
-// How far down .pt-body must be scrolled before the button is eligible to
-// show at all.
-const SHOW_AFTER_PX = 400;
-// How long scrolling must have stopped before the button actually appears.
-const SETTLE_MS = 150;
+import { useScrollSettle } from './useScrollSettle';
 
 /**
  * Floating "scroll to top" button for .pt-body -- the app's one real scroll
@@ -22,36 +17,9 @@ const SETTLE_MS = 150;
  * button, just pointed the other way.
  */
 export const ScrollToTopButton: React.FC = () => {
-    const [visible, setVisible] = useState(false);
+    const visible = useScrollSettle();
     // Lifts this button (and the Select pill) above any dock / bar / toast at the bottom.
     useFloatingClearance();
-    const settleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-    useEffect(() => {
-        const container = document.querySelector<HTMLElement>('.pt-body');
-        if (!container) {
-            return undefined;
-        }
-        const onScroll = () => {
-            if (settleTimer.current) {
-                clearTimeout(settleTimer.current);
-            }
-            if (container.scrollTop <= SHOW_AFTER_PX) {
-                setVisible(false);
-                return;
-            }
-            // Hidden while a scroll is actively in flight; reappears once it settles.
-            setVisible(false);
-            settleTimer.current = setTimeout(() => setVisible(true), SETTLE_MS);
-        };
-        container.addEventListener('scroll', onScroll, { passive: true });
-        return () => {
-            container.removeEventListener('scroll', onScroll);
-            if (settleTimer.current) {
-                clearTimeout(settleTimer.current);
-            }
-        };
-    }, []);
 
     const scrollToTop = () => {
         document.querySelector<HTMLElement>('.pt-body')?.scrollTo({ top: 0, behavior: 'smooth' });

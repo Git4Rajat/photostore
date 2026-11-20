@@ -51,10 +51,28 @@ describe('ScrollToTopButton', () => {
         act(() => { vi.advanceTimersByTime(150); });
         expect(button.className).toContain('visible');
 
+        fireEvent.wheel(body);
         scrollTo(body, 520); // another scroll tick -- hides until it settles again
         expect(button.className).not.toContain('visible');
         act(() => { vi.advanceTimersByTime(150); });
         expect(button.className).toContain('visible');
+    });
+
+    it('stays put when rows landing above shift scrollTop without any user input (photos pouring in)', () => {
+        const body = renderWithScrollBody();
+        const button = screen.getByRole('button', { name: 'Scroll to top' });
+
+        scrollTo(body, 500);
+        act(() => { vi.advanceTimersByTime(150); });
+        expect(button.className).toContain('visible');
+
+        vi.setSystemTime(Date.now() + 5000);
+        for (let i = 1; i <= 5; i += 1) {
+            scrollTo(body, 500 + i * 200); // scroll anchoring after each prepended batch
+            expect(button.className).toContain('visible');
+            act(() => { vi.advanceTimersByTime(300); });
+            expect(button.className).toContain('visible');
+        }
     });
 
     it('never shows once scrolled back above the threshold', () => {
