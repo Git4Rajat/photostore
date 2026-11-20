@@ -14,7 +14,7 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useR
 import { get, getUpload, postTools, postUpload, resolveApiUrl } from '../services/apiClient';
 import { addJustUploaded } from '../services/justUploaded';
 import { heartbeatWaveSession, quiesceWaveShadowSession, discardWaveShadowSession, stopWaveShadowSession, registerWaveItemsBatch, waveIdentityFor, ensureOpened as ensureWaveShadowSessionAdmitted, finalizeWaveShadowSession, resolveWaveShadowFile, reportFailedWaveFile, acknowledgeWaveFinalizedFile, cancelQueuedWaveSelection } from '../services/uploadWaveSync';
-import { hashLargeFile, LARGE_FILE_HASH_THRESHOLD } from '../utils/largeFileHash';
+import { fileHashTimeoutMs, hashLargeFile, LARGE_FILE_HASH_THRESHOLD, withFileHashTimeout } from '../utils/largeFileHash';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
 import { getRuntimeConfig } from '../config/appConfig';
 import type {
@@ -5354,7 +5354,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     if (index >= filesToUpload.length) return;
                     const file = filesToUpload[index];
                     try {
-                        const sha256 = await computeSha256(file, dedupController.signal);
+                        const sha256 = await withFileHashTimeout(
+                            computeSha256(file, dedupController.signal), fileHashTimeoutMs(file.size));
                         results[index] = {
                             file,
                             sha256,
@@ -5362,8 +5363,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         };
                     } catch (error) {
                         // A cancelled start must still abort; anything else
-                        // (a photo iOS can't read, a revoked file handle) only
-                        // costs that one file instead of the whole selection.
+                        // (a photo iOS can't read, a revoked file handle, a
+                        // read that stalls past its time limit) only costs
+                        // that one file instead of the whole selection.
                         if (dedupController.signal.aborted) throw error;
                         unreadableFileNames.push(file.name);
                     }
@@ -5381,7 +5383,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             if (unreadableFileNames.length > 0) {
                 addNotification(
                     'Some files were skipped',
-                    `${plural(unreadableFileNames.length, 'file')} couldn't be read and won't be uploaded (${unreadableFileNames.slice(0, 3).join(', ')}${unreadableFileNames.length > 3 ? ', …' : ''}). Try selecting them again.`,
+                    `${plural(unreadableFileNames.length, 'file')} couldn't be read in time and won't be uploaded (${unreadableFileNames.slice(0, 3).join(', ')}${unreadableFileNames.length > 3 ? ', …' : ''}). If they're in iCloud Drive or on an external drive, make sure they're downloaded or connected, then select them again.`,
                 );
             }
             const candidates: File[] = [];

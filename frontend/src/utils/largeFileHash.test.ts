@@ -1,7 +1,15 @@
 // @vitest-environment node
 import { createHash } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
-import { FILE_HASH_CHUNK_BYTES, hashLargeFile } from './largeFileHash';
+import {
+    FILE_HASH_CHUNK_BYTES,
+    FILE_HASH_TIMEOUT_BASE_MS,
+    FILE_HASH_TIMEOUT_MS_PER_MB,
+    FileHashTimeoutError,
+    fileHashTimeoutMs,
+    hashLargeFile,
+    withFileHashTimeout,
+} from './largeFileHash';
 
 describe('incremental upload SHA-256', () => {
     it('matches SHA-256 across chunk boundaries without reading the whole file', async () => {
@@ -51,5 +59,35 @@ describe('incremental upload SHA-256', () => {
         const file = new Blob(['abc']);
         vi.spyOn(file, 'slice').mockReturnValue(new Blob(['a']));
         await expect(hashLargeFile(file)).rejects.toThrow('could not be fully read');
+    });
+});
+
+describe('duplicate-check hash time limit', () => {
+    it('grows with file size on top of a fixed base', () => {
+        expect(fileHashTimeoutMs(0)).toBe(FILE_HASH_TIMEOUT_BASE_MS);
+        expect(fileHashTimeoutMs(1)).toBe(FILE_HASH_TIMEOUT_BASE_MS + FILE_HASH_TIMEOUT_MS_PER_MB);
+        expect(fileHashTimeoutMs(4096 * 1024 * 1024)).toBe(FILE_HASH_TIMEOUT_BASE_MS + 4096 * FILE_HASH_TIMEOUT_MS_PER_MB);
+    });
+
+    it('rejects a read that never resolves once its limit passes', async () => {
+        vi.useFakeTimers();
+        try {
+            const stalled = withFileHashTimeout(new Promise<string>(() => undefined), 5_000);
+            const outcome = expect(stalled).rejects.toBeInstanceOf(FileHashTimeoutError);
+            await vi.advanceTimersByTimeAsync(5_000);
+            await outcome;
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('returns the hash and clears its timer when the read finishes first', async () => {
+        vi.useFakeTimers();
+        try {
+            await expect(withFileHashTimeout(Promise.resolve('abc'), 5_000)).resolves.toBe('abc');
+            expect(vi.getTimerCount()).toBe(0);
+        } finally {
+            vi.useRealTimers();
+        }
     });
 });
