@@ -105,6 +105,10 @@ export const UploadDock: React.FC = () => {
     const [skipped, setSkipped] = useState<{ count: number } | null>(null);
     // How many files the last "Try again" started with, so the result can say how many worked.
     const [retryOf, setRetryOf] = useState<number | null>(null);
+    // Set when the person resumes a plain pause (nothing failed). Resuming is a continuation, so it keeps the
+    // normal upload wording; `resumeBase` is the added count the run picked up from, to tell when it has moved.
+    const [resumed, setResumed] = useState(false);
+    const [resumeBase, setResumeBase] = useState<number | null>(null);
     const startRef = useRef<{ at: number; base: number } | null>(null);
     const cancelSnapshotRef = useRef({ added: 0, notAdded: 0 });
     const discardingRef = useRef(false);
@@ -126,6 +130,12 @@ export const UploadDock: React.FC = () => {
 
     // A pause has landed once the upload is no longer active.
     useEffect(() => { if (acting === 'pause' && !uploadActive) setActing(null); }, [acting, uploadActive]);
+
+    useEffect(() => {
+        if (!resumed) return;
+        if (!uploadActive) { if (acting !== 'retry') { setResumed(false); setResumeBase(null); } return; }
+        if (resumeBase === null) setResumeBase(added);
+    }, [resumed, uploadActive, acting, added, resumeBase]);
 
     // Resume has started once the upload is active again; from then on Pause and Cancel are available.
     useEffect(() => { if (acting === 'retry' && uploadActive) setActing(null); }, [acting, uploadActive]);
@@ -165,10 +175,13 @@ export const UploadDock: React.FC = () => {
         : null;
     const duplicatesLabel = duplicates > 0 ? `${duplicates} already in your library` : null;
     const retrying = retryOf !== null && uploadActive;
+    const resuming = resumed && uploadActive && !checking && (resumeBase === null || added <= resumeBase);
     const label = uploading ? 'Uploading' : 'Finishing upload';
     const worked = retryOf === null ? 0 : Math.max(0, retryOf - failedFiles.length);
     const title = cancelling
         ? 'Cancelling upload'
+        : resuming
+        ? 'Resuming upload…'
         : checking && uploadActive
         ? `Checking ${plural(checking.total, 'photo')}`
         : retrying
@@ -181,9 +194,10 @@ export const UploadDock: React.FC = () => {
         : !uploadActive
         ? (showFailed ? (retryOf === null ? 'Tap to see why' : `${worked} of ${retryOf} worked this time`) : `${plural(pendingUploadSummary?.fileCount ?? 0, 'file')} waiting`)
         : checking ? 'Looking for ones you already have'
+        : resuming ? 'Picking up where you left off'
         : [timeLeft ?? (progress?.mbPerSecond ? `${progress.mbPerSecond.toFixed(1)} MB/s` : 'Starting…'), duplicatesLabel].filter(Boolean).join(' · ');
 
-    const heading = cancelling || retrying ? title : uploadActive ? (!checking && uploading && total ? `Uploading ${plural(total, 'item')}` : title) : title;
+    const heading = cancelling || retrying || resumed ? title : uploadActive ? (!checking && uploading && total ? `Uploading ${plural(total, 'item')}` : title) : title;
 
     const pause = () => {
         if (acting) return;
@@ -211,7 +225,8 @@ export const UploadDock: React.FC = () => {
     const retry = async () => {
         if (acting) return;
         setActing('retry');
-        setRetryOf(failedFiles.length || pendingUploadSummary?.fileCount || null);
+        if (showFailed) setRetryOf(failedFiles.length);
+        else { setResumed(true); setResumeBase(null); }
         try {
             await retryPersistedUploadSession();
         } finally {
@@ -234,7 +249,7 @@ export const UploadDock: React.FC = () => {
         setSkipped(null);
     };
     const busy = uploading || acting !== null;
-    const retryLabel = acting === 'retry' ? 'Trying again…' : showFailed ? 'Try again' : 'Resume';
+    const retryLabel = acting === 'retry' ? (showFailed ? 'Trying again…' : 'Resuming…') : showFailed ? 'Try again' : 'Resume';
     const pauseLabel = acting === 'pause' ? 'Pausing…' : 'Pause';
     const cancelLabel = acting === 'cancel' ? 'Cancelling…' : 'Cancel upload';
 
@@ -302,16 +317,16 @@ export const UploadDock: React.FC = () => {
                     <button type="button" className="up-head" onClick={() => setSheetOpen(true)} aria-label={`${title}. ${sub}. Show details`}>
                         {icon}
                         <span className="up-t"><b>{title}</b><span>{sub}</span></span>
-                        {uploadActive && !cancelling ? <span className="up-pct">{pct}%</span> : null}
+                        {uploadActive && !cancelling && !resuming ? <span className="up-pct">{pct}%</span> : null}
                         <ChevronRight className="up-chev" aria-hidden="true" />
                     </button>
-                    {uploadActive || cancelling ? <Progress pct={cancelling ? undefined : pct} /> : null}
+                    {uploadActive || cancelling ? <Progress pct={cancelling || resuming ? undefined : pct} /> : null}
                 </div>
                 <BottomSheet open={sheetOpen} onClose={() => setSheetOpen(false)} title={heading}>
                     <div className="up-sheet">
                         {cancelling ? cancellingBody : uploadActive ? (
                             <>
-                                <Progress pct={pct} />
+                                <Progress pct={resuming ? undefined : pct} />
                                 {retryingLede}
                                 {checking ? <p className="up-lede">{checking.checked} of {checking.total} checked. Photos already in your library won’t be uploaded again.</p> : stats}
                                 {!checking && duplicates > 0 ? <p className="up-fine">{duplicatesLabel}, so they were skipped.</p> : null}
@@ -356,9 +371,9 @@ export const UploadDock: React.FC = () => {
                 <>
                     {uploadActive ? (
                         <div className="up-ub">
-                            <Progress pct={pct} />
+                            <Progress pct={resuming ? undefined : pct} />
                             {retryingLede}
-                            <div className="up-fr"><span>{checking ? `${checking.checked} of ${checking.total} checked` : `${added} added · ${waiting} waiting`}</span><span>{checking ? 'Skipping ones you have' : timeLeft ?? duplicatesLabel ?? (progress?.mbPerSecond ? `${progress.mbPerSecond.toFixed(1)} MB/s` : '')}</span></div>
+                            <div className="up-fr"><span>{checking ? `${checking.checked} of ${checking.total} checked` : resuming ? `Picking up where you left off · ${plural(waiting, 'file')} left` : `${added} added · ${waiting} waiting`}</span><span>{checking ? 'Skipping ones you have' : timeLeft ?? duplicatesLabel ?? (progress?.mbPerSecond ? `${progress.mbPerSecond.toFixed(1)} MB/s` : '')}</span></div>
                         </div>
                     ) : null}
                     {!collapsed ? (
