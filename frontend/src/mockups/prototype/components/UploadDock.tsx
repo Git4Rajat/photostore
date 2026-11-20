@@ -305,7 +305,7 @@ export const UploadDock: React.FC = () => {
                 <div className="up-stat"><b>{cancelSnapshotRef.current.added}</b><span>Stay added</span></div>
                 <div className="up-stat"><b>{cancelSnapshotRef.current.notAdded}</b><span>To clear</span></div>
             </div>
-            <p className="up-note"><Info aria-hidden="true" /><span>Photos already added are never removed. You can close this page.</span></p>
+            <p className="up-note"><Info aria-hidden="true" /><span>Photos already added are never removed. Keep this page open until the last files finish.</span></p>
         </>
     );
 
