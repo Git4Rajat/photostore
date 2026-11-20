@@ -2178,3 +2178,48 @@ describe('Server activity in the bell', () => {
         expect(entry?.details).toBe('');
     });
 });
+
+describe('upload lanes versus the preparation gate', () => {
+    const FILES = 300;
+    const TRANSFER_MS = 1500;
+    const PREPARE_MS = 2000;
+    const GATE = 5;
+
+    // Virtual-time stand-ins: 20 lanes, bytes take TRANSFER_MS, preparation runs GATE at a time for PREPARE_MS.
+    function emulate() {
+        mocks.preparationEnabled = true;
+        mocks.profile.mockImplementation(() => ({ fileParallelism: 20, chunkSizeBytes: 4 * 1024 * 1024, reason: 'emulated' }));
+        mocks.transferred.mockImplementation(() => new Promise<void>((resolve) => { setTimeout(resolve, TRANSFER_MS); }));
+        const stats = { active: 0, waiting: 0, peakWaiting: 0 };
+        const queue: Array<() => void> = [];
+        const release = () => { stats.active -= 1; const next = queue.shift(); if (next) { stats.waiting -= 1; next(); } };
+        mocks.prepared.mockImplementation(() => new Promise((resolve) => {
+            const run = () => { stats.active += 1; setTimeout(() => { release(); resolve({}); }, PREPARE_MS); };
+            if (stats.active < GATE) run();
+            else { stats.waiting += 1; stats.peakWaiting = Math.max(stats.peakWaiting, stats.waiting); queue.push(run); }
+        }));
+        return stats;
+    }
+
+    it('keeps the lanes from running far ahead of preparation without slowing the upload', async () => {
+        const stats = emulate();
+        select(filesFor(FILES));
+        let seconds = 0;
+        while (finalizedFiles().length < FILES && seconds < 600) { await advance(1000); seconds += 1; }
+        expect(finalizedFiles()).toHaveLength(FILES);
+        expect(stats.peakWaiting).toBeLessThanOrEqual(40);
+        // The gate is the long pole: FILES x PREPARE_MS / GATE, plus the first transfer and the last finalize.
+        expect(seconds).toBeLessThanOrEqual(FILES * PREPARE_MS / GATE / 1000 + 10);
+    }, 60000);
+
+    it('pausing lands within seconds, not after the whole preparation queue drains', async () => {
+        emulate();
+        select(filesFor(FILES));
+        await advance(30_000);
+        act(() => { services.pauseActiveUpload(); });
+        let seconds = 0;
+        while ((services.uploadActive || services.pausingUpload) && seconds < 600) { await advance(1000); seconds += 1; }
+        expect(services.uploadActive).toBe(false);
+        expect(seconds).toBeLessThanOrEqual(30);
+    }, 60000);
+});

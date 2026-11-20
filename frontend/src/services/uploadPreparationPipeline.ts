@@ -1,4 +1,5 @@
 import {UploadAssetPreparer} from './uploadAssetPreparation';
+import {BASE_PREPARATION_LIMITS, type PreparationLimits} from './uploadPreparationLimits';
 import type {UploadMetadataDescriptor, UploadMetadataPacket} from '../utils/uploadMetadata';
 import {isVideoFilename} from '../utils/photoDisplay';
 import {extractBrowserExif} from '../utils/browserExifTool';
@@ -60,12 +61,18 @@ const delay = (ms: number, signal: AbortSignal): Promise<void> => new Promise(re
 });
 
 export class UploadPreparationPipeline {
-    private preparer = new UploadAssetPreparer();
+    private preparer: UploadAssetPreparer;
     private jobs = new Set<AbortController>();
-    private admission = new PreparationGate(5);
-    private puts = new PreparationGate(2);
+    private admission: PreparationGate;
+    private puts: PreparationGate;
     private disposed = false;
     private metadataWorkers = new UploadWorkerReuse();
+
+    constructor(limits: PreparationLimits = BASE_PREPARATION_LIMITS) {
+        this.preparer = new UploadAssetPreparer(undefined, limits.queuedDecodes, undefined, limits.decoders);
+        this.admission = new PreparationGate(limits.admission);
+        this.puts = new PreparationGate(limits.puts);
+    }
 
     start(file: File, sha256: string, targets: UploadAssetTargets, signal: AbortSignal): Promise<PreparedUpload> {
         const started = performance.now();
