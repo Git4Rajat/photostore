@@ -1941,6 +1941,19 @@ describe('discard acknowledgment after refresh', () => {
         expect(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)).toBeNull();
     });
 
+    it('clears the paused upload locally when the session was rejected, so new uploads are not blocked', async () => {
+        vi.spyOn(uploadWaveSync, 'discardWaveShadowSession')
+            .mockRejectedValueOnce(Object.assign(new Error('Invalid or expired session'), { status: 401 }));
+        restorePaused(); await advance(100);
+        await act(async () => { await services.discardPersistedUploadSession(); });
+        expect(localStorage.getItem(UPLOAD_SESSION_STORAGE_KEY)).toBeNull();
+        expect(services.pendingUploadSummary).toBeNull();
+        expect(services.notifications.some(n => n.title === 'Upload discard failed')).toBe(false);
+        act(() => { void services.startUpload(filesFor(2)); });
+        await advance(5000);
+        expect(finalizedFiles()).toHaveLength(2);
+    });
+
     it('tells the user a blocked discard is a temporary server-side wait, not a failure', async () => {
         // Mirrors the exact wording of backend/wave_settlement.py's abandon():
         // raise Conflict('A finalization is still in flight; retry abandonment later')

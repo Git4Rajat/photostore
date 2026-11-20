@@ -388,6 +388,14 @@ const isUnsupportedFileTypeError = (err: unknown): boolean => {
     return failure?.code === 'unsupported_file_type' || failure?.response?.data?.code === 'unsupported_file_type';
 };
 
+// A 401 means the session token is dead, so the server can never confirm this
+// upload's closure for this browser; waiting on it would block new uploads forever.
+const isSessionRejectedError = (err: unknown): boolean => {
+    const failure = err as { status?: unknown; response?: { status?: unknown }; message?: unknown } | null | undefined;
+    return failure?.status === 401 || failure?.response?.status === 401
+        || (typeof failure?.message === 'string' && /invalid or expired session/i.test(failure.message));
+};
+
 const getUploadErrorMessage = (err: unknown, fallback: string): string => {
     if (typeof err === 'string') {
         return err;
@@ -3711,6 +3719,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             try {
                 await postUpload('/upload/cancel', { files: unfinished });
             } catch (err) {
+                if (isSessionRejectedError(err)) throw err;
                 addNotification('Upload cleanup warning', getUploadErrorMessage(err, 'Some upload records could not be removed.'));
             }
         }
@@ -5103,10 +5112,19 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         try {
             if (session) {
                 addNotification('Discarding upload', 'Closing the unfinished upload before starting another.');
-                // Clean incomplete artifacts while the intake barrier still
-                // protects finalized metadata from newly released Vision work.
-                await cleanupUnfinishedUploadArtifacts(session);
-                await discardWaveShadowSession(session);
+                try {
+                    // Clean incomplete artifacts while the intake barrier still
+                    // protects finalized metadata from newly released Vision work.
+                    await cleanupUnfinishedUploadArtifacts(session);
+                    await discardWaveShadowSession(session);
+                } catch (error) {
+                    if (!isSessionRejectedError(error)) throw error;
+                    // The session is dead, so the server can't confirm closure
+                    // from here. Drop the local checkpoint rather than leave the
+                    // banner blocking every new upload; the server expires the
+                    // abandoned reservations on its own.
+                    addNotification('Signed out of this upload', 'Your session expired, so the paused upload was cleared on this device. Sign in again to upload.');
+                }
             }
             uploadSourceFilesRef.current.clear();
             uploadPrecomputedHashesRef.current.clear();
