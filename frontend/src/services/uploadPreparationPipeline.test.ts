@@ -1,12 +1,14 @@
 import {Blob as NodeBlob} from 'node:buffer';
 
-const mocks = vi.hoisted(() => ({prepare: vi.fn(), dispose: vi.fn(), fetch: vi.fn(), exif: vi.fn()}));
+const mocks = vi.hoisted(() => ({prepare: vi.fn(), dispose: vi.fn(), fetch: vi.fn(), exif: vi.fn(), preparer: vi.fn()}));
 vi.mock('./uploadAssetPreparation', () => ({UploadAssetPreparer: class {
+    constructor(...args: unknown[]) { mocks.preparer(...args); }
     prepare = mocks.prepare;
     dispose = mocks.dispose;
 }}));
 vi.mock('../utils/browserExifTool', () => ({extractBrowserExif: mocks.exif}));
 import {UploadPreparationPipeline, preparedThumbnail} from './uploadPreparationPipeline';
+import {BASE_PREPARATION_LIMITS, FAST_PREPARATION_LIMITS} from './uploadPreparationLimits';
 
 const browserVerdict = {ok: true, result: {source: 'browser_exiftool', verifiedComplete: true, exifToolJson: {'EXIF:Make': 'Canon'}}};
 
@@ -184,6 +186,35 @@ test('bounded admission queues excess files until uploads release a job slot', a
     expect(results.every(result => result.clientProcessing?.preview && result.clientProcessing?.thumbnail)).toBe(true);
     expect(results[5].preparationReport?.admissionMs).toBeGreaterThanOrEqual(1000);
     expect(results.every(result => result.preparationReport?.reason !== 'busy')).toBe(true);
+    pipeline.dispose();
+});
+
+test('the fast limits size the decoder, admission and PUT gates together', async () => {
+    metadataWorker();
+    let active = 0, maximum = 0;
+    mocks.fetch.mockImplementation(() => new Promise(resolve => {
+        active++; maximum = Math.max(maximum, active);
+        setTimeout(() => { active--; resolve({ok: true, status: 201}); }, 50);
+    }));
+    mocks.prepare.mockImplementation(() => new Promise(resolve => setTimeout(() => resolve(assets()), 500)));
+    const pipeline = new UploadPreparationPipeline(FAST_PREPARATION_LIMITS);
+    expect(mocks.preparer).toHaveBeenLastCalledWith(undefined, 4, undefined, 4);
+    const jobs = Array.from({length: 40}, () => pipeline.start(source(), 'a'.repeat(64),
+        {...targets, metadataBlobUrl: 'https://storage/metadata'}, new AbortController().signal));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mocks.prepare).toHaveBeenCalledTimes(FAST_PREPARATION_LIMITS.admission);
+    await vi.advanceTimersByTimeAsync(60_000);
+    const results = await Promise.all(jobs);
+    expect(maximum).toBeLessThanOrEqual(FAST_PREPARATION_LIMITS.puts);
+    expect(maximum).toBeGreaterThan(BASE_PREPARATION_LIMITS.puts);
+    expect(results.every(result => result.clientProcessing?.preview && result.clientProcessing?.thumbnail && result.clientMetadata)).toBe(true);
+    expect(results.every(result => result.preparationReport?.reason !== 'busy')).toBe(true);
+    pipeline.dispose();
+});
+
+test('the default limits keep today\'s two decoders and five admitted files', () => {
+    const pipeline = new UploadPreparationPipeline();
+    expect(mocks.preparer).toHaveBeenLastCalledWith(undefined, 4, undefined, 2);
     pipeline.dispose();
 });
 

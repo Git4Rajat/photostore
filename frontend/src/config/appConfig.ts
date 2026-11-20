@@ -31,6 +31,8 @@ export interface AppConfig {
     processingMode?: 'browser' | 'backend' | 'both';
     /** Default-off upload preparation, independent of browser AI processing. */
     browserUploadPreparation?: boolean;
+    /** Prepare several photos at once on desktop-class devices (default on; false restores the old limits). */
+    uploadPreparationParallel?: boolean;
     /** Deployment opt-in; durable per-library ownership is still discovered by Upload. */
     uploadWaveExecutionEnabled?: boolean;
 }

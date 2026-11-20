@@ -25,6 +25,10 @@ WAVE_EXECUTION=false
 if [ "${APP_CONFIG_UPLOAD_WAVE_EXECUTION_ENABLED:-false}" = "true" ]; then
   WAVE_EXECUTION=true
 fi
+UPLOAD_PREPARATION_PARALLEL=true
+if [ "${APP_CONFIG_UPLOAD_PREPARATION_PARALLEL:-true}" = "false" ]; then
+  UPLOAD_PREPARATION_PARALLEL=false
+fi
 UPLOAD_PREPARATION=false
 if [ "${APP_CONFIG_BROWSER_UPLOAD_PREPARATION:-false}" = "true" ]; then
   UPLOAD_PREPARATION=true
@@ -58,7 +62,8 @@ window.__APP_CONFIG__ = {
   buildTimestamp: "${BUILD_TS}",
   processingMode: "${PROCESSING_MODE}",
   uploadWaveExecutionEnabled: ${WAVE_EXECUTION},
-  browserUploadPreparation: ${UPLOAD_PREPARATION}
+  browserUploadPreparation: ${UPLOAD_PREPARATION},
+  uploadPreparationParallel: ${UPLOAD_PREPARATION_PARALLEL}
 };
 EOF
 

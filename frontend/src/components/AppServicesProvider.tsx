@@ -69,6 +69,7 @@ import { publishLibraryChange } from '../services/libraryChanges';
 import { fetchKnownUploadHashes, requestUploadHashRefresh, type UploadEndReason } from '../services/uploadKnownHashes';
 import { perf } from '../services/perf';
 import { UploadSessionStore } from '../services/uploadSessionStore';
+import { uploadPreparationLimits } from '../services/uploadPreparationLimits';
 import { UploadPreparationPipeline, preparedThumbnail, type PreparedUpload, type UploadAssetTargets } from '../services/uploadPreparationPipeline';
 import type { UploadMetadataDescriptor } from '../utils/uploadMetadata';
 import { prewarmBrowserExifTool } from '../utils/browserExifTool';
@@ -497,6 +498,16 @@ const createDispatchGate = (concurrency: number) => {
 // stage several blocks in flight and size the per-file concurrency so the total
 // across active file lanes stays near this cap.
 const TARGET_CONCURRENT_UPLOAD_BLOCKS = 6;
+
+// A lane hands a transferred file to a background finalize and moves on, but that finalize first
+// waits for the file's preparation, which runs only a few at a time. Without a bound the lanes
+// run far ahead of it (600 files: ~480 waiting, a Pause then takes minutes to land because it
+// waits for all of them). Lanes hold their next file while this many are still waiting on their
+// preparation: the preparation gate stays busy, so the upload takes no longer, but Pause waits
+// for ~this many. Files already in a finalize request don't count, so a slow server never
+// throttles the lanes.
+const MAX_FILES_AWAITING_PREPARATION = 24;
+const PREPARATION_RECHECK_MS = 500;
 
 // Cap the staging block size so files split into enough blocks for the parallel
 // pool to engage. Very large blocks (the desktop profile uses tens of MB) would
@@ -3876,7 +3887,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             });
         },UPLOAD_TRANSFER_HEARTBEAT_MS);
         const pendingFinalizeTasks = new Set<Promise<void>>();
-        const uploadPreparation = new UploadPreparationPipeline();
+        const awaitingPreparation = new Set<Promise<unknown>>();
+        const uploadPreparation = new UploadPreparationPipeline(uploadPreparationLimits({
+            parallel: getRuntimeConfig().uploadPreparationParallel !== false,
+            constrained: isConstrainedUploadDevice(),
+            cores: typeof navigator.hardwareConcurrency === 'number' && navigator.hardwareConcurrency > 0 ? navigator.hardwareConcurrency : undefined,
+        }));
         let uploadEndReason: UploadEndReason = 'failed';
         let admissionReady = false;
         // Tracks this run's own terminal outcomes independent of
@@ -4330,6 +4346,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     if (uploadStopRequestedRef.current || uploadDrainRequestedRef.current) {
                         return;
                     }
+                    if (awaitingPreparation.size >= MAX_FILES_AWAITING_PREPARATION) {
+                        await Promise.race([
+                            Promise.race(Array.from(awaitingPreparation)),
+                            new Promise((resolve) => { setTimeout(resolve, PREPARATION_RECHECK_MS); }),
+                        ]);
+                        continue;
+                    }
                     const currentIndex = nextFileIndex;
                     nextFileIndex += 1;
                     if (currentIndex >= pendingFiles.length) {
@@ -4424,6 +4447,11 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                                         ? uploadPreparation.start(resolvedFile, sha256,
                                             {...targets, uploadPreparationEnabled: !!targets.uploadPreparationEnabled}, controller.signal)
                                         : Promise.resolve({});
+                                    if (getRuntimeConfig().browserUploadPreparation || isVideoFilename(resolvedFile.name)) {
+                                        const started = preparation.then(() => undefined, () => undefined);
+                                        awaitingPreparation.add(started);
+                                        void started.then(() => awaitingPreparation.delete(started));
+                                    }
                                 },
                                 onChunkCommitted: (bytesReceived) => {
                                     const previousBytes = lastCommittedBytesByFile.get(fileMeta.key) || 0;
