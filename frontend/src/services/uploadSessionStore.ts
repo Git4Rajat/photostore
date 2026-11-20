@@ -60,6 +60,12 @@ export class UploadSessionStore {
         const index = this.positions.get(key);
         if (!this.current || index === undefined) return;
         const files = this.current.files;
+        // The entry is about to vanish, so remember it was finished: after a pause/resume the
+        // progress counter would otherwise restart from the files still in the queue.
+        if (files[index].status === 'done') {
+            this.current.completedCount = (this.current.completedCount ?? 0) + 1;
+            if (files[index].skippedDuplicate) this.current.completedSkippedCount = (this.current.completedSkippedCount ?? 0) + 1;
+        }
         const last = files.length - 1;
         if (index !== last) {
             files[index] = files[last];

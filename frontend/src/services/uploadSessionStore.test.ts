@@ -215,3 +215,31 @@ describe('upload recovery checkpoints', () => {
         expect(storage.setItem).not.toHaveBeenCalled();
     });
 });
+
+describe('completed-file counters survive the queue shrinking', () => {
+    it('counts finished files as they leave the queue and persists the totals for a resume', () => {
+        const { store, storage } = setup();
+        store.set(session(5));
+        store.update('session:0', { status: 'done' });
+        store.update('session:1', { status: 'done', skippedDuplicate: true });
+        store.update('session:2', { status: 'failed' });
+        store.remove('session:0');
+        store.remove('session:1');
+        store.remove('session:2'); // not finished: must not count
+        expect(store.current).toMatchObject({ completedCount: 2, completedSkippedCount: 1 });
+        expect(store.current!.files).toHaveLength(2);
+        store.flush();
+        const saved = JSON.parse(storage.getItem(KEY)!) as PersistedUploadSession;
+        expect(saved.completedCount).toBe(2);
+        expect(saved.completedSkippedCount).toBe(1);
+    });
+
+    it('keeps the counters when the session is set again for a resumed run', () => {
+        const { store } = setup();
+        store.set({ ...session(3), completedCount: 9000, completedSkippedCount: 12 });
+        expect(store.current).toMatchObject({ completedCount: 9000, completedSkippedCount: 12 });
+        store.update('session:0', { status: 'done' });
+        store.remove('session:0');
+        expect(store.current!.completedCount).toBe(9001);
+    });
+});

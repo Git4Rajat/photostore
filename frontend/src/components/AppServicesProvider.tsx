@@ -3759,11 +3759,15 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         // to autolock mid-transfer otherwise.
         keepAliveRef.current?.start();
         setPendingUploadSessionLive(null);
-        const totalCount = session.files.length;
-        let totalUploaded = session.files.filter((file) => file.status === 'done').length;
+        // Finished files leave `session.files` (UploadSessionStore.remove) but stay counted here,
+        // so a resumed upload continues from its real total instead of restarting at zero.
+        const completedBefore = session.completedCount ?? 0;
+        const totalCount = session.files.length + completedBefore;
+        let totalUploaded = session.files.filter((file) => file.status === 'done').length + completedBefore;
         let totalFailed = 0;
         let totalUnsupported = 0;
         let totalSkippedDuplicates = session.files.filter((file) => file.skippedDuplicate).length
+            + (session.completedSkippedCount ?? 0)
             + (options.preflightSkippedDuplicateCount || 0);
         const previouslyUploaded = totalUploaded;
         const previouslySkipped = totalSkippedDuplicates;
