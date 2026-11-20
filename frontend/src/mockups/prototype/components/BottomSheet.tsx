@@ -19,11 +19,16 @@ export const BottomSheet: React.FC<{
 }> = ({ open, onClose, title, children, header }) => {
     const sheetRef = useRef<HTMLDivElement | null>(null);
     const restoreFocusRef = useRef<HTMLElement | null>(null);
+    // Callers pass inline arrows; depending on onClose directly would rerun the
+    // effect on every parent render (each keystroke), bouncing focus out of the
+    // field and dismissing the phone keyboard.
+    const onCloseRef = useRef(onClose);
+    onCloseRef.current = onClose;
 
     useEffect(() => {
         if (!open) return undefined;
         restoreFocusRef.current = (document.activeElement as HTMLElement) ?? null;
-        const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+        const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onCloseRef.current(); };
         document.addEventListener('keydown', onKey);
         // Focus the first focusable control (the search field / first row) so the
         // sheet is operable by keyboard and announced by screen readers.
@@ -36,7 +41,7 @@ export const BottomSheet: React.FC<{
             const el = restoreFocusRef.current;
             if (el && typeof el.focus === 'function' && document.contains(el)) el.focus();
         };
-    }, [open, onClose]);
+    }, [open]);
 
     if (!open) return null;
 
