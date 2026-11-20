@@ -226,16 +226,55 @@ export interface CleanRequestResult {
     expiresIn: number;
 }
 
-// Step 1 of "Clean library": owner re-enters their password (password mode
-// only) and an emailed, single-use confirmation link is sent to the owner —
-// plus one other member, picked at random, if the library is shared.
-export const requestLibraryClean = async (password?: string): Promise<CleanRequestResult> => {
+// Why a clean request failed, so the caller can tell "try the email again" (a
+// send failure) from "ask for the password again" (the proof ran out).
+export class CleanRequestError extends Error {
+    constructor(message: string, readonly status: number, readonly code?: string) {
+        super(message);
+        this.name = 'CleanRequestError';
+    }
+}
+
+// Step 1 of "Clean library", password mode only: core checks the owner's
+// password and returns a short-lived proof the clean request must carry. The
+// archive that sends the email never sees the password. Throws WrongPassword
+// for a bad password, an ordinary Error for anything else (throttled, offline).
+export class WrongPasswordError extends Error {
+    constructor() {
+        super('That password isn’t right.');
+        this.name = 'WrongPasswordError';
+    }
+}
+
+export const verifyLibraryPassword = async (password: string): Promise<string> => {
+    const response = await authedFetch('/api/library/verify-password', {
+        method: 'POST',
+        body: JSON.stringify({ password }),
+    });
+    if (response.status === 401) throw new WrongPasswordError();
+    if (!response.ok) {
+        throw new Error(await parseError(response, 'Could not check the password.'));
+    }
+    return String((await response.json()).proof || '');
+};
+
+// Step 2: an emailed, single-use confirmation link is sent to the owner — plus
+// one other member, picked at random, if the library is shared. `proof` comes
+// from verifyLibraryPassword (password mode only).
+export const requestLibraryClean = async (proof?: string): Promise<CleanRequestResult> => {
     const response = await authedFetch('/api/library/clean/request', {
         method: 'POST',
-        body: JSON.stringify(password ? { password } : {}),
+        body: JSON.stringify(proof ? { proof } : {}),
     });
     if (!response.ok) {
-        throw new Error(await parseError(response, 'Could not start the cleanup confirmation.'));
+        let code: string | undefined;
+        let message = 'Could not start the cleanup confirmation.';
+        try {
+            const body = await response.json();
+            code = body?.code;
+            message = body?.error || message;
+        } catch { /* keep the fallback */ }
+        throw new CleanRequestError(message, response.status, code);
     }
     return response.json();
 };

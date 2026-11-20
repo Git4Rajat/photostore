@@ -10,7 +10,7 @@ vi.mock('../store', () => ({
             { userId: 'u2', email: 'asha@example.test', isOwner: false, isSelf: false },
         ],
         pendingInvites: [{ inviteId: 'i1', email: 'dev@example.test', targetType: 'join', expiresAt: Date.now() + 20 * 3_600_000 }],
-        libraryName: 'Verma family', isOwner: true, maxMembers: 15, membersLoading: false, totalPhotos: 31,
+        libraryName: 'Verma family', isOwner: true, maxMembers: 15, membersLoading: false, totalPhotos: 31, albums: [],
         fetchMembers: vi.fn(async () => {}), invite: mocks.invite, revokeInvite: vi.fn(), removeMember: mocks.removeMember,
         renameLibrary: vi.fn(), toast: vi.fn(),
     }),

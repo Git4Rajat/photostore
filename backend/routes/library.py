@@ -327,6 +327,30 @@ def library_rename():
     app.library_store.audit(library_id, actor=account_id, action='rename', target=name)
     return app.jsonify({'status': 'ok', 'name': name})
 
+@library_bp.route('/api/library/verify-password', methods=['POST'])
+def library_verify_password():
+    """The owner's password check for "Delete everything in this library", run on core so the
+    dialog answers at once. Returns a short-lived proof the archive's clean request requires."""
+    guard = app._password_mode_guard()
+    if guard:
+        return guard
+    account_id, library_id, error = app._require_owner_context()
+    if error:
+        return error
+    password = str((app.request.get_json(silent=True) or {}).get('password', '') or '')
+    row = f'clean-reauth-throttle:{account_id}'
+    if not app.password_auth.login_attempt_allowed(app.config_table_client, row):
+        return app.jsonify({'error': 'Too many attempts. Please wait and try again.'}), 429
+    stored_hash = str((app.library_store.get_user(account_id) or {}).get('passwordHash') or '')
+    if not stored_hash or not app.password_auth.verify_password(password, stored_hash):
+        app.password_auth.record_login_failure(app.config_table_client, row_key=row)
+        return app.jsonify({'error': 'Incorrect password.'}), 401
+    app.password_auth.record_login_success(app.config_table_client, row)
+    return app.jsonify({
+        'proof': app._library_clean_reauth_proof(account_id, library_id),
+        'expiresIn': app.LIBRARY_CLEAN_REAUTH_TTL_SECONDS,
+    })
+
 @library_bp.route('/api/library/members/remove', methods=['POST'])
 def library_remove_member():
     account_id, library_id, error = app._require_owner_context()
