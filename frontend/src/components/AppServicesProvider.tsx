@@ -3767,7 +3767,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             + (options.preflightSkippedDuplicateCount || 0);
         const previouslyUploaded = totalUploaded;
         const previouslySkipped = totalSkippedDuplicates;
-        const uploadProfile = options.uploadProfile || getAdaptiveUploadProfile(session.files);
+        // A resume (Pause then Resume, Retry) has no warm-up of its own, so it sized its lanes from the
+        // browser's rtt/downlink guess alone; a conservative guess ran ~20 files/min for the first minutes
+        // (2026-11-20) until the first init's latency raised the lane count. Reuse this tab's last real
+        // reading, however old: a stale reading still beats none. Size lanes from the files still to send.
+        const lastProbe = lastWarmProbeRef.current;
+        const uploadProfile = options.uploadProfile || getAdaptiveUploadProfile(filesToProcess, {
+            measuredRttMs: lastProbe && lastProbe.ms > 0 ? lastProbe.ms : undefined,
+        });
         const uploadStartedAt = Date.now();
         let transferredBytesThisRun = 0;
         const lastCommittedBytesByFile = new Map<string, number>();
