@@ -677,6 +677,35 @@ TRASH_RETENTION_DAYS = int(os.getenv('TRASH_RETENTION_DAYS', '30'))
 # replaced. Sized comfortably above the largest concurrency user in this
 # process so pooling stays effective under concurrent requests too.
 STORAGE_CONNECTION_POOL_MAXSIZE = int(os.getenv('STORAGE_CONNECTION_POOL_MAXSIZE', '64'))
+
+
+def _pooled_storage_transport():
+    """A transport whose urllib3 pool really holds STORAGE_CONNECTION_POOL_MAXSIZE.
+
+    The Azure SDKs ignore a ``connection_pool_maxsize`` keyword: every
+    RequestsTransport mounts its own adapter at urllib3's default of 10 per
+    host. Clients built with that keyword still logged "Connection pool is
+    full" at pool size 10 during an upload on 2026-11-20, where table calls
+    averaged 33 ms in-app against ~10 ms server-side. The pool size can only be
+    set on a session the transport is handed. Each service client gets its own.
+    """
+    import requests
+    from urllib3.util.retry import Retry
+    from azure.core.pipeline.transport import RequestsTransport
+    try:
+        # azure-core's own adapter (larger read blocks for blob transfers).
+        from azure.core.pipeline.transport._bigger_block_size_http_adapters import (
+            BiggerBlockSizeHTTPAdapter as Adapter)
+    except ImportError:
+        from requests.adapters import HTTPAdapter as Adapter
+    session = requests.Session()
+    # Matches RequestsTransport._init_session: the pipeline owns retries.
+    adapter = Adapter(pool_connections=STORAGE_CONNECTION_POOL_MAXSIZE,
+                      pool_maxsize=STORAGE_CONNECTION_POOL_MAXSIZE,
+                      max_retries=Retry(total=False, redirect=False, raise_on_status=False))
+    for protocol in ('http://', 'https://'):
+        session.mount(protocol, adapter)
+    return RequestsTransport(session=session, session_owner=False)
 # 'sas' hands the browser day-stable read SAS URLs pointing straight at blob
 # storage so media bytes never stream through this container; 'proxy' serves
 # every byte through the backend. 'sas' silently degrades to proxy URLs when
@@ -1613,18 +1642,18 @@ def _init_storage_clients():
 
         if BLOB_CONNECTION_STRING:
             blob_service_client_local = BlobServiceClient.from_connection_string(
-                BLOB_CONNECTION_STRING, connection_pool_maxsize=STORAGE_CONNECTION_POOL_MAXSIZE,
+                BLOB_CONNECTION_STRING, transport=_pooled_storage_transport(),
             )
         else:
             blob_service_client_local = BlobServiceClient(
                 account_url=f'https://{account_name}.blob.core.windows.net',
                 credential=credential,
-                connection_pool_maxsize=STORAGE_CONNECTION_POOL_MAXSIZE,
+                transport=_pooled_storage_transport(),
             )
         queue_service_client_local = QueueServiceClient(
             account_url=f'https://{account_name}.queue.core.windows.net',
             credential=credential,
-            connection_pool_maxsize=STORAGE_CONNECTION_POOL_MAXSIZE,
+            transport=_pooled_storage_transport(),
         )
         clustering_queue_client_local = queue_service_client_local.get_queue_client(CLUSTERING_QUEUE_NAME)
         clustering_deferred_queue_client_local = queue_service_client_local.get_queue_client(CLUSTERING_DEFERRED_QUEUE_NAME)
@@ -1637,7 +1666,7 @@ def _init_storage_clients():
         tbl_svc = TableServiceClient(
             endpoint=f'https://{account_name}.table.core.windows.net',
             credential=credential,
-            connection_pool_maxsize=STORAGE_CONNECTION_POOL_MAXSIZE,
+            transport=_pooled_storage_transport(),
         )
         metadata_table_client_local = tbl_svc.get_table_client(METADATA_TABLE)
         embeddings_table_client_local = tbl_svc.get_table_client(EMBEDDINGS_TABLE)

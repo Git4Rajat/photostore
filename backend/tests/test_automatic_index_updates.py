@@ -1004,3 +1004,61 @@ def test_a_failed_shared_begin_lets_the_next_request_open_its_own(runtime, monke
     finally:
         end()
     assert runtime.store.control('A', 'vector')['active'] == 0
+
+
+def _count_admissions(monkeypatch):
+    calls = []
+    check = automatic.check_source_admission
+    monkeypatch.setattr(automatic, 'check_source_admission', lambda user: calls.append(user) or check(user))
+    return calls
+
+
+def test_coalesced_scope_checks_the_quiescence_fence_once_after_reserving(runtime, monkeypatch):
+    # 2026-11-20: finalize-batch read the (absent) quiescence row ~12 times per
+    # file, twice per tracked write. Once this scope's durable reservation is
+    # held, a later clean waits for it, so one passed check covers the scope.
+    table = su.track_index_source_table(runtime.source, 'embeddings')
+    calls = _count_admissions(monkeypatch)
+    end = _wave_scope(monkeypatch)
+    try:
+        with automatic.coalesced_source_reservations():
+            for index in range(5):
+                table.upsert_entity({'PartitionKey': 'A', 'RowKey': f'p{index}'})
+    finally:
+        end()
+    assert calls == ['A', 'A']  # the first write's pre-check and post-reservation check
+    assert len(runtime.source.rows) == 5
+
+
+def test_quiescence_fence_is_rechecked_per_write_outside_a_coalesced_scope(runtime, monkeypatch):
+    table = su.track_index_source_table(runtime.source, 'embeddings')
+    calls = _count_admissions(monkeypatch)
+    end = _wave_scope(monkeypatch)
+    try:
+        for index in range(3):
+            table.upsert_entity({'PartitionKey': 'A', 'RowKey': f'p{index}'})
+    finally:
+        end()
+    assert calls == ['A', 'A'] * 3
+
+
+def test_scope_check_is_ignored_until_the_scope_holds_a_reservation(runtime):
+    with automatic.coalesced_source_reservations():
+        automatic.record_scope_check('A', 'admission')
+        assert automatic.scope_checked('A', 'admission') is False
+    assert automatic.scope_checked('A', 'admission') is False
+
+
+def test_fence_set_mid_scope_still_waits_for_the_scope_reservation(runtime, monkeypatch):
+    table = su.track_index_source_table(runtime.source, 'embeddings')
+    end = _wave_scope(monkeypatch)
+    try:
+        with automatic.coalesced_source_reservations():
+            table.upsert_entity({'PartitionKey': 'A', 'RowKey': 'p0'})
+            # A clean fencing now cannot prove quiescence while this scope's
+            # reservation is active, so the cached check stays sound.
+            assert automatic._sources_busy('A')
+            table.upsert_entity({'PartitionKey': 'A', 'RowKey': 'p1'})
+    finally:
+        end()
+    assert not runtime.store.control('A', 'vector')['active']

@@ -1038,6 +1038,9 @@ class _CoalescedReservations:
         self.lock = threading.Lock()
         self.held = {}
         self.failed = set()
+        # Fence checks already passed while this scope held a reservation for
+        # the library (see scope_checked).
+        self.checked = set()
 
     def reserve(self, user, kind, *, deleted, operation):
         with self.lock:
@@ -1049,6 +1052,36 @@ class _CoalescedReservations:
     def fail(self, keys):
         with self.lock:
             self.failed.update(keys)
+
+    def reserving(self, user):
+        return any(held_user == user for held_user, _ in self.held)
+
+
+def scope_checked(user, check):
+    """Whether ``check`` already passed for ``user`` in this coalesced scope.
+
+    Library cleanup proves quiescence only once no source reservation is
+    active (_sources_busy), and this scope's durable reservation stays active
+    until the scope exits. A fence check that passed while it was held
+    therefore still holds for every later write in the scope: a clean that
+    fences afterwards waits for this scope to finish before it can wipe. Before
+    the scope holds a reservation for the library, every call checks again.
+    """
+    scope = _COALESCED.get()
+    if scope is None:
+        return False
+    with scope.lock:
+        return scope.reserving(user) and (user, check) in scope.checked
+
+
+def record_scope_check(user, check):
+    """Remember a passed fence check; ignored unless a reservation is held."""
+    scope = _COALESCED.get()
+    if scope is None:
+        return
+    with scope.lock:
+        if scope.reserving(user):
+            scope.checked.add((user, check))
 
 
 @contextmanager
@@ -1160,7 +1193,8 @@ class SourceTable:
                 if cleanup_check is not None:
                     cleanup_check()
                 elif user not in admitted:
-                    check_source_admission(user)
+                    if not scope_checked(user, 'admission'):
+                        check_source_admission(user)
                     admitted.add(user)
                 user, kinds, unsafe, gone = mutation_targets(self.source, self.table, op, entity, options)
                 wave = wave_owned(user)
@@ -1203,7 +1237,10 @@ class SourceTable:
                                          operation=f'{self.source}.{name}')
                     reserved.append((user, kind, res_id))
                 for user in dict.fromkeys(user for user, _ in sorted(targets)):
+                    if scope_checked(user, 'admission'):
+                        continue
                     check_source_admission(user)
+                    record_scope_check(user, 'admission')
                 result = method(*args, **kwargs)
                 success = True
                 return result
