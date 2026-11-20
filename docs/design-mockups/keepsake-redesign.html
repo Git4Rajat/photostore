@@ -500,6 +500,25 @@ figure.xl { width: 100%; max-width: 1120px; }
 .starpop .f { fill: var(--v-accent); stroke: var(--v-accent); }
 .starpop::after { content: ""; position: absolute; left: 22px; bottom: -6px; width: 12px; height: 12px; background: var(--v-chip); transform: rotate(45deg); }
 
+/* Delete library dialogs */
+.dsm { position: relative; height: 440px; overflow: hidden; background: var(--bg); }
+.dsm .pg { padding: 22px 26px; display: flex; flex-direction: column; gap: 12px; }
+.dsm .pg h3 { margin: 0; font: 600 28px/1.1 var(--font-display); }
+.dsm .scrim { z-index: 4; }
+.dlg { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(400px, calc(100% - 32px)); z-index: 6; background: var(--surface); border-radius: 20px; padding: 22px; box-shadow: var(--shadow), 0 0 0 1px var(--line); display: flex; flex-direction: column; gap: 12px; }
+.dlg h4 { margin: 0; font: 600 21px/1.2 var(--font-display); text-wrap: balance; }
+.dlg p { margin: 0; font-size: 13.5px; color: var(--muted); }
+.dlg .dacts { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+.dlg .bigicon { align-self: flex-start; }
+.dlg .bigicon.bad { background: var(--danger-soft); color: var(--danger); }
+.spinner { width: 16px; height: 16px; border-radius: 50%; border: 2px solid currentColor; border-right-color: transparent; animation: spin .8s linear infinite; flex: none; }
+@media (prefers-reduced-motion: reduce) { .spinner { animation: none; border-right-color: currentColor; opacity: .6; } }
+.field.dis { opacity: .55; }
+.btn.busy { opacity: .75; }
+.sheet .bigicon { align-self: flex-start; width: 48px; height: 48px; }
+.sheet .bigicon.bad { background: var(--danger-soft); color: var(--danger); }
+figure.shot.md { width: 540px; }
+
 /* Filter */
 .fbar { display: flex; align-items: center; gap: 10px; padding: 0 16px 8px; flex: none; }
 .fbar .meta { margin-left: auto; font-size: 12.5px; color: var(--muted); }
@@ -747,7 +766,7 @@ figure.xl { width: 100%; max-width: 1120px; }
   <div class="wrap">
     <div class="brand"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span>Keepsake <small>redesign</small></div>
     <nav class="nav" aria-label="Sections">
-      <a href="#system">System</a><a href="#gallery">Gallery</a><a href="#filter">Filter</a><a href="#albums">Albums</a><a href="#people">People</a><a href="#notifications">Notifications</a><a href="#invites">Invites</a><a href="#login">Sign in</a><a href="#upload">Upload</a><a href="#processing">After upload</a><a href="#upload-actions">Cancel &amp; retry</a><a href="#emails">Emails</a><a href="#shared-static">Shared · instant</a><a href="#shared-full">Shared · full</a><a href="#desktop">Desktop</a>
+      <a href="#system">System</a><a href="#gallery">Gallery</a><a href="#filter">Filter</a><a href="#albums">Albums</a><a href="#people">People</a><a href="#notifications">Notifications</a><a href="#invites">Invites</a><a href="#delete-library">Delete library</a><a href="#login">Sign in</a><a href="#upload">Upload</a><a href="#processing">After upload</a><a href="#upload-actions">Cancel &amp; retry</a><a href="#emails">Emails</a><a href="#shared-static">Shared · instant</a><a href="#shared-full">Shared · full</a><a href="#desktop">Desktop</a>
     </nav>
     <button class="tbtn" id="theme" type="button"><svg class="i"><use href="#i-sun"/></svg><span>Light mode</span></button>
   </div>
@@ -1429,6 +1448,362 @@ figure.xl { width: 100%; max-width: 1120px; }
           <div class="homebar"><i class="home"></i></div>
         </div></div>
         <figcaption><b>What they receive</b>It says who invited them, to what, and what happens next. If the link has expired or is broken, it says so and links to sign in, instead of mentioning a missing “token”.<span class="refs">Fixes #47</span></figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ========== DELETE LIBRARY ========== -->
+  <section class="sec" id="delete-library">
+    <div class="sec-head">
+      <h2>Deleting a library</h2>
+      <p class="lede">The most serious thing the app can do, so it takes three steps and says clearly what has and hasn't happened. The password is checked inside the dialog, so you know at once whether it was right. Only then does the email get sent, and the dialog doesn't wait for that.</p>
+    </div>
+    <div class="frames">
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Settings</span><span></span></div>
+          <div class="hdr" style="padding-top:0"><h3 class="ttl">Library</h3></div>
+          <div class="content">
+            <div class="list"><div class="row"><div class="rt"><b style="font:600 18px var(--font-display)">Verma family</b><span>31 items · 2 of 15 members</span></div></div></div>
+            <div class="sh"><b>Members</b></div>
+            <div class="list">
+              <div class="row"><span class="ini">RA</span><div class="rt"><b>Rajat</b><span>You</span></div><span class="pill">Owner</span></div>
+              <div class="row"><span class="av" data-av="0"></span><div class="rt"><b>Asha</b><span>Joined 3 November</span></div></div>
+            </div>
+            <div style="padding:22px 16px 0;text-align:center"><span class="link dan" style="font-size:13px">Delete everything in this library…</span></div>
+          </div>
+          <div class="scrim"></div>
+          <div class="sheet" style="gap:12px">
+            <div class="grab"></div>
+            <span class="bigicon bad"><svg class="i"><use href="#i-alert"/></svg></span>
+            <h4>Delete everything in this library?</h4>
+            <p>This permanently deletes all 31 photos and videos, 2 albums and everyone's access to <b style="color:var(--fg)">Verma family</b>. It can't be undone.</p>
+            <span class="btn dan wide">Continue</span><span class="btn  wide">Cancel</span>
+          </div>
+        </div></div>
+        <figcaption><b>1. Warning</b>It says exactly what goes: the photos, the albums and everyone's access. The red button is Continue, not Delete, because nothing is deleted yet.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Settings</span><span></span></div>
+          <div class="hdr" style="padding-top:0"><h3 class="ttl">Library</h3></div>
+          <div class="content">
+            <div class="list"><div class="row"><div class="rt"><b style="font:600 18px var(--font-display)">Verma family</b><span>31 items · 2 of 15 members</span></div></div></div>
+            <div class="sh"><b>Members</b></div>
+            <div class="list">
+              <div class="row"><span class="ini">RA</span><div class="rt"><b>Rajat</b><span>You</span></div><span class="pill">Owner</span></div>
+              <div class="row"><span class="av" data-av="0"></span><div class="rt"><b>Asha</b><span>Joined 3 November</span></div></div>
+            </div>
+            <div style="padding:22px 16px 0;text-align:center"><span class="link dan" style="font-size:13px">Delete everything in this library…</span></div>
+          </div>
+          <div class="scrim"></div>
+          <div class="sheet" style="gap:12px">
+            <div class="grab"></div>
+            
+            <h4>Confirm with your password</h4>
+            <p>We'll then email you a link to confirm. Nothing is deleted yet.</p><div class="fg"><span class="lbl">Your password</span><div class="field focus"><span>••••••••••••</span><i class="caret"></i><svg class="i"><use href="#i-eye"/></svg></div></div>
+            <span class="btn dan wide">Confirm</span><span class="btn  wide">Cancel</span>
+          </div>
+        </div></div>
+        <figcaption><b>2. Password</b>The dialog asks for the owner's password and says again that nothing is deleted yet. It stays open from here on.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Settings</span><span></span></div>
+          <div class="hdr" style="padding-top:0"><h3 class="ttl">Library</h3></div>
+          <div class="content">
+            <div class="list"><div class="row"><div class="rt"><b style="font:600 18px var(--font-display)">Verma family</b><span>31 items · 2 of 15 members</span></div></div></div>
+            <div class="sh"><b>Members</b></div>
+            <div class="list">
+              <div class="row"><span class="ini">RA</span><div class="rt"><b>Rajat</b><span>You</span></div><span class="pill">Owner</span></div>
+              <div class="row"><span class="av" data-av="0"></span><div class="rt"><b>Asha</b><span>Joined 3 November</span></div></div>
+            </div>
+            <div style="padding:22px 16px 0;text-align:center"><span class="link dan" style="font-size:13px">Delete everything in this library…</span></div>
+          </div>
+          <div class="scrim"></div>
+          <div class="sheet" style="gap:12px">
+            <div class="grab"></div>
+            
+            <h4>Confirm with your password</h4>
+            <p>We'll then email you a link to confirm. Nothing is deleted yet.</p><div class="fg"><span class="lbl">Your password</span><div class="field dis"><span>••••••••••••</span><svg class="i"><use href="#i-eye"/></svg></div></div>
+            <span class="btn dan busy wide"><i class="spinner"></i>Checking…</span><span class="btn  wide">Cancel</span>
+          </div>
+        </div></div>
+        <figcaption><b>3. Checking</b>While the password is checked, the field and the red button are dimmed and the button shows a spinner and "Checking…", so a second tap can't send it twice. This is quick, because it happens in the dialog.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Settings</span><span></span></div>
+          <div class="hdr" style="padding-top:0"><h3 class="ttl">Library</h3></div>
+          <div class="content">
+            <div class="list"><div class="row"><div class="rt"><b style="font:600 18px var(--font-display)">Verma family</b><span>31 items · 2 of 15 members</span></div></div></div>
+            <div class="sh"><b>Members</b></div>
+            <div class="list">
+              <div class="row"><span class="ini">RA</span><div class="rt"><b>Rajat</b><span>You</span></div><span class="pill">Owner</span></div>
+              <div class="row"><span class="av" data-av="0"></span><div class="rt"><b>Asha</b><span>Joined 3 November</span></div></div>
+            </div>
+            <div style="padding:22px 16px 0;text-align:center"><span class="link dan" style="font-size:13px">Delete everything in this library…</span></div>
+          </div>
+          <div class="scrim"></div>
+          <div class="sheet" style="gap:12px">
+            <div class="grab"></div>
+            
+            <h4>Confirm with your password</h4>
+            <p>We'll then email you a link to confirm. Nothing is deleted yet.</p><div class="fg"><span class="lbl">Your password</span><div class="field err"><span>••••••••••••</span><svg class="i"><use href="#i-eye"/></svg></div><div class="fmsg"><svg class="i"><use href="#i-alert"/></svg><span>That password isn't right. Try again. Nothing has been sent.</span></div></div>
+            <span class="btn dan wide">Confirm</span><span class="btn  wide">Cancel</span>
+          </div>
+        </div></div>
+        <figcaption><b>3b. Wrong password</b>The field turns red with a message beside it, the dialog stays open and what you typed stays, so you can fix one character. Nothing has been sent, and it says so.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Settings</span><span></span></div>
+          <div class="hdr" style="padding-top:0"><h3 class="ttl">Library</h3></div>
+          <div class="content">
+            <div class="list"><div class="row"><div class="rt"><b style="font:600 18px var(--font-display)">Verma family</b><span>31 items · 2 of 15 members</span></div></div></div>
+            <div class="sh"><b>Members</b></div>
+            <div class="list">
+              <div class="row"><span class="ini">RA</span><div class="rt"><b>Rajat</b><span>You</span></div><span class="pill">Owner</span></div>
+              <div class="row"><span class="av" data-av="0"></span><div class="rt"><b>Asha</b><span>Joined 3 November</span></div></div>
+            </div>
+            <div style="padding:22px 16px 0;text-align:center"><span class="link dan" style="font-size:13px">Delete everything in this library…</span></div>
+          </div>
+          <div class="scrim"></div>
+          <div class="sheet" style="gap:12px">
+            <div class="grab"></div>
+            <span class="bigicon"><svg class="i"><use href="#i-mail"/></svg></span>
+            <h4>Check your inbox, and spam</h4>
+            <p>We're sending a confirmation link to <b style="color:var(--fg)">r•••@example.com</b>.</p><p>The link expires in 30 minutes. Nothing is deleted until you open it.</p>
+            <span class="btn pri wide">OK</span>
+          </div>
+        </div></div>
+        <figcaption><b>4. Check your inbox</b>This appears as soon as the password is accepted, before the email has finished sending. It says to look in spam too, that the link lasts 30 minutes, and that nothing is deleted until the link is opened.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Settings</span><span></span></div>
+          <div class="hdr" style="padding-top:0"><h3 class="ttl">Library</h3></div>
+          <div class="content">
+            <div class="list"><div class="row"><div class="rt"><b style="font:600 18px var(--font-display)">Verma family</b><span>31 items · 2 of 15 members</span></div></div></div>
+            <div class="sh"><b>Members</b></div>
+            <div class="list">
+              <div class="row"><span class="ini">RA</span><div class="rt"><b>Rajat</b><span>You</span></div><span class="pill">Owner</span></div>
+              <div class="row"><span class="av" data-av="0"></span><div class="rt"><b>Asha</b><span>Joined 3 November</span></div></div>
+            </div>
+            <div style="padding:22px 16px 0;text-align:center"><span class="link dan" style="font-size:13px">Delete everything in this library…</span></div>
+          </div>
+          <div class="toast" style="bottom:36px"><span>Confirmation link sent to r•••@example.com</span><b>Close</b></div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>5a. Link sent</b>After OK, a short message confirms the email went to your masked address.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Settings</span><span></span></div>
+          <div class="hdr" style="padding-top:0"><h3 class="ttl">Library</h3></div>
+          <div class="content">
+            <div class="list"><div class="row"><div class="rt"><b style="font:600 18px var(--font-display)">Verma family</b><span>31 items · 2 of 15 members</span></div></div></div>
+            <div class="sh"><b>Members</b></div>
+            <div class="list">
+              <div class="row"><span class="ini">RA</span><div class="rt"><b>Rajat</b><span>You</span></div><span class="pill">Owner</span></div>
+              <div class="row"><span class="av" data-av="0"></span><div class="rt"><b>Asha</b><span>Joined 3 November</span></div></div>
+            </div>
+            <div style="padding:22px 16px 0;text-align:center"><span class="link dan" style="font-size:13px">Delete everything in this library…</span></div>
+          </div>
+          <div class="toast" style="bottom:36px"><span>We couldn't send the email. Nothing was deleted.</span><b>Try again</b></div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>5b. Email failed</b>If sending fails, the message says so and says that nothing was deleted. Try again sends it again without asking for the password.</figcaption>
+      </figure>
+    </div>
+    <div class="sec-head" style="margin-top:44px"><h3 style="font:600 24px var(--font-display);margin:0">When the library is shared</h3><p class="lede">If another member is part of the library, they have to agree too. The warning, the inbox message and the sent message all say so, so the owner isn't surprised later.</p></div>
+    <div class="frames">
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Settings</span><span></span></div>
+          <div class="hdr" style="padding-top:0"><h3 class="ttl">Library</h3></div>
+          <div class="content">
+            <div class="list"><div class="row"><div class="rt"><b style="font:600 18px var(--font-display)">Verma family</b><span>31 items · 2 of 15 members</span></div></div></div>
+            <div class="sh"><b>Members</b></div>
+            <div class="list">
+              <div class="row"><span class="ini">RA</span><div class="rt"><b>Rajat</b><span>You</span></div><span class="pill">Owner</span></div>
+              <div class="row"><span class="av" data-av="0"></span><div class="rt"><b>Asha</b><span>Joined 3 November</span></div></div>
+            </div>
+            <div style="padding:22px 16px 0;text-align:center"><span class="link dan" style="font-size:13px">Delete everything in this library…</span></div>
+          </div>
+          <div class="scrim"></div>
+          <div class="sheet" style="gap:12px">
+            <div class="grab"></div>
+            <span class="bigicon bad"><svg class="i"><use href="#i-alert"/></svg></span>
+            <h4>Delete everything in this library?</h4>
+            <p>This permanently deletes all 31 photos and videos, 2 albums and everyone's access to <b style="color:var(--fg)">Verma family</b>. It can't be undone.</p><p>This library is shared. Asha will be asked to confirm too.</p>
+            <span class="btn dan wide">Continue</span><span class="btn  wide">Cancel</span>
+          </div>
+        </div></div>
+        <figcaption><b>Warning, shared library</b>One extra line says that Asha will be asked to confirm.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Settings</span><span></span></div>
+          <div class="hdr" style="padding-top:0"><h3 class="ttl">Library</h3></div>
+          <div class="content">
+            <div class="list"><div class="row"><div class="rt"><b style="font:600 18px var(--font-display)">Verma family</b><span>31 items · 2 of 15 members</span></div></div></div>
+            <div class="sh"><b>Members</b></div>
+            <div class="list">
+              <div class="row"><span class="ini">RA</span><div class="rt"><b>Rajat</b><span>You</span></div><span class="pill">Owner</span></div>
+              <div class="row"><span class="av" data-av="0"></span><div class="rt"><b>Asha</b><span>Joined 3 November</span></div></div>
+            </div>
+            <div style="padding:22px 16px 0;text-align:center"><span class="link dan" style="font-size:13px">Delete everything in this library…</span></div>
+          </div>
+          <div class="scrim"></div>
+          <div class="sheet" style="gap:12px">
+            <div class="grab"></div>
+            <span class="bigicon"><svg class="i"><use href="#i-mail"/></svg></span>
+            <h4>Check your inbox, and spam</h4>
+            <p>We're sending a confirmation link to <b style="color:var(--fg)">r•••@example.com</b>. Because this library is shared, Asha will be asked to confirm too.</p><p>Both links expire in 30 minutes. Nothing is deleted until you both open them.</p>
+            <span class="btn pri wide">OK</span>
+          </div>
+        </div></div>
+        <figcaption><b>Check your inbox, shared library</b>The message names the second person and says both links last 30 minutes and both are needed before anything is deleted.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Settings</span><span></span></div>
+          <div class="hdr" style="padding-top:0"><h3 class="ttl">Library</h3></div>
+          <div class="content">
+            <div class="list"><div class="row"><div class="rt"><b style="font:600 18px var(--font-display)">Verma family</b><span>31 items · 2 of 15 members</span></div></div></div>
+            <div class="sh"><b>Members</b></div>
+            <div class="list">
+              <div class="row"><span class="ini">RA</span><div class="rt"><b>Rajat</b><span>You</span></div><span class="pill">Owner</span></div>
+              <div class="row"><span class="av" data-av="0"></span><div class="rt"><b>Asha</b><span>Joined 3 November</span></div></div>
+            </div>
+            <div style="padding:22px 16px 0;text-align:center"><span class="link dan" style="font-size:13px">Delete everything in this library…</span></div>
+          </div>
+          <div class="toast" style="bottom:36px"><span>Confirmation link sent to r•••@example.com. Asha has been asked to confirm too.</span><b>Close</b></div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>Link sent, shared library</b>The confirmation also says the other member has been asked.</figcaption>
+      </figure>
+    </div>
+    <div class="sec-head" style="margin-top:44px"><h3 style="font:600 24px var(--font-display);margin:0">On a desktop browser</h3><p class="lede">The same steps as a centred dialog over the Library page.</p></div>
+    <div class="frames">
+      <figure class="shot md">
+        <div class="browser"><div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/library</div></div>
+          <div class="dsm">
+            <div class="pg"><h3>Library</h3><div class="list" style="margin:0"><div class="row"><div class="rt"><b style="font:600 18px var(--font-display)">Verma family</b><span>31 items · 2 of 15 members</span></div></div></div><span class="link dan" style="font-size:13px">Delete everything in this library…</span></div>
+            <div class="scrim"></div>
+            <div class="dlg">
+              <span class="bigicon bad"><svg class="i"><use href="#i-alert"/></svg></span>
+              <h4>Delete everything in this library?</h4>
+              <p>This permanently deletes all 31 photos and videos, 2 albums and everyone's access to <b style="color:var(--fg)">Verma family</b>. It can't be undone.</p>
+              <div class="dacts"><span class="btn ">Cancel</span><span class="btn dan">Continue</span></div>
+            </div>
+          </div>
+        </div>
+        <figcaption><b>1. Warning</b>Cancel and Continue, with Continue in red.</figcaption>
+      </figure>
+      <figure class="shot md">
+        <div class="browser"><div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/library</div></div>
+          <div class="dsm">
+            <div class="pg"><h3>Library</h3><div class="list" style="margin:0"><div class="row"><div class="rt"><b style="font:600 18px var(--font-display)">Verma family</b><span>31 items · 2 of 15 members</span></div></div></div><span class="link dan" style="font-size:13px">Delete everything in this library…</span></div>
+            <div class="scrim"></div>
+            <div class="dlg">
+              
+              <h4>Confirm with your password</h4>
+              <p>We'll then email you a link to confirm. Nothing is deleted yet.</p><div class="fg"><span class="lbl">Your password</span><div class="field focus"><span>••••••••••••</span><i class="caret"></i><svg class="i"><use href="#i-eye"/></svg></div></div>
+              <div class="dacts"><span class="btn ">Cancel</span><span class="btn dan">Confirm</span></div>
+            </div>
+          </div>
+        </div>
+        <figcaption><b>2. Password</b>The dialog stays open from here on.</figcaption>
+      </figure>
+      <figure class="shot md">
+        <div class="browser"><div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/library</div></div>
+          <div class="dsm">
+            <div class="pg"><h3>Library</h3><div class="list" style="margin:0"><div class="row"><div class="rt"><b style="font:600 18px var(--font-display)">Verma family</b><span>31 items · 2 of 15 members</span></div></div></div><span class="link dan" style="font-size:13px">Delete everything in this library…</span></div>
+            <div class="scrim"></div>
+            <div class="dlg">
+              
+              <h4>Confirm with your password</h4>
+              <p>We'll then email you a link to confirm. Nothing is deleted yet.</p><div class="fg"><span class="lbl">Your password</span><div class="field dis"><span>••••••••••••</span><svg class="i"><use href="#i-eye"/></svg></div></div>
+              <div class="dacts"><span class="btn ">Cancel</span><span class="btn dan busy"><i class="spinner"></i>Checking…</span></div>
+            </div>
+          </div>
+        </div>
+        <figcaption><b>3. Checking</b>Field and button are dimmed, and the button shows a spinner.</figcaption>
+      </figure>
+      <figure class="shot md">
+        <div class="browser"><div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/library</div></div>
+          <div class="dsm">
+            <div class="pg"><h3>Library</h3><div class="list" style="margin:0"><div class="row"><div class="rt"><b style="font:600 18px var(--font-display)">Verma family</b><span>31 items · 2 of 15 members</span></div></div></div><span class="link dan" style="font-size:13px">Delete everything in this library…</span></div>
+            <div class="scrim"></div>
+            <div class="dlg">
+              
+              <h4>Confirm with your password</h4>
+              <p>We'll then email you a link to confirm. Nothing is deleted yet.</p><div class="fg"><span class="lbl">Your password</span><div class="field err"><span>••••••••••••</span><svg class="i"><use href="#i-eye"/></svg></div><div class="fmsg"><svg class="i"><use href="#i-alert"/></svg><span>That password isn't right. Try again. Nothing has been sent.</span></div></div>
+              <div class="dacts"><span class="btn ">Cancel</span><span class="btn dan">Confirm</span></div>
+            </div>
+          </div>
+        </div>
+        <figcaption><b>3b. Wrong password</b>An inline message, the password kept, and nothing sent.</figcaption>
+      </figure>
+      <figure class="shot md">
+        <div class="browser"><div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/library</div></div>
+          <div class="dsm">
+            <div class="pg"><h3>Library</h3><div class="list" style="margin:0"><div class="row"><div class="rt"><b style="font:600 18px var(--font-display)">Verma family</b><span>31 items · 2 of 15 members</span></div></div></div><span class="link dan" style="font-size:13px">Delete everything in this library…</span></div>
+            <div class="scrim"></div>
+            <div class="dlg">
+              <span class="bigicon"><svg class="i"><use href="#i-mail"/></svg></span>
+              <h4>Check your inbox, and spam</h4>
+              <p>We're sending a confirmation link to <b style="color:var(--fg)">r•••@example.com</b>.</p><p>The link expires in 30 minutes. Nothing is deleted until you open it.</p>
+              <div class="dacts"><span class="btn pri">OK</span></div>
+            </div>
+          </div>
+        </div>
+        <figcaption><b>4. Check your inbox</b>Shown straight away, with OK.</figcaption>
+      </figure>
+      <figure class="shot md">
+        <div class="browser"><div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/library</div></div>
+          <div class="dsm">
+            <div class="pg"><h3>Library</h3><div class="list" style="margin:0"><div class="row"><div class="rt"><b style="font:600 18px var(--font-display)">Verma family</b><span>31 items · 2 of 15 members</span></div></div></div><span class="link dan" style="font-size:13px">Delete everything in this library…</span></div>
+            <div class="scrim"></div>
+            <div class="dlg">
+              <span class="bigicon"><svg class="i"><use href="#i-mail"/></svg></span>
+              <h4>Check your inbox, and spam</h4>
+              <p>We're sending a confirmation link to <b style="color:var(--fg)">r•••@example.com</b>. Because this library is shared, Asha will be asked to confirm too.</p><p>Both links expire in 30 minutes. Nothing is deleted until you both open them.</p>
+              <div class="dacts"><span class="btn pri">OK</span></div>
+            </div>
+          </div>
+        </div>
+        <figcaption><b>4. Check your inbox, shared library</b>Names the second member and says both links are needed.</figcaption>
+      </figure>
+      <figure class="shot md">
+        <div class="browser"><div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/library</div></div>
+          <div class="dsm">
+            <div class="pg"><h3>Library</h3><div class="list" style="margin:0"><div class="row"><div class="rt"><b style="font:600 18px var(--font-display)">Verma family</b><span>31 items · 2 of 15 members</span></div></div></div><span class="link dan" style="font-size:13px">Delete everything in this library…</span></div>
+            <div class="toast" style="left:20px;right:auto;bottom:20px;width:400px"><span>Confirmation link sent to r•••@example.com</span><b>Close</b></div>
+          </div>
+        </div>
+        <figcaption><b>5a. Link sent</b>A short message at the bottom left.</figcaption>
+      </figure>
+      <figure class="shot md">
+        <div class="browser"><div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/library</div></div>
+          <div class="dsm">
+            <div class="pg"><h3>Library</h3><div class="list" style="margin:0"><div class="row"><div class="rt"><b style="font:600 18px var(--font-display)">Verma family</b><span>31 items · 2 of 15 members</span></div></div></div><span class="link dan" style="font-size:13px">Delete everything in this library…</span></div>
+            <div class="toast" style="left:20px;right:auto;bottom:20px;width:400px"><span>We couldn't send the email. Nothing was deleted.</span><b>Try again</b></div>
+          </div>
+        </div>
+        <figcaption><b>5b. Email failed</b>Says nothing was deleted, with Try again.</figcaption>
       </figure>
     </div>
   </section>
