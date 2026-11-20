@@ -118,6 +118,12 @@ describe('just-uploaded overlay store', () => {
             expect(names().sort()).toEqual(['IMG_1.HEIC', 'IMG_2.MOV', 'beach.mp4']);
         });
 
+        it('frees the thumbnail of a clip that gets no tile', () => {
+            addJustUploaded({ filename: 'IMG_1.HEIC' });
+            addJustUploaded({ filename: 'IMG_1.MOV', thumbnailUrl: 'blob:clip' });
+            expect(revoked).toEqual(['blob:clip']);
+        });
+
         it('does not pair across libraries', () => {
             addJustUploaded({ filename: 'IMG_1.HEIC' });
             scope.value = 'B';

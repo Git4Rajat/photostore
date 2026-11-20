@@ -64,11 +64,12 @@ const emit = (immediate = false): void => {
     if (notifyTimer === null) notifyTimer = setTimeout(notify, JUST_UPLOADED_NOTIFY_MS - (Date.now() - lastNotifyAt));
 };
 export const flushJustUploaded = (): void => { if (notifyTimer !== null) notify(); };
-const revoke = (entry: Stored): void => {
-    if (entry.thumbnailUrl?.startsWith('blob:')) {
-        try { URL.revokeObjectURL(entry.thumbnailUrl); } catch { /* not a real object URL */ }
+const revokeUrl = (url: string | undefined): void => {
+    if (url?.startsWith('blob:')) {
+        try { URL.revokeObjectURL(url); } catch { /* not a real object URL */ }
     }
 };
+const revoke = (entry: Stored): void => revokeUrl(entry.thumbnailUrl);
 
 // Runs from the snapshot getter (during render), so it only bumps the version:
 // notifying listeners there would set state while rendering.
@@ -98,7 +99,10 @@ export const addJustUploaded = (entry: { filename: string; captureDate?: string 
     }
     const stem = liveBaseStem(entry.filename);
     const mine0 = Array.from(entries.values()).filter((e) => e.scope === scope);
-    if (isLiveClipName(entry.filename) && mine0.some((e) => isLiveStillName(e.filename) && liveBaseStem(e.filename) === stem)) return;
+    if (isLiveClipName(entry.filename) && mine0.some((e) => isLiveStillName(e.filename) && liveBaseStem(e.filename) === stem)) {
+        revokeUrl(entry.thumbnailUrl);
+        return;
+    }
     if (isLiveStillName(entry.filename)) {
         // The clip finalized first and already has a tile: it belongs to this still.
         removeJustUploaded(mine0.filter((e) => isLiveClipName(e.filename) && liveBaseStem(e.filename) === stem).map((e) => e.filename));
