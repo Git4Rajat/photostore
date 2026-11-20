@@ -1,9 +1,11 @@
+import { __resetJustUploadedForTests, listJustUploaded } from '../services/justUploaded';
 import React from 'react';
 import { NotificationBell } from './AppServiceIndicators';
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
+    thumbs: new WeakMap<object, Blob>(),
     get: vi.fn(),
     post: vi.fn(),
     getUpload: vi.fn(),
@@ -32,10 +34,13 @@ vi.mock('../services/indexReadyPush', () => ({
 }));
 
 vi.mock('../config/appConfig', () => ({ getRuntimeConfig: () => ({ processingMode: mocks.processingMode, browserUploadPreparation: mocks.preparationEnabled }) }));
-vi.mock('../services/uploadPreparationPipeline', () => ({UploadPreparationPipeline: class {
-    start = mocks.prepared;
-    dispose() {}
-}}));
+vi.mock('../services/uploadPreparationPipeline', () => ({
+    preparedThumbnail: (prepared: object) => mocks.thumbs.get(prepared),
+    UploadPreparationPipeline: class {
+        start = mocks.prepared;
+        dispose() {}
+    },
+}));
 vi.mock('../services/apiClient', () => ({
     get: mocks.get,
     post: mocks.post,
@@ -553,9 +558,14 @@ describe('browser upload selection and startup', () => {
         const prepared = {clientProcessing: {preview: {alreadyUploaded: true}, thumbnail: {alreadyUploaded: true}},
             clientMetadata: {version: 1, bytes: 400, sha256: 'b'.repeat(64), sourceSha256: 'a'.repeat(64)},
             preparationReport: {version: 1, elapsedMs: 200, assets: {preview: {target: true, generation: 'generated', upload: 'uploaded'}}}};
+        // The thumbnail the preparation drew is reused for the gallery tile, not decoded again.
+        __resetJustUploadedForTests();
+        mocks.thumbs.set(prepared, new Blob(['thumb']));
+        vi.stubGlobal('URL', Object.assign(URL, { createObjectURL: () => 'blob:prepared-thumb', revokeObjectURL: () => {} }));
         await act(async () => { resolvePreparation(prepared); });
         await advance(1000);
         expect(finalizedFiles()[0]).toMatchObject({...prepared, blobName: 'blob-original-0.heic'});
+        expect(listJustUploaded().map(e => e.thumbnailUrl)).toEqual(['blob:prepared-thumb']);
         const batchId = finalizedFiles()[0].uploadBatchId;
         expect(batchId).toMatch(/^[0-9a-f-]{36}$/);
         await advance(3000);

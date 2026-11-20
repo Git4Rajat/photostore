@@ -6,7 +6,7 @@ vi.mock('./uploadAssetPreparation', () => ({UploadAssetPreparer: class {
     dispose = mocks.dispose;
 }}));
 vi.mock('../utils/browserExifTool', () => ({extractBrowserExif: mocks.exif}));
-import {UploadPreparationPipeline} from './uploadPreparationPipeline';
+import {UploadPreparationPipeline, preparedThumbnail} from './uploadPreparationPipeline';
 
 const browserVerdict = {ok: true, result: {source: 'browser_exiftool', verifiedComplete: true, exifToolJson: {'EXIF:Make': 'Canon'}}};
 
@@ -496,5 +496,23 @@ test.each(['abort', 'timeout', 'error'])('discards metadata workers after %s bef
     const result = await next;
     expect(instances).toHaveLength(2);
     expect(result.preparationReport?.assets.metadata.generation).toBe('generated');
+    pipeline.dispose();
+});
+
+test('exposes the drawn thumbnail for the gallery without adding it to the finalize payload', async () => {
+    const pipeline = new UploadPreparationPipeline();
+    const result = await pipeline.start(source(), 'a'.repeat(64), targets, new AbortController().signal);
+    expect(preparedThumbnail(result)).toBeInstanceOf(NodeBlob);
+    expect(Object.keys(result)).not.toContain('thumbnail');
+    expect(Object.keys(result).sort()).toEqual(['clientProcessing', 'clientProcessingReport', 'preparationReport']);   // all that `...prepared` sends
+    expect(preparedThumbnail(undefined)).toBeUndefined();
+    pipeline.dispose();
+});
+
+test('no thumbnail is exposed when preparation fell back', async () => {
+    mocks.prepare.mockResolvedValue({status: 'fallback', reason: 'busy'});
+    const pipeline = new UploadPreparationPipeline();
+    const result = await pipeline.start(source(), 'a'.repeat(64), targets, new AbortController().signal);
+    expect(preparedThumbnail(result)).toBeUndefined();
     pipeline.dispose();
 });

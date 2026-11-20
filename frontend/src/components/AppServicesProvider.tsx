@@ -12,7 +12,7 @@ import { preloadLocalIndexes } from '../services/preloadLocalIndexes';
 import { startMediaTokenAutoRefresh } from '../services/mediaToken';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { get, getUpload, postTools, postUpload, resolveApiUrl } from '../services/apiClient';
-import { addJustUploaded, drawLocalThumbnail, setJustUploadedThumbnail } from '../services/justUploaded';
+import { addJustUploaded } from '../services/justUploaded';
 import { heartbeatWaveSession, quiesceWaveShadowSession, discardWaveShadowSession, stopWaveShadowSession, registerWaveItemsBatch, waveIdentityFor, ensureOpened as ensureWaveShadowSessionAdmitted, finalizeWaveShadowSession, resolveWaveShadowFile, reportFailedWaveFile, acknowledgeWaveFinalizedFile, cancelQueuedWaveSelection } from '../services/uploadWaveSync';
 import { hashLargeFile, LARGE_FILE_HASH_THRESHOLD } from '../utils/largeFileHash';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
@@ -69,7 +69,7 @@ import { publishLibraryChange } from '../services/libraryChanges';
 import { fetchKnownUploadHashes, requestUploadHashRefresh, type UploadEndReason } from '../services/uploadKnownHashes';
 import { perf } from '../services/perf';
 import { UploadSessionStore } from '../services/uploadSessionStore';
-import { UploadPreparationPipeline, type PreparedUpload, type UploadAssetTargets } from '../services/uploadPreparationPipeline';
+import { UploadPreparationPipeline, preparedThumbnail, type PreparedUpload, type UploadAssetTargets } from '../services/uploadPreparationPipeline';
 import type { UploadMetadataDescriptor } from '../utils/uploadMetadata';
 import { prewarmBrowserExifTool } from '../utils/browserExifTool';
 import {
@@ -513,10 +513,15 @@ const SINGLE_PUT_UPLOAD_MAX_BYTES = 8 * MB;
 // cleared the moment it ends either way) -- a fast file's loop finishes before
 // the first tick, so the common case never sends anything extra.
 // Show a just-finalized upload in the gallery before any index covers it (see
-// services/justUploaded). The tile appears at once; its thumbnail is drawn in the browser.
-const showJustUploaded = (filename: string, file: File): void => {
-    addJustUploaded({ filename, captureDate: Number.isFinite(file.lastModified) && file.lastModified > 0 ? new Date(file.lastModified).toISOString() : null });
-    void drawLocalThumbnail(file).then((url) => { if (url) setJustUploadedThumbnail(filename, url); });
+// services/justUploaded). The tile is a swatch unless the upload's own preparation already drew
+// a thumbnail, which is reused as is: decoding every file again here would compete with
+// hashing, transfer and preparation for the main thread.
+const showJustUploaded = (filename: string, file: File, thumbnail?: Blob): void => {
+    addJustUploaded({
+        filename,
+        captureDate: Number.isFinite(file.lastModified) && file.lastModified > 0 ? new Date(file.lastModified).toISOString() : null,
+        thumbnailUrl: thumbnail ? URL.createObjectURL(thumbnail) : undefined,
+    });
 };
 
 const UPLOAD_TRANSFER_HEARTBEAT_MS = 90_000;
@@ -4206,6 +4211,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     await settleStoredFile(skippedDuplicate, completeResponse?.filename || fileMeta.name, {
                         waveResolution: completeResponse?.waveResolution,
                         kickThumbnail: !prepared.clientProcessing?.thumbnail,
+                        thumbnail: preparedThumbnail(prepared),
                     });
                 } catch (err) {
                     if (activeUploadHashClaimsRef.current.get(staged.sha256) === staged.hashClaim) {
@@ -4245,9 +4251,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 // finalize reply was lost (alreadyResolved: the report itself
                 // resolved the wave item).
                 async function settleStoredFile(skippedDuplicate: boolean, waveAcceptedFilename: string,
-                    { waveResolution, alreadyResolved = false, kickThumbnail = false }: {
+                    { waveResolution, alreadyResolved = false, kickThumbnail = false, thumbnail }: {
                         waveResolution?: { sessionId: string; itemId: string; manifestRevision: string; state: string };
-                        alreadyResolved?: boolean; kickThumbnail?: boolean;
+                        alreadyResolved?: boolean; kickThumbnail?: boolean; thumbnail?: Blob;
                     } = {}): Promise<void> {
                     totalUploaded += 1;
                     if (skippedDuplicate) {
@@ -4275,7 +4281,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     if (!skippedDuplicate) {
                         if (stripPhotos.length < 6) stripPhotos.push(waveAcceptedFilename);
                         freshlyUploadedFilenamesRef.current.add(fileMeta.name);
-                        showJustUploaded(waveAcceptedFilename, file);
+                        showJustUploaded(waveAcceptedFilename, file, thumbnail);
                         if (kickThumbnail) kickOffThumbnailForFile(file, fileMeta.name, fileMeta.blobName);
                     }
                     // Source bytes must outlive the checkpoint that marks them

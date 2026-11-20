@@ -11,6 +11,11 @@ export interface PreparedUpload {
     clientMetadata?: UploadMetadataDescriptor;
     preparationReport?: UploadPreparationReport;
 }
+// The small thumbnail the preparation already drew, kept out of PreparedUpload itself because
+// that object is spread into the finalize request. The gallery shows it for a photo that no
+// index covers yet (services/justUploaded) instead of decoding the file a second time.
+const preparedThumbnails = new WeakMap<object, Blob>();
+export const preparedThumbnail = (prepared: object | undefined | null): Blob | undefined => (prepared ? preparedThumbnails.get(prepared) : undefined);
 export interface UploadAssetTargets {previewBlobUrl?: string; thumbnailBlobUrl?: string; metadataBlobUrl?: string; uploadPreparationEnabled?: boolean; metadataPreparationReason?: string;}
 
 // Queued entries retain only File references; decoding and PUTs remain bounded.
@@ -252,6 +257,7 @@ export class UploadPreparationPipeline {
                     else diagnostic.generationReason = assets.failureReason || assets.reason || 'generation_failed';
                 }
                 if (assets.status === 'generated') {
+                    if (assets.thumbnail?.blob) preparedThumbnails.set(result, assets.thumbnail.blob);
                     await Promise.all((['preview', 'thumbnail'] as const).map(async kind => {
                         const url = targets[kind === 'preview' ? 'previewBlobUrl' : 'thumbnailBlobUrl'];
                         const derivative = assets[kind];

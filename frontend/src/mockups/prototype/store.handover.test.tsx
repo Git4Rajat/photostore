@@ -29,7 +29,7 @@ vi.mock('../../services/localPeopleIndex', () => ({ invalidateLocalPeopleIndex: 
 vi.mock('../../services/jobNotifications', () => ({ requestJobPoll: vi.fn() }));
 
 import { __resetPendingEditsForTests } from '../../services/pendingEdits';
-import { __resetJustUploadedForTests, addJustUploaded, listJustUploaded } from '../../services/justUploaded';
+import { __resetJustUploadedForTests, addJustUploaded, flushJustUploaded, listJustUploaded } from '../../services/justUploaded';
 import { StoreProvider, useStore } from './store';
 
 let store: ReturnType<typeof useStore>;
@@ -55,7 +55,7 @@ const reload = async () => {
     await act(async () => { store.reloadPhotos(); });
     await waitFor(() => expect(store.photosLoading).toBe(false), { timeout: 12_000 });
 };
-const upload = (filename = NEW, captureDate: string | null = '2026-03-01T00:00:00.000Z') => act(() => { addJustUploaded({ filename, captureDate }); });
+const upload = (filename = NEW, captureDate: string | null = '2026-03-01T00:00:00.000Z') => act(() => { addJustUploaded({ filename, captureDate }); flushJustUploaded(); });
 
 describe('upload overlay -> index handover', () => {
     beforeEach(() => {
@@ -192,7 +192,7 @@ describe('upload overlay -> index handover', () => {
         upload();
         expect(names()[0]).toBe(NEW);
         env.scope = 'lib-B';
-        act(() => { addJustUploaded({ filename: 'other.jpg', captureDate: null }); });
+        act(() => { addJustUploaded({ filename: 'other.jpg', captureDate: null }); flushJustUploaded(); });
         expect(names()).toContain('other.jpg');
         expect(names()).not.toContain(NEW);
     });

@@ -4,8 +4,8 @@ const scope = vi.hoisted(() => ({ value: 'A' }));
 vi.mock('./sessionScope', () => ({ sessionScope: () => scope.value }));
 
 import {
-    JUST_UPLOADED_MAX, JUST_UPLOADED_TTL_MS, __resetJustUploadedForTests, addJustUploaded, drawLocalThumbnail,
-    listJustUploaded, removeJustUploaded, setJustUploadedThumbnail, settleJustUploaded, subscribeJustUploaded,
+    JUST_UPLOADED_MAX, JUST_UPLOADED_NOTIFY_MS, JUST_UPLOADED_TTL_MS, __resetJustUploadedForTests, addJustUploaded,
+    listJustUploaded, removeJustUploaded, settleJustUploaded, subscribeJustUploaded,
 } from './justUploaded';
 
 const T0 = Date.now();
@@ -64,6 +64,32 @@ describe('just-uploaded overlay store', () => {
         expect(listener).not.toHaveBeenCalled();
     });
 
+    describe('notification rate during a burst', () => {
+        beforeEach(() => vi.useFakeTimers());
+        afterEach(() => vi.useRealTimers());
+
+        it('tells listeners at once for the first photo, then at most once per interval', () => {
+            const listener = vi.fn();
+            subscribeJustUploaded(listener);
+            addJustUploaded({ filename: 'f0.jpg' });
+            expect(listener).toHaveBeenCalledTimes(1);          // first photo shows immediately
+            for (let i = 1; i < 300; i += 1) addJustUploaded({ filename: `f${i}.jpg` });
+            expect(listener).toHaveBeenCalledTimes(1);          // the burst is held back...
+            vi.advanceTimersByTime(JUST_UPLOADED_NOTIFY_MS);
+            expect(listener).toHaveBeenCalledTimes(2);          // ...and delivered as one update
+            expect(listJustUploaded()).toHaveLength(300);       // nothing was dropped by coalescing
+        });
+
+        it('a removal is announced immediately, not held behind the burst timer', () => {
+            const listener = vi.fn();
+            addJustUploaded({ filename: 'a.jpg' });
+            addJustUploaded({ filename: 'b.jpg' });
+            subscribeJustUploaded(listener);
+            removeJustUploaded(['a.jpg']);
+            expect(listener).toHaveBeenCalledTimes(1);
+        });
+    });
+
     describe('Live Photo clips', () => {
         it('gives a clip no tile when its still is already shown', () => {
             addJustUploaded({ filename: 'IMG_1234.HEIC' });
@@ -90,6 +116,12 @@ describe('just-uploaded overlay store', () => {
             addJustUploaded({ filename: 'beach.mp4' });
             addJustUploaded({ filename: 'IMG_2.MOV' });
             expect(names().sort()).toEqual(['IMG_1.HEIC', 'IMG_2.MOV', 'beach.mp4']);
+        });
+
+        it('frees the thumbnail of a clip that gets no tile', () => {
+            addJustUploaded({ filename: 'IMG_1.HEIC' });
+            addJustUploaded({ filename: 'IMG_1.MOV', thumbnailUrl: 'blob:clip' });
+            expect(revoked).toEqual(['blob:clip']);
         });
 
         it('does not pair across libraries', () => {
@@ -153,35 +185,4 @@ describe('just-uploaded overlay store', () => {
             expect(revoked).toEqual(['blob:a']);
         });
     });
-
-    describe('thumbnails drawn after the row was added', () => {
-        it('attaches a late thumbnail once', () => {
-            addJustUploaded({ filename: 'a.jpg' });
-            setJustUploadedThumbnail('a.jpg', 'blob:1');
-            setJustUploadedThumbnail('a.jpg', 'blob:2');
-            expect(listJustUploaded()[0].thumbnailUrl).toBe('blob:1');
-            expect(revoked).toEqual(['blob:2']);
-        });
-
-        it('revokes a thumbnail that finishes drawing after the row is gone (no leaked object URL)', () => {
-            addJustUploaded({ filename: 'a.jpg' });
-            removeJustUploaded(['a.jpg']);
-            setJustUploadedThumbnail('a.jpg', 'blob:late');
-            expect(names()).toEqual([]);
-            expect(revoked).toEqual(['blob:late']);
-        });
-
-        it('draws nothing for non-images, oversized files and browsers without createImageBitmap', async () => {
-            vi.stubGlobal('createImageBitmap', undefined);
-            expect(await drawLocalThumbnail(new Blob(['x'], { type: 'image/jpeg' }))).toBeUndefined();
-            vi.stubGlobal('createImageBitmap', vi.fn());
-            expect(await drawLocalThumbnail(new Blob(['x'], { type: 'video/mp4' }))).toBeUndefined();
-            expect(await drawLocalThumbnail(new Blob(['x'], { type: 'image/heic' }))).toBeUndefined();
-        });
-
-        it('falls back to no thumbnail when the browser cannot decode the image (HEIC/RAW)', async () => {
-            vi.stubGlobal('createImageBitmap', vi.fn().mockRejectedValue(new Error('cannot decode')));
-            expect(await drawLocalThumbnail(new Blob(['x'], { type: 'image/jpeg' }))).toBeUndefined();
-        });
-    });
-});
+})
