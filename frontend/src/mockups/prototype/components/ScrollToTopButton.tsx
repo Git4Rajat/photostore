@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { ArrowUp } from 'lucide-react';
+import { useFloatingClearance } from './useFloatingClearance';
 
 // How far down .pt-body must be scrolled before the button is eligible to
 // show at all.
@@ -22,6 +23,8 @@ const SETTLE_MS = 150;
  */
 export const ScrollToTopButton: React.FC = () => {
     const [visible, setVisible] = useState(false);
+    // Lifts this button (and the Select pill) above any dock / bar / toast at the bottom.
+    useFloatingClearance();
     const settleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     useEffect(() => {

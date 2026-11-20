@@ -30,11 +30,13 @@
    .pt-body being the real scroll container instead of the document, which is
    also why iOS Safari's tap-status-bar gesture can't do this for us. Sits
    above normal content but below the header (z-index:30) and mobile tabbar
-   (z-index:40, see mockups.css) so it never floats over either. */
+   (z-index:40, see mockups.css) so it never floats over either. The docks, selection
+   bar and toasts are above it, so useFloatingClearance publishes --pt-float-clear and
+   the button rises above whichever is showing. */
 .pt-scroll-top {
   position: fixed;
   right: 20px;
-  bottom: calc(20px + env(safe-area-inset-bottom));
+  bottom: max(calc(20px + env(safe-area-inset-bottom)), var(--pt-float-clear, 0px));
   width: var(--tap-min);
   height: var(--tap-min);
   border-radius: 50%;
@@ -57,7 +59,7 @@
 .pt-scroll-top:hover { background: var(--lg-surface-strong); }
 @container (max-width: 805px) {
   /* Clear the fixed mobile tabbar (64px + its own safe-area padding). */
-  .pt-scroll-top { bottom: calc(64px + env(safe-area-inset-bottom) + 16px); }
+  .pt-scroll-top { bottom: max(calc(64px + env(safe-area-inset-bottom) + 16px), var(--pt-float-clear, 0px)); }
 }
 
 /* Floating "Select"/"Done" pill (FloatingSelectButton.tsx), left of the scroll-to-top
@@ -65,7 +67,7 @@
 .pt-float-select {
   position: fixed;
   right: calc(20px + var(--tap-min) + 12px);
-  bottom: calc(20px + env(safe-area-inset-bottom));
+  bottom: max(calc(20px + env(safe-area-inset-bottom)), var(--pt-float-clear, 0px));
   height: var(--tap-min);
   padding: 0 16px;
   border-radius: calc(var(--tap-min) / 2);
@@ -91,7 +93,7 @@
 .pt-float-select:hover { background: var(--lg-surface-strong); }
 .pt-float-select.active { background: var(--accent, var(--lg-surface-strong)); }
 @container (max-width: 805px) {
-  .pt-float-select { bottom: calc(64px + env(safe-area-inset-bottom) + 16px); }
+  .pt-float-select { bottom: max(calc(64px + env(safe-area-inset-bottom) + 16px), var(--pt-float-clear, 0px)); }
 }
 /* Touch screens start selecting with a long-press on a tile, so there the pill is only clutter. */
 @media (hover: none) and (pointer: coarse) {
