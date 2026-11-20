@@ -28,8 +28,12 @@ const stepState = (wave: ProcessingWave, step: ProcessingStage): 'done' | 'now' 
 const subline = (wave: ProcessingWave, now: number): string => {
     const problem = problemText(wave);
     if (wave.stage === 'done') {
-        const minutes = Math.max(1, Math.round((wave.processedSeconds ?? 0) / 60));
-        return [`Done in ${plural(minutes, 'minute')}`, problem].filter(Boolean).join(' · ');
+        // Matches the "Upload from <time>" line: from the first photo to the wave finishing, not just the
+        // processing after the upload closed (processedSeconds).
+        const total = wave.startedAt > 0 && wave.stageEnteredAt > wave.startedAt ? wave.stageEnteredAt - wave.startedAt : (wave.processedSeconds ?? 0);
+        const minutes = Math.max(1, Math.round(total / 60));
+        const took = minutes >= 120 ? `${Math.floor(minutes / 60)} h ${minutes % 60} min` : plural(minutes, 'minute');
+        return [`Done in ${took}`, problem].filter(Boolean).join(' · ');
     }
     const base = `Step ${stepNumber(wave.stage)} of 3 · ${STAGE_TITLES[wave.stage]}`;
     if (wave.problem === 'blocked') return problem as string;
