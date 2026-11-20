@@ -94,9 +94,7 @@ describe('upload overlay -> index handover', () => {
     it('EMPTY library: counts every upload past the tile cap too', async () => {
         env.index.mockResolvedValue([]);
         await mount();
-        console.log('EMPTY totalPhotos before', store.totalPhotos);
         act(() => { for (let i = 0; i < 700; i += 1) addJustUploaded({ filename: `burst${i}.jpg`, captureDate: null }); });
-        console.log('EMPTY totalPhotos after', store.totalPhotos, 'tiles', store.photos.length);
         expect(store.totalPhotos).toBe(700);
         expect(store.photos).toHaveLength(500);
     });
