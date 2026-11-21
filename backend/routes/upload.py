@@ -521,6 +521,43 @@ def get_known_upload_hashes():
     return response
 
 
+KNOWN_HASH_CHECK_MAX = 500
+
+
+@upload_bp.route('/upload/known-hashes/check', methods=['POST'])
+@upload_bp.route('/api/upload/known-hashes/check', methods=['POST'])
+def check_known_upload_hashes():
+    """Which of these hashes does the library already hold as a live photo?
+
+    The snapshot behind GET /upload/known-hashes cannot rebuild while an
+    upload wave is open, so a re-upload of photos finalized meanwhile would
+    send every byte. Point lookups need no snapshot. Best effort: a hash that
+    cannot be read is left out, and finalize-time detection stays authoritative.
+    """
+    _, user_id, error = app._require_library_context()
+    if error:
+        return error
+    hashes = (app.request.get_json(silent=True) or {}).get('hashes')
+    if (not isinstance(hashes, list) or len(hashes) > KNOWN_HASH_CHECK_MAX
+            or not all(isinstance(h, str) and 0 < len(h) <= 128 for h in hashes)):
+        return app.jsonify({'error': f'hashes must be a list of at most {KNOWN_HASH_CHECK_MAX} strings'}), 400
+    if app.hash_index_table_client is None or app.metadata_table_client is None:
+        return app.jsonify({'known': {}, 'available': False})
+    from concurrent.futures import ThreadPoolExecutor
+    from upload_wave_shadow import stored_filename_lookup
+    find = stored_filename_lookup(app.hash_index_table_client, app.metadata_table_client, user_id)
+
+    def lookup(sha):
+        try:
+            return sha, find(sha)
+        except Exception:
+            return sha, ''
+    unique = list(dict.fromkeys(hashes))
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        found = {sha: name for sha, name in pool.map(lookup, unique) if name}
+    return app.jsonify({'known': found, 'available': True})
+
+
 @upload_bp.route('/upload/known-hashes/refresh', methods=['POST'])
 @upload_bp.route('/api/upload/known-hashes/refresh', methods=['POST'])
 def refresh_known_upload_hashes():

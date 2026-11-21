@@ -67,7 +67,7 @@ import {
     MAX_NOTIFICATION_HISTORY,
 } from '../services/notificationHistory';
 import { publishLibraryChange } from '../services/libraryChanges';
-import { fetchKnownUploadHashes, requestUploadHashRefresh, type UploadEndReason } from '../services/uploadKnownHashes';
+import { checkKnownUploadHashes, fetchKnownUploadHashes, requestUploadHashRefresh, type UploadEndReason } from '../services/uploadKnownHashes';
 import { perf } from '../services/perf';
 import { UploadSessionStore } from '../services/uploadSessionStore';
 import { uploadPreparationLimits } from '../services/uploadPreparationLimits';
@@ -5443,6 +5443,15 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     'Some files were skipped',
                     `${plural(unreadableFileNames.length, 'file')} couldn't be read in time and won't be uploaded (${unreadableFileNames.slice(0, 3).join(', ')}${unreadableFileNames.length > 3 ? ', …' : ''}). If they're in iCloud Drive or on an external drive, make sure they're downloaded or connected, then select them again.`,
                 );
+            }
+            // The snapshot can lag the library by a whole open wave, so ask the
+            // server about what it doesn't cover. Matches never become wave members.
+            const unmatched = Array.from(new Set(results.filter((r) => r && !r.duplicate).map((r) => r!.sha256)));
+            if (unmatched.length > 0) {
+                const stored = await Promise.race([checkKnownUploadHashes(unmatched, dedupController.signal), aborted]);
+                dedupController.signal.throwIfAborted();
+                for (const [hash, filename] of Object.entries(stored)) knownHashesRef.current.set(hash, filename);
+                for (const result of results) if (result && stored[result.sha256]) result.duplicate = true;
             }
             const candidates: File[] = [];
             const selectedHashes = new Set<string>();

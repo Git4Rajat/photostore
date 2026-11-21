@@ -425,3 +425,51 @@ def test_many_hashes_are_losslessly_compressed_and_do_not_rescan_on_reads(world)
 def test_hash_list_fallback_never_exposes_control_rows(world):
     snapshots.rebuild_snapshot('lib')
     assert su.list_known_file_hashes('lib') == {'a' * 64: 'original.heic'}
+
+
+class _Rows:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def get_entity(self, pk, rk):
+        from azure.core.exceptions import ResourceNotFoundError
+        if (pk, rk) not in self.rows:
+            raise ResourceNotFoundError('missing')
+        return self.rows[pk, rk]
+
+
+def _check_world(monkeypatch):
+    hashes = _Rows({('lib', 'h-live'): {'filename': 'live.jpg'}, ('lib', 'h-gone'): {'filename': 'gone.jpg'},
+                    ('lib', 'h-stale'): {'filename': 'stale.jpg'}})
+    meta = _Rows({('lib', 'live.jpg'): {'fileHash': 'h-live', 'anonymousImageId': 'a'},
+                  ('lib', 'gone.jpg'): {'fileHash': 'h-gone', 'anonymousImageId': 'b', 'processing_state': 'deleted'},
+                  ('lib', 'stale.jpg'): {'fileHash': 'other', 'anonymousImageId': 'c'}})
+    monkeypatch.setattr(app, '_require_library_context', lambda: ('account', 'lib', None))
+    monkeypatch.setattr(app, 'hash_index_table_client', hashes)
+    monkeypatch.setattr(app, 'metadata_table_client', meta)
+
+
+def test_check_route_reports_only_live_stored_photos(monkeypatch):
+    _check_world(monkeypatch)
+    response = app.app.test_client().post('/upload/known-hashes/check', json={'hashes': ['h-live', 'h-gone', 'h-stale', 'h-new', 'h-live']})
+    assert response.status_code == 200
+    assert response.json == {'known': {'h-live': 'live.jpg'}, 'available': True}
+
+
+def test_check_route_leaves_out_hashes_it_cannot_read(monkeypatch):
+    _check_world(monkeypatch)
+    monkeypatch.setattr(app.hash_index_table_client, 'get_entity',
+                        lambda pk, rk: (_ for _ in ()).throw(RuntimeError('storage down')))
+    response = app.app.test_client().post('/upload/known-hashes/check', json={'hashes': ['h-live']})
+    assert response.status_code == 200 and response.json['known'] == {}
+
+
+@pytest.mark.parametrize('body', [{}, {'hashes': 'x'}, {'hashes': [1]}, {'hashes': ['a'] * 501}])
+def test_check_route_validates_input(monkeypatch, body):
+    _check_world(monkeypatch)
+    assert app.app.test_client().post('/upload/known-hashes/check', json=body).status_code == 400
+
+
+def test_check_route_does_not_bypass_library_authorization(monkeypatch):
+    monkeypatch.setattr(app, '_require_library_context', lambda: (None, None, (app.jsonify({'error': 'forbidden'}), 403)))
+    assert app.app.test_client().post('/upload/known-hashes/check', json={'hashes': ['h']}).status_code == 403

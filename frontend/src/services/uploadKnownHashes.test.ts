@@ -4,7 +4,7 @@ const mocks = vi.hoisted(() => ({ get: vi.fn(), post: vi.fn(), span: vi.fn() }))
 vi.mock('./apiClient', () => ({ getUpload: mocks.get, postUpload: mocks.post }));
 vi.mock('./perf', () => ({ perf: { recordSpan: mocks.span } }));
 
-import { fetchKnownUploadHashes, requestUploadHashRefresh, UPLOAD_HASH_DOWNLOAD_TIMEOUT_MS, UPLOAD_HASH_DOWNLOAD_ATTEMPTS } from './uploadKnownHashes';
+import { checkKnownUploadHashes, fetchKnownUploadHashes, requestUploadHashRefresh, UPLOAD_HASH_DOWNLOAD_TIMEOUT_MS, UPLOAD_HASH_DOWNLOAD_ATTEMPTS } from './uploadKnownHashes';
 
 beforeEach(() => {
     vi.useFakeTimers();
@@ -130,5 +130,31 @@ describe('background upload hash download', () => {
     it.each([{}, { hashes: [] }, { hashes: 'invalid' }])('ignores malformed responses %j', async (response) => {
         mocks.get.mockResolvedValue(response);
         expect(await fetchKnownUploadHashes()).toEqual({});
+    });
+});
+
+describe('library hash check', () => {
+    it('sends hashes in batches of 500 and merges what the library already holds', async () => {
+        const hashes = Array.from({ length: 1200 }, (_, i) => `h${i}`);
+        mocks.post.mockImplementation(async (_url: string, body: { hashes: string[] }) => ({
+            known: Object.fromEntries(body.hashes.filter((h) => h === 'h3' || h === 'h1100').map((h) => [h, `${h}.jpg`])),
+        }));
+        expect(await checkKnownUploadHashes(hashes)).toEqual({ h3: 'h3.jpg', h1100: 'h1100.jpg' });
+        expect(mocks.post.mock.calls.map((c) => c[1].hashes.length).sort()).toEqual([200, 500, 500]);
+        expect(mocks.post.mock.calls[0][0]).toBe('/upload/known-hashes/check');
+    });
+
+    it('a failed batch costs only that batch', async () => {
+        const hashes = Array.from({ length: 600 }, (_, i) => `h${i}`);
+        mocks.post.mockImplementation(async (_url: string, body: { hashes: string[] }) => {
+            if (body.hashes[0] === 'h0') throw new Error('offline');
+            return { known: { h599: 'x.jpg' } };
+        });
+        expect(await checkKnownUploadHashes(hashes)).toEqual({ h599: 'x.jpg' });
+    });
+
+    it('makes no request for an empty list', async () => {
+        expect(await checkKnownUploadHashes([])).toEqual({});
+        expect(mocks.post).not.toHaveBeenCalled();
     });
 });

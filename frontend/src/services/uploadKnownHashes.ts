@@ -80,3 +80,34 @@ export async function fetchKnownUploadHashes(signal?: AbortSignal): Promise<Reco
     }
     return {};
 }
+
+export const UPLOAD_HASH_CHECK_BATCH = 500;
+const UPLOAD_HASH_CHECK_CONCURRENCY = 3;
+
+// Which of these hashes does the library already hold? The prebuilt snapshot
+// cannot refresh while an upload wave is open, so photos finalized in the
+// meantime are missing from it. Best effort: a failed batch contributes
+// nothing and finalize-time detection stays authoritative.
+export async function checkKnownUploadHashes(hashes: string[], signal?: AbortSignal): Promise<Record<string, string>> {
+    const found: Record<string, string> = {};
+    const batches: string[][] = [];
+    for (let i = 0; i < hashes.length; i += UPLOAD_HASH_CHECK_BATCH) batches.push(hashes.slice(i, i + UPLOAD_HASH_CHECK_BATCH));
+    let next = 0;
+    const worker = async () => {
+        while (!signal?.aborted) {
+            const batch = batches[next++];
+            if (!batch) return;
+            try {
+                const response = await postUpload<{ known?: Record<string, string> }>(
+                    '/upload/known-hashes/check', { hashes: batch }, { timeout: 30000, signal });
+                for (const [hash, filename] of Object.entries(response?.known ?? {})) {
+                    if (typeof filename === 'string' && filename) found[hash] = filename;
+                }
+            } catch {
+                // Leave this batch to the finalize-time check.
+            }
+        }
+    };
+    await Promise.all(Array.from({ length: Math.min(UPLOAD_HASH_CHECK_CONCURRENCY, batches.length) }, worker));
+    return found;
+}
