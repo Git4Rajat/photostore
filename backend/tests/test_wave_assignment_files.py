@@ -435,3 +435,20 @@ def test_fallback_replay_only_checkpoints_newly_resolved_pages(tmp_path):
     assert not checkpoints
     assert counter.snapshot()['cluster_faces_newly_resolved'] == 0
     assert counter.snapshot()['cluster_faces_replayed'] == len(snapshots)
+
+
+def test_local_journal_accepts_a_decision_row_over_the_table_budget(tmp_path):
+    # An assignment to a person with a large shardIds list plus the 512-float candidate
+    # embedding is ~62 KB: over the Table row budget, fine for a mounted-file record.
+    import wave_assignment_files as files
+    h, snapshots, store, frozen, leases = setup()
+    run(h, snapshots, store, frozen, leases, tmp_path)
+    directory, = (tmp_path / 'mount').rglob('journal.jsonl')
+    big = dict(data='x' * 31_000)
+    assert len(wave.encoded(big).encode('utf-16-le')) > wave.JOURNAL_PAYLOAD_BYTES
+    with files.assignment_journal(store, frozen['waveId'], lambda: None,
+                                  share=str(tmp_path / 'mount'), local=str(tmp_path / 'work')) as journal:
+        journal.put('decision!big', big)
+        assert journal.get('decision!big') == big
+        with pytest.raises(ValueError, match='byte budget'):
+            journal.put('decision!huge', dict(data='x' * 70_000))
