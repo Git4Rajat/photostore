@@ -39,6 +39,7 @@ import os
 import queue
 import threading
 import time
+from PIL import Image
 import processing_metrics as metrics
 from typing import Dict, Optional
 
@@ -90,6 +91,12 @@ OCR_MIN_WORD_CONFIDENCE = float(os.getenv('OCR_MIN_WORD_CONFIDENCE', '40'))
 # This bounds just the one call, well under that outer ceiling, so a hang
 # fails this one photo's OCR step instead of the whole task/queue.
 OCR_CALL_TIMEOUT_SECONDS = float(os.getenv('OCR_CALL_TIMEOUT_SECONDS', '30'))
+# Photos of screens carry a fine moire grid that tesseract reads as text for
+# tens of seconds (QA 2026-11-21: 9 of 9,321 photos, 24-90 s at full size, 0.2 s
+# at 1024 px). A normal photo takes ~0.4 s, so a short first attempt costs little
+# and a timed-out photo gets one retry on a smaller copy instead of failing.
+OCR_FIRST_ATTEMPT_TIMEOUT_SECONDS = float(os.getenv('OCR_FIRST_ATTEMPT_TIMEOUT_SECONDS', '10'))
+OCR_RETRY_MAX_SIDE = int(os.getenv('OCR_RETRY_MAX_SIDE', '1024'))
 
 _thread_local = threading.local()
 
@@ -278,6 +285,44 @@ class _OcrPool:
 
 _POOL = _OcrPool(max(1, int(os.getenv('IPWORKER_CONCURRENCY', '1'))) + 2)
 
+def _downscaled_copy(image):
+    """Independent smaller copy, or None when the image is already small."""
+    try:
+        longest = max(image.size)
+        if longest <= OCR_RETRY_MAX_SIDE: return None
+        scale = OCR_RETRY_MAX_SIDE / longest
+        return image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))), Image.Resampling.LANCZOS)
+    except Exception:
+        return None  # The timed-out job may have released its image first.
+
+
+def _recognize_with_timeout(image, close_image, timeout):
+    """One pooled recognition. Returns (status, payload); the image is always closed."""
+    try:
+        worker = _POOL.acquire()
+    except Exception as exc:
+        close_image()
+        return 'acquire_error', exc
+    if worker is None:
+        close_image()
+        return 'capacity', None
+    job = _OcrJob(metrics.inherit(lambda: _recognize(image), purpose_name='other'), close_image)
+    worker.jobs.put_nowait(job)
+    try:
+        status, payload = job.outcome.get(timeout=timeout)
+    except queue.Empty:
+        metrics.add(ocr_worker_timeouts=1)
+        job.abandon()
+        _POOL.retire(worker)
+        return 'timeout', timeout
+    close_image()
+    if status == 'error':
+        _POOL.retire(worker)
+        return 'error', payload
+    _POOL.release(worker)
+    return 'ok', payload
+
+
 def process_ocr(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dict]:
     if tesserocr is None:
         return {'hasData': False, 'error': 'tesserocr_unavailable', 'errorCode': 'tesserocr_unavailable'}
@@ -307,28 +352,24 @@ def process_ocr(user_id: str, filename: str, image_bytes: bytes) -> Optional[Dic
     def close_image():
         try: cleanup()
         except Exception: pass
-    try:
-        worker = _POOL.acquire()
-    except Exception as exc:
-        close_image()
-        return {'hasData': False, 'error': str(exc), 'errorCode': error_code}
-    if worker is None:
-        close_image()
-        return {'hasData': False, 'error': 'OCR worker capacity exhausted', 'errorCode': 'ocr_capacity_exhausted'}
-    job = _OcrJob(metrics.inherit(lambda: _recognize(image), purpose_name='other'), close_image)
-    worker.jobs.put_nowait(job)
-    try:
-        status, payload = job.outcome.get(timeout=OCR_CALL_TIMEOUT_SECONDS)
-    except queue.Empty:
-        metrics.add(ocr_worker_timeouts=1)
-        job.abandon()
-        _POOL.retire(worker)
-        return {'hasData': False, 'error': f'OCR recognition exceeded {OCR_CALL_TIMEOUT_SECONDS}s', 'errorCode': 'ocr_timeout'}
-    close_image()
-    if status == 'error':
-        _POOL.retire(worker)
+    first_timeout = min(OCR_FIRST_ATTEMPT_TIMEOUT_SECONDS, OCR_CALL_TIMEOUT_SECONDS)
+    outcome = _recognize_with_timeout(image, close_image, first_timeout)
+    if outcome[0] == 'timeout' and first_timeout < OCR_CALL_TIMEOUT_SECONDS:
+        small = _downscaled_copy(image)
+        if small is not None:
+            metrics.add(ocr_downscaled_retries=1)
+            outcome = _recognize_with_timeout(small, small.close, OCR_CALL_TIMEOUT_SECONDS)
+            if outcome[0] == 'ok':
+                metrics.add(ocr_downscaled_retry_successes=1)
+    status, payload = outcome
+    if status == 'acquire_error':
         return {'hasData': False, 'error': str(payload), 'errorCode': error_code}
-    _POOL.release(worker)
+    if status == 'capacity':
+        return {'hasData': False, 'error': 'OCR worker capacity exhausted', 'errorCode': 'ocr_capacity_exhausted'}
+    if status == 'timeout':
+        return {'hasData': False, 'error': f'OCR recognition exceeded {payload}s', 'errorCode': 'ocr_timeout'}
+    if status == 'error':
+        return {'hasData': False, 'error': str(payload), 'errorCode': error_code}
     word_confidences = payload
     # Word-level confidences (not full-page GetUTF8Text()) so low-confidence
     # words -- texture/grain tesseract hallucinated as "text", the dominant
