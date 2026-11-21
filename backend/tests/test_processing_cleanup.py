@@ -191,3 +191,33 @@ def test_collect_defers_without_fencing_while_a_wave_stage_is_live():
     # The GC fence was never acquired: the policy row has no gcUntil/gcOwner.
     policy = table.get_entity(partition, 'policy')
     assert not policy.get('gcUntil') and not policy.get('gcOwner')
+
+
+def test_collect_defers_without_fencing_while_an_upload_session_is_open():
+    # A standing GC backlog must not fence a library whose upload session is
+    # still open: every register/resolve/finalize would be refused meanwhile.
+    from wave_policy import PROTOCOL
+    table = FakeTable()
+    partition = 'upload-wave-shadow-' + digest('lib')
+    table.upsert_entity(dict(PartitionKey=partition, RowKey='policy', protocol=PROTOCOL))
+    table.upsert_entity(dict(PartitionKey=partition, RowKey='control', collectingWaveId='wave-1'))
+    table.upsert_entity(dict(PartitionKey=partition, RowKey='wave!wave-1', waveId='wave-1', openSessions=1))
+
+    result = collect_library_artifacts(table, _Storage(), FakeTable(), 'lib')
+
+    assert result == dict(deletedManifests=0, deferred=True, reason='intake_open')
+    policy = table.get_entity(partition, 'policy')
+    assert not policy.get('gcUntil') and not policy.get('gcOwner')
+
+
+def test_collect_runs_once_the_upload_session_has_closed():
+    from wave_policy import PROTOCOL
+    table = FakeTable()
+    partition = 'upload-wave-shadow-' + digest('lib')
+    table.upsert_entity(dict(PartitionKey=partition, RowKey='policy', protocol=PROTOCOL))
+    table.upsert_entity(dict(PartitionKey=partition, RowKey='control', collectingWaveId='wave-1'))
+    table.upsert_entity(dict(PartitionKey=partition, RowKey='wave!wave-1', waveId='wave-1', openSessions=0, state='complete'))
+
+    result = collect_library_artifacts(table, _Storage(), FakeTable(), 'lib')
+
+    assert result.get('reason') != 'intake_open'
