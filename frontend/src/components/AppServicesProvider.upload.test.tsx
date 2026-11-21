@@ -804,13 +804,14 @@ describe('browser upload selection and startup', () => {
         act(() => { services.pauseActiveUpload(); });
         releases.splice(0).forEach((release) => release());
         await advance(3000);
-        const stories = () => (services.notifications as Array<{ story?: { state: string; pausedAt?: number; resumedAt?: number }; title: string }>).filter((n) => n.story);
+        const stories = () => (services.notifications as Array<{ story?: { sessionId: string; state: string; pausedAt?: number; resumedAt?: number }; title: string }>).filter((n) => n.story);
         expect(stories()).toHaveLength(1);
         expect(stories()[0].story?.state).toBe('paused');
         expect(stories()[0].title).toBe('Upload paused');
         expect(stories()[0].story?.pausedAt).toBeGreaterThan(0);
         mocks.transferred.mockImplementation(() => Promise.resolve());
-        act(() => { void services.retryPersistedUploadSession(); });
+        // The bell's Resume names the entry's own upload id.
+        act(() => { void services.retryPersistedUploadSession(stories()[0].story?.sessionId, 'resume'); });
         await advance(5000);
         expect(stories()).toHaveLength(1);
         expect(stories()[0].story?.resumedAt).toBeGreaterThan(0);

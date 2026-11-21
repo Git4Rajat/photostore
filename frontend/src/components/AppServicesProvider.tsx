@@ -4821,9 +4821,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     details: `${fmt(totalUploaded)} of ${fmt(totalCount)} were added. The other ${fmt(failedNow || waitingNow)} need another try.`,
                     story: setStory({ state: 'failed' }),
                 });
+                // A plain pause is not an error; only say something when files failed.
                 setUploadError(totalFailed > 0 || failedNow > 0
                     ? 'Some files failed to upload. Retry cached files or reselect missing files.'
-                    : 'Some files still need to be reselected before retry.'
+                    : null
                 );
             }
 
@@ -5069,7 +5070,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         let session = pendingUploadSessionRef.current || pendingUploadSession || loadPersistedSession();
         // A notice may name any session of this checkpoint's retry chain (an
         // abandoned sibling retry included), not only the newest one.
-        if (sessionId && sessionId !== (session?.waveOperationId || session?.id)
+        if (sessionId && sessionId !== session?.id && sessionId !== (session?.waveOperationId || session?.id)
             && !(session?.waveOperationId && sameWaveLineage(sessionId, session.waveOperationId, session.waveScope || ''))) {
             addNotification('Reselect unfinished files', 'The retry checkpoint for this upload is unavailable on this device. Use Upload to select the unfinished files again.');
             return;
@@ -6151,7 +6152,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         persistSession(restored);
         if (!waveLiveEnabled()) void ensureWaveShadowSessionAdmitted(restored);
         setPendingUploadSessionLive(restored);
-        addNotification('Upload paused', `${plural(restored.files.filter((file) => file.status !== 'done').length, 'file')} need retry approval.`);
+        // No second "Upload paused" entry on reload: the upload's own bell entry (kept in the notification
+        // history) already says it is paused, and the dock offers Resume and Discard.
         // autoResumeAttemptedRef only stops THIS mount's effect from calling
         // retryPersistedUploadSession twice (e.g. a dev-mode double-invoke).
         // The retry-attempt cap that matters across reloads -- and across

@@ -211,7 +211,9 @@ export const UploadDock: React.FC = () => {
         : resuming ? 'Picking up where you left off'
         : [timeLeft ?? (progress?.mbPerSecond ? `${progress.mbPerSecond.toFixed(1)} MB/s` : 'Starting…'), duplicatesLabel].filter(Boolean).join(' · ');
 
-    const heading = cancelling || retrying || resumed ? title : uploadActive ? (!checking && uploading && total ? `Uploading ${plural(total, 'item')}` : title) : title;
+    // A run that started with photos already added is a continuation: count on ("75 of 250"), whoever pressed Resume.
+    const continued = (startRef.current?.base ?? 0) > 0;
+    const heading = cancelling || retrying || resumed || continued ? title : uploadActive ? (!checking && uploading && total ? `Uploading ${plural(total, 'item')}` : title) : title;
 
     const pause = () => {
         if (acting) return;
