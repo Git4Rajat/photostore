@@ -796,6 +796,26 @@ describe('browser upload selection and startup', () => {
         expect(aborted).toBe(false);
     });
 
+    it('keeps one calm notification entry through pause and resume', async () => {
+        const releases: Array<() => void> = [];
+        mocks.transferred.mockImplementation(() => new Promise<void>((resolve) => { releases.push(resolve); }));
+        select(filesFor(50));
+        await advance(1000);
+        act(() => { services.pauseActiveUpload(); });
+        releases.splice(0).forEach((release) => release());
+        await advance(3000);
+        const stories = () => (services.notifications as Array<{ story?: { state: string; pausedAt?: number; resumedAt?: number }; title: string }>).filter((n) => n.story);
+        expect(stories()).toHaveLength(1);
+        expect(stories()[0].story?.state).toBe('paused');
+        expect(stories()[0].title).toBe('Upload paused');
+        expect(stories()[0].story?.pausedAt).toBeGreaterThan(0);
+        mocks.transferred.mockImplementation(() => Promise.resolve());
+        act(() => { void services.retryPersistedUploadSession(); });
+        await advance(5000);
+        expect(stories()).toHaveLength(1);
+        expect(stories()[0].story?.resumedAt).toBeGreaterThan(0);
+    });
+
     it('cancelling after a pause drops the files that never started but keeps the failed ones', async () => {
         mocks.transferred.mockRejectedValueOnce(Object.assign(new Error('bad'), { statusCode: 400 }));
         select(filesFor(40));

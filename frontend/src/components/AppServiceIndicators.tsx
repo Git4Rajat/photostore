@@ -4,7 +4,7 @@
 // only on the public useAppServices() contract, so they can live independently
 // of the (much larger) provider component itself.
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Bell as BellIcon, ChevronLeft as BackIcon, CloudUpload as UploadIcon, Link as LinkIcon, Mail as MailIcon, RotateCw as RetryIcon, TriangleAlert as AlertIcon, Users as PeopleIcon } from 'lucide-react';
+import { Bell as BellIcon, ChevronLeft as BackIcon, CloudUpload as UploadIcon, Link as LinkIcon, Mail as MailIcon, Pause as PauseIcon, RotateCw as RetryIcon, TriangleAlert as AlertIcon, Users as PeopleIcon } from 'lucide-react';
 import { formatMegabytesPerSecond } from './browserAiShared';
 import { formatNotificationClock, formatNotificationTime } from '../services/notificationTime';
 import { getCachedSortThumb } from '../services/localSortIndex';
@@ -16,15 +16,28 @@ import { useSwipeDismiss } from '../services/swipeDismiss';
 
 // Problems read red; uploads, people, shared albums and invites get their own mark; the rest a bell.
 const KIND_ICONS: Record<NotificationKind, React.ElementType> = {
-    warn: AlertIcon, upload: UploadIcon, people: PeopleIcon, share: LinkIcon, invite: MailIcon, info: BellIcon,
+    warn: AlertIcon, paused: PauseIcon, upload: UploadIcon, people: PeopleIcon, share: LinkIcon, invite: MailIcon, info: BellIcon,
 };
 const PROBLEM_WORDS = /\b(fail|failed|couldn.t|can.t|error|stopped|warning|limit|unavailable|reselect)\b/i;
 export const notificationKind = (n: AppNotification): NotificationKind => {
+    // A deliberate pause is not a problem: calm colour and a pause mark, red only once something failed.
+    if (n.story?.state === 'paused' && (n.progress?.failedCount ?? 0) === 0) return 'paused';
     if ((n.progress?.failedCount ?? 0) > 0 || PROBLEM_WORDS.test(`${n.title} ${n.details}`)) return 'warn';
     if (n.kind) return n.kind;
     if (n.progress || n.uploadSessionId || /upload/i.test(n.title)) return 'upload';
     if (/\b(people|person|faces?)\b/i.test(n.title)) return 'people';
     return 'info';
+};
+
+const countFmt = new Intl.NumberFormat();
+/** "Paused 10:19 · resumed 10:21 · cancelled 10:34": what has happened to this one upload so far. */
+export const storyHistory = (story: AppNotification['story']): string => {
+    if (!story) return '';
+    return [
+        story.pausedAt ? `Paused ${formatNotificationClock(story.pausedAt)}` : '',
+        story.resumedAt ? `${story.pausedAt ? 'resumed' : 'Resumed'} ${formatNotificationClock(story.resumedAt)}` : '',
+        story.cancelledAt ? `${story.pausedAt || story.resumedAt ? 'cancelled' : 'Cancelled'} ${formatNotificationClock(story.cancelledAt)}` : '',
+    ].filter(Boolean).join(' · ');
 };
 
 /** Progress entries are snapshots of one ongoing job: keep the newest of each
@@ -109,6 +122,9 @@ export const NotificationBell: React.FC<{ backLabel?: string }> = ({ backLabel =
         resendInvite,
         uploadActive,
         retryingUpload,
+        pauseActiveUpload,
+        discardPersistedUploadSession,
+        requestUpload,
     } = useAppServices();
     const [showNotifications, setShowNotifications] = useState<boolean>(false);
     // Opening the panel marks everything read (and acknowledges stale uploads),
@@ -227,6 +243,14 @@ export const NotificationBell: React.FC<{ backLabel?: string }> = ({ backLabel =
                                         const progress = notification.progress;
                                         // A bar only while the job is still going; a finished one says how it went in words.
                                         const running = progress && progress.uploadedCount + progress.failedCount < progress.totalCount;
+                                        const story = notification.story;
+                                        const paused = story?.state === 'paused';
+                                        const history = storyHistory(story);
+                                        // Duplicates found before uploading are a quieter line of their own, not part of added/total.
+                                        const leftOut = story && ['uploading', 'paused', 'done'].includes(story.state) ? progress?.skippedDuplicateCount ?? 0 : 0;
+                                        const title = story?.state === 'uploading' && progress
+                                            ? `Uploading ${countFmt.format(progress.uploadedCount)} of ${countFmt.format(progress.totalCount)}`
+                                            : notification.title;
                                         return (
                                             <article
                                                 key={notification.id}
@@ -237,7 +261,7 @@ export const NotificationBell: React.FC<{ backLabel?: string }> = ({ backLabel =
                                                     <div className="notification-top">
                                                         <p className="notification-title">
                                                             {isNew(notification) && <span className="sr-only">New: </span>}
-                                                            {notification.title}
+                                                            {title}
                                                         </p>
                                                         <time
                                                             className="notification-time"
@@ -246,10 +270,11 @@ export const NotificationBell: React.FC<{ backLabel?: string }> = ({ backLabel =
                                                             {formatNotificationClock(notification.timestamp)}
                                                         </time>
                                                     </div>
-                                                    {notification.details && <p className="notification-details">{notification.details}</p>}
+                                                    {history && <p className="notification-details notification-history">{history}</p>}
+                                                    {notification.details && story?.state !== 'uploading' && <p className="notification-details">{notification.details}</p>}
                                                     {running && (
                                                         <>
-                                                            <div className="notification-progress" aria-hidden="true">
+                                                            <div className={`notification-progress${paused ? ' paused' : ''}`} aria-hidden="true">
                                                                 <i
                                                                     style={{
                                                                         width: `${progress.totalCount > 0
@@ -258,18 +283,19 @@ export const NotificationBell: React.FC<{ backLabel?: string }> = ({ backLabel =
                                                                     }}
                                                                 />
                                                             </div>
-                                                            <p className="notification-details">
+                                                            {!paused && <p className="notification-details">
                                                                 {progress.uploadedCount}/{progress.totalCount}
                                                                 {progress.failedCount > 0
                                                                     ? ` (Failed ${progress.failedCount})`
                                                                     : ''}
-                                                                {progress.skippedDuplicateCount > 0
+                                                                {progress.skippedDuplicateCount > 0 && !story
                                                                     ? ` (Skipped duplicates ${progress.skippedDuplicateCount})`
                                                                     : ''}
                                                                 {(progress.mbPerSecond ?? 0) > 0 ? ` · ${formatMegabytesPerSecond(progress.mbPerSecond)}` : ''}
-                                                            </p>
+                                                            </p>}
                                                         </>
                                                     )}
+                                                    {leftOut > 0 && <p className="notification-details notification-history">{countFmt.format(leftOut)} already in your library, left out</p>}
                                                     {notification.photos && notification.photos.length > 0 && (
                                                         <NotificationStrip filenames={notification.photos} />
                                                     )}
@@ -281,7 +307,31 @@ export const NotificationBell: React.FC<{ backLabel?: string }> = ({ backLabel =
                                                             </button>
                                                         </div>
                                                     )}
-                                                    {notification.uploadSessionId && (
+                                                    {story && (
+                                                        <div className="notification-acts">
+                                                            {story.state === 'uploading' && (
+                                                                <button type="button" className="btn btn-soft btn-sm" disabled={!uploadActive} onClick={() => pauseActiveUpload()}>Pause</button>
+                                                            )}
+                                                            {paused && (
+                                                                <>
+                                                                    <button type="button" className="btn btn-primary btn-sm" disabled={uploadActive || retryingUpload}
+                                                                        onClick={() => void retryPersistedUploadSession(story.sessionId)}>Resume</button>
+                                                                    <button type="button" className="btn btn-soft btn-sm" disabled={uploadActive || retryingUpload}
+                                                                        onClick={() => void discardPersistedUploadSession()}>Discard</button>
+                                                                </>
+                                                            )}
+                                                            {story.state === 'cancelled' && (
+                                                                <button type="button" className="btn btn-soft btn-sm" disabled={uploadActive} onClick={() => requestUpload()}>Choose again</button>
+                                                            )}
+                                                            {story.state === 'failed' && (
+                                                                <button type="button" className="btn btn-primary btn-sm" disabled={uploadActive || retryingUpload}
+                                                                    onClick={() => void retryPersistedUploadSession(story.sessionId)}>
+                                                                    <RetryIcon aria-hidden="true" />Try again
+                                                                </button>
+                                                            )}
+                                                        </div>
+                                                    )}
+                                                    {notification.uploadSessionId && !story && (
                                                         <div className="notification-acts">
                                                             <button type="button" className="btn btn-primary btn-sm" disabled={uploadActive || retryingUpload}
                                                                 onClick={() => void retryPersistedUploadSession(notification.uploadSessionId)}>

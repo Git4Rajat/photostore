@@ -31,6 +31,7 @@ const toStored = (scope: string, n: AppNotification): StoredNotification => ({
     kind: n.kind,
     processing: n.processing,
     inviteId: n.inviteId,
+    story: n.story,
     scope,
 });
 
