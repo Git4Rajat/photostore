@@ -1,6 +1,7 @@
 import IndexBuildBar from './components/IndexBuildBar';
 import UploadDock from './components/UploadDock';
 import ProcessingDock from './components/ProcessingDock';
+import { WidgetStackProvider } from './components/WidgetStack';
 import { clearLocalSortIndexRemovals, invalidateLocalSortIndex, removeLocalSortIndexRows } from '../../services/localSortIndex';
 import { invalidateLocalAlbumsIndex } from '../../services/localAlbumsIndex';
 import { invalidateLocalPeopleIndex } from '../../services/localPeopleIndex';
@@ -320,8 +321,10 @@ const Shell: React.FC<{ onSignOut: () => void }> = ({ onSignOut }) => {
                             <Page />
                         </div>
                         <MobileTabbar />
-                        <UploadDock />
-                        <ProcessingDock />
+                        <WidgetStackProvider>
+                            <UploadDock />
+                            <ProcessingDock />
+                        </WidgetStackProvider>
                         <ScrollToTopButton />
                         <StoreFloatingSelectButton />
                     </div>

@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertGlyph, CheckGlyph, CloseGlyph, ChevGlyph } from './RedesignIcons';
 import { useAppServices } from '../../../components/AppServicesProvider';
 import BottomSheet from './BottomSheet';
+import { StackWidget } from './WidgetStack';
 import { plural } from '../../../utils/format';
 import {
     STAGE_TITLES, clampMonotonic, dismissProcessingWave, etaLabel, fetchProcessingWaves, holdStalled, isProcessingPushLive, isTrouble, isWaiting,
@@ -189,6 +190,7 @@ export const ProcessingDock: React.FC = () => {
 
     return (
         <>
+            <StackWidget id="processing" finished={finished} onDismiss={() => dismissWaves(finishedWaves)}>
             <div className="up-dock up-bar pd-bar" role="region" aria-label="Photo processing">
                 <button type="button" className="up-head" onClick={() => setOpen(true)} aria-label={`${title}. ${sub}. ${more ?? ''} Show details`}>
                     <span className={`up-ico${trouble ? ' bad' : ''}`}>
@@ -212,6 +214,7 @@ export const ProcessingDock: React.FC = () => {
                     })}
                 </div>
             </div>
+            </StackWidget>
             <BottomSheet open={open} onClose={() => setOpen(false)} title={title}>
                 <div className="up-sheet">
                     <p className="up-lede">Your photos are safe. These steps make search and people work.</p>

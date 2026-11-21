@@ -1705,3 +1705,34 @@
 .pd-wx svg { width: 14px; height: 14px; }
 .pd-line { margin: 0; font-size: 13px; }
 .pd-clear { align-self: flex-start; }
+
+/* Stacked widgets: upload, photo processing and other activities share one stack (WidgetStack.tsx). */
+.wstk { position: fixed; z-index: 70; left: 12px; right: 12px; bottom: calc(76px + env(safe-area-inset-bottom)); display: flex; flex-direction: column; gap: 8px; }
+.wstk[hidden] { display: none; }
+@media (min-width: 806px) { .wstk { left: auto; right: 20px; bottom: 20px; width: 372px; max-width: calc(100vw - 40px); } }
+.wstk-layers { position: relative; display: flex; flex-direction: column; gap: 8px; min-height: 0; }
+.wc-slot { min-width: 0; display: flex; flex-direction: column; }
+/* The cards keep their own look; the stack positions them. */
+.wstk .up-dock { position: relative; left: auto; right: auto; bottom: auto; width: auto; max-width: none; max-height: none; z-index: auto; }
+.wstk .up-dock.up-tray { max-height: calc(100vh - 40px); }
+/* Folded: the newest card in front, older ones peeking out above it (at most three layers). */
+.wstk.col .wc-slot:not(.b1):not(.b2):not(.b3) { position: relative; }
+.wstk.col .wc-slot.b1, .wstk.col .wc-slot.b2, .wstk.col .wc-slot.b3 { position: absolute; left: 0; right: 0; bottom: 0; height: 100%; overflow: hidden; border-radius: 18px; pointer-events: none; }
+.wstk.col .wc-slot.b1 { transform: translateY(-18px); margin: 0 9px; z-index: -1; }
+.wstk.col .wc-slot.b2, .wstk.col .wc-slot.b3 { transform: translateY(-36px); margin: 0 18px; z-index: -2; }
+.wstk.col .wc-slot.gone { display: none; }
+.wstk.col .wc-slot.b1 .up-dock, .wstk.col .wc-slot.b2 .up-dock, .wstk.col .wc-slot.b3 .up-dock { height: 100%; overflow: hidden; padding-top: 5px; }
+.wstk.col .wc-slot.b1 .up-t > span, .wstk.col .wc-slot.b2 .up-t > span, .wstk.col .wc-slot.b3 .up-t > span, .wstk.col .wc-slot.b1 .up-ico, .wstk.col .wc-slot.b2 .up-ico, .wstk.col .wc-slot.b3 .up-ico, .wstk.col .wc-slot.b1 .up-pct, .wstk.col .wc-slot.b2 .up-pct, .wstk.col .wc-slot.b1 .up-chev, .wstk.col .wc-slot.b2 .up-chev { display: none; }
+.wstk.col .wc-slot.b1 .up-t b, .wstk.col .wc-slot.b2 .up-t b { font-size: 12.5px; }
+.wstk.col { cursor: pointer; }
+.wstk .wcnt { position: absolute; top: -12px; right: -4px; min-width: 24px; height: 24px; padding: 0 7px; border-radius: 12px; background: var(--accent); color: var(--on-accent, #fff); font-size: 12.5px; font-weight: 700; display: grid; place-items: center; box-shadow: 0 0 0 2px var(--bg-1, var(--bg)); z-index: 3; }
+/* Open: a header, then every card in full. */
+.wstk.open { max-height: calc(100vh - 40px); overflow-y: auto; overscroll-behavior: contain; }
+.wstk .wh { display: flex; align-items: center; gap: 10px; padding: 4px 6px 4px 14px; background: var(--lg-surface-strong); border-radius: 16px; box-shadow: var(--lg-shadow-floating), 0 0 0 1px var(--lg-edge); flex: none; }
+.wstk .wh b { flex: 1; font: 600 15px var(--font-display); color: var(--text); }
+.wstk .wh .btn-icon { width: 30px; height: 30px; min-height: 0; padding: 0; }
+.wstk .wh .btn-icon svg { width: 16px; height: 16px; }
+.wstk-scrim { display: none; }
+@media (max-width: 805px) { .wstk-scrim { display: block; position: fixed; inset: 0; z-index: 69; background: rgba(0, 0, 0, 0.4); } }
+/* Toasts show alone, above the stack. */
+@media (max-width: 805px) { .pt-toasts { bottom: max(100px, calc(76px + env(safe-area-inset-bottom) + var(--pt-stack-h, 0px) + 12px)); } }

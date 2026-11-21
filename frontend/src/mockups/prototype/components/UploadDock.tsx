@@ -6,6 +6,7 @@ import { confirmDialog } from '../../../components/shared/dialogs';
 import { plural } from '../../../utils/format';
 import type { PersistedUploadFile } from '../../../types/browserProcessing';
 import BottomSheet from './BottomSheet';
+import { StackWidget } from './WidgetStack';
 import { plainFailureReason, timeLeftLabel } from './uploadDockText';
 
 const FAILURES_SHOWN = 4;
@@ -51,7 +52,9 @@ const ResultBar: React.FC<{
     sub: string;
     action?: { label: string; onClick: () => void; disabled?: boolean };
     onDismiss?: () => void;
-}> = ({ narrow, bad, title, sub, action, onDismiss }) => (
+    finished?: boolean;
+}> = ({ narrow, bad, title, sub, action, onDismiss, finished }) => (
+    <StackWidget id="upload" finished={finished} onDismiss={onDismiss}>
     <div className={`up-dock up-result ${narrow ? 'up-bar' : 'up-tray'}`} role="status" aria-live="polite">
         <div className="up-rr">
             <span className={`up-ico${bad ? ' bad' : ''}`}>{bad ? <CircleAlert aria-hidden="true" /> : <CheckGlyph aria-hidden="true" />}</span>
@@ -60,6 +63,7 @@ const ResultBar: React.FC<{
             {onDismiss ? <IconButton label="Dismiss" variant="link" size="sm" onClick={onDismiss}><CloseIcon aria-hidden="true" /></IconButton> : null}
         </div>
     </div>
+    </StackWidget>
 );
 
 const FailedRows: React.FC<{ files: PersistedUploadFile[]; onRetry?: () => void; retryDisabled?: boolean }> = ({ files, onRetry, retryDisabled }) => {
@@ -286,6 +290,7 @@ export const UploadDock: React.FC = () => {
                 title="Cancelled"
                 sub={`${outcome.added} added, ${outcome.notAdded} not`}
                 action={{ label: 'Choose again', onClick: () => { setOutcome(null); requestUpload(); } }}
+                finished
                 onDismiss={() => setOutcome(null)}
             />
         );
@@ -336,6 +341,7 @@ export const UploadDock: React.FC = () => {
     if (narrow) {
         return (
             <>
+                <StackWidget id="upload">
                 <div className="up-dock up-bar">
                     <button type="button" className="up-head" onClick={() => setSheetOpen(true)} aria-label={`${title}. ${sub}. Show details`}>
                         {icon}
@@ -345,6 +351,7 @@ export const UploadDock: React.FC = () => {
                     </button>
                     {uploadActive || cancelling ? <Progress pct={cancelling || resuming ? undefined : pct} /> : null}
                 </div>
+                </StackWidget>
                 <BottomSheet open={sheetOpen} onClose={() => setSheetOpen(false)} title={heading}>
                     <div className="up-sheet">
                         {cancelling ? cancellingBody : uploadActive ? (
@@ -377,6 +384,7 @@ export const UploadDock: React.FC = () => {
 
     // A tray at the bottom right on desktop, collapsible to one line.
     return (
+        <StackWidget id="upload">
         <div className="up-dock up-tray" role="region" aria-label="Upload progress">
             <div className="up-uh">
                 {icon}
@@ -424,6 +432,7 @@ export const UploadDock: React.FC = () => {
                 </>
             )}
         </div>
+        </StackWidget>
     );
 };
 
