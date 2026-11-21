@@ -97,7 +97,7 @@ fi
 # unpkg.com serves any npm package, so only allow the exact pinned tesseract
 # paths (keep in sync with the tesseract.js / tesseract.js-core versions).
 UNPKG_SRC="https://unpkg.com/tesseract.js@v2.1.5/ https://unpkg.com/tesseract.js-core@v2.2.0/"
-CONNECT_SRC="wss://*.webpubsub.azure.com 'self' ${BLOB_HOST:-https://*.blob.core.windows.net} ${UNPKG_SRC:-https://unpkg.com/tesseract.js@v2.1.5/ https://unpkg.com/tesseract.js-core@v2.2.0/} https://tessdata.projectnaptha.com https://huggingface.co https://*.hf.co data:"
+CONNECT_SRC="wss://*.webpubsub.azure.com 'self' ${BLOB_HOST:-https://*.blob.core.windows.net} ${UNPKG_SRC:-https://unpkg.com/tesseract.js@v2.1.5/ https://unpkg.com/tesseract.js-core@v2.2.0/} https://tessdata.projectnaptha.com https://huggingface.co https://*.hf.co data: blob:"
 if [ -n "$API_BASE_URL" ]; then
   CONNECT_SRC="${CONNECT_SRC} ${API_BASE_URL}"
 fi
