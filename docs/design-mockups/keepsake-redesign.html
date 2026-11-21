@@ -313,6 +313,47 @@ figcaption b { display: block; color: var(--b-fg); font-size: 15px; margin-botto
 .strip { display: flex; gap: 2px; margin-top: 8px; }
 .strip .t { width: 36px; height: 36px; border-radius: 5px; }
 
+
+/* Stacked widgets */
+.wstk { position: absolute; left: 12px; right: 12px; bottom: 88px; z-index: 5; display: grid; }
+.wstk.dk { left: auto; right: 20px; bottom: 20px; width: 372px; }
+.wc { display: flex; align-items: center; gap: 11px; padding: 11px 10px 11px 14px; border-radius: 16px; background: var(--surface); box-shadow: var(--shadow), 0 0 0 1px var(--line); min-width: 0; }
+.wc.tt { background: var(--toast-bg); color: var(--toast-fg); box-shadow: var(--shadow); }
+.wc .wt { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.wc .wt b { font-size: 13.5px; font-weight: 600; }
+.wc .wt span { font-size: 12px; color: var(--muted); }
+.wc.tt .wt span { color: inherit; opacity: .72; }
+.wc .wa { font-size: 13px; font-weight: 700; color: var(--accent); flex: none; padding: 0 4px; }
+.wc.tt .wa { color: var(--toast-link); }
+.wc .wx { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; flex: none; opacity: .7; }
+.wc .wx .i { width: 15px; height: 15px; }
+.wc .wc-prog { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+.wc .wc-prog .r { display: flex; align-items: center; gap: 11px; }
+.wc .ui { width: 30px; height: 30px; }
+/* collapsed: one cell, older cards peek above */
+.wstk.col { --fh: 54px; }
+.wstk.col.p { --fh: 70px; }
+.wstk.col > .wc { grid-area: 1 / 1; align-self: end; height: var(--fh); }
+.wstk.col > .wc.b1 { transform: translateY(-19px); margin: 0 9px; height: var(--fh); overflow: hidden; align-items: flex-start; padding-top: 7px; z-index: -1; }
+.wstk.col > .wc.b2 { transform: translateY(-32px); margin: 0 18px; height: var(--fh); overflow: hidden; align-items: flex-start; padding-top: 7px; z-index: -2; }
+.wstk.col > .wc.b3 { transform: translateY(-42px); margin: 0 26px; height: var(--fh); overflow: hidden; z-index: -3; }
+.wstk.col > .wc.b1 .wt span, .wstk.col > .wc.b2 .wt span, .wstk.col > .wc.b1 .wa, .wstk.col > .wc.b2 .wa, .wstk.col > .wc.b1 .wx, .wstk.col > .wc.b2 .wx, .wstk.col > .wc.b1 .wc-prog .prog, .wstk.col > .wc.b2 .wc-prog .prog { display: none; }
+.wstk.col > .wc.b1 .ui, .wstk.col > .wc.b2 .ui, .wstk.col > .wc.b1 .ni, .wstk.col > .wc.b2 .ni { display: none; }
+.wstk.col > .wc.b1 .wt b, .wstk.col > .wc.b2 .wt b, .wstk.col > .wc.b1 .wc-prog b, .wstk.col > .wc.b2 .wc-prog b { font-size: 12.5px; }
+.wstk.col > .wc.b1.tt .wt b { opacity: .9; }
+.wstk .wcnt { position: absolute; top: -12px; right: -4px; min-width: 24px; height: 24px; padding: 0 7px; border-radius: 12px; background: var(--accent); color: var(--on-accent, #fff); font-size: 12.5px; font-weight: 700; display: grid; place-items: center; box-shadow: 0 0 0 2px var(--bg); z-index: 3; }
+.wstk.col.up > .wc:first-of-type { }
+/* expanded: a list with its own header */
+.wstk.open { gap: 8px; max-height: 640px; }
+.wstk .wh { display: flex; align-items: center; gap: 10px; padding: 4px 6px 4px 14px; background: var(--surface); border-radius: 16px; box-shadow: var(--shadow), 0 0 0 1px var(--line); }
+.wstk .wh b { flex: 1; font: 600 15px var(--font-display); color: var(--fg); }
+.wstk .wh .link { font-size: 13px; }
+.wstk .wh .ibtn { width: 30px; height: 30px; }
+.wstk.open .wc.out { opacity: .4; transform: translateX(18px); }
+.wstk .wc .ring { box-shadow: 0 0 0 2px var(--accent); border-radius: 8px; }
+.totop { position: absolute; right: 16px; z-index: 4; width: 40px; height: 40px; border-radius: 50%; background: var(--surface); box-shadow: var(--shadow), 0 0 0 1px var(--line); display: grid; place-items: center; color: var(--fg); }
+.totop .i { width: 18px; height: 18px; }
+
 /* Viewer (always dark) */
 .vw { background: var(--v-bg); color: var(--v-fg); }
 .vw .sb::after { background: var(--bezel); }
@@ -772,7 +813,7 @@ figure.shot.md { width: 540px; }
   <div class="wrap">
     <div class="brand"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span>Keepsake <small>redesign</small></div>
     <nav class="nav" aria-label="Sections">
-      <a href="#system">System</a><a href="#gallery">Gallery</a><a href="#filter">Filter</a><a href="#albums">Albums</a><a href="#people">People</a><a href="#notifications">Notifications</a><a href="#invites">Invites</a><a href="#delete-library">Delete library</a><a href="#login">Sign in</a><a href="#upload">Upload</a><a href="#processing">After upload</a><a href="#upload-actions">Cancel &amp; retry</a><a href="#upload-resume">Pause &amp; resume</a><a href="#upload-story">Upload in the bell</a><a href="#emails">Emails</a><a href="#shared-static">Shared · instant</a><a href="#shared-full">Shared · full</a><a href="#desktop">Desktop</a>
+      <a href="#system">System</a><a href="#gallery">Gallery</a><a href="#filter">Filter</a><a href="#albums">Albums</a><a href="#people">People</a><a href="#notifications">Notifications</a><a href="#invites">Invites</a><a href="#delete-library">Delete library</a><a href="#login">Sign in</a><a href="#upload">Upload</a><a href="#processing">After upload</a><a href="#upload-actions">Cancel &amp; retry</a><a href="#upload-resume">Pause &amp; resume</a><a href="#upload-story">Upload in the bell</a><a href="#stacked-widgets">Stacked widgets</a><a href="#emails">Emails</a><a href="#shared-static">Shared · instant</a><a href="#shared-full">Shared · full</a><a href="#desktop">Desktop</a>
     </nav>
     <button class="tbtn" id="theme" type="button"><svg class="i"><use href="#i-sun"/></svg><span>Light mode</span></button>
   </div>
@@ -2923,6 +2964,206 @@ figure.shot.md { width: 540px; }
           </div>
         </div></div>
         <figcaption><b>Desktop · resumed</b>The entry has gone back to uploading in the same spot, with the history line. Only one entry exists for the upload.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ========== STACKED WIDGETS ========== -->
+  <section class="sec" id="stacked-widgets">
+    <div class="sec-head">
+      <h2>Stacked widgets</h2>
+      <p class="lede">Widgets are for activity that is live, or was live: an upload, a library clean-up, getting photos ready. When more than one is showing, they stack, newest in front with the others peeking behind. Tapping the stack fans it out so each widget is a full card with its own controls. Toasts, which are single actions like Undo, are a separate thing and are never part of the stack.</p>
+    </div>
+    <div class="frames">
+      <figure class="shot" style="width:100%;max-width:900px">
+        <div style="background:var(--surface);border-radius:18px;box-shadow:var(--shadow),0 0 0 1px var(--line);padding:22px 24px;font-size:13.5px;line-height:1.45">
+          <table style="border-collapse:collapse;width:100%"><thead><tr><th></th><th style="text-align:left;padding:0 12px 8px;font-size:12px;color:var(--muted);font-weight:700">What it holds</th><th style="text-align:left;padding:0 12px 8px;font-size:12px;color:var(--muted);font-weight:700">How long it lives</th><th style="text-align:left;padding:0 12px 8px;font-size:12px;color:var(--muted);font-weight:700">Where it appears</th></tr></thead><tbody style="border-top:1px solid var(--line)">
+<tr><td style="padding:10px 12px 10px 0;font-weight:700;vertical-align:top;white-space:nowrap">Widget</td><td style="padding:10px 12px;vertical-align:top">Something that is happening, or just happened, over time: an upload, a library clean-up, getting photos ready. It has progress and its own controls (Pause, Stop, Details).</td><td style="padding:10px 12px;vertical-align:top">While the activity runs, then stays as a finished result until dismissed.</td><td style="padding:10px 0 10px 12px;vertical-align:top">The stack at the bottom. Several widgets share one stack.</td></tr>
+<tr><td style="padding:10px 12px 10px 0;font-weight:700;vertical-align:top;white-space:nowrap">Toast</td><td style="padding:10px 12px;vertical-align:top">One thing you just did, with one action: “Removed 1 item. Undo”, “7,166 items skipped. Undo”.</td><td style="padding:10px 12px;vertical-align:top">A few seconds. Never saved.</td><td style="padding:10px 0 10px 12px;vertical-align:top">Alone, above the stack. It is never part of the stack.</td></tr>
+<tr><td style="padding:10px 12px 10px 0;font-weight:700;vertical-align:top;white-space:nowrap">Notification</td><td style="padding:10px 12px;vertical-align:top">A message you may want later: an upload finished, people to name, an invite ends.</td><td style="padding:10px 12px;vertical-align:top">Kept for 30 days.</td><td style="padding:10px 0 10px 12px;vertical-align:top">The bell.</td></tr>
+</tbody></table>
+        </div>
+        <figcaption><b>Three things, three places</b>A widget is about an activity, a toast is about a single action, and a notification is a record. When a widget finishes, its result is also kept as one notification in the bell, so the stack can be cleared without losing it. The stack below only ever holds widgets.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="ibtn dot"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="content">
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+            <div class="day"><b>27 January 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="food*L snow*L fire road"></div>
+          </div>
+          <span class="totop" style="bottom:252px"><svg class="i" style="transform:rotate(-90deg)"><use href="#i-chev"/></svg></span>
+          <div class="wstk col p"><div class="wc b1"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-trash"/></svg></span><div class="wt"><b>Cleaning your library</b><span>4,200 of 9,000 checked</span></div><span class="wa">Stop</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:47%"></i></div></div></div><div class="wc"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-upload"/></svg></span><div class="wt"><b>Uploading 128 of 700</b><span>About 12 minutes left</span></div><span class="wa">Pause</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:15%"></i></div></div></div><span class="wcnt">2</span></div><div class="toast" style="bottom:196px"><span>7,166 items skipped</span><b>Undo</b></div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>Collapsed · 2 widgets</b>An upload and a clean-up are both running. The newest is in front, the other peeks out behind with its title, and the count badge on the corner shows it can be opened. The toast above is not in the stack: it belongs to one action, stays a few seconds and goes.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="ibtn dot"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="content">
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+            <div class="day"><b>27 January 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="food*L snow*L fire road"></div>
+          </div>
+          <span class="totop" style="bottom:236px"><svg class="i" style="transform:rotate(-90deg)"><use href="#i-chev"/></svg></span>
+          <div class="wstk col p"><div class="wc b3"><span class="ni warn"><svg class="i"><use href="#i-alert"/></svg></span><div class="wt"><b>Photos are ready, some had problems</b><span>12 items didn't upload</span></div><span class="wa">View</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="wc b2"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-users"/></svg></span><div class="wt"><b>Getting photos ready</b><span>Finding people · step 2 of 3</span></div><span class="wa">Details</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:55%"></i></div></div></div><div class="wc b1"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-trash"/></svg></span><div class="wt"><b>Cleaning your library</b><span>4,200 of 9,000 checked</span></div><span class="wa">Stop</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:47%"></i></div></div></div><div class="wc"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-upload"/></svg></span><div class="wt"><b>Uploading 128 of 700</b><span>About 12 minutes left</span></div><span class="wa">Pause</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:15%"></i></div></div></div><span class="wcnt">4</span></div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>Collapsed · 4 or more</b>Never more than three layers show, so the stack stays the same height; the badge carries the real number. A finished widget ("Photos are ready…") stays in the stack until it is dismissed, and it sits at the back because it is the oldest.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="ibtn dot"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="content">
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+            <div class="day"><b>27 January 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="food*L snow*L fire road"></div>
+          </div>
+          <div class="scrim" style="z-index:4"></div>
+          <div class="wstk open"><div class="wh"><b>4 activities</b><span class="link">Clear all</span><span class="ibtn ghost"><svg class="i" style="transform:rotate(90deg)"><use href="#i-chev"/></svg></span></div>
+<div class="wc"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-upload"/></svg></span><div class="wt"><b>Uploading 128 of 700</b><span>About 12 minutes left</span></div><span class="wa">Pause</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:15%"></i></div></div></div>
+<div class="wc"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-trash"/></svg></span><div class="wt"><b>Cleaning your library</b><span>4,200 of 9,000 checked</span></div><span class="wa">Stop</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:47%"></i></div></div></div>
+<div class="wc"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-users"/></svg></span><div class="wt"><b>Getting photos ready</b><span>Finding people · step 2 of 3</span></div><span class="wa">Details</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:55%"></i></div></div></div>
+<div class="wc"><span class="ni warn"><svg class="i"><use href="#i-alert"/></svg></span><div class="wt"><b>Photos are ready, some had problems</b><span>12 items didn't upload</span></div><span class="wa">View</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div>
+</div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>Expanded</b>Tapping the stack fans it out, newest on top, with a header: the count, Clear all and a collapse button. The photos dim behind it, and tapping them folds it back. Progress is visible on every running widget at once. Clear all removes only finished widgets; running ones stay.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="ibtn dot"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="content">
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+            <div class="day"><b>27 January 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="food*L snow*L fire road"></div>
+          </div>
+          <div class="scrim" style="z-index:4"></div>
+          <div class="wstk open"><div class="wh"><b>4 activities</b><span class="link">Clear all</span><span class="ibtn ghost"><svg class="i" style="transform:rotate(90deg)"><use href="#i-chev"/></svg></span></div>
+<div class="wc"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-upload"/></svg></span><div class="wt"><b>Uploading 128 of 700</b><span>About 12 minutes left</span></div><span class="wa">Pause</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:15%"></i></div></div></div>
+<div class="wc"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-trash"/></svg></span><div class="wt"><b>Cleaning your library</b><span>4,200 of 9,000 checked</span></div><span class="wa">Stop</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:47%"></i></div></div></div>
+<div class="wc"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-users"/></svg></span><div class="wt"><b>Getting photos ready</b><span>Finding people · step 2 of 3</span></div><span class="wa">Details</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:55%"></i></div></div></div>
+<div class="wc out"><span class="ni warn"><svg class="i"><use href="#i-alert"/></svg></span><div class="wt"><b>Photos are ready, some had problems</b><span>12 items didn't upload</span></div><span class="wa">View</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div>
+</div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>Using one widget</b>Every widget works on its own: Pause, Stop and Details control its activity, View opens the result, and tapping the body does what it does today. On a finished widget the X dismisses it. On a running one the X only hides the card; the activity carries on and its progress is still in the bell.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="ibtn dot"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="content">
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+            <div class="day"><b>27 January 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="food*L snow*L fire road"></div>
+          </div>
+          <div class="scrim" style="z-index:4"></div>
+          <div class="wstk open"><div class="wh"><b>3 activities</b><span class="link">Clear all</span><span class="ibtn ghost"><svg class="i" style="transform:rotate(90deg)"><use href="#i-chev"/></svg></span></div>
+<div class="wc"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-upload"/></svg></span><div class="wt"><b>Uploading 128 of 700</b><span>About 12 minutes left</span></div><span class="wa">Pause</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:15%"></i></div></div></div>
+<div class="wc"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-trash"/></svg></span><div class="wt"><b>Cleaning your library</b><span>4,200 of 9,000 checked</span></div><span class="wa">Stop</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:47%"></i></div></div></div>
+<div class="wc"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-users"/></svg></span><div class="wt"><b>Getting photos ready</b><span>Finding people · step 2 of 3</span></div><span class="wa">Details</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:55%"></i></div></div></div>
+</div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>After a dismiss</b>The count and header update straight away (4 became 3) and the stack stays open while the person works through it. Running widgets never time out. A finished one leaves only when it is dismissed, or when Clear all is used.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="ibtn dot"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="content">
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+            <div class="day"><b>27 January 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="food*L snow*L fire road"></div>
+          </div>
+          <span class="totop" style="bottom:226px"><svg class="i" style="transform:rotate(-90deg)"><use href="#i-chev"/></svg></span>
+          <div class="wstk"><div class="wc"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-upload"/></svg></span><div class="wt"><b>Uploading 128 of 700</b><span>About 12 minutes left</span></div><span class="wa">Pause</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:15%"></i></div></div></div></div><div class="toast" style="bottom:170px"><span>Removed 1 item from Malmö nights</span><b>Undo</b></div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>Back to one</b>With a single widget left the stack drops away: no badge, no header, just the card. A toast that appears meanwhile shows on its own above it and times out without touching the stack.</figcaption>
+      </figure>
+      <figure class="shot xl">
+        <div class="scrollx"><div class="browser app">
+          <div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/photos</div></div>
+          <div class="dapp">
+            <aside class="side" data-side="photos"></aside>
+            <div class="dmain">
+              <div class="dtop" data-dtop></div>
+              <div class="dbody">
+                <div class="dph"><h3>Photos<small>31 items</small></h3></div>
+                <div class="dday"><b>10 October 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+                <div class="dday"><b>27 January 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="food*L snow*L fire wedding city memoji indoor notes"></div>
+              </div>
+              <div class="wstk dk col p"><div class="wc b3"><span class="ni warn"><svg class="i"><use href="#i-alert"/></svg></span><div class="wt"><b>Photos are ready, some had problems</b><span>12 items didn't upload</span></div><span class="wa">View</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="wc b2"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-users"/></svg></span><div class="wt"><b>Getting photos ready</b><span>Finding people · step 2 of 3</span></div><span class="wa">Details</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:55%"></i></div></div></div><div class="wc b1"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-trash"/></svg></span><div class="wt"><b>Cleaning your library</b><span>4,200 of 9,000 checked</span></div><span class="wa">Stop</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:47%"></i></div></div></div><div class="wc"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-upload"/></svg></span><div class="wt"><b>Uploading 128 of 700</b><span>About 12 minutes left</span></div><span class="wa">Pause</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:15%"></i></div></div></div><span class="wcnt">4</span></div><div class="toast" style="bottom:150px;left:auto;right:20px;width:372px"><span>7,166 items skipped</span><b>Undo</b></div>
+            </div>
+          </div>
+        </div></div>
+        <figcaption><b>Desktop · collapsed</b>The same stack at the bottom right, where the upload tray already lives. Clicking anywhere on it opens it. The toast sits above, separate, and goes after a few seconds.</figcaption>
+      </figure>
+      <figure class="shot xl">
+        <div class="scrollx"><div class="browser app">
+          <div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/photos</div></div>
+          <div class="dapp">
+            <aside class="side" data-side="photos"></aside>
+            <div class="dmain">
+              <div class="dtop" data-dtop></div>
+              <div class="dbody">
+                <div class="dph"><h3>Photos<small>31 items</small></h3></div>
+                <div class="dday"><b>10 October 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+                <div class="dday"><b>27 January 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="food*L snow*L fire wedding city memoji indoor notes"></div>
+              </div>
+              <div class="wstk dk open"><div class="wh"><b>4 activities</b><span class="link">Clear all</span><span class="ibtn ghost"><svg class="i" style="transform:rotate(90deg)"><use href="#i-chev"/></svg></span></div>
+<div class="wc"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-upload"/></svg></span><div class="wt"><b>Uploading 128 of 700</b><span>About 12 minutes left</span></div><span class="wa">Pause</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:15%"></i></div></div></div>
+<div class="wc"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-trash"/></svg></span><div class="wt"><b>Cleaning your library</b><span>4,200 of 9,000 checked</span></div><span class="wa">Stop</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:47%"></i></div></div></div>
+<div class="wc"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-users"/></svg></span><div class="wt"><b>Getting photos ready</b><span>Finding people · step 2 of 3</span></div><span class="wa">Details</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:55%"></i></div></div></div>
+<div class="wc"><span class="ni warn"><svg class="i"><use href="#i-alert"/></svg></span><div class="wt"><b>Photos are ready, some had problems</b><span>12 items didn't upload</span></div><span class="wa">View</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div>
+</div>
+            </div>
+          </div>
+        </div></div>
+        <figcaption><b>Desktop · expanded</b>No dimming on a computer: the cards fan out above the corner and the page stays usable. Click away, press Esc or use the chevron to fold them back.</figcaption>
+      </figure>
+      <figure class="shot xl">
+        <div class="scrollx"><div class="browser app">
+          <div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/photos</div></div>
+          <div class="dapp">
+            <aside class="side" data-side="photos"></aside>
+            <div class="dmain">
+              <div class="dtop" data-dtop></div>
+              <div class="dbody">
+                <div class="dph"><h3>Photos<small>31 items</small></h3></div>
+                <div class="dday"><b>10 October 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+                <div class="dday"><b>27 January 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="food*L snow*L fire wedding city memoji indoor notes"></div>
+              </div>
+              <div class="wstk dk open"><div class="wh"><b>4 activities</b><span class="link">Clear all</span><span class="ibtn ghost"><svg class="i" style="transform:rotate(90deg)"><use href="#i-chev"/></svg></span></div>
+<div class="wc"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-upload"/></svg></span><div class="wt"><b>Uploading 128 of 700</b><span>About 12 minutes left</span></div><span class="wa">Pause</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:15%"></i></div></div></div>
+<div class="wc"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-trash"/></svg></span><div class="wt"><b>Cleaning your library</b><span>4,200 of 9,000 checked</span></div><span class="wa">Stop</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:47%"></i></div></div></div>
+<div class="wc"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-users"/></svg></span><div class="wt"><b>Getting photos ready</b><span>Finding people · step 2 of 3</span></div><span class="wa">Details</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:55%"></i></div></div></div>
+<div class="wc out"><span class="ni warn"><svg class="i"><use href="#i-alert"/></svg></span><div class="wt"><b>Photos are ready, some had problems</b><span>12 items didn't upload</span></div><span class="wa">View</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div>
+</div>
+            </div>
+          </div>
+        </div></div>
+        <figcaption><b>Desktop · using one widget</b>Each widget has its own control and X. The finished one is being dismissed, and the others settle down. Running widgets keep their progress and controls while the others are read.</figcaption>
       </figure>
     </div>
   </section>
