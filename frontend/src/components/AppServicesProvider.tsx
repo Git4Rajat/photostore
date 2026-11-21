@@ -1,5 +1,6 @@
 import { hasForegroundDemand, onForegroundReturn } from '../services/foregroundDemand';
 import { sessionScope } from '../services/sessionScope';
+import { FINALIZE_BATCH_MAX_SIZE, finalizeBatchWindow } from '../services/finalizeBatchPolicy';
 import { acknowledgeStaleUpload, reconcileUploadSessions } from '../services/uploadSessionRecovery';
 import { activityNotifications, fetchActivity, fetchProcessingSummary, loadAnnouncedActivity, processingSummaryText, resendInvite as postInviteResend, saveAnnouncedActivity } from '../services/activityNotifications';
 import { observeExpiredWaveSession } from '../services/uploadWaveSync';
@@ -1335,6 +1336,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         reject: (err: unknown) => void;
     }>>([]);
     const batchFinalizeDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const finalizeInFlightRef = useRef(0);
+    const finalizeLastCallMsRef = useRef<number | null>(null);
     const batchFinalizeMaxWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     // flushInitBatch/flushFinalizeBatch use their gate for more than a plain
     // concurrency cap: when no slot is free, they leave the pending batch
@@ -2702,9 +2705,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     //
     // Stay below the backend's shared init/finalize request cap. Larger
     // batches still perform sequential per-file work on the server.
-    const FINALIZE_BATCH_MAX_SIZE = 24;
-    const FINALIZE_BATCH_COLLECTION_MS = 100;
-    const FINALIZE_BATCH_MAX_WAIT_MS = 500;
+    // The window itself comes from finalizeBatchWindow: short while the server
+    // is idle, longer while it is busy so each call carries more files.
 
     const flushFinalizeBatch = (force: boolean) => {
         if (batchFinalizeDebounceTimerRef.current) {
@@ -2725,6 +2727,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
         const batch = pendingBatchFinalizeRef.current;
         pendingBatchFinalizeRef.current = [];
+        const callStartedAt = Date.now();
+        finalizeInFlightRef.current += 1;
         runGatedRequestWithRetry(gate, '/upload/finalize-batch', {
             files: batch.map(({ filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId, blobName, clientLastModified, clientMetadata, preparationReport, uploadBatchId, waveSessionId, waveItemId }) => ({
                 filename, uploadId, totalSize, contentType, sha256, clientProcessing, clientProcessingReport, clientAssetId, blobName, clientLastModified, clientMetadata, preparationReport, uploadBatchId,
@@ -2744,6 +2748,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             })
             .catch((err) => {
                 batch.forEach((req) => req.reject(err));
+            })
+            .finally(() => {
+                finalizeInFlightRef.current = Math.max(0, finalizeInFlightRef.current - 1);
+                finalizeLastCallMsRef.current = Date.now() - callStartedAt;
             });
     };
 
@@ -2777,11 +2785,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 flushFinalizeBatch(true);
                 return;
             }
+            const batchWindow = finalizeBatchWindow({ inFlight: finalizeInFlightRef.current, lastCallMs: finalizeLastCallMsRef.current });
             if (!batchFinalizeDebounceTimerRef.current) {
-                batchFinalizeDebounceTimerRef.current = setTimeout(() => { flushFinalizeBatch(false); }, FINALIZE_BATCH_COLLECTION_MS);
+                batchFinalizeDebounceTimerRef.current = setTimeout(() => { flushFinalizeBatch(false); }, batchWindow.collectMs);
             }
             if (!batchFinalizeMaxWaitTimerRef.current) {
-                batchFinalizeMaxWaitTimerRef.current = setTimeout(() => { flushFinalizeBatch(false); }, FINALIZE_BATCH_MAX_WAIT_MS);
+                batchFinalizeMaxWaitTimerRef.current = setTimeout(() => { flushFinalizeBatch(false); }, batchWindow.maxWaitMs);
             }
         })
     );
