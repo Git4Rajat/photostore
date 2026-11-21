@@ -3,7 +3,7 @@ import { useEffect } from 'react';
 // Fixed bottom-of-screen surfaces that can sit where the floating buttons
 // (Scroll to top, Select) live: the upload / processing dock bar or tray, the
 // selection action bar and toasts.
-export const FLOAT_OBSTACLES = '.up-dock, .pt-action-bar, .pt-toast';
+export const FLOAT_OBSTACLES = '.wstk, .up-dock, .pt-action-bar, .pt-toast';
 export const FLOAT_CLEAR_VAR = '--pt-float-clear';
 const GAP_PX = 12;
 // The Select pill sits left of the round button; anything reaching into this
