@@ -17,9 +17,15 @@ import processing_diagnostics
 import processing_metrics
 
 from upload_waves import digest
-from wave_assignment import WaveAssignmentJournal, encoded, JOURNAL_PAYLOAD_BYTES
+from wave_assignment import WaveAssignmentJournal, encoded
 
 _MAX_LINE = 256_000
+# The Table journal's row budget (JOURNAL_PAYLOAD_BYTES) exists for Table's 64 KiB
+# property limit. A mounted-file record is bounded only by _MAX_LINE, and a decision
+# row can legitimately exceed the Table budget: an existing person with a large
+# overflow-shard list (shardIds) plus the 512-float candidate embedding came to
+# ~62 KB and failed every clustering attempt (wave 43c98a86, 2026-11-21).
+FILE_JOURNAL_PAYLOAD_BYTES = 120_000
 
 
 class FileAssignmentJournal(WaveAssignmentJournal):
@@ -110,7 +116,7 @@ class FileAssignmentJournal(WaveAssignmentJournal):
     def put(self, key, payload):
         self.check()
         body = encoded(payload)
-        if len(body.encode('utf-16-le')) > JOURNAL_PAYLOAD_BYTES:
+        if len(body.encode('utf-16-le')) > FILE_JOURNAL_PAYLOAD_BYTES:
             raise ValueError('Assignment journal row exceeds byte budget')
         identity = digest(payload)
         previous = self.get(key)
