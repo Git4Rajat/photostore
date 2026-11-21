@@ -23,7 +23,17 @@ export interface UploadProgress {
 }
 
 /** The round icon a notification gets: problems red, then uploads, people, shared albums, invites. */
-export type NotificationKind = 'warn' | 'upload' | 'people' | 'share' | 'invite' | 'info';
+export type NotificationKind = 'warn' | 'paused' | 'upload' | 'people' | 'share' | 'invite' | 'info';
+
+/** The one notification entry an upload keeps for its whole life; it changes state in place.
+ *  The times (ms) feed its history line: "Paused 10:19 · resumed 10:21 · cancelled 10:34". */
+export interface UploadStory {
+    sessionId: string;
+    state: 'uploading' | 'paused' | 'done' | 'cancelled' | 'failed';
+    pausedAt?: number;
+    resumedAt?: number;
+    cancelledAt?: number;
+}
 
 export interface AppNotification {
     id: string;
@@ -42,6 +52,8 @@ export interface AppNotification {
     processing?: { sessionId: string; since: number; restore?: { title: string; details: string } };
     // A pending invite about to end; the panel offers Resend.
     inviteId?: string;
+    // One upload's single entry as it moves through its life (see UploadStory). Persisted with the entry.
+    story?: UploadStory;
     // Ephemeral (in-memory) button shown on the preview, e.g. Undo or Retry.
     action?: { label: string; onClick: () => void };
 }

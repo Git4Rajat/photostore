@@ -18,12 +18,14 @@ import { fileHashTimeoutMs, hashLargeFile, LARGE_FILE_HASH_THRESHOLD, withFileHa
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
 import { isSessionExpiryRedirecting } from '../services/sessionExpiry';
 import { getRuntimeConfig } from '../config/appConfig';
+import { confirmDialog } from './shared/dialogs';
 import type {
     AppNotification,
     BrowserAiLoadStage,
     BrowserAiModelState as SharedBrowserAiModelState,
     UploadProgress,
     UploadProfile,
+    UploadStory,
     PersistedUploadFile,
     PersistedUploadSession,
 } from '../types/browserProcessing';
@@ -1047,6 +1049,9 @@ const formatBrowserProcessingNotificationDetails = (
 
 export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     const [notifications, setNotifications] = useState<AppNotification[]>([]);
+    // The latest list, for code that must find an upload's existing entry (see UploadStory).
+    const notificationsRef = useRef<AppNotification[]>([]);
+    notificationsRef.current = notifications;
     const [uploading, setUploading] = useState<boolean>(false);
     const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
     const [uploadCheckProgress, setUploadCheckProgress] = useState<{ checked: number; total: number } | null>(null);
@@ -1430,6 +1435,22 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 : notification
         )));
     }, []);
+
+    // An upload keeps one entry for its whole life. A cancel or discard ends that same entry
+    // instead of adding a second one. Returns false when the upload has no entry yet.
+    const markUploadCancelled = useCallback((sessionId: string, notAdded?: number) => {
+        const entry = notificationsRef.current.find((n) => n.story?.sessionId === sessionId);
+        if (!entry?.story) return false;
+        const added = entry.progress?.uploadedCount ?? 0;
+        const left = notAdded ?? Math.max(0, (entry.progress?.totalCount ?? 0) - added);
+        updateNotification(entry.id, {
+            title: 'Upload cancelled',
+            details: `${added} added, ${left} not. The added photos stay in your library.`,
+            progress: undefined,
+            story: { ...entry.story, state: 'cancelled', cancelledAt: Date.now() },
+        });
+        return true;
+    }, [updateNotification]);
 
     // Notification history survives reloads (IndexedDB, scoped to the session's
     // account/library). Hydrate once, then mirror every change. Saving waits
@@ -3831,7 +3852,15 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
         setUploadProgress({ uploadedCount: totalUploaded, totalCount, failedCount: totalFailed,
             skippedDuplicateCount: totalSkippedDuplicates, mbPerSecond: 0 });
-        const notificationId = options.notificationId || addNotification(
+        // A resume continues the entry the pause left behind, so the list tells one story per upload.
+        const earlier = options.resumed ? notificationsRef.current.find((n) => n.story?.sessionId === session.id) : undefined;
+        const reuseId = options.notificationId || earlier?.id;
+        let story: UploadStory = {
+            ...(earlier?.story ?? {}), sessionId: session.id, state: 'uploading',
+            ...(earlier?.story?.pausedAt ? { resumedAt: Date.now() } : {}),
+        };
+        const setStory = (patch: Partial<UploadStory>): UploadStory => { story = { ...story, ...patch }; return story; };
+        const notificationId = reuseId || addNotification(
             options.resumed ? 'Upload resumed' : 'Upload started',
             options.resumed ? `Processing ${plural(totalCount, 'persisted file')}.` : `Uploading ${plural(totalCount, 'file')} with ${plural(uploadProfile.fileParallelism, 'lane')}.`,
             {
@@ -3846,12 +3875,16 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             if (updates.progress && uploadRunGenerationRef.current === uploadRunGeneration) {
                 setUploadProgress(updates.progress);
             }
-            updateNotification(notificationId, updates);
+            // Any ending the code reports by title (failed, stopped, expired) must not leave the entry saying it is uploading.
+            const ended = updates.title && !updates.story && story.state === 'uploading' && /fail|stopped|expired/i.test(updates.title);
+            updateNotification(notificationId, ended ? { ...updates, story: setStory({ state: 'failed' }) } : updates);
         };
-        if (options.notificationId) {
+        if (!reuseId) updateNotification(notificationId, { story });
+        if (reuseId) {
             updateUploadNotification({
-                title: options.resumed ? 'Upload resumed' : 'Upload started',
-                details: options.resumed ? `Processing ${plural(totalCount, 'persisted file')}.` : `Uploading ${plural(totalCount, 'file')} with ${plural(uploadProfile.fileParallelism, 'lane')}.`,
+                title: 'Upload in progress',
+                story,
+                details: `Uploaded ${totalUploaded}/${plural(totalCount, 'file')}. Skipped duplicates: ${totalSkippedDuplicates}.`,
                 progress: {
                     uploadedCount: totalUploaded,
                     totalCount,
@@ -4712,6 +4745,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 setPendingUploadSessionLive(null);
                 updateUploadNotification({
                     title: 'Upload stopped',
+                    story: setStory({ state: 'cancelled', cancelledAt: Date.now() }),
                     details: `Stopped after uploading ${totalUploaded}/${plural(totalCount, 'file')}.`,
                     progress: {
                         uploadedCount: totalUploaded,
@@ -4764,15 +4798,23 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 });
                 setUploadError(null);
             } else if (totalFailed === 0 && !hasPending) {
-                updateUploadNotification(uploadedNotice());
+                updateUploadNotification({ ...uploadedNotice(), story: setStory({ state: 'done' }) });
                 setUploadError(null);
             } else {
                 if (latest) {
                     setPendingUploadSessionLive(latest);
                 }
-                updateUploadNotification({
+                const waitingNow = (latest?.files || []).filter((file) => file.status !== 'done').length;
+                const fmt = (n: number) => n.toLocaleString();
+                updateUploadNotification(totalFailed === 0 ? {
+                    // A pause is calm: where it stopped, and nothing that reads as a problem.
                     title: 'Upload paused',
-                    details: `Uploaded ${totalUploaded}/${plural(totalCount, 'file')}, failed ${totalFailed}, skipped duplicates ${totalSkippedDuplicates}. Reselect any missing files to retry.`,
+                    details: `${fmt(totalUploaded)} of ${fmt(totalCount)} added · ${fmt(waitingNow)} waiting`,
+                    story: setStory({ state: 'paused', pausedAt: Date.now() }),
+                } : {
+                    title: `${plural(totalFailed, 'item')} didn’t upload`,
+                    details: `${fmt(totalUploaded)} of ${fmt(totalCount)} were added. The other ${fmt(waitingNow)} need another try.`,
+                    story: setStory({ state: 'failed' }),
                 });
                 setUploadError(totalFailed > 0
                     ? 'Some files failed to upload. Retry cached files or reselect missing files.'
@@ -5164,7 +5206,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             void requestUploadHashRefresh('discarded');
             setUploadError(null);
             setUploadQueueDrainSignal((signal) => signal + 1);
-            addNotification('Upload discarded', 'Paused upload files were removed.');
+            if (!session || !markUploadCancelled(session.id)) addNotification('Upload discarded', 'Paused upload files were removed.');
         } catch (error) {
             if (session) discardedUploadSessionIdsRef.current.delete(session.id);
             const message = getUploadErrorMessage(error, 'Upload discard could not finish. Retry Discard.');
@@ -5184,7 +5226,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         } finally {
             uploadDiscardInProgressRef.current = false;
         }
-    }, [addNotification, cleanupUnfinishedUploadArtifacts, clearPersistedSession, loadPersistedSession, pendingUploadSession, setPendingUploadSessionLive, setUploadError, uploading]);
+    }, [addNotification, cleanupUnfinishedUploadArtifacts, clearPersistedSession, loadPersistedSession, markUploadCancelled, pendingUploadSession, setPendingUploadSessionLive, setUploadError, uploading]);
 
     const stopActiveUpload = useCallback(() => {
         if (!uploading && !isResumingUploadRef.current && !uploadStartInProgressRef.current) {
@@ -5236,8 +5278,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         persistSession(kept);
         setPendingUploadSessionLive(kept);
         dropped.forEach((file) => { uploadHandlesRef.current.delete(file.key); void releaseCachedUploadFile(file.key); });
-        addNotification('Upload cancelled', `${plural(dropped.length, 'file')} won't be uploaded. ${plural(failed.length, 'file')} failed and can be retried.`);
-    }, [addNotification, discardPersistedUploadSession, pendingUploadSession, persistSession, releaseCachedUploadFile, setPendingUploadSessionLive]);
+        if (!markUploadCancelled(session.id, dropped.length)) {
+            addNotification('Upload cancelled', `${plural(dropped.length, 'file')} won't be uploaded. ${plural(failed.length, 'file')} failed and can be retried.`);
+        }
+    }, [addNotification, discardPersistedUploadSession, markUploadCancelled, pendingUploadSession, persistSession, releaseCachedUploadFile, setPendingUploadSessionLive]);
 
     // Best-effort resume cache: writes each file's bytes into IndexedDB so an
     // interrupted upload can resume after a page reload (uploadSourceFilesRef
@@ -5327,16 +5371,23 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         return kept;
     }, [addNotification]);
 
+    // One clear question right where the person is, not a toast plus bell entries.
+    // Discard stays on the upload bar and the paused entry; Esc or Not now keeps the paused upload.
+    const offerPausedUploadRef = useRef<() => void>(() => undefined);
+    const offerPausedUpload = useCallback(() => offerPausedUploadRef.current(), []);
+
     const startUpload = useCallback(async (selectedUploadFiles: File[], handlesToUpload?: Map<File, FileSystemFileHandle>) => {
         let filesToUpload = dropUnsupportedUploadFiles(selectedUploadFiles);
         if (filesToUpload.length === 0) {
             return;
         }
         prewarmBrowserExifTool();
-        if (uploadDiscardInProgressRef.current || uploadStartInProgressRef.current || pendingUploadSessionRef.current) {
-            const message = pendingUploadSessionRef.current
-                ? 'A paused upload is waiting -- use Retry or Discard on the banner before starting a new one.'
-                : 'The selected files are already being prepared or uploaded.';
+        if (pendingUploadSessionRef.current && !uploadDiscardInProgressRef.current && !uploadStartInProgressRef.current) {
+            offerPausedUpload();
+            return;
+        }
+        if (uploadDiscardInProgressRef.current || uploadStartInProgressRef.current) {
+            const message = 'The selected files are already being prepared or uploaded.';
             addNotification('Upload already starting', message);
             // A bell-only notification is easy to miss here in particular: a
             // stuck pendingUploadSession silently blocks every subsequent
@@ -5673,13 +5724,29 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         persistSession,
         warmBackend,
         warmEndpoint,
+        retryPersistedUploadSession,
         runUploadSession,
         setUploadError,
         updateNotification,
         uploading,
     ]);
 
+    offerPausedUploadRef.current = () => {
+        const waiting = (pendingUploadSessionRef.current?.files ?? []).filter((file) => file.status !== 'done').length;
+        void confirmDialog({
+            title: 'You have a paused upload',
+            message: `${plural(waiting, 'photo')} from it are still waiting. Resume it, or discard it (Discard on the upload bar) to choose new photos.`,
+            confirmLabel: 'Resume upload',
+            cancelLabel: 'Not now',
+        }).then((resume) => { if (resume) void retryPersistedUploadSession(); });
+    };
+
     const requestUpload = useCallback(() => {
+        if (pendingUploadSessionRef.current && !uploading && !isResumingUploadRef.current
+            && !uploadStartInProgressRef.current && !uploadDiscardInProgressRef.current) {
+            offerPausedUpload();
+            return;
+        }
         if (uploadStartInProgressRef.current) {
             const message = 'Wait for the current upload preparation to finish before selecting more files.';
             addNotification('Upload already starting', message);
@@ -5748,7 +5815,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
         pickerOpenedAtRef.current = Date.now();
         uploadInputRef.current?.click();
-    }, [addNotification, armUploadWarmupCeiling, pollUntilWarm, startUpload, stopUploadWarmup, uploading, warmUpload]);
+    }, [addNotification, armUploadWarmupCeiling, offerPausedUpload, pollUntilWarm, startUpload, stopUploadWarmup, uploading, warmUpload]);
 
     const resumeAllPendingUploads = useCallback(async () => {
         await retryPersistedUploadSession();

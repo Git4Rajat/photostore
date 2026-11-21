@@ -89,4 +89,27 @@ describe('notification panel', () => {
         const icons = Array.from(view.container.querySelectorAll('.notification-icon')).map((icon) => icon.className);
         expect(icons).toEqual(['notification-icon invite', 'notification-icon share']);
     });
+
+    it('draws a paused upload calmly, with its history and Resume / Discard', () => {
+        const progress = { uploadedCount: 100, totalCount: 2422, failedCount: 0, skippedDuplicateCount: 13648 };
+        mount([note({ id: 'u', title: 'Upload paused', details: '100 of 2,422 added · 2,322 waiting', progress,
+            story: { sessionId: 's', state: 'paused', pausedAt: Date.now(), resumedAt: Date.now() } })]);
+        act(() => { fireEvent.click(screen.getByLabelText(/^Open notifications/)); });
+        expect(screen.getByText('Upload paused')).toBeTruthy();
+        expect(screen.getByText('100 of 2,422 added · 2,322 waiting')).toBeTruthy();
+        expect(screen.getByText(/^Paused \d.* · resumed /)).toBeTruthy();
+        expect(screen.getByText('13,648 already in your library, left out')).toBeTruthy();
+        expect(screen.getByRole('button', { name: 'Resume' })).toBeTruthy();
+        expect(screen.getByRole('button', { name: 'Discard' })).toBeTruthy();
+        expect(document.querySelector('.notification-icon.warn')).toBeNull();
+        expect(document.querySelector('.notification-icon.paused')).not.toBeNull();
+    });
+
+    it('shows a resumed upload as the same entry, counting on', () => {
+        const progress = { uploadedCount: 164, totalCount: 2422, failedCount: 0, skippedDuplicateCount: 0, mbPerSecond: 8 };
+        mount([note({ id: 'u', title: 'Upload in progress', progress, story: { sessionId: 's', state: 'uploading', pausedAt: Date.now(), resumedAt: Date.now() } })]);
+        act(() => { fireEvent.click(screen.getByLabelText(/^Open notifications/)); });
+        expect(screen.getByText('Uploading 164 of 2,422')).toBeTruthy();
+        expect(screen.getByRole('button', { name: 'Pause' })).toBeTruthy();
+    });
 });

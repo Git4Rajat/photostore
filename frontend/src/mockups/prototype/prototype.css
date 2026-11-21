@@ -1256,6 +1256,8 @@
 .notification-thumb:not(.ready) { animation: notification-thumb-wait 1.4s ease-in-out infinite; }
 @keyframes notification-thumb-wait { 50% { opacity: 0.55; } }
 @media (prefers-reduced-motion: reduce) { .notification-thumb:not(.ready) { animation: none; } }
+.notification-progress.paused i { background: var(--text-faint, #8a8a93); }
+.notification-history { font-size: 12px; }
 .notification-acts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 9px; }
 .pt-shell .notification-acts .btn { min-height: 34px; height: 34px; padding: 0 13px; gap: 7px; border: 0; border-radius: 999px; font-size: 13px; font-weight: 600; }
 .pt-shell .notification-acts .btn svg { width: 16px; height: 16px; }
