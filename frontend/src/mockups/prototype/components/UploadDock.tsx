@@ -54,7 +54,7 @@ const ResultBar: React.FC<{
     onDismiss?: () => void;
     finished?: boolean;
 }> = ({ narrow, bad, title, sub, action, onDismiss, finished }) => (
-    <StackWidget id="upload" finished={finished} onDismiss={onDismiss}>
+    <StackWidget id="upload-result" finished={finished} onDismiss={onDismiss}>
     <div className={`up-dock up-result ${narrow ? 'up-bar' : 'up-tray'}`} role="status" aria-live="polite">
         <div className="up-rr">
             <span className={`up-ico${bad ? ' bad' : ''}`}>{bad ? <CircleAlert aria-hidden="true" /> : <CheckGlyph aria-hidden="true" />}</span>
@@ -129,12 +129,14 @@ export const UploadDock: React.FC = () => {
     // that has some failures is still just a pause; they come up at the end.
     const waitingToResume = Math.max(0, (pendingUploadSummary?.fileCount ?? 0) - (pendingUploadSummary?.failedCount ?? 0));
     const showFailed = pending && failedFiles.length > 0 && waitingToResume === 0;
-    const visible = cancelling || skipped || outcome ? true : uploadActive ? !hidden : pending;
+    // A cancelled upload's result is its own card; a new upload (checking, then going up) is another one in front of it.
+    const outcomeOnly = !!outcome && !cancelling && !uploadActive && !checking;
+    const liveVisible = !skipped && (cancelling || (uploadActive ? !hidden : checking ? true : pending && !outcomeOnly));
+    const resultVisible = !!skipped || !!outcome;
 
     useEffect(() => {
         if (!uploadActive) { startRef.current = null; setHidden(false); return; }
         if (!startRef.current) startRef.current = { at: Date.now(), base: added };
-        setOutcome(null);
     }, [uploadActive, added]);
 
     // A pause has landed once the upload is no longer active.
@@ -172,12 +174,12 @@ export const UploadDock: React.FC = () => {
         })();
     }, [cancelling, uploadActive, pendingUploadSummary, cancelRemainingUpload]);
 
-    useEffect(() => { if (!visible) setSheetOpen(false); }, [visible]);
+    useEffect(() => { if (!liveVisible) setSheetOpen(false); }, [liveVisible]);
 
     // Leaving with a skip pending drops nothing: the files stay in the retry list.
     useEffect(() => () => { if (skipTimerRef.current !== null) window.clearTimeout(skipTimerRef.current); }, []);
 
-    if (!visible) return null;
+    if (!liveVisible && !resultVisible) return null;
 
     const duplicates = progress?.skippedDuplicateCount ?? 0;
     const retrying = retryOf !== null && uploadActive;
@@ -273,167 +275,168 @@ export const UploadDock: React.FC = () => {
     const pauseLabel = acting === 'pause' ? 'Pausing…' : 'Pause';
     const cancelLabel = acting === 'cancel' ? 'Cancelling…' : 'Cancel upload';
 
-    if (skipped) {
-        return (
-            <ResultBar
-                narrow={narrow}
-                title={`${plural(skipped.count, 'item')} skipped`}
-                sub="You can choose them again later"
-                action={{ label: 'Undo', onClick: undoSkip }}
-            />
-        );
-    }
-    if (outcome && !cancelling && !uploadActive) {
-        return (
-            <ResultBar
-                narrow={narrow}
-                title="Cancelled"
-                sub={`${outcome.added} added, ${outcome.notAdded} not`}
-                action={{ label: 'Choose again', onClick: () => { setOutcome(null); requestUpload(); } }}
-                finished
-                onDismiss={() => setOutcome(null)}
-            />
-        );
-    }
+    const resultCard = skipped ? (
+        <ResultBar
+            narrow={narrow}
+            title={`${plural(skipped.count, 'item')} skipped`}
+            sub="You can choose them again later"
+            action={{ label: 'Undo', onClick: undoSkip }}
+        />
+    ) : outcome ? (
+        <ResultBar
+            narrow={narrow}
+            title="Cancelled"
+            sub={`${outcome.added} added, ${outcome.notAdded} not`}
+            action={{ label: 'Choose again', onClick: () => { setOutcome(null); requestUpload(); } }}
+            finished
+            onDismiss={() => setOutcome(null)}
+        />
+    ) : null;
+    // Same element shape either way, so the result card keeps its place in the stack when a live card comes and goes.
+    if (!liveVisible) return <>{null}{resultCard}</>;
 
-    const icon = (
-        <span className={`up-ico${!uploadActive && showFailed ? ' bad' : ''}`}>
-            {!uploadActive && showFailed ? <CircleAlert aria-hidden="true" /> : <CloudUpload aria-hidden="true" />}
-        </span>
-    );
-    const stats = (
-        <div className="up-stats">
-            <div className="up-stat"><b>{added}</b><span>Added</span></div>
-            <div className="up-stat"><b>{waiting}</b><span>Waiting</span></div>
-            <div className={`up-stat${failed > 0 ? ' bad' : ''}`}><b>{failed}</b><span>To retry</span></div>
-        </div>
-    );
-    const keepOpen = (
-        <p className="up-note"><Info aria-hidden="true" /><span>Keep this page open until it finishes. If you close it, uploading stops and can continue from where it left off.</span></p>
-    );
-    const failureLede = (
-        <>
-            <p className="up-lede">These just need another try.</p>
-            <p className="up-fine">If Try again can’t find them, choose Upload and pick the same photos again. Files already added are skipped.</p>
-        </>
-    );
-    const pausedFailed = pendingUploadSummary?.failedCount ?? 0;
-    const pausedLede = (
-        <>
-            <p className="up-lede">{plural(waitingToResume, 'file')} still waiting.</p>
-            {pausedFailed > 0 ? <p className="up-fine">{plural(pausedFailed, 'file')} didn’t upload yet. They are listed here when the rest has finished.</p> : null}
-        </>
-    );
-    const retryingLede = retrying ? <p className="up-lede">{retried} of {retryOf} retried. {retryWorked} worked, {failed} failed again.</p> : null;
-    const cancellingBody = (
-        <>
-            <Progress />
-            <p className="up-lede">Stopping the last few files and clearing {cancelSnapshotRef.current.notAdded} from the list.</p>
-            <div className="up-stats up-stats-2">
-                <div className="up-stat"><b>{cancelSnapshotRef.current.added}</b><span>Stay added</span></div>
-                <div className="up-stat"><b>{cancelSnapshotRef.current.notAdded}</b><span>To clear</span></div>
+    const renderLive = (): React.ReactElement => {
+        const icon = (
+            <span className={`up-ico${!uploadActive && showFailed ? ' bad' : ''}`}>
+                {!uploadActive && showFailed ? <CircleAlert aria-hidden="true" /> : <CloudUpload aria-hidden="true" />}
+            </span>
+        );
+        const stats = (
+            <div className="up-stats">
+                <div className="up-stat"><b>{added}</b><span>Added</span></div>
+                <div className="up-stat"><b>{waiting}</b><span>Waiting</span></div>
+                <div className={`up-stat${failed > 0 ? ' bad' : ''}`}><b>{failed}</b><span>To retry</span></div>
             </div>
-            <p className="up-note"><Info aria-hidden="true" /><span>Photos already added are never removed. Keep this page open until the last files finish.</span></p>
-        </>
-    );
-
-    // One bar on phones; tapping it opens the detail in a sheet.
-    if (narrow) {
-        return (
+        );
+        const keepOpen = (
+            <p className="up-note"><Info aria-hidden="true" /><span>Keep this page open until it finishes. If you close it, uploading stops and can continue from where it left off.</span></p>
+        );
+        const failureLede = (
             <>
-                <StackWidget id="upload">
-                <div className="up-dock up-bar">
-                    <button type="button" className="up-head" onClick={() => setSheetOpen(true)} aria-label={`${title}. ${sub}. Show details`}>
-                        {icon}
-                        <span className="up-t"><b>{title}</b><span>{sub}</span></span>
-                        {uploadActive && !cancelling && !resuming ? <span className="up-pct">{pct}%</span> : null}
-                        <ChevronRight className="up-chev" aria-hidden="true" />
-                    </button>
-                    {uploadActive || cancelling ? <Progress pct={cancelling || resuming ? undefined : pct} /> : null}
-                </div>
-                </StackWidget>
-                <BottomSheet open={sheetOpen} onClose={() => setSheetOpen(false)} title={heading}>
-                    <div className="up-sheet">
-                        {cancelling ? cancellingBody : uploadActive ? (
-                            <>
-                                <Progress pct={resuming ? undefined : pct} />
-                                {retryingLede}
-                                {checking ? <p className="up-lede">{checking.checked} of {checking.total} checked. Photos already in your library won’t be uploaded again.</p> : retrying ? null : stats}
-                                {!checking && duplicates > 0 ? <p className="up-fine">{duplicatesLabel}, so they were skipped.</p> : null}
-                                {keepOpen}
-                                <div className="up-btns">
-                                    <Button onClick={pause} disabled={acting !== null}>{pauseLabel}</Button>
-                                    <Button onClick={() => void cancel()} disabled={acting !== null}>{cancelLabel}</Button>
-                                </div>
-                            </>
-                        ) : (
-                            <>
-                                {showFailed ? failureLede : pausedLede}
-                                {showFailed ? <FailedRows files={failedFiles} /> : null}
-                                <Button variant="primary" className="up-wide" onClick={() => void retry()} disabled={busy} aria-busy={acting === 'retry'}>{retryLabel}</Button>
-                                <Button className="up-wide" onClick={skip} disabled={busy}>
-                                    {showFailed ? `Skip ${failedFiles.length === 1 ? 'this one' : `these ${failedFiles.length}`}` : 'Discard'}
-                                </Button>
-                            </>
-                        )}
-                    </div>
-                </BottomSheet>
+                <p className="up-lede">These just need another try.</p>
+                <p className="up-fine">If Try again can’t find them, choose Upload and pick the same photos again. Files already added are skipped.</p>
             </>
         );
-    }
+        const pausedFailed = pendingUploadSummary?.failedCount ?? 0;
+        const pausedLede = (
+            <>
+                <p className="up-lede">{plural(waitingToResume, 'file')} still waiting.</p>
+                {pausedFailed > 0 ? <p className="up-fine">{plural(pausedFailed, 'file')} didn’t upload yet. They are listed here when the rest has finished.</p> : null}
+            </>
+        );
+        const retryingLede = retrying ? <p className="up-lede">{retried} of {retryOf} retried. {retryWorked} worked, {failed} failed again.</p> : null;
+        const cancellingBody = (
+            <>
+                <Progress />
+                <p className="up-lede">Stopping the last few files and clearing {cancelSnapshotRef.current.notAdded} from the list.</p>
+                <div className="up-stats up-stats-2">
+                    <div className="up-stat"><b>{cancelSnapshotRef.current.added}</b><span>Stay added</span></div>
+                    <div className="up-stat"><b>{cancelSnapshotRef.current.notAdded}</b><span>To clear</span></div>
+                </div>
+                <p className="up-note"><Info aria-hidden="true" /><span>Photos already added are never removed. Keep this page open until the last files finish.</span></p>
+            </>
+        );
 
-    // A tray at the bottom right on desktop, collapsible to one line.
-    return (
-        <StackWidget id="upload">
-        <div className="up-dock up-tray" role="region" aria-label="Upload progress">
-            <div className="up-uh">
-                {icon}
-                <b>{heading}</b>
-                <IconButton label={collapsed ? 'Expand' : 'Collapse'} variant="link" size="sm" onClick={() => setCollapsed((c) => !c)} aria-expanded={!collapsed}>
-                    <ChevronRight style={{ transform: `rotate(${collapsed ? -90 : 90}deg)` }} aria-hidden="true" />
-                </IconButton>
-                {uploadActive && !cancelling ? (
-                    <IconButton label="Hide" variant="link" size="sm" onClick={() => setHidden(true)}><CloseIcon aria-hidden="true" /></IconButton>
-                ) : null}
-            </div>
-            {cancelling ? (
-                !collapsed ? <div className="up-ub">{cancellingBody}</div> : null
-            ) : (
+        // One bar on phones; tapping it opens the detail in a sheet.
+        if (narrow) {
+            return (
                 <>
-                    {uploadActive ? (
-                        <div className="up-ub">
-                            <Progress pct={resuming ? undefined : pct} />
-                            {retryingLede}
-                            <div className="up-fr"><span>{checking ? `${checking.checked} of ${checking.total} checked` : resuming ? `Picking up where you left off · ${plural(waiting, 'file')} left` : retrying ? `${plural(Math.max(0, (retryOf as number) - retried), 'file')} left to retry` : `${added} added · ${waiting} waiting`}</span><span>{checking ? 'Skipping ones you have' : timeLeft ?? duplicatesLabel ?? (progress?.mbPerSecond ? `${progress.mbPerSecond.toFixed(1)} MB/s` : '')}</span></div>
+                    <StackWidget id="upload">
+                    <div className="up-dock up-bar">
+                        <button type="button" className="up-head" onClick={() => setSheetOpen(true)} aria-label={`${title}. ${sub}. Show details`}>
+                            {icon}
+                            <span className="up-t"><b>{title}</b><span>{sub}</span></span>
+                            {uploadActive && !cancelling && !resuming ? <span className="up-pct">{pct}%</span> : null}
+                            <ChevronRight className="up-chev" aria-hidden="true" />
+                        </button>
+                        {uploadActive || cancelling ? <Progress pct={cancelling || resuming ? undefined : pct} /> : null}
+                    </div>
+                    </StackWidget>
+                    <BottomSheet open={sheetOpen} onClose={() => setSheetOpen(false)} title={heading}>
+                        <div className="up-sheet">
+                            {cancelling ? cancellingBody : uploadActive ? (
+                                <>
+                                    <Progress pct={resuming ? undefined : pct} />
+                                    {retryingLede}
+                                    {checking ? <p className="up-lede">{checking.checked} of {checking.total} checked. Photos already in your library won’t be uploaded again.</p> : retrying ? null : stats}
+                                    {!checking && duplicates > 0 ? <p className="up-fine">{duplicatesLabel}, so they were skipped.</p> : null}
+                                    {keepOpen}
+                                    <div className="up-btns">
+                                        <Button onClick={pause} disabled={acting !== null}>{pauseLabel}</Button>
+                                        <Button onClick={() => void cancel()} disabled={acting !== null}>{cancelLabel}</Button>
+                                    </div>
+                                </>
+                            ) : (
+                                <>
+                                    {showFailed ? failureLede : pausedLede}
+                                    {showFailed ? <FailedRows files={failedFiles} /> : null}
+                                    <Button variant="primary" className="up-wide" onClick={() => void retry()} disabled={busy} aria-busy={acting === 'retry'}>{retryLabel}</Button>
+                                    <Button className="up-wide" onClick={skip} disabled={busy}>
+                                        {showFailed ? `Skip ${failedFiles.length === 1 ? 'this one' : `these ${failedFiles.length}`}` : 'Discard'}
+                                    </Button>
+                                </>
+                            )}
                         </div>
-                    ) : null}
-                    {!collapsed ? (
-                        <>
-                            {!uploadActive ? <div className="up-ub">{showFailed ? failureLede : pausedLede}</div> : null}
-                            {showFailed ? <FailedRows files={failedFiles} onRetry={() => void retry()} retryDisabled={busy} /> : null}
-                            <div className="up-uf">
-                                {uploadActive ? (
-                                    <>
-                                        <span>Keep this tab open until it finishes.</span>
-                                        <span className="up-fbtns">
-                                            <button type="button" className="up-link" onClick={pause} disabled={acting !== null}>{pauseLabel}</button>
-                                            <button type="button" className="up-link mut" onClick={() => void cancel()} disabled={acting !== null}>{acting === 'cancel' ? 'Cancelling…' : 'Cancel'}</button>
-                                        </span>
-                                    </>
-                                ) : (
-                                    <>
-                                        <button type="button" className="up-link mut" onClick={skip} disabled={busy}>{showFailed ? 'Skip these' : 'Discard'}</button>
-                                        <Button variant="primary" size="sm" onClick={() => void retry()} disabled={busy} aria-busy={acting === 'retry'}>{retryLabel}</Button>
-                                    </>
-                                )}
-                            </div>
-                        </>
-                    ) : null}
+                    </BottomSheet>
                 </>
-            )}
-        </div>
-        </StackWidget>
-    );
+            );
+        }
+
+        // A tray at the bottom right on desktop, collapsible to one line.
+        return (
+            <StackWidget id="upload">
+            <div className="up-dock up-tray" role="region" aria-label="Upload progress">
+                <div className="up-uh">
+                    {icon}
+                    <b>{heading}</b>
+                    <IconButton label={collapsed ? 'Expand' : 'Collapse'} variant="link" size="sm" onClick={() => setCollapsed((c) => !c)} aria-expanded={!collapsed}>
+                        <ChevronRight style={{ transform: `rotate(${collapsed ? -90 : 90}deg)` }} aria-hidden="true" />
+                    </IconButton>
+                    {uploadActive && !cancelling ? (
+                        <IconButton label="Hide" variant="link" size="sm" onClick={() => setHidden(true)}><CloseIcon aria-hidden="true" /></IconButton>
+                    ) : null}
+                </div>
+                {cancelling ? (
+                    !collapsed ? <div className="up-ub">{cancellingBody}</div> : null
+                ) : (
+                    <>
+                        {uploadActive ? (
+                            <div className="up-ub">
+                                <Progress pct={resuming ? undefined : pct} />
+                                {retryingLede}
+                                <div className="up-fr"><span>{checking ? `${checking.checked} of ${checking.total} checked` : resuming ? `Picking up where you left off · ${plural(waiting, 'file')} left` : retrying ? `${plural(Math.max(0, (retryOf as number) - retried), 'file')} left to retry` : `${added} added · ${waiting} waiting`}</span><span>{checking ? 'Skipping ones you have' : timeLeft ?? duplicatesLabel ?? (progress?.mbPerSecond ? `${progress.mbPerSecond.toFixed(1)} MB/s` : '')}</span></div>
+                            </div>
+                        ) : null}
+                        {!collapsed ? (
+                            <>
+                                {!uploadActive ? <div className="up-ub">{showFailed ? failureLede : pausedLede}</div> : null}
+                                {showFailed ? <FailedRows files={failedFiles} onRetry={() => void retry()} retryDisabled={busy} /> : null}
+                                <div className="up-uf">
+                                    {uploadActive ? (
+                                        <>
+                                            <span>Keep this tab open until it finishes.</span>
+                                            <span className="up-fbtns">
+                                                <button type="button" className="up-link" onClick={pause} disabled={acting !== null}>{pauseLabel}</button>
+                                                <button type="button" className="up-link mut" onClick={() => void cancel()} disabled={acting !== null}>{acting === 'cancel' ? 'Cancelling…' : 'Cancel'}</button>
+                                            </span>
+                                        </>
+                                    ) : (
+                                        <>
+                                            <button type="button" className="up-link mut" onClick={skip} disabled={busy}>{showFailed ? 'Skip these' : 'Discard'}</button>
+                                            <Button variant="primary" size="sm" onClick={() => void retry()} disabled={busy} aria-busy={acting === 'retry'}>{retryLabel}</Button>
+                                        </>
+                                    )}
+                                </div>
+                            </>
+                        ) : null}
+                    </>
+                )}
+            </div>
+            </StackWidget>
+        );
+    };
+
+    return <>{renderLive()}{resultCard}</>;
 };
 
 export default UploadDock;
