@@ -167,3 +167,23 @@ describe('ProcessingDock', () => {
         await waitFor(() => expect(api.dismissProcessingWave).toHaveBeenCalledTimes(2));
     });
 });
+
+describe('ProcessingDock buttons', () => {
+    it('uses the shared icon buttons for details and dismiss, like the upload card', async () => {
+        api.fetchProcessingWaves.mockResolvedValue([wave({ stage: 'done', state: 'done', processedSeconds: 420 })]);
+        render(<ProcessingDock />);
+        const dismiss = await screen.findByRole('button', { name: 'Dismiss' });
+        const details = screen.getByRole('button', { name: 'Details' });
+        for (const button of [dismiss, details]) {
+            expect(button.classList.contains('btn-icon')).toBe(true);
+            expect(button.classList.contains('btn-sm')).toBe(true);
+        }
+    });
+
+    it('shows no dismiss while still running', async () => {
+        api.fetchProcessingWaves.mockResolvedValue([wave({ done: 1, total: 10 })]);
+        render(<ProcessingDock />);
+        await screen.findByRole('button', { name: 'Details' });
+        expect(screen.queryByRole('button', { name: 'Dismiss' })).toBeNull();
+    });
+});

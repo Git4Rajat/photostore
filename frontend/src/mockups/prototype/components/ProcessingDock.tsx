@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertGlyph, CheckGlyph, CloseGlyph, ChevGlyph } from './RedesignIcons';
 import { useAppServices } from '../../../components/AppServicesProvider';
 import BottomSheet from './BottomSheet';
+import { IconButton } from '../../../components/ui/Button';
 import { StackWidget } from './WidgetStack';
 import { plural } from '../../../utils/format';
 import {
@@ -199,17 +200,21 @@ export const ProcessingDock: React.FC = () => {
     return (
         <>
             <StackWidget id="processing" finished={finished} onDismiss={() => dismissWaves(finishedWaves)}>
-            <div className={`up-dock up-bar pd-bar${finished ? ' pd-fin' : ''}`} role="region" aria-label="Photo processing">
-                <button type="button" className="up-head" onClick={() => setOpen(true)} aria-label={`${title}. ${sub}. ${more ?? ''} Show details`}>
-                    <span className={`up-ico${trouble ? ' bad' : ''}`}>
-                        {trouble ? <AlertGlyph aria-hidden="true" /> : finished ? <CheckGlyph aria-hidden="true" /> : wave.problem === 'blocked' ? <ChevGlyph aria-hidden="true" /> : <span className="pd-spin" aria-hidden="true" />}
-                    </span>
-                    <span className="up-t"><b>{title}</b><span>{sub}</span>{more ? <span className="pd-more">{more}</span> : null}</span>
-                    {finished || wave.problem ? null : <span className="up-pct">{pct}%</span>}
-                    <ChevGlyph className="up-chev" aria-hidden="true" />
-                </button>
+            <div className={`up-dock up-bar pd-bar`} role="region" aria-label="Photo processing">
+                <div className="pd-row">
+                    <button type="button" className="up-head" onClick={() => setOpen(true)} aria-label={`${title}. ${sub}. ${more ?? ''} Show details`}>
+                        <span className={`up-ico${trouble ? ' bad' : ''}`}>
+                            {trouble ? <AlertGlyph aria-hidden="true" /> : finished ? <CheckGlyph aria-hidden="true" /> : wave.problem === 'blocked' ? <ChevGlyph aria-hidden="true" /> : <span className="pd-spin" aria-hidden="true" />}
+                        </span>
+                        <span className="up-t"><b>{title}</b><span>{sub}</span>{more ? <span className="pd-more">{more}</span> : null}</span>
+                        {finished || wave.problem ? null : <span className="up-pct">{pct}%</span>}
+                    </button>
+                    <IconButton label="Details" variant="link" size="sm" onClick={() => setOpen(true)}>
+                        <ChevGlyph style={{ transform: 'rotate(-90deg)' }} aria-hidden="true" />
+                    </IconButton>
+                    {finished ? <IconButton label="Dismiss" variant="link" size="sm" onClick={() => dismissWaves(finishedWaves)}><CloseGlyph aria-hidden="true" /></IconButton> : null}
+                </div>
                 {retryControl ? <div className="pd-actions">{retryControl}</div> : null}
-                {finished ? <button type="button" className="pd-x" onClick={() => dismissWaves(finishedWaves)} aria-label="Dismiss"><CloseGlyph aria-hidden="true" /></button> : null}
                 <div className={`pd-seg${trouble ? ' bad' : ''}${wave.problem ? ' idle' : ''}`} role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct} aria-label="Processing progress (estimated)">
                     {STEPS.map((step) => {
                         const state = stepState(wave, step);
