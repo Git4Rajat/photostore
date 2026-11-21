@@ -28,6 +28,8 @@ MAX_PAGE = 20
 # per-item transaction fan-out is larger.
 REGISTER_MAX_PAGE = 90
 MAX_RETRIES = 16
+# resolve_many refreshes its item/member reads on every Nth attempt (see there).
+REFRESH_EVERY = 3
 # How long a wave mutation keeps retrying the shared library control row once
 # MAX_RETRIES attempts have lost. Every finalize in a large upload resolves its
 # items through that one row; at ~350 files/min a quarter of finalize-batch
@@ -364,12 +366,25 @@ class ShadowWaves:
                 processingRevision=processing_revision, acceptedFilename=filename,
                 requiredSteps=json.dumps(sorted(set(required_steps))))))
 
+        # The per-item and member/source reads are the bulk of an attempt's
+        # storage calls, yet every write they inform is conditional (item and
+        # wave rows by ETag, members and sources by create), so a stale read can
+        # only lose the commit, never corrupt it. A retry therefore re-reads just
+        # the shared control/session/wave rows, and refreshes the rest on every
+        # REFRESH_EVERYth attempt so a stale view cannot loop until patience runs out.
+        cache = {}
+        attempts = [0]
+
         def run():
             from table_reads import read_entities
+            attempts[0] += 1
+            refresh = attempts[0] == 1 or attempts[0] % REFRESH_EVERY == 0
             control = self._required('control')
             old_session = self._required(self.session_key(session))
-            items = read_entities(self.table, self.partition,
-                [self.item_key(session, item) for item, _ in normalized], workers=2)
+            if refresh:
+                cache['items'] = read_entities(self.table, self.partition,
+                    [self.item_key(session, item) for item, _ in normalized], workers=2)
+            items = cache['items']
             pending = []
             for item, binding in normalized:
                 old_item = items[self.item_key(session, item)]
@@ -393,8 +408,11 @@ class ShadowWaves:
                 binding['photoId'], binding['processingRevision']]) for _, binding in accepted]
             source_keys = ['admitted-source!' + digest([
                 binding['photoId'], binding['processingRevision']]) for _, binding in accepted]
-            existing = read_entities(self.table, self.partition, member_keys + source_keys,
-                workers=4, group_namespaces=True)
+            if refresh or 'existing' not in cache or cache['existing_keys'] != (member_keys, source_keys):
+                cache['existing'] = read_entities(self.table, self.partition, member_keys + source_keys,
+                    workers=4, group_namespaces=True)
+                cache['existing_keys'] = (member_keys, source_keys)
+            existing = dict(cache['existing'])
             changes = []
             next_wave = dict(wave, lastProgressAt=self.clock(), updatedAt=self.clock())
             created_members = set()

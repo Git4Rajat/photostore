@@ -20,7 +20,8 @@ except Exception:
     piexif = None
 
 MAX_EXIF_VALUE_LENGTH = 512
-MAX_EXIF_STORAGE_LENGTH = 60000
+# Azure Table string properties hold at most 32,768 characters; stay under it.
+MAX_EXIF_STORAGE_LENGTH = 30000
 EXIFTOOL_TIMEOUT_SECONDS = int(os.getenv('EXIFTOOL_TIMEOUT_SECONDS', '20'))
 _PILLOW_METADATA_LOCK = threading.RLock()
 
