@@ -351,8 +351,12 @@ figcaption b { display: block; color: var(--b-fg); font-size: 15px; margin-botto
 .wstk .wh .ibtn { width: 30px; height: 30px; }
 .wstk.open .wc.out { opacity: .4; transform: translateX(18px); }
 .wstk .wc .ring { box-shadow: 0 0 0 2px var(--accent); border-radius: 8px; }
-.totop { position: absolute; right: 16px; z-index: 4; width: 40px; height: 40px; border-radius: 50%; background: var(--surface); box-shadow: var(--shadow), 0 0 0 1px var(--line); display: grid; place-items: center; color: var(--fg); }
+.totop { position: absolute; right: 16px; z-index: 4; width: 44px; height: 44px; border-radius: 50%; background: var(--surface); box-shadow: var(--shadow), 0 0 0 1px var(--line); display: grid; place-items: center; color: var(--fg); }
 .totop .i { width: 18px; height: 18px; }
+.fpill { position: absolute; right: 16px; z-index: 4; display: flex; align-items: center; gap: 8px; }
+.fpill .totop { position: static; }
+.fsel { height: 44px; padding: 0 18px 0 14px; border-radius: 999px; background: var(--surface); box-shadow: var(--shadow), 0 0 0 1px var(--line); display: inline-flex; align-items: center; gap: 8px; font: 600 14px var(--font-ui); color: var(--fg); }
+.fsel .i { width: 18px; height: 18px; }
 
 /* Viewer (always dark) */
 .vw { background: var(--v-bg); color: var(--v-fg); }
@@ -796,6 +800,7 @@ figure.shot.md { width: 540px; }
   <symbol id="i-star" viewBox="0 0 24 24"><path d="M12 4l2.4 5 5.4.6-4 3.7 1.1 5.4L12 16l-4.9 2.7 1.1-5.4-4-3.7 5.4-.6z"/></symbol>
   <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 4.5l8.5 15h-17z"/><path d="M12 10v4"/><circle cx="12" cy="16.8" r="1" fill="currentColor" stroke="none"/></symbol>
   <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3"/><path d="M19.5 4.5v4.8h-4.8"/></symbol>
+  <symbol id="i-select" viewBox="0 0 24 24"><path d="M3.5 7l1.7 1.7L8.5 5.4M3.5 15.5l1.7 1.7 3.3-3.3M12 7h8.5M12 15.5h8.5"/></symbol>
   <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7.5h9M17 7.5h3M4 16.5h3M11 16.5h9"/><circle cx="15" cy="7.5" r="2"/><circle cx="9" cy="16.5" r="2"/></symbol>
   <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8.5" y="8.5" width="11" height="11" rx="2.2"/><path d="M15.5 8.5V6.7a2.2 2.2 0 0 0-2.2-2.2H6.7a2.2 2.2 0 0 0-2.2 2.2v6.6a2.2 2.2 0 0 0 2.2 2.2h1.8"/></symbol>
   <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M5 19l1-4L15.5 5.5a2.1 2.1 0 0 1 3 3L9 18z"/></symbol>
@@ -813,7 +818,7 @@ figure.shot.md { width: 540px; }
   <div class="wrap">
     <div class="brand"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span>Keepsake <small>redesign</small></div>
     <nav class="nav" aria-label="Sections">
-      <a href="#system">System</a><a href="#gallery">Gallery</a><a href="#filter">Filter</a><a href="#albums">Albums</a><a href="#people">People</a><a href="#notifications">Notifications</a><a href="#invites">Invites</a><a href="#delete-library">Delete library</a><a href="#login">Sign in</a><a href="#upload">Upload</a><a href="#processing">After upload</a><a href="#upload-actions">Cancel &amp; retry</a><a href="#upload-resume">Pause &amp; resume</a><a href="#upload-story">Upload in the bell</a><a href="#stacked-widgets">Stacked widgets</a><a href="#emails">Emails</a><a href="#shared-static">Shared · instant</a><a href="#shared-full">Shared · full</a><a href="#desktop">Desktop</a>
+      <a href="#system">System</a><a href="#gallery">Gallery</a><a href="#filter">Filter</a><a href="#albums">Albums</a><a href="#people">People</a><a href="#notifications">Notifications</a><a href="#invites">Invites</a><a href="#delete-library">Delete library</a><a href="#login">Sign in</a><a href="#upload">Upload</a><a href="#processing">After upload</a><a href="#upload-actions">Cancel &amp; retry</a><a href="#upload-resume">Pause &amp; resume</a><a href="#upload-story">Upload in the bell</a><a href="#stacked-widgets">Stacked widgets</a><a href="#floating-buttons">Floating buttons</a><a href="#emails">Emails</a><a href="#shared-static">Shared · instant</a><a href="#shared-full">Shared · full</a><a href="#desktop">Desktop</a>
     </nav>
     <button class="tbtn" id="theme" type="button"><svg class="i"><use href="#i-sun"/></svg><span>Light mode</span></button>
   </div>
@@ -3164,6 +3169,110 @@ figure.shot.md { width: 540px; }
           </div>
         </div></div>
         <figcaption><b>Desktop · using one widget</b>Each widget has its own control and X. The finished one is being dismissed, and the others settle down. Running widgets keep their progress and controls while the others are read.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ========== FLOATING BUTTONS ========== -->
+  <section class="sec" id="floating-buttons">
+    <div class="sec-head">
+      <h2>Floating buttons</h2>
+      <p class="lede">The gallery has two floating buttons at the bottom right: Select, and Scroll to top. They stay out of the way of everything at the bottom: they ride above the tab bar, the upload bar and the widget stack, and disappear while selecting.</p>
+    </div>
+    <div class="frames">
+      <figure class="shot" style="width:100%;max-width:900px">
+        <div style="background:var(--surface);border-radius:18px;box-shadow:var(--shadow),0 0 0 1px var(--line);padding:22px 24px;font-size:13.5px;line-height:1.5;display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:18px 28px">
+          <div><b>Select pill</b><br>44 px tall, fully round. Page-surface fill, 1 px faint ring and the standard shadow. A checklist icon (18 px) and the label "Select" at weight 600, 14 px, the same as a standard button. 14 px left padding, 18 px right.</div>
+          <div><b>Scroll-to-top</b><br>A 44 px circle with the same fill, ring and shadow. An 18 px arrow up. It shows only after scrolling about one screen, and is hidden at the top of the page.</div>
+          <div><b>Placement</b><br>Right edge 16 px in, 8 px between them, Select on the left. 12 px above whatever is at the bottom: the tab bar, the upload bar, or the top of the widget stack. They move up and down with it.</div>
+          <div><b>Hidden when</b><br>Selecting photos (the selection bar replaces the tab bar and Cancel is at the top), the widget stack is open, or a sheet or dialog is showing.</div>
+        </div>
+        <figcaption><b>Floating buttons: the rules</b>Both are the same family as the rest of the app: round, light surface, one ring, no colour. Colour is kept for the one thing to act on. In dark mode they use the dark surface and the faint light ring, as in the app today.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="ibtn"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="content">
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+            <div class="day"><b>27 January 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="food*L snow*L fire road"></div>
+          </div>
+          <div class="fpill" style="bottom:100px"><span class="fsel"><svg class="i"><use href="#i-select"/></svg>Select</span></div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>At the top</b>Only Select shows. There is nothing to scroll back to, so the arrow stays hidden.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="ibtn"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="content">
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+            <div class="day"><b>27 January 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="food*L snow*L fire road"></div>
+          </div>
+          <div class="fpill" style="bottom:100px"><span class="fsel"><svg class="i"><use href="#i-select"/></svg>Select</span><span class="totop"><svg class="i" style="transform:rotate(-90deg)"><use href="#i-chev"/></svg></span></div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>After scrolling</b>The arrow appears beside Select. Select stays on the left so it doesn't move when the arrow comes and goes.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="ibtn"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="content">
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+            <div class="day"><b>27 January 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="food*L snow*L fire road"></div>
+          </div>
+          <div class="upbar">
+            <div class="ur"><span class="ui"><svg class="i"><use href="#i-upload"/></svg></span><div class="ut"><b>Uploading 128 of 700</b><span>About 12 minutes left</span></div><span class="pct">15%</span><svg class="i" style="color:var(--muted);transform:rotate(-90deg)"><use href="#i-chev"/></svg></div>
+            <div class="prog lg"><i style="width:15%"></i></div>
+          </div><div class="fpill" style="bottom:176px"><span class="fsel"><svg class="i"><use href="#i-select"/></svg>Select</span><span class="totop"><svg class="i" style="transform:rotate(-90deg)"><use href="#i-chev"/></svg></span></div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>Above the upload bar</b>Both move up so they sit 12 px above the bar, never on top of it, and come back down when the upload ends.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="ibtn"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="content">
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+            <div class="day"><b>27 January 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="food*L snow*L fire road"></div>
+          </div>
+          <div class="wstk col p"><div class="wc b1"><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-trash"/></svg></span><div class="wt"><b>Cleaning your library</b><span>4,200 of 9,000 checked</span></div><span class="wa">Stop</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:47%"></i></div></div></div><div class="wc "><div class="wc-prog"><div class="r"><span class="ui"><svg class="i"><use href="#i-upload"/></svg></span><div class="wt"><b>Uploading 128 of 700</b><span>About 12 minutes left</span></div><span class="wa">Pause</span><span class="wx"><svg class="i"><use href="#i-close"/></svg></span></div><div class="prog lg"><i style="width:15%"></i></div></div></div><span class="wcnt">2</span></div><div class="fpill" style="bottom:204px"><span class="fsel"><svg class="i"><use href="#i-select"/></svg>Select</span><span class="totop"><svg class="i" style="transform:rotate(-90deg)"><use href="#i-chev"/></svg></span></div>
+          <div class="tabs" data-tabs="photos"></div>
+        </div></div>
+        <figcaption><b>Above the widget stack</b>They sit 12 px above the top of the stack's front card and the peeking cards. When the stack opens they are covered by the dimming and come back when it closes.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="selhdr"><span class="link">Cancel</span><b>3 selected</b><span class="link">Select all</span></div>
+          <div class="content">
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4" data-tiles="aurora*S forest*s field*L*S tunnel*s shot*s notif*s portrait*S garden*s"></div>
+            <div class="day"><b>27 January 2024</b><span>Malmö</span></div>
+            <div class="g c4" data-tiles="food*L*s snow*L*s"></div>
+          </div>
+          <div class="actbar six">
+            <span class="act"><svg class="i"><use href="#i-addalbum"/></svg>Album</span>
+            <span class="act"><svg class="i"><use href="#i-heart"/></svg>Like</span>
+            <span class="act"><svg class="i"><use href="#i-star"/></svg>Rate</span>
+            <span class="act"><svg class="i"><use href="#i-bench"/></svg>Workbench</span>
+            <span class="act"><svg class="i"><use href="#i-more"/></svg>More</span>
+            <span class="act dan"><svg class="i"><use href="#i-trash"/></svg>Delete</span>
+            <i class="home"></i>
+          </div>
+        </div></div>
+        <figcaption><b>While selecting</b>Both buttons are gone. Select has done its job and the arrow would only crowd the selection bar. Cancel at the top is the way out.</figcaption>
       </figure>
     </div>
   </section>
