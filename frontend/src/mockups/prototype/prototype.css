@@ -1660,6 +1660,8 @@
 .pd-spin { width: 14px; height: 14px; border-radius: 50%; border: 2px solid currentColor; border-top-color: transparent; animation: pd-rot 1s linear infinite; }
 @keyframes pd-rot { to { transform: rotate(360deg); } }
 .pd-x { all: unset; position: absolute; top: 8px; right: 8px; width: 28px; height: 28px; display: grid; place-items: center; color: var(--muted); cursor: pointer; border-radius: 50%; }
+.pd-fin .up-head { padding-right: 34px; }
+.pd-fin .pd-x { top: 16px; right: 10px; }
 .pd-x:focus-visible { outline: 2px solid var(--accent); }
 .pd-x svg { width: 16px; height: 16px; }
 .pd-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 12px; }
