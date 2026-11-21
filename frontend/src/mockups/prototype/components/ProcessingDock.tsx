@@ -13,6 +13,8 @@ import {
 const POLL_WITH_PUSH_MS = 2 * 60_000;
 const POLL_WITHOUT_PUSH_MS = 20_000;
 const RETRY_COOLDOWN_MS = 2 * 60_000;
+// Browser and server clocks differ a little; a wave this close before the upload began still counts as its own.
+const CLOCK_SLACK_S = 30;
 const AFTER_UPLOAD_WATCH_MS = 15 * 60_000;
 const STEPS: Array<'vision' | 'cluster' | 'index'> = ['vision', 'cluster', 'index'];
 const STEP_COPY: Record<'vision' | 'cluster' | 'index', string> = {
@@ -101,6 +103,8 @@ export const ProcessingDock: React.FC = () => {
     const [waves, setWaves] = useState<ProcessingWave[]>([]);
     const [open, setOpen] = useState(false);
     const shown = useRef<Record<string, number>>({});
+    // When the running upload began (seconds), to tell its own processing waves from earlier ones.
+    const uploadStartedAt = useRef<number | null>(null);
     const retriedAt = useRef<Record<string, number>>({});
     const [, tick] = useState(0);
     const [retry, setRetry] = useState<{ busy: boolean; until: number; message: string }>({ busy: false, until: 0, message: '' });
@@ -134,7 +138,12 @@ export const ProcessingDock: React.FC = () => {
         void load();
     }, [uploadActive, load]);
 
-    const ordered = orderWaves(waves.map((candidate) => holdStalled(candidate, retriedAt.current[candidate.waveId], Date.now())));
+    // The upload card speaks for the run that is going up, so processing waves that run started are not
+    // repeated beside it. Older ones are separate activities and stay in the stack next to the upload.
+    if (!uploadActive) uploadStartedAt.current = null;
+    else if (uploadStartedAt.current === null) uploadStartedAt.current = Date.now() / 1000;
+    const ownedByUpload = (candidate: ProcessingWave) => uploadStartedAt.current !== null && candidate.startedAt >= uploadStartedAt.current - CLOCK_SLACK_S;
+    const ordered = orderWaves(waves.filter((candidate) => !ownedByUpload(candidate)).map((candidate) => holdStalled(candidate, retriedAt.current[candidate.waveId], Date.now())));
     const wave = leadWave(ordered);
     const unfinished = ordered.filter((candidate) => candidate.stage !== 'done');
     const finishedWaves = ordered.filter((candidate) => candidate.stage === 'done');
@@ -149,8 +158,7 @@ export const ProcessingDock: React.FC = () => {
         return () => window.clearInterval(timer);
     }, [watching, load]);
 
-    // The upload bar owns the screen while files are still going up.
-    if (!wave || uploadActive) return null;
+    if (!wave) return null;
 
     const fraction = clampMonotonic(shown.current, wave);
     const finished = wave.stage === 'done';

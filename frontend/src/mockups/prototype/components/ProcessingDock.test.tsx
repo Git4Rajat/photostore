@@ -107,12 +107,19 @@ describe('ProcessingDock', () => {
         expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
     });
 
-    it('stays out of the way while files are still uploading', async () => {
+    it('does not repeat the running upload as a processing card', async () => {
         services.uploadActive = true;
-        api.fetchProcessingWaves.mockResolvedValue([wave({ done: 1, total: 10 })]);
+        api.fetchProcessingWaves.mockResolvedValue([wave({ done: 1, total: 10, startedAt: Date.now() / 1000 + 5 })]);
         render(<ProcessingDock />);
         await waitFor(() => expect(api.fetchProcessingWaves).toHaveBeenCalled());
         expect(screen.queryByText('Getting your photos ready')).toBeNull();
+    });
+
+    it('keeps an earlier upload\'s processing card while a new upload is going up', async () => {
+        services.uploadActive = true;
+        api.fetchProcessingWaves.mockResolvedValue([wave({ waveId: 'old', done: 1, total: 10, startedAt: Date.now() / 1000 - 3600 })]);
+        render(<ProcessingDock />);
+        await waitFor(() => expect(screen.getByText('Getting your photos ready')).toBeTruthy());
     });
 
     it('speaks for the running upload and says how many are waiting behind it', async () => {
