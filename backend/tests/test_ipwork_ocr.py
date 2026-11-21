@@ -523,3 +523,63 @@ def test_timeout_retains_owned_pixels_after_shared_source_job_closes(monkeypatch
         release.set()
         isolated_ocr_pool.close()
     with pytest.raises(ValueError): pixels[0].getpixel((0, 0))
+
+
+def _jpeg_bytes(size):
+    buf = io.BytesIO()
+    Image.new('RGB', size, color='white').save(buf, format='JPEG')
+    return buf.getvalue()
+
+
+def _slow_on_large_images(monkeypatch, seen, release):
+    class Api:
+        def SetImage(self, image): self.image = image; seen.append(image.size)
+        def Recognize(self):
+            if max(self.image.size) > 1024: release.wait(5)
+            return True
+        def GetIterator(self): return _WordIterator([('PHOTO', 95)])
+    monkeypatch.setattr(ipwork_ocr, 'tesserocr', SimpleNamespace(
+        RIL=SimpleNamespace(WORD=3), PyTessBaseAPI=lambda **kw: Api()))
+    monkeypatch.setattr(ipwork_ocr, 'OCR_FIRST_ATTEMPT_TIMEOUT_SECONDS', .05)
+    monkeypatch.setattr(ipwork_ocr, 'OCR_CALL_TIMEOUT_SECONDS', 2)
+
+
+def test_timed_out_large_photo_is_retried_on_a_smaller_copy(monkeypatch, isolated_ocr_pool):
+    seen, release = [], threading.Event()
+    _slow_on_large_images(monkeypatch, seen, release)
+    try:
+        result = ipwork_ocr.process_ocr('owner', 'screen.jpg', _jpeg_bytes((2048, 1152)))
+        assert result == {'hasData': True, 'text': 'PHOTO'}
+        assert seen == [(2048, 1152), (1024, 576)]
+    finally:
+        release.set()
+        isolated_ocr_pool.close()
+
+
+def test_fast_photo_is_read_once_at_full_size(monkeypatch, isolated_ocr_pool):
+    seen, release = [], threading.Event()
+    _slow_on_large_images(monkeypatch, seen, release)
+    try:
+        assert ipwork_ocr.process_ocr('owner', 'a.jpg', _jpeg_bytes((1000, 700)))['text'] == 'PHOTO'
+        assert seen == [(1000, 700)]
+    finally:
+        release.set()
+        isolated_ocr_pool.close()
+
+
+def test_timed_out_photo_that_is_already_small_is_not_retried(monkeypatch, isolated_ocr_pool):
+    seen, release = [], threading.Event()
+    class Api:
+        def SetImage(self, image): seen.append(image.size)
+        def Recognize(self): release.wait(5); return True
+        def GetIterator(self): return _WordIterator([])
+    monkeypatch.setattr(ipwork_ocr, 'tesserocr', SimpleNamespace(
+        RIL=SimpleNamespace(WORD=3), PyTessBaseAPI=lambda **kw: Api()))
+    monkeypatch.setattr(ipwork_ocr, 'OCR_FIRST_ATTEMPT_TIMEOUT_SECONDS', .05)
+    monkeypatch.setattr(ipwork_ocr, 'OCR_CALL_TIMEOUT_SECONDS', 2)
+    try:
+        result = ipwork_ocr.process_ocr('owner', 'small.jpg', _jpeg_bytes((800, 600)))
+        assert result['errorCode'] == 'ocr_timeout' and seen == [(800, 600)]
+    finally:
+        release.set()
+        isolated_ocr_pool.close()
