@@ -539,3 +539,46 @@ def test_a_wave_mutation_still_gives_up_once_its_patience_runs_out(world, monkey
         store._retry(conflict)
     waited = now[0] - started
     assert upload_waves.MUTATION_PATIENCE_SECONDS <= waited < upload_waves.MUTATION_PATIENCE_SECONDS + 1
+
+
+def test_resolve_many_retries_reread_shared_rows_not_every_item(world, monkeypatch):
+    """A lost race must not repeat the per-item reads: they dominate an attempt's storage calls."""
+    import upload_waves
+    store, table, _ = world
+    store.open_session('lean', 6)
+    store.register('lean', [dict(itemId=str(index), filename=f'{index}.jpg') for index in range(6)])
+    monkeypatch.setattr(upload_waves.time, 'sleep', lambda _seconds: None)
+    original, losses, queries_at_loss = table.submit_transaction, [], []
+    def losing(ops):
+        if len(losses) < 2:
+            losses.append(1)
+            queries_at_loss.append(len(table.queries))
+            raise ResourceModifiedError('busy library control row')
+        return original(ops)
+    monkeypatch.setattr(table, 'submit_transaction', losing)
+    table.queries.clear()
+    row = store.resolve_many('lean', [dict(item=str(index), outcome='accepted',
+        photo_id=f'photo-{index}', processing_revision=f'revision-{index}',
+        filename=f'{index}.jpg', required_steps=['face']) for index in range(6)])
+    assert row['resolvedCount'] == 6
+    # The first retry reused the first attempt's item and member/source reads.
+    assert queries_at_loss[1] == queries_at_loss[0]
+
+
+def test_resolve_many_refreshes_item_reads_every_few_attempts(world, monkeypatch):
+    import upload_waves
+    store, table, _ = world
+    store.open_session('refresh', 1)
+    store.register('refresh', [dict(itemId='0', filename='0.jpg')])
+    monkeypatch.setattr(upload_waves.time, 'sleep', lambda _seconds: None)
+    original, losses = table.submit_transaction, []
+    def losing(ops):
+        if len(losses) < upload_waves.REFRESH_EVERY:
+            losses.append(len(table.queries))
+            raise ResourceModifiedError('busy library control row')
+        return original(ops)
+    monkeypatch.setattr(table, 'submit_transaction', losing)
+    table.queries.clear()
+    store.resolve_many('refresh', [dict(item='0', outcome='accepted', photo_id='p', processing_revision='r',
+        filename='0.jpg', required_steps=['face'])])
+    assert losses[-1] > losses[0]  # the REFRESH_EVERYth attempt re-read items
