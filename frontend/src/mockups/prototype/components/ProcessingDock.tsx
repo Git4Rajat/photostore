@@ -191,7 +191,7 @@ export const ProcessingDock: React.FC = () => {
     return (
         <>
             <StackWidget id="processing" finished={finished} onDismiss={() => dismissWaves(finishedWaves)}>
-            <div className="up-dock up-bar pd-bar" role="region" aria-label="Photo processing">
+            <div className={`up-dock up-bar pd-bar${finished ? ' pd-fin' : ''}`} role="region" aria-label="Photo processing">
                 <button type="button" className="up-head" onClick={() => setOpen(true)} aria-label={`${title}. ${sub}. ${more ?? ''} Show details`}>
                     <span className={`up-ico${trouble ? ' bad' : ''}`}>
                         {trouble ? <AlertGlyph aria-hidden="true" /> : finished ? <CheckGlyph aria-hidden="true" /> : wave.problem === 'blocked' ? <ChevGlyph aria-hidden="true" /> : <span className="pd-spin" aria-hidden="true" />}
