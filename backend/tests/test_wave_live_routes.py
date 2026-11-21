@@ -714,6 +714,23 @@ def test_discard_adopts_stored_reservations_and_cancels_only_unfinished_uploads(
     assert store.status(store._required('session!s')['waveId'])['memberCount'] == 1
 
 
+def test_discard_adopts_a_stored_photo_a_later_upload_left_a_pending_reservation_on(live_api, hash_index, monkeypatch):
+    # A later upload of the same filename reserves the finalized row (pendingAnonymousBlob).
+    # That must not make adoption raise, or abandonment never completes and the
+    # wave stays collecting (2026-11-20, wave 43c98a86).
+    client, store, metadata, _ = live_api
+    _stored(metadata, hash_index, 'a.jpg', 'a' * 64, 'pa')
+    metadata.rows['u', 'a.jpg']['pendingAnonymousBlob'] = 'later-reservation'
+    _reserve(store, 's', [('a', 'a.jpg', 'a' * 64), ('b', 'b.jpg', 'b' * 64)])
+    monkeypatch.setattr(app, '_cleanup_failed_upload', lambda library, name: None)
+    manifest = store._required('session!s')['manifestRevision']
+    response = client.post('/upload/waves/live/sessions/s/abandon',
+                           json=dict(manifestRevision=manifest, reason='Lease expired'))
+    assert response.status_code == 200, response.json
+    outcome = lambda item: store._required(store.item_key('s', item))['outcome']
+    assert [outcome(k) for k in 'ab'] == ['accepted', 'cancelled']
+
+
 def test_lease_expiry_adopts_stored_reservations_before_cancelling(live_api, hash_index):
     import time
     from upload_session_registry import Sessions
