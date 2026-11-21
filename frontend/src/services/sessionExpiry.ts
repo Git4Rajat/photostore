@@ -34,6 +34,15 @@ const onPublicRoute = (): boolean => {
 // first should drive the reset -- the rest are moot once we navigate away.
 let handling = false;
 
+// True while the redirect to /login is under way. Page-level "leave site?"
+// guards (an active upload registers one) check this so they don't veto it.
+let redirecting = false;
+export const isSessionExpiryRedirecting = (): boolean => redirecting;
+
+// If the navigation never happens, re-arm so the next 401 can try again instead
+// of leaving a dead session on screen with the one-shot flag stuck.
+const REARM_AFTER_MS = 5000;
+
 export const reportUnauthorized = (): void => {
     if (handling) return;
     if (typeof window === 'undefined') return;
@@ -43,6 +52,7 @@ export const reportUnauthorized = (): void => {
     // Anonymous/shared/auth routes 401 by design; don't redirect them.
     if (onPublicRoute()) return;
     handling = true;
+    redirecting = true;
     try {
         window.localStorage.removeItem('photostore.passwordAuthToken');
     } catch { /* ignore storage failures */ }
@@ -50,4 +60,5 @@ export const reportUnauthorized = (): void => {
     // Full load (not an SPA navigate) so every in-flight poller/timer is torn
     // down instead of continuing to 401 against the now-cleared session.
     window.location.assign('/login');
+    window.setTimeout(() => { handling = false; redirecting = false; }, REARM_AFTER_MS);
 };
