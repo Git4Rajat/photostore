@@ -719,6 +719,32 @@ describe('browser upload selection and startup', () => {
         expect(mocks.getUpload.mock.calls.filter(([url]) => url === '/upload/known-hashes')).toHaveLength(1);
     });
 
+    it('asks the server about photos the snapshot misses and never uploads the ones it already holds', async () => {
+        const files = filesFor(30);
+        const hashOf = (file: File) => Array.from(new TextEncoder().encode(file.name)).join('-');
+        const base = mocks.postUpload.getMockImplementation()!;
+        mocks.postUpload.mockImplementation(async (url: string, payload: any, ...rest: unknown[]) => url === '/upload/known-hashes/check'
+            ? { known: Object.fromEntries(files.slice(0, 12).map((file) => [hashOf(file), `stored-${file.name}`])) }
+            : base(url, payload, ...rest));
+        select(files);
+        await advance(10000);
+        expect(initFiles()).toHaveLength(18);
+        expect(mocks.postUpload.mock.calls.filter(([url]) => url === '/upload/known-hashes/check')).toHaveLength(1);
+        expect(services.notifications.some((notification) =>
+            notification.progress?.skippedDuplicateCount === 12)).toBe(true);
+    });
+
+    it('uploads normally when the server hash check fails', async () => {
+        const base = mocks.postUpload.getMockImplementation()!;
+        mocks.postUpload.mockImplementation(async (url: string, payload: any, ...rest: unknown[]) => {
+            if (url === '/upload/known-hashes/check') throw new Error('down');
+            return base(url, payload, ...rest);
+        });
+        select(filesFor(5));
+        await advance(10000);
+        expect(initFiles()).toHaveLength(5);
+    });
+
     it('refreshes after a run ends with failed files', async () => {
         mocks.transferred.mockRejectedValue(new Error('Test transfer failure'));
         select(filesFor(2));
