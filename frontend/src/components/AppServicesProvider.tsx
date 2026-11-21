@@ -16,6 +16,7 @@ import { addJustUploaded } from '../services/justUploaded';
 import { heartbeatWaveSession, quiesceWaveShadowSession, discardWaveShadowSession, stopWaveShadowSession, registerWaveItemsBatch, waveIdentityFor, ensureOpened as ensureWaveShadowSessionAdmitted, finalizeWaveShadowSession, resolveWaveShadowFile, reportFailedWaveFile, acknowledgeWaveFinalizedFile, cancelQueuedWaveSelection } from '../services/uploadWaveSync';
 import { fileHashTimeoutMs, hashLargeFile, LARGE_FILE_HASH_THRESHOLD, withFileHashTimeout } from '../utils/largeFileHash';
 import { getAccessToken, isAuthEnabled } from '../services/authClient';
+import { isSessionExpiryRedirecting } from '../services/sessionExpiry';
 import { getRuntimeConfig } from '../config/appConfig';
 import type {
     AppNotification,
@@ -6163,6 +6164,8 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             return undefined;
         }
         const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+            // A dead session redirects to login; vetoing that leaves the page stuck.
+            if (isSessionExpiryRedirecting()) return;
             event.preventDefault();
             event.returnValue = '';
         };
