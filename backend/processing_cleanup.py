@@ -431,6 +431,12 @@ def _mark_sources_deleted(metadata,library,rows):
             metadata.update_entity(change(row),**options(row))
 
 
+def _intake_open(store):
+    wave_id=(store._get('control') or {}).get('collectingWaveId')
+    wave=store._get(store.wave_key(wave_id)) if wave_id else None
+    return bool(wave and wave.get('openSessions',0)>0)
+
+
 def collect_library_artifacts(table,storage,metadata,library,*,limit=50,purge=False,lease_check=lambda:None):
     """Full reference survey, bounded physical deletion. Retain unfinished waves.
     Source claims are paused during this short GC; existing leases cause retry.
@@ -448,6 +454,11 @@ def collect_library_artifacts(table,storage,metadata,library,*,limit=50,purge=Fa
         from execution_lease import ExecutionLeases
         if ExecutionLeases(store.table,partition=store.partition,clock=store.clock).active(library):
             return dict(deletedManifests=0,deferred=True,reason='wave_active')
+        if _intake_open(store):
+            # The fence below rejects every register/resolve/finalize of an open
+            # upload session. A standing GC backlog re-fences slice after slice,
+            # so a long upload kept hitting it and its files failed.
+            return dict(deletedManifests=0,deferred=True,reason='intake_open')
     import uuid
     from upload_waves import Conflict
     owner=uuid.uuid4().hex
@@ -607,10 +618,10 @@ def run_artifact_cleanup(payload):
         with publication(work,claim) as guard:
             result=collect_library_artifacts(store.table,app.storage_utils_module,app.metadata_table_client,
                 library,lease_check=guard.check)
-        if result.get('reason')=='wave_active':
+        if result.get('reason') in ('wave_active','intake_open'):
             # Deferred because a wave stage is live; reschedule past it rather
             # than hot-looping. gcRequested stays set so the GC is never lost.
-            work.release(claim,deferred=True,retry_delay=WAVE_ACTIVE_RETRY_DELAY_SECONDS,retry_reason='wave_active')
+            work.release(claim,deferred=True,retry_delay=WAVE_ACTIVE_RETRY_DELAY_SECONDS,retry_reason=result['reason'])
             return result
         if store._required('policy').get('gcRequested'):
             work.release(claim,deferred=True)
