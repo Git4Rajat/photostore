@@ -315,7 +315,7 @@ export const NotificationBell: React.FC<{ backLabel?: string }> = ({ backLabel =
                                                             {paused && (
                                                                 <>
                                                                     <button type="button" className="btn btn-primary btn-sm" disabled={uploadActive || retryingUpload}
-                                                                        onClick={() => void retryPersistedUploadSession(story.sessionId)}>Resume</button>
+                                                                        onClick={() => void retryPersistedUploadSession(story.sessionId, 'resume')}>Resume</button>
                                                                     <button type="button" className="btn btn-soft btn-sm" disabled={uploadActive || retryingUpload}
                                                                         onClick={() => void discardPersistedUploadSession()}>Discard</button>
                                                                 </>
@@ -325,7 +325,7 @@ export const NotificationBell: React.FC<{ backLabel?: string }> = ({ backLabel =
                                                             )}
                                                             {story.state === 'failed' && (
                                                                 <button type="button" className="btn btn-primary btn-sm" disabled={uploadActive || retryingUpload}
-                                                                    onClick={() => void retryPersistedUploadSession(story.sessionId)}>
+                                                                    onClick={() => void retryPersistedUploadSession(story.sessionId, 'failed')}>
                                                                     <RetryIcon aria-hidden="true" />Try again
                                                                 </button>
                                                             )}
