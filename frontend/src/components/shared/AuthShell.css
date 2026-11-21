@@ -95,8 +95,9 @@
   align-items: center;
   gap: 8px;
   height: 44px;
-  padding: 0 12px;
+  padding: 0;
   border-radius: 12px;
+  overflow: hidden;
   background: var(--bg-2);
 }
 
@@ -108,7 +109,8 @@
   flex: 1;
   min-width: 0;
   height: 100%;
-  padding: 0;
+  /* The inset lives on the input, not the field, so a browser autofill tint fills the whole box. */
+  padding: 0 0 0 12px;
   border: 0;
   outline: 0;
   background: transparent;
@@ -118,12 +120,21 @@
   font-size: 16px;
 }
 
+.auth-field input:last-child { padding-right: 12px; }
+
+.auth-field input:-webkit-autofill {
+  -webkit-text-fill-color: var(--text);
+  caret-color: var(--text);
+  box-shadow: 0 0 0 100px var(--bg-2) inset;
+  transition: background-color 9999s;
+}
+
 .auth-eye {
   display: grid;
   place-items: center;
   width: 32px;
   height: 32px;
-  margin-right: -6px;
+  margin-right: 6px;
   border: 0;
   border-radius: 50%;
   background: none;
