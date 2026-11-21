@@ -104,7 +104,7 @@ def stored_filename_lookup(hash_index_table, metadata_table, library):
     return find
 
 
-def resolve_sources(store, metadata_table, session, sources, *, find_stored=None):
+def resolve_sources(store, metadata_table, session, sources, *, find_stored=None, pending_ok=frozenset()):
     """Resolve a bounded set of finalized sources with one wave mutation.
 
     With find_stored, a failed/cancelled report for a reservation whose bytes
@@ -137,13 +137,13 @@ def resolve_sources(store, metadata_table, session, sources, *, find_stored=None
         row = rows.get(filename)
         if row is None:
             raise Conflict('Finalized photo not found')
-        if item in adopted and row.get('fileHash') != items[store.item_key(session, item)].get('sourceHash'):
+        if (item in adopted or item in pending_ok) and row.get('fileHash') != items[store.item_key(session, item)].get('sourceHash'):
             raise Conflict('Stored source changed while it was being adopted')
         # A duplicate resolves to an already-finalized canonical row; a pending
         # reservation left on it by a concurrent upload of the same filename is
         # irrelevant to that finalized source and must not block admission.
         # The same holds for an adopted source: its bytes are proven stored.
-        photo, revision, _qualified = source_identity(row, allow_pending=outcome == 'duplicate' or item in adopted)
+        photo, revision, _qualified = source_identity(row, allow_pending=outcome == 'duplicate' or item in adopted or item in pending_ok)
         previous = items.get(store.item_key(session, item))
         if previous is None:
             raise Conflict('Unknown session, member or wave')
@@ -170,8 +170,12 @@ def adopt_stored_reservations(store, metadata_table, session, reservations, find
              if item['outcome'] == 'reserved' and (stored := stored_source(item, find_stored))]
     for offset in range(0, len(found), MAX_PAGE):
         page = found[offset:offset + MAX_PAGE]
+        # The bytes are proven stored (find_stored matched the hash), so a pending
+        # reservation a later upload of the same filename left on the row must not
+        # block adoption: it would stall every discard/lease-expiry of this session.
         resolve_sources(store, metadata_table, session,
-                        [(item, outcome, filename) for item, (outcome, filename) in page])
+                        [(item, outcome, filename) for item, (outcome, filename) in page],
+                        pending_ok=frozenset(item for item, _stored in page))
     return [item for item, _stored in found]
 
 
