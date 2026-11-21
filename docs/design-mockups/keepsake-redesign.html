@@ -585,6 +585,9 @@ figure.shot.md { width: 540px; }
 .prog.lg { height: 6px; border-radius: 3px; }
 .prog.lg i { border-radius: 3px; }
 .prog.bad i { background: var(--danger); }
+.prog.paused i { background: var(--muted); opacity: .6; }
+.nb .hist { margin: 3px 0 0; font-size: 11.5px; color: var(--muted); }
+.nb .prog { margin-top: 9px; }
 .prog.ind i { width: 40%; animation: slide 1.6s ease-in-out infinite; }
 @media (prefers-reduced-motion: reduce) { .prog.ind i { animation: none; width: 100%; opacity: .5; } }
 .ustats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
@@ -746,6 +749,7 @@ figure.shot.md { width: 540px; }
   <symbol id="i-userplus" viewBox="0 0 24 24"><circle cx="10" cy="8.5" r="3.3"/><path d="M4 19.5a6 6 0 0 1 12 0"/><path d="M19 8v6M16 11h6"/></symbol>
   <symbol id="i-userx" viewBox="0 0 24 24"><circle cx="10" cy="8.5" r="3.3"/><path d="M4 19.5a6 6 0 0 1 12 0"/><path d="M16.5 8.5l4 4M20.5 8.5l-4 4"/></symbol>
   <symbol id="i-mail" viewBox="0 0 24 24"><rect x="3.5" y="5.5" width="17" height="13" rx="2.5"/><path d="M4.5 7l7.5 6 7.5-6"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><path d="M9 6.5v11M15 6.5v11"/></symbol>
   <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></symbol>
   <symbol id="i-pin" viewBox="0 0 24 24"><path d="M12 20.5s-6.5-5.7-6.5-10.7a6.5 6.5 0 0 1 13 0c0 5-6.5 10.7-6.5 10.7z"/><circle cx="12" cy="9.8" r="2.3"/></symbol>
   <symbol id="i-star" viewBox="0 0 24 24"><path d="M12 4l2.4 5 5.4.6-4 3.7 1.1 5.4L12 16l-4.9 2.7 1.1-5.4-4-3.7 5.4-.6z"/></symbol>
@@ -768,7 +772,7 @@ figure.shot.md { width: 540px; }
   <div class="wrap">
     <div class="brand"><span class="mark"><svg class="i"><use href="#i-keep"/></svg></span>Keepsake <small>redesign</small></div>
     <nav class="nav" aria-label="Sections">
-      <a href="#system">System</a><a href="#gallery">Gallery</a><a href="#filter">Filter</a><a href="#albums">Albums</a><a href="#people">People</a><a href="#notifications">Notifications</a><a href="#invites">Invites</a><a href="#delete-library">Delete library</a><a href="#login">Sign in</a><a href="#upload">Upload</a><a href="#processing">After upload</a><a href="#upload-actions">Cancel &amp; retry</a><a href="#upload-resume">Pause &amp; resume</a><a href="#emails">Emails</a><a href="#shared-static">Shared · instant</a><a href="#shared-full">Shared · full</a><a href="#desktop">Desktop</a>
+      <a href="#system">System</a><a href="#gallery">Gallery</a><a href="#filter">Filter</a><a href="#albums">Albums</a><a href="#people">People</a><a href="#notifications">Notifications</a><a href="#invites">Invites</a><a href="#delete-library">Delete library</a><a href="#login">Sign in</a><a href="#upload">Upload</a><a href="#processing">After upload</a><a href="#upload-actions">Cancel &amp; retry</a><a href="#upload-resume">Pause &amp; resume</a><a href="#upload-story">Upload in the bell</a><a href="#emails">Emails</a><a href="#shared-static">Shared · instant</a><a href="#shared-full">Shared · full</a><a href="#desktop">Desktop</a>
     </nav>
     <button class="tbtn" id="theme" type="button"><svg class="i"><use href="#i-sun"/></svg><span>Light mode</span></button>
   </div>
@@ -2674,6 +2678,251 @@ figure.shot.md { width: 540px; }
           </div>
         </div></div>
         <figcaption><b>Desktop · cancelled</b>States what was added and what wasn't, says the added photos stay, and offers Choose again.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ========== UPLOAD IN THE BELL ========== -->
+  <section class="sec" id="upload-story">
+    <div class="sec-head">
+      <h2>One upload, one entry in the bell</h2>
+      <p class="lede">An upload has a single entry in the notification list for its whole life. It changes in place as the upload is uploading, paused, resumed, finished or cancelled, keeps its place in the list, and never turns into a second entry. A pause is calm: same blue family and a pause symbol, no red. Red is only for photos that really failed. Counts always include photos added before the pause.</p>
+    </div>
+    <div class="frames">
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Photos</span><span class="link">Mark all read</span></div>
+          <div class="hdr" style="padding-top:0"><h3 class="ttl">Notifications</h3></div>
+          <div class="content">
+            <div class="gl">Today</div>
+            <div class="nt unread">
+              <span class="ni "><svg class="i"><use href="#i-upload"/></svg></span>
+              <div class="nb"><div class="top2"><b>Uploading 164 of 2,422</b><span class="ntime">10:21</span></div><div class="prog"><i style="width:7%"></i></div><p>8 MB/s · about 40 minutes left</p><div class="nacts"><span class="btn sm">Pause</span></div></div>
+            </div>
+            <div class="nt">
+              <span class="ni"><svg class="i"><use href="#i-users"/></svg></span>
+              <div class="nb"><div class="top2"><b>7 people to name</b><span class="ntime">09:15</span></div></div>
+            </div>
+            <div class="nt">
+              <span class="ni"><svg class="i"><use href="#i-link"/></svg></span>
+              <div class="nb"><div class="top2"><b>Asha opened “Malmö nights”</b><span class="ntime">08:40</span></div></div>
+            </div>
+          </div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>1 · Uploading</b>The entry shows live counts, a progress line, speed and time left, with one action: Pause. It is the same upload icon as the upload bar.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Photos</span><span class="link">Mark all read</span></div>
+          <div class="hdr" style="padding-top:0"><h3 class="ttl">Notifications</h3></div>
+          <div class="content">
+            <div class="gl">Today</div>
+            <div class="nt unread">
+              <span class="ni "><svg class="i"><use href="#i-pause"/></svg></span>
+              <div class="nb"><div class="top2"><b>Upload paused</b><span class="ntime">10:19</span></div><div class="prog paused"><i style="width:4%"></i></div><p>100 of 2,422 added · 2,322 waiting</p><div class="nacts"><span class="btn sm pri">Resume</span><span class="btn sm">Discard</span></div></div>
+            </div>
+            <div class="nt">
+              <span class="ni"><svg class="i"><use href="#i-users"/></svg></span>
+              <div class="nb"><div class="top2"><b>7 people to name</b><span class="ntime">09:15</span></div></div>
+            </div>
+            <div class="nt">
+              <span class="ni"><svg class="i"><use href="#i-link"/></svg></span>
+              <div class="nb"><div class="top2"><b>Asha opened “Malmö nights”</b><span class="ntime">08:40</span></div></div>
+            </div>
+          </div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>2 · Paused</b>A deliberate pause is not an emergency, so it uses the normal blue, a pause symbol and a stopped grey bar. "100 of 2,422 added · 2,322 waiting" says exactly where it stopped. Resume is the main button, and Discard is beside it.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Photos</span><span class="link">Mark all read</span></div>
+          <div class="hdr" style="padding-top:0"><h3 class="ttl">Notifications</h3></div>
+          <div class="content">
+            <div class="gl">Today</div>
+            <div class="nt unread">
+              <span class="ni "><svg class="i"><use href="#i-upload"/></svg></span>
+              <div class="nb"><div class="top2"><b>Uploading 164 of 2,422</b><span class="ntime">10:21</span></div><p class="hist">Paused 10:19 · resumed 10:21</p><div class="prog"><i style="width:7%"></i></div><p>8 MB/s · about 40 minutes left</p><div class="nacts"><span class="btn sm">Pause</span></div></div>
+            </div>
+            <div class="nt">
+              <span class="ni"><svg class="i"><use href="#i-users"/></svg></span>
+              <div class="nb"><div class="top2"><b>7 people to name</b><span class="ntime">09:15</span></div></div>
+            </div>
+            <div class="nt">
+              <span class="ni"><svg class="i"><use href="#i-link"/></svg></span>
+              <div class="nb"><div class="top2"><b>Asha opened “Malmö nights”</b><span class="ntime">08:40</span></div></div>
+            </div>
+          </div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>3 · Resumed</b>The same entry goes back to uploading, in the same place, and the count carries on (164, not 0). A short history line, "Paused 10:19 · resumed 10:21", says it is the same upload. There is no separate "paused" entry left behind, because it was this one.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Photos</span><span class="link">Mark all read</span></div>
+          <div class="hdr" style="padding-top:0"><h3 class="ttl">Notifications</h3></div>
+          <div class="content">
+            <div class="gl">Today</div>
+            <div class="nt">
+              <span class="ni "><svg class="i"><use href="#i-check"/></svg></span>
+              <div class="nb"><div class="top2"><b>2,422 items added</b><span class="ntime">10:58</span></div><p class="hist">Paused 10:19 · resumed 10:21</p><p>All processed in 12 minutes. 31 people found.</p></div>
+            </div>
+            <div class="nt">
+              <span class="ni"><svg class="i"><use href="#i-users"/></svg></span>
+              <div class="nb"><div class="top2"><b>7 people to name</b><span class="ntime">09:15</span></div></div>
+            </div>
+            <div class="nt">
+              <span class="ni"><svg class="i"><use href="#i-link"/></svg></span>
+              <div class="nb"><div class="top2"><b>Asha opened “Malmö nights”</b><span class="ntime">08:40</span></div></div>
+            </div>
+          </div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>4 · Done</b>When it finishes, the entry turns into the usual result and keeps the history line. It becomes an unread notification again so the person notices, and it isn't repeated as a second entry.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Photos</span><span class="link">Mark all read</span></div>
+          <div class="hdr" style="padding-top:0"><h3 class="ttl">Notifications</h3></div>
+          <div class="content">
+            <div class="gl">Today</div>
+            <div class="nt">
+              <span class="ni "><svg class="i"><use href="#i-close"/></svg></span>
+              <div class="nb"><div class="top2"><b>Upload cancelled</b><span class="ntime">10:34</span></div><p class="hist">Paused 10:19 · resumed 10:21 · cancelled 10:34</p><p>1,200 added, 1,222 not. The added photos stay in your library.</p><div class="nacts"><span class="btn sm">Choose again</span></div></div>
+            </div>
+            <div class="nt">
+              <span class="ni"><svg class="i"><use href="#i-users"/></svg></span>
+              <div class="nb"><div class="top2"><b>7 people to name</b><span class="ntime">09:15</span></div></div>
+            </div>
+            <div class="nt">
+              <span class="ni"><svg class="i"><use href="#i-link"/></svg></span>
+              <div class="nb"><div class="top2"><b>Asha opened “Malmö nights”</b><span class="ntime">08:40</span></div></div>
+            </div>
+          </div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>5 · Cancelled</b>Cancelling from a paused or resumed upload ends the same entry: how many were added and how many weren't, that the added photos stay, and a way to choose them again.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="navrow"><span class="link"><svg class="i"><use href="#i-back"/></svg>Photos</span><span class="link">Mark all read</span></div>
+          <div class="hdr" style="padding-top:0"><h3 class="ttl">Notifications</h3></div>
+          <div class="content">
+            <div class="gl">Today</div>
+            <div class="nt unread">
+              <span class="ni warn"><svg class="i"><use href="#i-alert"/></svg></span>
+              <div class="nb"><div class="top2"><b>12 items didn't upload</b><span class="ntime">10:58</span></div><p class="hist">Paused 10:19 · resumed 10:21</p><p>2,410 of 2,422 were added. The other 12 need another try.</p><div class="nacts"><span class="btn sm pri"><svg class="i"><use href="#i-refresh"/></svg>Try again</span><span class="btn sm">See why</span></div></div>
+            </div>
+            <div class="nt">
+              <span class="ni"><svg class="i"><use href="#i-users"/></svg></span>
+              <div class="nb"><div class="top2"><b>7 people to name</b><span class="ntime">09:15</span></div></div>
+            </div>
+            <div class="nt">
+              <span class="ni"><svg class="i"><use href="#i-link"/></svg></span>
+              <div class="nb"><div class="top2"><b>Asha opened “Malmö nights”</b><span class="ntime">08:40</span></div></div>
+            </div>
+          </div>
+          <div class="homebar"><i class="home"></i></div>
+        </div></div>
+        <figcaption><b>6 · Finished with failures</b>The only state that is red. It says how many were added and how many weren't, and keeps Try again. Because pause never uses red, the two can't be confused.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="phone"><div class="scr">
+          <div class="sb" data-sb></div>
+          <div class="hdr"><h3 class="ttl">Photos</h3><div class="hdr-r"><span class="ibtn"><svg class="i"><use href="#i-bell"/></svg></span><span class="me">RA</span></div></div>
+          <div class="content">
+            <div class="day"><b>10 October 2024</b><span>Malmö</span></div>
+            <div class="g c4 pad" data-tiles="aurora forest field tunnel shot notif portrait garden"></div>
+          </div>
+          <div class="scrim"></div>
+          <div class="sheet" style="gap:12px">
+            <div class="grab"></div>
+            <h4>You have a paused upload</h4>
+            <p>100 of 2,422 added. Resume it to carry on, or discard the rest to start a new upload.</p>
+            <span class="btn pri wide">Resume upload</span>
+            <span class="btn wide">Discard and choose new photos</span>
+          </div>
+        </div></div>
+        <figcaption><b>Choosing photos while one is paused</b>Tapping Upload with a paused upload waiting shows this one message right there, with the two real choices as buttons. No toast and no extra entries in the bell, and the words match the buttons: Resume and Discard, never "Retry".</figcaption>
+      </figure>
+      <figure class="shot xl">
+        <div class="scrollx"><div class="browser app">
+          <div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/photos</div></div>
+          <div class="dapp">
+            <aside class="side" data-side="photos"></aside>
+            <div class="dmain">
+              <div class="dtop" data-dtop="bell"></div>
+              <div class="dbody">
+                <div class="dph"><h3>Photos<small>31 items</small></h3></div>
+                <div class="dday"><b>10 October 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="aurora forest field*L tunnel shot notif portrait garden"></div>
+                <div class="dday"><b>27 January 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="food*L snow*L"></div>
+              </div>
+              <div class="pop np">
+                <div class="ph"><b>Notifications</b><span class="link" style="font-size:13px">Mark all read</span></div>
+                <div class="gl">Today</div>
+                <div class="nt unread">
+              <span class="ni "><svg class="i"><use href="#i-pause"/></svg></span>
+              <div class="nb"><div class="top2"><b>Upload paused</b><span class="ntime">10:19</span></div><div class="prog paused"><i style="width:4%"></i></div><p>100 of 2,422 added · 2,322 waiting</p><div class="nacts"><span class="btn sm pri">Resume</span><span class="btn sm">Discard</span></div></div>
+            </div>
+                <div class="nt">
+              <span class="ni"><svg class="i"><use href="#i-users"/></svg></span>
+              <div class="nb"><div class="top2"><b>7 people to name</b><span class="ntime">09:15</span></div></div>
+            </div>
+            <div class="nt">
+              <span class="ni"><svg class="i"><use href="#i-link"/></svg></span>
+              <div class="nb"><div class="top2"><b>Asha opened “Malmö nights”</b><span class="ntime">08:40</span></div></div>
+            </div>
+                <div class="pf"><span class="lbl" style="font-weight:500">Kept for 30 days</span><span class="link" style="font-size:13px">Notification settings</span></div>
+              </div>
+            </div>
+          </div>
+        </div></div>
+        <figcaption><b>Desktop · paused</b>The same entry in the bell panel. Resume and Discard sit inside it, and the progress line is grey and still.</figcaption>
+      </figure>
+      <figure class="shot xl">
+        <div class="scrollx"><div class="browser app">
+          <div class="bbar"><i></i><i></i><i></i><div class="url"><svg class="i"><use href="#i-lock"/></svg>…/photos</div></div>
+          <div class="dapp">
+            <aside class="side" data-side="photos"></aside>
+            <div class="dmain">
+              <div class="dtop" data-dtop="bell"></div>
+              <div class="dbody">
+                <div class="dph"><h3>Photos<small>31 items</small></h3></div>
+                <div class="dday"><b>10 October 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="aurora forest field*L tunnel shot notif portrait garden"></div>
+                <div class="dday"><b>27 January 2024</b><span>Malmö</span></div>
+                <div class="g c8 dgrid" data-tiles="food*L snow*L"></div>
+              </div>
+              <div class="pop np">
+                <div class="ph"><b>Notifications</b><span class="link" style="font-size:13px">Mark all read</span></div>
+                <div class="gl">Today</div>
+                <div class="nt unread">
+              <span class="ni "><svg class="i"><use href="#i-upload"/></svg></span>
+              <div class="nb"><div class="top2"><b>Uploading 164 of 2,422</b><span class="ntime">10:21</span></div><p class="hist">Paused 10:19 · resumed 10:21</p><div class="prog"><i style="width:7%"></i></div><p>8 MB/s · about 40 minutes left</p><div class="nacts"><span class="btn sm">Pause</span></div></div>
+            </div>
+                <div class="nt">
+              <span class="ni"><svg class="i"><use href="#i-users"/></svg></span>
+              <div class="nb"><div class="top2"><b>7 people to name</b><span class="ntime">09:15</span></div></div>
+            </div>
+            <div class="nt">
+              <span class="ni"><svg class="i"><use href="#i-link"/></svg></span>
+              <div class="nb"><div class="top2"><b>Asha opened “Malmö nights”</b><span class="ntime">08:40</span></div></div>
+            </div>
+                <div class="pf"><span class="lbl" style="font-weight:500">Kept for 30 days</span><span class="link" style="font-size:13px">Notification settings</span></div>
+              </div>
+            </div>
+          </div>
+        </div></div>
+        <figcaption><b>Desktop · resumed</b>The entry has gone back to uploading in the same spot, with the history line. Only one entry exists for the upload.</figcaption>
       </figure>
     </div>
   </section>
