@@ -118,4 +118,26 @@ describe('UploadDock actions', () => {
         expect(screen.getByText('Uploading 135 of 400')).toBeTruthy();
         expect(screen.getByText('135 added · 265 waiting')).toBeTruthy();
     });
+
+    it('a pause with some failed files is still a pause: no failed list until nothing is left to resume', () => {
+        setServices({ pendingUploadSummary: { fileCount: 12, failedCount: 2 }, pendingUploadFailedFiles: [failedFile(1), failedFile(2)] });
+        render(<UploadDock />);
+        expect(screen.getByText('Upload paused')).toBeTruthy();
+        expect(screen.getByText('10 files still waiting.')).toBeTruthy();
+        expect(screen.getByText(/2 files didn’t upload yet/)).toBeTruthy();
+        expect(screen.queryByText('IMG_1.HEIC')).toBeNull();
+        fireEvent.click(screen.getByRole('button', { name: 'Resume' }));
+        expect(services.retryPersistedUploadSession).toHaveBeenCalledWith(undefined, 'resume');
+    });
+
+    it('Try again retries only the failed files and counts them on their own', () => {
+        const { rerender } = render(<UploadDock />);
+        fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+        expect(services.retryPersistedUploadSession).toHaveBeenCalledWith(undefined, 'failed');
+        setServices({ uploadActive: true, uploading: true, uploadProgress: { uploadedCount: 6213, totalCount: 6215, failedCount: 0 }, pendingUploadFailedFiles: [] });
+        rerender(<UploadDock />);
+        setServices({ uploadActive: true, uploading: true, uploadProgress: { uploadedCount: 6214, totalCount: 6215, failedCount: 1 }, pendingUploadFailedFiles: [] });
+        rerender(<UploadDock />);
+        expect(screen.getAllByText('2 of 2 retried. 1 worked, 1 failed again.').length).toBeGreaterThan(0);
+    });
 });

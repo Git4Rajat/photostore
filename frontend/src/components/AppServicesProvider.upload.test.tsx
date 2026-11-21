@@ -816,6 +816,31 @@ describe('browser upload selection and startup', () => {
         expect(stories()[0].story?.resumedAt).toBeGreaterThan(0);
     });
 
+    it('resume leaves failed files for the end and Try again retries only them', async () => {
+        const releases: Array<() => void> = [];
+        mocks.transferred.mockRejectedValueOnce(Object.assign(new Error('bad'), { statusCode: 400 }));
+        mocks.transferred.mockImplementation(() => new Promise<void>((resolve) => { releases.push(resolve); }));
+        select(filesFor(50));
+        await advance(1000);
+        act(() => { services.pauseActiveUpload(); });
+        releases.splice(0).forEach((release) => release());
+        await advance(3000);
+        const summary = services.pendingUploadSummary;
+        expect(summary?.failedCount).toBe(1);
+        expect(summary!.fileCount).toBeGreaterThan(1);
+        const waiting = summary!.fileCount - 1;
+        const callsBefore = mocks.transferred.mock.calls.length;
+        mocks.transferred.mockImplementation(() => Promise.resolve());
+        act(() => { void services.retryPersistedUploadSession(undefined, 'resume'); });
+        await advance(8000);
+        expect(mocks.transferred.mock.calls.length - callsBefore).toBe(waiting);
+        expect(services.pendingUploadSummary).toEqual({ fileCount: 1, failedCount: 1 });
+        const callsAfterResume = mocks.transferred.mock.calls.length;
+        act(() => { void services.retryPersistedUploadSession(undefined, 'failed'); });
+        await advance(8000);
+        expect(mocks.transferred.mock.calls.length - callsAfterResume).toBe(1);
+    });
+
     it('cancelling after a pause drops the files that never started but keeps the failed ones', async () => {
         mocks.transferred.mockRejectedValueOnce(Object.assign(new Error('bad'), { statusCode: 400 }));
         select(filesFor(40));

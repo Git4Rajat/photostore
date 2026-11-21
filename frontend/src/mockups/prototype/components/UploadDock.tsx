@@ -109,6 +109,8 @@ export const UploadDock: React.FC = () => {
     // normal upload wording; `resumeBase` is the added count the run picked up from, to tell when it has moved.
     const [resumed, setResumed] = useState(false);
     const [resumeBase, setResumeBase] = useState<number | null>(null);
+    // Added count when a Try again began: the retry is counted on its own, from 0, not against the whole upload.
+    const [retryBase, setRetryBase] = useState<number | null>(null);
     const startRef = useRef<{ at: number; base: number } | null>(null);
     const cancelSnapshotRef = useRef({ added: 0, notAdded: 0 });
     const discardingRef = useRef(false);
@@ -119,7 +121,10 @@ export const UploadDock: React.FC = () => {
     const failed = progress?.failedCount ?? 0;
     const pending = !uploadActive && (pendingUploadSummary?.fileCount ?? 0) > 0;
     const failedFiles = pendingUploadFailedFiles;
-    const showFailed = pending && failedFiles.length > 0;
+    // Failed files are listed once nothing is left to resume, i.e. when the upload has finished. A pause
+    // that has some failures is still just a pause; they come up at the end.
+    const waitingToResume = Math.max(0, (pendingUploadSummary?.fileCount ?? 0) - (pendingUploadSummary?.failedCount ?? 0));
+    const showFailed = pending && failedFiles.length > 0 && waitingToResume === 0;
     const visible = cancelling || skipped || outcome ? true : uploadActive ? !hidden : pending;
 
     useEffect(() => {
@@ -136,6 +141,11 @@ export const UploadDock: React.FC = () => {
         if (!uploadActive) { if (acting !== 'retry') { setResumed(false); setResumeBase(null); } return; }
         if (resumeBase === null) setResumeBase(added);
     }, [resumed, uploadActive, acting, added, resumeBase]);
+
+    useEffect(() => {
+        if (retryOf !== null && uploadActive && retryBase === null) setRetryBase(added);
+        if (retryOf === null && retryBase !== null) setRetryBase(null);
+    }, [retryOf, uploadActive, retryBase, added]);
 
     // Resume has started once the upload is active again; from then on Pause and Cancel are available.
     useEffect(() => { if (acting === 'retry' && uploadActive) setActing(null); }, [acting, uploadActive]);
@@ -166,15 +176,18 @@ export const UploadDock: React.FC = () => {
     if (!visible) return null;
 
     const duplicates = progress?.skippedDuplicateCount ?? 0;
+    const retrying = retryOf !== null && uploadActive;
+    const retryWorked = retrying ? Math.min(retryOf as number, Math.max(0, added - (retryBase ?? added))) : 0;
+    const retried = retrying ? Math.min(retryOf as number, retryWorked + failed) : 0;
     const pct = checking
         ? (checking.total ? Math.round((checking.checked / checking.total) * 100) : 0)
+        : retrying ? (retryOf ? Math.round((retried / (retryOf as number)) * 100) : 0)
         : total ? Math.round((added / total) * 100) : 0;
     const waiting = Math.max(0, total - added - failed);
     const timeLeft = startRef.current
         ? timeLeftLabel(Date.now() - startRef.current.at, added - startRef.current.base, waiting)
         : null;
     const duplicatesLabel = duplicates > 0 ? `${duplicates} already in your library` : null;
-    const retrying = retryOf !== null && uploadActive;
     const resuming = resumed && uploadActive && !checking && (resumeBase === null || added <= resumeBase);
     const label = uploading ? 'Uploading' : 'Finishing upload';
     const worked = retryOf === null ? 0 : Math.max(0, retryOf - failedFiles.length);
@@ -192,7 +205,8 @@ export const UploadDock: React.FC = () => {
     const sub = cancelling
         ? 'Photos already added stay in your library'
         : !uploadActive
-        ? (showFailed ? (retryOf === null ? 'Tap to see why' : `${worked} of ${retryOf} worked this time`) : `${plural(pendingUploadSummary?.fileCount ?? 0, 'file')} waiting`)
+        ? (showFailed ? (retryOf === null ? 'Tap to see why' : `${worked} of ${retryOf} worked this time`) : `${plural(waitingToResume, 'file')} waiting`)
+        : retrying ? `${plural(Math.max(0, (retryOf as number) - retried), 'file')} left to retry`
         : checking ? 'Looking for ones you already have'
         : resuming ? 'Picking up where you left off'
         : [timeLeft ?? (progress?.mbPerSecond ? `${progress.mbPerSecond.toFixed(1)} MB/s` : 'Starting…'), duplicatesLabel].filter(Boolean).join(' · ');
@@ -225,10 +239,10 @@ export const UploadDock: React.FC = () => {
     const retry = async () => {
         if (acting) return;
         setActing('retry');
-        if (showFailed) setRetryOf(failedFiles.length);
+        if (showFailed) { setRetryOf(failedFiles.length); setRetryBase(null); }
         else { setResumed(true); setResumeBase(null); }
         try {
-            await retryPersistedUploadSession();
+            await retryPersistedUploadSession(undefined, showFailed ? 'failed' : 'resume');
         } finally {
             // The call above lasts the whole resumed upload; Pause or Cancel tapped meanwhile must keep their state.
             setActing(a => (a === 'retry' ? null : a));
@@ -296,7 +310,14 @@ export const UploadDock: React.FC = () => {
             <p className="up-fine">If Try again can’t find them, choose Upload and pick the same photos again. Files already added are skipped.</p>
         </>
     );
-    const retryingLede = retrying ? <p className="up-lede">{added} of {total} retried. {added} worked, {failed} failed again.</p> : null;
+    const pausedFailed = pendingUploadSummary?.failedCount ?? 0;
+    const pausedLede = (
+        <>
+            <p className="up-lede">{plural(waitingToResume, 'file')} still waiting.</p>
+            {pausedFailed > 0 ? <p className="up-fine">{plural(pausedFailed, 'file')} didn’t upload yet. They are listed here when the rest has finished.</p> : null}
+        </>
+    );
+    const retryingLede = retrying ? <p className="up-lede">{retried} of {retryOf} retried. {retryWorked} worked, {failed} failed again.</p> : null;
     const cancellingBody = (
         <>
             <Progress />
@@ -328,7 +349,7 @@ export const UploadDock: React.FC = () => {
                             <>
                                 <Progress pct={resuming ? undefined : pct} />
                                 {retryingLede}
-                                {checking ? <p className="up-lede">{checking.checked} of {checking.total} checked. Photos already in your library won’t be uploaded again.</p> : stats}
+                                {checking ? <p className="up-lede">{checking.checked} of {checking.total} checked. Photos already in your library won’t be uploaded again.</p> : retrying ? null : stats}
                                 {!checking && duplicates > 0 ? <p className="up-fine">{duplicatesLabel}, so they were skipped.</p> : null}
                                 {keepOpen}
                                 <div className="up-btns">
@@ -338,7 +359,7 @@ export const UploadDock: React.FC = () => {
                             </>
                         ) : (
                             <>
-                                {showFailed ? failureLede : <p className="up-lede">{plural(pendingUploadSummary?.fileCount ?? 0, 'file')} still waiting.</p>}
+                                {showFailed ? failureLede : pausedLede}
                                 {showFailed ? <FailedRows files={failedFiles} /> : null}
                                 <Button variant="primary" className="up-wide" onClick={() => void retry()} disabled={busy} aria-busy={acting === 'retry'}>{retryLabel}</Button>
                                 <Button className="up-wide" onClick={skip} disabled={busy}>
@@ -373,12 +394,12 @@ export const UploadDock: React.FC = () => {
                         <div className="up-ub">
                             <Progress pct={resuming ? undefined : pct} />
                             {retryingLede}
-                            <div className="up-fr"><span>{checking ? `${checking.checked} of ${checking.total} checked` : resuming ? `Picking up where you left off · ${plural(waiting, 'file')} left` : `${added} added · ${waiting} waiting`}</span><span>{checking ? 'Skipping ones you have' : timeLeft ?? duplicatesLabel ?? (progress?.mbPerSecond ? `${progress.mbPerSecond.toFixed(1)} MB/s` : '')}</span></div>
+                            <div className="up-fr"><span>{checking ? `${checking.checked} of ${checking.total} checked` : resuming ? `Picking up where you left off · ${plural(waiting, 'file')} left` : retrying ? `${plural(Math.max(0, (retryOf as number) - retried), 'file')} left to retry` : `${added} added · ${waiting} waiting`}</span><span>{checking ? 'Skipping ones you have' : timeLeft ?? duplicatesLabel ?? (progress?.mbPerSecond ? `${progress.mbPerSecond.toFixed(1)} MB/s` : '')}</span></div>
                         </div>
                     ) : null}
                     {!collapsed ? (
                         <>
-                            {!uploadActive ? <div className="up-ub">{showFailed ? failureLede : <p className="up-lede">{plural(pendingUploadSummary?.fileCount ?? 0, 'file')} still waiting.</p>}</div> : null}
+                            {!uploadActive ? <div className="up-ub">{showFailed ? failureLede : pausedLede}</div> : null}
                             {showFailed ? <FailedRows files={failedFiles} onRetry={() => void retry()} retryDisabled={busy} /> : null}
                             <div className="up-uf">
                                 {uploadActive ? (

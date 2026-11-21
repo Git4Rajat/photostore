@@ -342,7 +342,9 @@ interface AppServicesContextValue {
     pausingUpload: boolean;
     // Cancel: drop every file that never started; files that failed stay for Try again.
     cancelRemainingUpload: () => Promise<void>;
-    retryPersistedUploadSession: (sessionId?: string) => Promise<void>;
+    // `scope`: 'resume' continues the files not yet tried, 'failed' retries only the ones that failed.
+    // Left out, it resumes when anything is waiting, otherwise retries the failed ones.
+    retryPersistedUploadSession: (sessionId?: string, scope?: 'resume' | 'failed') => Promise<void>;
     discardPersistedUploadSession: () => Promise<void>;
     registerUploadCompletionHandler: (handler: () => void | Promise<void>) => () => void;
     /** Called (debounced) when server-side work finished that changes what the library shows: photo
@@ -4805,18 +4807,21 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     setPendingUploadSessionLive(latest);
                 }
                 const waitingNow = (latest?.files || []).filter((file) => file.status !== 'done').length;
+                const untriedNow = (latest?.files || []).filter((file) => file.status !== 'done' && file.status !== 'failed').length;
+                const failedNow = waitingNow - untriedNow;
                 const fmt = (n: number) => n.toLocaleString();
-                updateUploadNotification(totalFailed === 0 ? {
+                // Failures are reported once nothing is left to resume; a pause with some failed files is still a pause.
+                updateUploadNotification(untriedNow > 0 || (totalFailed === 0 && failedNow === 0) ? {
                     // A pause is calm: where it stopped, and nothing that reads as a problem.
                     title: 'Upload paused',
-                    details: `${fmt(totalUploaded)} of ${fmt(totalCount)} added · ${fmt(waitingNow)} waiting`,
+                    details: `${fmt(totalUploaded)} of ${fmt(totalCount)} added · ${fmt(untriedNow)} waiting`,
                     story: setStory({ state: 'paused', pausedAt: Date.now() }),
                 } : {
-                    title: `${plural(totalFailed, 'item')} didn’t upload`,
-                    details: `${fmt(totalUploaded)} of ${fmt(totalCount)} were added. The other ${fmt(waitingNow)} need another try.`,
+                    title: `${plural(failedNow || totalFailed, 'item')} didn’t upload`,
+                    details: `${fmt(totalUploaded)} of ${fmt(totalCount)} were added. The other ${fmt(failedNow || waitingNow)} need another try.`,
                     story: setStory({ state: 'failed' }),
                 });
-                setUploadError(totalFailed > 0
+                setUploadError(totalFailed > 0 || failedNow > 0
                     ? 'Some files failed to upload. Retry cached files or reselect missing files.'
                     : 'Some files still need to be reselected before retry.'
                 );
@@ -5060,7 +5065,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         return { matchedCount, unmatchedFiles };
     }, [loadPersistedSession, pendingUploadSession, persistSession, setPendingUploadSessionLive, updatePersistedFile]);
 
-    const retryPersistedUploadSession = useCallback(async (sessionId?: string) => {
+    const retryPersistedUploadSession = useCallback(async (sessionId?: string, scope?: 'resume' | 'failed') => {
         let session = pendingUploadSessionRef.current || pendingUploadSession || loadPersistedSession();
         // A notice may name any session of this checkpoint's retry chain (an
         // abandoned sibling retry included), not only the newest one.
@@ -5084,7 +5089,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         retryInFlightRef.current = true;
         setRetryingUpload(true);
         try {
-            const unfinishedFiles = session.files.filter((file) => file.status !== 'done');
+            // Resume and Retry are different asks: Resume carries on with what was never tried (a pause),
+            // Retry goes back only to what failed. Failed files stay out of a resume; they are offered
+            // once the upload has finished.
+            const waitingFiles = session.files.filter((file) => file.status !== 'done' && file.status !== 'failed');
+            const failedFiles = session.files.filter((file) => file.status === 'failed');
+            const unfinishedFiles = scope === 'failed' || (scope !== 'resume' && waitingFiles.length === 0) || waitingFiles.length === 0
+                ? failedFiles : waitingFiles;
             // Throttled the same way as cacheUploadFilesForResume: an unfinished
             // batch of 1000+ files, most missing from uploadSourceFilesRef after a
             // reload, used to fire that many simultaneous idbGet calls via a bare
