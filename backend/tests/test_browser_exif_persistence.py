@@ -53,3 +53,30 @@ def test_browser_exif_verdict_with_done_report_item_still_persists(browser_apply
     assert row['exif_status'] == 'done'
     from ipwork_geo import geo_exif_from_metadata
     assert geo_exif_from_metadata(dict(row)) is not None
+
+
+def test_browser_result_survives_a_lost_write_race(browser_apply, monkeypatch):
+    """Another writer changes the row between our read and our conditional write.
+    The retry must still store the browser results and keep the other writer's change."""
+    update = browser_apply.update_entity
+    raced = []
+    def other_writer_first(entity, **kwargs):
+        if not raced:
+            raced.append(True)
+            key = ('private-user', 'private.jpg')
+            browser_apply.upsert_entity({**browser_apply.rows[key], 'caption': 'edited elsewhere'})
+        return update(entity, **kwargs)
+    monkeypatch.setattr(browser_apply, 'update_entity', other_writer_first)
+    monkeypatch.setattr(storage_utils.time, 'sleep', lambda *a: None)
+    storage_utils.apply_client_processing_results_for_file(
+        'private-user', 'private.jpg', origin='browser', lease_owner='worker',
+        client_processing={'exif': {
+            'source': 'browser_exiftool', 'verifiedComplete': True,
+            'exifToolJson': {'EXIF:Make': 'Test', 'Composite:GPSLatitude': 10.5, 'Composite:GPSLongitude': 20.25},
+        }})
+    assert raced
+    row = browser_apply.rows[('private-user', 'private.jpg')]
+    assert row['caption'] == 'edited elsewhere'
+    assert json.loads(row['exifData'])['Make'] == 'Test'
+    assert row['exif_status'] == 'done'
+    assert row['processing_lease_owner'] == ''
