@@ -207,3 +207,65 @@ def test_existing_filenames_lookup_on_the_library_database(tmp_path):
     db = search_db.SearchDatabase(path)
     names = [f'p{i}.jpg' for i in range(0, 1200, 2)] + ['ghost.jpg']
     assert db.existing_filenames(names) == {f'p{i}.jpg' for i in range(0, 1200, 2)}
+
+
+# --- smart album of one big upload day -----------------------------------------------------------
+
+def test_smart_album_grouping_is_not_quadratic_and_keeps_order():
+    import time
+    rows = [{'RowKey': f'p{i:06d}.jpg', 'uploadDate': '2026-11-22T10:00:00+00:00'} for i in range(60000)]
+    rows += rows[:1000]                                                   # duplicates are collapsed
+    started = time.monotonic()
+    groups = app._smart_album_candidates('u1', 'recent-upload', rows)
+    assert time.monotonic() - started < 10
+    assert len(groups) == 1 and len(groups[0]['filenames']) == 60000
+    assert groups[0]['filenames'][:2] == ['p000000.jpg', 'p000001.jpg']
+
+
+def test_failed_member_write_leaves_no_orphan_members(monkeypatch):
+    members = FakeTable()
+    monkeypatch.setattr(album_store, '_MEMBERS', members)
+    real = members.submit_transaction
+    calls = []
+
+    def flaky(operations):
+        calls.append(1)
+        if len(calls) > 2:
+            raise RuntimeError('storage down')
+        real(operations)
+    members.submit_transaction = flaky
+    members.upsert_entity = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('storage down'))
+    entity = {'PartitionKey': 'u1', 'RowKey': 'al'}
+    with pytest.raises(RuntimeError):
+        album_store.set_all(entity, [f'p{i:05d}.jpg' for i in range(5000)])
+    assert 'storage' not in entity and not [k for k in members.rows if k[0] == 'al']
+
+
+def test_big_album_members_are_written_in_parallel_batches_and_all_present(monkeypatch):
+    members = FakeTable()
+    monkeypatch.setattr(album_store, '_MEMBERS', members)
+    names = [f'p{i:05d}.jpg' for i in range(28169)]
+    entity = {'PartitionKey': 'u1', 'RowKey': 'al'}
+    album_store.set_all(entity, names)
+    assert album_store.count(entity) == 28169 and album_store.members_intact(entity, names)
+    assert len([k for k in members.rows if k[0] == 'al']) == 28169
+
+
+def test_autocreate_restores_members_of_an_existing_album_that_opens_empty(monkeypatch):
+    members = FakeTable()
+    monkeypatch.setattr(album_store, '_MEMBERS', members)
+    names = [f'p{i:05d}.jpg' for i in range(3000)]
+    broken = {'PartitionKey': 'u1', 'RowKey': 'al', 'name': 'Uploaded: Nov 22, 2026', 'storage': 'table', 'photoCount': 3000}
+    saved = []
+    monkeypatch.setattr(app, '_require_user_id', lambda *a, **k: ('u1', None))
+    monkeypatch.setattr(app, '_albums_table_available', lambda: True)
+    monkeypatch.setattr(app, 'albums_table_client', type('T', (), {'query_entities': lambda self, q: [broken]})())
+    monkeypatch.setattr(app, '_save_album_entity', lambda e: saved.append(e))
+    monkeypatch.setattr(app, '_smart_album_candidates', lambda uid, rule, rows: [{'name': 'Uploaded: Nov 22, 2026', 'filenames': names}])
+    import search_db
+    monkeypatch.setattr(search_db, 'open_database', lambda uid, **k: None)
+    monkeypatch.setattr(app, '_iter_metadata_rows_for_user', lambda *a, **k: iter([]))
+    with app.app.test_request_context('/api/albums/autocreate', method='POST', json={'rule': 'recent-upload'}):
+        albums.autocreate_albums()
+    assert saved and album_store.members_intact(broken, names)
+    assert album_store.page(broken, 0, 5)[0] == names[:5]

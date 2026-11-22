@@ -424,6 +424,22 @@ def purge_album(album_id: str):
         return app.jsonify({'error': 'Internal server error'}), 500
     return app.jsonify({'success': True})
 
+def _resolve_existing_members(existing, filenames):
+    """An album that counts photos but whose member rows are gone (a creation that died after its row
+    was saved, or whose members were swept) opens empty and, being named, is skipped by every later
+    smart-album request. Re-attach its members from the rule's current matches instead."""
+    if not existing or not filenames:
+        return
+    try:
+        if app.album_store.members_intact(existing, filenames):
+            return
+        app.album_store.set_all(existing, filenames)
+        existing['updatedAt'] = app.datetime.now(app.timezone.utc).isoformat()
+        app._save_album_entity(existing)
+    except Exception:
+        app.app.logger.warning('Could not restore the members of smart album %s', existing.get('RowKey'), exc_info=True)
+
+
 @albums_bp.route('/albums/autocreate', methods=['POST'])
 @albums_bp.route('/api/albums/autocreate', methods=['POST'])
 def autocreate_albums():
@@ -469,6 +485,8 @@ def autocreate_albums():
         existing_rows = []
 
     existing_names = {row.get('name') for row in existing_rows if row.get('name')}
+    existing_by_name = {row.get('name'): row for row in existing_rows
+                        if row.get('name') and not app._coerce_bool(row.get('deleted', False))}
     try:
         candidates = app._smart_album_candidates(user_id, rule, metadata_rows)
     except Exception:
@@ -480,6 +498,7 @@ def autocreate_albums():
         name = candidate.get('name') or ''
         filenames, truncated = list(candidate.get('filenames') or []), False
         if name in existing_names:
+            _resolve_existing_members(existing_by_name.get(name), filenames)
             continue
         album_id = str(app.uuid.uuid4())
         now = app.datetime.now(app.timezone.utc).isoformat()

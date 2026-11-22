@@ -9693,9 +9693,11 @@ def _smart_album_group_push(groups: Dict[str, Dict], key: str, name: str, filena
     group = groups.setdefault(key, {
         'name': name,
         'filenames': [],
+        'seen': set(),       # `filename in list` made a 28,000-photo day quadratic
         'latest': datetime.min.replace(tzinfo=timezone.utc),
     })
-    if filename not in group['filenames']:
+    if filename not in group['seen']:
+        group['seen'].add(filename)
         group['filenames'].append(filename)
     if date_value > group['latest']:
         group['latest'] = date_value

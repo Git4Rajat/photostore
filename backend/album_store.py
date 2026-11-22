@@ -267,20 +267,31 @@ def contains(entity: Dict, filename: str) -> bool:
         return False
 
 
+def _transact_chunk(chunk: List[Tuple]) -> None:
+    try:
+        _MEMBERS.submit_transaction(chunk)
+    except Exception:
+        for action, row in chunk:                 # transactions are atomic; singles are idempotent
+            if action == 'upsert':
+                _MEMBERS.upsert_entity(row)
+            else:
+                try:
+                    _MEMBERS.delete_entity(partition_key=row['PartitionKey'], row_key=row['RowKey'])
+                except Exception:
+                    pass
+
+
 def _transact(operations: List[Tuple]) -> None:
-    for start in range(0, len(operations), _BATCH):
-        chunk = operations[start:start + _BATCH]
-        try:
-            _MEMBERS.submit_transaction(chunk)
-        except Exception:
-            for action, row in chunk:                 # transactions are atomic; singles are idempotent
-                if action == 'upsert':
-                    _MEMBERS.upsert_entity(row)
-                else:
-                    try:
-                        _MEMBERS.delete_entity(partition_key=row['PartitionKey'], row_key=row['RowKey'])
-                    except Exception:
-                        pass
+    chunks = [operations[start:start + _BATCH] for start in range(0, len(operations), _BATCH)]
+    if len(chunks) <= 1:
+        for chunk in chunks:
+            _transact_chunk(chunk)
+        return
+    # A 28,000-photo album is ~280 round trips; one after another that outlasts the request, so
+    # the chunks (independent: distinct RowKeys, one partition) go out in parallel.
+    with ThreadPoolExecutor(max_workers=_POOL) as pool:
+        for _ in pool.map(_transact_chunk, chunks):
+            pass
 
 
 def _write_members(entity: Dict, names: List[str]) -> None:
@@ -291,7 +302,16 @@ def _write_members(entity: Dict, names: List[str]) -> None:
 def _promote(entity: Dict, names: List[str]) -> None:
     if _MEMBERS is None:
         raise AlbumTooLarge(f'An album can hold about {max_photos(names)} photos')
-    _write_members(entity, names)
+    try:
+        _write_members(entity, names)
+    except Exception:
+        # The album row is saved only after this returns, so a failure here must not leave
+        # thousands of member rows behind that no album owns.
+        try:
+            delete_members({**entity, 'storage': 'table'})
+        except Exception:
+            pass
+        raise
     entity['storage'] = 'table'
     entity['photoCount'] = len(set(names))
     for index in range(MAX_CHUNKS):
@@ -371,3 +391,15 @@ def delete_members(entity: Dict) -> None:
     pk = _pk(entity)
     rows = [str(r['RowKey']) for r in _MEMBERS.query_entities(f"PartitionKey eq '{_quote(pk)}'", select=['RowKey'])]
     _transact([('delete', {'PartitionKey': pk, 'RowKey': n}) for n in rows])
+
+
+def members_intact(entity: Dict, expected: List[str]) -> bool:
+    """False when a table-backed album's members are missing (a half-created or interrupted album).
+
+    Spot-checks the first, middle and last of ``expected`` rather than reading every row."""
+    if not is_table_backed(entity) or not expected:
+        return True
+    if _MEMBERS is None:
+        return False
+    probes = {expected[0], expected[len(expected) // 2], expected[-1]}
+    return all(contains(entity, name) for name in probes)
