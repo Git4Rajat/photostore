@@ -10,8 +10,13 @@ from typing import Dict, Optional, Tuple
 from PIL import Image, ImageDraw, ImageOps
 
 try:
+    import pillow_heif
     from pillow_heif import register_heif_opener
     register_heif_opener()
+    # Some iPhone 16 HEICs carry an auxiliary image without an 'hvcC' box. libheif fails
+    # while listing it ("No 'hvcC' box"), so the whole file looked undecodable even
+    # though its primary image is fine. Nothing here reads auxiliary images.
+    pillow_heif.options.AUX_IMAGES = False
 except Exception:
     pass
 
@@ -555,6 +560,7 @@ def create_placeholder_thumbnail() -> bytes:
 def create_thumbnail_data(source_bytes: bytes) -> bytes:
     try:
         with Image.open(io.BytesIO(source_bytes)) as image:
+            image.draft('RGB', (max(THUMBNAIL_SIZE), max(THUMBNAIL_SIZE)))  # JPEG only; keeps both sides >= the request
             image = ImageOps.exif_transpose(image)
             image.thumbnail(THUMBNAIL_SIZE, RESAMPLING_LANCZOS)
             if image.mode != 'RGB':
@@ -871,6 +877,9 @@ def convert_image_to_jpeg(image_bytes: bytes, filename: str = '') -> bytes:
                 and len(image_bytes) <= PREVIEW_SKIP_THRESHOLD_BYTES
             ):
                 return image_bytes
+            # JPEG DCT scaling decodes at 1/2, 1/4 or 1/8 size. A 144 MP panorama otherwise
+            # needs ~1.2 GB to decode; the vision worker is killed for memory at that size.
+            image.draft('RGB', (PREVIEW_MAX_DIMENSION, PREVIEW_MAX_DIMENSION))
             image = ImageOps.exif_transpose(image)
             return _encode_preview_jpeg(image)
     except Exception:
