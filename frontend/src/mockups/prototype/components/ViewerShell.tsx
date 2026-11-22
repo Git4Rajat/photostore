@@ -195,6 +195,11 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
         return () => observer.disconnect();
     }, []);
     useEffect(() => { setNatural(null); }, [photoKey]);
+    // The <img> keeps painting the previous photo until the next one has loaded, so after a step the
+    // title changes but the picture does not. Hide the still until the new photo's own load fires
+    // (the preview -> full resolution swap keeps its photoKey, so the preview stays up meanwhile).
+    const [loadedKey, setLoadedKey] = useState<string | null>(null);
+    const stillStale = loadedKey !== photoKey;
 
     // A rotated video turns its drawing, not its box. At a quarter turn the box swaps width and
     // height (centred on the stage) so object-fit: contain fills the stage with the turned picture.
@@ -655,15 +660,23 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
                                 </button>
                             </div>
                         ) : mainSrc && !decodeFailed && !fullResBroken ? (
+                            <>
                             <img
                                 className="pt-viewer-img"
                                 src={mainSrc}
                                 alt={filename}
                                 draggable={false}
-                                style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom}) rotate(${displayRotation}deg)` }}
+                                ref={(el) => { if (el && el.complete && el.naturalWidth > 0) setLoadedKey((k) => (k === photoKey ? k : photoKey)); }}
+                                style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom}) rotate(${displayRotation}deg)`, ...(stillStale ? { visibility: 'hidden' } : null) }}
                                 onError={() => (fullRes && onFullResFailed ? setFullResFailedSrc(mainSrc) : setDecodeFailed(true))}
-                                onLoad={(e) => setNatural({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })}
+                                onLoad={(e) => { setLoadedKey(photoKey); setNatural({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight }); }}
                             />
+                            {stillStale && (
+                                <div className="pt-viewer-loading">
+                                    <Spinner label="" center={false} />
+                                </div>
+                            )}
+                            </>
                         ) : mediaStatus === 'unavailable' || decodeFailed ? (
                             <div className="pt-viewer-unavailable">
                                 <p>Unsupported format — unable to generate a preview.</p>

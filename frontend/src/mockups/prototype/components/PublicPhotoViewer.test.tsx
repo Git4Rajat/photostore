@@ -65,4 +65,29 @@ describe('PublicPhotoViewer', () => {
         rerender(<PublicPhotoViewer photos={photos} index={0} onClose={vi.fn()} onIndexChange={vi.fn()} />);
         expect(screen.queryByText(/can.t be played in your browser/)).toBeNull();
     });
+
+    it('hides the previous photo behind a spinner until the stepped-to photo has loaded', () => {
+        const { rerender, container } = render(<PublicPhotoViewer photos={photos} index={0} onClose={vi.fn()} onIndexChange={vi.fn()} />);
+        const spinner = () => container.ownerDocument.querySelector('.pt-viewer-loading');
+        const img = () => screen.getByAltText(/\.jpg$/) as HTMLImageElement;
+        expect(spinner()).not.toBeNull();
+        fireEvent.load(img());
+        expect(spinner()).toBeNull();
+        expect(img().style.visibility).not.toBe('hidden');
+
+        rerender(<PublicPhotoViewer photos={photos} index={1} onClose={vi.fn()} onIndexChange={vi.fn()} />);
+        expect(img().getAttribute('src')).toBe('https://x/b-preview.jpg');
+        expect(img().style.visibility).toBe('hidden');
+        expect(spinner()).not.toBeNull();
+        fireEvent.load(img());
+        expect(img().style.visibility).not.toBe('hidden');
+        expect(spinner()).toBeNull();
+
+        // Full resolution keeps the same photo, so the preview stays up while it loads.
+        rerender(<PublicPhotoViewer photos={photos} index={0} onClose={vi.fn()} onIndexChange={vi.fn()} />);
+        fireEvent.load(img());
+        fireEvent.click(screen.getByLabelText('Full resolution'));
+        expect(img().style.visibility).not.toBe('hidden');
+        expect(spinner()).toBeNull();
+    });
 });
