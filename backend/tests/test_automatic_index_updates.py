@@ -1062,3 +1062,50 @@ def test_fence_set_mid_scope_still_waits_for_the_scope_reservation(runtime, monk
     finally:
         end()
     assert not runtime.store.control('A', 'vector')['active']
+
+
+class _ReadSpy(Table):
+    def __init__(self):
+        super().__init__()
+        self.reads = []
+
+    def get_entity(self, *args, **kwargs):
+        self.reads.append(args or (kwargs.get('partition_key'), kwargs.get('row_key')))
+        return super().get_entity(*args, **kwargs)
+
+
+@pytest.mark.parametrize('source,kinds', [
+    ('embeddings', {'vector': ['k']}),
+    ('hash', {'hash': ['k']}),
+    ('person', {'people_embedding': ['k']}),
+])
+@pytest.mark.parametrize('stored', [False, True])
+def test_key_only_sources_do_not_read_their_own_old_row(runtime, source, kinds, stored):
+    table = _ReadSpy()
+    entity = {'PartitionKey': 'A', 'RowKey': 'k', 'value': 1}
+    if stored:
+        table.upsert_entity(dict(entity, value=0))
+    for operation in ('create', 'update', 'upsert', 'delete'):
+        assert automatic.mutation_targets(source, table, operation, entity, {}) == (
+            'A', kinds, False, operation == 'delete')
+    assert table.reads == []
+
+
+@pytest.mark.parametrize('stored', [False, True])
+def test_face_embeddings_classify_by_the_face_row_only(runtime, monkeypatch, stored):
+    embeddings, faces = _ReadSpy(), _ReadSpy()
+    faces.upsert_entity({'PartitionKey': 'A', 'RowKey': 'f1', 'personId': 'p1'})
+    if stored:
+        embeddings.upsert_entity({'PartitionKey': 'A', 'RowKey': 'f1', 'embedding': '[]'})
+    monkeypatch.setitem(su._CTX, 'face_table_client', faces)
+    entity = {'PartitionKey': 'A', 'RowKey': 'f1', 'embedding': '[1]'}
+    assert automatic.mutation_targets('face_embeddings', embeddings, 'upsert', entity, {}) == (
+        'A', {'people_embedding': ['p1']}, False, False)
+    assert embeddings.reads == [] and faces.reads == [('A', 'f1')]
+
+
+def test_tracked_embedding_write_costs_no_extra_read(runtime):
+    spy = _ReadSpy()
+    table = su.track_index_source_table(spy, 'embeddings')
+    table.upsert_entity({'PartitionKey': 'A', 'RowKey': 'e1', 'embedding': '[1]'})
+    assert spy.reads == [] and ('A', 'e1') in spy.rows

@@ -802,6 +802,9 @@ def _is_internal_source_row(source, user, key):
     return False
 
 
+_KEY_ONLY_SOURCES = frozenset({'embeddings', 'hash', 'person', 'face_embeddings'})
+
+
 def mutation_targets(source, table, operation, entity, options):
     """Exclude exact internal rows, then derive old AND new owners before writes."""
     import storage_utils as su
@@ -811,12 +814,16 @@ def mutation_targets(source, table, operation, entity, options):
     if _is_internal_source_row(source, user, key):
         return user, {}, False, operation == 'delete'
     old, uncertain = None, False
-    try:
-        old = table.get_entity(user, key)
-    except ResourceNotFoundError:
-        pass
-    except Exception:
-        uncertain = True
+    # These sources map a write to a fixed kind and the exact row key, and
+    # face_embeddings classifies by the photofaces row, so the row's own
+    # previous value is never consulted: skip a read per tracked write.
+    if source not in _KEY_ONLY_SOURCES:
+        try:
+            old = table.get_entity(user, key)
+        except ResourceNotFoundError:
+            pass
+        except Exception:
+            uncertain = True
     deleted = operation == 'delete'
     conditional = bool(old is not None and operation in ('update', 'delete') and
         options.get('match_condition') == MatchConditions.IfNotModified and
