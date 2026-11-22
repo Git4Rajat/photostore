@@ -21,6 +21,7 @@ from upload_waves import ShadowWaves, digest
 from wave_publication import ObligationLedger, compute_obligations
 import wave_policy
 import wave_runtime
+import wave_settlement
 
 
 @pytest.fixture
@@ -274,3 +275,21 @@ def test_runtime_restores_face_preparation_batches_and_source_metrics(live, monk
     assert [len(names) for names in prepared] == [20, 5]
     assert len(processed) == len(set(processed)) == 25
     assert set(processed) == {name for names in prepared for name in names}
+
+
+def test_fully_processed_source_waits_for_its_completion_instead_of_failing(live,monkeypatch):
+    """Every required step finished, but the completion record is not qualified
+    yet. The widget must not count that photo as failed; only after the bounded
+    wait does it give up."""
+    store,metadata,sent,_=live;wave=admit(store,metadata,1)
+    def finished_without_completion(library,filename,revision,renew):
+        row=metadata.rows[library,filename]
+        row.update({step+'_status':'done' for step in STEPS});row['processingCompletionId']='not-yet-qualified'
+    monkeypatch.setattr(wave_runtime,'process_source',finished_without_completion)
+    payload=wake(store,wave,'vision')
+    results=[wave_runtime.consume(payload)]
+    assert store.status(wave)['failedMembers']==0
+    monkeypatch.setattr(wave_settlement,'COMPLETION_WAIT_SECONDS',0)
+    for _ in range(3):
+        results.append(wave_runtime.consume(payload))
+    assert store.status(wave)['failedMembers']==1,results

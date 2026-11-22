@@ -8,6 +8,11 @@ MAX_SOURCE_ATTEMPTS=1
 MAX_INSPECTION_FAILURES=3
 MAX_BLOCKED_CHECKS=3
 BLOCKED_GRACE_SECONDS=300
+# A source whose every required step already finished is not failed just because
+# its completion record has not been qualified yet; wait this long before giving up.
+MAX_COMPLETION_WAIT_CHECKS=3
+COMPLETION_WAIT_SECONDS=300
+FINISHED_STEP_STATUSES=('done','no_data','skipped','unsupported')
 
 
 def blocked_source(store, wave_id, member, metadata):
@@ -203,6 +208,24 @@ def inspection_failed(store, wave_id, member, metadata, error):
     return True
 
 
+def awaiting_completion(store,member):
+    """True while a fully processed source may still get its completion qualified.
+
+    The wait is bounded by both a check count and an age, so a source whose
+    completion never qualifies still reaches a terminal failure."""
+    def record():
+        control=store._required('control');current=store._required(member['RowKey'])
+        if current['outcome']!='pending':return current
+        updated=dict(current,completionWaitChecks=min(MAX_COMPLETION_WAIT_CHECKS,int(current.get('completionWaitChecks',0))+1),
+                     completionWaitSince=current.get('completionWaitSince') or store.clock())
+        if updated!=dict(current):store._commit(control,[store._change(current,updated)])
+        return updated
+    current=store._retry(record)
+    if current['outcome']!='pending':return True  # Settled elsewhere; never overwrite it.
+    age=max(0,store.clock()-current['completionWaitSince'])
+    return current['completionWaitChecks']<MAX_COMPLETION_WAIT_CHECKS or age<COMPLETION_WAIT_SECONDS
+
+
 def exhausted(store,wave_id,member,metadata,count,*,error=None):
     """Force a terminal settlement once a source has had its full retry budget,
     regardless of whether a required step ever recorded 'failed'.
@@ -224,6 +247,10 @@ def exhausted(store,wave_id,member,metadata,count,*,error=None):
         or (row.get('processing_lease_owner') and not _processing_is_expired(row))):return False
     steps=json.loads(member['requiredSteps'])
     statuses={step:row.get(step+'_status','pending') for step in steps}
+    if (statuses and row.get('processingCompletionId')
+            and all(status in FINISHED_STEP_STATUSES for status in statuses.values())
+            and awaiting_completion(store,member)):
+        return False
     reason=('required_step_retries_exhausted' if any(status=='failed' for status in statuses.values())
             else 'source_retries_exhausted')
     from processing_failures import source_details, exception_details
