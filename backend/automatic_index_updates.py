@@ -803,6 +803,20 @@ def _is_internal_source_row(source, user, key):
 
 
 _KEY_ONLY_SOURCES = frozenset({'embeddings', 'hash', 'person', 'face_embeddings'})
+_KNOWN_OLD_ROW = ContextVar('known_old_source_row', default=None)
+
+
+@contextmanager
+def known_old_row(row):
+    """Name the row an ETag-conditional metadata update inside this block was built from.
+
+    Write tracking then diffs against it instead of re-reading the row it was
+    just handed. Pass an unmodified copy that keeps the ETag it was read with."""
+    token = _KNOWN_OLD_ROW.set(row)
+    try:
+        yield
+    finally:
+        _KNOWN_OLD_ROW.reset(token)
 
 
 def mutation_targets(source, table, operation, entity, options):
@@ -814,10 +828,19 @@ def mutation_targets(source, table, operation, entity, options):
     if _is_internal_source_row(source, user, key):
         return user, {}, False, operation == 'delete'
     old, uncertain = None, False
+    known = _KNOWN_OLD_ROW.get() if source == 'metadata' else None
+    if (known is not None and operation == 'update'
+            and options.get('match_condition') == MatchConditions.IfNotModified
+            and known.get('PartitionKey') == user and known.get('RowKey') == key
+            and etag(known) and etag(known) == (options.get('etag') or etag(entity))):
+        # The caller built this conditional write from `known`. It can only land
+        # while the stored row still carries that ETag, i.e. still equals `known`,
+        # so diffing against it is exactly what a fresh read would show.
+        old = known
     # These sources map a write to a fixed kind and the exact row key, and
     # face_embeddings classifies by the photofaces row, so the row's own
     # previous value is never consulted: skip a read per tracked write.
-    if source not in _KEY_ONLY_SOURCES:
+    elif source not in _KEY_ONLY_SOURCES:
         try:
             old = table.get_entity(user, key)
         except ResourceNotFoundError:

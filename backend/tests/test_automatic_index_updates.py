@@ -1109,3 +1109,79 @@ def test_tracked_embedding_write_costs_no_extra_read(runtime):
     table = su.track_index_source_table(spy, 'embeddings')
     table.upsert_entity({'PartitionKey': 'A', 'RowKey': 'e1', 'embedding': '[1]'})
     assert spy.reads == [] and ('A', 'e1') in spy.rows
+
+
+def _photo_row(spy, **fields):
+    spy.upsert_entity({'PartitionKey': 'A', 'RowKey': 'p.jpg', 'tags': '[]', 'exifData': '{}',
+                       'processing_lease_owner': '', **fields})
+    return spy.get_entity('A', 'p.jpg')
+
+
+@pytest.mark.parametrize('changed', [
+    {'processing_lease_owner': 'w'},
+    {'tags': '["cat"]'},
+    {'photoEmbedding': '[1]'},
+    {'tags': '["cat"]', 'photoEmbedding': '[1]', 'processing_lease_owner': 'w'},
+])
+def test_known_old_row_gives_the_same_targets_without_a_read(runtime, changed):
+    spy = _ReadSpy()
+    as_read = _photo_row(spy)
+    spy.reads.clear()
+    entity = copy.copy(as_read)
+    entity.update(changed)
+    options = dict(mode='merge', match_condition=MatchConditions.IfNotModified)
+    expected = automatic.mutation_targets('metadata', spy, 'update', entity, options)
+    assert spy.reads == [('A', 'p.jpg')]
+    spy.reads.clear()
+    with automatic.known_old_row(as_read):
+        assert automatic.mutation_targets('metadata', spy, 'update', entity, options) == expected
+    assert spy.reads == []
+
+
+def test_known_old_row_is_ignored_unless_it_is_exactly_the_row_the_write_was_built_from(runtime):
+    spy = _ReadSpy()
+    as_read = _photo_row(spy)
+    entity = copy.copy(as_read)
+    entity['tags'] = '["cat"]'
+    options = dict(mode='merge', match_condition=MatchConditions.IfNotModified)
+    other_row = copy.copy(as_read)
+    other_row['RowKey'] = 'other.jpg'
+    spy.upsert_entity({'PartitionKey': 'A', 'RowKey': 'p.jpg', 'tags': '[]'})  # the stored row moves on
+    moved_on = spy.get_entity('A', 'p.jpg')  # same row, but not the version the write was built from
+    cases = [
+        (other_row, 'update', options),  # a different row
+        (moved_on, 'update', options),  # a different ETag than the write's own
+        (as_read, 'upsert', options),  # not an update
+        (as_read, 'update', dict(mode='merge')),  # not ETag-conditional
+    ]
+    for hint, operation, opts in cases:
+        spy.reads.clear()
+        with automatic.known_old_row(hint):
+            automatic.mutation_targets('metadata', spy, operation, entity, opts)
+        assert spy.reads == [('A', 'p.jpg')], (operation, opts)
+
+
+def test_known_old_row_does_not_leak_past_its_block(runtime):
+    spy = _ReadSpy()
+    as_read = _photo_row(spy)
+    entity = copy.copy(as_read)
+    options = dict(mode='merge', match_condition=MatchConditions.IfNotModified)
+    with automatic.known_old_row(as_read):
+        pass
+    spy.reads.clear()
+    automatic.mutation_targets('metadata', spy, 'update', entity, options)
+    assert spy.reads == [('A', 'p.jpg')]
+
+
+def test_lease_claim_and_release_cost_no_tracking_read(runtime, monkeypatch):
+    spy = _ReadSpy()
+    spy.upsert_entity({'PartitionKey': 'A', 'RowKey': 'p.jpg', 'tags': '[]', 'fileHash': 'h',
+                       'anonymousImageId': 'id', 'processing_lease_owner': ''})
+    monkeypatch.setitem(su._CTX, 'metadata_table_client', su.track_index_source_table(spy, 'metadata'))
+    monkeypatch.setitem(su._CTX, 'blob_service_client', object())
+    lease = su.claim_processing_lease('A', 'p.jpg', 'w1', mark_running=False)
+    assert spy.reads == [('A', 'p.jpg')]  # the claim's own read only
+    spy.reads.clear()
+    su.release_processing_lease('A', 'p.jpg', 'w1')
+    assert spy.reads == [('A', 'p.jpg')]  # the release's own read only
+    assert spy.rows['A', 'p.jpg']['processing_lease_owner'] == '' and lease['ownerId'] == 'w1'
