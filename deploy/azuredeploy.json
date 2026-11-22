@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.37.4.10188",
-      "templateHash": "17095878787635803281"
+      "templateHash": "13054938910859988008"
     }
   },
   "parameters": {
@@ -132,6 +132,24 @@
       "defaultValue": true,
       "metadata": {
         "description": "Run maintenance in its own queue-scaled app instead of the Tools API sidecar."
+      }
+    },
+    "uploadConcurrentRequests": {
+      "type": "int",
+      "defaultValue": 32,
+      "minValue": 1,
+      "maxValue": 256,
+      "metadata": {
+        "description": "Upload app: concurrent HTTP requests per replica before another replica starts. Live QA value after the 2026-11-22 portal change."
+      }
+    },
+    "uploadMaxReplicas": {
+      "type": "int",
+      "defaultValue": 2,
+      "minValue": 1,
+      "maxValue": 30,
+      "metadata": {
+        "description": "Upload app: maximum replicas. Live QA value after the 2026-11-22 portal change."
       }
     },
     "enableWaveExecution": {
@@ -315,6 +333,12 @@
           "enableIndexPush": {
             "value": "[parameters('enableIndexPush')]"
           },
+          "uploadConcurrentRequests": {
+            "value": "[parameters('uploadConcurrentRequests')]"
+          },
+          "uploadMaxReplicas": {
+            "value": "[parameters('uploadMaxReplicas')]"
+          },
           "enableWaveExecution": {
             "value": "[parameters('enableWaveExecution')]"
           },
@@ -353,7 +377,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.37.4.10188",
-              "templateHash": "9739537586486190288"
+              "templateHash": "2383065096735330277"
             }
           },
           "parameters": {
@@ -487,6 +511,24 @@
               "defaultValue": true,
               "metadata": {
                 "description": "Scale the index maintenance worker independently from the Tools API; false retains the legacy sidecar topology."
+              }
+            },
+            "uploadConcurrentRequests": {
+              "type": "int",
+              "defaultValue": 32,
+              "minValue": 1,
+              "maxValue": 256,
+              "metadata": {
+                "description": "Upload app: concurrent HTTP requests per replica before another replica starts. Live QA value after the 2026-11-22 portal change."
+              }
+            },
+            "uploadMaxReplicas": {
+              "type": "int",
+              "defaultValue": 2,
+              "minValue": 1,
+              "maxValue": 30,
+              "metadata": {
+                "description": "Upload app: maximum replicas. Live QA value after the 2026-11-22 portal change."
               }
             },
             "enableWaveExecution": {
@@ -1435,13 +1477,13 @@
                   "scale": {
                     "cooldownPeriod": 300,
                     "minReplicas": 0,
-                    "maxReplicas": 5,
+                    "maxReplicas": "[parameters('uploadMaxReplicas')]",
                     "rules": [
                       {
                         "name": "http-scaler",
                         "http": {
                           "metadata": {
-                            "concurrentRequests": "8"
+                            "concurrentRequests": "[string(parameters('uploadConcurrentRequests'))]"
                           }
                         }
                       }
