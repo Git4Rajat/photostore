@@ -76,6 +76,16 @@ param separateIndexWorker bool = true
 
 
 
+@description('Upload app: concurrent HTTP requests per replica before another replica starts. Live QA value after the 2026-11-22 portal change.')
+@minValue(1)
+@maxValue(256)
+param uploadConcurrentRequests int = 32
+
+@description('Upload app: maximum replicas. Live QA value after the 2026-11-22 portal change.')
+@minValue(1)
+@maxValue(30)
+param uploadMaxReplicas int = 2
+
 @description('Enable qualified wave execution after certificate seeding; fresh installs use deploy/fresh_wave.py.')
 param enableWaveExecution bool = true
 @description('Enroll newly created empty libraries only. Existing libraries never change ownership.')
@@ -136,6 +146,8 @@ module app 'resources.bicep' = {
     dedicatedIndexWorker: dedicatedIndexWorker
     separateIndexWorker: separateIndexWorker
     enableIndexPush: enableIndexPush
+    uploadConcurrentRequests: uploadConcurrentRequests
+    uploadMaxReplicas: uploadMaxReplicas
     enableWaveExecution: enableWaveExecution
     enableNewWaveLibraries: enableNewWaveLibraries
     waveCapabilityId: waveCapabilityId

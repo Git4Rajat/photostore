@@ -84,6 +84,16 @@ param dedicatedIndexWorker bool = true
 @description('Scale the index maintenance worker independently from the Tools API; false retains the legacy sidecar topology.')
 param separateIndexWorker bool = true
 
+@description('Upload app: concurrent HTTP requests per replica before another replica starts. Live QA value after the 2026-11-22 portal change.')
+@minValue(1)
+@maxValue(256)
+param uploadConcurrentRequests int = 32
+
+@description('Upload app: maximum replicas. Live QA value after the 2026-11-22 portal change.')
+@minValue(1)
+@maxValue(30)
+param uploadMaxReplicas int = 2
+
 @description('Enable qualified wave execution after certificate seeding; fresh installs use deploy/fresh_wave.py.')
 param enableWaveExecution bool = true
 @description('Enroll newly created empty libraries only. Existing libraries never change ownership.')
@@ -1576,7 +1586,7 @@ resource upload 'Microsoft.App/containerApps@2025-01-01' = {
         // of lull instead of scaling down into it.
         cooldownPeriod: 300
         minReplicas: 0
-        maxReplicas: 5
+        maxReplicas: uploadMaxReplicas
         rules: [
           {
             name: 'http-scaler'
@@ -1588,7 +1598,10 @@ resource upload 'Microsoft.App/containerApps@2025-01-01' = {
                 // historically (not 2x), so sustained demand still has to
                 // clearly exceed one replica's real capacity to trigger
                 // scale-out rather than sitting flush with it.
-                concurrentRequests: '8'
+                // 2026-11-22: now the uploadConcurrentRequests parameter (live
+                // QA value 32). A one-browser test never exceeded 4 requests in
+                // flight, so neither 8 nor 32 has been exercised under load.
+                concurrentRequests: string(uploadConcurrentRequests)
               }
             }
           }
