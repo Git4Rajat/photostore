@@ -1659,11 +1659,6 @@
 @keyframes pd-slide { 0% { transform: translateX(-100%); } 100% { transform: translateX(250%); } }
 .pd-spin { width: 14px; height: 14px; border-radius: 50%; border: 2px solid currentColor; border-top-color: transparent; animation: pd-rot 1s linear infinite; }
 @keyframes pd-rot { to { transform: rotate(360deg); } }
-.pd-x { all: unset; position: absolute; top: 8px; right: 8px; width: 28px; height: 28px; display: grid; place-items: center; color: var(--muted); cursor: pointer; border-radius: 50%; }
-.pd-fin .up-head { padding-right: 34px; }
-.pd-fin .pd-x { top: 16px; right: 10px; }
-.pd-x:focus-visible { outline: 2px solid var(--accent); }
-.pd-x svg { width: 16px; height: 16px; }
 .pd-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 12px; }
 .pd-step { display: flex; align-items: center; gap: 12px; }
 .pd-dot { width: 28px; height: 28px; border-radius: 50%; flex: none; display: grid; place-items: center; background: var(--lg-surface-wash); color: var(--muted); font-size: 12px; font-weight: 700; }
@@ -1684,8 +1679,10 @@
 .up-result.up-tray { width: 372px; }
 .up-rr { display: flex; align-items: center; gap: 11px; }
 .up-result.up-tray .up-rr { padding: 12px 10px 12px 16px; }
-.up-rr .btn-icon { width: 28px; height: 28px; min-height: 0; padding: 0; flex: none; }
-.up-rr .btn-icon svg { width: 16px; height: 16px; }
+.pd-row { display: flex; align-items: center; gap: 11px; }
+.pd-row .up-head { flex: 1; width: auto; min-width: 0; }
+.pd-row .btn-icon, .up-rr .btn-icon { width: 28px; height: 28px; min-height: 0; padding: 0; flex: none; }
+.pd-row .btn-icon svg, .up-rr .btn-icon svg { width: 16px; height: 16px; }
 .up-dock button:disabled, .up-dock .btn:disabled { opacity: 0.55; cursor: default; }
 .up-dock .btn[aria-busy="true"]::before { content: ""; width: 12px; height: 12px; margin-right: 8px; border-radius: 50%; border: 2px solid currentColor; border-right-color: transparent; display: inline-block; vertical-align: -2px; animation: up-spin 0.8s linear infinite; }
 @keyframes up-spin { to { transform: rotate(360deg); } }
