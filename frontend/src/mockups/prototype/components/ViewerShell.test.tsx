@@ -104,6 +104,56 @@ const zoomIn = () => {
     fireEvent.wheel(stage, { deltaY: -100, clientX: 400, clientY: 300 });
 };
 
+describe('ViewerShell info panel dismissal', () => {
+    it('a click on the photo closes the open info panel and leaves the floating tools alone', () => {
+        const onDismissInfo = vi.fn();
+        render(<ViewerShell {...props({ onDismissInfo })} />);
+        fireEvent.click(screen.getByAltText('IMG_1.HEIC'));
+        expect(onDismissInfo).toHaveBeenCalledTimes(1);
+        expect(toolsShown()).toBe(false);
+    });
+
+    it('a mouse click closes it too', () => {
+        const onDismissInfo = vi.fn();
+        render(<ViewerShell {...props({ onDismissInfo })} />);
+        const photo = document.querySelector('.pt-viewer-photo')!;
+        fireEvent.pointerDown(photo, { pointerType: 'mouse' });
+        fireEvent.click(screen.getByAltText('IMG_1.HEIC'));
+        expect(onDismissInfo).toHaveBeenCalledTimes(1);
+        expect(toolsShown()).toBe(false);
+    });
+
+    it('a tap on a video closes it', () => {
+        const onDismissInfo = vi.fn();
+        render(<ViewerShell {...props({ photoKey: 'clip.mp4', filename: 'clip.mp4', videoSrc: 'https://x/clip.mp4', showFullResControl: false, onDismissInfo })} />);
+        fireEvent.click(document.querySelector('video')!);
+        expect(onDismissInfo).toHaveBeenCalledTimes(1);
+        expect(toolsShown()).toBe(false);
+    });
+
+    it('a tap on a zoomed photo closes it instead of toggling the tools', () => {
+        const onDismissInfo = vi.fn();
+        render(<ViewerShell {...props({ onDismissInfo })} />);
+        zoomIn();
+        tapAt(document.querySelector('.pt-viewer-photo')!);
+        expect(onDismissInfo).toHaveBeenCalledTimes(1);
+        expect(toolsShown()).toBe(false);
+    });
+
+    it('a click on the info panel itself does not close it', () => {
+        const onDismissInfo = vi.fn();
+        render(<ViewerShell {...props({ onDismissInfo, info: <aside className="pt-viewer-info">Details</aside> })} />);
+        fireEvent.click(screen.getByText('Details'));
+        expect(onDismissInfo).not.toHaveBeenCalled();
+    });
+
+    it('with no info panel open a click toggles the tools as before', () => {
+        render(<ViewerShell {...props()} />);
+        fireEvent.click(screen.getByAltText('IMG_1.HEIC'));
+        expect(toolsShown()).toBe(true);
+    });
+});
+
 describe('ViewerShell floating panel', () => {
     afterEach(() => { vi.useRealTimers(); });
 

@@ -192,6 +192,7 @@ const PhotoViewer: React.FC = () => {
             // For a RAW, FR loads the backend's native-size embedded preview (see useMainMedia).
             showFullResControl={!isVideo}
             onDownloadOriginal={startDownload}
+            onDismissInfo={showInfo ? () => setShowInfo(false) : undefined}
             info={showInfo ? (
                     <aside className="pt-viewer-info" aria-label="Photo information">
                             {!meta ? (
