@@ -38,12 +38,13 @@ class FakeTable:
         merging = str(getattr(mode, 'value', mode) or '').lower() == 'merge' and key in self.rows
         self.rows[key] = {**self.rows[key], **entity} if merging else dict(entity)
         self.stamps[(entity['PartitionKey'], entity['RowKey'])] = self.clock() if self.clock else datetime.now(timezone.utc)
+        return {'etag': str(self.versions[key])}  # like the service: the new ETag comes back with every write
 
     def create_entity(self, entity, **kwargs):
         from azure.core.exceptions import ResourceExistsError
         if (entity['PartitionKey'], entity['RowKey']) in self.rows:
             raise ResourceExistsError('entity already exists')
-        self.upsert_entity(entity)
+        return self.upsert_entity(entity)
 
     def submit_transaction(self, operations):
         # Real azure-data-tables requires every entity in one transaction to
@@ -72,7 +73,7 @@ class FakeTable:
             else:
                 raise ValueError(f'Unsupported fake transaction op: {op_type}')
 
-    def update_entity(self, entity, mode=None, *, etag=None, match_condition=None):
+    def update_entity(self, entity, mode=None, *, etag=None, match_condition=None, **kwargs):
         # Match conditional writes, including projected MERGE entities.
         key = (entity['PartitionKey'], entity['RowKey'])
         if key not in self.rows:
@@ -82,6 +83,7 @@ class FakeTable:
             raise ResourceModifiedError('changed')
         self.rows[key] = {**self.rows[key], **entity} if mode == 'merge' else dict(entity)
         self.versions[key] = self.versions.get(key, 0) + 1
+        return {'etag': str(self.versions[key])}
 
     def get_entity(self, partition_key, row_key):
         key = (partition_key, row_key)

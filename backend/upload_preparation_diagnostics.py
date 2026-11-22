@@ -87,11 +87,17 @@ def rejection_reason(error, domain='metadata'):
     return 'storage_http_' + str(status) if type(status) is int and 400 <= status <= 599 else domain + '_exception'
 
 
-def record_receipt(app, user_id, filename, payload, *, packet_accepted=False, packet_rejection=None, processing_rejection=None, duplicate=False):
+def record_receipt(app, user_id, filename, payload, *, packet_accepted=False, packet_rejection=None, processing_rejection=None, duplicate=False,
+                   extra_updates=None, initial_entity=None):
+    """Store the receipt on the photo's row; True when the row was written.
+
+    ``extra_updates`` are stored in the same write (the caller falls back to writing them itself when
+    this returns False). ``initial_entity`` is the caller's current copy of the row, used instead of reading it."""
     report = bounded_report(payload.get('preparationReport'))
     # Do not add storage work or change behavior for old/non-preparation clients.
     if report is None:
-        return
+        return False
+    written = False
     try:
         record = None
         def derive(row):
@@ -117,10 +123,12 @@ def record_receipt(app, user_id, filename, payload, *, packet_accepted=False, pa
             if processing_rejection and any(receipts[asset] == 'rejected' for asset in ('preview', 'thumbnail')):
                 receipts['processingReason'] = processing_rejection
             record = {'browserClaim': report, 'backendReceipt': receipts}
-            return {'uploadPreparationReport': json.dumps(record, separators=(',', ':'))}
-        updated = app._update_metadata_entity_fields(user_id, filename, {}, derive_updates=derive)
+            return {**(extra_updates or {}), 'uploadPreparationReport': json.dumps(record, separators=(',', ':'))}
+        updated = app._update_metadata_entity_fields(user_id, filename, {}, derive_updates=derive,
+                                                     **({'initial_entity': initial_entity} if initial_entity is not None else {}))
         if updated is None or record is None:
             raise RuntimeError('Receipt metadata unavailable')
+        written = True
         receipts = record['backendReceipt']
         from processing_diagnostics import file_event, batch_id
         for asset in ('preview', 'thumbnail', 'metadata'):
@@ -136,3 +144,4 @@ def record_receipt(app, user_id, filename, payload, *, packet_accepted=False, pa
     except Exception:
         # Diagnostic failures never reject a successfully uploaded original.
         app.app.logger.info('upload preparation receipt unavailable user=%s file=%s', user_id, filename)
+    return written

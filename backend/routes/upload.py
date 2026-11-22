@@ -47,6 +47,12 @@ def close_source_reservations(error):
         app.app.logger.warning('Could not close shared source reservations', exc_info=True)
 
 
+def _from_row(row):
+    """Keyword for a follow-up update of a row this request just wrote: its copy with the ETag of that
+    write. Nothing when there is no such ETag, so the update reads the row as it always did."""
+    return {'initial_entity': row} if row is not None and getattr(row, 'metadata', {}).get('etag') else {}
+
+
 def attach_live_photo(user_id, final_name, metadata):
     """Attach a just-finalized Live Photo half to its other half (see live_photos.py). Never fails an upload."""
     try:
@@ -861,6 +867,9 @@ def finalize_upload_batch():
         try:
             # This call writes one source. Checking every other reservation on
             # each internal write fence made a batch's storage reads quadratic.
+            # The row as finalize wrote it, with that write's ETag: each later update of this row below
+            # starts from it instead of reading the row again.
+            written_row = []
             with finalization_item(item.get('waveSessionId'), item.get('waveItemId')):
                 duplicates, final_name = timed_call('finalize_metadata', app.finalize_uploaded_file,
                     user_id,
@@ -871,6 +880,7 @@ def finalize_upload_batch():
                     client_asset_id=str(item.get('clientAssetId') or item.get('uploadId') or ''),
                     client_sha256=str(item.get('sha256') or ''),
                     anonymous_blob_name=anonymous_blob_name,
+                    row_out=written_row,
                 )
         except Exception as exc:
             app.app.logger.exception('Batch finalize failed for %s', filename)
@@ -896,7 +906,8 @@ def finalize_upload_batch():
                 client_last_modified_iso = app.epoch_millis_to_iso(item.get('clientLastModified'))
                 if client_last_modified_iso:
                     finalize_updates['clientLastModified'] = client_last_modified_iso
-                metadata = timed_call('metadata_stamp', app._update_metadata_entity_fields, user_id, final_name, finalize_updates)
+                metadata = timed_call('metadata_stamp', app._update_metadata_entity_fields, user_id, final_name, finalize_updates,
+                                      **_from_row(written_row[0] if written_row else None))
         except Exception:
             app.app.logger.debug('Could not stamp finalize metadata for %s', final_name)
 
@@ -926,6 +937,7 @@ def finalize_upload_batch():
                     client_processing=item.get('clientProcessing'),
                     client_processing_report=item.get('clientProcessingReport'),
                     client_asset_id=str(item.get('clientAssetId') or item.get('uploadId') or ''),
+                    **_from_row(metadata),
                 )
             except Exception as exc:
                 processing_rejection = rejection_reason(exc, domain='processing')
@@ -936,20 +948,37 @@ def finalize_upload_batch():
             pass
         packet_accepted = False
         packet_rejection = 'backend_disabled' if not uploads_enabled(final_name) else 'processing_isolated' if isolated(metadata) else None
+        # A photo's packet is stored together with its receipt: one update of the row instead of two. A
+        # video's packet is read back from the row right away, so it is stored on its own.
+        deferred_packet = None
         if not duplicates and not isolated(metadata) and item.get('clientMetadata'):
             try:
-                timed_call('metadata_packet', stamp_candidate, app, user_id, final_name, item['clientMetadata'],
-                           anonymous_blob_name, total_size, str(item.get('sha256') or ''))
                 if app.is_video_file(final_name):
+                    timed_call('metadata_packet', stamp_candidate, app, user_id, final_name, item['clientMetadata'],
+                               anonymous_blob_name, total_size, str(item.get('sha256') or ''), metadata)
                     from video_metadata import apply_browser_video_metadata
                     metadata = timed_call('metadata_packet', apply_browser_video_metadata, app, user_id, final_name,
                                           str(item.get('clientAssetId') or item.get('uploadId') or ''))
+                else:
+                    deferred_packet = timed_call('metadata_packet', stamp_candidate, app, user_id, final_name, item['clientMetadata'],
+                                                 anonymous_blob_name, total_size, str(item.get('sha256') or ''), metadata, True)
                 packet_accepted = uploads_enabled(final_name)
             except Exception as exc:
                 packet_rejection = rejection_reason(exc)
                 app.app.logger.info('Metadata sidecar rejected for %s; original fallback=%s', final_name, not app.is_video_file(final_name))
-        record_receipt(app, user_id, final_name, item, packet_accepted=packet_accepted,
-                       packet_rejection=packet_rejection, processing_rejection=processing_rejection, duplicate=bool(duplicates))
+        receipt_stored = record_receipt(app, user_id, final_name, item, packet_accepted=packet_accepted,
+                                        packet_rejection=packet_rejection, processing_rejection=processing_rejection,
+                                        duplicate=bool(duplicates),
+                                        **({'extra_updates': deferred_packet} if deferred_packet else {}), **_from_row(metadata))
+        if deferred_packet and not receipt_stored:
+            # No receipt to carry it (older client, or the receipt write failed): store the packet on its own.
+            try:
+                timed_call('metadata_packet', app._update_metadata_entity_fields, user_id, final_name, deferred_packet,
+                           **_from_row(metadata))
+            except Exception as exc:
+                packet_rejection = rejection_reason(exc)
+                packet_accepted = False
+                app.app.logger.info('Metadata sidecar rejected for %s; original fallback=%s', final_name, not app.is_video_file(final_name))
         if not duplicates:
             attach_live_photo(user_id, final_name, metadata)
             try:
