@@ -3,6 +3,7 @@ import { RotateCcw as ArrowUturnLeftIcon, RotateCw as ArrowUturnRightIcon, ZoomO
 import { BackGlyph as ChevronLeftIcon, ChevGlyph as ChevronRightIcon, DownloadGlyph as DownloadIcon } from './RedesignIcons';
 import { Spinner } from './bits';
 import { TurnedVideoControls } from './TurnedVideoControls';
+import { isOpenSwipe, startsInBottomZone } from './bottomSwipeUp';
 
 export const ZOOM_MIN = 1;
 export const ZOOM_MAX = 4;
@@ -57,6 +58,8 @@ export interface ViewerShellProps {
     onDownloadOriginal: () => void;
     /** Rendered inside the stage (the info panel). */
     info?: React.ReactNode;
+    /** Called when a finger swipes up from the bottom of the screen. Leave unset while the panel is already open. */
+    onSwipeUpFromBottom?: () => void;
     /** The bottom action bar's groups. */
     bar: React.ReactNode;
 }
@@ -77,7 +80,7 @@ export const liveCorner = (natural: { w: number; h: number } | null, box: { w: n
 
 const ViewerShell: React.FC<ViewerShellProps> = ({
     photoKey, filename, title, subtitle, index, count, initialRotation = 0, onRotate, onClose, onStep,
-    media, videoSrc, onVideoError, videoFailed: videoFailedProp, videoPoster, liveSrc, fullRes, onToggleFullRes, onFullResFailed, showFullResControl, onDownloadOriginal, info, bar,
+    media, videoSrc, onVideoError, videoFailed: videoFailedProp, videoPoster, liveSrc, fullRes, onToggleFullRes, onFullResFailed, showFullResControl, onDownloadOriginal, info, onSwipeUpFromBottom, bar,
 }) => {
     const { url: mainSrc, loading: fullResLoading, progress: fullResProgress, status: mediaStatus } = media;
     const [rotation, setRotation] = useState(0);
@@ -161,6 +164,8 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
     useEffect(() => { setLivePlaying(false); }, [photoKey]);
     const videoFailed = onVideoError ? Boolean(videoFailedProp) : videoErrored;
     const swipeRef = useRef<{ x: number; y: number } | null>(null);
+    // A swipe up that began at the bottom edge (see bottomSwipeUp). Tracked on the root so it also covers the action bar.
+    const bottomSwipeRef = useRef<{ x: number; y: number; t: number } | null>(null);
     // Zoom and pan are for photos; a video's stage never scales, so pinch and wheel leave it alone.
     const zoomableRef = useRef(!videoSrc);
     zoomableRef.current = !videoSrc;
@@ -498,7 +503,29 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
     };
 
     return (
-        <div ref={rootRef} tabIndex={-1} className={`pt-viewer${showTools ? ' tools-visible' : ''}`} role="dialog" aria-modal="true" aria-label="Photo viewer">
+        <div
+            ref={rootRef}
+            tabIndex={-1}
+            className={`pt-viewer${showTools ? ' tools-visible' : ''}`}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Photo viewer"
+            onTouchStart={(e) => {
+                const t = e.touches[0];
+                bottomSwipeRef.current = onSwipeUpFromBottom && e.touches.length === 1 && !zoomed && !isControl(e.target)
+                    && startsInBottomZone(t.clientY, window.innerHeight)
+                    ? { x: t.clientX, y: t.clientY, t: e.timeStamp }
+                    : null;
+            }}
+            onTouchMove={(e) => { if (e.touches.length !== 1) bottomSwipeRef.current = null; }}
+            onTouchEnd={(e) => {
+                const start = bottomSwipeRef.current;
+                bottomSwipeRef.current = null;
+                const t = e.changedTouches[0];
+                if (start && t && isOpenSwipe(t.clientX - start.x, t.clientY - start.y, e.timeStamp - start.t)) onSwipeUpFromBottom?.();
+            }}
+            onTouchCancel={() => { bottomSwipeRef.current = null; }}
+        >
             <div className="pt-viewer-top">
                 <button type="button" className="pt-viewer-back" onClick={onClose} aria-label="Back" title="Back">
                     <ChevronLeftIcon />

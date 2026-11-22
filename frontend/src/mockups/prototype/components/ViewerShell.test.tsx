@@ -232,3 +232,27 @@ describe('ViewerShell full resolution', () => {
         expect(screen.getByText(/Unsupported format/)).toBeTruthy();
     });
 });
+
+describe('ViewerShell swipe up from the bottom', () => {
+    const swipe = (target: Element, from: number, to: number, ts = [0, 200]) => {
+        fireEvent.touchStart(target, { touches: [{ clientX: 100, clientY: from }], timeStamp: ts[0] });
+        fireEvent.touchEnd(target, { changedTouches: [{ clientX: 100, clientY: to }], timeStamp: ts[1] });
+    };
+    const dialog = () => screen.getByRole('dialog');
+
+    it('opens from the bottom zone', () => {
+        const open = vi.fn();
+        render(<ViewerShell {...props({ onSwipeUpFromBottom: open })} />);
+        swipe(dialog(), window.innerHeight - 70, window.innerHeight - 200);
+        expect(open).toHaveBeenCalledTimes(1);
+    });
+
+    it('ignores swipes from the home-indicator strip, higher up, or on a button', () => {
+        const open = vi.fn();
+        render(<ViewerShell {...props({ onSwipeUpFromBottom: open })} />);
+        swipe(dialog(), window.innerHeight - 5, window.innerHeight - 200);
+        swipe(dialog(), window.innerHeight - 400, window.innerHeight - 600);
+        swipe(screen.getByRole('button', { name: 'Previous' }), window.innerHeight - 70, window.innerHeight - 200);
+        expect(open).not.toHaveBeenCalled();
+    });
+});
