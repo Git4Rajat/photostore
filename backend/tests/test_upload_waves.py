@@ -481,8 +481,22 @@ def test_contention_beyond_old_retry_budget_can_finish_without_partial_writes(wo
     result = store.open_session('after-contention', 0)
     assert result['state'] == 'open'
     assert len(attempts) == 11  # ten conflicts, then the atomic intake commit
-    assert len(pauses) == 10 and all(0 < pause <= .5 for pause in pauses)
+    assert len(pauses) == 10 and all(0 < pause <= upload_waves.RETRY_PAUSE_CAP_SECONDS for pause in pauses)
     assert len(table.transactions) == 1  # the atomic intake commit
+
+
+def test_pauses_stay_short_however_long_the_control_row_stays_busy(world, monkeypatch):
+    import upload_waves
+    store, _, _ = world
+    pauses, attempts = [], []
+    monkeypatch.setattr(upload_waves.time, 'sleep', pauses.append)
+    def competing_write():
+        attempts.append(1)
+        if len(attempts) <= 40:
+            raise ResourceModifiedError('another replica committed')
+        return 'committed'
+    assert store._retry(competing_write) == 'committed'
+    assert len(pauses) == 40 and max(pauses) <= upload_waves.RETRY_PAUSE_CAP_SECONDS
 
 
 def test_storage_contention_is_distinct_and_records_failed_operation(world, monkeypatch):

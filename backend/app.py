@@ -11814,7 +11814,10 @@ def _run_grid_image_job(payload: Dict) -> None:
         filters.append(f"Timestamp ge datetime'{since}'")
     rows = _iter_metadata_rows_for_user(user_id, select=list(grid_images.SOURCE_FIELDS),
                                         extra_filter=' and '.join(filters), purpose='grid_images.scan')
-    result = grid_images.run_batch(rows, lambda row: _make_grid_image(user_id, row), limit=grid_images.BATCH_SIZE)
+    # One index publication for the whole batch, not one per photo: the workers
+    # would otherwise race each other and the index worker on the same manifests.
+    with storage_utils_module.deferred_index_publication(user_id):
+        result = grid_images.run_batch(rows, lambda row: _make_grid_image(user_id, row), limit=grid_images.BATCH_SIZE)
     try:
         made = max(0, int(payload.get('made') or 0)) + result['made']
     except (TypeError, ValueError):

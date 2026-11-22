@@ -193,6 +193,7 @@ const PhotoViewer: React.FC = () => {
             showFullResControl={!isVideo}
             onDownloadOriginal={startDownload}
             onSwipeUpFromBottom={showInfo ? undefined : () => setShowInfo(true)}
+            onDismissInfo={showInfo ? () => setShowInfo(false) : undefined}
             info={showInfo ? (
                     <aside className="pt-viewer-info" aria-label="Photo information">
                             {!meta ? (

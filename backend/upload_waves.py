@@ -36,6 +36,11 @@ REFRESH_EVERY = 3
 # requests lost 16 races in a row (~1-2 s) and failed with 503 even though
 # the photos themselves were stored. Same patience as index coverage (#209).
 MUTATION_PATIENCE_SECONDS = float(os.getenv('UPLOAD_WAVE_MUTATION_PATIENCE_SECONDS', '20'))
+# Longest pause between lost races. One attempt (re-read, commit) takes about
+# 0.1-0.2 s, so a pause of up to 0.5 s let a request sit out several commits by
+# its neighbours; at ~100 ms the slowest requests finish roughly twice as fast
+# in a four-writer simulation, with the same number of races lost overall.
+RETRY_PAUSE_CAP_SECONDS = 0.1
 EMPTY_DIGEST = hashlib.sha256(b'upload-wave-shadow-v1').hexdigest()
 
 
@@ -150,7 +155,7 @@ class ShadowWaves:
             # Immediate retries can repeatedly lose to another request on the
             # library control row. Yield with bounded jitter; still fail closed
             # after the patience rather than weakening the conditional commit.
-            time.sleep(random.uniform(0.001, min(0.5, 0.002 * (2 ** min(attempt - 1, 8)))))
+            time.sleep(random.uniform(0.001, min(RETRY_PAUSE_CAP_SECONDS, 0.002 * (2 ** min(attempt - 1, 8)))))
 
     def _page(self, prefix, after='', *, size=MAX_PAGE):
         # RowKey range + service paging: never materialize an entire library.

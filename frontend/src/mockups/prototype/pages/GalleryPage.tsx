@@ -5,6 +5,7 @@ import type { CaptureRange } from '../store';
 import { useAppServices } from '../../../components/AppServicesProvider';
 import { invalidateLocalSortIndex } from '../../../services/localSortIndex';
 import PhotoGrid, { type HeadingGrain } from '../components/PhotoGrid';
+import { useGalleryScrollMemory } from '../components/useGalleryScrollMemory';
 import TimelineBrowser from '../components/TimelineBrowser';
 import { Spinner } from '../components/bits';
 import { SearchGlyph as SearchIcon, UploadGlyph as ArrowUpTrayIcon, PhotosGlyph as PhotoIcon, UserPlusGlyph as UserPlusIcon } from '../components/RedesignIcons';
@@ -78,6 +79,11 @@ const GalleryPage: React.FC = () => {
         const scroller = scrollParentOf(el);
         if (scroller) scroller.scrollTop += delta; else window.scrollBy(0, delta);
     }, [tileMin]);
+    // Coming back from another page (or browser back/forward) lands on the same photos.
+    useGalleryScrollMemory({
+        gridRef, trackable: level === 'days' && !captureRange,
+        photoCount: photos.length, hasMore: hasMorePhotos, loading: photosLoading, loadMore: loadMorePhotos,
+    });
     // Entering/leaving selection mode collapses/restores the app header, which
     // moves the grid under the finger: keep the pressed tile where it was.
     const pressAnchorRef = useRef<{ id: string; top: number } | null>(null);
@@ -262,7 +268,11 @@ const GalleryPage: React.FC = () => {
         if (!target) { openedPhotoParamRef.current = null; return; }
         if (openedPhotoParamRef.current === target) return;
         openedPhotoParamRef.current = target;
-        focusPhoto(target);
+        // Scroll the grid to the photo behind the viewer, so closing it leaves
+        // the gallery there: now if its tile is already rendered, else when the
+        // page that holds it lands (the photos effect above).
+        pendingScrollIdRef.current = target;
+        void focusPhoto(target).then(() => { window.requestAnimationFrame(() => scrollToTile(target)); });
     }, [route.params.photo, focusPhoto]);
 
     // Drill from Years → Months → Days.

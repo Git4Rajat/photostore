@@ -60,6 +60,8 @@ export interface ViewerShellProps {
     info?: React.ReactNode;
     /** Called when a finger swipes up from the bottom of the screen. Leave unset while the panel is already open. */
     onSwipeUpFromBottom?: () => void;
+    /** Set while the info panel is open: a click or tap on the photo or video calls it instead of toggling the floating tools. */
+    onDismissInfo?: () => void;
     /** The bottom action bar's groups. */
     bar: React.ReactNode;
 }
@@ -80,7 +82,7 @@ export const liveCorner = (natural: { w: number; h: number } | null, box: { w: n
 
 const ViewerShell: React.FC<ViewerShellProps> = ({
     photoKey, filename, title, subtitle, index, count, initialRotation = 0, onRotate, onClose, onStep,
-    media, videoSrc, onVideoError, videoFailed: videoFailedProp, videoPoster, liveSrc, fullRes, onToggleFullRes, onFullResFailed, showFullResControl, onDownloadOriginal, info, onSwipeUpFromBottom, bar,
+    media, videoSrc, onVideoError, videoFailed: videoFailedProp, videoPoster, liveSrc, fullRes, onToggleFullRes, onFullResFailed, showFullResControl, onDownloadOriginal, info, onDismissInfo, onSwipeUpFromBottom, bar,
 }) => {
     const { url: mainSrc, loading: fullResLoading, progress: fullResProgress, status: mediaStatus } = media;
     const [rotation, setRotation] = useState(0);
@@ -113,10 +115,20 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
             setToolsNudge((n) => n + 1);
         }
     }, []);
+    const onDismissInfoRef = useRef(onDismissInfo);
+    useEffect(() => { onDismissInfoRef.current = onDismissInfo; }, [onDismissInfo]);
+    // A tap on the photo or video first closes an open info panel and does nothing else.
+    const dismissInfo = useCallback(() => {
+        const dismiss = onDismissInfoRef.current;
+        if (!dismiss) return false;
+        dismiss();
+        return true;
+    }, []);
     const toggleTools = useCallback(() => {
+        if (dismissInfo()) return;
         setShowTools((v) => !v);
         setToolsNudge((n) => n + 1);
-    }, []);
+    }, [dismissInfo]);
     useEffect(() => {
         // Stays up while the mouse rests on it or a full-resolution download shows its progress.
         if (!showTools || toolsHovered || fullResLoading) return undefined;
@@ -585,7 +597,10 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
                         ref={photoRef}
                         className="pt-viewer-photo"
                         // Tapping the photo toggles the floating tools; a mouse click only shows them.
-                        onClick={() => (pointerTypeRef.current === 'mouse' ? revealTools() : toggleTools())}
+                        onClick={() => {
+                            if (dismissInfo()) return;
+                            if (pointerTypeRef.current === 'mouse') revealTools(); else toggleTools();
+                        }}
                         onDoubleClick={(e) => (zoomed ? resetZoom() : zoomAtPoint(zoom + ZOOM_STEP * 2, e.clientX, e.clientY))}
                         onMouseDown={(e) => { if (zoomed) panRef.current = { x: e.clientX, y: e.clientY, px: pan.x, py: pan.y }; }}
                         onMouseMove={(e) => {
@@ -615,6 +630,7 @@ const ViewerShell: React.FC<ViewerShellProps> = ({
                                 onLoadedMetadata={(e) => setNatural({ w: e.currentTarget.videoWidth, h: e.currentTarget.videoHeight })}
                                 onClick={(e) => {
                                     e.stopPropagation();
+                                    if (dismissInfo()) return;
                                     if (pointerTypeRef.current !== 'mouse') { toggleTools(); return; }
                                     if (!videoTurned) return;
                                     const el = e.currentTarget;

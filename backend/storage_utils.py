@@ -14,6 +14,7 @@ import uuid
 import base64
 import shutil
 import sys
+import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -993,49 +994,116 @@ def prepare_metadata_index_intent(entity, updates):
         entity['indexPending'] = json.dumps({'revision': str(uuid.uuid4()), 'kinds': sorted(kinds)})
 
 
+_DEFERRED_INTENTS: Dict[str, Dict[str, str]] = {}
+_DEFERRED_INTENTS_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def deferred_index_publication(user_id):
+    """Hold back per-photo index publication for one library and send it once.
+
+    A batch job that stamps many photos (the grid images) would otherwise touch
+    the same index manifests, dirty rows and scheduler once per photo, and its
+    workers race each other (and the index worker) on those shared files. Rows
+    keep their ``indexPending`` outbox until the single publication at the end,
+    so a crash in between leaves them for recovery exactly like a failed publish.
+    """
+    key = str(user_id or '').strip()
+    with _DEFERRED_INTENTS_LOCK:
+        owner = key not in _DEFERRED_INTENTS
+        if owner:
+            _DEFERRED_INTENTS[key] = {}
+    try:
+        yield
+    finally:
+        if owner:
+            with _DEFERRED_INTENTS_LOCK:
+                held = _DEFERRED_INTENTS.pop(key, {})
+            _publish_deferred_intents(key, held)
+
+
+def _publish_index_kinds(user_id, kinds, filenames_by_kind):
+    touchers = {
+        'lexical': touch_user_lexical_index_state, 'access': touch_user_access_index_state,
+        'vector': touch_user_vector_index_state, 'tag_embedding': touch_user_tag_embedding_index_state,
+        'albums': touch_user_albums_index_state,
+    }
+    for kind in kinds:
+        if kind in ('vector', 'tag_embedding'):
+            # Their owner is another process; its successful rebuild
+            # cannot clear this writer's process-local debounce flag.
+            _clear_manifest_dirty_flag(user_id, kind)
+        if kind == 'sort':
+            if not sort_index_skipped(user_id):
+                touch_user_sort_index_state(user_id, touch_albums=False)
+        elif kind in touchers:
+            touchers[kind](user_id)
+    marked = kinds.intersection(_SEARCH_INDEX_KINDS)
+    for kind in marked:
+        _mark_search_index_dirty_filenames(user_id, filenames_by_kind[kind], kinds=(kind,))
+    for kind in marked:
+        _flush_dirty_filename_buffer(user_id, kind)
+    if METADATA_INDEX_REQUEST_HOOK is None:
+        raise RuntimeError('Metadata index scheduler unavailable')
+    import index_updates
+    for kind in sorted(kinds):
+        # Scheduler routes model-owned tags into vision's durable scope;
+        # neither the HTTP role nor the index worker loads CLIP.
+        if kind == 'sort' and sort_index_skipped(user_id):
+            continue
+        if METADATA_INDEX_REQUEST_HOOK(user_id, index_updates.scope_for_index(kind)) == 'unavailable':
+            raise RuntimeError('Metadata index schedule unavailable')
+
+
+def _clear_index_outbox(user_id, filename, pending):
+    """Clear only this source outbox version, never an edit written while the
+    publication was in flight."""
+    table = _CTX.get('metadata_table_client')
+    current = table.get_entity(user_id, filename)
+    if current.get('indexPending') == pending:
+        table.update_entity({'PartitionKey': user_id, 'RowKey': filename, 'indexPending': ''},
+                            mode=UpdateMode.MERGE, etag=current.metadata['etag'],
+                            match_condition=MatchConditions.IfNotModified)
+
+
+def _publish_deferred_intents(user_id, held):
+    if not held:
+        return
+    try:
+        kinds, filenames_by_kind = set(), {}
+        for filename, pending in held.items():
+            for kind in json.loads(pending)['kinds']:
+                kinds.add(kind)
+                filenames_by_kind.setdefault(kind, []).append(filename)
+        _publish_index_kinds(user_id, kinds, filenames_by_kind)
+    except Exception:
+        _LOGGER.warning('Metadata index intents retained for recovery user=%s count=%d', user_id, len(held), exc_info=True)
+        return
+
+    def clear(item):
+        try:
+            _clear_index_outbox(user_id, *item)
+        except Exception:
+            _LOGGER.warning('Metadata index intent retained for recovery user=%s', user_id, exc_info=True)
+
+    with ThreadPoolExecutor(max_workers=min(8, len(held))) as pool:
+        list(pool.map(clear, held.items()))
+
+
 def publish_metadata_index_intent(user_id, filename, entity):
     pending = str(entity.get('indexPending') or '')
     if not DURABLE_INDEX_UPDATES or not pending:
         return True
+    with _DEFERRED_INTENTS_LOCK:
+        held = _DEFERRED_INTENTS.get(str(user_id or '').strip())
+        if held is not None:
+            held[filename] = pending
+            return True
     try:
         kinds = set(json.loads(pending)['kinds'])
-        touchers = {
-            'lexical': touch_user_lexical_index_state, 'access': touch_user_access_index_state,
-            'vector': touch_user_vector_index_state, 'tag_embedding': touch_user_tag_embedding_index_state,
-            'albums': touch_user_albums_index_state,
-        }
-        for kind in kinds:
-            if kind in ('vector', 'tag_embedding'):
-                # Their owner is another process; its successful rebuild
-                # cannot clear this writer's process-local debounce flag.
-                _clear_manifest_dirty_flag(user_id, kind)
-            if kind == 'sort':
-                if not sort_index_skipped(user_id):
-                    touch_user_sort_index_state(user_id, touch_albums=False)
-            elif kind in touchers:
-                touchers[kind](user_id)
-        marked = kinds.intersection(_SEARCH_INDEX_KINDS)
-        _mark_search_index_dirty_filenames(user_id, [filename], kinds=marked)
-        for kind in marked:
-            _flush_dirty_filename_buffer(user_id, kind)
-        if METADATA_INDEX_REQUEST_HOOK is None:
-            raise RuntimeError('Metadata index scheduler unavailable')
-        import index_updates
-        for kind in sorted(kinds):
-            # Scheduler routes model-owned tags into vision's durable scope;
-            # neither the HTTP role nor the index worker loads CLIP.
-            if kind == 'sort' and sort_index_skipped(user_id):
-                continue
-            if METADATA_INDEX_REQUEST_HOOK(user_id, index_updates.scope_for_index(kind)) == 'unavailable':
-                raise RuntimeError('Metadata index schedule unavailable')
-        # Queue/intent persistence succeeded. Clear only this source outbox
-        # version, never an edit written while the publication was in flight.
-        table = _CTX.get('metadata_table_client')
-        current = table.get_entity(user_id, filename)
-        if current.get('indexPending') == pending:
-            table.update_entity({'PartitionKey': user_id, 'RowKey': filename, 'indexPending': ''},
-                                mode=UpdateMode.MERGE, etag=current.metadata['etag'],
-                                match_condition=MatchConditions.IfNotModified)
+        _publish_index_kinds(user_id, kinds, {kind: [filename] for kind in kinds})
+        # Queue/intent persistence succeeded.
+        _clear_index_outbox(user_id, filename, pending)
         return True
     except Exception:
         _LOGGER.warning('Metadata index intent retained for recovery user=%s', user_id, exc_info=True)
@@ -4944,6 +5012,9 @@ def delete_user_lexical_index_data(user_id: str) -> None:
     invalidate_user_listing_index_cache(key)
 
 
+_LEXICAL_TOUCH_ATTEMPTS = 4
+
+
 def touch_user_lexical_index_state(user_id: str) -> str:
     key = str(user_id or '').strip()
     if not key:
@@ -4959,17 +5030,26 @@ def touch_user_lexical_index_state(user_id: str) -> str:
     if blob_client is not None:
         try:
             import lexical_incremental
-            manifest, props = lexical_incremental.capture_manifest(blob_client)
-            snapshot_version = lexical_incremental.effective_snapshot_version(manifest)
-            if not manifest.get('dirty'):
-                manifest['baseSourceVersion'] = manifest.get('sourceVersion', '')
-            manifest.update(userId=key, sourceVersion=source_version,
-                            schemaVersion=_LEXICAL_INDEX_SCHEMA_VERSION,
-                            dirty=True, updatedAt=source_version,
-                            lexicalSnapshotSourceVersion=snapshot_version or '',
-                            lexicalSnapshotDirty=True)
-            lexical_incremental.commit_manifest(
-                blob_client, manifest, props, BlobContentSettings(content_type='application/json'))
+            for attempt in range(_LEXICAL_TOUCH_ATTEMPTS):
+                try:
+                    manifest, props = lexical_incremental.capture_manifest(blob_client)
+                    snapshot_version = lexical_incremental.effective_snapshot_version(manifest)
+                    if not manifest.get('dirty'):
+                        manifest['baseSourceVersion'] = manifest.get('sourceVersion', '')
+                    manifest.update(userId=key, sourceVersion=source_version,
+                                    schemaVersion=_LEXICAL_INDEX_SCHEMA_VERSION,
+                                    dirty=True, updatedAt=source_version,
+                                    lexicalSnapshotSourceVersion=snapshot_version or '',
+                                    lexicalSnapshotDirty=True)
+                    lexical_incremental.commit_manifest(
+                        blob_client, manifest, props, BlobContentSettings(content_type='application/json'))
+                    break
+                except ResourceModifiedError:
+                    # Another writer changed the manifest first. Losing the touch would
+                    # leave a clean manifest over changed rows, so re-read and try again.
+                    if attempt == _LEXICAL_TOUCH_ATTEMPTS - 1:
+                        raise
+                    time.sleep(random.uniform(0.02, 0.1) * (attempt + 1))
         except Exception:
             _clear_manifest_dirty_flag(key, 'lexical')
             _LOGGER.warning('Lexical dirty touch failed for %s', key, exc_info=True)
