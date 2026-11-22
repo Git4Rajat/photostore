@@ -581,12 +581,62 @@ def _report_vision_progress(progress_store, library, wave_id, done, total):
         logging.getLogger(__name__).warning('Vision progress report failed for wave %s', wave_id, exc_info=True)
 
 
+class _NextPage:
+    """Loads the following member page and its metadata while the current page runs.
+
+    The page window is stateful, so exactly one load is in flight and it is
+    consumed in order. Metadata is only a selection snapshot (claims and commits
+    reread under fences); names the current page may still write are dropped
+    from it so the next page falls back to an authoritative read.
+    """
+    def __init__(self, window, store, metadata_table):
+        from concurrent.futures import ThreadPoolExecutor
+        self.window, self.store, self.metadata_table = window, store, metadata_table
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='wave-next-page')
+        self.pending = None
+
+    def start(self, after):
+        import processing_metrics as metrics
+        from contextvars import copy_context
+        from wave_source_batch import MetadataBatch
+        def load():
+            with metrics.timer('vision_page_prefetch', count_name='vision_page_prefetch_calls'):
+                members = self.window.page(after)
+                done = self.window.done
+                return members, done, MetadataBatch(self.metadata_table, self.store.library, members)
+        self.pending = (after, copy_context().run(self.executor.submit, load))
+
+    def take(self, after, current_names):
+        """Return (members, done, metadata) for the page after `after`, or None."""
+        if self.pending is None:
+            return None
+        guess, future = self.pending
+        self.pending = None
+        members, done, metadata = future.result()
+        if guess != after:
+            # The scan position moved differently than expected; start over from
+            # the real cursor instead of trusting a page loaded for another one.
+            self.window.keys.clear()
+            self.window.rows.clear()
+            return None
+        for name in current_names:
+            metadata.invalidate(name)
+        return members, done, metadata
+
+    def close(self):
+        pending, self.pending = self.pending, None
+        if pending is not None:
+            try: pending[1].result()
+            except BaseException: pass
+        self.executor.shutdown(wait=True)
+
+
 @processing_diagnostics.vision_wave_summary
 def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
                        metadata_table, face_table, face_ids, cluster_send, *, process_source=None,
                        deadline=None, progress=None, before_freeze=None, source_workers=1, source_executor=None,
                        prepare_sources=None, inspection_failures=None, preview_loader=None,
-                       member_fetch_size=1000):
+                       member_fetch_size=1000, page_overlap=None):
     """Resume bounded source/evaluation passes using qualified receipts.
 
     A checkpoint is a scan position, never proof of source completion. Each
@@ -598,7 +648,7 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
     import processing_metrics as metrics
     import vision_utils
     from semantic_batching import text_batches
-    from contextlib import nullcontext, ExitStack
+    from contextlib import nullcontext, ExitStack, closing
     from concurrent.futures import ThreadPoolExecutor
     from execution_lease import execution_scope, OwnershipLost
     from upload_waves import MAX_PAGE
@@ -609,6 +659,8 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
     from vision_prefetch import PreviewPrefetch
     if type(source_workers) is not int or not 1 <= source_workers <= MAX_PAGE:
         raise ValueError('Vision source concurrency must be between 1 and the member page size')
+    if page_overlap is None:
+        page_overlap = os.getenv('IPWORK_VISION_PAGE_OVERLAP', 'true').lower() in ('1', 'true', 'yes')
     ownership, wave = claim_release(leases, store, library, wave_id, 'vision', outbox_key, 'vision')
     if ownership is None:
         return None
@@ -668,13 +720,23 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
                 preview_prefetch_enabled=preview_loader is not None, preview_storage=previews.storage,
                 preview_reserved_limit_bytes=previews.limit, preview_workers=previews.workers,
                 model_schedule='source_serial', clip_image_batch_size=int(os.getenv('IPWORK_CLIP_IMAGE_BATCH_SIZE', '1')))
+            next_page = resources.enter_context(closing(_NextPage(window, store, metadata_table))) if page_overlap else None
+            previous_names = ()
             while phase == 'sources':
                 if expired(): return store._required(store.wave_key(wave_id))
                 renew(force=True)
                 with metrics.timer('vision_page_load', count_name='vision_page_load_calls'):
-                    members = window.page(cursor)
-                    with metrics.timer('vision_metadata_fetch', count_name='vision_metadata_fetch_calls'):
-                        metadata = MetadataBatch(metadata_table, store.library, members)
+                    loaded = next_page.take(cursor, previous_names) if next_page is not None else None
+                    if loaded is not None:
+                        members, page_done, metadata = loaded
+                    else:
+                        members = window.page(cursor)
+                        page_done = window.done
+                        with metrics.timer('vision_metadata_fetch', count_name='vision_metadata_fetch_calls'):
+                            metadata = MetadataBatch(metadata_table, store.library, members)
+                if next_page is not None and members and not page_done:
+                    next_page.start(members[-1]['RowKey'])
+                previous_names = {member['filename'] for member in members}
                 if members and prepare_sources is not None:
                     progressed()
                     with metrics.timer('vision_source_prepare', count_name='vision_source_prepare_calls'):
@@ -710,7 +772,7 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
                     commit_observations(store, wave_id, observations)
                 checkpoint('sources', cursor)
                 if expired(): return store._required(store.wave_key(wave_id))
-                if window.done:
+                if page_done:
                     phase = 'evaluate'
                     checkpoint(phase)
             if before_freeze is not None:

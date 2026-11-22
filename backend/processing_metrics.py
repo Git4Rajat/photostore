@@ -89,7 +89,7 @@ _FIELDS = {
 } | {
     'vision_' + phase + suffix
     for phase in ('page_load', 'page_commit', 'checkpoint', 'evaluation',
-                  'member_fetch', 'metadata_fetch', 'proof_inbox_fetch',
+                  'member_fetch', 'metadata_fetch', 'page_prefetch', 'proof_inbox_fetch',
                   'manifest_fetch', 'face_receipt_fetch', 'source_prepare')
     for suffix in ('_calls', '_ms', '_errors')
 } | {prefix + suffix for prefix in ('receipt_cache', 'member_buffer')
