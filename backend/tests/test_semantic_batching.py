@@ -13,6 +13,12 @@ from test_processing_diagnostics import records
 
 
 @pytest.fixture(autouse=True)
+def text_vector_enabled(monkeypatch):
+    """These tests exercise the text vector, which is off by default in production."""
+    monkeypatch.setattr(storage, 'SEMANTIC_TEXT_EMBEDDING_ENABLED', True)
+
+
+@pytest.fixture(autouse=True)
 def broker_mode_for_broker_tests(monkeypatch):
     monkeypatch.setenv('IPWORK_SEMANTIC_TEXT_MODE','batch')
 

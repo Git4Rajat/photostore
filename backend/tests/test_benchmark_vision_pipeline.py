@@ -12,6 +12,13 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 import benchmark_vision_pipeline as bench
 from test_face_by_filename_lookup import FilenameLookupTable
 from test_upload_waves import AtomicTable
+import storage_utils
+
+
+@pytest.fixture(autouse=True)
+def text_vector_enabled(monkeypatch):
+    """These tests exercise the text vector, which is off by default in production."""
+    monkeypatch.setattr(storage_utils, 'SEMANTIC_TEXT_EMBEDDING_ENABLED', True)
 
 
 @pytest.fixture(autouse=True)
