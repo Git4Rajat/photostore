@@ -802,6 +802,59 @@ def _is_internal_source_row(source, user, key):
     return False
 
 
+class _CachedRow(dict):
+    """A metadata row as this scope last saw it, with the ETag of that version."""
+    def __init__(self, row, etag_value):
+        super().__init__(row)
+        self.metadata = {'etag': etag_value}
+
+
+def _cache_key(args, kwargs):
+    if kwargs.get('select') is not None:
+        return None
+    user = kwargs.get('partition_key', args[0] if args else None)
+    key = kwargs.get('row_key', args[1] if len(args) > 1 else None)
+    return (user, key) if isinstance(user, str) and isinstance(key, str) else None
+
+
+def _remember_read(scope, args, kwargs, row):
+    key = _cache_key(args, kwargs)
+    version = etag(row)
+    if key is not None and version:
+        scope.rows[key] = _CachedRow(row, version)
+
+
+def _remember_write(scope, name, entity, options, old, response):
+    """Keep the row this write produced, so the next conditional write on it need not read it again.
+
+    Only a merge onto a row already cached, or a replace, yields a row known in full; anything else forgets it."""
+    key = (str(entity.get('PartitionKey') or ''), str(entity.get('RowKey') or ''))
+    version = response.get('etag') if isinstance(response, dict) else None
+    if name not in ('update_entity', 'upsert_entity') or not version or version == '*':
+        return
+    mode = options.get('mode')
+    if mode == UpdateMode.REPLACE:
+        scope.rows[key] = _CachedRow(entity, version)
+    elif old is not None:
+        scope.rows[key] = _CachedRow({**old, **entity}, version)
+
+
+def _cached_old(source, user, key, operation, entity, options):
+    """The row a conditional update is written against, when this scope already holds that very version.
+
+    The write only succeeds if the stored row still carries that ETag, so a row that changed since is
+    rejected by the write itself; the field diff below is never applied to a different version."""
+    scope = _COALESCED.get()
+    if scope is None or source != 'metadata' or operation != 'update':
+        return None
+    if options.get('match_condition') != MatchConditions.IfNotModified:
+        return None
+    cached = scope.rows.get((user, key))
+    if cached is None or (options.get('etag') or etag(entity)) != etag(cached):
+        return None
+    return cached
+
+
 def mutation_targets(source, table, operation, entity, options):
     """Exclude exact internal rows, then derive old AND new owners before writes."""
     import storage_utils as su
@@ -810,9 +863,10 @@ def mutation_targets(source, table, operation, entity, options):
         raise ValueError('Source mutation requires partition and row identity')
     if _is_internal_source_row(source, user, key):
         return user, {}, False, operation == 'delete'
-    old, uncertain = None, False
+    old, uncertain = _cached_old(source, user, key, operation, entity, options), False
     try:
-        old = table.get_entity(user, key)
+        if old is None:
+            old = table.get_entity(user, key)
     except ResourceNotFoundError:
         pass
     except Exception:
@@ -1055,6 +1109,8 @@ class _CoalescedReservations:
         # Fence checks already passed while this scope held a reservation for
         # the library (see scope_checked).
         self.checked = set()
+        # Metadata rows this scope read or wrote, by (user, key); see _CachedRow.
+        self.rows = {}
 
     def reserve(self, user, kind, *, deleted, operation):
         with self.lock:
@@ -1153,8 +1209,35 @@ class SourceTable:
 
     def __getattr__(self, name):
         method = getattr(self.table, name)
+        source = self.source
+        if name == 'get_entity' and source == 'metadata':
+            @wraps(method)
+            def read(*args, **kwargs):
+                row = method(*args, **kwargs)
+                scope = _COALESCED.get()
+                if scope is not None:
+                    _remember_read(scope, args, kwargs, row)
+                return row
+            return read
         if name not in self.MUTATIONS:
             return method
+        if source == 'metadata':
+            raw = method
+
+            @wraps(raw)
+            def method(*args, **kwargs):  # noqa: F811 - the table method, keeping the scope's row cache current
+                scope = _COALESCED.get()
+                entity = args[0] if args else kwargs.get('entity')
+                if scope is None or name == 'submit_transaction' or not isinstance(entity, dict):
+                    if scope is not None:
+                        scope.rows.clear()
+                    return raw(*args, **kwargs)
+                key = (str(entity.get('PartitionKey') or ''), str(entity.get('RowKey') or ''))
+                old = scope.rows.pop(key, None)
+                response = raw(*args, **kwargs)
+                _remember_write(scope, name, entity, {'mode': kwargs.get('mode', args[1] if len(args) > 1 else None)},
+                                old, response)
+                return response
 
         @wraps(method)
         def write(*args, **kwargs):
