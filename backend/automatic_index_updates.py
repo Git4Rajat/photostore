@@ -883,6 +883,20 @@ class _WaveAssignmentCoverage:
         self.limit, self.writes = max_faces * 2, 0
         self.wave_owned = None
         self.store = self.reservation = None
+        self.admitted_at = None
+
+    def _admit(self, *, fresh=False):
+        """Read the fence, or reuse a read from the last WAVE_COVERAGE_ADMISSION_CACHE_SECONDS.
+
+        Each face is two or three source writes and the fence row is almost always
+        absent (a 404 read, ~8 ms). A fence still stops this page within the window;
+        a library clean waits for the page's own reservation either way. fresh=True
+        always reads (after begin, where the fence may have changed)."""
+        ttl = float(os.getenv('WAVE_COVERAGE_ADMISSION_CACHE_SECONDS', '2'))
+        if not fresh and self.admitted_at is not None and time.monotonic() - self.admitted_at < ttl:
+            return
+        check_source_admission(self.user)
+        self.admitted_at = time.monotonic()
 
     def write(self, proxy, name, method, args, options):
         from wave_policy import source_change_active
@@ -910,7 +924,7 @@ class _WaveAssignmentCoverage:
         if self.writes >= self.limit:
             raise RuntimeError('Wave assignment coverage page exceeded its write bound')
         self.check()
-        check_source_admission(self.user)
+        self._admit()
         if self.reservation is None:
             self.store = configured_store()
             # Assign only after confirmed begin. An ambiguous begin must remain
@@ -921,7 +935,7 @@ class _WaveAssignmentCoverage:
                     uncertain=True, operation='wave_assignment_page')
             from processing_metrics import add
             add(cluster_coverage_pages=1)
-            check_source_admission(self.user)  # Fence may have changed during begin.
+            self._admit(fresh=True)  # Fence may have changed during begin.
         self.check()
         self.writes += 1
         from processing_metrics import add
