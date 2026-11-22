@@ -102,6 +102,31 @@ describe('index-backed gallery', () => {
         expect(mocks.poll).toHaveBeenCalledTimes(polls ? 1 : 0);
     });
 
+    it('Show in Gallery loads the page holding a far-down photo and opens the viewer on the gallery sequence', async () => {
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await waitFor(() => expect(store.photosLoading).toBe(false));
+        expect(store.photos.some((p) => p.id === 'p700.jpg')).toBe(false);
+        await act(async () => { await store.focusPhoto('p700.jpg'); });
+        await waitFor(() => expect(store.viewer).not.toBeNull());
+        expect(store.photos.some((p) => p.id === 'p700.jpg')).toBe(true);
+        expect(store.viewer?.ids[store.viewer.index]).toBe('p700.jpg');
+        expect(store.viewer?.ids.length).toBeGreaterThan(1);
+        expect(store.viewer?.extendable).toBe(true);
+    });
+
+    it('Show in Gallery clears filters that would hide the photo', async () => {
+        render(<StoreProvider><Probe /></StoreProvider>);
+        await waitFor(() => expect(store.photosLoading).toBe(false));
+        act(() => store.setGalleryRating(5));
+        await waitFor(() => expect(store.photosLoading).toBe(false));
+        expect(store.photos).toHaveLength(0);
+        await act(async () => { await store.focusPhoto('p5.jpg'); });
+        await waitFor(() => expect(store.viewer).not.toBeNull());
+        expect(store.galleryFilters.rating).toBe(0);
+        expect(store.viewer?.ids[store.viewer.index]).toBe('p5.jpg');
+        expect(store.viewer?.ids.length).toBeGreaterThan(1);
+    });
+
     it('Back closes the open viewer and leaves the page under it alone', async () => {
         render(<StoreProvider><Probe /></StoreProvider>);
         await act(async () => { store.navigate('albums', { albumId: 'a1' }); });
