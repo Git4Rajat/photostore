@@ -11353,6 +11353,11 @@ def apply_client_processing_results_for_file(
             lease_owner = _metadata_lease_owner(baseline)
         _check_result_lease(baseline, lease_owner)
         metadata = dict(baseline)
+    elif browser_consolidated:
+        # The browser commit diffs the result against the baseline, so the
+        # baseline must stay untouched while the result is edited; otherwise
+        # the diff is empty and a lost write race drops the browser results.
+        baseline = copy.deepcopy(metadata)
     # Anonymized photos are stored under the anonymous UUID; resolve it from the
     # metadata row we just loaded so the byte read hits the real blob.
     source_blob = str(metadata.get('anonymousImageId') or '').strip() or filename
