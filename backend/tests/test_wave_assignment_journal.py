@@ -119,8 +119,8 @@ def test_lost_replies_resume_recorded_decisions_without_redeciding(failure, monk
     else:
         original = wave.WaveAssignmentJournal.put
         fired = [False]
-        def put(self, key, body):
-            result = original(self, key, body)
+        def put(self, key, body, **kwargs):
+            result = original(self, key, body, **kwargs)
             if key.startswith(failure+'!') and not fired[0]:
                 fired[0] = True
                 raise OSError('lost reply')
@@ -209,13 +209,13 @@ def test_decision_commit_is_atomically_fenced_when_an_owner_is_replaced():
     # Replace the owner just before a decision transaction reaches the table.
     original = wave.WaveAssignmentJournal.put
     def steal(ownership):
-        def put(self, key, payload):
+        def put(self, key, payload, **kwargs):
             if key.startswith('decision!'):
                 def replace():
                     now[0] += 1000
                     leases.claim('u', frozen['waveId'], 'cluster', frozen['frozenRevision'])
                 store.table.before_commit = replace
-            return original(self, key, payload)
+            return original(self, key, payload, **kwargs)
         self_patch = pytest.MonkeyPatch()
         self_patch.setattr(wave.WaveAssignmentJournal, 'put', put)
         patches.append(self_patch)
@@ -237,19 +237,19 @@ def test_crash_boundaries_recover_without_changing_person_creation(failure_point
     fired = [False]
     if failure_point == 'before_decision':
         original = wave.WaveAssignmentJournal.put
-        def crash(self, key, value):
+        def crash(self, key, value, **kwargs):
             if key.startswith('decision!') and not fired[0]:
                 fired[0] = True
                 raise OSError('crash boundary')
-            return original(self,key,value)
+            return original(self,key,value,**kwargs)
         monkeypatch.setattr(wave.WaveAssignmentJournal,'put',crash)
     elif failure_point == 'after_effects_before_marker':
         original = wave.WaveAssignmentJournal.put
-        def crash(self,key,value):
+        def crash(self,key,value,**kwargs):
             if key.startswith('applied!') and not fired[0]:
                 fired[0] = True
                 raise OSError('crash boundary')
-            return original(self,key,value)
+            return original(self,key,value,**kwargs)
         monkeypatch.setattr(wave.WaveAssignmentJournal,'put',crash)
     else:
         original = wave._replay
@@ -369,8 +369,8 @@ def test_deleted_matched_person_is_not_recreated_during_recovery(monkeypatch):
     h,snapshots,store,frozen,leases=setup()
     original=wave.WaveAssignmentJournal.put
     fired=[False]
-    def crash(self,key,payload):
-        result=original(self,key,payload)
+    def crash(self,key,payload,**kwargs):
+        result=original(self,key,payload,**kwargs)
         if key.startswith('decision!') and not fired[0]:
             fired[0]=True
             raise OSError('before applying')

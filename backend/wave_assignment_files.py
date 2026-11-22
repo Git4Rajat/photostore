@@ -38,6 +38,7 @@ class FileAssignmentJournal(WaveAssignmentJournal):
         self.file = None
         self.directory = directory
         self.preparing = False
+        self.unflushed = False
         try:
             marker = self.cloud.get('local-v1')
             path = directory / 'journal.jsonl'
@@ -111,9 +112,14 @@ class FileAssignmentJournal(WaveAssignmentJournal):
             with processing_metrics.timer('journal_fsync'):
                 os.fsync(self.file.fileno())
             self.db.commit()
+        self.unflushed = False
+
+    def flush(self):
+        if self.unflushed:
+            self._flush()
 
     @processing_diagnostics.wave_phase('journal_write')
-    def put(self, key, payload):
+    def put(self, key, payload, *, defer=False):
         self.check()
         body = encoded(payload)
         if len(body.encode('utf-16-le')) > FILE_JOURNAL_PAYLOAD_BYTES:
@@ -129,7 +135,10 @@ class FileAssignmentJournal(WaveAssignmentJournal):
             raise ValueError('Oversized wave journal record')
         self.file.write(record)
         self._index(key, json.loads(body), identity)
-        if not self.preparing or key == 'manifest':
+        if defer and key != 'manifest':
+            # Later records follow in file order, so the next flush covers this one.
+            self.unflushed = True
+        elif not self.preparing or key == 'manifest':
             self._flush()
         if key == 'manifest':
             # The snapshot is durable on the mount before any Table effects.
