@@ -100,6 +100,8 @@ PHOTO_LIST_SELECT_FIELDS = [
     'anonymousImageId', 'thumbnailArtifact', 'previewArtifact', 'processing_state', 'deletedAt',
     'uploadDate', 'upload_started_at', 'last_processing_update', 'clientLastModified', 'gridImage',
 ]
+# Off by default: encoding each photo's text description costs about 126 ms per photo in Vision.
+SEMANTIC_TEXT_EMBEDDING_ENABLED = os.getenv('SEMANTIC_TEXT_EMBEDDING_ENABLED', 'false').lower() in ('1', 'true', 'yes')
 SUSPICIOUS_FACE_CONFIDENCE = float(os.getenv('SUSPICIOUS_FACE_CONFIDENCE', '0.60'))
 FACE_MIN_STORE_CONFIDENCE = float(os.getenv('FACE_MIN_STORE_CONFIDENCE', '0.24'))
 FACE_LOW_CONFIDENCE_REJECT_BELOW = float(os.getenv('FACE_LOW_CONFIDENCE_REJECT_BELOW', '0.32'))
@@ -9950,6 +9952,12 @@ def _refresh_semantic_fields(filename: str, metadata: Dict) -> None:
     semantic_text = _build_client_semantic_text(filename, metadata)
     metadata['semanticText'] = semantic_text
     metadata['semanticLayers'] = _json_compact(build_semantic_layers(filename, metadata))
+    if not SEMANTIC_TEXT_EMBEDDING_ENABLED:
+        # Search ranks on the photo's image vector and the index rebuilds a text vector itself for photos
+        # without one; the stored text vector is only a cold-start fallback. Skip the model call.
+        for field in ('semanticEmbedding', 'semanticEmbeddingVersion', 'semanticTextDigest'):
+            metadata.pop(field, None)
+        return
     text_digest = hashlib.sha256(semantic_text.encode('utf-8')).hexdigest()
     version = vision_utils.get_text_embedding_version()
     dimension = vision_utils.get_text_embedding_dimension()

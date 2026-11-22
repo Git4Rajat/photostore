@@ -87,6 +87,7 @@ param waveCompatibleCapabilities string = 'b7f6d1be1855afa55b795ba92db3c0dc85065
 @description('Source commit of the pinned release (set by the release pin job).')
 param waveSourceCommit string = 'b434569f1dc948eb41fc56d5c667370471a895b4'
 param waveBootstrapPending bool = false
+param semanticTextEmbeddingEnabled bool = false
 
 @description('Provision managed WebSocket notifications when library indexes are published.')
 param enableIndexPush bool = true
@@ -141,6 +142,7 @@ module app 'resources.bicep' = {
     waveCompatibleCapabilities: waveCompatibleCapabilities
     waveSourceCommit: waveSourceCommit
     waveBootstrapPending: waveBootstrapPending
+    semanticTextEmbeddingEnabled: semanticTextEmbeddingEnabled
     logAnalyticsWorkspaceName: logAnalyticsWorkspaceName
     enableLogAnalytics: enableLogAnalytics
     enableShareSnapshot: enableShareSnapshot

@@ -97,6 +97,8 @@ param waveCompatibleCapabilities string = 'b7f6d1be1855afa55b795ba92db3c0dc85065
 param waveSourceCommit string = 'b434569f1dc948eb41fc56d5c667370471a895b4'
 @description('Fresh-install preparation only: block upload intake and run certificate seeding as a manual recovery job. Activate only after that job succeeds.')
 param waveBootstrapPending bool = false
+@description('Have Vision encode a text vector of each photo description while processing (about 126 ms per photo). Off by default: search ranks on the image vector and the indexes rebuild any text vector they need.')
+param semanticTextEmbeddingEnabled bool = false
 
 
 @description('Enable managed WebSocket index-ready notifications. Adds a Free-tier Web PubSub unit (20 concurrent connections, 20,000 messages/day); browsers beyond the cap, and any outage, fall back to polling.')
@@ -461,6 +463,7 @@ resource indexPush 'Microsoft.SignalRService/webPubSub@2024-03-01' = if (enableI
 
 // Shared backend/worker environment variables.
 var backendEnv = [
+  { name: 'SEMANTIC_TEXT_EMBEDDING_ENABLED', value: semanticTextEmbeddingEnabled ? 'true' : 'false' }
   { name: 'UPLOAD_WAVE_BOOTSTRAP_PENDING', value: waveBootstrapPending ? 'true' : 'false' }
   { name: 'UPLOAD_WAVE_EXECUTION_ENABLED', value: enableWaveExecution ? 'true' : 'false' }
   { name: 'UPLOAD_WAVE_NEW_LIBRARIES_ENABLED', value: enableNewWaveLibraries ? 'true' : 'false' }

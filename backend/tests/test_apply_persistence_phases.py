@@ -10,6 +10,12 @@ import storage_utils
 from fakes import FakeTable
 
 
+@pytest.fixture(autouse=True)
+def text_vector_enabled(monkeypatch):
+    """These tests exercise the text vector, which is off by default in production."""
+    monkeypatch.setattr(storage_utils, 'SEMANTIC_TEXT_EMBEDDING_ENABLED', True)
+
+
 @pytest.fixture
 def apply_context(monkeypatch):
     metadata, embeddings = FakeTable(), FakeTable()
