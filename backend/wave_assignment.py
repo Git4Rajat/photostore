@@ -109,8 +109,11 @@ class WaveAssignmentJournal:
             raise ValueError('Corrupt wave assignment journal')
         return body
 
+    def flush(self):
+        """Table journal rows are durable per put; the file journal buffers deferred ones."""
+
     @processing_diagnostics.wave_phase('journal_write')
-    def put(self, key, payload):
+    def put(self, key, payload, *, defer=False):
         body = encoded(payload)
         if len(body.encode('utf-16-le')) > JOURNAL_PAYLOAD_BYTES:
             raise ValueError('Assignment journal row exceeds byte budget')
@@ -608,7 +611,9 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
                                     library_guard.begin_assignment()
                                     begun = True
                                 _apply(assigner, store.library, face, decision, identity, guard, wave['waveId'],observed)
-                                journal.put(f'applied!{position:012d}', {'decisionId': identity})
+                                # Idempotent: the face stamp proves the effects landed, so this marker may
+                                # reach disk with the next decision's flush (or the page-end flush).
+                                journal.put(f'applied!{position:012d}', {'decisionId': identity}, defer=True)
                                 processing_metrics.add(cluster_faces_newly_resolved=1)
                                 materialized = True
                             else:
@@ -616,6 +621,7 @@ def run_frozen_assignment(store, wave, assigner, inputs, check, *, page_size=128
                             _replay(workspace, runtime, decision, guard)
                             chain = digest([chain, position, identity])
                             processing_diagnostics.wave_faces(processed=position + 1)
+                    journal.flush()
                     # Coverage must close successfully before recording execution
                     # progress or saving a resumable page. Replay alone is not
                     # new work and must not rewind the durable execution cursor.

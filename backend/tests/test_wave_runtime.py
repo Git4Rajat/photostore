@@ -43,7 +43,9 @@ def test_wave_source_retains_preview_and_original_through_apply_and_cleans_up(mo
     if fail_apply:
         with pytest.raises(RuntimeError,match='apply failed'):runtime.process_source('lib','photo.jpg','rev',lambda:None)
     else:runtime.process_source('lib','photo.jpg','rev',lambda:None)
-    assert seen==released==[1]
+    # A committed result clears the lease in its own write; only a failed apply needs the release.
+    assert seen==[1]
+    assert released==([1] if fail_apply else [])
     assert crop_preview('lib','photo.jpg',row) is None
     assert original_input('lib','photo.jpg',row) is None
 

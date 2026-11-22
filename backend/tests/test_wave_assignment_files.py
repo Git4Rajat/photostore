@@ -288,9 +288,9 @@ def test_interrupted_resume_marker_publication_replays_authoritative_journal(tmp
     expected = oracle()
     h, snapshots, store, frozen, leases = setup()
     original = files.FileAssignmentJournal.put
-    def put(self, key, payload):
+    def put(self, key, payload, **kwargs):
         if key.startswith('resume!'):raise OSError('snapshot marker not published')
-        return original(self, key, payload)
+        return original(self, key, payload, **kwargs)
     with monkeypatch.context() as patch:
         patch.setattr(files.FileAssignmentJournal, 'put', put)
         with pytest.raises(OSError, match='not published'):
@@ -343,9 +343,9 @@ def test_failed_new_resume_publication_invalidates_old_snapshot_safely(tmp_path,
     with pytest.raises(wave.AssignmentYield):
         run(h,snapshots,store,frozen,leases,tmp_path,page_size=1,should_yield=lambda:True)
     original=files.FileAssignmentJournal.put
-    def put(self,key,payload):
+    def put(self,key,payload,**kwargs):
         if key.startswith('resume!'):raise OSError('new snapshot marker interrupted')
-        return original(self,key,payload)
+        return original(self,key,payload,**kwargs)
     with monkeypatch.context() as patch:
         patch.setattr(files.FileAssignmentJournal,'put',put)
         with pytest.raises(OSError,match='marker interrupted'):
@@ -452,3 +452,30 @@ def test_local_journal_accepts_a_decision_row_over_the_table_budget(tmp_path):
         assert journal.get('decision!big') == big
         with pytest.raises(ValueError, match='byte budget'):
             journal.put('decision!huge', dict(data='x' * 70_000))
+
+
+def test_applied_markers_do_not_each_sync_the_mount(tmp_path, monkeypatch):
+    import wave_assignment_files as files
+    h, snapshots, store, frozen, leases = setup()
+    syncs = []
+    real = files.os.fsync
+    monkeypatch.setattr(files.os, 'fsync', lambda fd: (syncs.append(fd), real(fd))[1])
+    run(h, snapshots, store, frozen, leases, tmp_path, page_size=128)
+    # One sync per decision, plus the manifest, the page end and the completion; the
+    # applied marker rides on the next flush instead of costing its own.
+    assert len(syncs) <= len(snapshots) + 6
+
+
+def test_failed_page_end_flush_resumes_without_reapplying(tmp_path, monkeypatch):
+    import wave_assignment_files as files
+    expected = oracle()
+    h, snapshots, store, frozen, leases = setup()
+    original = files.FileAssignmentJournal.flush
+    def flush(self):
+        raise OSError('mount went away before the page-end sync')
+    with monkeypatch.context() as patch:
+        patch.setattr(files.FileAssignmentJournal, 'flush', flush)
+        with pytest.raises(OSError, match='page-end sync'):
+            run(h, snapshots, store, frozen, leases, tmp_path, page_size=2)
+    run(h, snapshots, store, frozen, leases, tmp_path)
+    assert comparable(assignment_snapshot(h)) == expected

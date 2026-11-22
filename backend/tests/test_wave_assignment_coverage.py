@@ -94,13 +94,41 @@ def test_admission_fence_during_begin_prevents_source_effect(covered, monkeypatc
     assert covered.store.control('A', 'people_embedding')['active'] == 0
 
 
-def test_admission_fence_between_writes_is_not_cached_for_the_page(covered):
+def test_admission_fence_between_writes_stops_the_page_after_the_cache_window(covered, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(automatic.time, 'monotonic', lambda: clock[0])
+    with pytest.raises(automatic.SourceBusy), scope(covered):
+        update(covered, name='First write')
+        automatic.operator_fence('A', operator='test', reason='stop subsequent writes')
+        clock[0] += 2.5
+        update(covered, name='Must not commit')
+    assert covered.source.get_entity('A', 'person')['name'] == 'First write'
+    assert covered.store.control('A', 'people_embedding')['active'] == 0
+
+
+def test_admission_is_read_once_per_cache_window_not_once_per_write(covered, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(automatic.time, 'monotonic', lambda: clock[0])
+    reads = []
+    real = automatic.check_source_admission
+    monkeypatch.setattr(automatic, 'check_source_admission', lambda user: (reads.append(user), real(user))[1])
+    with scope(covered):
+        for i in range(20):
+            update(covered, name=str(i))
+        first = len(reads)
+        clock[0] += 2.5
+        update(covered, name='later')
+    assert first == 2  # before begin, and again after it
+    assert len(reads) == first + 1
+
+
+def test_admission_cache_can_be_disabled(covered, monkeypatch):
+    monkeypatch.setenv('WAVE_COVERAGE_ADMISSION_CACHE_SECONDS', '0')
     with pytest.raises(automatic.SourceBusy), scope(covered):
         update(covered, name='First write')
         automatic.operator_fence('A', operator='test', reason='stop subsequent writes')
         update(covered, name='Must not commit')
     assert covered.source.get_entity('A', 'person')['name'] == 'First write'
-    assert covered.store.control('A', 'people_embedding')['active'] == 0
 
 
 def test_source_failure_keeps_its_identity_when_finish_also_fails(covered, monkeypatch):

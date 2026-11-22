@@ -11730,7 +11730,7 @@ def _commit_worker_processing_results(user_id, filename, baseline, result, updat
                 entity['processing_complete'] = _photo_processing_complete(entity)
             try:
                 writes += 1
-                with processing_diagnostics.apply_phase(user_id, filename, 'metadata_cas'), _known_old_row(current):
+                with processing_diagnostics.apply_phase(user_id, filename, 'metadata_cas'):
                     committed = table.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
             except ResourceModifiedError:
                 conflicts += 1
@@ -12169,12 +12169,6 @@ class PhotoNotFoundError(RuntimeError):
 
 
 @processing_metrics.purpose('claim')
-def _known_old_row(row):
-    """Write tracking diffs an ETag-conditional update against `row`, the row it was built from."""
-    from automatic_index_updates import known_old_row
-    return known_old_row(row)
-
-
 def claim_processing_lease(
     user_id: str,
     filename: str,
@@ -12215,7 +12209,6 @@ def claim_processing_lease(
             raise PhotoNotFoundError('Photo has been deleted.')
         if entity.get('processingIsolated') is True:
             raise PhotoNotFoundError('Photo is isolated for an upload-only benchmark.')
-        as_read = copy.copy(entity)
 
         lease_expired = _processing_is_expired(entity)
         current_owner = str(entity.get('processing_lease_owner') or '').strip()
@@ -12259,8 +12252,10 @@ def claim_processing_lease(
         entity['processing_lease_expires_at'] = expires_at.isoformat()
         entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
         try:
-            with _known_old_row(as_read):
-                metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
+            written = metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
+            # The merged row with this write's ETag: a caller that applies its result next can start from it
+            # (see ``initial_entity``) instead of reading the row again.
+            entity = row_after_write(entity, written)
             break
         except ResourceModifiedError:
             import time
@@ -12385,14 +12380,12 @@ def release_processing_lease(user_id: str, filename: str, owner_id: str, *,
                 not expected_processing_fence or entity.get('processingFence') != expected_processing_fence
                 or current_owner != owner_id):
             return
-        as_read = copy.copy(entity)
         entity['processing_lease_owner'] = ''
         entity['processing_lease'] = ''
         entity['processing_lease_expires_at'] = ''
         entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
         try:
-            with _known_old_row(as_read):
-                metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
+            metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
             return
         except ResourceModifiedError:
             import time

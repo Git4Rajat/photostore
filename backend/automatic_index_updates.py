@@ -803,20 +803,59 @@ def _is_internal_source_row(source, user, key):
 
 
 _KEY_ONLY_SOURCES = frozenset({'embeddings', 'hash', 'person', 'face_embeddings'})
-_KNOWN_OLD_ROW = ContextVar('known_old_source_row', default=None)
 
 
-@contextmanager
-def known_old_row(row):
-    """Name the row an ETag-conditional metadata update inside this block was built from.
+class _CachedRow(dict):
+    """A metadata row as this scope last saw it, with the ETag of that version."""
+    def __init__(self, row, etag_value):
+        super().__init__(row)
+        self.metadata = {'etag': etag_value}
 
-    Write tracking then diffs against it instead of re-reading the row it was
-    just handed. Pass an unmodified copy that keeps the ETag it was read with."""
-    token = _KNOWN_OLD_ROW.set(row)
-    try:
-        yield
-    finally:
-        _KNOWN_OLD_ROW.reset(token)
+
+def _cache_key(args, kwargs):
+    if kwargs.get('select') is not None:
+        return None
+    user = kwargs.get('partition_key', args[0] if args else None)
+    key = kwargs.get('row_key', args[1] if len(args) > 1 else None)
+    return (user, key) if isinstance(user, str) and isinstance(key, str) else None
+
+
+def _remember_read(scope, args, kwargs, row):
+    key = _cache_key(args, kwargs)
+    version = etag(row)
+    if key is not None and version:
+        scope.rows[key] = _CachedRow(row, version)
+
+
+def _remember_write(scope, name, entity, options, old, response):
+    """Keep the row this write produced, so the next conditional write on it need not read it again.
+
+    Only a merge onto a row already cached, or a replace, yields a row known in full; anything else forgets it."""
+    key = (str(entity.get('PartitionKey') or ''), str(entity.get('RowKey') or ''))
+    version = response.get('etag') if isinstance(response, dict) else None
+    if name not in ('update_entity', 'upsert_entity') or not version or version == '*':
+        return
+    mode = options.get('mode')
+    if mode == UpdateMode.REPLACE:
+        scope.rows[key] = _CachedRow(entity, version)
+    elif old is not None:
+        scope.rows[key] = _CachedRow({**old, **entity}, version)
+
+
+def _cached_old(source, user, key, operation, entity, options):
+    """The row a conditional update is written against, when this scope already holds that very version.
+
+    The write only succeeds if the stored row still carries that ETag, so a row that changed since is
+    rejected by the write itself; the field diff below is never applied to a different version."""
+    scope = _COALESCED.get()
+    if scope is None or source != 'metadata' or operation != 'update':
+        return None
+    if options.get('match_condition') != MatchConditions.IfNotModified:
+        return None
+    cached = scope.rows.get((user, key))
+    if cached is None or (options.get('etag') or etag(entity)) != etag(cached):
+        return None
+    return cached
 
 
 def mutation_targets(source, table, operation, entity, options):
@@ -827,26 +866,17 @@ def mutation_targets(source, table, operation, entity, options):
         raise ValueError('Source mutation requires partition and row identity')
     if _is_internal_source_row(source, user, key):
         return user, {}, False, operation == 'delete'
-    old, uncertain = None, False
-    known = _KNOWN_OLD_ROW.get() if source == 'metadata' else None
-    if (known is not None and operation == 'update'
-            and options.get('match_condition') == MatchConditions.IfNotModified
-            and known.get('PartitionKey') == user and known.get('RowKey') == key
-            and etag(known) and etag(known) == (options.get('etag') or etag(entity))):
-        # The caller built this conditional write from `known`. It can only land
-        # while the stored row still carries that ETag, i.e. still equals `known`,
-        # so diffing against it is exactly what a fresh read would show.
-        old = known
-    # These sources map a write to a fixed kind and the exact row key, and
-    # face_embeddings classifies by the photofaces row, so the row's own
-    # previous value is never consulted: skip a read per tracked write.
-    elif source not in _KEY_ONLY_SOURCES:
-        try:
+    old, uncertain = _cached_old(source, user, key, operation, entity, options), False
+    try:
+        # These sources map a write to a fixed kind and the exact row key, and
+        # face_embeddings classifies by the photofaces row, so the row's own
+        # previous value is never consulted: skip a read per tracked write.
+        if old is None and source not in _KEY_ONLY_SOURCES:
             old = table.get_entity(user, key)
-        except ResourceNotFoundError:
-            pass
-        except Exception:
-            uncertain = True
+    except ResourceNotFoundError:
+        pass
+    except Exception:
+        uncertain = True
     deleted = operation == 'delete'
     conditional = bool(old is not None and operation in ('update', 'delete') and
         options.get('match_condition') == MatchConditions.IfNotModified and
@@ -913,6 +943,20 @@ class _WaveAssignmentCoverage:
         self.limit, self.writes = max_faces * 2, 0
         self.wave_owned = None
         self.store = self.reservation = None
+        self.admitted_at = None
+
+    def _admit(self, *, fresh=False):
+        """Read the fence, or reuse a read from the last WAVE_COVERAGE_ADMISSION_CACHE_SECONDS.
+
+        Each face is two or three source writes and the fence row is almost always
+        absent (a 404 read, ~8 ms). A fence still stops this page within the window;
+        a library clean waits for the page's own reservation either way. fresh=True
+        always reads (after begin, where the fence may have changed)."""
+        ttl = float(os.getenv('WAVE_COVERAGE_ADMISSION_CACHE_SECONDS', '2'))
+        if not fresh and self.admitted_at is not None and time.monotonic() - self.admitted_at < ttl:
+            return
+        check_source_admission(self.user)
+        self.admitted_at = time.monotonic()
 
     def write(self, proxy, name, method, args, options):
         from wave_policy import source_change_active
@@ -940,7 +984,7 @@ class _WaveAssignmentCoverage:
         if self.writes >= self.limit:
             raise RuntimeError('Wave assignment coverage page exceeded its write bound')
         self.check()
-        check_source_admission(self.user)
+        self._admit()
         if self.reservation is None:
             self.store = configured_store()
             # Assign only after confirmed begin. An ambiguous begin must remain
@@ -951,7 +995,7 @@ class _WaveAssignmentCoverage:
                     uncertain=True, operation='wave_assignment_page')
             from processing_metrics import add
             add(cluster_coverage_pages=1)
-            check_source_admission(self.user)  # Fence may have changed during begin.
+            self._admit(fresh=True)  # Fence may have changed during begin.
         self.check()
         self.writes += 1
         from processing_metrics import add
@@ -1071,6 +1115,8 @@ class _CoalescedReservations:
         # Fence checks already passed while this scope held a reservation for
         # the library (see scope_checked).
         self.checked = set()
+        # Metadata rows this scope read or wrote, by (user, key); see _CachedRow.
+        self.rows = {}
 
     def reserve(self, user, kind, *, deleted, operation):
         with self.lock:
@@ -1169,8 +1215,35 @@ class SourceTable:
 
     def __getattr__(self, name):
         method = getattr(self.table, name)
+        source = self.source
+        if name == 'get_entity' and source == 'metadata':
+            @wraps(method)
+            def read(*args, **kwargs):
+                row = method(*args, **kwargs)
+                scope = _COALESCED.get()
+                if scope is not None:
+                    _remember_read(scope, args, kwargs, row)
+                return row
+            return read
         if name not in self.MUTATIONS:
             return method
+        if source == 'metadata':
+            raw = method
+
+            @wraps(raw)
+            def method(*args, **kwargs):  # noqa: F811 - the table method, keeping the scope's row cache current
+                scope = _COALESCED.get()
+                entity = args[0] if args else kwargs.get('entity')
+                if scope is None or name == 'submit_transaction' or not isinstance(entity, dict):
+                    if scope is not None:
+                        scope.rows.clear()
+                    return raw(*args, **kwargs)
+                key = (str(entity.get('PartitionKey') or ''), str(entity.get('RowKey') or ''))
+                old = scope.rows.pop(key, None)
+                response = raw(*args, **kwargs)
+                _remember_write(scope, name, entity, {'mode': kwargs.get('mode', args[1] if len(args) > 1 else None)},
+                                old, response)
+                return response
 
         @wraps(method)
         def write(*args, **kwargs):
