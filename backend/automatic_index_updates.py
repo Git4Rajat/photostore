@@ -802,6 +802,9 @@ def _is_internal_source_row(source, user, key):
     return False
 
 
+_KEY_ONLY_SOURCES = frozenset({'embeddings', 'hash', 'person', 'face_embeddings'})
+
+
 class _CachedRow(dict):
     """A metadata row as this scope last saw it, with the ETag of that version."""
     def __init__(self, row, etag_value):
@@ -865,7 +868,10 @@ def mutation_targets(source, table, operation, entity, options):
         return user, {}, False, operation == 'delete'
     old, uncertain = _cached_old(source, user, key, operation, entity, options), False
     try:
-        if old is None:
+        # These sources map a write to a fixed kind and the exact row key, and
+        # face_embeddings classifies by the photofaces row, so the row's own
+        # previous value is never consulted: skip a read per tracked write.
+        if old is None and source not in _KEY_ONLY_SOURCES:
             old = table.get_entity(user, key)
     except ResourceNotFoundError:
         pass
