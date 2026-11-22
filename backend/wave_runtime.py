@@ -22,6 +22,8 @@ from upload_wave_execution import (execution_enabled,stage_work_store,run_vision
 
 TYPE='upload_wave_stage'
 ROLES={'vision':'vision','cluster':'cluster','index':'index-worker'}
+# The lease heartbeat renews every 30 s; a claim row older than this may no longer be the stored row.
+SOURCE_ROW_REUSE_SECONDS = 20
 _SOURCE_POOL = None
 _SOURCE_POOL_LOCK = threading.Lock()
 
@@ -166,6 +168,8 @@ def _process_source(library,filename,revision,renew):
     steps=required_steps_for_media(is_video_file(filename))
     with metrics.timer('vision_source_claim', count_name='vision_source_claim_calls'):
         lease=storage.claim_processing_lease(library,filename,'wave-'+uuid.uuid4().hex,steps=list(steps),mark_running=False)
+    claimed_at=time.monotonic()
+    committed=False
     try:
         row=lease['entity']
         if row.get('processingRevision')!=revision:
@@ -177,18 +181,28 @@ def _process_source(library,filename,revision,renew):
                 with metrics.timer('vision_source_steps', count_name='vision_source_steps_calls'):
                     output=app._run_ipwork_steps(library,filename,runnable,metadata_snapshot=dict(row))
                 check()
+                # The claim's row carries the ETag of that write, so apply starts from it instead of reading
+                # the row again; its commit is conditional on that ETag. Not once the heartbeat may have
+                # renewed the lease (and so changed the row).
+                fresh=time.monotonic()-claimed_at<SOURCE_ROW_REUSE_SECONDS
                 with metrics.timer('vision_source_apply', count_name='vision_source_apply_calls'):
                     storage.apply_client_processing_results_for_file(library,filename,
                         client_processing=output,origin='ipworker',claimed_steps=runnable,
                         lease_owner=lease['ownerId'],expected_processing_revision=revision,
-                        expected_processing_fence=row['processingFence'])
+                        expected_processing_fence=row['processingFence'],
+                        **(dict(initial_entity=row) if fresh else {}))
+                committed=True
             else:
                 with metrics.timer('vision_source_qualify', count_name='vision_source_qualify_calls'):
                     storage.qualify_completed_processing(library,filename,lease)
+                committed=True
     finally:
-        with metrics.timer('vision_source_release', count_name='vision_source_release_calls'):
-            storage.release_processing_lease(library,filename,lease['ownerId'],
-                expected_processing_fence=lease['entity']['processingFence'])
+        # A committed result already cleared the lease in the same conditional write; reading the row to
+        # find that out is all a release would do.
+        if not committed:
+            with metrics.timer('vision_source_release', count_name='vision_source_release_calls'):
+                storage.release_processing_lease(library,filename,lease['ownerId'],
+                    expected_processing_fence=lease['entity']['processingFence'])
 
 
 def invalidate_wave_tags(storage,library):

@@ -12252,7 +12252,10 @@ def claim_processing_lease(
         entity['processing_lease_expires_at'] = expires_at.isoformat()
         entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
         try:
-            metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
+            written = metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
+            # The merged row with this write's ETag: a caller that applies its result next can start from it
+            # (see ``initial_entity``) instead of reading the row again.
+            entity = row_after_write(entity, written)
             break
         except ResourceModifiedError:
             import time
