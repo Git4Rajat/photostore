@@ -380,3 +380,38 @@ def test_finalize_never_overwrites_an_already_stamped_revision(dedup_ctx, monkey
     first = metadata.rows[('lib-A', 'vacation.jpg')]['processingRevision']
     storage_utils.finalize_uploaded_file('lib-A', 'vacation.jpg', 'image/jpeg', client_sha256='t' * 64)
     assert metadata.rows[('lib-A', 'vacation.jpg')]['processingRevision'] == first
+
+
+@pytest.mark.parametrize('name', ['IMG_0052 (1).HEIC', 'lp_image (22).HEIC', 'Ünïcode photo.jpg'])
+def test_names_secure_filename_would_change_still_get_collision_protection(dedup_ctx, name):
+    """Copy-numbered and non-ASCII names used to skip the resolver, so a different
+    photo with the same name silently replaced the earlier one."""
+    first = storage_utils._resolve_filename_for_upload('lib-A', name, 'a' * 64)
+    second = storage_utils._resolve_filename_for_upload('lib-A', name, 'b' * 64)
+    again = storage_utils._resolve_filename_for_upload('lib-A', name, 'a' * 64)
+    stem, ext = name.rsplit('.', 1)
+    assert first == name and again == name
+    assert second != name and second.startswith(stem + '-') and second.endswith('.' + ext)
+
+
+def test_stored_photo_without_an_owner_row_is_not_overwritten_by_different_content(dedup_ctx):
+    """Photos stored before the fix have a metadata row but no filename-owner row."""
+    metadata, hash_index, filename_owners = dedup_ctx
+    metadata.upsert_entity({'PartitionKey': 'lib-A', 'RowKey': 'IMG_0052 (1).HEIC', 'fileHash': 'c' * 64,
+                            'processing_state': 'active'})
+    different = storage_utils._resolve_filename_for_upload('lib-A', 'IMG_0052 (1).HEIC', 'd' * 64)
+    assert different != 'IMG_0052 (1).HEIC' and different.startswith('IMG_0052 (1)-')
+    same = storage_utils._resolve_filename_for_upload('lib-A', 'IMG_0052 (1).HEIC', 'c' * 64)
+    assert same == 'IMG_0052 (1).HEIC'
+
+
+def test_trashed_photo_with_an_unclaimed_name_can_be_reclaimed(dedup_ctx):
+    metadata, hash_index, filename_owners = dedup_ctx
+    metadata.upsert_entity({'PartitionKey': 'lib-A', 'RowKey': 'IMG_1 (2).HEIC', 'fileHash': 'e' * 64,
+                            'processing_state': 'deleted'})
+    assert storage_utils._resolve_filename_for_upload('lib-A', 'IMG_1 (2).HEIC', 'f' * 64) == 'IMG_1 (2).HEIC'
+
+
+@pytest.mark.parametrize('name', ['a/b.jpg', 'a\\b.jpg', 'a#b.jpg', 'a?b.jpg', 'a\x01b.jpg', '..', ''])
+def test_names_that_cannot_be_table_keys_are_returned_unchanged(dedup_ctx, name):
+    assert storage_utils._resolve_filename_for_upload('lib-A', name, 'a' * 64) == name

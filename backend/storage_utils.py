@@ -12521,6 +12521,30 @@ def _claim_filename_owner(user_id: str, filename: str, file_hash: str) -> bool:
         return True
 
 
+_INVALID_TABLE_KEY_CHARS = re.compile(r'[\x00-\x1f\x7f-\x9f/\\#?]')
+
+
+def _is_table_key_name(filename: str) -> bool:
+    """Whether ``filename`` can be an Azure Table key and a flat blob name as-is."""
+    return (bool(filename) and filename not in ('.', '..') and len(filename.encode('utf-8')) <= 512
+            and not _INVALID_TABLE_KEY_CHARS.search(filename))
+
+
+def _stored_photo_has_other_content(user_id: str, filename: str, file_hash: str) -> bool:
+    """A live photo already stored under this exact name with a different hash."""
+    metadata_table_client = _CTX.get('metadata_table_client')
+    if metadata_table_client is None:
+        return False
+    try:
+        row = metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+    except ResourceNotFoundError:
+        return False
+    except Exception:
+        return False
+    stored = str(row.get('fileHash') or '')
+    return bool(stored) and stored != file_hash and row.get('processing_state') != 'deleted'
+
+
 def _resolve_filename_for_upload(user_id: str, filename: str, file_hash: str) -> str:
     """Return a safe filename to use for storing this upload.
 
@@ -12541,9 +12565,12 @@ def _resolve_filename_for_upload(user_id: str, filename: str, file_hash: str) ->
     """
     _require_context()
 
-    safe_name = secure_filename(filename)
-    if not safe_name or safe_name != filename:
+    if not _is_table_key_name(filename):
         return filename
+    # Names secure_filename would change ("IMG_0052 (1).HEIC", non-ASCII) used to skip this
+    # whole function, so a different photo with the same name silently replaced the earlier
+    # one. They never got a filename-owner row, so stored photos are checked directly below.
+    legacy_unclaimed = secure_filename(filename) != filename
 
     try:
         if _CTX.get('filename_owners_table_client') is None:
@@ -12581,8 +12608,9 @@ def _resolve_filename_for_upload(user_id: str, filename: str, file_hash: str) ->
                         return candidate
                 return f"{name}-{uuid.uuid4().hex[:8]}{ext}"
 
-        if _claim_filename_owner(user_id, filename, file_hash):
-            return filename
+        if not (legacy_unclaimed and _stored_photo_has_other_content(user_id, filename, file_hash)):
+            if _claim_filename_owner(user_id, filename, file_hash):
+                return filename
 
         # Same-user conflict: pick a unique filename and atomically claim
         # that instead.
