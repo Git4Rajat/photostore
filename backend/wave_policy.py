@@ -49,6 +49,15 @@ def finalization_check():
     check();return True
 
 
+def finalization_active():
+    """Whether this request finalizes under wave admission, without reading the fence.
+
+    ``finalization_check`` re-reads the policy and the item reservation every time. A caller that
+    only needs to know which write mode applies, and runs the check itself right before its write,
+    asks this instead of paying for a second fence read."""
+    return _FINALIZE.get() is not None
+
+
 @contextmanager
 def finalization_item(session, item):
     """Limit repeated write fences to the source currently being finalized.

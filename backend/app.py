@@ -3866,6 +3866,12 @@ def _humanize_job(row: Dict) -> Dict:
     }
 
 
+def _row_without_etag(row: Dict) -> Dict:
+    """The row's values with no ETag, so a caller reading it as ``initial_entity`` reads the row instead."""
+    from azure.data.tables import TableEntity
+    return TableEntity(row)
+
+
 def _update_metadata_entity_fields(
     user_id: str, filename: str, updates: Dict, *,
     derive_updates: Optional[Callable[[Dict], Dict]] = None,
@@ -3898,7 +3904,7 @@ def _update_metadata_entity_fields(
                 storage_utils_module.publish_metadata_index_intent(user_id, filename, entity)
             except Exception:
                 app.logger.warning('Metadata saved; index intent delivery pending for %s/%s', user_id, filename, exc_info=True)
-            return entity
+            return _row_without_etag(entity) if str(entity.get('indexPending') or '') else entity
         changed = {k: v for k, v in (current_updates or {}).items() if entity.get(k) != v}
         entity.update(current_updates or {})
         complete = _photo_processing_complete(entity)
@@ -3910,7 +3916,7 @@ def _update_metadata_entity_fields(
         try:
             # Conditional on the etag just read -- see _update_metadata_fields's
             # identical comment in storage_utils.py.
-            metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
+            written = metadata_table_client.update_entity(entity, mode=UpdateMode.MERGE, match_condition=MatchConditions.IfNotModified)
         except ResourceNotFoundError:
             # Deleted between our read and this write -- nothing left to retry.
             return None
@@ -3939,7 +3945,11 @@ def _update_metadata_entity_fields(
                     app.logger.warning('Metadata saved; index refresh pending for %s/%s', user_id, filename, exc_info=True)
                 else:
                     time.sleep(0.05 * (2 ** delivery_attempt))
-        return entity
+        if str(entity.get('indexPending') or ''):
+            # Publishing the index intent rewrites the row to clear it, so no ETag is current any more.
+            return _row_without_etag(entity)
+        # Carries this write's ETag, so a caller updating the row again can pass it back as initial_entity.
+        return storage_utils_module.row_after_write(entity, written)
     if last_exc:
         app.logger.warning('Failed to update metadata entity %s/%s: %s', user_id, filename, last_exc)
     return None

@@ -25,7 +25,7 @@ from typing import BinaryIO, Callable, Dict, List, Optional, Sequence, Set, Tupl
 import numpy as np
 from azure.core import MatchConditions
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError, ResourceModifiedError
-from azure.data.tables import UpdateMode
+from azure.data.tables import TableEntity, UpdateMode
 from azure.storage.blob import ContentSettings as BlobContentSettings
 from werkzeug.utils import secure_filename
 from upload_diagnostics import timed_call, upload_phase
@@ -117,6 +117,25 @@ FACE_LOW_CONFIDENCE_MAX_AREA_RATIO = float(os.getenv('FACE_LOW_CONFIDENCE_MAX_AR
 FACE_LOW_CONFIDENCE_MAX_SIDE_RATIO = float(os.getenv('FACE_LOW_CONFIDENCE_MAX_SIDE_RATIO', '0.42'))
 CLIENT_PROCESSING_ALLOWED_STEPS = {'preview', 'thumbnail', 'exif', 'ocr', 'ai_vision', 'map_detection', 'face'}
 CLIENT_PROCESSING_ALLOWED_STATUSES = {'done', 'skipped', 'failed', 'timeout', 'unsupported'}
+
+
+def row_after_write(row, response):
+    """The row we just wrote, carrying the ETag that write produced.
+
+    Table Storage returns the new ETag with every successful write. Handing it to the next
+    read-modify-write on the same row (see ``initial_entity`` on ``app._update_metadata_entity_fields``)
+    saves that write's read; a change made by anyone else in between still fails the conditional write
+    and the writer re-reads. Without an ETag in the response (a client that does not return one) the
+    row is returned unchanged and the next writer reads as before."""
+    try:
+        etag = response['etag']
+    except Exception:
+        return row
+    if not etag:
+        return row
+    fresh = TableEntity(row)
+    fresh._metadata = {'etag': etag, 'timestamp': None}
+    return fresh
 
 
 def _safe_json_load(value, default=None):
@@ -11307,8 +11326,13 @@ def apply_client_processing_results_for_file(
     lease_owner: Optional[str] = None,
     expected_processing_revision: Optional[str] = None,
     expected_processing_fence: Optional[str] = None,
+    initial_entity: Optional[Dict] = None,
 ) -> Dict:
     """Validate and apply late processing results to an existing asset.
+
+    `initial_entity`: the row exactly as the caller last wrote it, with that write's ETag (see
+    ``row_after_write``). Used in place of the opening read; the result commit is conditional on that
+    ETag, so a change made by anyone else in between fails it and the commit re-reads, as it always did.
 
     `origin` identifies who computed these results ('browser' or 'ipworker')
     and is stamped into each step's provenance; it does not change which
@@ -11322,7 +11346,12 @@ def apply_client_processing_results_for_file(
     """
     _require_context()
     metadata_table_client = _CTX['metadata_table_client']
-    metadata = timed_call('metadata_read', metadata_table_client.get_entity, partition_key=user_id, row_key=filename)
+    if (initial_entity is not None and getattr(initial_entity, 'metadata', {}).get('etag')
+            and initial_entity.get('PartitionKey') == user_id and initial_entity.get('RowKey') == filename):
+        # Same object kind a read returns: this function mutates it.
+        metadata = copy.deepcopy(initial_entity)
+    else:
+        metadata = timed_call('metadata_read', metadata_table_client.get_entity, partition_key=user_id, row_key=filename)
     if str(metadata.get('processing_state') or '').strip().lower() == 'deleted':
         raise RuntimeError('Photo has been deleted.')
     from processing_completion import check_revision, StaleProcessingResult
@@ -11572,10 +11601,10 @@ def _commit_browser_processing_results(user_id, filename, baseline, result, upda
         entity['last_processing_update'] = datetime.now(timezone.utc).isoformat()
         entity['processing_complete'] = _photo_processing_complete(entity)
         try:
-            table.update_entity(entity, mode=UpdateMode.MERGE,
-                                match_condition=MatchConditions.IfNotModified)
+            written = table.update_entity(entity, mode=UpdateMode.MERGE,
+                                          match_condition=MatchConditions.IfNotModified)
             touch_user_search_indexes_state(user_id, filenames=filename)
-            return entity
+            return row_after_write(entity, written)
         except ResourceModifiedError:
             if attempt + 1 == _METADATA_UPDATE_MAX_RETRIES:
                 raise
@@ -11733,8 +11762,12 @@ def finalize_uploaded_file(
     client_asset_id: str = '',
     client_sha256: str = '',
     anonymous_blob_name: Optional[str] = None,
+    row_out: Optional[List] = None,
 ) -> Tuple[List[Dict], str]:
     """Finalize upload and initialize durable browser-only processing state.
+
+    ``row_out``: when given, the row as written (with the ETag of that write) is appended, so the
+    caller's next update of the same row can skip its read.
 
     The file has already been uploaded straight to blob storage by the browser, so
     this avoids moving the bytes again wherever possible:
@@ -11802,8 +11835,10 @@ def finalize_uploaded_file(
             pass
 
     metadata = timed_call('metadata_read', get_or_create_metadata, user_id, final_filename)
-    from wave_policy import finalization_check
-    live_finalization=finalization_check()
+    from wave_policy import finalization_active, finalization_check
+    # Which write mode applies is known without reading the fence; the fence itself is checked once,
+    # immediately before the write below, where it matters.
+    live_finalization=finalization_active()
     if live_finalization and metadata.get('processing_state')=='deleted':
         raise ValueError('Photo deletion is in progress; retry upload after deletion completes')
     finalize_etag=getattr(metadata,'metadata',{}).get('etag')
@@ -11892,12 +11927,14 @@ def finalize_uploaded_file(
         if live_finalization:
             finalization_check()
             if finalize_etag:
-                metadata_table_client.update_entity(metadata,mode=UpdateMode.REPLACE,etag=finalize_etag,
+                written = metadata_table_client.update_entity(metadata,mode=UpdateMode.REPLACE,etag=finalize_etag,
                     match_condition=MatchConditions.IfNotModified,timeout=30,retry_total=0)
             else:
-                metadata_table_client.create_entity(metadata,timeout=30,retry_total=0)
+                written = metadata_table_client.create_entity(metadata,timeout=30,retry_total=0)
         else:
-            metadata_table_client.upsert_entity(metadata)
+            written = metadata_table_client.upsert_entity(metadata)
+    if row_out is not None:
+        row_out.append(row_after_write(metadata, written))
     # Mark the new row dirty for the search/listing indexes immediately --
     # without this, a brand-new photo is invisible to /api/photos (and
     # search) until something ELSE later writes one of the

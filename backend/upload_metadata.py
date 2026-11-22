@@ -388,13 +388,19 @@ def validate_descriptor(descriptor, source_hash):
     return {'version': 1, 'bytes': size, 'sha256': digest, 'sourceSha256': source_hash}
 
 
-def stamp_candidate(app, user_id, filename, descriptor, physical, total_size, source_hash):
-    """Persist HEAD-bound candidate before queueing; parse only in the worker."""
+def stamp_candidate(app, user_id, filename, descriptor, physical, total_size, source_hash, row=None, defer=False):
+    """Persist HEAD-bound candidate before queueing; parse only in the worker.
+
+    ``row``: the caller's current copy of this photo's row, used instead of reading it again. The
+    write is conditional on the row's ETag when it carries one, so a change made since fails the write
+    and the writer re-reads. ``defer``: validate, but return the fields to store instead of writing
+    them, so the caller can store them together with its own update of the same row."""
     if not uploads_enabled(filename) or not descriptor:
         return
     import storage_utils
     clean = validate_descriptor(descriptor, source_hash)
-    row = app.metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
+    if row is None or row.get('PartitionKey') != user_id or row.get('RowKey') != filename:
+        row = app.metadata_table_client.get_entity(partition_key=user_id, row_key=filename)
     if row.get('anonymousImageId') != physical or row.get('fileHash') != source_hash or int(row.get('size') or 0) != total_size:
         raise ValueError('Metadata reservation mismatch')
     blob = storage_utils._get_blob_client(storage_utils._CTX['blob_thumbnail_container'], packet_blob_name(physical))
@@ -402,7 +408,12 @@ def stamp_candidate(app, user_id, filename, descriptor, physical, total_size, so
     if props.size != clean['bytes'] or props.content_settings.content_type != 'application/octet-stream':
         raise ValueError('Metadata blob mismatch')
     clean.update({'physical': physical, 'sourceSize': total_size, 'etag': str(props.etag)})
-    app._update_metadata_entity_fields(user_id, filename, {'uploadMetadataPacket': json.dumps(clean, separators=(',', ':'))})
+    updates = {'uploadMetadataPacket': json.dumps(clean, separators=(',', ':'))}
+    if defer:
+        return updates
+    # With the row's ETag, the update continues from the row just validated instead of reading it again.
+    return app._update_metadata_entity_fields(user_id, filename, updates,
+                                              **({'initial_entity': row} if getattr(row, 'metadata', {}).get('etag') else {}))
 
 
 def decode_packet(packet, descriptor, source_size):
