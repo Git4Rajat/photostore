@@ -262,7 +262,11 @@ const GalleryPage: React.FC = () => {
         if (!target) { openedPhotoParamRef.current = null; return; }
         if (openedPhotoParamRef.current === target) return;
         openedPhotoParamRef.current = target;
-        focusPhoto(target);
+        // Scroll the grid to the photo behind the viewer, so closing it leaves
+        // the gallery there: now if its tile is already rendered, else when the
+        // page that holds it lands (the photos effect above).
+        pendingScrollIdRef.current = target;
+        void focusPhoto(target).then(() => { window.requestAnimationFrame(() => scrollToTile(target)); });
     }, [route.params.photo, focusPhoto]);
 
     // Drill from Years → Months → Days.

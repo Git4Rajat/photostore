@@ -414,7 +414,7 @@ interface Store {
     galleryFilters: GalleryFilters;
     setGalleryRating: (rating: number) => void;
     setGalleryLikedOnly: (likedOnly: boolean) => void;
-    jumpToGalleryDate: (date: string) => Promise<string | null>;
+    jumpToGalleryDate: (date: string, anchorFilename?: string) => Promise<string | null>;
     captureRange: CaptureRange | null;
     setCaptureRange: (range: CaptureRange | null) => void;
     timeline: TimelineSummary | null;
@@ -456,7 +456,7 @@ interface Store {
     viewerStep: (delta: number) => void;
     // Open a single photo in the viewer within the gallery sequence, resolving
     // it by exact filename lookup when it isn't on a loaded gallery page yet.
-    focusPhoto: (filename: string) => void;
+    focusPhoto: (filename: string) => Promise<void>;
 
     // photo mutations
     ratePhotos: (ids: string[], rating: number) => void;
@@ -1042,7 +1042,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setGalleryFilters({ ...galleryFiltersRef.current, likedOnly });
     }, [setGalleryFilters]);
 
-    const jumpToGalleryDate = useCallback(async (date: string): Promise<string | null> => {
+    // `anchorFilename` (Show in Gallery) widens the page so it is guaranteed to
+    // contain that photo even when its day holds more photos than one page.
+    const jumpToGalleryDate = useCallback(async (date: string, anchorFilename?: string): Promise<string | null> => {
         const clean = String(date || '').trim();
         if (!/^\d{4}-\d{2}-\d{2}$/.test(clean)) return null;
         const endMs = new Date(`${clean}T23:59:59.999Z`).getTime();
@@ -1074,6 +1076,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             }
             let offset = sorted.findIndex((row) => rowCaptureTime(row) <= endMs);
             if (offset < 0) offset = sorted.length - 1;
+            if (anchorFilename) {
+                const anchorAt = sorted.findIndex((row) => row.filename === anchorFilename);
+                if (anchorAt >= 0 && (anchorAt < offset || anchorAt >= offset + pageSize)) offset = anchorAt;
+            }
             const pageRows = sorted.slice(offset, offset + pageSize);
             const pageFilenames = pageRows.map((row) => row.filename);
             const target = pageRows[0]?.filename ?? null;
@@ -1277,26 +1283,66 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         });
     }, []);
 
-    // "Show in Gallery": open one photo in the viewer, reliably, wherever it
-    // lives in the library. If it's already on a loaded gallery page, open it
-    // in that (swipeable, extendable) sequence; otherwise resolve it by exact
-    // filename via /photos/lookup -- an exact point lookup that always finds
-    // the photo, unlike scrolling/paging forward until it happens to load
-    // (which never terminates for a photo thousands of items deep). The looked
-    // -up photo is registered so the viewer can render it as a standalone item.
-    const focusPhoto = useCallback((filename: string) => {
-        const loadedIndex = photos.findIndex((p) => p.id === filename);
+    // "Show in Gallery": land the gallery on a photo and open the viewer on it
+    // inside the gallery's own (swipeable, extendable) sequence. If the photo is
+    // not on a loaded page -- it may be thousands deep -- the sort index tells us
+    // its capture date and the gallery is reloaded from there
+    // (jumpToGalleryDate), never by paging forward until it happens to load.
+    // Filters that would hide it are cleared. Only when the index cannot place
+    // the photo do we fall back to an exact /photos/lookup and a one-item viewer.
+    const pendingFocusRef = useRef<string | null>(null);
+    const focusPhoto = useCallback(async (filename: string): Promise<void> => {
+        const loadedIndex = galleryViewerIds.indexOf(filename);
         if (loadedIndex >= 0) {
-            openViewer(photos.map((p) => p.id), loadedIndex, { extendable: true });
+            openViewer(galleryViewerIds, loadedIndex, { extendable: true });
             return;
         }
-        openViewer([filename], 0);
-        void get<{ photo?: BackendPhoto }>(`/photos/lookup/${encodeURIComponent(filename)}`)
-            .then((res) => {
-                if (res?.photo) registerPhotos([mapPhoto(res.photo)]);
-            })
-            .catch(() => { /* viewer will show its own empty/loading state */ });
-    }, [photos, openViewer, registerPhotos]);
+        const standalone = () => {
+            openViewer([filename], 0);
+            void get<{ photo?: BackendPhoto }>(`/photos/lookup/${encodeURIComponent(filename)}`)
+                .then((res) => {
+                    if (res?.photo) registerPhotos([mapPhoto(res.photo)]);
+                })
+                .catch(() => { /* viewer will show its own empty/loading state */ });
+        };
+        try {
+            const sortIndex = await withIndexRetry(getLocalSortIndex);
+            const row = sortIndex?.find((r) => r.filename === filename);
+            if (!row) { standalone(); return; }
+            // Let an in-flight load finish; a jump is refused while one runs.
+            for (let i = 0; i < 50 && photoLoadingRef.current; i += 1) {
+                await new Promise((resolve) => setTimeout(resolve, 100));
+            }
+            if (!filterRowsForGallery([row], galleryFiltersRef.current).length || captureRangeRef.current) {
+                const cleared: GalleryFilters = { rating: 0, likedOnly: false, media: 'all' };
+                galleryFiltersRef.current = cleared;
+                setGalleryFiltersState(cleared);
+                setMediaFilterState('all');
+                captureRangeRef.current = null;
+                setCaptureRangeState(null);
+            }
+            const iso = row.captureDate ? new Date(row.captureDate).toISOString().slice(0, 10) : '1970-01-01';
+            pendingFocusRef.current = filename;
+            const landed = await jumpToGalleryDate(iso, filename);
+            if (!landed && pendingFocusRef.current === filename) {
+                pendingFocusRef.current = null;
+                standalone();
+            }
+        } catch {
+            pendingFocusRef.current = null;
+            standalone();
+        }
+    }, [galleryViewerIds, openViewer, registerPhotos, jumpToGalleryDate]);
+
+    // Open the viewer once the jump's page has landed with the target in it.
+    useEffect(() => {
+        const target = pendingFocusRef.current;
+        if (!target) return;
+        const index = galleryViewerIds.indexOf(target);
+        if (index < 0) return;
+        pendingFocusRef.current = null;
+        openViewer(galleryViewerIds, index, { extendable: true });
+    }, [galleryViewerIds, openViewer]);
 
     // Minimal rendering of a pending-create receipt until the index confirms
     // the real row (see reconcileAlbumCreateReceipts/applyAlbumOperationOverlay).
