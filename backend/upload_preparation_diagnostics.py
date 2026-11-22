@@ -124,7 +124,8 @@ def record_receipt(app, user_id, filename, payload, *, packet_accepted=False, pa
                 receipts['processingReason'] = processing_rejection
             record = {'browserClaim': report, 'backendReceipt': receipts}
             return {**(extra_updates or {}), 'uploadPreparationReport': json.dumps(record, separators=(',', ':'))}
-        updated = app._update_metadata_entity_fields(user_id, filename, {}, derive_updates=derive, initial_entity=initial_entity)
+        updated = app._update_metadata_entity_fields(user_id, filename, {}, derive_updates=derive,
+                                                     **({'initial_entity': initial_entity} if initial_entity is not None else {}))
         if updated is None or record is None:
             raise RuntimeError('Receipt metadata unavailable')
         written = True

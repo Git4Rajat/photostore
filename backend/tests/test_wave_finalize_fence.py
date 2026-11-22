@@ -25,7 +25,8 @@ def test_live_finalize_is_conditional_and_cannot_resurrect_cleanup_tombstone(fin
     checks=[]
     def gate():
         checks.append(1)
-        if len(checks)==2 and race:
+        # The only read of the fence is the one right before the write; a change landing during it must fail that write.
+        if len(checks)==1 and race:
             current=table.get_entity('lib-A','photo.cr3')
             original(dict(current,processing_state='deleted'),etag=current.metadata['etag'],match_condition='IfNotModified')
     token=wave_policy.begin_finalization(gate)
