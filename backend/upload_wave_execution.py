@@ -315,6 +315,60 @@ def _observe_qualified(store, member, metadata_table, receipts=None, inboxes=Non
     return completion, row
 
 
+SETTLEMENT_READ_WORKERS = 8
+
+
+def _settlement_read_workers():
+    """Threads reading each drained page's rows at once; 0 (IPWORK_VISION_SETTLEMENT_PARALLEL=false) reads them one by one."""
+    if os.getenv('IPWORK_VISION_SETTLEMENT_PARALLEL', 'true').lower() not in ('1', 'true', 'yes'):
+        return 0
+    return SETTLEMENT_READ_WORKERS
+
+
+class _FreshRows:
+    """Authoritative metadata rows for one settlement, read concurrently as soon as the page has drained.
+
+    Settlement reads each runnable member's row twice in a row (source_state, then _observe_qualified), one
+    member after another. Here every row is read once, in parallel, and served to those two reads. A row whose
+    read failed is not served, so that read reaches the table and fails the way it always did; any other call,
+    and any later read, goes straight to the table."""
+    SERVED_READS = 2
+
+    def __init__(self, table, library, filenames, workers):
+        from concurrent.futures import ThreadPoolExecutor
+        from contextvars import copy_context
+        self.table, self.library, self.served = table, library, {}
+        executor = ThreadPoolExecutor(max_workers=max(1, min(workers, len(filenames))), thread_name_prefix='vision-settle')
+        self.futures = {name: executor.submit(copy_context().run, self._read, name) for name in dict.fromkeys(filenames)}
+        executor.shutdown(wait=False)  # Submitted reads still finish; the threads then exit.
+
+    def _read(self, filename):
+        from azure.core.exceptions import ResourceNotFoundError
+        try:
+            return self.table.get_entity(self.library, filename)
+        except ResourceNotFoundError:
+            return None
+
+    def get_entity(self, library, filename):
+        import copy
+        from azure.core.exceptions import ResourceNotFoundError
+        future = self.futures.get(filename)
+        if library == self.library and future is not None and self.served.get(filename, 0) < self.SERVED_READS:
+            self.served[filename] = self.served.get(filename, 0) + 1
+            try:
+                row = future.result()
+            except Exception:
+                row = False  # Unread: let the caller's own read raise what the table raises.
+            if row is None:
+                raise ResourceNotFoundError('Source absent from settlement read')
+            if row is not False:
+                return copy.copy(row)
+        return self.table.get_entity(library, filename)
+
+    def __getattr__(self, name):
+        return getattr(self.table, name)
+
+
 def _inspect_vision_member(store, wave_id, member, metadata_table, receipts):
     from wave_settlement import source_state, verified
     from storage_utils import _processing_is_expired
@@ -501,6 +555,12 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
         except Exception:
             metrics.add(vision_qualification_fallback_members=len(runnable))
             logger.exception('Vision qualification prefetch failed; using authoritative point reads')
+    verify_metadata = current_metadata
+    read_workers = _settlement_read_workers()
+    if runnable and read_workers > 1:
+        # Started after the prefetch so the rereads still see changes made during it; they run side by side, not member by member.
+        verify_metadata = _FreshRows(current_metadata, store.library,
+                                     [member['filename'] for member in runnable], read_workers)
     getattr(renew, 'boundary', renew)()
     verification_started = time.monotonic()
     observations = []
@@ -511,7 +571,7 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
                 renew()
                 metadata.invalidate(member['filename'])
                 from wave_settlement import source_state
-                if source_state(store, wave_id, member, current_metadata,
+                if source_state(store, wave_id, member, verify_metadata,
                         proofs=qualification.proofs if qualification is not None else None):
                     continue
                 count, _ = counts[member['RowKey']]
@@ -522,7 +582,7 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
                     continue
                 try:
                     metrics.add(vision_qualification_fresh_metadata_reads=1)
-                    item['completion'], item['row'] = _observe_qualified(store, member, current_metadata, receipts,
+                    item['completion'], item['row'] = _observe_qualified(store, member, verify_metadata, receipts,
                         inboxes=qualification.inboxes if qualification is not None else None)
                 except OwnershipLost:
                     raise
