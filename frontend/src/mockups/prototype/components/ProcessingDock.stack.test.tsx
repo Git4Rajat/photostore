@@ -44,4 +44,18 @@ describe('upload and processing in one stack', () => {
         expect(screen.queryByText('Getting your photos ready')).toBeNull();
         expect(document.querySelector('.wcnt')).toBeNull();
     });
+
+    it('another device\'s upload shows its count, but not on the device that is uploading', async () => {
+        const upload = wave({ waveId: 'far', stage: 'upload', state: 'collecting', done: 40, total: 300, files: [] });
+        Object.assign(services, { uploadActive: false, uploading: false, uploadProgress: null });
+        api.fetchProcessingWaves.mockResolvedValue([upload]);
+        render(<App />);
+        await waitFor(() => expect(screen.getByText('Uploading from another device')).toBeTruthy());
+        expect(screen.getByText('40 of 300 photos')).toBeTruthy();
+        cleanup();
+        Object.assign(services, { uploadActive: true, uploading: true, uploadProgress: { uploadedCount: 5, totalCount: 40, failedCount: 0 } });
+        render(<App />);
+        await waitFor(() => expect(api.fetchProcessingWaves).toHaveBeenCalledTimes(2));
+        expect(screen.queryByText('Uploading from another device')).toBeNull();
+    });
 });

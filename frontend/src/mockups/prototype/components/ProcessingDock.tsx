@@ -5,6 +5,7 @@ import BottomSheet from './BottomSheet';
 import { IconButton } from '../../../components/ui/Button';
 import { StackWidget } from './WidgetStack';
 import { plural } from '../../../utils/format';
+import { resolveThumbnailAccessUrls } from '../../../services/thumbnailAccessCache';
 import {
     STAGE_TITLES, clampMonotonic, dismissProcessingWave, etaLabel, fetchProcessingWaves, holdStalled, isProcessingPushLive, isTrouble, isWaiting,
     leadWave, onProcessingSignal, orderWaves, problemText, uploadLabel, retryOutcomeText, retryStuckProcessing, stepNumber, takingLonger, type ProcessingStage, type ProcessingWave,
@@ -13,6 +14,8 @@ import {
 // Socket up: one safety read now and then. Socket down: follow the bar closely, but only while it is on screen.
 const POLL_WITH_PUSH_MS = 2 * 60_000;
 const POLL_WITHOUT_PUSH_MS = 20_000;
+// An upload running on another device: follow it closely, but only while this page is on screen.
+const POLL_UPLOADING_MS = 15_000;
 const RETRY_COOLDOWN_MS = 2 * 60_000;
 // Browser and server clocks differ a little; a wave this close before the upload began still counts as its own.
 const CLOCK_SLACK_S = 30;
@@ -99,6 +102,43 @@ const WaveBlock: React.FC<BlockProps> = ({ wave, full, onDismiss }) => {
     );
 };
 
+// Another device's upload: a count and a sample of what has landed. Thumbnails already sit in
+// storage under their final names before any processing, so they can be shown right away.
+const UploadingElsewhere: React.FC<{ wave: ProcessingWave }> = ({ wave }) => {
+    const names = (wave.files ?? []).join('\n');
+    const [urls, setUrls] = useState<Map<string, string>>(new Map());
+    useEffect(() => {
+        let live = true;
+        const list = names ? names.split('\n') : [];
+        if (list.length) void resolveThumbnailAccessUrls(list).then((map) => { if (live) setUrls(map); }).catch(() => undefined);
+        return () => { live = false; };
+    }, [names]);
+    const total = wave.total ?? 0;
+    const done = Math.min(wave.done ?? 0, total || Infinity);
+    const pct = total ? Math.round((done / total) * 100) : 0;
+    return (
+        <StackWidget id="uploading-elsewhere">
+            <div className="up-dock up-bar pd-bar" role="region" aria-label="Upload from another device">
+                <div className="pd-row">
+                    <span className="up-head">
+                        <span className="up-ico"><span className="pd-spin" aria-hidden="true" /></span>
+                        <span className="up-t"><b>Uploading from another device</b><span>{total ? `${done} of ${plural(total, 'photo')}` : 'Photos are coming in'}</span></span>
+                        {total ? <span className="up-pct">{pct}%</span> : null}
+                    </span>
+                </div>
+                {names ? (
+                    <div className="pd-strip" aria-hidden="true" style={{ display: 'flex', gap: 4, overflow: 'hidden', padding: '4px 0' }}>
+                        {(wave.files ?? []).filter((name) => urls.get(name)).slice(0, 12).map((name) => (
+                            <img key={name} src={urls.get(name)} alt="" width={44} height={44} style={{ objectFit: 'cover', borderRadius: 6 }} />
+                        ))}
+                    </div>
+                ) : null}
+                {total ? <div className="pd-seg" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct} aria-label="Upload progress"><i className="now"><b style={{ width: `${pct}%` }} /></i></div> : null}
+            </div>
+        </StackWidget>
+    );
+};
+
 export const ProcessingDock: React.FC = () => {
     const { uploadActive } = useAppServices();
     const [waves, setWaves] = useState<ProcessingWave[]>([]);
@@ -144,22 +184,24 @@ export const ProcessingDock: React.FC = () => {
     if (!uploadActive) uploadStartedAt.current = null;
     else if (uploadStartedAt.current === null) uploadStartedAt.current = Date.now() / 1000;
     const ownedByUpload = (candidate: ProcessingWave) => uploadStartedAt.current !== null && candidate.startedAt >= uploadStartedAt.current - CLOCK_SLACK_S;
-    const ordered = orderWaves(waves.filter((candidate) => !ownedByUpload(candidate)).map((candidate) => holdStalled(candidate, retriedAt.current[candidate.waveId], Date.now())));
+    // This device's own upload has its own card; another device's is shown beside it, read-only.
+    const elsewhere = uploadActive ? undefined : waves.find((candidate) => candidate.stage === 'upload');
+    const ordered = orderWaves(waves.filter((candidate) => candidate.stage !== 'upload' && !ownedByUpload(candidate)).map((candidate) => holdStalled(candidate, retriedAt.current[candidate.waveId], Date.now())));
     const wave = leadWave(ordered);
     const unfinished = ordered.filter((candidate) => candidate.stage !== 'done');
     const finishedWaves = ordered.filter((candidate) => candidate.stage === 'done');
     const running = unfinished.length > 0;
-    const watching = running || watchUntil > Date.now();
+    const watching = running || Boolean(elsewhere) || watchUntil > Date.now();
     useEffect(() => {
         if (!watching) return undefined;
         const timer = window.setInterval(() => {
             void load();
             tick((value) => value + 1); // "taking longer" is time-based
-        }, isProcessingPushLive() ? POLL_WITH_PUSH_MS : POLL_WITHOUT_PUSH_MS);
+        }, elsewhere ? POLL_UPLOADING_MS : isProcessingPushLive() ? POLL_WITH_PUSH_MS : POLL_WITHOUT_PUSH_MS);
         return () => window.clearInterval(timer);
-    }, [watching, load]);
+    }, [watching, load, Boolean(elsewhere)]);
 
-    if (!wave) return null;
+    if (!wave) return elsewhere ? <UploadingElsewhere wave={elsewhere} /> : null;
 
     const fraction = clampMonotonic(shown.current, wave);
     const finished = wave.stage === 'done';
@@ -199,6 +241,7 @@ export const ProcessingDock: React.FC = () => {
 
     return (
         <>
+            {elsewhere ? <UploadingElsewhere wave={elsewhere} /> : null}
             <StackWidget id="processing" finished={finished} onDismiss={() => dismissWaves(finishedWaves)}>
             <div className={`up-dock up-bar pd-bar`} role="region" aria-label="Photo processing">
                 <div className="pd-row">

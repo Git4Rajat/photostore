@@ -5,7 +5,8 @@ import { get, post, postUpload } from './apiClient';
 // says "read it again" with the latest step attached, so a dropped message costs
 // a slower bar, never a wrong one.
 
-export type ProcessingStage = 'vision' | 'cluster' | 'index' | 'done';
+// 'upload' is an upload still going up, on this or another device; it is not a processing step.
+export type ProcessingStage = 'upload' | 'vision' | 'cluster' | 'index' | 'done';
 
 export interface ProcessingWave {
     waveId: string;
@@ -15,6 +16,8 @@ export interface ProcessingWave {
     stageEnteredAt: number;
     done?: number;
     total?: number;
+    // Upload stage only: a sample of the photos already uploaded.
+    files?: string[];
     etaSeconds?: number | null;
     processedSeconds?: number;
     failed?: number;
@@ -67,6 +70,7 @@ const STAGE_ORDER: Array<'vision' | 'cluster' | 'index'> = ['vision', 'cluster',
 const STAGE_WEIGHT: Record<'vision' | 'cluster' | 'index', number> = { vision: 0.7, cluster: 0.15, index: 0.15 };
 
 export const STAGE_TITLES: Record<ProcessingStage, string> = {
+    upload: 'Uploading photos',
     vision: 'Reading your photos',
     cluster: 'Finding people',
     index: 'Getting search ready',
@@ -95,7 +99,7 @@ export const clampMonotonic = (shown: Record<string, number>, wave: ProcessingWa
     return next;
 };
 
-export const stepNumber = (stage: ProcessingStage): number => (stage === 'done' ? 3 : STAGE_ORDER.indexOf(stage) + 1);
+export const stepNumber = (stage: ProcessingStage): number => (stage === 'done' ? 3 : stage === 'upload' ? 0 : STAGE_ORDER.indexOf(stage) + 1);
 
 export const etaLabel = (seconds: number | null | undefined): string | null => {
     if (seconds === null || seconds === undefined || seconds < 0) return null;
