@@ -1,6 +1,5 @@
 import React from 'react';
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({ status: vi.fn(), confirm: vi.fn() }));
@@ -8,10 +7,12 @@ vi.mock('../services/libraryClient', () => ({
     getLibraryCleanConfirmationStatus: mocks.status,
     confirmLibraryClean: mocks.confirm,
 }));
-vi.mock('./shared/AuthShell', () => ({ default: ({ children }: { children: React.ReactNode }) => <section>{children}</section> }));
-import ConfirmLibraryCleanPage from './ConfirmLibraryCleanPage';
+import LibraryCleanApprovalDialog from './LibraryCleanApprovalDialog';
 
-const mount = () => render(<MemoryRouter initialEntries={['/confirm-library-clean?token=example-token']}><ConfirmLibraryCleanPage /></MemoryRouter>);
+const mount = () => {
+    window.history.replaceState(null, '', '/confirm-library-clean?token=example-token');
+    return render(<LibraryCleanApprovalDialog />);
+};
 const flush = async () => { await act(async () => { await Promise.resolve(); }); };
 beforeEach(() => {
     vi.useFakeTimers();
@@ -103,4 +104,22 @@ it('preserves an approval error when the server confirms that approval is still 
     await flush();
     expect(screen.getByText('Could not save your approval.')).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Confirm cleanup' })).toBeTruthy();
+});
+
+it('renders nothing outside the confirmation link', async () => {
+    window.history.replaceState(null, '', '/');
+    const view = render(<LibraryCleanApprovalDialog />);
+    await flush();
+    expect(view.container.textContent).toBe('');
+    expect(mocks.status).not.toHaveBeenCalled();
+});
+
+it('closing the dialog clears the link without confirming', async () => {
+    mocks.status.mockResolvedValue({ status: 'pending' });
+    const view = mount();
+    await flush();
+    fireEvent.click(screen.getByRole('button', { name: 'Not now' }));
+    expect(view.container.textContent).toBe('');
+    expect(window.location.pathname).toBe('/');
+    expect(mocks.confirm).not.toHaveBeenCalled();
 });

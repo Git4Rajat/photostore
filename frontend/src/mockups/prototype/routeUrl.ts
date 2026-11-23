@@ -6,7 +6,7 @@ import type { PageId, Route, RouteParams } from './types';
  * photo) is reflected in the address bar and survives a refresh/back-button
  * instead of always bouncing back to Gallery. Lives on the root path (`/`)
  * only -- the few special unauthenticated deep-link pages (public album
- * share, invite accept, password reset, confirm-library-clean) match on
+ * share, invite accept, password reset) match on
  * pathname, not query string, in PrototypeApp.tsx's isPublicAlbumPath() and
  * siblings, so this never collides with those.
  */

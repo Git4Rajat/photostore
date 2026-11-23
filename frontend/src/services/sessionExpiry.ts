@@ -19,7 +19,6 @@ const PUBLIC_PATH_PREFIXES = [
     '/public/',
     '/accept-invite',
     '/reset-password',
-    '/confirm-library-clean',
     '/login',
     '/logout',
 ];

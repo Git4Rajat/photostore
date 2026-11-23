@@ -286,7 +286,7 @@ export interface CleanConfirmResult {
 }
 
 // Step 2: each required approver opens their emailed link (see
-// ConfirmLibraryCleanPage) and this is called while signed in as that account.
+// LibraryCleanApprovalDialog) and this is called while signed in as that account.
 export const confirmLibraryClean = async (token: string): Promise<CleanConfirmResult> => {
     const response = await authedFetch('/api/library/clean/confirm', {
         method: 'POST',
