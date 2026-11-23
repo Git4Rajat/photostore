@@ -153,3 +153,17 @@ def test_a_wave_waiting_behind_an_earlier_one_is_listed_after_it(live_api):
     waves = pg.active('alice')
     assert [(w['waveId'], w['stage'], w['done'], w['total']) for w in waves] == [('w1', 'vision', 0 + 10, 100), ('w2', 'vision', 0, 30)]
     assert waves[1]['state'] == 'waiting_predecessor'
+
+
+def test_open_upload_is_listed_with_counts_and_a_filename_sample(live_api):
+    _, store, _, _ = live_api
+    clock = Clock()
+    pg = ProgressStore(store, clock=clock)
+    wave_row(store, 'wc', state='collecting', lastProgressAt=990.0)
+    store.table.create_entity(store._row('control', revision='', collectingWaveId='wc', tailWaveId='wc'))
+    store.table.create_entity(store._row('session!s1', waveId='wc', state='open', declaredCount=300, resolvedCount=40))
+    store.table.create_entity(store._row('e!wc!m!a', kind='member', filename='a.jpg'))
+    [item] = pg.active('u1')
+    assert (item['stage'], item['done'], item['total'], item['files']) == ('upload', 40, 300, ['a.jpg'])
+    clock.now += progress.UPLOAD_IDLE_SECONDS + 100
+    assert pg.active('u1') == []  # an abandoned upload does not look like it is running

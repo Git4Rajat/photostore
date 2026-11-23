@@ -6,6 +6,7 @@ library's wave partition next to the wave rows, are advisory, and are written
 without compare-and-swap so they never contend with wave transitions.
 """
 import time
+from itertools import islice
 
 from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
 from azure.data.tables import TableTransactionError
@@ -18,6 +19,10 @@ RATE_ALPHA = 0.3
 MIN_SAMPLES = 3
 SMALL_WAVE = 50
 RETAIN_SECONDS = 24 * 3600
+# An upload that has registered or resolved nothing for this long is not shown as running.
+UPLOAD_IDLE_SECONDS = 600
+# Filenames sampled from an open upload so another device can draw a preview strip.
+UPLOAD_SAMPLE = 48
 # Nothing moved for this long while the stage is not failed: say so instead of "in progress".
 STALL_SECONDS = 600
 MAX_ROWS = 200
@@ -166,7 +171,37 @@ class ProgressStore:
                     wave.get('frozenAt') or wave['createdAt']))), failed=int(wave.get('failedMembers') or 0))
             out.append(item)
         out.extend(self._queued(user, {item['waveId'] for item in out}, can_repair))
+        out.extend(self._uploading({item['waveId'] for item in out}))
         return out
+
+    def _uploading(self, listed):
+        """The wave still taking uploads, so another device can say "uploading, 40 of 300" and show a
+        sample of what is already there. Read-only: counts come from the session rows and names from
+        the member rows that resolve already writes, so uploading adds no work for this."""
+        control = self.store._get('control')
+        wave_id = (control or {}).get('collectingWaveId')
+        if not wave_id or wave_id in listed:
+            return []
+        wave = self.store._get(self.store.wave_key(wave_id))
+        if not wave or wave.get('state') != 'collecting':
+            return []
+        now = self.clock()
+        if now - float(wave.get('lastProgressAt') or 0) > UPLOAD_IDLE_SECONDS:
+            return []
+        sessions = list(islice(self.store.table.query_entities(
+            f"PartitionKey eq '{self.store.partition}' and RowKey ge 'session!' and RowKey lt 'session!~' "
+            f"and waveId eq '{wave_id}' and state eq 'open'"), 20))
+        if not sessions:
+            return []
+        members = islice(self.store.table.query_entities(
+            f"PartitionKey eq '{self.store.partition}' and RowKey ge 'e!{wave_id}!m!' and RowKey lt 'e!{wave_id}!m!~'"),
+            UPLOAD_SAMPLE)
+        return [dict(waveId=wave_id, stage='upload', state='collecting',
+                     startedAt=float(wave.get('createdAt') or 0),
+                     stageEnteredAt=float(wave.get('stateEnteredAt') or 0),
+                     done=sum(int(row.get('resolvedCount') or 0) for row in sessions),
+                     total=sum(int(row.get('declaredCount') or 0) for row in sessions),
+                     files=[str(row['filename']) for row in members if row.get('filename')])]
 
     def _queued(self, user, listed, can_repair):
         """Waves lined up behind an earlier one (or not yet started) have no progress row, so
