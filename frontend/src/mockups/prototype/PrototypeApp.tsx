@@ -34,7 +34,7 @@ import { StoreFloatingSelectButton } from './components/StoreFloatingSelectButto
 const LazyPublicAlbumPage = React.lazy(() => import('../../components/PublicAlbumPage'));
 const LazyAcceptInvitePage = React.lazy(() => import('../../components/AcceptInvitePage'));
 const LazyResetPasswordPage = React.lazy(() => import('../../components/ResetPasswordPage'));
-const LazyConfirmLibraryCleanPage = React.lazy(() => import('../../components/ConfirmLibraryCleanPage'));
+const LazyLibraryCleanApprovalDialog = React.lazy(() => import('../../components/LibraryCleanApprovalDialog'));
 import GalleryPage from './pages/GalleryPage';
 import AlbumsPage from './pages/AlbumsPage';
 import { PeoplePage, PersonDetailPage } from './pages/PeoplePages';
@@ -72,10 +72,6 @@ const isAcceptInvitePath = (): boolean =>
 // Same problem for a password-reset link (…/reset-password?token=…).
 const isResetPasswordPath = (): boolean =>
     typeof window !== 'undefined' && window.location.pathname === '/reset-password';
-
-// Same problem for a library-clean confirmation link (…/confirm-library-clean?token=…).
-const isConfirmLibraryCleanPath = (): boolean =>
-    typeof window !== 'undefined' && window.location.pathname === '/confirm-library-clean';
 
 const NAV: { id: PageId; label: string }[] = [...NAV_ITEMS];
 // The phone tab bar holds the three places people live in. People and Explore
@@ -428,20 +424,6 @@ const PrototypeApp: React.FC = () => {
         );
     }
 
-    // Library-clean confirmation links render the real confirm page regardless
-    // of auth state (it shows its own sign-in-required message if needed).
-    if (isConfirmLibraryCleanPath()) {
-        return (
-            <BrowserRouter>
-                <React.Suspense fallback={<Loading label="Loading…" />}>
-                    <Routes>
-                        <Route path="/confirm-library-clean" element={<LazyConfirmLibraryCleanPage />} />
-                    </Routes>
-                </React.Suspense>
-            </BrowserRouter>
-        );
-    }
-
     if (!authReady) {
         return <Loading label="Loading Keepsake…" />;
     }
@@ -466,9 +448,14 @@ const PrototypeApp: React.FC = () => {
     }
 
     return (
-        <AppServicesProvider>
-            <AppShellGate onSignOut={handleSignOut} />
-        </AppServicesProvider>
+        <>
+            <AppServicesProvider>
+                <AppShellGate onSignOut={handleSignOut} />
+            </AppServicesProvider>
+            {/* A library-clean link from the approval email opens as a dialog over the app. It sits
+                outside AppShellGate so it only waits for its own status call, not the library index. */}
+            <React.Suspense fallback={null}><LazyLibraryCleanApprovalDialog /></React.Suspense>
+        </>
     );
 };
 
