@@ -11,7 +11,9 @@
 //     metadata tables are created automatically by the app on first use
 //   - dedicated Azure Files storage for worker FAISS checkpoints
 //   - a Container Apps environment (+ Log Analytics workspace)
-//   - backend, frontend, and worker container apps
+//   - container apps for each role (one image for the Python roles, selected by
+//     APP_ROLE): core, upload, indexer, index-worker (or a sidecar in indexer),
+//     recovery, archive, cluster and vision, plus the web SPA
 //   - role assignments so the apps reach storage via managed identity
 //
 // Sign-in uses a single owner email + password that you set right here in the
