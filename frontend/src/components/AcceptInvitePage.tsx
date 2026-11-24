@@ -16,6 +16,7 @@ const AcceptInvitePage: React.FC = () => {
     const [info, setInfo] = useState<library.InviteInfo | null>(null);
     const [loading, setLoading] = useState(true);
     const [password, setPassword] = useState('');
+    const [confirm, setConfirm] = useState('');
     const [libraryName, setLibraryName] = useState('');
     const [pending, setPending] = useState(false);
     const [errorMessage, setErrorMessage] = useState('');
@@ -54,6 +55,10 @@ const AcceptInvitePage: React.FC = () => {
                 setErrorMessage(`Password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
                 return;
             }
+            if (password !== confirm) {
+                setErrorMessage('Passwords do not match.');
+                return;
+            }
         }
         setPending(true);
         try {
@@ -70,6 +75,7 @@ const AcceptInvitePage: React.FC = () => {
     // The mock-up's "First time" screen: an invited person who starts their own library.
     const ownLibrary = needsPassword && info?.targetType !== 'join';
     const longEnough = password.length >= MIN_PASSWORD_LENGTH;
+    const matches = confirm.length > 0 && password === confirm;
     const problem = (text: string) => (
         <p className="auth-msg box" role="alert"><AlertIcon aria-hidden="true" /><span>{text}</span></p>
     );
@@ -90,6 +96,7 @@ const AcceptInvitePage: React.FC = () => {
     const rules = (
         <ul className="auth-rules" aria-label="Password rules">
             <li className={longEnough ? 'ok' : undefined}>{longEnough ? <CheckIcon aria-hidden="true" /> : <PlusIcon aria-hidden="true" />}At least {MIN_PASSWORD_LENGTH} characters</li>
+            <li className={matches ? 'ok' : undefined}>{matches ? <CheckIcon aria-hidden="true" /> : <PlusIcon aria-hidden="true" />}Both passwords match</li>
         </ul>
     );
 
@@ -130,10 +137,11 @@ const AcceptInvitePage: React.FC = () => {
                         <>
                             <AuthField id="invite-email" label="Email address" type="email" value={info?.email || ''} onChange={() => {}} readOnly autoComplete="username" />
                             <AuthField id="invite-password" label="Password" type="password" autoComplete="new-password" value={password} onChange={setPassword} />
+                            <AuthField id="invite-confirm-password" label="Confirm password" type="password" autoComplete="new-password" value={confirm} onChange={setConfirm} />
                             {rules}
                         </>
                     )}
-                    <button type="submit" className="auth-btn top" disabled={pending || (needsPassword && !longEnough)}>
+                    <button type="submit" className="auth-btn top" disabled={pending || (needsPassword && !(longEnough && matches))}>
                         {pending ? (ownLibrary ? 'Creating…' : 'Accepting…') : ownLibrary ? 'Create library' : 'Accept invite'}
                     </button>
                     {/* Hard navigation: this page can render under a router that
