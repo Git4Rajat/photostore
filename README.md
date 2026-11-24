@@ -167,8 +167,8 @@ You'll see the same icons throughout the gallery and on individual photos:
   or "make an album from these").
 - **🔄 Spinning icon — processing on server.** Only appears if you deployed with
   "On the server" or "Both" processing (see [Choosing where AI processing
-  runs](#choosing-where-ai-processing-runs)). Shows while `ipworker` is
-  actively working on that photo; disappears once it finishes.
+  runs](#choosing-where-ai-processing-runs)). Shows while the server (the
+  `vision` app) is actively working on that photo; disappears once it finishes.
 
 #### Filtering the gallery
 
@@ -222,7 +222,7 @@ lists files that couldn't be processed at all.
 
 If you deployed with **"On the server" or "Both"** processing (see [Choosing
 where AI processing runs](#choosing-where-ai-processing-runs)), re-running a
-stage here also queues it to `ipworker` — this is how you bulk-reprocess an
+stage here also queues it to the `vision` app — this is how you bulk-reprocess an
 existing library server-side, with no browser tab needing to stay open.
 
 #### Working with Albums
@@ -315,14 +315,14 @@ in the deploy form's "Photo processing" dropdown (`processingMode` parameter):
 | Mode | What happens |
 | --- | --- |
 | **In your browser** | Legacy processing mode: everything runs client-side. Requires a reasonably capable device; nothing runs until you click "Load browser AI." |
-| **On the server** (default) | The browser skips this AI work. A new `ipworker` container app processes every upload instead — better for low-power/mobile devices, and it's the only mode that lets you bulk-reprocess an existing library from the **Tools** page (see below) without a browser tab open. Costs more to run (`ipworker` needs meaningfully more CPU/memory than the rest of the deployment) and only scales up when there's work queued. Required for wave-owned libraries. |
+| **On the server** (default) | The browser skips this AI work. A separate `vision` container app processes every upload instead — better for low-power/mobile devices, and it's the only mode that lets you bulk-reprocess an existing library from the **Tools** page (see below) without a browser tab open. Costs more to run (`vision` needs meaningfully more CPU/memory than the rest of the deployment) and only scales up when there's work queued. Required for wave-owned libraries. |
 | **Both** | Browser and server both attempt each step; whichever finishes first for a given photo wins, the other is discarded. Roughly doubles compute cost per step — useful mainly for comparing the two paths, not a typical choice. |
 
-`ipworker` pulls a separate public image, `ghcr.io/git4rajat/photostore-ipworker` (digest-pinned)
+The `vision` app pulls a separate public image, `ghcr.io/git4rajat/photostore-ipworker` (digest-pinned)
 (also gated behind the [Publish images workflow](.github/workflows/publish-images.yml)
 being run and set to Public in GHCR, same as the backend/frontend images
 above). It's only deployed at all when you choose "On the server" or "Both" —
-in browser mode, no `ipworker` container app is created.
+in browser mode, no `vision` container app is created.
 
 You can change this later by re-running the deployment with a different
 `processingMode` value (Azure Portal → your resource group → Deployments →
@@ -349,7 +349,7 @@ When the deployment finishes, open the app URL and log in.
 - **Your email is your sign-in identity.** Set the login **email** (`OWNER_EMAIL`)
   in the deploy form — password-mode sign-in is by email + password, so an empty
   email leaves the owner unable to log in. If you deployed without one, set
-  `OWNER_EMAIL` on the `<appName>-backend` Container App and restart; the account
+  `OWNER_EMAIL` on the `<appName>-core` Container App and restart; the account
   reconciles to that address on the next boot.
 
 ### Library sharing and members
@@ -382,7 +382,7 @@ and set to **Public** in GHCR before a deploy can succeed.
 ### Tuning how aggressively faces get merged
 
 Whether two face crops end up in the same person cluster is controlled by a
-preset on the backend (`PEOPLE_CLUSTER_PRESET` env var, default `strictest`):
+preset, read from the `PEOPLE_CLUSTER_PRESET` environment variable (default `strictest`):
 
 | Preset | Same-person link threshold | Behavior |
 | --- | --- | --- |
@@ -392,7 +392,7 @@ preset on the backend (`PEOPLE_CLUSTER_PRESET` env var, default `strictest`):
 | `loose` | ≥ 0.66 | Merges more readily, tolerating more variation in lighting/angle, at higher risk of fusing two different people. |
 
 Switching preset (e.g. to `balanced` for more auto-merging) is just an env var
-change on the backend and worker — no code change or redeploy of new code
+change on the Container Apps that read it (`core` and `cluster`) — no code change or redeploy of new code
 needed. See `_resolve_people_cluster_config` in `backend/app.py` for the full
 threshold table and the calibration script
 (`backend/scripts/calibrate_face_thresholds.py`) used to derive these numbers

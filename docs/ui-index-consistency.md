@@ -8,7 +8,7 @@ flowchart LR
     B --> C[Save in original session]
     C -->|Success| D[Persist independent field receipts]
     C -->|Failure or session switch| E[Roll back this request]
-    D --> F[Backend publishes index]
+    D --> F[index-worker publishes index]
     F --> G[Library-scoped index-ready push]
     G --> H[Browser fetches projection]
     H --> L[Render projection plus receipts immediately]
@@ -24,17 +24,17 @@ sequenceDiagram
     participant User
     participant UI
     participant API
-    participant Indexer
+    participant IndexWorker as index-worker
     participant Push
     User->>UI: Save rating 5
     UI->>UI: Show 5 and create request token
     UI->>API: Save with original session scope
     API-->>UI: Success
     UI->>UI: Persist rating receipt
-    API->>Indexer: Request rebuild
+    API->>IndexWorker: Request index build (index-maintenance queue)
     User->>UI: Navigate to another page
     UI->>UI: Overlay receipt on stale index
-    Indexer->>Push: Publication ready
+    IndexWorker->>Push: Publication ready
     Push-->>UI: Index-ready notification
     UI->>API: Fetch new projection
     UI->>UI: Render immediately with saved receipts

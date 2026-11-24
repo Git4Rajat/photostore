@@ -9328,6 +9328,17 @@ def _ensure_static_website() -> None:
         worker_logger.warning('Share snapshot: could not enable the static website', exc_info=True)
 
 
+def _prepare_share_snapshot_site() -> None:
+    """Publish the static website's front-door page and album bundle without waiting for a first share."""
+    if not share_snapshot.enabled():
+        return
+    container = _share_snapshot_container()
+    if container is None:
+        return
+    _ensure_static_website()
+    share_snapshot.ensure_app(container, SPA_BASE_URL)
+
+
 def _enqueue_share_snapshot(action: str, user_id: str = '', album_id: str = '', token: str = '', delay: int = 0) -> bool:
     if not share_snapshot.enabled() or clustering_queue_client is None:
         return False
@@ -19296,6 +19307,12 @@ def run_ipworker() -> None:
         _recover_stranded_cluster_buffer_checkpoints()
     except Exception:
         worker_logger.exception('Startup cluster-buffer checkpoint recovery failed')
+    try:
+        # The static website's front-door page and album bundle are otherwise only written when an
+        # album is first shared, so links opened before that find an empty site.
+        _prepare_share_snapshot_site()
+    except Exception:
+        worker_logger.warning('Startup share snapshot site preparation failed', exc_info=True)
     incremental_assign_flush_thread = threading.Thread(
         target=_run_incremental_assign_flush_loop, args=(shutdown_requested,),
         name='ipwork-cluster-batch-flush', daemon=True)

@@ -1,302 +1,347 @@
-# Backend API architecture (as of 2026-08-29)
+# Backend architecture (as of 2026-11-24)
 
-> **2026-10-09 role rename**: the container-app roles described throughout this
-> doc were renamed for clarity: `backend`→`core`, `tools`→`indexer`,
-> `admin`→`recovery`, `extras`→`archive`, `worker`→`cluster`, `ipworker`→`vision`,
-> `frontend`→`web` (`upload` unchanged). The prose and `APP_ROLE=` values below
-> still use the OLD names — translate via this table when cross-referencing
-> against current `deploy/resources.bicep`/`backend/app.py`.
+Scope: the Flask codebase in `backend/` and how it runs as separate Container
+Apps. Sections 1-10 describe the current deployment and the synchronous HTTP
+request path. Sections 11-15 describe the index read models (search database,
+sort/access/albums/people indexes) and the performance instrumentation. The
+processing half (vision, clustering, index builds, upload waves) is in
+[`docs/ipworker-architecture.md`](ipworker-architecture.md) and
+[`docs/indexing-clustering-target-state.md`](indexing-clustering-target-state.md).
 
-Scope: the synchronous HTTP request path served by the `backend` Container App
-(gunicorn, `APP_ROLE=backend`) — process/thread model, data layer, per-request
-auth cost, caching, and where API latency actually goes today. Everything
-below is verified against current code (`backend/app.py`, `backend/storage_utils.py`,
-`backend/entrypoint.sh`, `deploy/resources.bicep`), not recalled from memory.
-Background photo processing (`worker`, `ipworker` roles, same codebase, different
-entrypoint) is out of scope — see `docs/ipworker-architecture.md` for that half.
+Everything below was checked against `backend/app.py`, `backend/routes/`,
+`backend/entrypoint.sh`, `backend/gunicorn.conf.py` and `deploy/resources.bicep`.
+When a fact changes, update the text here in the same change.
 
-This doc exists for the same reason `docs/ipworker-architecture.md` does: so the
-next round of "why is the API slow" investigation starts from verified facts
-instead of re-deriving them. Keep it current when the facts below change.
+## 0. One image, several roles
 
-## 1. What `backend` is
+The same image (`coreImage`, `ghcr.io/git4rajat/photostore-backend`) runs in
+several Container Apps. `APP_ROLE` picks what each one does. `entrypoint.sh`
+chooses the process (gunicorn for HTTP roles, a queue loop for worker roles),
+and `app.py` registers only the blueprints that role serves.
 
-A single Flask app (`backend/app.py`, ~14k lines) that also contains the
-`worker` and `ipworker` roles — `entrypoint.sh` picks which one runs via
-`APP_ROLE`. In the `backend` role it's served by gunicorn and does nothing but
-answer HTTP requests: no queue polling, no clustering, no image inference in
-its main loop. **226 routes** (`grep -c '^@app.route'`), covering auth,
-library/multi-tenant management, uploads, photo listing/search, people/faces,
-albums, admin/backfill tools, and public share links.
+| Container App (`${appName}-…`) | `APP_ROLE` | Process | Serves / does |
+|---|---|---|---|
+| `core` | `core` (default) | gunicorn | Auth, gallery and photos, albums, People, Explore, library membership and switching, upload-session reads, activity, index events |
+| `upload` | `upload` | gunicorn | Upload init, finalize, processing leases, known-hash checks, corrupted-upload list |
+| `indexer` | `indexer` | gunicorn | Tools API (`tools_bp`) only |
+| `index-worker` | `index-worker` | queue loop (`run_index_worker`) | Index builds from `photostore-index-maintenance`. Runs as its own app, or as a sidecar inside `indexer` when `separateIndexWorker=false` |
+| `recovery` | `recovery` | gunicorn | Manual repair API (`admin_bp`) |
+| `archive` | `archive` | gunicorn | Library operations (export, delete, clean), public share pages (`library_bp`, `library_operations_bp`, `public_bp`) |
+| `web` | — | static | The frontend bundle |
+| `cluster` | `cluster` | queue loop (`run_clustering_worker`) | Face clustering and assignment (`photostore-clustering`), library clean and download jobs (`photostore-library-ops`) |
+| `vision` | `vision` | queue loop (`run_ipworker`) | Per-photo processing: preview, thumbnail, EXIF, OCR, faces, vision tags, geo (`photostore-ipwork`). Deployed only when `processingMode` is `backend` or `both` |
 
-There is no SQL database and no Cosmos DB. All structured data lives in
-**Azure Table Storage** (`azure.data.tables`); all media bytes live in
-**Azure Blob Storage** (`azure.storage.blob`). This shapes almost everything
-below — no joins, no server-side filtering beyond `PartitionKey`/`RowKey`
-equality and simple OData predicates, and "list X for this user" almost always
-means "download every row in this partition, filter/sort/paginate in Python."
+`APP_ROLE=wave-recovery` exists in `entrypoint.sh`, but `deploy/resources.bicep`
+(around line 2202) deploys no compute for it. There is no scheduled wave sweep
+in the current deployment.
 
-## 2. Process / thread model (`backend/entrypoint.sh`, `deploy/resources.bicep:453-538`)
+Older names still appear in some code comments and in the design docs below.
+Translate them with this table: `backend`→`core`, `tools`→`indexer`,
+`admin`→`recovery`, `extras`→`archive`, `worker`→`cluster`, `ipworker`→`vision`,
+`frontend`→`web`, `upload` unchanged. The `worker` role no longer exists as a
+single app; index builds moved to `index-worker` (see §14).
 
-- **1.25 vCPU / 2.5Gi memory per replica**, `minReplicas: 0`, `maxReplicas: 5`,
-  scaled by an HTTP concurrency rule (`concurrentRequests: 8`).
-- **`GUNICORN_WORKERS=1`, `GUNICORN_THREADS=4`**, `gthread` worker class.
-  Deliberately 1 process, not N: gunicorn forks *before* importing the app (no
-  `--preload`), so every additional worker process would separately load its
-  own numpy/scipy/scikit-learn/Pillow/Azure-SDK baseline (~250-350MB) and
-  prime its own vector-index cache. Threads share one Python process's memory
-  and module state; processes don't. Concurrency is bought with threads
-  instead of processes for this reason.
-- **This means the whole replica shares a single GIL.** 4 threads give real
-  concurrency for I/O-wait (a table query, a blob read, waiting on Azure) but
-  serialize on any CPU-bound Python stretch (JSON parsing, numpy work,
-  synchronous image decode). This is not a hypothetical — see §6.
-- **Worker recycling**: `--max-requests 400` (±50 jitter), `--graceful-timeout 60`.
-  Long-lived workers fragment their heap on image/RAW/video processing and
-  creep upward in RSS until OOM; periodic recycling bounds that. With
-  `--workers 1` a recycle is a capacity-zero blackout until the sole worker
-  drains or is force-killed — bounded to ≤60s by the graceful timeout (was up
-  to ~120s before this was tuned; see §7).
-- **`--timeout 600`, `--keep-alive 30`**: the app is I/O-bound enough (table/
-  blob round-trips, some endpoints doing many of them per call) that a long
-  per-request timeout is treated as normal, not a bug to route around.
+## 1. What `core` is, and the deployment topology
+
+The backend is one Flask application, `backend/app.py` (about 19,800 lines),
+with route handlers in 17 blueprint modules under `backend/routes/`
+(306 `@…_bp.route(…)` decorators). Shared logic lives in helper modules such
+as `storage_utils.py`, `search_db.py`, `library_build.py`, `upload_waves.py`
+and `wave_*.py`.
+
+There is no SQL database and no Cosmos DB. Structured data is in **Azure Table
+Storage** (`azure.data.tables`), media bytes and index files are in **Azure
+Blob Storage** (`azure.storage.blob`), and background work goes through
+**Azure Storage queues**. Index files that must be shared between apps are
+also kept on an **Azure Files** share (`faiss-checkpoints`), mounted as
+`/mnt/photostore/shared` by the index apps and as `/mnt/photostore/faiss-checkpoints`
+by `cluster`. Live index-ready and processing-progress messages
+use **Web PubSub** on the Free tier (`Free_F1`, `${appName}-index-events`).
+Web PubSub is enabled by default (`enableIndexPush`), and polling is the
+fallback when it is off or over budget.
+
+```mermaid
+flowchart LR
+  Browser["Browser (web SPA)"]
+  Web["web: static bundle"]
+  Core["core: auth, gallery, albums, people, explore"]
+  Upload["upload: upload sessions and finalize"]
+  Archive["archive: library ops and public share"]
+  Recovery["recovery: manual repair API"]
+  Indexer["indexer: Tools API"]
+  IdxW["index-worker: index builds"]
+  Cluster["cluster: face clustering, library ops"]
+  Vision["vision: per-photo processing"]
+  Tables[("Table Storage: photo, face, person, album, job, wave tables")]
+  Blobs[("Blob Storage and Azure Files share: media and index files")]
+  Queues[("Storage queues: ipwork, clustering, library-ops, index-maintenance")]
+  PubSub["Web PubSub Free_F1: index-ready and progress"]
+
+  Browser --> Web
+  Browser --> Core
+  Browser --> Upload
+  Browser --> Archive
+  Browser --> Indexer
+  Browser --> Recovery
+  Upload --> Tables
+  Upload --> Blobs
+  Upload --> Queues
+  Core --> Tables
+  Core --> Blobs
+  Core -. reads index files .-> Blobs
+  Queues --> Vision
+  Queues --> Cluster
+  Queues --> IdxW
+  Vision --> Tables
+  Vision --> Blobs
+  Cluster --> Tables
+  IdxW --> Blobs
+  IdxW --> Tables
+  Vision --> PubSub
+  IdxW --> PubSub
+```
+
+Partitioning: most per-user tables use `PartitionKey = library id` (the
+library, not necessarily the login account; see §4). `RowKey` is the filename
+for photo rows, and `personId/faceId` or similar for face rows.
+
+### Table and queue names (env-overridable defaults)
+
+| Kind | Names |
+|---|---|
+| Photos | `photometadata` (rows), `photoembeddings`, `photofaceembeddings`, `photoimagenames`, `photofilehashes`, `photofilenameowners`, `phototrashindex`, `photosearchdirty` |
+| Faces and people | `photofaces`, `photofacebyfilename`, `photopeople`, `photopersonmembers`, `personmerges`, `peopledirtyset` |
+| Albums | `photoalbums`, `photoalbummembers` (members of albums too large for one row), `photoalbumtokens`, `albumsdirtyset` |
+| Work and uploads | `photojobs`, `photouploadsessions`, `workbenchactions` |
+| Accounts and sharing | `photousers`, `photolibraries`, `photomemberships`, `photoinvites`, `photoaudit`, `photolibraryclean`, `photostoreconfig` |
+| Queues | `photostore-ipwork` (+ `-deferred`, `-deadletter`), `photostore-clustering` (+ `-deferred`, `-deadletter`), `photostore-library-ops` (+ `-deadletter`), `photostore-index-maintenance` (+ `-deferred`, `-deadletter`) |
+
+Blob containers include `images`, `thumbnails`, `covers`, `library-exports`,
+`merge-payloads`, and the index containers (`lexical-index`, `vector-index`,
+`people-embedding-index`, `tag-embedding-index`, plus sort, access, albums and
+people indexes).
+
+### Media URLs
+
+Two modes exist (`MEDIA_URL_MODE`, default `sas`; `app.py:713`):
+- **SAS mode**: the browser fetches the bytes straight from Blob Storage.
+  `GET /api/photos/media-token` returns one container-scoped, read-only,
+  day-aligned SAS for the thumbnails container (previews live under `preview/`
+  in the same container), and one for the face-crop container. The browser
+  builds the URLs itself. See §12 and §15.9.
+- **Proxy mode**: `/api/photos/{thumbnail,preview,image,cover}/<filename>`
+  streams bytes through the core app. It is the fallback for thumbnails that
+  are not ready and for RAW/HEIC.
+
+The user-delegation key is minted once per UTC day and stored as a row in the
+metadata table (`_stable_delegation_key`, `app.py:13293`), so all replicas sign
+with the same key. SAS start and expiry are day-aligned, so the same blob gets a
+byte-identical URL all day and the browser cache stays effective
+(`_stable_container_read_sas`, `app.py:13389`).
+
+## 2. Process and thread model (`entrypoint.sh`, `gunicorn.conf.py`, `resources.bicep`)
+
+HTTP roles run `gunicorn app:app` with `--worker-class gthread`. The entrypoint
+defaults are `GUNICORN_WORKERS=1` and `GUNICORN_THREADS=2`. Each app sets its
+own values in `resources.bicep`:
+
+| App | Declared CPU / memory | Workers × threads | Replicas (min / max) | HTTP scale rule |
+|---|---|---|---|---|
+| `core` | 0.5 vCPU / 1 Gi (see drift note) | 2 × 2 | 0 / 5 | `concurrentRequests: 4` |
+| `upload` | 0.75 vCPU / 1.5 Gi | 2 × 4 | 0 / 5 | `concurrentRequests: 8` |
+| `indexer` | 0.5 vCPU / 1 Gi (dedicated) | 1 × 4 | 0 / 1 | `concurrentRequests: 10` |
+| `recovery` | 0.5 vCPU / 1 Gi | 1 × 4 | 0 / 2 | `concurrentRequests: 10` |
+| `archive` | 0.5 vCPU / 1 Gi | 1 × 4 | 0 / 3 | `concurrentRequests: 8` |
+| `web` | 0.25 vCPU / 0.5 Gi | — | 0 / 2 | — |
+
+Queue apps are not HTTP-scaled. KEDA `azure-queue` rules wake them:
+- `cluster` (2 vCPU / 4 Gi): one replica max; rules on `photostore-clustering`
+  and `photostore-library-ops` (`queueLengthStrategy: all`, so claimed work keeps
+  the replica up).
+- `vision` (2 vCPU / 4 Gi): one replica max, `IPWORKER_CONCURRENCY=3` per
+  replica; rule on `photostore-ipwork`.
+- `index-worker` (1.5 vCPU / 3 Gi): one replica max; rule on
+  `photostore-index-maintenance`.
+
+Gunicorn settings that apply to every HTTP role:
+- `--max-requests 400 --max-requests-jitter 50`: recycle workers so the heap
+  fragmentation from image, RAW and video work does not grow RSS until an OOM.
+- `--graceful-timeout 60`: bounds the capacity-zero window when a recycle hits a
+  single-worker app.
+- `--timeout 600`, `--keep-alive 30`.
+- `gunicorn.conf.py` `on_starting` starts a stdlib health sidecar on
+  `HEALTH_SIDECAR_PORT` (default 5001) in the master process. Liveness probes
+  hit that port, so they still get an answer when every app thread is busy.
+- `gunicorn.conf.py` `post_fork` pre-builds the offline geocoder in each new
+  worker, so the first upload request does not pay for it.
+
+Why more than one worker process on some apps: gunicorn forks before the app
+is imported (no `--preload`), so each extra worker process loads its own copy of
+numpy, scipy, scikit-learn, Pillow and the Azure SDKs (about 250-350 MB each)
+and builds its own caches. Threads share one interpreter's memory, so the
+number of threads is the cheap concurrency knob. The `core` and `upload` apps
+use two worker processes so one slow request cannot occupy every thread of the
+only worker.
+
+**Drift note.** The `core` block in `resources.bicep` declares 0.5 vCPU / 1 Gi,
+but comments in the same file say the live dev deployment ran 2 vCPU / 4 Gi
+when the 2-worker setting was chosen. Treat the declared numbers as the
+template default, not a measurement. Reconcile against the live app before
+resizing.
 
 ## 3. Data layer
 
-### Tables (`_init_storage_clients`, `backend/app.py:898-1063`)
+### Access pattern
 
-One `TableServiceClient`, one client per logical table: `photometadata`,
-`albums`, `faces`, `people`, `merges`, `imagenames`, `hashindex`,
-`filenameowners`, plus multi-tenant tables (`users`, `libraries`,
-`memberships`, `invites`, `audit`, `cleanrequests`) and a queue service client
-shared with `worker`/`ipworker`. Almost every per-user table uses
-`PartitionKey = user_id` (the *library* id, not necessarily the login
-identity — see §4), `RowKey = filename` or `RowKey = personId/faceId`. This
-partitioning means:
-- A single-entity lookup (`get_entity(partition_key, row_key)`) is a cheap
-  point read — used throughout (`_get_metadata_entity`, membership checks,
-  etc.).
-- "List everything for this user" (`query_entities("PartitionKey eq '{user_id}'")`)
-  is a **full partition scan** — the only way to list photos, faces, or
-  people, since there's no secondary index or server-side pagination in Azure
-  Table Storage's query model here. Every listing endpoint pays for this
-  proportionally to library size, not to page size requested.
+- A single-entity lookup (`get_entity(partition_key, row_key)`) is a point read.
+  `_get_metadata_entity` (`app.py:3077`) and membership checks use this.
+- A "list everything for this library" query is a **full partition scan**.
+  Azure Table Storage has no secondary index here, so every listing paid for
+  proportionally to library size. Sections 14-15 replaced most of these listings
+  with SQLite-backed pages and bounded streams. The remaining scans are
+  documented per endpoint.
+- `_InvalidatingTableClient` (`app.py:1377`) wraps the face and person table
+  clients. Any write through it invalidates the matching per-library scan cache
+  (§5), so callers do not invalidate manually.
+- Batched writes use `_batch_upsert_entities` (`app.py:6206`), capped at 100
+  operations per transaction. Batched reads are the 15-row `RowKey eq … or …`
+  queries used by the gallery and album pages (§15.2).
 
-`face_table_client` / `person_table_client` are wrapped in
-`_InvalidatingTableClient` (`backend/app.py:811`) — any write through them
-auto-invalidates the relevant per-user cache entry (§5) by inferring the
-`PartitionKey` from the call arguments, so callers don't have to remember to
-invalidate manually.
+## 4. Request lifecycle for an authenticated call
 
-### Blob storage and media URLs
+Every non-public route goes through `_require_library_context`
+(`app.py:2905`), usually via the `_require_user_id` wrapper (`app.py:3011`):
 
-Two modes, both present in the code (`backend/app.py:7589-7767`):
-- **Proxy mode**: `/api/photos/{thumbnail,preview,image,cover}/<filename>`
-  streams bytes through the backend container. Comment in code: "Streaming
-  media bytes through this container dominated its compute bill" — this is
-  why SAS mode exists.
-- **SAS mode** (`MEDIA_URL_MODE='sas'`): the browser gets a direct
-  read-SAS URL to blob storage, bypassing the backend for the actual bytes.
-  Two things keep this cheap rather than one SAS-mint round-trip per URL:
-  - The **user-delegation key** is minted once per UTC day and cached
-    in-process plus persisted as a row in the metadata table
-    (`_stable_delegation_key`, `backend/app.py:7638`), so every
-    replica/worker signs with the *same* key instead of each minting its own.
-  - SAS start/expiry are **day-aligned** (`[day start - 15min, day start + 48h]`),
-    so a given blob's URL is byte-identical across requests all day —
-    the browser's HTTP cache stays effective instead of busting on every
-    page load.
+1. **Session token** (`_resolve_session_payload`, `app.py:2866`): HMAC-signed
+   token checked in process by `password_auth.validate_session_token`. No
+   storage call.
+2. **Account lookup**: `library_store.get_user_checked(user_id)`, a Table point
+   read, wrapped in `_auth_lookup_with_retry` (`app.py:2886`): three attempts
+   with 50 / 100 ms backoff. A storage blip becomes a retryable 503, not a 401.
+3. **Token version**: checked in memory against the account row, so a password
+   reset or removal invalidates outstanding tokens.
+4. **Membership**: only when the token's active library (`lib` claim) differs
+   from the caller's own id. This is another point read, with the same retry
+   wrapper. A user's own library is never checked this way.
+5. The route handler runs.
 
-## 4. Request lifecycle for a typical authenticated call
+So a typical call costs **one Table point read** for auth, and two when the
+caller is working in a shared library. `GET /health` (`routes/system.py:15`,
+and `app.py:19767` as a fallback for roles that do not register `system_bp`)
+skips this path.
 
-Every non-public route goes through the same tenant-isolation boundary,
-`_require_library_context` (`backend/app.py:1683`), usually via the
-`_require_user_id` compatibility wrapper:
+## 5. In-process caches
 
-1. **Session token validation** (`_resolve_session_payload`, `app.py:1645`) —
-   in-process HMAC/JWT-style verification (`password_auth.validate_session_token`),
-   no storage call.
-2. **Account lookup** — `library_store.get_user_checked(user_id)`, a Table
-   Storage point read, wrapped in `_auth_lookup_with_retry` (3 attempts,
-   50ms/100ms/200ms backoff, `app.py:1664`) so a transient storage blip
-   surfaces as a retryable 503 instead of a spurious 401.
-3. **Token-version check** (in-memory, from the account row already fetched).
-4. **Membership lookup** — *only* if the active library differs from the
-   caller's own id (i.e. shared-library access, not the common case) —
-   another point read, same retry wrapper.
-5. Route handler runs.
+`_UserScanCache` (`app.py:1208`) is a per-library TTL cache with request
+coalescing. The first caller for a library runs the partition scan. Concurrent
+callers for the same library wait on a lock and reuse the result.
 
-So the common case is **one Table Storage point read per request** just for
-auth, before the handler does anything — cheap individually (point read on a
-partition key), but it's fixed per-request overhead paid by all 226 routes,
-including trivial ones like `/health`... actually `/health` (`app.py:6216`)
-does not go through this path, but most `/api/*` routes do.
-
-## 5. In-process caching layer
-
-`_UserScanCache` (`backend/app.py:705`) is the core primitive: a per-user TTL
-cache with request coalescing — the first caller for a given user does the
-real partition scan while concurrent callers for the *same* user block on a
-lock and reuse the result, rather than each re-scanning. Three instances share
-this pattern and the same invalidation hook (`_invalidate_people_scan_cache`,
-`app.py:774`, auto-wired to every face/person table write via
-`_InvalidatingTableClient`):
-
-| Cache | Backs | TTL (default) |
+| Cache (`app.py`) | Backs | TTL |
 |---|---|---|
-| `_person_scan_cache` | `_cached_person_rows_for_user` | `PEOPLE_SCAN_CACHE_TTL_SECONDS` = 20s (backend), 120s (ipworker override, `resources.bicep`) |
-| `_face_summary_scan_cache` | face-partition lookups | same |
-| `_people_embedding_index_cache` | `_load_people_embedding_index` | same (added 2026-08-29, commit `dd2a1b1`) |
-| (separate) `_cached_metadata_rows_for_user` | photo-metadata partition scan | its own TTL, same coalescing shape |
+| `_person_scan_cache` (`:1325`) | person rows with embeddings | `PEOPLE_SCAN_CACHE_TTL_SECONDS`: 20 s default; 120 s on `vision` (`resources.bicep`) |
+| `_face_summary_scan_cache` (`:1326`) | face summaries | same |
+| `_people_embedding_index_cache` (`:1330`) | built people-embedding index | same |
+| `_person_light_scan_cache` (`:3192`) | person rows without embeddings | same |
+| metadata row cache | photo rows | removed: `_cached_metadata_rows_for_user` now raises (§14.2) |
 
-**Important caveat for capacity planning**: these caches are plain
-module-level Python dicts — **process-local, not shared across replicas**,
-and (with `GUNICORN_WORKERS=1`) shared across all 4 threads of one replica but
-not across the up-to-5 scaled replicas. A user's requests landing on
-different replicas each pay a fresh scan on first hit. This is fine today
-(`GUNICORN_WORKERS=1` means no intra-replica fragmentation) but would silently
-regress cache hit rate if workers were ever scaled up per-replica without
-also moving this to a shared cache (Redis, or the existing table-backed
-pattern used for the SAS delegation key).
+Invalidation: `_invalidate_people_scan_cache` (`app.py:1333`) is called from
+`_InvalidatingTableClient` on every face or person write.
 
-## 6. CPU-bound work under a shared GIL — a real, already-hit failure mode
+**Capacity caveat.** These caches are process-local. Replicas do not share
+them, and each replica pays a fresh scan on the first hit for a library. With
+one worker process per replica, the threads of that replica share the cache.
+If the worker count goes up, or replicas routinely outnumber the work, move
+the hot caches to a shared store. The table-backed delegation-key pattern (§1)
+is the existing precedent.
 
-`deploy/resources.bicep:470-492` documents a live experiment worth
-internalizing before touching concurrency again: `GUNICORN_THREADS` was
-raised `4→12` on `photostore-test` to fix slow `/upload/finalize`,
-`/upload/init-batch`, and `/upload/client-processing` calls (each 20-90s+,
-under a ~20-slot ceiling that looked saturated). Result: one genuinely
-I/O-bound endpoint (`/upload/processing/claim`) got much faster, but the three
-target endpoints got **worse** (p50 37-45s→60-67s, p90 85-94s→197-240s,
-clustered at 240s — a gateway timeout signature, not organic slowness).
-Conclusion: those handlers do enough CPU-bound Python work per call that more
-threads increased GIL contention instead of relieving an I/O queue — reverted
-same session.
+## 6. CPU-bound work under a shared GIL: the lesson
 
-The actual root cause was found and fixed 2026-08-29 (commit `dd2a1b1`,
-**not yet deployed**): `_load_people_embedding_index` was rebuilding the
-entire people-embedding index (JSON-decode + normalize every person's rep
-embedding) from scratch, synchronously, on **every single uploaded photo** —
-an O(library-size) CPU-bound operation inline in the upload request path,
-invisible in CPU-percent metrics because it was fast per-call but ran
-constantly during a burst. Fixed two ways, both measured:
-- Cached the built index (new `_people_embedding_index_cache` above): 131ms →
-  0.04ms per call on a 500-person library, cache hit.
-- Vectorized `_best_two_person_matches` (`app.py:3005`): one batched numpy
-  matmul across same-dimension embeddings instead of one Python similarity
-  call per person. Full assign call: ~131ms → ~1.6ms.
+Threads are good for I/O waits (table and blob round trips), and bad for
+CPU-bound Python (JSON parsing, numpy, image decode). Under the GIL, extra
+threads add contention without adding throughput.
 
-**Takeaway for future optimization work on this app**: `htop`-style CPU% per
-replica under-reports this class of bug, because the cost is O(library size)
-Python work repeated per-request, not a single expensive call. When a handler
-is slow under concurrency but CPU isn't pegged, check for per-request
-full-partition rebuilds before assuming it's pure I/O wait and reaching for
-more threads — more threads made it worse here.
+Measured case: `GUNICORN_THREADS` was raised from 4 to 12 on the dev
+deployment to relieve slow `/upload/finalize`, `/upload/init-batch` and
+`/upload/client-processing` calls. The processing-claim endpoint got faster, but
+the three target endpoints got slower (p50 37-45 s → 60-67 s, p90 85-94 s →
+197-240 s). The change was reverted. The actual cause was an
+O(library-size) people-embedding index rebuild on every uploaded photo. The
+fix was a cached index (`_people_embedding_index_cache`, `app.py:1330`) plus a
+vectorized best-two-match function (`_best_two_person_matches`,
+`app.py:5684`).
 
-## 7. Prior incidents & fixes (grounded in commit history / existing docs)
+**Rule for this app.** CPU% per replica under-reports this failure, because the
+cost is O(library) Python work repeated per request, not one slow call. When a
+handler is slow under concurrency but CPU is not pegged, first look for
+per-request full-partition work. Do not raise thread counts to fix it. The
+comments in `resources.bicep` (core and upload blocks) repeat this warning.
 
-- **Gunicorn worker-recycle blackout**: `--workers 1` + periodic recycle had
-  no second worker to cover the gap, producing up to ~120s capacity-zero
-  windows (bursts of 503s). Fixed by bounding `--graceful-timeout` to 60s.
-  Also fixed missing CORS preflight caching and a `fileParallelism`-stuck-at-1
-  bug in the same investigation. Shipped `a6c3398`; `maxReplicas` raised 3→5
-  in `e15adda`.
-- **`/api/persons` and `/api/faces` were unpaginated full-account scans** —
-  fixed with offset/limit/`namesOnly`/`q` params (Phase A/B split), verified
-  live.
-- **Upload dispatch-gate retry convoy**: a concurrency-2 cap + retry-in-place
-  on `/upload/init-batch`/`/upload/finalize-batch` let one stuck request hold
-  a slot for up to ~33 minutes, stalling the whole batch at 0.00 MB/s. Fixed,
-  shipped `05f43ee`. Related commits (`d8583a5`, `4513977`, `22d7a5f`,
-  `665c323`) show several iterations tuning that concurrency cap — currently
-  bounded and adaptive to backend congestion rather than fixed.
-- **Backend call-reduction survey**: fixed synchronous duplicate geocode work
-  and batched lease-claims for the drain-loop's first wave; confirmed polling
-  loops and per-item access URLs were already reasonable and left alone
-  rather than "optimizing" code that wasn't the bottleneck.
-- **Redundant read-modify-write removed from the upload finalize path**
-  (uncommitted, `backend/storage_utils.py`, working tree as of this doc):
-  `finalize_uploaded_file` used to `upsert_entity` the metadata row, then
-  immediately call `_init_processing_status_for_image`, which re-read the
-  same row via `get_entity` purely to set processing-status fields and
-  `upsert_entity` it right back. Folded the status fields directly into the
-  first `metadata` dict so the second read+write disappears — one fewer round
-  trip per uploaded file, same final state. Not yet committed.
-- **People-embedding-index CPU bottleneck** — see §6, `dd2a1b1`, committed but
-  **not yet deployed** as of this doc.
+## 7. Prior incidents and the fixes that are in code
 
-## 8. Hot-endpoint patterns worth knowing before optimizing further
+- **Worker-recycle blackout.** A single-worker app with periodic recycling lost
+  up to ~120 s of capacity. Fixed by bounding `--graceful-timeout` to 60 s, and
+  by running two workers on `core` and `upload`.
+- **Dead-end liveness probes.** A slow request could hold every thread of the
+  only worker, so the liveness probe got no answer and the container restarted
+  in a loop. Fixed by the master-process health sidecar (`gunicorn.conf.py`).
+- **`/api/persons` and `/api/faces` were unpaginated full-account scans.**
+  Now paged (`/api/persons/page`, §15.10).
+- **Upload dispatch-gate retry convoy.** Retry-in-place on `init-batch` and
+  `finalize-batch` with a fixed concurrency cap let one stuck request hold a
+  slot for up to ~33 minutes and stall the batch. The cap is now bounded and
+  adapts to backend congestion.
+- **Redundant read-modify-write on finalize.** `finalize_uploaded_file` used to
+  read the metadata row back just to set processing-status fields. The status
+  fields are now written in the first upsert (`storage_utils.py`, comment near
+  line 11783).
+- **People-embedding index rebuilt per photo.** Fixed by the cached, vectorized
+  index (§6).
+- **Serving processes must not build indexes.** Enforced by `index_build_allowed()`
+  (§14.4).
 
-Two patterns found while writing this doc that fit the same "N per-request
-storage round-trips" or "O(library size) work regardless of page size" shape
-as the incidents above, neither yet flagged/fixed:
+## 8. Earlier hot-path findings (superseded)
 
-- **`list_photos` (`GET /photos`, `app.py:10959`) always loads and sorts the
-  entire metadata partition**, even though it returns a `limit`-sized page
-  (`entries[offset:offset+limit]`). The full-partition load is cached
-  (`_cached_metadata_rows_for_user`) and the sort/filter is pure in-memory
-  Python, so this is bounded by cache TTL rather than hitting storage every
-  call — but CPU cost of sorting/filtering still scales with total library
-  size on every cache-miss request, not with the page requested. Same
-  backfill-on-read pattern also lives here (bounded per request via
-  `UPLOAD_DATE_BACKFILL_MAX_PER_REQUEST` / `PHOTO_PROPS_BACKFILL_MAX_PER_REQUEST`,
-  so it's self-limiting, not unbounded).
-- **`/api/photos/access-batch` (`app.py:7536`) does one sequential
-  `_get_metadata_entity` point-read per filename**, in a plain Python `for`
-  loop, for up to 2000 filenames per call (`app.py:7548`'s own limit). Each
-  point read is cheap individually, but they're not batched or parallelized —
-  a 2000-filename call is 2000 sequential network round trips to Table
-  Storage before the SAS-minting even starts. This is the same per-request
-  storage engine (`azure.data.tables`) already used elsewhere with genuine
-  batch support (`_batch_upsert_entities`, `app.py:3352`, capped at 100 ops)
-  for writes; there's no equivalent batched *read* path used here. Worth
-  profiling against real gallery page sizes before assuming it matters —
-  unlike §6/§7's items, this one hasn't been measured live yet, only located
-  by reading the code.
+The two patterns that earlier versions of this doc flagged are now handled:
+- `GET /api/photos` no longer loads and sorts the whole metadata partition. It
+  pages with SQL on the library database (§14.2).
+- `POST /api/photos/access-batch` no longer does one point read per filename on
+  each call. It uses a compact per-index filename map (§14.2).
 
-## 9. Summary of current numbers, for reference
+## 9. Summary of current numbers
 
-| Metric | Value |
+| Metric | Value (source) |
 |---|---|
-| Replicas (min / max) | 0 / 5 |
-| vCPU / memory per replica | 1.25 / 2.5Gi |
-| Gunicorn workers × threads | 1 × 4 |
-| Worker class | `gthread` |
-| Max requests per worker (recycle) | 400 ± 50 |
-| Graceful timeout | 60s |
-| Request timeout | 600s |
-| Scale trigger | HTTP concurrency ≥ 8 concurrent requests/replica |
-| Data store | Azure Table Storage (structured) + Blob Storage (media), no SQL/Cosmos |
-| Listing query shape | Full `PartitionKey eq user_id` partition scan, filtered/paginated in Python |
-| Per-request auth cost | 1 Table point read (+1 more for shared-library membership) |
-| People/face scan cache TTL | 20s (backend) |
-| Known unresolved CPU-bound risk pattern | O(library-size) Python work inline in a request handler defeats thread-based concurrency under the shared GIL — see §6 before raising `GUNICORN_THREADS` again |
-| Deployed but pending | `dd2a1b1` (embedding-index cache+vectorization) — committed, not deployed |
-| Uncommitted | `storage_utils.py` finalize round-trip removal (this session) |
+| Route decorators | 306 across 17 modules in `backend/routes/` |
+| `app.py` size | about 19,800 lines |
+| Container Apps with an HTTP surface | `core`, `upload`, `indexer`, `recovery`, `archive`, `web` |
+| Queue-driven apps | `cluster`, `vision`, `index-worker` (+ `wave-recovery` role, not deployed) |
+| Gunicorn defaults (entrypoint) | 1 worker × 2 threads; per-app values in §2 |
+| Gunicorn recycle | 400 ± 50 requests; graceful timeout 60 s; request timeout 600 s |
+| Auth cost per request | 1 Table point read (+1 for a shared-library membership check) |
+| Per-library scan cache TTL | 20 s (120 s on `vision`) |
+| Table scan parallelism | `TABLE_SCAN_PARALLELISM=4` (`table_scan.py`) |
+| Search DB | per-library SQLite (FTS5) on ephemeral disk; candidate window 4000; compaction at 200 deltas (§13, §15.4) |
+| Sort-index browser cap | `SORT_INDEX_CLIENT_MAX_ROWS=200000`; above it the gallery pages from the server (§15.6) |
+| Web PubSub | `Free_F1`, enabled by default; progress push budget `INDEX_EVENTS_PROCESSING_DAILY_BUDGET=1500` (`index_events.py`) |
+| Face clustering presets | `PEOPLE_CLUSTER_PRESET`, default `strictest` (cosine ≥ 0.80) |
 
-## 10. Where to look next if optimizing further
+## 10. Open items
 
-Roughly in order of expected effort-to-payoff, based on what's already
-measured vs. only located:
+These are the items that the current code still leaves open. Measurements
+for each are in §11-§15.
 
-1. **Deploy `dd2a1b1`** — it's written, tested, and benchmarked, just not
-   live yet. Free win sitting on the branch.
-2. **Batch or parallelize `access-batch`'s per-filename metadata reads**
-   (§8) — straightforward if it turns out to matter; needs a real
-   measurement first (HAR capture or server-side timing log) since it hasn't
-   been profiled against realistic gallery page sizes yet, unlike the other
-   items in this doc which all have real before/after numbers.
-3. **Before raising `GUNICORN_THREADS` again**, use the §6 lesson: look for
-   per-request O(library-size) Python work first. The bicep comment at
-   `resources.bicep:470` is effectively a standing "don't re-raise this
-   without finding the CPU work" warning — the embedding-index rebuild was
-   one instance of that class; there may be others in `finalize`/
-   `init-batch`/`client-processing` not yet found.
-4. **If replica-local caching (§5) ever becomes a hit-rate problem** — e.g.
-   if `GUNICORN_WORKERS` is ever raised, or replica count regularly exceeds
-   1 during normal (not just burst) load — the existing table-backed
-   delegation-key pattern (§3) is the precedent for making a cache
-   cross-replica without introducing a new dependency like Redis.
+1. **Library-proportional work on serving roles.** The access map and the
+   albums and people indexes are sized by album or person count, not photos.
+   They are bounded but not free (§14.2, §14.4).
+2. **Backend disk at 1M photos.** Each replica keeps a copy of the library's
+   search database. Check `sqlite_mb` against the local disk before raising the
+   library size (§15.5).
+3. **Browser sort index.** Above 200,000 photos the gallery pages from the
+   server. Nothing in the browser holds the whole library index (§15.6).
+4. **Replica-local caches (§5).** This becomes a hit-rate problem if the
+   worker count goes up or replicas routinely outnumber work.
+5. **Thread counts (§6).** Before raising `GUNICORN_THREADS` again, look for
+   per-request O(library) Python work first.
 
 ## 11. Large-library index path (130k photos) — instrumentation, slim index, disk cache
 
@@ -308,9 +353,9 @@ measured vs. only located:
 
 **Search.** There is no browser-side search or search index any more (the 709 MB lexical blob could never load in a tab, and with server search frozen every query came back empty). See section 13.
 
-**Indexes on the shared volume.** With `INDEX_DISK_CACHE_DIR` set (backend, tools, extras: `/mnt/photostore/shared/index-cache`; worker: `/mnt/photostore/faiss-checkpoints/index-cache` -- the same `faiss-checkpoints` Azure Files share), `_get_blob_client` returns a `_ShareBackedBlob` for the four index containers, covering every index kind (sort, lexical, listing, access, albums, people, vector, people/tag embeddings, explore, timeline); the SQLite search database is deliberately excluded (section 13). Uploads write through to the share; downloads are served from it when the blob's ETag sidecar matches (one `get_blob_properties`), else fall back to Blob and refill. Blobs under `INDEX_DISK_CACHE_MIN_BYTES` (manifests) bypass it. Blob Storage stays the source of truth and any share error falls back to it. **Session start:** `/api/photos/index-status` (called once per session) kicks `warm_user_index_files_async`, which streams every index blob for the user onto the share (single-flight, `INDEX_WARM_COOLDOWN_SECONDS`=300), without holding any in memory. Browsers cannot mount SMB, so they still download via SAS URLs from Blob (now of the slim blobs) and keep them in IndexedDB.
+**Indexes on the shared volume.** With `INDEX_DISK_CACHE_DIR` set (the indexer and index-worker apps: `/mnt/photostore/shared/index-cache`; cluster: `/mnt/photostore/faiss-checkpoints/index-cache`, both on the same `faiss-checkpoints` Azure Files share), `_get_blob_client` returns a `_ShareBackedBlob` for the four index containers, covering every index kind (sort, lexical, listing, access, albums, people, vector, people/tag embeddings, explore, timeline); the SQLite search database is deliberately excluded (section 13). Uploads write through to the share; downloads are served from it when the blob's ETag sidecar matches (one `get_blob_properties`), else fall back to Blob and refill. Blobs under `INDEX_DISK_CACHE_MIN_BYTES` (manifests) bypass it. Blob Storage stays the source of truth and any share error falls back to it. **Session start:** `/api/photos/index-status` (called once per session) kicks `warm_user_index_files_async`, which streams every index blob for the user onto the share (single-flight, `INDEX_WARM_COOLDOWN_SECONDS`=300), without holding any in memory. Browsers cannot mount SMB, so they still download via SAS URLs from Blob (now of the slim blobs) and keep them in IndexedDB.
 
-**Timeline.** `/photos/timeline` serves a summary precomputed on tools (`refresh_user_timeline_summary`) instead of loading the listing index into the backend.
+**Timeline.** `/photos/timeline` serves a summary precomputed by the index build (`refresh_user_timeline_summary`) instead of loading the listing index into the core app.
 
 **Client.** `preloadLocalIndexes()` starts the media token and the sort, albums and people index downloads concurrently once `/api/photos/index-status` reports ready. There is no browser search index any more; `/api/photos/search-index` is a retired stub and `/api/photos/search` is the only search path.
 
@@ -322,7 +367,7 @@ measured vs. only located:
 - `GET /api/photos/media-token` returns ONE container-scoped, read-only, day-aligned token for the thumbnails container (`_stable_container_read_sas`); previews are in the same container under `preview/`, so it covers both. No list permission: blobs are reachable only by their unguessable UUID names. Same exposure class as the per-blob SAS URLs it replaces, but note it is a bearer token for the whole container -- rotate by rotating the user-delegation key / shortening the day-aligned window if that ever matters.
 - The sort index (schema v2) carries `thumb` (physical thumbnail blob name, once the thumbnail exists) per photo.
 - The browser (`services/mediaToken.ts`) caches the token in memory + localStorage until 30 min before expiry and builds `{baseUrl}/{blob}?{sas}` itself. The grid (`mockups/prototype/store.tsx` `fetchPhotos`) paints each page straight from sort-index rows + token -- no backend call -- then enriches in the background with `lookup-batch {directMedia: true}`, which skips all URL signing and returns `thumbnailBlob` instead. Proxy/preview fallbacks (thumbnail not ready, RAW/HEIC) keep their normal URLs.
-- `tools` upgrades existing libraries: `/api/tools/indexes/build` runs `ensure_user_sort_index_current` (full sort-index rebuild when the stored schema is older). Until then rows lack `thumb` and the grid simply waits for the enrichment call, as before.
+- The Tools API (`indexer` app) upgrades existing libraries: `/api/tools/indexes/build` runs `ensure_user_sort_index_current` (full sort-index rebuild when the stored schema is older). Until then rows lack `thumb` and the grid simply waits for the enrichment call, as before.
 
 Known gaps: provisional tiles lack per-user `liked`, people, tags and `thumbnailRotation` until enrichment lands (normally well under a second); a tab left open past the token's expiry needs a reload to refresh already-built URLs; Albums/People/Explore/Search result grids still use their own URL sources. The Gallery now sizes each step to the screen: `measureGridCapacity()` reads the live `.pt-grid` column count / tile width and loads ~3 viewports of tiles (60-600) per step, painted straight from the sort index; only the metadata enrichment is chunked (100 per `lookup-batch`, in parallel).
 
@@ -331,10 +376,10 @@ Known gaps: provisional tiles lack per-user `liked`, people, tags and `thumbnail
 **Why.** Search was returning nothing: the browser could not load the 709 MB index and `/photos/search` was frozen because the old implementation loaded the whole lexical index into the 1Gi backend and scored every row per query.
 
 **Now** (`backend/search_db.py`):
-- **Build (worker).** Cold or schema-stale libraries are built by the queued `index_build` worker. `library_build.bootstrap_library_build` creates an empty base and then streams the metadata table in chunks, publishing SQLite deltas as it goes and spooling sort/access parts. The DB holds a compact scorer-compatible row per photo (deduped, confidence-filtered tags; see `reduced_row` and `SEARCH_INDEX_*` env vars), an FTS5 index over the exact texts `lexical_search_score` matches against (filename, effective tags, semantic text incl. OCR, location, camera model), a `person -> photos` table, a capture-day column and the library's place-name vocabulary. ~100 MB / ~40 s for 130k synthetic photos.
-- **Query (backend).** `open_database` copies the current DB to **local ephemeral disk** (`SEARCH_DB_DIR`, an EmptyDir mount; streamed, once per replica per version, oldest files evicted past `SEARCH_DB_MAX_CACHE_MB`) and queries it read-only. `/photos/search` takes the top `SEARCH_DB_CANDIDATE_LIMIT` (4000) bm25-ranked candidates (OR of query terms, their singular/plural variants, expansions, 4+ char prefixes; plus rows of named people), then runs the unchanged hard filters + `_score_search_row` on just those rows and point-reads full metadata for the returned page. Nothing library-sized is held in memory.
+- **Build (index-worker).** Cold or schema-stale libraries are built by the queued `index_build` job. `library_build.bootstrap_library_build` creates an empty base and then streams the metadata table in chunks, publishing SQLite deltas as it goes and spooling sort/access parts. The DB holds a compact scorer-compatible row per photo (deduped, confidence-filtered tags; see `reduced_row` and `SEARCH_INDEX_*` env vars), an FTS5 index over the exact texts `lexical_search_score` matches against (filename, effective tags, semantic text incl. OCR, location, camera model), a `person -> photos` table, a capture-day column and the library's place-name vocabulary. ~100 MB / ~40 s for 130k synthetic photos.
+- **Query (core).** `open_database` copies the current DB to **local ephemeral disk** (`SEARCH_DB_DIR`, an EmptyDir mount; streamed, once per replica per version, oldest files evicted past `SEARCH_DB_MAX_CACHE_MB`) and queries it read-only. `/photos/search` takes the top `SEARCH_DB_CANDIDATE_LIMIT` (4000) bm25-ranked candidates (OR of query terms, their singular/plural variants, expansions, 4+ char prefixes; plus rows of named people), then runs the unchanged hard filters + `_score_search_row` on just those rows and point-reads full metadata for the returned page. Nothing library-sized is held in memory.
 - **Not on the share.** SQLite needs a real local filesystem; `-searchdb` blobs bypass the Azure Files layer. `/api/photos/index-status` (session start) kicks `search_db.warm_async` so the first search doesn't pay for the download.
-- **Cold library.** No current DB -> `/photos/search` returns `{photos: [], total: 0, searchIndexBuilding: true}` and nudges tools; Ask shows a "preparing" notice and retries for ~2 minutes.
+- **Cold library.** No current DB -> `/photos/search` returns `{photos: [], total: 0, searchIndexBuilding: true}` and requests a build; Ask shows a "preparing" notice and retries for ~2 minutes.
 
 **Behaviour changes to know about.** Semantic (CLIP) scoring is gone from the live `/api/photos/search` route -- it passes no query embedding and no vector scores. Ranking is lexical, with optional tag-embedding query expansion when an ipworker-built tag index exists. The first `SEARCH_DB_CANDIDATE_LIMIT` matches are relevance-ranked; if the result set is larger, `total` is exact and later pages continue newest-first with `rankedWindow` in the response. The `/api/photos/search-index` route is a retired stub.
 
@@ -343,10 +388,10 @@ Known gaps: provisional tiles lack per-user `liked`, people, tags and `thumbnail
 **The failure.** "Library index build failed — Job did not finish (worker restarted or timed out)" is the `index_build` job (one row per library, `index-build-<libraryId>`). `/api/jobs/status` rewrites any queued/running job whose row hasn't been updated for `CLUSTERING_ACTIVE_JOB_STALE_MINUTES` (15) as failed with that text. The build used to run inside `POST /api/tools/indexes/build` on the scale-to-zero `tools` app: ingress cuts requests at ~240 s, after which nothing counted as in-flight, so a scale-down (or an OOM restart of the 4Gi replica while holding the whole library in memory) killed it mid-step; and the job row was only touched *between* indexes, so one long step (full-table scan, search-database build) could trip the 15-minute sweep even while alive.
 
 **Now.**
-- `tools_build_indexes` only decides whether a full build is needed (`index_build_needed`: missing readiness, old sort-index schema, missing/stale search DB; upload dirtiness is handled by light/people scopes) and `enqueue_index_build`s a `{type: 'index_build'}` message on the library-ops queue; it returns immediately. `_trigger_tools_index_rebuild` (backend/ipworker nudges) enqueues the same message. Status (`/api/tools/indexes/status`) reads the shared job row, not a per-process lock.
-- The always-on `worker` consumes it (`_run_index_build_job`): same lease renewal, bounded retries, dead-letter queue and SIGTERM handling as library clean/download; a failed or killed build is redelivered. A heartbeat thread rewrites the job row every `INDEX_BUILD_HEARTBEAT_SECONDS` (30), so a live build is never declared dead, and a truly dead one is. The worker mounts the same Azure Files share and `INDEX_DISK_CACHE_DIR`, so indexes it builds are written through for every other role; consumers still locate them by deterministic blob name (no path hand-off needed).
+- `tools_build_indexes` only decides whether a full build is needed (`index_build_needed`: missing readiness, old sort-index schema, missing/stale search DB; upload dirtiness is handled by light/people scopes) and `enqueue_index_build` sends a `{type: 'index_build'}` message to the index-maintenance queue (`photostore-index-maintenance`) and returns immediately. Core, upload and vision requests reach the same function. Status (`/api/tools/indexes/status`) reads the shared job row, not a per-process lock.
+- The `index-worker` role consumes it (`run_index_worker`, `_run_index_build_job`): same lease renewal, bounded retries, dead-letter queue and SIGTERM handling as library clean/download; a failed or killed build is redelivered. A heartbeat thread rewrites the job row every `INDEX_BUILD_HEARTBEAT_SECONDS` (30), so a live build is never declared dead, and a truly dead one is. The index-worker mounts the same Azure Files share and `INDEX_DISK_CACHE_DIR`, so indexes it builds are written through for every other role; consumers still locate them by deterministic blob name (no path hand-off needed).
 
-**To verify after deploy:** `PERF event=span name=index.build.job` / `index.<kind>.table_scan` / `searchdb.*` show where time goes and `rss_mb` shows memory per step; if the worker still restarts mid-build, the usual cause is memory (the lexical snapshot holds every metadata column in Python objects) -- look for `event=mem` climbing toward 4Gi before the restart. No replica floors are assumed: the worker scales from the library-ops queue rule, and the outstanding (in-flight) message keeps it up.
+**To verify after deploy:** `PERF event=span name=index.build.job` / `index.<kind>.table_scan` / `searchdb.*` show where time goes and `rss_mb` shows memory per step; if the index-worker still restarts mid-build, the usual cause is memory (the lexical snapshot holds every metadata column in Python objects) -- look for `event=mem` climbing toward 4Gi before the restart. No replica floors are assumed: the worker scales from the library-ops queue rule, and the outstanding (in-flight) message keeps it up.
 
 ### 14.1 Bounded-memory build (the OOM fix)
 
@@ -383,7 +428,7 @@ Remaining library-proportional memory on the backend: the compact access map (~t
 ### 14.3 People: no 200-cluster cap
 
 Accounts have tens of thousands of clusters. The primary People path (the people index blob, downloaded once per session) was never capped; the cap lived in the fallback used when that index is unavailable (`listPersons(undefined, 0, 200)`), so a failed/cold index build meant only 200 people were visible.
-- `GET /api/persons?namesOnly=1&covers=1` returns **every** cluster in one request -- name, `isNamed`, `faceCount` and a `coverFaceId` chosen (confirmed > confidence, never rejected) from the in-memory bulk face map: no per-person lookups and no thumbnail signing, which is the per-page work the paged endpoint does and why it pages. 30,000 clusters build in <1 s in `tests/test_person_roster.py`. Without `covers=1` the response shape is unchanged.
+- `GET /api/persons?namesOnly=1&covers=1` returns **every** cluster in one request -- name, `isNamed`, `faceCount` and a `coverFaceId` chosen (confirmed > confidence, never rejected) from the in-memory bulk face map: no per-person lookups and no thumbnail signing, which is the per-page work the paged endpoint does and why it pages. The original measurement was 30,000 clusters in under 1 s; no test file by that name exists in the current tree. Without `covers=1` the response shape is unchanged.
 - `faceService.listAllPersons()` replaces the capped call in the store's fallback; covers load lazily via `/api/faces/crop/<id>`.
 - People grid is windowed (`useWindowedGrid`) so only on-screen cards render and only their covers are requested (it used to request every cover); selection lookups use a Set; the merge picker on a person page is searchable and renders at most 200 options (a `<select>` with 30k options freezes the tab).
 
@@ -391,13 +436,13 @@ Accounts have tens of thousands of clusters. The primary People path (the people
 
 **Incident (microsvcpoc-dev-extras, 0.5 vCPU / 1Gi):** RSS climbed 289 -> 1007 MB within ~2 min of a rollout with `inflight` 1-2, was OOM-killed, and repeated until `Persistent Failure to start container`. Cause: the first People request ran the **people-index build in-process** (`get_user_people_index` -> `_rebuild_people_index_in_background`). `_build_user_people_index_snapshot` did `list(query_entities(...))` of every column of every person **and every face**, including each face's `embedding` and each person's `repEmbedding` (512-float JSON, ~6-8 KB each). Measured on identical synthetic data (distinct 6 KB embedding strings per row): old build **180.6 MB peak at 4,000 persons / 20,000 faces** (~1.35 GB extrapolated to 30,000 / 150,000), new build **12.9 MB**.
 
-**Structural guard.** Only `worker` and `ipworker` may build indexes (`INDEX_BUILD_ROLES`, default `worker,ipworker`; `storage_utils.index_build_allowed()`). In every other process -- backend, extras, admin, upload, tools:
-- the six `_rebuild_*_in_background` kickers are decorated with `_builds_only_where_allowed` and become *"request a worker build"* (`INDEX_BUILD_REQUEST_HOOK` -> `enqueue_index_build`, deduped/throttled);
+**Structural guard.** Only `index-worker` may build indexes (`INDEX_BUILD_ROLES`, default `index-worker`; `index_ownership.configured_build_roles()` rejects any other role, and `storage_utils.index_build_allowed()` checks it). In every other process -- core, upload, indexer, recovery, archive, cluster and vision:
+- the six `_rebuild_*_in_background` kickers are decorated with `_builds_only_where_allowed` and become *"request an index-worker build"* (`INDEX_BUILD_REQUEST_HOOK` -> `enqueue_index_build`, deduped/throttled);
 - the synchronous branches of every `get_user_*_index` (sort, access, albums, people, vector, tag-embedding, people-embedding) return `None`/stale data and request a build instead of scanning;
 - `_load_people_embedding_index` no longer falls back to scanning person rows (with embeddings) when the durable blob is absent.
 `tests/test_index_build_guard.py` makes the person/face/metadata/embeddings tables explode on any scan in a serving process and asserts a build is requested instead.
 
-**Builders are bounded too** (they run on the 4Gi worker, but 4Gi is also finite):
+**Builders are bounded too** (they run on the index-worker, 3 GiB, and that is also finite):
 | Builder | Fix |
 |---|---|
 | people index | server-side column projection (no embeddings), streamed, compact face map; no thread pool per person |
@@ -426,13 +471,13 @@ The sort and access indexes follow the same rule. `_refresh_rows_index_on_disk` 
 
 ## 15. Performance instrumentation (find slow steps, extra round trips, duplicate work)
 
-Everything logs as `PERF event=...` lines (backend, worker, and the browser through `POST /api/perf/client`), so one Log Analytics query set covers the whole path. Switch off with `PERF_INSTRUMENTATION=false` on the backend and `localStorage['photostore.perf']='off'` in the browser. Query strings (SAS tokens) are never logged.
+Everything logs as `PERF event=...` lines (core, the queue roles, and the browser through `POST /api/perf/client`), so one Log Analytics query set covers the whole path. Switch off with `PERF_INSTRUMENTATION=false` on the backend and `localStorage['photostore.perf']='off'` in the browser. Query strings (SAS tokens) are never logged.
 
 **Backend (`perf_instrumentation.py`)**
 - Every Azure Table, Blob and Queue call is traced at the SDK transport. Each request and job records round-trip count, storage time, bytes and the top operations. These are labelled `table:GET:photos(..)` or `blob:GET:lexical-index`, with ids collapsed.
 - `event=request` now carries `rid`, `view`, `sess`, `io_calls`, `io_ms`, `io_mb` and `io_top`. The response gets `X-Request-ID` and `Server-Timing: app;dur, storage;dur`.
 - `event=dup_io` is logged when one request or job repeats the same storage call `PERF_IO_DUP_WARN` (3) or more times.
-- `event=scope_summary` is logged per queue message, per ipworker message and per index-build job. It includes wall time, I/O, peak RSS, the slowest spans and `io_top`.
+- `event=scope_summary` is logged per queue message, per vision message and per index-build job. It includes wall time, I/O, peak RSS, the slowest spans and `io_top`.
 - `event=step` is logged per phase of a job (`index.prime.<kind>`, `index.<kind>.table_scan|fetch_previous|upload`). It reports the storage calls made inside the step. This tells a slow step apart from a chatty one.
 - `event=stream_scan_split` breaks the library scan into time waiting on the table versus time in each sink, such as ListingSink or SearchDbSink.
 - `event=io_totals` is logged every sample interval with process-wide storage calls ranked by time.
@@ -503,10 +548,10 @@ Build scopes and triggers:
 | Scope | Runs | Triggered by |
 | --- | --- | --- |
 | `full` | everything | library never indexed, schema upgrade, compaction request |
-| `light` | sort + access indexes, then the database delta | ipworker queue drain / every 10k files, dirty sort/access observed, Workbench action |
+| `light` | sort + access indexes, then the database delta | vision queue drain / every 10k files, dirty sort/access observed, Workbench action |
 | `people` | people + albums indexes, then the database delta | a clustering, recluster or propagate job finishing |
 
-Each scope has its own job row and trigger cooldown. `light` and `people` touch different indexes, so ipworker and clustering do not repeat each other's work; whichever runs second finds the dirty set empty and its delta step is a no-op.
+Each scope has its own job row and trigger cooldown. `light` and `people` touch different indexes, so vision and cluster do not repeat each other's work; whichever runs second finds the dirty set empty and its delta step is a no-op.
 
 Still full-rebuild-only: the Explore places/things summary. Still O(library) per light build: the sort and access index files (streamed on the worker, but a million-photo sort index is too big for the browser either way).
 
@@ -520,8 +565,8 @@ Still full-rebuild-only: the Explore places/things summary. Still O(library) per
 | Search is usable long before the build ends | An empty base database is published first and every chunk is appended as a delta. Responses carry `indexPartial: true` until the build finishes. |
 | One table scan, not four | The same pass produces the search rows, the sort-index rows and the access-index rows (spooled per chunk, then assembled). Before this it was a scan for the sort index, another for access, another for search, and the listing blob had no consumer. |
 | Memory is bounded | O(chunk), about 20-40 MB. |
-| Disk is bounded and checked | The worker holds its local database copy plus one snapshot during compaction, and compaction refuses to start without enough free disk (2.5x the database + 64 MB). The spool is removed when the build ends. |
-| No repeated full rebuilds | Normal change is deltas (§15.4). Compaction folds the delta log into a new base from the worker's local copy and never reads the table. The scan build runs only for a library with no usable database (new, or a schema upgrade). |
+| Disk is bounded and checked | The index-worker holds its local database copy plus one snapshot during compaction, and compaction refuses to start without enough free disk (2.5x the database + 64 MB). The spool is removed when the build ends. |
+| No repeated full rebuilds | Normal change is deltas (§15.4). Compaction folds the delta log into a new base from the index-worker's local copy and never reads the table. The scan build runs only for a library with no usable database (new, or a schema upgrade). |
 | The first build does not starve live traffic | `LIBRARY_BUILD_MAX_ROWS_PER_SECOND` throttles the scan (0 = unlimited, the default). |
 
 **Compatibility:** `deltaSeq` is global to a lineage; compaction changes the base's `sourceVersion` and `baseSeq` but not the lineage. Readiness (`search_db.is_current`) compares lineages, so a compaction does not make the library look "stale".
@@ -531,7 +576,7 @@ Still full-rebuild-only: the Explore places/things summary. Still O(library) per
 **Operating it:** PERF events `library_build_started|resumed|progress|done`, `searchdb_delta_published`, `searchdb_compacted` (queries 13-14 in `docs/perf-queries.kql`).
 
 **Known limits at 1M, not yet addressed**
-- **Backend disk:** each backend replica keeps a local copy of the library's database. The 0.5 vCPU backend has about 2 GiB of ephemeral disk and `SEARCH_DB_MAX_CACHE_MB` defaults to 1200. Read `sqlite_mb` from the `searchdb_built` / `searchdb_compact` log lines at 130k and multiply by 7.7. If the result is above about 1.5 GB, give the backend 1 vCPU (4 GiB ephemeral) and raise the cache budget.
+- **Core disk:** each core replica keeps a local copy of the library's database. The core app's ephemeral disk (`SEARCH_DB_DIR`) is shared by its two worker processes and `SEARCH_DB_MAX_CACHE_MB` defaults to 1200. Read `sqlite_mb` from the `searchdb_built` / `searchdb_compact` log lines at 130k and multiply by 7.7. If the result is above about 1.5 GB, give core more ephemeral disk and raise the cache budget.
 - **Browser sort index:** about 24 MB at 130k photos, so about 180 MB at 1M. The browser cannot download that; the gallery needs server-side paging first.
 - **People and albums indexes** still read every cluster and face for each build.
 - **Sort/access light builds** rewrite their whole file when something changes (a streamed disk pass, about a minute at 1M).
@@ -595,7 +640,7 @@ The Ask search now lives in `mockups/prototype/askSearchStore.ts` (outside React
 
 ### 15.13 A person's photos come from the person-membership table
 
-`GET /api/persons/<id>/photos?offset&limit` (extras) returns one page of the person's photos as filenames, best face first (confirmed, then confidence), with the exact total. It reads **one partition** of `photopersonmembers` (one row per person+face), which now also carries each face's `filename`, `confidence` and `confirmed`. Rows written before this lack those columns: the first time a person is opened, their faces are point-read and the columns written back (a person pays that once; new faces are filled in the same way on the next open). The browser then makes one `/api/photos/lookup-batch` call (backend, token thumbnails) to turn the page into photo records, so opening a person no longer scans the library's face table. Pages come from a 45 s per-person cache. If this endpoint fails the page falls back to the face list (`/api/persons/<id>`).
+`GET /api/persons/<id>/photos?offset&limit` (core) returns one page of the person's photos as filenames, best face first (confirmed, then confidence), with the exact total. It reads **one partition** of `photopersonmembers` (one row per person+face), which now also carries each face's `filename`, `confidence` and `confirmed`. Rows written before this lack those columns: the first time a person is opened, their faces are point-read and the columns written back (a person pays that once; new faces are filled in the same way on the next open). The browser then makes one `/api/photos/lookup-batch` call (backend, token thumbnails) to turn the page into photo records, so opening a person no longer scans the library's face table. Pages come from a 45 s per-person cache. If this endpoint fails the page falls back to the face list (`/api/persons/<id>`).
 
 Not used for this: the library database's `row_people` index only contains **named** people (a photo's `peopleIds` skips unnamed clusters), so it cannot answer for most clusters. `GET /api/photos?personId=<id>` (served from it) still exists for named people.
 
@@ -615,194 +660,155 @@ The browser reads the sort and albums indexes once per session and re-reads them
 
 ### 15.17 Dirty marks reach the table on their own
 
-A photo is added to the library database only if the worker finds it in the dirty-marks table (`photosearchdirty`). Marks are buffered in memory by whichever process changed the photo (upload, ipworker, backend) and used to be written only when 100 filenames piled up, or when a reader in the SAME process asked. The worker that builds the indexes is a different process, so a library that adds fewer than 100 photos at a time (a new library, a phone upload) never published a mark: the worker saw nothing dirty, and the Workbench, album covers and search stayed empty. Marks are now flushed 3 s after the first one (`DIRTY_FLUSH_DELAY_SECONDS`, 0 disables), after every ipworker message, and before a worker/ipworker process exits.
+A photo is added to the library database only if the worker finds it in the dirty-marks table (`photosearchdirty`). Marks are buffered in memory by whichever process changed the photo (upload, vision, core) and used to be written only when 100 filenames piled up, or when a reader in the SAME process asked. The worker that builds the indexes is a different process, so a library that adds fewer than 100 photos at a time (a new library, a phone upload) never published a mark: the worker saw nothing dirty, and the Workbench, album covers and search stayed empty. Marks are now flushed 3 s after the first one (`DIRTY_FLUSH_DELAY_SECONDS`, 0 disables), after every ipworker message, and before a worker/ipworker process exits.
 
 Photos whose marks were lost before this fix are not in the database. Re-queueing their processing (the admin backfill endpoints in `routes/admin.py`, or a Workbench re-run once they are listed) marks them again.
 
 ### 15.18 Index architecture diagrams
 
-These diagrams summarize how the source tables, dirty markers, build jobs and derived read models fit together for gallery, search, albums and people.
+These diagrams match the 2026-11-24 role split: `core` and `upload` mark
+changes dirty, `vision` and `cluster` produce source rows, and `index-worker`
+publishes the derived read models.
 
 ```mermaid
 flowchart TB
-  subgraph Source["Source of truth: Azure Tables and Blob Storage"]
-    M["Photo Metadata Table"]
-    A["Albums Table + Album Members Table"]
-    F["Face Table"]
-    P["Person Table"]
-    E["Photo Embeddings Table"]
-    H["Hash / Filename Owner / Trash Index Tables"]
-    B["Image / Thumbnail / Preview Blobs"]
+  subgraph Source["Source of truth: Table Storage and Blob Storage"]
+    M["photometadata rows"]
+    F["photofaces and photopersonmembers"]
+    P["photopeople"]
+    A["photoalbums and photoalbummembers"]
+    E["photoembeddings and photofaceembeddings"]
+    H["photofilehashes, photofilenameowners, phototrashindex"]
+    B["Blobs: images, thumbnails, previews"]
   end
 
-  subgraph Dirty["Dirty marking"]
-    TUS["touch_user_search_indexes_state"]
-    TAI["touch_user_albums_index_state"]
-    TPI["touch_user_people_index_state"]
-    DFT["Dirty Filename Table<br/>lexical / sort / access"]
-    MAN["Index Manifests<br/>dirty=true, sourceVersion"]
+  subgraph Dirty["Dirty marks (written by core, upload, vision, cluster)"]
+    SD["photosearchdirty: search DB, sort and access rows"]
+    PD["peopledirtyset"]
+    AD["albumsdirtyset"]
   end
 
-  subgraph Worker["Index build worker"]
-    JOB["index_build Queue Job"]
-    PRIME["prime_all_user_indexes_sequentially"]
-    LIGHT["light scope<br/>sort + access"]
-    PEOPLE["people scope<br/>people + albums"]
-    FULL["full scope<br/>bootstrap/search DB + sort/access + albums/people"]
+  subgraph Build["index-worker (photostore-index-maintenance queue)"]
+    FULL["full: first build, schema change, compaction"]
+    LIGHT["light: sort, access and search DB delta"]
+    PEOPLE["people: people, albums and search DB delta"]
   end
 
-  subgraph Derived["Derived indexes / read models"]
-    DB["SQLite Search/Gallery DB<br/>FTS, dates, people, rating, geo"]
-    SORT["Sort Index Blob<br/>captureDate, rating, likes, thumb"]
-    ACCESS["Access Index Blob<br/>filename -> blob/status"]
-    ALBUMS["Albums Index Blob<br/>album list, counts, covers"]
-    PEOPLEIDX["People Index Blob<br/>person list, cover face, counts"]
-    VECTOR["Vector Index Blob<br/>photo semantic vectors<br/>(not used by /api/photos/search)"]
-    TAGS["Tag Embedding Index Blob<br/>optional query expansion"]
-    PEE["People Embedding Index Blob<br/>cluster assignment"]
-    TRASH["Trash Index Table<br/>trashed filenames"]
+  subgraph Derived["Derived read models"]
+    DB["Per-library SQLite DB (FTS5, dates, people, rating)"]
+    SORT["Sort index blob (capture date, rating, thumb)"]
+    ACC["Access index blob (filename to blob and status)"]
+    ALB["Albums index blob"]
+    PIDX["People index blob"]
+    VEC["Vector index blob (not on the search path)"]
+    TAG["Tag-embedding index blob (query expansion)"]
+    PEE["People-embedding index blob (face assignment)"]
   end
 
   subgraph Readers["Readers"]
-    Gallery["Gallery / Timeline"]
-    Search["Server Search"]
-    AlbumsPage["Albums Page"]
-    PeoplePage["People Page"]
-    AccessBatch["Thumbnail/Preview access-batch"]
-    Clustering["People Clustering / Assignment"]
-    TrashPage["Recently Deleted"]
+    Gallery["core: gallery, timeline, search"]
+    AlbumsP["core: albums"]
+    PeopleP["core: people"]
+    AccessP["core: access-batch and thumbnails"]
+    Assign["cluster: face assignment"]
+    TrashP["core: recently deleted"]
   end
 
-  M --> TUS
-  A --> TAI
-  F --> TPI
-  P --> TPI
-  E --> VECTOR
-  H --> TRASH
-  B --> ACCESS
-
-  TUS --> MAN
-  TUS --> DFT
-  TAI --> MAN
-  TPI --> MAN
-
-  MAN --> JOB
-  JOB --> PRIME
-  PRIME --> FULL
-  PRIME --> LIGHT
-  PRIME --> PEOPLE
-
-  FULL --> DB
-  FULL --> SORT
-  FULL --> ACCESS
-  FULL --> ALBUMS
-  FULL --> PEOPLEIDX
-
-  LIGHT --> SORT
-  LIGHT --> ACCESS
-  LIGHT --> DB
-
-  PEOPLE --> PEOPLEIDX
-  PEOPLE --> ALBUMS
-  PEOPLE --> DB
-
-  M --> DB
-  M --> SORT
-  M --> ACCESS
-  A --> ALBUMS
-  F --> PEOPLEIDX
-  P --> PEOPLEIDX
-  E --> VECTOR
-  M --> TAGS
+  M --> SD
+  F --> PD
+  P --> PD
+  A --> AD
+  H --> TrashP
+  B --> ACC
+  E --> VEC
+  M --> TAG
   P --> PEE
   F --> PEE
 
+  SD --> FULL
+  SD --> LIGHT
+  PD --> PEOPLE
+  AD --> PEOPLE
+
+  FULL --> DB
+  FULL --> SORT
+  FULL --> ACC
+  FULL --> ALB
+  FULL --> PIDX
+  LIGHT --> SORT
+  LIGHT --> ACC
+  LIGHT --> DB
+  PEOPLE --> PIDX
+  PEOPLE --> ALB
+  PEOPLE --> DB
+
   DB --> Gallery
-  DB --> Search
   SORT --> Gallery
-  ACCESS --> AccessBatch
-  ALBUMS --> AlbumsPage
-  PEOPLEIDX --> PeoplePage
-  TAGS -. expands query tokens .-> Search
-  PEE --> Clustering
-  TRASH --> TrashPage
+  ACC --> AccessP
+  ALB --> AlbumsP
+  PIDX --> PeopleP
+  TAG -. expands query tokens .-> Gallery
+  PEE --> Assign
 ```
 
 ```mermaid
 sequenceDiagram
   participant User
-  participant API as Backend API
-  participant Tables as Source Tables
-  participant Dirty as Dirty Manifests / Dirty Filenames
-  participant Queue as index_build Queue
-  participant Worker as Worker
-  participant Indexes as Derived Indexes
-  participant UI as Frontend
+  participant Upload as upload app
+  participant Tables as Tables and dirty marks
+  participant Q as Storage queues
+  participant Vision as vision app
+  participant Cluster as cluster app
+  participant IW as index-worker
+  participant Blobs as Blob Storage
+  participant Core as core app
 
-  User->>API: Upload photo
-  API->>Tables: Write metadata row, hash index, filename owner
-  API->>Dirty: Mark lexical/search-DB, sort/access dirty filenames; mark vector/tag manifests dirty
-  API-->>User: Upload finalized
-
-  API->>Tables: Background processing writes EXIF/OCR/tags/faces
-  API->>Dirty: Mark same filename dirty again
-
-  UI->>API: Check /api/photos/index-status
-  API-->>UI: ready=false or dirty manifests
-
-  UI->>API: POST /api/tools/indexes/build
-  API->>Queue: Enqueue index_build job
-
-  Worker->>Queue: Consume job
-  alt Cold or missing DB
-    Worker->>Tables: Chunked/full scan
-    Worker->>Indexes: Build SQLite DB, sort, access, albums, people
-  else Small upload/edit/delete
-    Worker->>Dirty: Read dirty filenames
-    Worker->>Tables: Fetch only changed rows
-    Worker->>Indexes: Publish SQLite deltas / merge sort-access rows
-  else People/album mutation
-    Worker->>Tables: Read affected people/albums
-    Worker->>Indexes: Rebuild people/albums index
+  User->>Upload: Upload and finalize photos
+  Upload->>Tables: Metadata row, hash and owner rows, dirty marks
+  Upload->>Q: Enqueue processing (photostore-ipwork)
+  Vision->>Q: Claim message under a processing lease
+  Vision->>Tables: Write EXIF, OCR, tags, faces, step outcomes
+  Vision->>Tables: Mark the same photos dirty again
+  Vision-->>User: Progress push (Web PubSub, budgeted) or polling
+  Cluster->>Q: Claim the wave's clustering job
+  Cluster->>Tables: Write face-to-person assignments
+  Cluster->>Q: Hand off to indexing (photostore-index-maintenance)
+  IW->>Q: Claim the index build
+  alt Cold library or missing search DB
+    IW->>Tables: Chunked scan (resumable)
+    IW->>Blobs: Publish SQLite base, sort, access, albums, people
+  else Ordinary change
+    IW->>Tables: Read dirty rows only
+    IW->>Blobs: Publish SQLite deltas, merge sort and access rows
   end
-
-  Worker->>Dirty: Clear dirty flags after successful publish
-  UI->>API: Poll status / reload index URLs
-  API-->>UI: ready=true
+  IW->>Tables: Clear dirty marks after a successful publish
+  User->>Core: Read gallery, albums, people and search
+  Core->>Blobs: Fetch published index files through SAS or the share
 ```
 
 ```mermaid
 flowchart LR
-  Upload["Upload photos"] --> SearchDirty["search/sort/access dirty by filename"]
-  Upload --> Hash["hash + filename-owner indexes updated"]
-  Upload --> Processing["EXIF/OCR/tags/faces processing"]
-  Processing --> SearchDirty
-  Processing --> PeopleDirty["people index dirty if face/person rows changed"]
+  Upload["Upload finalize (upload app)"] --> Dirty["Dirty marks: search DB, sort, access"]
+  Proc["Vision and browser results"] --> Dirty
+  Proc --> PDirty["People dirty when face or person rows change"]
 
-  Delete["Soft delete photos"] --> Trash["trash index add"]
-  Delete --> SearchDirty
-  Delete --> PeopleDirty
+  Del["Soft delete"] --> Trash["Trash index table"]
+  Del --> Dirty
+  Del --> PDirty
+  Restore["Restore"] --> Trash
+  Restore --> Dirty
+  Restore --> PDirty
 
-  Restore["Restore photos"] --> TrashRemove["trash index remove"]
-  Restore --> SearchDirty
-  Restore --> PeopleDirty
+  Purge["Hard delete"] --> Blobs["Delete blobs, metadata and embeddings"]
+  Purge --> AlbumFix["Remove names from albums"]
+  Purge --> Dirty
 
-  Purge["Hard delete photos"] --> BlobDelete["delete blobs + metadata + embeddings"]
-  Purge --> AlbumCleanup["remove filenames from albums"]
-  Purge --> SearchDirty
+  AlbumEdit["Create, rename, add or remove album photos"] --> ADirty["Albums dirty"]
+  Merge["Merge or label clusters"] --> PDirty
+  Merge --> Dirty
 
-  AlbumCreate["Create/rename album"] --> AlbumsDirty["albums index dirty"]
-  AlbumAdd["Add/remove album photos"] --> AlbumsDirty
-  AlbumDelete["Delete/restore/purge album"] --> AlbumsDirty
-
-  Merge["Merge clusters"] --> FaceWrites["move face personId"]
-  Merge --> PersonWrites["delete source persons / update target"]
-  FaceWrites --> PeopleDirty
-  PersonWrites --> PeopleDirty
-  Merge --> MetadataFaces["rebuild metadata face summaries"]
-  MetadataFaces --> SearchDirty
-
-  SearchDirty --> LightOrFull["worker light/people/full build drains SQLite deltas"]
-  AlbumsDirty --> PeopleScope["worker people scope"]
-  PeopleDirty --> PeopleScope
+  Dirty --> Flush["Flushed 3 s after the first mark"]
+  Flush --> Light["index-worker: light or full build drains SQLite deltas"]
+  PDirty --> PeopleScope["index-worker: people scope"]
+  ADirty --> PeopleScope
 ```

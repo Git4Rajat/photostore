@@ -1,16 +1,15 @@
-> **2026-10-09 role rename**: `ipworker`→`vision`, `backend`→`core`,
-> `worker`→`cluster`, `tools`→`indexer`, `admin`→`recovery`, `extras`→`archive`,
-> `frontend`→`web` (`upload` unchanged). This doc still uses the OLD names —
-> translate via this table against current `deploy/resources.bicep`/`backend/app.py`.
+# Vision architecture (`ipworker`, as of 2026-11-24)
 
-> **2026-10-11 image reuse experiments**: preview-first processing already
-> reuses JPEG bytes. Task-scoped RGB reuse and downloading a completed stored
-> preview now have separate, default-off flags. See
-> [the benchmark and adoption limits](vision-image-reuse-benchmark-20261011.md).
-> Results remain batched until processing finishes; early photo visibility is
-> outside the accepted scope.
+> **Names.** The deployed app is `vision` (the `ipworker` image and code path
+> are unchanged). The role map is: `backend`→`core`, `tools`→`indexer`,
+> `admin`→`recovery`, `extras`→`archive`, `worker`→`cluster` (and index builds
+> moved to `index-worker`), `frontend`→`web`, `upload` unchanged.
+> Sections 1-5 describe the current deployment and were checked against
+> `backend/app.py`, `backend/storage_utils.py` and `deploy/resources.bicep`.
+> Sections 6-10 are measurement records from 2026-08 to 2026-10. They keep the
+> numbers and the rejected experiments, and they are not current configuration.
 
-# Bounded face-index preparation
+## Bounded face-index preparation
 
 The ipworker now supports bounded authoritative filename-index reconciliation
 before photo processing. See [ipworker-face-batch-reconciliation.md](ipworker-face-batch-reconciliation.md)
@@ -180,156 +179,142 @@ Use a retained matched upload to establish the new apply share before choosing
 cross-photo write batching or semantic-model batching; do not weaken generation
 fences or acknowledge unconfirmed writes to make apply appear faster.
 
-# ipworker background-processing architecture (as of 2026-08-28)
-
 Scope: how server-side AI processing of uploaded photos actually works today —
 dispatch, hardware, concurrency, scaling, coordination with the browser path,
 and the per-step cost profile measured live this session. Everything below is
 verified against the current code (`backend/app.py`, `backend/storage_utils.py`,
 `backend/ipwork_*.py`, `deploy/resources.bicep`), not recalled from memory.
 
-## 1. What ipworker is
+## 1. What `vision` is (the code calls it `ipworker`)
 
-A separate Azure Container App (`ownphotostore-ipworker` / `photostore-test-ipworker`)
-running the same Flask codebase as `backend`/`worker`, but started via
-`run_ipworker()` instead of gunicorn — a pure queue-consumer process, no HTTP
-serving. It exists so photo processing (thumbnail, EXIF/GPS, OCR, face
-detection+embedding, CLIP scene tagging, reverse geocoding) can happen
-server-side instead of requiring a browser tab to stay open. Controlled by the
-`PROCESSING_MODE` env var (`browser` / `backend` / `both`), which gates whether
-the frontend's client-side AI pipeline runs at all (`AppServicesProvider.tsx`)
-and whether the backend ever enqueues ipwork messages.
+`vision` is the Container App `${appName}-vision` (`APP_ROLE=vision`). It runs
+the same codebase as `core`. `entrypoint.sh` starts `run_ipworker()`
+(`backend/app.py:19226`) instead of gunicorn, so it has no HTTP surface. It
+consumes the `photostore-ipwork` queue. The code still uses `ipwork` and
+`IPWORK*` names for this path; in prose, `vision` and `ipworker` mean the same
+thing.
 
-Six steps, defined once and shared with the browser path:
+It exists so photo processing can run server-side, without a browser tab
+staying open. `PROCESSING_MODE` (`app.py:746`) decides who does the work:
+`browser`, `backend` (vision does everything), or `both`. The vision app is
+deployed only when `processingMode` is not `browser` (`deployVision`,
+`deploy/resources.bicep:160`).
+
+It has its own image, `photostore-ipworker` (`backend/requirements-ipworker.txt`:
+torch, open_clip_torch, onnxruntime, opencv-python-headless, mediapipe,
+tesserocr), because those dependencies would bloat the `core` image. The
+entrypoint sets `TESSDATA_PREFIX` before starting, since tesserocr needs it.
+
+Seven steps, defined once and shared with the browser path:
+
 ```python
-IPWORK_STEPS = ('thumbnail', 'exif', 'ocr', 'face', 'ai_vision', 'map_detection')
+IPWORK_STEPS = ('preview', 'thumbnail', 'exif', 'ocr', 'face', 'ai_vision', 'map_detection')
 ```
-(`backend/app.py:398`)
 
-## 2. Hardware / deployment (`deploy/resources.bicep:664-791`)
+(`backend/app.py:848`.) `preview` produces the JPEG preview that the other
+steps can reuse. See the 2026-10 sections below.
 
-- **Image**: its own image (`ipworkerImage`), not shared with `backend`/`worker`
-  — it needs a much heavier dependency set (`requirements-ipworker.txt`: torch,
-  open_clip_torch, onnxruntime, opencv-python-headless, mediapipe, tesserocr)
-  that would otherwise bloat cold-starts for the plain backend/worker roles.
-- **Per-replica resources**: `2.0 vCPU / 4Gi memory`. Sized to match `worker`'s
-  footprint on the reasoning that "a single pass runs YOLO face detection,
-  MediaPipe landmarks, AdaFace embedding, CLIP tagging, and tesseract OCR in
-  sequence for one photo" — i.e. originally provisioned for **one photo at a
-  time per replica**.
-- **Scale**: `minReplicas: 0`, `maxReplicas: 4`. Scales to zero when idle.
-- **2 vCPU/4Gi is a hard ceiling, not just today's choice.** This managed
-  environment (`resource managedEnvironment`, `resources.bicep:185-188`) has
-  `properties: {}` — no `workloadProfiles` configured, i.e. it's a plain
-  Consumption environment. Azure caps Consumption-only environments at 2
-  vCPU/4Gi per replica; going higher requires migrating the managed
-  environment to Workload Profiles first, not just bumping a bicep number.
-  Relevant if a future "just give it more CPU" plan comes up.
+## 2. Deployment (`deploy/resources.bicep`, `vision` block)
+
+- **Resources**: 2.0 vCPU / 4 GiB per replica.
+- **Scale**: `minReplicas: 0`, `maxReplicas: 1`. The template comment records a
+  measured 1,809-file run at about 0.5 s of processing per photo and about 8%
+  CPU. One replica drains a burst. Raise `maxReplicas` if backfills drain too
+  slowly.
+- **Concurrency**: `IPWORKER_CONCURRENCY=3` in the template (`app.py:901`
+  defaults to 1 when unset).
+- **Caches**: `PEOPLE_SCAN_CACHE_TTL_SECONDS=120` on this app only (§5 of
+  [backend-api-architecture.md](backend-api-architecture.md)).
+- **Sweep interval**: `IPWORK_SWEEP_INTERVAL_SECONDS=432000` (five days). The
+  template comment says maintenance may run only while queue-triggered work
+  keeps the replica active. The code default is 1200 s (`app.py:14740`). There
+  is no scheduled wake for the sweep: the template has no `ipwork-sweep-wake`
+  cron rule.
+- **Volumes**: the `faiss-checkpoints` Azure Files share, mounted at
+  `/mnt/photostore/shared` for the index cache.
+- **Environment**: the template sets no workload profiles, so the managed
+  environment uses the default Consumption profile. The 2 vCPU / 4 GiB size is
+  what the template declares. Changing it means checking the environment's
+  workload-profile setup first.
 
 ## 3. How work gets dispatched
 
-A queue (`photostore-ipwork`), one message per (photo, set-of-steps) unit of
-work, created by the backend at startup. `PROCESSING_MODE != 'browser'`
-enqueues a message after each upload with whichever steps are outstanding.
+Queue `photostore-ipwork`, with `photostore-ipwork-deferred` for delayed
+retries and a dead-letter queue. Core and upload enqueue a message per photo
+with the steps still outstanding. With `IPWORK_DEFER_UNTIL_UPLOAD_END=true`
+(default, `app.py:14163`), messages for an upload are released when the upload
+ends, not as each file arrives.
 
-**Two independent ways ipworker learns about work:**
-1. **Direct enqueue** at upload time (or whenever the backend decides a step
-   needs redoing, e.g. a face-embedding-version bump).
-2. **Sweep** (`_ipwork_sweep_loop`, `backend/app.py:10195`) — a daemon thread
-   inside every ipworker replica, independent of the queue-polling loop, that
-   runs every `IPWORK_SWEEP_INTERVAL_SECONDS` (default 1200s / 20min) and
-   re-enqueues any photo across *every* library whose steps look stuck: never
-   queued at all (uploaded while ipworker was stopped, or during a
-   `browser`-only window), `running` with an expired lease, `queued` for
-   longer than `IPWORK_SWEEP_STALE_QUEUED_SECONDS` (1800s), or a `done` face
-   whose embedding version is stale. This is the self-healing path for
-   "photo never got enqueued in the first place."
-3. Because minReplicas=0, a cron scale rule (`ipwork-sweep-wake`) wakes one
-   replica for a 5-minute window every 20 minutes (`0,20,40 * * * *` →
-   `5,25,45 * * * *`, UTC) purely so the sweep gets a chance to run even when
-   the queue is empty — kept in sync with `IPWORK_SWEEP_INTERVAL_SECONDS`.
+Work reaches vision in two ways:
+
+1. **Enqueue** at upload end, or when a step must be redone (for example after
+   a face-embedding version bump).
+2. **Sweep.** `_ipwork_sweep_loop` (`app.py:15023`) runs on a daemon thread in
+   each vision replica. Each pass first takes a cluster-wide lock, so one
+   replica does the scan. It re-enqueues photos that look stuck. A photo is
+   eligible when a step is `failed`, `no_data` (where a retry applies), or
+   `queued` for longer than `IPWORK_SWEEP_STALE_QUEUED_SECONDS` (1800 s, so a
+   message that is still in flight is not duplicated), or when its browser
+   lease has expired or its face version is stale. Videos, photos marked
+   `processingIsolated` and deleted photos are skipped. The selection code is
+   `_browser_processing_*` and the function around `app.py:14800`.
+
+Because the vision app scales to zero, the sweep only runs while a replica is
+up. Stuck work is recovered by queue traffic or by a manual wake.
 
 ## 4. Concurrency model
 
-Two independent levels of concurrency:
+**Across replicas.** KEDA rule `ipwork-queue` on `photostore-ipwork`, with
+`queueLength: 1` and `queueLengthStrategy: all`. The `all` strategy counts
+claimed messages as well as visible ones, so active work keeps the replica up.
+`ipwork-deferred-queue` uses `visibleonly`. `maxReplicas` is 1.
 
-**Across replicas** — KEDA `azure-queue` scale rule on `photostore-ipwork`,
-target `queueLength: 2` with `queueLengthStrategy: all`. Counts queued and
-claimed messages so active work survives an empty visible queue. Delayed
-retries also count until handled or expired. The current template permits
-0 to 1 replicas; the minimum remains zero.
+**Within a replica.** `IPWORKER_CONCURRENCY` (3 in the template) sizes the
+thread pool in `run_ipworker()`. There is one exception. When
+`UPLOAD_WAVE_EXECUTION_ENABLED=true` (the template default, from
+`enableWaveExecution`), the queue loop takes one delivery at a time
+(`queue_concurrency = 1`, `app.py:19279`). Wave source work then uses a
+process-wide pool sized by `IPWORKER_CONCURRENCY`. Sibling replicas can claim
+other libraries that way.
 
-**Within a replica** — `IPWORKER_CONCURRENCY` (currently `2`, `backend/app.py:441`,
-default `1` if unset) sizes a `ThreadPoolExecutor` in `run_ipworker()`
-(`backend/app.py:12970`). The main loop keeps exactly enough messages
-in-flight to saturate that pool, refilling one slot at a time as futures
-complete rather than batch-waiting (`backend/app.py:12942-12951`):
-```python
-free_slots = min(IPWORKER_CONCURRENCY - len(in_flight), 32)
-```
-**Total concurrent-photo ceiling = replicas × IPWORKER_CONCURRENCY = 4 × 2 = 8** today.
+Ceiling today: 1 replica × 3 = **3 photos in progress at once**.
 
-Per photo, within one worker thread, `_run_ipwork_steps` (`backend/app.py:12676`)
-runs every requested step **sequentially** — one `for step in steps` loop, one
-lazy image download shared across all steps, no intra-photo parallelism:
-`thumbnail → exif → ocr → face → ai_vision → map_detection`. A slow step (OCR)
-blocks everything after it for that photo; it does not block other photos,
-since those run on their own thread-pool slots.
+Within one photo, `_run_ipwork_steps` (`app.py:18315`) runs the requested steps
+in order, sharing one image decode (`image_job(IPWORK_SHARED_DECODE)`). A slow
+step, such as OCR, delays the later steps for that photo. It does not delay
+other photos.
 
-**Results are also batched, not streamed per-step — this matters more than
-the ordering above.** `_handle_ipwork_queue_payload` calls `_run_ipwork_steps`
-to completion (building one `client_processing` dict across all 6 steps) and
-only *then* calls `apply_client_processing_results_for_file` once with the
-whole dict. So today, nothing — not even the already-finished thumbnail —
-becomes visible/persisted until OCR *and* every step after it also finishes.
-Reordering `IPWORK_STEPS` alone would not fix this (the batched write still
-waits for the slowest step regardless of order); the actual fix would be
-either per-step persistence or splitting the fast steps into their own apply
-call before OCR runs. Not implemented — a real UX-latency lever (time until a
-thumbnail/face appears), distinct from raw photos/hour throughput, which this
-change would not move.
+**Results are applied once per photo.** `_handle_ipwork_queue_payload_impl`
+(`app.py:18635`) calls `apply_client_processing_results_for_file`
+(`storage_utils.py:11217`) after all of a photo's steps finish. A finished
+thumbnail is therefore not visible until the photo's last step is applied. The
+progress estimate (see [processing-progress-design.md](processing-progress-design.md))
+is the coarse view of this while it runs.
 
-`IPWORKER_CONCURRENCY`'s own comment (`backend/app.py:428-434`) documents the
-last real benchmark that set it: Azure Monitor showed ~45% avg CPU per
-replica at concurrency=1 (headroom), but memory was already the tighter
-constraint at ~66-77% peak — i.e. the historical rationale for raising
-concurrency was memory-bound, not CPU-bound, and CPU contention wasn't
-re-checked when it was later pushed to 3. This session's timing data
-(§7) is the first direct CPU-contention measurement against a live
-concurrency value.
+## 5. Coordination with the browser path
 
-## 5. Coordination with the browser path (avoiding duplicate work)
+In `both` mode, a browser tab and vision can process the same photo. A per-photo
+lease on the metadata row prevents duplicate work:
+`claim_processing_lease`, `heartbeat_processing_lease` and
+`release_processing_lease` (`storage_utils.py:12050`, `:12217`, `:12237`). The
+row stores `processing_lease_owner`, `processing_lease_expires_at`, and one
+`{step}_status` per step (`pending`, `queued`, `running`, `done`, `no_data`,
+`failed`, `skipped`, `unsupported`). Whoever claims the lease does the work. The
+other side backs off.
 
-In `both` mode, a browser tab and ipworker can both be trying to process the
-same upload. Coordination is a single per-photo lease
-(`claim_processing_lease`/`release_processing_lease`/`heartbeat_processing_lease`,
-`backend/storage_utils.py:3013-3090`) stored directly on the metadata row:
-`processing_lease_owner`, `processing_lease_expires_at`, plus a `{step}_status`
-field per step (`pending`/`queued`/`running`/`done`/`no_data`/`failed`/`skipped`/
-`unsupported`). Whoever claims the lease does the work; the loser backs off
-without wasting inference. `IPWORKER_LEASE_SECONDS = 300` (generous vs. the
-browser's 120s, because one ipwork pass does every step in sequence rather
-than one at a time).
+- `IPWORKER_LEASE_SECONDS=300` (`app.py:853`). It is longer than the browser's
+  lease, because one vision pass runs every step.
+- `IPWORKER_VISIBILITY_TIMEOUT_SECONDS=300` (`app.py:881`) keeps the queue
+  message invisible for the whole pass. Otherwise Azure's default 30 s would
+  redeliver the message to a second replica while the first still works on it.
+  A redelivered copy carries the same job id, so the ownership check would not
+  stop it.
+- If the lease is lost to the browser, the message is not deleted, and Azure
+  redelivers it up to `IPWORK_LEASE_RETRY_LIMIT=3` times (`app.py:865`).
+  Claimed messages count toward the KEDA `all` signal, so the replica stays up
+  while they are pending.
 
-If ipworker loses the lease race (browser already claimed it) but the browser
-tab then closes mid-processing, ipworker's queue message is deliberately left
-**undeleted** so Azure redelivers it — retried up to `IPWORK_LEASE_RETRY_LIMIT`
-(3) times, each retry costing one `IPWORKER_VISIBILITY_TIMEOUT_SECONDS` (300s)
-wait. These undeleted messages also count toward the KEDA `all` scale
-signal. Counting claimed work prevents a long-running wave from losing its
-worker when its queue receipt is made invisible. The worker scales to zero
-after the pending messages are handled or expire and cooldown completes.
-
-`IPWORKER_VISIBILITY_TIMEOUT_SECONDS` also guards against a subtler bug: with
-no visibility timeout, Azure defaults to 30s, and one ipwork pass can exceed
-that — the same message would then get redelivered to a *second* replica
-while the first is still working it, and because the redelivered copy carries
-the same `jobId` (same lease-owner string), the ownership check wouldn't
-block the second attempt. Two replicas could genuinely run the full model
-pipeline on the same photo concurrently. Matching this to `IPWORKER_LEASE_SECONDS`
-closes that gap.
-
-## 6. Per-photo processing cost — real measured numbers (2026-08-27)
+## 6. Per-photo processing cost — measured 2026-08-27 (historical)
 
 Added this session (`worker_logger.info` in `_run_ipwork_steps` and
 `_handle_ipwork_queue_payload`, commit `e42de90`), captured live on
@@ -743,7 +728,7 @@ explicitly flag "re-benchmark before changing this again" — this file exists
 so that re-benchmarking has somewhere to start from instead of re-deriving
 from scratch.
 
-## 9. Summary of current numbers, for reference while analyzing
+## 9. Summary of the 2026-08 measurements (historical)
 
 | Metric | Value |
 |---|---|

@@ -23,13 +23,17 @@ it('draws "Set up your library" for an invited person starting their own library
     const email = screen.getByLabelText('Email address') as HTMLInputElement;
     expect(email.value).toBe('neha@example.com');
     expect(email.readOnly).toBe(true);
-    expect(screen.queryByLabelText('Confirm password')).toBeNull();
+    expect(screen.getByLabelText('Confirm password')).toBeTruthy();
     const button = screen.getByRole('button', { name: 'Create library' }) as HTMLButtonElement;
     expect(button.disabled).toBe(true);
     type('Library name', 'Neha family');
     type('Password', 'short');
     expect(button.disabled).toBe(true);
     type('Password', 'long-enough-1');
+    expect(button.disabled).toBe(true);
+    type('Confirm password', 'long-enough-2');
+    expect(button.disabled).toBe(true);
+    type('Confirm password', 'long-enough-1');
     expect(button.disabled).toBe(false);
     await act(async () => { fireEvent.click(button); });
     expect(mocks.accept).toHaveBeenCalledWith('t', 'long-enough-1', 'Neha family');
@@ -42,6 +46,7 @@ it('joins an existing library without a library name', async () => {
     expect(screen.getByRole('heading', { name: 'Join Verma family' })).toBeTruthy();
     expect(screen.queryByLabelText('Library name')).toBeNull();
     type('Password', 'long-enough-1');
+    type('Confirm password', 'long-enough-1');
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Accept invite' })); });
     expect(mocks.accept).toHaveBeenCalledWith('t', 'long-enough-1', undefined);
 });
