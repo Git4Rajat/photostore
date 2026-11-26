@@ -96,7 +96,7 @@ param uploadConcurrentRequests int = 32
 @maxValue(30)
 param uploadMaxReplicas int = 2
 
-@description('Vision: intra-op threads per model call (IPWORK_MODEL_THREADS), also the OMP/OpenBLAS thread caps. 1 keeps each of the IPWORKER_CONCURRENCY source threads on one core; raise only after a live test on the vCPU quota.')
+@description('Vision: intra-op threads per model call (IPWORK_MODEL_THREADS), also the OMP/OpenBLAS thread caps. Keep 1: measured 2026-11-26 at 2 vCPU with IPWORKER_CONCURRENCY=5, 2 threads cost about 22% of files per hour and 40% more CPU per file, because the cores are already about 84% busy across the concurrent source threads. Raise only together with more vCPU, after a live test.')
 @minValue(1)
 @maxValue(16)
 param visionModelThreads int = 1
