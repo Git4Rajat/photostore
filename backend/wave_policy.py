@@ -197,7 +197,7 @@ def validate_admission(store,data,*,finalizing=False):
     return validate_admissions(store,[data],finalizing=finalizing)[0]
 
 
-def validate_admissions(store,files,*,finalizing=False):
+def validate_admissions(store,files,*,finalizing=False,rows_out=None):
     """Bind each upload to its reservation's source bytes, one transaction per
     session page instead of one per file.
 
@@ -224,6 +224,7 @@ def validate_admissions(store,files,*,finalizing=False):
             def bind(page=page,session=session):
                 keys=[store.item_key(session,item) for item in page]
                 rows=read_entities(store.table,store.partition,keys,workers=4)
+                if rows_out is not None:rows_out.update(rows)
                 parent=store._required(store.session_key(session))
                 changes=[]
                 for item,key in zip(page,keys):

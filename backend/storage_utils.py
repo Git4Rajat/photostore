@@ -12535,7 +12535,8 @@ def _claim_filename_owner(user_id: str, filename: str, file_hash: str) -> bool:
             lookup_table = _CTX.get('face_by_filename_table_client')
             current = _face_filename_row(lookup_table, user_id, filename) if lookup_table is not None else None
             if current is None or _validated_face_filename_ids(current) is None:
-                generation, prior_ids = _begin_face_filename_write(user_id, filename)
+                # The row just read leads the first attempt; the write is conditional on it.
+                generation, prior_ids = _begin_face_filename_write(user_id, filename, first_read=(current,))
                 try:
                     _finish_face_filename_write(
                         user_id, filename, generation,

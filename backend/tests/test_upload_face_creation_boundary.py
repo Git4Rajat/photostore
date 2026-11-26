@@ -226,3 +226,18 @@ def test_missing_lookup_preserves_rejection_at_identical_deterministic_id(bounda
     assert faces.rows[('u1', face_id)] == rejected
     assert faces.writes == []
     assert storage_utils.get_face_ids_for_filename('u1', 'photo.jpg') == [face_id]
+
+def test_new_owner_claim_reads_the_filename_lookup_once_before_stamping(boundary_ctx):
+    """The pre-stamp reads the lookup row and hands it to the write that depends on it,
+    instead of reading the same absent row a second time."""
+    _, _, _, lookup = boundary_ctx
+    reads = []
+    original = lookup.get_entity
+    def counting(*args, **kwargs):
+        reads.append(kwargs.get('row_key') or args[-1])
+        return original(*args, **kwargs)
+    lookup.get_entity = counting
+    assert storage_utils._claim_filename_owner('u1', 'photo.jpg', 'hash')
+    # One read to decide, one inside the publish that verifies its own generation.
+    assert reads == ['photo.jpg', 'photo.jpg']
+    assert storage_utils._validated_face_filename_ids(lookup.rows[('u1', 'photo.jpg')]) == []

@@ -377,6 +377,17 @@ def test_an_init_batch_binds_all_its_files_in_one_transaction():
     assert commits==[]
 
 
+def test_admission_hands_back_the_reservation_rows_it_read():
+    table=RuntimeTable();store=active(table)
+    store.open_session('s',2);store.register('s',[dict(itemId='a',filename='a.jpg'),dict(itemId='b',filename='b.jpg')])
+    files=[dict(filename='a.jpg',sha256='a'*64,waveSessionId='s',waveItemId='a'),
+           dict(filename='b.jpg',sha256='b'*64,waveSessionId='s',waveItemId='b')]
+    rows={}
+    policy.validate_admissions(store,files,finalizing=True,rows_out=rows)
+    assert set(rows)=={store.item_key('s','a'),store.item_key('s','b')}
+    assert rows[store.item_key('s','a')]['filename']=='a.jpg'
+
+
 def test_one_bad_file_in_an_init_batch_binds_none_of_its_page():
     table=RuntimeTable();store=active(table)
     store.open_session('s',2);store.register('s',[dict(itemId='a',filename='a.jpg'),dict(itemId='b',filename='b.jpg')])
