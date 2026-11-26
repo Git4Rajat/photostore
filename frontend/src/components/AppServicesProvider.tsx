@@ -4909,6 +4909,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             void Promise.allSettled(Array.from(pendingFinalizeTasks)).then(() => batchTelemetry('end', {
                 uploaded: totalUploaded - previouslyUploaded - (totalSkippedDuplicates - previouslySkipped),
                 failed: totalFailed, duplicates: totalSkippedDuplicates - previouslySkipped,
+                lanes: uploadProfile.fileParallelism, laneReason: uploadProfile.reason,
             }));
             uploadSessionStoreRef.current!.flush();
             const reason = discardedUploadSessionIdsRef.current.has(session.id) ? 'discarded'
