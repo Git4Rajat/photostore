@@ -32,11 +32,17 @@ export type BrowserExifOutcome =
 type Pending = (value: BrowserExifOutcome) => void;
 
 let worker: Worker | null = null;
+// A replacement booted a few parses ahead of the recycle, so the swap is instant.
+let standby: Worker | null = null;
+let standbyReady = false;
 let unavailable = false;
 let seq = 0;
 let parsesSinceBoot = 0;
 let queue: Promise<unknown> = Promise.resolve();
 const RECYCLE_AFTER_PARSES = 25;
+// Boot the replacement this many parses before the recycle. Booting is ~30MB of
+// fetch plus unpacking; started late, every photo's EXIF step queues behind it.
+const STANDBY_LEAD_PARSES = 12;
 const pending = new Map<number, { resolve: Pending; timer: ReturnType<typeof setTimeout>; started: number }>();
 
 function failed(reason: string, started: number): BrowserExifOutcome {
@@ -47,17 +53,16 @@ function capable(): boolean {
   return typeof Worker !== 'undefined' && typeof WebAssembly !== 'undefined';
 }
 
-function getWorker(): Worker | null {
-  if (worker) return worker;
+function createWorker(): Worker | null {
   if (unavailable || !capable()) return null;
   try {
     // Classic worker (served from public/) — it importScripts the Emscripten glue.
     const w = new Worker(WORKER_URL);
-    parsesSinceBoot = 0;
     w.onmessage = (event: MessageEvent) => {
       const data = (event.data || {}) as {
-        id?: number; ok?: boolean; json?: Record<string, unknown>; outcome?: string;
+        type?: string; id?: number; ok?: boolean; json?: Record<string, unknown>; outcome?: string;
       };
+      if (data.type === 'ready') { if (w === standby) standbyReady = true; return; }
       if (typeof data.id !== 'number') return;
       const entry = pending.get(data.id);
       if (!entry) return;
@@ -73,8 +78,11 @@ function getWorker(): Worker | null {
         recycleWorker();
       }
     };
-    w.onerror = () => { markUnavailable(); };
-    worker = w;
+    w.onerror = () => {
+      // A standby that fails to boot is just dropped; the next parse boots on demand.
+      if (w === standby) { standby = null; standbyReady = false; try { w.terminate(); } catch { /* ignore */ } return; }
+      markUnavailable();
+    };
     return w;
   } catch {
     markUnavailable();
@@ -82,8 +90,27 @@ function getWorker(): Worker | null {
   }
 }
 
+function getWorker(): Worker | null {
+  if (worker) return worker;
+  // Promote the pre-booted replacement if there is one, else boot now.
+  worker = standby ?? createWorker();
+  standby = null;
+  standbyReady = false;
+  if (worker) parsesSinceBoot = 0;
+  return worker;
+}
+
+function ensureStandby(): void {
+  if (standby || unavailable) return;
+  standby = createWorker();
+  if (standby) { try { standby.postMessage({ type: 'prewarm' }); } catch { /* ignore */ } }
+}
+
 function markUnavailable(): void {
   unavailable = true;
+  try { standby?.terminate(); } catch { /* ignore */ }
+  standby = null;
+  standbyReady = false;
   recycleWorker('tool_unavailable');
 }
 
@@ -133,10 +160,13 @@ export function extractBrowserExif(
 
 function parseOnce(bytes: Uint8Array, name: string, timeoutMs: number): Promise<BrowserExifOutcome> {
   const started = performance.now();
-  if (parsesSinceBoot >= RECYCLE_AFTER_PARSES) recycleWorker();
+  // Only swap once the replacement reports ready; until then the current worker
+  // keeps serving, so no file waits on a boot (a few parses past 25 is harmless).
+  if (parsesSinceBoot >= RECYCLE_AFTER_PARSES && standbyReady) recycleWorker();
   const w = getWorker();
   if (!w) return Promise.resolve(failed(unavailable ? 'tool_unavailable' : 'unsupported_runtime', started));
   parsesSinceBoot++;
+  if (parsesSinceBoot >= RECYCLE_AFTER_PARSES - STANDBY_LEAD_PARSES) ensureStandby();
   const id = ++seq;
   return new Promise<BrowserExifOutcome>((resolve) => {
     const timer = setTimeout(() => {

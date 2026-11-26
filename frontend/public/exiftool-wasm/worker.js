@@ -86,6 +86,9 @@ self.__boot = new Promise(function (resolve, reject) {
   };
 });
 
+// Tells the page this worker can parse now, so a standby is only swapped in once warm.
+self.__boot.then(function () { self.postMessage({ type: 'ready' }); }, function () {});
+
 importScripts(BASE + 'emperl.js');   // defines Module/FS/ENV/callMain and starts the runtime
 
 self.onmessage = async function (ev) {
