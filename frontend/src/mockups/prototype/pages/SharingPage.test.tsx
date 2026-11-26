@@ -2,7 +2,7 @@ import React from 'react';
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const mocks = vi.hoisted(() => ({ invite: vi.fn(), removeMember: vi.fn(), confirm: vi.fn(), prompt: vi.fn(), transfer: vi.fn(), verify: vi.fn(), toast: vi.fn() }));
+const mocks = vi.hoisted(() => ({ invite: vi.fn(), removeMember: vi.fn(), confirm: vi.fn(), prompt: vi.fn(), transfer: vi.fn(), verify: vi.fn(), toast: vi.fn(), accept: vi.fn(), decline: vi.fn() }));
 vi.mock('../store', () => ({
     useStore: () => ({
         members: [
@@ -10,6 +10,7 @@ vi.mock('../store', () => ({
             { userId: 'u2', email: 'asha@example.test', isOwner: false, isSelf: false },
         ],
         pendingInvites: [{ inviteId: 'i1', email: 'dev@example.test', targetType: 'join', expiresAt: Date.now() + 20 * 3_600_000 }],
+        receivedInvites: [{ inviteId: 'r1', libraryId: 'lib9', libraryName: 'Rao family', invitedBy: 'priya@example.test', expiresAt: Date.now() + 20 * 3_600_000 }],
         libraryName: 'Verma family', isOwner: true, maxMembers: 15, membersLoading: false, totalPhotos: 31, albums: [],
         fetchMembers: vi.fn(async () => {}), invite: mocks.invite, revokeInvite: vi.fn(), removeMember: mocks.removeMember,
         renameLibrary: vi.fn(), toast: mocks.toast,
@@ -17,12 +18,12 @@ vi.mock('../store', () => ({
 }));
 vi.mock('../../../services/backgroundRequestQueue', () => ({ enqueueBackgroundRequest: () => Promise.resolve() }));
 vi.mock('../../../components/shared/dialogs', () => ({ confirmDialog: mocks.confirm, promptDialog: mocks.prompt }));
-vi.mock('../../../services/libraryClient', () => ({ transferOwnership: mocks.transfer, verifyLibraryPassword: mocks.verify }));
+vi.mock('../../../services/libraryClient', () => ({ transferOwnership: mocks.transfer, verifyLibraryPassword: mocks.verify, acceptReceivedInvite: mocks.accept, declineReceivedInvite: mocks.decline }));
 
 import SharingPage, { inviteEnds } from './SharingPage';
 
 describe('Library and sharing', () => {
-    beforeEach(() => { mocks.invite.mockReset(); mocks.removeMember.mockReset(); mocks.confirm.mockReset(); mocks.prompt.mockReset(); mocks.transfer.mockReset(); mocks.verify.mockReset(); mocks.toast.mockReset(); });
+    beforeEach(() => { mocks.invite.mockReset(); mocks.removeMember.mockReset(); mocks.confirm.mockReset(); mocks.prompt.mockReset(); mocks.transfer.mockReset(); mocks.verify.mockReset(); mocks.toast.mockReset(); mocks.accept.mockReset(); mocks.decline.mockReset(); });
     afterEach(cleanup);
 
     it('spells out both invite choices and sends the one picked', () => {
@@ -43,6 +44,16 @@ describe('Library and sharing', () => {
         const now = 1_000_000_000_000;
         expect(inviteEnds(now + 50 * 3_600_000, now)).toBe('ends in 3 days');
         expect(inviteEnds((now - 1) / 1000, now)).toBe('ended');
+    });
+
+    it('lists invitations sent to this account and lets them be declined', async () => {
+        mocks.decline.mockResolvedValue(undefined);
+        render(<SharingPage />);
+        expect(screen.getByText('Invitations for you')).toBeTruthy();
+        expect(screen.getByText('Rao family')).toBeTruthy();
+        expect(screen.getByText(/From priya@example.test · ends in 20 hours/)).toBeTruthy();
+        await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Decline' })); });
+        expect(mocks.decline).toHaveBeenCalledWith({ libraryId: 'lib9', inviteId: 'r1', libraryName: 'Rao family', invitedBy: 'priya@example.test', expiresAt: expect.any(Number) });
     });
 
     it('asks before removing a member', async () => {

@@ -93,6 +93,7 @@ _LIBRARY_PK = 'library'
 _MEMBER_LIB_PREFIX = 'lib:'
 _MEMBER_USR_PREFIX = 'usr:'
 _TOKEN_PK = 'token'
+_FOR_EMAIL_PK = 'for-email:'   # recipient index: partition per address, one row per join invite
 _THROTTLE_PK = 'throttle'
 _INVITE_INDEX_MARKER = '_pending_index_v1'
 # Per-user password reset (stored in the users table).
@@ -808,7 +809,40 @@ class LibraryStore:
         self.invites.submit_transaction([
             ('upsert', invite), ('upsert', self._invite_lookup(invite)),
         ])
+        if invite['targetType'] == 'join':
+            # Lets the recipient list their invitations without the emailed link.
+            self.invites.upsert_entity({
+                'PartitionKey': self._for_email_pk(norm), 'RowKey': invite_id, 'libraryId': str(library_id),
+            })
         return raw
+
+    @staticmethod
+    def _for_email_pk(email_norm: str) -> str:
+        return _FOR_EMAIL_PK + hashlib.sha256(str(email_norm).encode('utf-8')).hexdigest()[:32]
+
+    def invites_for_email(self, email: str) -> List[Dict]:
+        """Pending, unexpired join invitations addressed to this email, newest first. Stale index
+        rows (accepted, revoked, expired) are skipped; the canonical invite row is the truth."""
+        norm = normalize_email(email)
+        if not norm:
+            return []
+        now = _now()
+        found = []
+        for ptr in self._query(self.invites, f"PartitionKey eq '{self._for_email_pk(norm)}'"):
+            invite = self._get(self.invites, str(ptr.get('libraryId') or ''), str(ptr.get('RowKey') or ''))
+            if (invite and str(invite.get('status') or '') == 'pending'
+                    and str(invite.get('targetType') or '') == 'join'
+                    and int(invite.get('expiresAt', 0) or 0) > now
+                    and normalize_email(invite.get('emailNorm')) == norm):
+                found.append(invite)
+        return sorted(found, key=lambda row: int(row.get('createdAt', 0) or 0), reverse=True)
+
+    def get_invite_for_email(self, library_id: str, invite_id: str, email: str) -> Optional[Dict]:
+        """One pending invite by id, only if it is addressed to ``email``."""
+        for invite in self.invites_for_email(email):
+            if str(invite.get('PartitionKey')) == str(library_id) and str(invite.get('RowKey')) == str(invite_id):
+                return invite
+        return None
 
     def get_invite_by_token(self, raw_token: str) -> Optional[Dict]:
         """Resolve a raw invite token to its invite row if valid & pending."""
@@ -837,6 +871,7 @@ class LibraryStore:
             ('upsert', invite), ('upsert', self._invite_lookup(invite)),
         ])
         self._delete(self.invites, _TOKEN_PK, str(invite.get('tokenHash') or ''))
+        self._delete(self.invites, self._for_email_pk(invite.get('emailNorm')), str(invite.get('RowKey') or ''))
 
     def delete_all_invites(self, library_id: str) -> None:
         """Delete every invite (and its token lookup) for a library."""
@@ -861,6 +896,7 @@ class LibraryStore:
             ('upsert', invite), ('upsert', self._invite_lookup(invite)),
         ])
         self._delete(self.invites, _TOKEN_PK, str(invite.get('tokenHash') or ''))
+        self._delete(self.invites, self._for_email_pk(invite.get('emailNorm')), str(invite_id))
         return True
 
     def invite_send_allowed(self, library_id: str) -> bool:

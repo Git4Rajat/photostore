@@ -31,6 +31,15 @@ export interface PendingInvite {
     expiresAt: number;
 }
 
+// A join invitation other libraries sent to the signed-in account.
+export interface ReceivedInvite {
+    inviteId: string;
+    libraryId: string;
+    libraryName: string;
+    invitedBy: string;
+    expiresAt: number;
+}
+
 export interface MembersResponse {
     libraryId: string;
     name: string;
@@ -39,6 +48,7 @@ export interface MembersResponse {
     members: LibraryMember[];
     maxMembers: number;
     pendingInvites?: PendingInvite[];
+    invitationsForYou?: ReceivedInvite[];
     cleanupInfo?: CleanupInfo;
 }
 
@@ -129,6 +139,26 @@ export const revokePendingInvite = async (inviteId: string): Promise<void> => {
     });
     if (!response.ok) {
         throw new Error(await parseError(response, 'Could not revoke that invitation.'));
+    }
+};
+
+export const acceptReceivedInvite = async (invite: Pick<ReceivedInvite, 'libraryId' | 'inviteId'>): Promise<void> => {
+    const response = await authedFetch('/api/library/invitations/accept', {
+        method: 'POST',
+        body: JSON.stringify({ libraryId: invite.libraryId, inviteId: invite.inviteId }),
+    });
+    if (!response.ok) {
+        throw new Error(await parseError(response, 'Could not accept that invitation.'));
+    }
+};
+
+export const declineReceivedInvite = async (invite: Pick<ReceivedInvite, 'libraryId' | 'inviteId'>): Promise<void> => {
+    const response = await authedFetch('/api/library/invitations/decline', {
+        method: 'POST',
+        body: JSON.stringify({ libraryId: invite.libraryId, inviteId: invite.inviteId }),
+    });
+    if (!response.ok) {
+        throw new Error(await parseError(response, 'Could not decline that invitation.'));
     }
 };
 

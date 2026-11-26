@@ -164,3 +164,27 @@ def test_exclusive_create_user_refuses_an_email_already_claimed():
     with pytest.raises(library_utils.EmailAlreadyRegistered):
         s.create_user(email='A@x.com', password_hash='h2', user_id='u2', exclusive=True)
     assert s.get_user_by_email('a@x.com')['RowKey'] == 'u1'
+
+
+def test_invites_for_email_lists_pending_join_invites_until_resolved():
+    s = make_store()
+    s.create_user(email='o@x.com', user_id='owner', password_hash='h')
+    s.ensure_personal_library('owner')
+
+    s.create_invite(library_id='owner', email='Eve@x.com', target_type='fresh', invited_by='owner')
+    raw = s.create_invite(library_id='owner', email='Eve@x.com', target_type='join', invited_by='owner')
+    mine = s.invites_for_email('eve@X.com')
+    assert [i['targetType'] for i in mine] == ['join']   # own-library invites are not listed
+    assert s.invites_for_email('someone-else@x.com') == []
+    invite_id = mine[0]['RowKey']
+    assert s.get_invite_for_email('owner', invite_id, 'eve@x.com') is not None
+    assert s.get_invite_for_email('owner', invite_id, 'someone-else@x.com') is None
+
+    s.mark_invite_accepted(s.get_invite_by_token(raw))
+    assert s.invites_for_email('eve@x.com') == []
+
+    s.create_invite(library_id='owner', email='eve@x.com', target_type='join', invited_by='owner')
+    again = s.invites_for_email('eve@x.com')
+    assert len(again) == 1
+    assert s.revoke_invite('owner', again[0]['RowKey']) is True
+    assert s.invites_for_email('eve@x.com') == []
