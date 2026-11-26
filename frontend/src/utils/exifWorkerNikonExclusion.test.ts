@@ -26,7 +26,7 @@ async function runWorker(record: Record<string, unknown>) {
     const self = context.self as {__boot: Promise<void>; onmessage: (event: {data: unknown}) => Promise<void>};
     await self.__boot;
     await self.onmessage({data: {id: 1, type: 'parse', bytes: new Uint8Array([0]), name: 'DSC_0001.NEF'}});
-    return posted[0];
+    return posted.find(message => (message as {type?: string}).type !== 'ready')!;
 }
 
 describe('browser ExifTool worker Nikon exclusion', () => {

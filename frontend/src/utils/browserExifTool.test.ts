@@ -2,6 +2,7 @@ import {afterEach, beforeEach, describe, expect, test, vi} from 'vitest';
 
 class FakeWorker {
     static instances: FakeWorker[] = [];
+    static autoReady = true;
     static respond: (worker: FakeWorker, message: {id: number; name: string}) => void = (worker, message) => {
         worker.reply({id: message.id, ok: true, json: {'File:FileType': 'JPEG', 'EXIF:Make': 'Test'}});
     };
@@ -9,7 +10,10 @@ class FakeWorker {
     onerror: (() => void) | null = null;
     terminated = false;
     received: Array<{id: number; name: string; type: string}> = [];
-    constructor(public url: string) { FakeWorker.instances.push(this); }
+    constructor(public url: string) {
+        FakeWorker.instances.push(this);
+        if (FakeWorker.autoReady) queueMicrotask(() => this.reply({type: 'ready'}));
+    }
     postMessage(message: {id: number; name: string; type: string}) {
         if (message.type !== 'parse') return;
         this.received.push(message);
@@ -29,6 +33,7 @@ const flush = () => new Promise(resolve => setTimeout(resolve, 0));
 
 beforeEach(() => {
     FakeWorker.instances = [];
+    FakeWorker.autoReady = true;
     FakeWorker.respond = (worker, message) => {
         worker.reply({id: message.id, ok: true, json: {'File:FileType': 'JPEG'}});
     };
@@ -102,5 +107,41 @@ describe('browser EXIF client', () => {
         expect(FakeWorker.instances).toHaveLength(2);
         expect(FakeWorker.instances[0].terminated).toBe(true);
         expect(FakeWorker.instances[1].received).toHaveLength(1);
+    });
+
+    test('boots the replacement ahead of the recycle and swaps to it without a new boot', async () => {
+        const {extractBrowserExif} = await loadClient();
+        for (let i = 0; i < 12; i++) await extractBrowserExif(bytes(), `f${i}.jpg`);
+        expect(FakeWorker.instances).toHaveLength(1);
+        await extractBrowserExif(bytes(), 'f12.jpg');
+        expect(FakeWorker.instances).toHaveLength(2);
+        expect(FakeWorker.instances[1].received).toHaveLength(0);
+        for (let i = 13; i < 26; i++) await extractBrowserExif(bytes(), `f${i}.jpg`);
+        expect(FakeWorker.instances).toHaveLength(2);
+        expect(FakeWorker.instances[0].terminated).toBe(true);
+        expect(FakeWorker.instances[1].received.map(m => m.name)).toEqual(['f25.jpg']);
+    });
+
+    test('keeps using the current worker past 25 parses until the standby is ready', async () => {
+        const {extractBrowserExif} = await loadClient();
+        FakeWorker.autoReady = false;
+        for (let i = 0; i < 30; i++) await extractBrowserExif(bytes(), `f${i}.jpg`);
+        expect(FakeWorker.instances).toHaveLength(2);
+        expect(FakeWorker.instances[0].terminated).toBe(false);
+        expect(FakeWorker.instances[0].received).toHaveLength(30);
+        FakeWorker.instances[1].reply({type: 'ready'});
+        await extractBrowserExif(bytes(), 'next.jpg');
+        expect(FakeWorker.instances[0].terminated).toBe(true);
+        expect(FakeWorker.instances[1].received.map(m => m.name)).toEqual(['next.jpg']);
+    });
+
+    test('a standby that fails to boot is dropped and the next parse still works', async () => {
+        const {extractBrowserExif} = await loadClient();
+        for (let i = 0; i < 13; i++) await extractBrowserExif(bytes(), `f${i}.jpg`);
+        FakeWorker.instances[1].onerror?.();
+        expect(FakeWorker.instances[1].terminated).toBe(true);
+        for (let i = 13; i < 26; i++) await extractBrowserExif(bytes(), `f${i}.jpg`);
+        expect(FakeWorker.instances).toHaveLength(3);
+        expect((await extractBrowserExif(bytes(), 'after.jpg')).ok).toBe(true);
     });
 });
