@@ -86,6 +86,11 @@ param uploadConcurrentRequests int = 32
 @maxValue(30)
 param uploadMaxReplicas int = 2
 
+@description('Vision: intra-op threads per model call (IPWORK_MODEL_THREADS), also the OMP/OpenBLAS thread caps. 1 keeps each of the IPWORKER_CONCURRENCY source threads on one core; raise only after a live test on the vCPU quota.')
+@minValue(1)
+@maxValue(16)
+param visionModelThreads int = 1
+
 @description('Enable qualified wave execution after certificate seeding; fresh installs use deploy/fresh_wave.py.')
 param enableWaveExecution bool = true
 @description('Enroll newly created empty libraries only. Existing libraries never change ownership.')
@@ -147,6 +152,7 @@ module app 'resources.bicep' = {
     separateIndexWorker: separateIndexWorker
     enableIndexPush: enableIndexPush
     uploadConcurrentRequests: uploadConcurrentRequests
+    visionModelThreads: visionModelThreads
     uploadMaxReplicas: uploadMaxReplicas
     enableWaveExecution: enableWaveExecution
     enableNewWaveLibraries: enableNewWaveLibraries
