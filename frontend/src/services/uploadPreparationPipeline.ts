@@ -2,7 +2,7 @@ import {UploadAssetPreparer} from './uploadAssetPreparation';
 import {BASE_PREPARATION_LIMITS, type PreparationLimits} from './uploadPreparationLimits';
 import type {UploadMetadataDescriptor, UploadMetadataPacket} from '../utils/uploadMetadata';
 import {isVideoFilename} from '../utils/photoDisplay';
-import {extractBrowserExif} from '../utils/browserExifTool';
+import {extractBrowserExif, setBrowserExifWorkers} from '../utils/browserExifTool';
 import {UploadWorkerReuse, discardUploadWorker, type UploadWorker} from './uploadWorkerReuse';
 import {PREPARATION_ASSETS, type AssetPreparationDiagnostic, type PreparationAsset, type UploadPreparationReport} from '../utils/uploadPreparationDiagnostics';
 
@@ -72,6 +72,7 @@ export class UploadPreparationPipeline {
         this.preparer = new UploadAssetPreparer(undefined, limits.queuedDecodes, undefined, limits.decoders);
         this.admission = new PreparationGate(limits.admission);
         this.puts = new PreparationGate(limits.puts);
+        setBrowserExifWorkers(limits.exifWorkers);
     }
 
     start(file: File, sha256: string, targets: UploadAssetTargets, signal: AbortSignal): Promise<PreparedUpload> {

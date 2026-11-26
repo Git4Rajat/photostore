@@ -1,12 +1,12 @@
 import {Blob as NodeBlob} from 'node:buffer';
 
-const mocks = vi.hoisted(() => ({prepare: vi.fn(), dispose: vi.fn(), fetch: vi.fn(), exif: vi.fn(), preparer: vi.fn()}));
+const mocks = vi.hoisted(() => ({prepare: vi.fn(), dispose: vi.fn(), fetch: vi.fn(), exif: vi.fn(), exifWorkers: vi.fn(), preparer: vi.fn()}));
 vi.mock('./uploadAssetPreparation', () => ({UploadAssetPreparer: class {
     constructor(...args: unknown[]) { mocks.preparer(...args); }
     prepare = mocks.prepare;
     dispose = mocks.dispose;
 }}));
-vi.mock('../utils/browserExifTool', () => ({extractBrowserExif: mocks.exif}));
+vi.mock('../utils/browserExifTool', () => ({extractBrowserExif: mocks.exif, setBrowserExifWorkers: mocks.exifWorkers}));
 import {UploadPreparationPipeline, preparedThumbnail} from './uploadPreparationPipeline';
 import {BASE_PREPARATION_LIMITS, FAST_PREPARATION_LIMITS} from './uploadPreparationLimits';
 
@@ -546,4 +546,13 @@ test('no thumbnail is exposed when preparation fell back', async () => {
     const result = await pipeline.start(source(), 'a'.repeat(64), targets, new AbortController().signal);
     expect(preparedThumbnail(result)).toBeUndefined();
     pipeline.dispose();
+});
+
+test('the pipeline asks for the ExifTool worker count in its limits', () => {
+    mocks.exifWorkers.mockClear();
+    new UploadPreparationPipeline(FAST_PREPARATION_LIMITS).dispose();
+    expect(mocks.exifWorkers).toHaveBeenLastCalledWith(FAST_PREPARATION_LIMITS.exifWorkers);
+    new UploadPreparationPipeline(BASE_PREPARATION_LIMITS).dispose();
+    expect(mocks.exifWorkers).toHaveBeenLastCalledWith(1);
+    expect(FAST_PREPARATION_LIMITS.exifWorkers).toBeGreaterThan(1);
 });

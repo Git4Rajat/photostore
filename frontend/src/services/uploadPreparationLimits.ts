@@ -12,10 +12,12 @@ export interface PreparationLimits {
     queuedDecodes: number;
     /** Derivative PUTs running at once. */
     puts: number;
+    /** ExifTool workers at once; one worker parses ~3-5 photos/s, which capped uploads near 100-200 files/min. */
+    exifWorkers: number;
 }
 
-export const BASE_PREPARATION_LIMITS: PreparationLimits = {admission: 5, decoders: 2, queuedDecodes: 4, puts: 2};
-export const FAST_PREPARATION_LIMITS: PreparationLimits = {admission: 8, decoders: 4, queuedDecodes: 4, puts: 6};
+export const BASE_PREPARATION_LIMITS: PreparationLimits = {admission: 5, decoders: 2, queuedDecodes: 4, puts: 2, exifWorkers: 1};
+export const FAST_PREPARATION_LIMITS: PreparationLimits = {admission: 8, decoders: 4, queuedDecodes: 4, puts: 6, exifWorkers: 3};
 const FAST_MIN_CORES = 6;
 
 export const uploadPreparationLimits = (device: {parallel: boolean; constrained: boolean; cores?: number}): PreparationLimits => (
