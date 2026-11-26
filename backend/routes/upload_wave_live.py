@@ -11,10 +11,11 @@ def finalized_replay(data):
     return getattr(g,'wave_finalize_replays',{}).get((data.get('waveSessionId'),data.get('waveItemId')))
 
 
-def _verified_replay(store, binding, data, metadata_table):
+def _verified_replay(store, binding, data, metadata_table, item=None):
+    """item: the reservation row admission just read; read here when absent."""
     from upload_wave_shadow import source_identity
     from azure.core.exceptions import ResourceNotFoundError
-    item=store._required(store.item_key(*binding))
+    if item is None:item=store._required(store.item_key(*binding))
     if item['outcome'] not in ('accepted','duplicate'):return None
     try:
         source=metadata_table.get_entity(store.library,item['acceptedFilename'])
@@ -85,12 +86,14 @@ def install(blueprint):
             data=app.request.get_json(silent=True) or {}
             files=data.get('files') if operation.endswith('-batch') else [data]
             if not isinstance(files,list) or not files:raise ValueError('Upload reservations required')
+            admitted={}
             with app.perf_instrumentation.span('wave.guard.admissions',op=operation,files=len(files)):
-                bindings=wave_policy.validate_admissions(store,files,finalizing=True)
+                bindings=wave_policy.validate_admissions(store,files,finalizing=True,rows_out=admitted)
             if operation.startswith('finalize'):
                 with app.perf_instrumentation.span('wave.guard.replays',op=operation,files=len(files)):
                     g.wave_finalize_replays={binding:replay for binding,item in zip(bindings,files)
-                        if (replay:=_verified_replay(store,binding,item,app.metadata_table_client)) is not None}
+                        if (replay:=_verified_replay(store,binding,item,app.metadata_table_client,
+                            admitted.get(store.item_key(*binding)))) is not None}
             g.wave_upload=(store,bindings,operation)
             g.wave_source_token=wave_policy.begin_source_change()
             g.wave_finalize_token=wave_policy.begin_finalization(lambda:wave_policy.check_finalization(store,bindings))
