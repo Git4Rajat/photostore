@@ -28,7 +28,10 @@ if torch is not None:
     # already fixed once for tesseract; set it explicitly here instead of
     # relying on an env var with unverified effect on this library. See
     # docs/ipworker-architecture.md for the writeup.
-    torch.set_num_threads(1)
+    # IPWORK_MODEL_THREADS (default 1, so unchanged) is the one knob for this and the ONNX sessions; see
+    # model_threads.py for what raising it can and cannot do.
+    from model_threads import model_threads
+    torch.set_num_threads(model_threads())
 
 _MODEL = None
 _TOKENIZER = None
@@ -110,7 +113,8 @@ def _load_onnx_towers() -> bool:
             finally:
                 torch.backends.mha.set_fastpath_enabled(fastpath)
             options = ort.SessionOptions()
-            options.intra_op_num_threads, options.inter_op_num_threads = 1, 1
+            from model_threads import model_threads
+            options.intra_op_num_threads, options.inter_op_num_threads = model_threads(), 1
             _ONNX_IMAGE = ort.InferenceSession(os.path.join(directory, 'image.onnx'),
                 sess_options=options, providers=['CPUExecutionProvider'])
             _ONNX_TEXT = ort.InferenceSession(os.path.join(directory, 'text.onnx'),

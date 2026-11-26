@@ -159,8 +159,10 @@ def _single_threaded_session_options() -> ort.SessionOptions:
     # auto-threaded YOLO/AdaFace session is the same CPU-oversubscription bug
     # already fixed once for tesseract, just in a library that env var
     # doesn't reach -- see docs/ipworker-architecture.md for the writeup.
+    # IPWORK_MODEL_THREADS (default 1, so unchanged) sets the intra-op count; see model_threads.py.
+    from model_threads import model_threads
     options = ort.SessionOptions()
-    options.intra_op_num_threads = 1
+    options.intra_op_num_threads = model_threads()
     options.inter_op_num_threads = 1
     return options
 
