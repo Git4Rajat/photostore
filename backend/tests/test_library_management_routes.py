@@ -102,6 +102,12 @@ def test_new_account_invite_library_name_defaults_to_email_and_is_ignored_when_j
     assert store.get_library(store.get_user_by_email('b@example.com')['RowKey'])['name'] == 'b@example.com'
 
 
+@pytest.fixture(autouse=True)
+def _owner_is_not_legacy(monkeypatch):
+    # These fixtures call their library 'owner', which is the legacy seeded id transfer refuses.
+    monkeypatch.setattr(app.password_auth, 'OWNER_USER_ID', 'legacy-owner')
+
+
 def _transfer(client, store, proof=True, **body):
     owner = headers('owner')
     if proof:
@@ -149,3 +155,11 @@ def test_transfer_retry_after_partial_failure_converges(management):
     second = store.transfer_ownership('owner', 'owner', 'bob')
     assert first == second
     assert store.is_owner('bob', 'owner') and not store.is_owner('owner', 'owner')
+
+
+def test_legacy_owner_library_cannot_be_transferred(management, monkeypatch):
+    store, client = management
+    store.add_membership('bob', 'owner')
+    monkeypatch.setattr(app.password_auth, 'OWNER_USER_ID', 'owner')
+    assert _transfer(client, store, userId='bob').status_code == 400
+    assert store.is_owner('owner', 'owner')
