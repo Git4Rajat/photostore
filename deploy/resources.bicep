@@ -61,13 +61,13 @@ param processingMode string = 'backend'
 param browserUploadPreparation bool = true
 
 @description('Public core API image. Defaults to an immutable @sha256 digest (rewritten by the publish workflow after each qualified release), never :latest, so installs never auto-upgrade. To upgrade an EXISTING deployment, override with the new release digest.')
-param coreImage string = 'ghcr.io/git4rajat/photostore-backend@sha256:c3ae257b29383d181db446308d85edc71c302c5ec7b45d9a6a46cc6b9c13b4f2'
+param coreImage string = 'ghcr.io/git4rajat/photostore-backend@sha256:5a0fca86c7b2a83d58fa834ec314f3ab6c707efd0673a5b2a448c8684050f8bd'
 
 @description('Public web (frontend) image. Defaults to an immutable @sha256 digest, never :latest, same as coreImage above.')
-param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:2c90ea6b3c1da960bd780c00ca003f6ecc143da3b06b8ac86b991ca3e0c8f5ef'
+param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:d40352eb60fa6f3370fba3071c29ae4f0967f15ca18d6db1bfadc8668fad731c'
 
 @description('Public vision (server-side image processing) image. Only pulled/deployed when processingMode is "backend" or "both". Separate from coreImage (unlike the clustering `cluster` role, which reuses it) because vision needs torch/open_clip/onnxruntime/opencv/mediapipe/tesseract -- multiple GB of extra weight that would slow every core/cluster cold start if bundled into their shared image. Same digest-pinning guidance as coreImage applies.')
-param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker@sha256:c7c2ed1a90c03a6f09a23cc4f8375ad9378e9a7fcff15c26ed444a07449f6a38'
+param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker@sha256:93776881004b062269f1abb866258fe528d6a6e891d051a0ab712801e3e87faf'
 
 @description('Quota in GiB for the dedicated clustering FAISS checkpoint SMB share. Local SQLite/work files remain on ephemeral storage.')
 @minValue(1)
@@ -101,12 +101,12 @@ param enableWaveExecution bool = true
 @description('Enroll newly created empty libraries only. Existing libraries never change ownership.')
 param enableNewWaveLibraries bool = true
 @description('Exact-image capability ID. Fresh wave activation requires the seeded release certificate; never leave empty.')
-param waveCapabilityId string = 'd715bd1dfd346d8758cc94e858b187967f28ff1f69c048c5fa520293f07341ba'
+param waveCapabilityId string = 'b24701464e8a754d7a09b87e42f8f5a6f3e8e5504c727fdc97e370626b224006'
 
 @description('Earlier release certificates this release may replace in place (set by the release pin job).')
-param waveCompatibleCapabilities string = 'cbe86c3edb95a7ae4cf253c19ad8cecc6d3fbcc1bc022556606c4e9d0f2c27d5,e06541a00d63da1033a5eeaa163ad01f8c96436c4c63566477731ce580397b42,46a97224e1c89ab36103a0e450265e648118d4e9d6e8bc26682305ea50aa4458,4ad5fc0c0d53c75c063868846e002a900962745edaad0eae13beb05f001d4ccd,a944595f8cbdc66f7a18ae9cb037def36d177fb209a2b4656e23efe2bbfe52c4,b7f6d1be1855afa55b795ba92db3c0dc8506516ebd734aeda9230d7e0a202c2b,b51147093781c7df913084b936ed6dc59875fce9f3a7f2e13f0bcd3f9d25a207,efe0433585a946dff449bae7f60b7bfff514e1a2d8b489dffe2ec45064c545df'
+param waveCompatibleCapabilities string = 'd715bd1dfd346d8758cc94e858b187967f28ff1f69c048c5fa520293f07341ba,cbe86c3edb95a7ae4cf253c19ad8cecc6d3fbcc1bc022556606c4e9d0f2c27d5,e06541a00d63da1033a5eeaa163ad01f8c96436c4c63566477731ce580397b42,46a97224e1c89ab36103a0e450265e648118d4e9d6e8bc26682305ea50aa4458,4ad5fc0c0d53c75c063868846e002a900962745edaad0eae13beb05f001d4ccd,a944595f8cbdc66f7a18ae9cb037def36d177fb209a2b4656e23efe2bbfe52c4,b7f6d1be1855afa55b795ba92db3c0dc8506516ebd734aeda9230d7e0a202c2b,b51147093781c7df913084b936ed6dc59875fce9f3a7f2e13f0bcd3f9d25a207'
 @description('Source commit of the pinned release (set by the release pin job).')
-param waveSourceCommit string = '8bc4dda17514fcf9e2a00ad83e6a6d563d297b69'
+param waveSourceCommit string = '56a205f1f4a0c2dc87165aedc28c0dfbcd53f6fa'
 @description('Fresh-install preparation only: block upload intake and run certificate seeding as a manual recovery job. Activate only after that job succeeds.')
 param waveBootstrapPending bool = false
 @description('Have Vision encode a text vector of each photo description while processing (about 126 ms per photo). Off by default: search ranks on the image vector and the indexes rebuild any text vector they need.')
