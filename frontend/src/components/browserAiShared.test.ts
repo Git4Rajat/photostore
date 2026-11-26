@@ -160,7 +160,7 @@ describe('getAdaptiveUploadProfile', () => {
         // this should land in the ordinary "good network" tier, not get downgraded.
         const profile = getAdaptiveUploadProfile(bigFile(1 * MB), { measuredRttMs: 5000 });
         expect(profile.reason).toBe('good network');
-        expect(profile.fileParallelism).toBe(6);
+        expect(profile.fileParallelism).toBe(12);
     });
 
     it('falls back to a real bandwidth probe when the Network Information API is unavailable (e.g. Safari)', () => {
@@ -171,7 +171,7 @@ describe('getAdaptiveUploadProfile', () => {
         setResourceTiming([{ transferSize: 20 * MB, requestStart: 0, responseEnd: 1000 }]);
         const profile = getAdaptiveUploadProfile(bigFile(1 * MB));
         expect(profile.reason).toBe('good network');
-        expect(profile.fileParallelism).toBe(6);
+        expect(profile.fileParallelism).toBe(12);
     });
 
     it('ignores cached (transferSize 0) resource timing entries when probing', () => {
@@ -193,5 +193,23 @@ describe('getAdaptiveUploadProfile', () => {
         const profile = getAdaptiveUploadProfile(manyFiles);
         expect(profile.fileParallelism).toBe(4);
         expect(profile.chunkSizeBytes).toBeGreaterThanOrEqual(16 * MB);
+    });
+
+    it('gives small files 12 lanes on a moderate, higher-latency connection instead of the default 3', () => {
+        // 5 Mbps downlink and 150ms RTT: below the 8 Mbps "good network" bar and over the 100ms RTT
+        // evidence bar for the 20-lane tier, so it reaches the final fallthrough.
+        setConnection({ downlink: 5, rtt: 150, type: '' });
+        setMatchMedia({});
+        setResourceTiming([]);
+        const profile = getAdaptiveUploadProfile(bigFile(1 * MB));
+        expect(profile.fileParallelism).toBe(12);
+        expect(profile.reason).toBe('standard connection, small files');
+    });
+
+    it('still gives a congested link a single lane', () => {
+        setConnection({ downlink: 1, rtt: 450, type: '' });
+        setMatchMedia({});
+        setResourceTiming([]);
+        expect(getAdaptiveUploadProfile(bigFile(1 * MB)).fileParallelism).toBe(1);
     });
 });
