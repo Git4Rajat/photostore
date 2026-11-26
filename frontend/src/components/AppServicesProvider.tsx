@@ -2115,8 +2115,10 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     const id = `stale-upload:${scope}:${notice.sessionId}`;
                     setNotifications(previous => previous.some(item => item.id === id) ? previous : [{
                         id, uploadSessionId: notice.sessionId,
-                        title: 'Previous upload closed after inactivity',
-                        details: `${notice.affectedCount} files did not finish. Completed photos are saved. Retry unfinished files if they are still available on this device.`,
+                        title: 'Upload was terminated incorrectly, starting processing of uploaded photos now.',
+                        details: notice.affectedCount > 0
+                            ? `${notice.affectedCount} files did not finish. Completed photos are saved. Retry unfinished files if they are still available on this device.`
+                            : 'Completed photos are saved.',
                         timestamp: notice.closedAt * 1000, unread: true,
                     }, ...previous].slice(0, MAX_NOTIFICATION_HISTORY));
                 }

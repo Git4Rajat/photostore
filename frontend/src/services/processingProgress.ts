@@ -18,6 +18,8 @@ export interface ProcessingWave {
     total?: number;
     // Upload stage only: a sample of the photos already uploaded.
     files?: string[];
+    // Upload stage only: the open upload sessions behind it, to tell this browser's own from another device's.
+    sessionIds?: string[];
     etaSeconds?: number | null;
     processedSeconds?: number;
     failed?: number;

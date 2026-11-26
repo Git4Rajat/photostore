@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { allSessionsOwn } from '../../../services/ownUploadSessions';
 import { AlertGlyph, CheckGlyph, CloseGlyph, ChevGlyph } from './RedesignIcons';
 import { useAppServices } from '../../../components/AppServicesProvider';
 import BottomSheet from './BottomSheet';
@@ -116,13 +117,17 @@ const UploadingElsewhere: React.FC<{ wave: ProcessingWave }> = ({ wave }) => {
     const total = wave.total ?? 0;
     const done = Math.min(wave.done ?? 0, total || Infinity);
     const pct = total ? Math.round((done / total) * 100) : 0;
+    const paused = wave.state === 'paused';
     return (
         <StackWidget id="uploading-elsewhere">
             <div className="up-dock up-bar pd-bar" role="region" aria-label="Upload from another device">
                 <div className="pd-row">
                     <span className="up-head">
-                        <span className="up-ico"><span className="pd-spin" aria-hidden="true" /></span>
-                        <span className="up-t"><b>Uploading from another device</b><span>{total ? `${done} of ${plural(total, 'photo')}` : 'Photos are coming in'}</span></span>
+                        <span className="up-ico">{paused ? null : <span className="pd-spin" aria-hidden="true" />}</span>
+                        <span className="up-t">
+                            <b>{paused ? 'Upload paused on another device' : 'Uploading from another device'}</b>
+                            <span>{total ? `${done} of ${plural(total, 'photo')}` : 'Photos are coming in'}{paused ? ' · Photos already sent are processed if it isn’t resumed' : ''}</span>
+                        </span>
                         {total ? <span className="up-pct">{pct}%</span> : null}
                     </span>
                 </div>
@@ -185,7 +190,8 @@ export const ProcessingDock: React.FC = () => {
     else if (uploadStartedAt.current === null) uploadStartedAt.current = Date.now() / 1000;
     const ownedByUpload = (candidate: ProcessingWave) => uploadStartedAt.current !== null && candidate.startedAt >= uploadStartedAt.current - CLOCK_SLACK_S;
     // This device's own upload has its own card; another device's is shown beside it, read-only.
-    const elsewhere = uploadActive ? undefined : waves.find((candidate) => candidate.stage === 'upload');
+    // Paused or cancelled here, the server still lists this browser's own session: that is not "another device".
+    const elsewhere = uploadActive ? undefined : waves.find((candidate) => candidate.stage === 'upload' && !allSessionsOwn(candidate.sessionIds));
     const ordered = orderWaves(waves.filter((candidate) => candidate.stage !== 'upload' && !ownedByUpload(candidate)).map((candidate) => holdStalled(candidate, retriedAt.current[candidate.waveId], Date.now())));
     const wave = leadWave(ordered);
     const unfinished = ordered.filter((candidate) => candidate.stage !== 'done');

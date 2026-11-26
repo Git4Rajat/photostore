@@ -167,3 +167,21 @@ def test_open_upload_is_listed_with_counts_and_a_filename_sample(live_api):
     assert (item['stage'], item['done'], item['total'], item['files']) == ('upload', 40, 300, ['a.jpg'])
     clock.now += progress.UPLOAD_IDLE_SECONDS + 100
     assert pg.active('u1') == []  # an abandoned upload does not look like it is running
+
+
+def test_a_paused_upload_says_paused_and_a_cancelled_one_is_not_listed(live_api):
+    _, store, _, _ = live_api
+    clock = Clock()
+    pg = ProgressStore(store, clock=clock)
+    wave_row(store, 'wc', state='collecting', lastProgressAt=990.0)
+    store.table.create_entity(store._row('control', revision='', collectingWaveId='wc', tailWaveId='wc'))
+    store.table.create_entity(store._row('session!s1', waveId='wc', sessionId='s1', state='open', declaredCount=300,
+                                         resolvedCount=40, lastRequestAt=995.0))
+    [item] = pg.active('u1')
+    assert (item['state'], item['sessionIds']) == ('collecting', ['s1'])
+    clock.now += progress.UPLOAD_PAUSED_SECONDS + 10
+    [item] = pg.active('u1')
+    assert item['state'] == 'paused'
+    row = store._get('session!s1')
+    store.table.submit_transaction([store._change(row, dict(row, abandoning=True))])
+    assert pg.active('u1') == []

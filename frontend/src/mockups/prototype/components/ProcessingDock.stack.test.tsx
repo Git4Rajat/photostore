@@ -1,4 +1,5 @@
 import React from 'react';
+import { rememberOwnUploadSession } from '../../../services/ownUploadSessions';
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -56,6 +57,20 @@ describe('upload and processing in one stack', () => {
         Object.assign(services, { uploadActive: true, uploading: true, uploadProgress: { uploadedCount: 5, totalCount: 40, failedCount: 0 } });
         render(<App />);
         await waitFor(() => expect(api.fetchProcessingWaves).toHaveBeenCalledTimes(2));
+        expect(screen.queryByText('Uploading from another device')).toBeNull();
+    });
+
+    it('a paused upload shows as paused, and this browser\'s own paused upload is not "another device"', async () => {
+        Object.assign(services, { uploadActive: false, uploading: false, uploadProgress: null });
+        api.fetchProcessingWaves.mockResolvedValue([wave({ waveId: 'far', stage: 'upload', state: 'paused', done: 40, total: 300, files: [], sessionIds: ['other'] })]);
+        render(<App />);
+        await waitFor(() => expect(screen.getByText('Upload paused on another device')).toBeTruthy());
+        cleanup();
+        rememberOwnUploadSession('mine');
+        api.fetchProcessingWaves.mockResolvedValue([wave({ waveId: 'far', stage: 'upload', state: 'paused', done: 40, total: 300, files: [], sessionIds: ['mine'] })]);
+        render(<App />);
+        await waitFor(() => expect(api.fetchProcessingWaves).toHaveBeenCalledTimes(2));
+        expect(screen.queryByText('Upload paused on another device')).toBeNull();
         expect(screen.queryByText('Uploading from another device')).toBeNull();
     });
 });

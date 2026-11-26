@@ -21,6 +21,8 @@ SMALL_WAVE = 50
 RETAIN_SECONDS = 24 * 3600
 # An upload that has registered or resolved nothing for this long is not shown as running.
 UPLOAD_IDLE_SECONDS = 600
+# No request or heartbeat from an open upload for this long: it is paused (or its device is gone).
+UPLOAD_PAUSED_SECONDS = 90
 # Filenames sampled from an open upload so another device can draw a preview strip.
 UPLOAD_SAMPLE = 48
 # Nothing moved for this long while the stage is not failed: say so instead of "in progress".
@@ -191,12 +193,18 @@ class ProgressStore:
         sessions = list(islice(self.store.table.query_entities(
             f"PartitionKey eq '{self.store.partition}' and RowKey ge 'session!' and RowKey lt 'session!~' "
             f"and waveId eq '{wave_id}' and state eq 'open'"), 20))
+        # A cancelled upload is sealed (abandoning) but its row stays open until Core settles it.
+        sessions = [row for row in sessions if not row.get('abandoning')]
         if not sessions:
             return []
+        last_seen = max(max(float(row.get('lastRequestAt') or 0), float(row.get('heartbeatAt') or 0),
+                            float(row.get('createdAt') or 0)) for row in sessions)
+        paused = now - last_seen > UPLOAD_PAUSED_SECONDS
         members = islice(self.store.table.query_entities(
             f"PartitionKey eq '{self.store.partition}' and RowKey ge 'e!{wave_id}!m!' and RowKey lt 'e!{wave_id}!m!~'"),
             UPLOAD_SAMPLE)
-        return [dict(waveId=wave_id, stage='upload', state='collecting',
+        return [dict(waveId=wave_id, stage='upload', state='paused' if paused else 'collecting',
+                     sessionIds=[str(row.get('sessionId') or '') for row in sessions],
                      startedAt=float(wave.get('createdAt') or 0),
                      stageEnteredAt=float(wave.get('stateEnteredAt') or 0),
                      done=sum(int(row.get('resolvedCount') or 0) for row in sessions),
