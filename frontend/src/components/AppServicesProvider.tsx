@@ -2673,7 +2673,14 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             if (pendingBatchInitRef.current.some((req) => req.fileMeta.name === fileMeta.name)) {
                 flushInitBatch(true);
             }
-            pendingBatchInitRef.current.push({ fileMeta, session, totalSize, sha256, resolve, reject });
+            // Time from joining the batch to its answer: debounce plus the round trip.
+            const queuedAt = Date.now();
+            const record = () => perf.recordSpan('upload.lane.wait.init_batch', Date.now() - queuedAt, { n: pendingBatchInitRef.current.length });
+            pendingBatchInitRef.current.push({
+                fileMeta, session, totalSize, sha256,
+                resolve: (value: any) => { record(); resolve(value); },
+                reject: (reason: unknown) => { record(); reject(reason); },
+            });
             if (pendingBatchInitRef.current.length >= INIT_BATCH_MAX_SIZE) {
                 flushInitBatch(true);
                 return;
@@ -4389,16 +4396,23 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
             let nextFileIndex = 0;
             const worker = async () => {
+                let holdStartedAt: number | null = null;
                 while (true) {
                     if (uploadStopRequestedRef.current || uploadDrainRequestedRef.current) {
                         return;
                     }
                     if (awaitingPreparation.size >= MAX_FILES_AWAITING_PREPARATION) {
+                        holdStartedAt ??= Date.now();
                         await Promise.race([
                             Promise.race(Array.from(awaitingPreparation)),
                             new Promise((resolve) => { setTimeout(resolve, PREPARATION_RECHECK_MS); }),
                         ]);
                         continue;
+                    }
+                    if (holdStartedAt !== null) {
+                        // Why a lane sat idle: the preparation backlog was full.
+                        perf.recordSpan('upload.lane.wait.backlog_hold', Date.now() - holdStartedAt, { n: awaitingPreparation.size });
+                        holdStartedAt = null;
                     }
                     const currentIndex = nextFileIndex;
                     nextFileIndex += 1;
