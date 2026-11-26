@@ -1307,6 +1307,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         session: PersistedUploadSession;
         totalSize: number;
         sha256: string;
+        queuedAt?: number;
         resolve: (value: any) => void;
         reject: (err: unknown) => void;
     }>>([]);
@@ -2602,6 +2603,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
         const batch = pendingBatchInitRef.current;
         pendingBatchInitRef.current = [];
+        // Where an init batch spends its time, one span per stage: waiting to
+        // be sent (debounce, or the init gate being full), resolving wave
+        // identities, then the request itself (gate slot, retries, round trip).
+        const flushedAt = Date.now();
+        const oldestQueuedAt = Math.min(...batch.map((req) => req.queuedAt ?? flushedAt));
+        perf.recordSpan('upload.init.stage.flush_wait', flushedAt - oldestQueuedAt, { n: batch.length });
         void (async () => {
             // Resolve this batch's wave identities. Live sessions normally
             // registered their full pending manifest before workers started,
@@ -2635,7 +2642,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 }
             }
             const admitted = batch.filter((req) => !waveLiveEnabled() || admissionByKey.has(req.fileMeta.key));
+            perf.recordSpan('upload.init.stage.identity', Date.now() - flushedAt, { n: batch.length });
             if (!admitted.length) return;
+            const requestStartedAt = Date.now();
             runGatedRequestWithRetry(gate, '/upload/init-batch', {
                 files: admitted.map(({ fileMeta, totalSize, sha256 }) => ({ filename: fileMeta.name, totalSize, sha256,
                     ...admissionByKey.get(fileMeta.key),
@@ -2643,6 +2652,7 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 })),
             })
                 .then((response) => {
+                    perf.recordSpan('upload.init.stage.request', Date.now() - requestStartedAt, { n: admitted.length });
                     const results = Array.isArray(response?.results) ? response.results : [];
                     admitted.forEach((req, index) => {
                         const result = results[index];
@@ -2675,9 +2685,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             }
             // Time from joining the batch to its answer: debounce plus the round trip.
             const queuedAt = Date.now();
-            const record = () => perf.recordSpan('upload.lane.wait.init_batch', Date.now() - queuedAt, { n: pendingBatchInitRef.current.length });
+            const record = () => perf.recordSpan('upload.lane.wait.init_batch', Date.now() - queuedAt);
             pendingBatchInitRef.current.push({
-                fileMeta, session, totalSize, sha256,
+                fileMeta, session, totalSize, sha256, queuedAt,
                 resolve: (value: any) => { record(); resolve(value); },
                 reject: (reason: unknown) => { record(); reject(reason); },
             });
