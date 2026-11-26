@@ -11,6 +11,8 @@ export const DEFAULT_UPLOAD_PROFILE = {
     chunkSizeBytes: 8 * MB,
     reason: 'standard connection',
 };
+// Lanes for small-file batches on connections that do not qualify for the 20-lane tier.
+const SMALL_FILE_LANES = 12;
 export const MAX_BACKEND_UPLOAD_CHUNK_BYTES = 64 * MB;
 export const MAX_FINALIZE_RETRIES = 8;
 export const PHOTO_CACHE_STORAGE_KEY = 'photostore.photo.cache.v1';
@@ -417,12 +419,17 @@ export const getAdaptiveUploadProfile = (
     if (effectiveType === '4g' && downlink >= 20 && !hasLargeFiles) {
         return withChunkFloor({ fileParallelism: 12, chunkSizeBytes: MAX_BACKEND_UPLOAD_CHUNK_BYTES, reason: 'fast network' });
     }
+    // Small files are not bandwidth-bound: a lane spends most of its time on round trips (init,
+    // preparation, finalize), so a lane's rate is set by latency, not link speed. With 3 lanes a
+    // 1085-photo upload from a >100ms-RTT client ran at ~100 files/min (2026-11-26, forenklad2);
+    // the RTT gate above that stops the 20-lane tier is exactly when more lanes matter most.
+    // Slow/congested links already returned 1 lane above, and large files keep their own tier.
     if (downlink >= 8 && !hasLargeFiles) {
-        return withChunkFloor({ fileParallelism: 6, chunkSizeBytes: MAX_BACKEND_UPLOAD_CHUNK_BYTES, reason: 'good network' });
+        return withChunkFloor({ fileParallelism: SMALL_FILE_LANES, chunkSizeBytes: MAX_BACKEND_UPLOAD_CHUNK_BYTES, reason: 'good network' });
     }
     if (hasLargeFiles) {
         return withChunkFloor({ fileParallelism: 16, chunkSizeBytes: MAX_BACKEND_UPLOAD_CHUNK_BYTES, reason: 'large files' });
     }
-    return withChunkFloor(DEFAULT_UPLOAD_PROFILE);
+    return withChunkFloor({ ...DEFAULT_UPLOAD_PROFILE, fileParallelism: SMALL_FILE_LANES, reason: 'standard connection, small files' });
 };
 
