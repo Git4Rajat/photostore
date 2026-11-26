@@ -144,4 +144,41 @@ describe('browser EXIF client', () => {
         expect(FakeWorker.instances).toHaveLength(3);
         expect((await extractBrowserExif(bytes(), 'after.jpg')).ok).toBe(true);
     });
+
+    test('with several workers allowed, concurrent photos parse on separate workers', async () => {
+        const {extractBrowserExif, setBrowserExifWorkers} = await loadClient();
+        setBrowserExifWorkers(3);
+        const replies: Array<() => void> = [];
+        FakeWorker.respond = (worker, message) => {
+            replies.push(() => worker.reply({id: message.id, ok: true, json: {'File:FileType': 'JPEG'}}));
+        };
+        const runs = ['a', 'b', 'c', 'd'].map(n => extractBrowserExif(bytes(), `${n}.jpg`));
+        await flush();
+        expect(FakeWorker.instances).toHaveLength(3);
+        expect(FakeWorker.instances.map(w => w.received.map(m => m.name))).toEqual([['a.jpg'], ['b.jpg'], ['c.jpg']]);
+        replies.shift()!();
+        await flush();
+        expect(FakeWorker.instances[0].received.map(m => m.name)).toEqual(['a.jpg', 'd.jpg']);
+        while (replies.length) { replies.shift()!(); await flush(); }
+        expect((await Promise.all(runs)).every(outcome => outcome.ok)).toBe(true);
+    });
+
+    test('one slot failing a parse does not fail the other slots', async () => {
+        const {extractBrowserExif, setBrowserExifWorkers} = await loadClient();
+        setBrowserExifWorkers(2);
+        const replies: Array<(ok: boolean) => void> = [];
+        FakeWorker.respond = (worker, message) => {
+            replies.push(ok => worker.reply(ok ? {id: message.id, ok: true, json: {'File:FileType': 'JPEG'}}
+                : {id: message.id, ok: false, outcome: 'timeout'}));
+        };
+        const first = extractBrowserExif(bytes(), 'a.jpg');
+        const second = extractBrowserExif(bytes(), 'b.jpg');
+        await flush();
+        replies[0](false);
+        replies[1](true);
+        expect(await first).toMatchObject({ok: false, reason: 'timeout'});
+        expect((await second).ok).toBe(true);
+        expect(FakeWorker.instances[0].terminated).toBe(true);
+        expect(FakeWorker.instances[1].terminated).toBe(false);
+    });
 });
