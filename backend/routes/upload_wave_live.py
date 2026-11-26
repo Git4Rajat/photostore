@@ -77,17 +77,20 @@ def install(blueprint):
                 return
             if not wave_policy.configuration_ready():raise Conflict('Wave source capabilities are unavailable')
             store=ShadowWaves(app.jobs_table_client,library)
-            wave_policy.require_capability(store,'upload')
-            if store._required('policy').get('cleanupState'):raise Conflict('Library cleanup is in progress')
+            with app.perf_instrumentation.span('wave.guard.policy',op=operation):
+                wave_policy.require_capability(store,'upload')
+                if store._required('policy').get('cleanupState'):raise Conflict('Library cleanup is in progress')
             if operation in ('claim','claim-batch','client-processing'):
                 raise Conflict('Vision owns processing for this library')
             data=app.request.get_json(silent=True) or {}
             files=data.get('files') if operation.endswith('-batch') else [data]
             if not isinstance(files,list) or not files:raise ValueError('Upload reservations required')
-            bindings=wave_policy.validate_admissions(store,files,finalizing=True)
+            with app.perf_instrumentation.span('wave.guard.admissions',op=operation,files=len(files)):
+                bindings=wave_policy.validate_admissions(store,files,finalizing=True)
             if operation.startswith('finalize'):
-                g.wave_finalize_replays={binding:replay for binding,item in zip(bindings,files)
-                    if (replay:=_verified_replay(store,binding,item,app.metadata_table_client)) is not None}
+                with app.perf_instrumentation.span('wave.guard.replays',op=operation,files=len(files)):
+                    g.wave_finalize_replays={binding:replay for binding,item in zip(bindings,files)
+                        if (replay:=_verified_replay(store,binding,item,app.metadata_table_client)) is not None}
             g.wave_upload=(store,bindings,operation)
             g.wave_source_token=wave_policy.begin_source_change()
             g.wave_finalize_token=wave_policy.begin_finalization(lambda:wave_policy.check_finalization(store,bindings))
@@ -121,13 +124,20 @@ def install(blueprint):
                 session=None
                 if pending:
                     from wave_write_combiner import combine
-                    session=combine((id(store.table),store.library,session_id),
-                        [(binding[1],'duplicate' if entry.get('duplicates') else 'accepted',entry['filename'])
-                         for _index,binding,entry in pending],
-                        lambda page:resolve_sources(store,app.metadata_table_client,session_id,page))
+                    timings={}
+                    try:
+                        session=combine((id(store.table),store.library,session_id),
+                            [(binding[1],'duplicate' if entry.get('duplicates') else 'accepted',entry['filename'])
+                             for _index,binding,entry in pending],
+                            lambda page:resolve_sources(store,app.metadata_table_client,session_id,page),timings)
+                    finally:
+                        # wait_ms is time queued behind other requests' commits;
+                        # commit_ms is the commits that carried this request.
+                        app.perf_instrumentation.log_event('wave_bind',files=len(pending),**timings)
                 if session is None:
                     session=store._required(store.session_key(session_id))
-                session=close_resolved_intake(store,session)
+                with app.perf_instrumentation.span('wave.bind.close_intake'):
+                    session=close_resolved_intake(store,session)
                 for _index,binding,entry in group:
                     entry['waveResolution']=dict(sessionId=binding[0],itemId=binding[1],
                         manifestRevision=session['manifestRevision'],state=session['state'])
