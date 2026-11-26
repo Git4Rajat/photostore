@@ -64,7 +64,7 @@ param browserUploadPreparation bool = true
 param coreImage string = 'ghcr.io/git4rajat/photostore-backend@sha256:b84c3e07e56fb0e8657f75ddba0efd1680a2f62f95bba463663142f8f8aad917'
 
 @description('Public web (frontend) image. Defaults to an immutable @sha256 digest, never :latest, same as coreImage above.')
-param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:659f7e5be919727e7107cf4327a63b6517f284eec4d80c86b8c5ff11bda14bf1'
+param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:9e5f73b464f135f7eb690de85e5512349f3a909093fe5463e49221db4b4dd0eb'
 
 @description('Public vision (server-side image processing) image. Only pulled/deployed when processingMode is "backend" or "both". Separate from coreImage (unlike the clustering `cluster` role, which reuses it) because vision needs torch/open_clip/onnxruntime/opencv/mediapipe/tesseract -- multiple GB of extra weight that would slow every core/cluster cold start if bundled into their shared image. Same digest-pinning guidance as coreImage applies.')
 param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker@sha256:48ea5d015507c056f2dcb70ed542f654acd9d7c1efabbfa1856c304070366a22'
@@ -111,7 +111,7 @@ param waveCapabilityId string = 'b111e2bfff409a536071bdbc89f0321c9249743c0dc4486
 @description('Earlier release certificates this release may replace in place (set by the release pin job).')
 param waveCompatibleCapabilities string = 'b24701464e8a754d7a09b87e42f8f5a6f3e8e5504c727fdc97e370626b224006,d715bd1dfd346d8758cc94e858b187967f28ff1f69c048c5fa520293f07341ba,cbe86c3edb95a7ae4cf253c19ad8cecc6d3fbcc1bc022556606c4e9d0f2c27d5,e06541a00d63da1033a5eeaa163ad01f8c96436c4c63566477731ce580397b42,46a97224e1c89ab36103a0e450265e648118d4e9d6e8bc26682305ea50aa4458,4ad5fc0c0d53c75c063868846e002a900962745edaad0eae13beb05f001d4ccd,a944595f8cbdc66f7a18ae9cb037def36d177fb209a2b4656e23efe2bbfe52c4,b7f6d1be1855afa55b795ba92db3c0dc8506516ebd734aeda9230d7e0a202c2b'
 @description('Source commit of the pinned release (set by the release pin job).')
-param waveSourceCommit string = '96a017f33b8679a132fdf5d54b56392e51be114f'
+param waveSourceCommit string = 'c1818d996a3f8a881b1737253cfb79532c4e59dc'
 @description('Fresh-install preparation only: block upload intake and run certificate seeding as a manual recovery job. Activate only after that job succeeds.')
 param waveBootstrapPending bool = false
 @description('Have Vision encode a text vector of each photo description while processing (about 126 ms per photo). Off by default: search ranks on the image vector and the indexes rebuild any text vector they need.')
