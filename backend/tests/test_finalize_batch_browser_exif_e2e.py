@@ -91,3 +91,32 @@ def test_a_failing_live_photo_pairing_never_fails_the_upload(finalize, monkeypat
         response = upload.finalize_upload_batch()
     assert response.status_code == 200
     assert response.get_json()['results'][0].get('complete') is True
+
+
+def _finalize_one(monkeypatch, *, folded):
+    import wave_policy
+    seen = {'finalize': None, 'stamps': []}
+    monkeypatch.setattr(wave_policy, 'finalization_active', lambda: folded)
+    def finalize_stub(*args, **kwargs):
+        seen['finalize'] = kwargs
+        kwargs['row_out'].append({'PartitionKey': 'library', 'RowKey': 'renamed.cr3'})
+        return [], 'renamed.cr3'
+    monkeypatch.setattr(app, 'finalize_uploaded_file', finalize_stub)
+    monkeypatch.setattr(app, '_update_metadata_entity_fields',
+                        lambda user, name, updates, **kwargs: seen['stamps'].append(dict(updates)))
+    item = {'filename': 'photo.cr3', 'blobName': 'physical', 'uploadId': 'id', 'totalSize': 100, 'sha256': 'a' * 64}
+    with app.app.test_request_context('/upload/finalize-batch', method='POST', json={'files': [item]}):
+        assert upload.finalize_upload_batch().status_code == 200
+    return seen
+
+
+def test_wave_finalize_stores_the_upload_stamp_in_the_creating_write(finalize, monkeypatch):
+    seen = _finalize_one(monkeypatch, folded=True)
+    assert seen['finalize']['extra_fields'] == {'size': 100, 'uploadedBy': 'account'}
+    assert seen['stamps'] == []
+
+
+def test_other_finalizes_stamp_the_row_in_an_update_after_it(finalize, monkeypatch):
+    seen = _finalize_one(monkeypatch, folded=False)
+    assert 'extra_fields' not in seen['finalize']
+    assert seen['stamps'] == [{'size': 100, 'uploadedBy': 'account'}]

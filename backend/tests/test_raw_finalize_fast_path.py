@@ -149,3 +149,23 @@ def test_same_source_finalize_retry_preserves_derivative_receipts(finalize_ctx):
     assert stored['processingRevision'] == 'revision'
     for field in ('thumbnailArtifact', 'previewArtifact', 'artifactReceipt'):
         assert stored[field] == row[field]
+
+
+def test_extra_fields_are_stored_by_the_write_that_creates_the_row(finalize_ctx):
+    writes = []
+    original = finalize_ctx.upsert_entity
+    finalize_ctx.upsert_entity = lambda entity: (writes.append(dict(entity)), original(entity))[1]
+    rows = []
+    storage_utils.finalize_uploaded_file(
+        'lib-A', 'photo.cr3', 'image/x-canon-cr3', client_sha256='a' * 64, row_out=rows,
+        extra_fields={'size': 1234, 'uploadedBy': 'acct-1', 'clientLastModified': '2026-11-01T10:00:00+00:00'},
+    )
+    stored = finalize_ctx.get_entity('lib-A', 'photo.cr3')
+    assert (stored['size'], stored['uploadedBy'], stored['clientLastModified']) == (
+        1234, 'acct-1', '2026-11-01T10:00:00+00:00')
+    assert [w['RowKey'] for w in writes].count('photo.cr3') == 1
+    # The copy handed back for the caller's next update already carries them.
+    assert rows and rows[0]['size'] == 1234 and rows[0]['uploadedBy'] == 'acct-1'
+    # Without them the row is as before.
+    storage_utils.finalize_uploaded_file('lib-A', 'other.cr3', 'image/x-canon-cr3', client_sha256='b' * 64)
+    assert 'uploadedBy' not in finalize_ctx.get_entity('lib-A', 'other.cr3')

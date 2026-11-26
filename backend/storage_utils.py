@@ -11832,11 +11832,14 @@ def finalize_uploaded_file(
     client_sha256: str = '',
     anonymous_blob_name: Optional[str] = None,
     row_out: Optional[List] = None,
+    extra_fields: Optional[Dict] = None,
 ) -> Tuple[List[Dict], str]:
     """Finalize upload and initialize durable browser-only processing state.
 
     ``row_out``: when given, the row as written (with the ETag of that write) is appended, so the
     caller's next update of the same row can skip its read.
+
+    ``extra_fields``: stored in this same write instead of in an update of the row right after it.
 
     The file has already been uploaded straight to blob storage by the browser, so
     this avoids moving the bytes again wherever possible:
@@ -11985,6 +11988,8 @@ def finalize_uploaded_file(
         metadata['processing_complete'] = True
         metadata['processing_metadata'] = json.dumps({'isolation': {'reason': 'upload_only_benchmark', 'runId': metadata.get('benchmarkRunId')}})
     metadata['last_processing_update'] = datetime.now(timezone.utc).isoformat()
+    if extra_fields:
+        metadata.update(extra_fields)
     if file_is_video:
         metadata['videoBrowserOnly'] = True
         metadata['processing_complete'] = _photo_processing_complete(metadata)

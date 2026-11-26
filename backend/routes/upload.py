@@ -864,6 +864,17 @@ def finalize_upload_batch():
             results.append({'index': idx, 'filename': filename, 'error': 'Uploaded blob not found'})
             continue
 
+        finalize_updates: app.Dict[str, object] = {'size': total_size}
+        finalize_updates.update(processing_diagnostics.upload_fields(item))
+        if account_id:
+            finalize_updates['uploadedBy'] = account_id
+        client_last_modified_iso = app.epoch_millis_to_iso(item.get('clientLastModified'))
+        if client_last_modified_iso:
+            finalize_updates['clientLastModified'] = client_last_modified_iso
+        # Under wave admission these fields go into the row's creating write; otherwise they are
+        # stamped by an update right after it, as before.
+        from wave_policy import finalization_active
+        folded = finalization_active()
         try:
             # This call writes one source. Checking every other reservation on
             # each internal write fence made a batch's storage reads quadratic.
@@ -881,6 +892,7 @@ def finalize_upload_batch():
                     client_sha256=str(item.get('sha256') or ''),
                     anonymous_blob_name=anonymous_blob_name,
                     row_out=written_row,
+                    **({'extra_fields': finalize_updates} if folded else {}),
                 )
         except Exception as exc:
             app.app.logger.exception('Batch finalize failed for %s', filename)
@@ -898,14 +910,11 @@ def finalize_upload_batch():
             if duplicates:
                 metadata = timed_call('metadata_read', app.metadata_table_client.get_entity,
                                       partition_key=user_id, row_key=final_name)
+            elif folded:
+                # Already stored by the write that created the row; its copy, with that write's ETag,
+                # starts the next update.
+                metadata = written_row[0] if written_row else None
             else:
-                finalize_updates: app.Dict[str, object] = {'size': total_size}
-                finalize_updates.update(processing_diagnostics.upload_fields(item))
-                if account_id:
-                    finalize_updates['uploadedBy'] = account_id
-                client_last_modified_iso = app.epoch_millis_to_iso(item.get('clientLastModified'))
-                if client_last_modified_iso:
-                    finalize_updates['clientLastModified'] = client_last_modified_iso
                 metadata = timed_call('metadata_stamp', app._update_metadata_entity_fields, user_id, final_name, finalize_updates,
                                       **_from_row(written_row[0] if written_row else None))
         except Exception:
