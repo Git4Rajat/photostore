@@ -1401,18 +1401,24 @@ def get_face_ids_for_filename(user_id: str, filename: str) -> Optional[List[str]
     return ids
 
 
-def _begin_face_filename_write(user_id: str, filename: str):
+def _begin_face_filename_write(user_id: str, filename: str, *, first_read=None):
     """Durably invalidate before mutation; return (generation, prior IDs).
 
     Missing/legacy/dirty/expired generations require a fresh filename query.
     CAS retries are bounded; no local locks or wildcard ETags are sufficient.
+
+    first_read: (row or None,) the caller's own read of the lookup row, used for the first attempt only. The
+    write it leads to is conditional on that row, so a change since makes the attempt fail and read again.
     """
     table = _CTX.get('face_by_filename_table_client')
     if table is None:
         return None, None
     generation = uuid.uuid4().hex
     for _ in range(_FACE_FILENAME_CAS_ATTEMPTS):
-        previous = _face_filename_row(table, user_id, filename)
+        if first_read is not None:
+            (previous,), first_read = first_read, None
+        else:
+            previous = _face_filename_row(table, user_id, filename)
         if previous is not None and _face_filename_lease_active(previous):
             raise FaceFilenameLookupRetryableError('Filename face writer is active')
         entity = {
@@ -1699,8 +1705,69 @@ def reconcile_face_filename_indexes_batch(user_id: str, filenames, *, cancelled=
         _LOGGER.info('face index batch timings metrics=%s', json.dumps(metrics, sort_keys=True))
 
 
+def _candidate_client_faces(faces):
+    """The reported faces that pass the quality gate and have a real box, with their normalized boxes."""
+    candidate_faces: List[Dict] = []
+    candidate_bboxes: List[Dict] = []
+    for face in faces:
+        if not isinstance(face, dict):
+            continue
+        if not _client_face_passes_quality_gate(face):
+            continue
+        bbox = _normalize_face_bbox(face)
+        if bbox['width'] <= 0 or bbox['height'] <= 0:
+            continue
+        candidate_faces.append(face)
+        candidate_bboxes.append(bbox)
+    return candidate_faces, candidate_bboxes
+
+
+def _publish_faceless_filename_lookup(user_id: str, filename: str, faces, *, force_reconcile: bool) -> bool:
+    """Publish the lookup of a photo with nothing to store in one create, not a begin and a finish.
+
+    Only for a filename with no lookup row yet and no face that would be stored. Such a pass mutates no
+    face row: what it publishes is the faces already in the face table for this filename (a query, as the
+    begin-and-finish path does for a filename without a row), complete, in the row that path would leave.
+    The begin step's 'writing' row exists to fence concurrent writers and a crash during mutation; with
+    nothing to mutate the exclusive create is the fence: a writer that began since the read above has
+    already created the row, so the create fails and the caller takes the begin-and-finish path unchanged.
+    Returns (True, None) once published. Otherwise (False, first_read) with nothing written: the lookup read
+    made on the way, for the begin step to reuse, or None when no read was made."""
+    table = _CTX.get('face_by_filename_table_client')
+    face_table_client = _CTX.get('face_table_client')
+    if table is None or face_table_client is None or force_reconcile or _candidate_client_faces(faces)[0]:
+        return False, None
+    previous = _face_filename_row(table, user_id, filename)
+    if previous is not None:
+        return False, (previous,)
+    rows = face_table_client.query_entities(
+        f"PartitionKey eq '{_escape_odata(user_id)}' and filename eq '{_escape_odata(filename)}'",
+        **_face_query_request_options())
+    ids = sorted({str(row.get('RowKey') or '') for row in rows} - {''})
+    entity = {
+        'PartitionKey': user_id, 'RowKey': filename,
+        'schemaVersion': _FACE_FILENAME_SCHEMA_VERSION,
+        'generation': uuid.uuid4().hex, 'state': 'complete', 'faceIds': json.dumps(ids),
+        'leaseExpiresAt': '',
+    }
+    from processing_fence import current_fence
+    fence = current_fence(user_id, filename)
+    if fence:
+        fence.check()
+        entity.update(fence.headers())
+    try:
+        table.create_entity(entity)
+    except (ResourceExistsError, ResourceNotFoundError):
+        return False, None  # Someone began since the read: read again, as the begin step does.
+    processing_diagnostics.file_event('face_lookup_single_write', user_id, filename, face_ids=len(ids))
+    return True, None
+
+
 def _store_client_face_entities(user_id: str, filename: str, faces, *, force_reconcile: bool = False) -> List[str]:
     if _CTX.get('face_table_client') is None or not isinstance(faces, list):
+        return []
+    published, first_read = _publish_faceless_filename_lookup(user_id, filename, faces, force_reconcile=force_reconcile)
+    if published:
         return []
     started = time.monotonic()
     diagnostics = {'phase': 'acquire', 'phase_started': started, 'path': 'unknown',
@@ -1713,7 +1780,7 @@ def _store_client_face_entities(user_id: str, filename: str, faces, *, force_rec
         from processing_fence import current_fence
         if force_reconcile and current_fence(user_id, filename):
             raise FaceFilenameLookupRetryableError('Fenced destructive face reconciliation is not yet supported')
-        generation, previous_ids = _begin_face_filename_write(user_id, filename)
+        generation, previous_ids = _begin_face_filename_write(user_id, filename, first_read=first_read)
         _face_storage_phase(diagnostics, 'prepare')
         diagnostics.update(path='indexed_point_reads' if previous_ids is not None else 'filename_query',
                            ids_count=len(previous_ids) if previous_ids is not None else None)
@@ -1772,18 +1839,7 @@ def _store_client_face_generation_rows(user_id: str, filename: str, faces, *,
     if face_table_client is None or not isinstance(faces, list):
         return []
 
-    candidate_faces: List[Dict] = []
-    candidate_bboxes: List[Dict] = []
-    for face in faces:
-        if not isinstance(face, dict):
-            continue
-        if not _client_face_passes_quality_gate(face):
-            continue
-        bbox = _normalize_face_bbox(face)
-        if bbox['width'] <= 0 or bbox['height'] <= 0:
-            continue
-        candidate_faces.append(face)
-        candidate_bboxes.append(bbox)
+    candidate_faces, candidate_bboxes = _candidate_client_faces(faces)
 
     # Only IDs from the complete generation acquired above can bound reads.
     # Never consult or publish a whole-user summary: curation must be fresh,
