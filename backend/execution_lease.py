@@ -305,23 +305,34 @@ class ExecutionLeases:
 
 
 @contextmanager
-def execution_scope(leases, ownership, store, eligible):
+def execution_scope(leases, ownership, store, eligible, coalesced=None):
     # Wave transitions and their ownership check must share one transaction.
+    # `coalesced` is the attempt's shared one-second eligibility observation; only a caller that passes
+    # guard_operations(store, coalesced=True) uses it, in place of reading the eligibility rows again.
     if leases.table is not store.table or leases.partition != store.partition:
         raise ValueError('Stage execution must share the wave table and partition')
-    token = _ACTIVE.set((leases, ownership, eligible))
+    token = _ACTIVE.set((leases, ownership, eligible, coalesced))
     try:
         yield
     finally:
         _ACTIVE.reset(token)
 
 
-def guard_operations(store):
+def guard_operations(store, *, coalesced=False):
+    """The execution lease's conditional write for a wave transaction.
+
+    The lease row is always read fresh: its ETag is what makes the transaction fail once ownership moved.
+    `coalesced` lets a write that only adds bookkeeping (attempt counters) reuse the attempt's shared
+    one-second eligibility observation, the one every source thread's renew already relies on, instead of
+    reading policy, wave and dispatch rows again; transactions that change wave evidence never pass it."""
     active = _ACTIVE.get()
     if active is None:
         return []
-    leases, ownership, eligible = active
+    leases, ownership, eligible, shared = active
     if store.table is not leases.table or store.partition != leases.partition:
         raise ValueError('Execution scope does not match wave storage')
-    eligible()
+    if coalesced and shared is not None:
+        shared()
+    else:
+        eligible()
     return [leases.guard_operation(leases.check(ownership))]

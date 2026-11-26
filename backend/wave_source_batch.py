@@ -1,4 +1,5 @@
 """Bounded Vision coordination batches; source artifacts retain their own fences."""
+import os
 from azure.core.exceptions import ResourceNotFoundError
 
 from upload_waves import Conflict, MAX_PAGE, digest
@@ -182,6 +183,12 @@ class MetadataBatch:
         return getattr(self.table, name)
 
 
+def attempt_guard_coalesced():
+    """IPWORK_VISION_ATTEMPT_GUARD_COALESCE (default on): reserving attempts reuses the stage's one-second
+    eligibility observation instead of re-reading policy, wave and dispatch rows for every admission."""
+    return os.getenv('IPWORK_VISION_ATTEMPT_GUARD_COALESCE', 'true').lower() in ('1', 'true', 'yes')
+
+
 def reserve_attempts(store, members):
     """Commit a bounded group's attempt admissions together, before inference.
 
@@ -210,7 +217,7 @@ def reserve_attempts(store, members):
             if admitted:
                 changes.append(store._change(old, store._row(key, count=count, updatedAt=store.clock())))
         if changes:
-            guards = guard_operations(store)
+            guards = guard_operations(store, coalesced=attempt_guard_coalesced())
             store.table.submit_transaction([*changes, *guards, *store._policy_guard()])
         return counts
     return store._retry(commit)
