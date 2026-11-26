@@ -1,4 +1,5 @@
 import { sessionScope } from './sessionScope';
+import { rememberOwnUploadSession } from './ownUploadSessions';
 import { getRuntimeConfig } from '../config/appConfig';
 import { getUpload, postUpload } from './apiClient';
 
@@ -125,12 +126,14 @@ export type WaveShadowOutcome = 'accepted' | 'duplicate' | 'cancelled' | 'failed
 export const WAVE_REGISTER_MAX_BATCH = 1000;
 export const WAVE_RESOLVE_MAX_BATCH = 100;
 
-export const openWaveShadowSession = (sessionId: string, declaredCount: number, resumedFromSessionId?: string) =>
-    callShadow<{ waveId: string; manifestRevision: string; state?: string; resumedFromSessionId?: string; leaseActive?: boolean; leaseExpiresAt?: number; serverNow?: number }>(
+export const openWaveShadowSession = (sessionId: string, declaredCount: number, resumedFromSessionId?: string) => {
+    rememberOwnUploadSession(sessionId);
+    return callShadow<{ waveId: string; manifestRevision: string; state?: string; resumedFromSessionId?: string; leaseActive?: boolean; leaseExpiresAt?: number; serverNow?: number }>(
         `${base()}/sessions`,
         { sessionId, declaredCount, ...(resumedFromSessionId ? { resumedFromSessionId } : {}) },
         SHADOW_REQUEST_CONFIG, true,
     );
+};
 
 export const registerWaveShadowItems = (sessionId: string, items: WaveShadowItem[]) =>
     callShadow<{ manifestRevision: string; registeredCount: number }>(
