@@ -546,6 +546,7 @@ interface Store {
 
     // toasts
     toast: (message: string, actionLabel?: string, onAction?: () => void, tone?: 'info' | 'error') => void;
+    pendingToast: (message: string) => () => void;
     dismissToast: (id: string) => void;
 }
 
@@ -1203,6 +1204,24 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         [],
     );
 
+    // In-flight message ("Creating album…") that stays up until the action settles, so
+    // the gap before the outcome toast is never silent. Returns the closer; the
+    // timer is a backstop for an action that never resolves.
+    const pendingToast = useCallback((message: string): (() => void) => {
+        const id = nextId();
+        setToasts((prev) => [...prev, { id, message, tone: 'info' }]);
+        const close = () => {
+            const timer = toastTimers.current[id];
+            if (timer) {
+                window.clearTimeout(timer);
+                delete toastTimers.current[id];
+            }
+            setToasts((prev) => prev.filter((t) => t.id !== id));
+        };
+        toastTimers.current[id] = window.setTimeout(close, 60000);
+        return close;
+    }, []);
+
     const navigate = useCallback((page: PageId, params: RouteParams = {}) => {
         setRoute({ page, params });
         setSelection([]);
@@ -1747,9 +1766,13 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         adjustPeopleCountsForPhotos(moved, 1);
         applyPhotoRestoreCount(moved.length);
         const pendingDeletes = ids.map((id) => pendingDeletesRef.current.get(id)).filter(Boolean);
+        const done = pendingToast(`Restoring ${plural(ids.length, 'item')}…`);
         void Promise.allSettled(pendingDeletes).then(() => post('/photos/trash/restore', { filenames: ids })).then(() => {
+            done();
+            toast(`Restored ${plural(ids.length, 'item')}`);
             publishLibraryChange('photos-restored', ['photos', 'people', 'albums', 'explore', 'trash'], { itemCount: ids.length, entityIds: ids });
         }).catch(() => {
+            done();
             const movedSet = new Set(moved.map((p) => p.id));
             setPhotos((cur) => cur.filter((p) => !movedSet.has(p.id)));
             adjustPeopleCountsForPhotos(moved, -1);
@@ -1758,7 +1781,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             setTrash((prev) => [...moved.map((photo) => ({ photo, purgesInDays: 30 })), ...prev]);
             toast('Couldn’t restore photos', undefined, undefined, 'error');
         });
-    }, [adjustPeopleCountsForPhotos, photosByIds, toast, applyPhotoDeleteCount, applyPhotoRestoreCount]);
+    }, [adjustPeopleCountsForPhotos, photosByIds, toast, pendingToast, applyPhotoDeleteCount, applyPhotoRestoreCount]);
 
     const deletePhotos = useCallback(
         (ids: string[]) => {
@@ -1784,6 +1807,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 adjustPeopleCountsForPhotos(failedPhotos, 1);
                 applyPhotoRestoreCount(failedIds.length);
             };
+            const done = pendingToast(`Deleting ${plural(ids.length, 'item')}…`);
             const request = post<{ jobId?: string; status?: string; deleted?: string[]; errors?: string[] }>('/photos/delete', { filenames: ids });
             const settled = request.then(() => undefined, () => undefined);
             ids.forEach((id) => pendingDeletesRef.current.set(id, settled));
@@ -1791,6 +1815,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 if (pendingDeletesRef.current.get(id) === settled) pendingDeletesRef.current.delete(id);
             }));
             void request.then((response) => {
+                done();
                 if (response?.status === 'queued') {
                     toast(`Moving ${plural(ids.length, 'item')} to Recently Deleted`);
                     requestJobPoll();
@@ -1818,12 +1843,13 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                     itemCount: succeededIds.length, entityIds: succeededIds,
                 });
             }).catch(() => {
+                done();
                 // Roll back the optimistic removal on failure.
                 rollBack(ids);
                 toast('Couldn’t delete photos', undefined, undefined, 'error');
             });
         },
-        [photosByIds, adjustPeopleCountsForPhotos, removeFromEverywhere, toast, clearSelection, applyPhotoDeleteCount, applyPhotoRestoreCount],
+        [photosByIds, adjustPeopleCountsForPhotos, removeFromEverywhere, toast, pendingToast, clearSelection, applyPhotoDeleteCount, applyPhotoRestoreCount],
     );
 
     const reloadTrash = useCallback(async () => {
@@ -1865,8 +1891,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         invalidateLocalAlbumsIndex();
         adjustPeopleCountsForPhotos(moved, 1);
         applyPhotoRestoreCount(moved.length);
+        const done = pendingToast('Restoring everything from Recently Deleted…');
         void post<{ restored?: string[] }>('/photos/trash/restore-all', {})
             .then((res) => {
+                done();
                 // The server's list also covers photos this tab never had in its trash cache.
                 const restored = (res?.restored ?? []).filter((name) => !movedIds.includes(name));
                 if (restored.length) {
@@ -1876,35 +1904,43 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 toast('Restored everything from Recently Deleted');
             })
             .catch(() => {
+                done();
                 setTrash(snapshot);
                 adjustPeopleCountsForPhotos(moved, -1);
                 applyPhotoDeleteCount(moved.length);
                 removeLocalSortIndexRows(movedIds);
                 toast('Couldn’t restore everything', undefined, undefined, 'error');
             });
-    }, [adjustPeopleCountsForPhotos, trash, toast, applyPhotoDeleteCount, applyPhotoRestoreCount]);
+    }, [adjustPeopleCountsForPhotos, trash, toast, pendingToast, applyPhotoDeleteCount, applyPhotoRestoreCount]);
 
     const purgePhoto = useCallback((id: string) => {
         const snapshot = trash;
         setTrash((prev) => prev.filter((t) => t.photo.id !== id));
-        void post('/photos/trash/purge', { filenames: [id] }).catch(() => {
+        const done = pendingToast('Deleting photo…');
+        void post('/photos/trash/purge', { filenames: [id] }).then(() => {
+            done();
+            toast('Photo deleted');
+        }).catch(() => {
+            done();
             setTrash(snapshot);
             toast('Couldn’t delete photo', undefined, undefined, 'error');
         });
-    }, [trash, toast]);
+    }, [trash, toast, pendingToast]);
 
     const purgeAllTrash = useCallback(() => {
         const snapshot = trash;
         const filenames = snapshot.map((t) => t.photo.id);
         if (!filenames.length) return;
         setTrash([]);
+        const done = pendingToast('Emptying Recently Deleted…');
         void post('/photos/trash/purge', { filenames })
-            .then(() => toast('Recently Deleted emptied'))
+            .then(() => { done(); toast('Recently Deleted emptied'); })
             .catch(() => {
+                done();
                 setTrash(snapshot);
                 toast('Couldn’t empty Recently Deleted', undefined, undefined, 'error');
             });
-    }, [trash, toast]);
+    }, [trash, toast, pendingToast]);
 
     const reloadAlbumTrash = useCallback(async () => {
         setAlbumTrashLoading(true);
@@ -1935,13 +1971,18 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         // its tombstone or it stays invisible until the (7-day) TTL expires.
         clearAlbumDeleteTombstone(id);
         invalidateLocalAlbumsIndex();
-        void post(`/albums/${encodeURIComponent(id)}/restore`, {}).catch(() => {
+        const done = pendingToast('Restoring album…');
+        void post(`/albums/${encodeURIComponent(id)}/restore`, {}).then(() => {
+            done();
+            toast('Album restored');
+        }).catch(() => {
+            done();
             setAlbumTrash(snapshot);
             if (restored) setAlbums((prev) => prev.filter((a) => a.id !== id));
             beginAlbumDelete(id); // still soft-deleted server-side; keep hiding it
             toast('Couldn’t restore album', undefined, undefined, 'error');
         });
-    }, [albumTrash, toast]);
+    }, [albumTrash, toast, pendingToast]);
 
     const purgeAlbum = useCallback((id: string) => {
         const snapshot = albumTrash;
@@ -1958,11 +1999,16 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         // tombstone is left to expire via its own TTL instead.
         beginAlbumDelete(id);
         invalidateLocalAlbumsIndex();
-        void post(`/albums/${encodeURIComponent(id)}/purge`, {}).catch(() => {
+        const done = pendingToast('Deleting album…');
+        void post(`/albums/${encodeURIComponent(id)}/purge`, {}).then(() => {
+            done();
+            toast('Album deleted');
+        }).catch(() => {
+            done();
             setAlbumTrash(snapshot);
             toast('Couldn’t permanently delete album', undefined, undefined, 'error');
         });
-    }, [albumTrash, toast]);
+    }, [albumTrash, toast, pendingToast]);
 
     // No longer fetched unconditionally on app mount -- AlbumsPage's own
     // mount effect enqueues this (queue-managed, canceled on tab-leave) only
@@ -2114,8 +2160,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const createAlbum = useCallback(
         async (name?: string): Promise<string> => {
             const finalName = (name ?? 'New album').trim() || 'New album';
+            const done = pendingToast('Creating album…');
             try {
                 const res = await post<{ album?: Album }>('/albums', { name: finalName });
+                done();
                 const created = res?.album;
                 if (created) {
                     // Persist a creation receipt *before* invalidating the index
@@ -2133,11 +2181,12 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                     return created.id;
                 }
             } catch {
+                done();
                 toast('Couldn’t create album', undefined, undefined, 'error');
             }
             return '';
         },
-        [toast],
+        [toast, pendingToast],
     );
 
     // Smart albums: server picks the matching photos by `rule` (location,
@@ -2145,8 +2194,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // in AlbumsPage.tsx) and creates/returns the album in one call.
     const autoCreateAlbum = useCallback(
         async (rule: string): Promise<{ albumId: string; count: number; message?: string }> => {
+            const done = pendingToast('Creating smart album…');
             try {
                 const res = await post<{ album?: Album; count?: number; photoCount?: number; message?: string }>('/albums/autocreate', { rule });
+                done();
                 const created = res?.album;
                 // `count` is albums created; the toast wants the album's photos.
                 const count = Number(res?.photoCount ?? created?.photoCount ?? res?.count ?? 0);
@@ -2158,11 +2209,12 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 }
                 return { albumId: '', count: 0, message: res?.message };
             } catch {
+                done();
                 toast('Couldn’t create smart album', undefined, undefined, 'error');
                 return { albumId: '', count: 0 };
             }
         },
-        [toast],
+        [toast, pendingToast],
     );
 
     // Tracks the rename transaction chain per album, same shape/reasoning as
@@ -2194,13 +2246,16 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const edit = beginPendingEdit('album', id, { name: trimmed });
         setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, name: trimmed } : a)));
         invalidateLocalAlbumsIndex();
+        const done = pendingToast('Renaming album…');
         void savePendingEdits([edit], () => post(`/albums/${encodeURIComponent(id)}/rename`, { name: trimmed })).then(() => {
+            done();
             confirmPendingEdit(edit);
             albumEdit.previous = undefined;
             if (edit.scope !== pendingEditScope()) return;
             requestJobPoll();
             publishLibraryChange('album-renamed', ['albums'], { itemCount: 1 });
         }).catch(() => {
+            done();
             rollbackPendingEdit(edit);
             // Mark failed even if superseded, so a later overlapping rename's
             // own failure handler knows to skip over this one when walking back.
@@ -2247,12 +2302,14 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 });
             }
             invalidateLocalAlbumsIndex();
+            const done = pendingToast(`Adding ${ids.length} to “${album?.name ?? 'album'}”…`);
             // Returned so a caller adding several chunks can await each one: the server
             // read-modify-writes the album row, so concurrent adds overwrite each other.
             return post<{ success?: boolean; added?: string[]; errors?: string[]; album?: Album }>(
                 `/albums/${encodeURIComponent(albumId)}/photos/add`, { filenames: ids },
             )
                 .then((res) => {
+                    done();
                     if (scope !== pendingEditScope()) return;
                     // Update the creation receipt straight from this response,
                     // not just from the follow-up detail refresh below: the
@@ -2274,6 +2331,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                     void openAlbum(albumId);
                 })
                 .catch(() => {
+                    done();
                     if (scope !== pendingEditScope() || deleted()) return;
                     setAlbums((prev) => prev.map((a) => (a.id === albumId ? { ...a, photoCount: Math.max(0, a.photoCount - ids.length) } : a)));
                     setAlbumPhotos((prev) => (prev[albumId]
@@ -2282,7 +2340,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                     toast('Couldn’t add photos to album', undefined, undefined, 'error');
                 });
         },
-        [albums, photosByIds, openAlbum, toast],
+        [albums, photosByIds, openAlbum, toast, pendingToast],
     );
 
     // /albums/delete-multiple deliberately returns HTTP 200 with success:false
@@ -2300,10 +2358,12 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setAlbums((prev) => prev.map((a) => (a.id === albumId ? { ...a, photoCount: Math.max(0, a.photoCount - gone) } : a)));
         clearSelection();
         invalidateLocalAlbumsIndex();
+        const done = pendingToast(`Removing ${ids.length === 1 ? '1 item' : `${ids.length} items`} from the album…`);
         void post<{ success?: boolean; removed?: number; album?: Album }>(
             `/albums/${encodeURIComponent(albumId)}/photos/remove`, { filenames: ids },
         )
             .then(() => {
+                done();
                 publishLibraryChange('album-photos-removed', ['albums'], { itemCount: ids.length });
                 // Say where the photos still are, and offer the way back.
                 const name = albumsRef.current.find((a) => a.id === albumId)?.name;
@@ -2315,10 +2375,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 void openAlbum(albumId);
             })
             .catch(() => {
+                done();
                 toast('Couldn’t remove photos from the album', undefined, undefined, 'error');
                 void openAlbum(albumId);
             });
-    }, [openAlbum, toast, clearSelection, addPhotosToAlbum]);
+    }, [openAlbum, toast, pendingToast, clearSelection, addPhotosToAlbum]);
 
     type DeleteMultipleResponse = { deletedAlbums?: string[]; albumErrors?: { albumId: string; error: string }[]; success?: boolean };
 
@@ -2355,8 +2416,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             });
         };
         invalidateLocalAlbumsIndex();
+        const done = pendingToast(requested.length === 1 ? 'Deleting album…' : `Deleting ${requested.length} albums…`);
         void post<DeleteMultipleResponse>('/albums/delete-multiple', { albumIds: requested })
             .then((res) => {
+                done();
                 const errors = new Set((res?.albumErrors ?? []).map(error => error.albumId));
                 const confirmed = new Set(res?.deletedAlbums ?? []);
                 // An omitted acknowledgement is not a confirmed deletion.
@@ -2381,18 +2444,20 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 }
             })
             .catch(() => {
+                done();
                 rollback(idSet);
                 if (scope !== pendingEditScope()) return;
                 toast(`Couldn’t delete ${requested.length === 1 ? 'album' : 'albums'}`, undefined, undefined, 'error');
             })
             .finally(() => { attempts.forEach(attempt => albumDeleteBaselines.current.delete(attempt)); });
-    }, [albums, toast]);
+    }, [albums, toast, pendingToast]);
 
     const deleteAlbum = useCallback((id: string) => { deleteAlbums([id]); }, [deleteAlbums]);
 
     const shareAlbum = useCallback(async (id: string, opts: { expiresInDays?: number; accessCode?: string; clearAccessCode?: boolean }) => {
         if (hasAlbumDeleteTombstone(id, pendingEditScope())) return false;
         const keepExpiry = opts.expiresInDays === undefined;
+        const done = pendingToast('Updating share link…');
         try {
             const res = await post<{ album?: Album }>(`/albums/${encodeURIComponent(id)}/share`, {
                 enabled: true,
@@ -2409,25 +2474,30 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 setAlbums((prev) => prev.map((a) => (a.id === id ? { ...a, ...res.album } : a)));
             }
             invalidateLocalAlbumsIndex();
+            done();
             return true;
         } catch {
+            done();
             toast('Couldn’t update share link', undefined, undefined, 'error');
             return false;
         }
-    }, [albums, toast]);
+    }, [albums, toast, pendingToast]);
 
     const revokeAlbum = useCallback(async (id: string) => {
         if (hasAlbumDeleteTombstone(id, pendingEditScope())) return;
+        const done = pendingToast('Revoking share link…');
         try {
             const res = await post<{ album?: Album }>(`/albums/${encodeURIComponent(id)}/revoke`, {});
             setAlbums((prev) => prev.map((a) => (a.id === id
                 ? { ...a, ...(res?.album ?? {}), isPublic: false, publicUrl: undefined }
                 : a)));
             invalidateLocalAlbumsIndex();
+            done();
         } catch {
+            done();
             toast('Couldn’t revoke share link', undefined, undefined, 'error');
         }
-    }, [toast]);
+    }, [toast, pendingToast]);
 
     // Primary path: one server page of clusters (named first), cut from the cached people index, then
     // more as the user scrolls -- the browser never downloads every cluster. If the index is not
@@ -2655,8 +2725,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // propagation). Usually queued on the worker, whose completion notification
     // reports what it added; without a worker it runs inline and answers here.
     const findMoreFaces = useCallback(async (id: string) => {
+        const done = pendingToast('Looking for more faces…');
         try {
             const result = await faceService.findPersonFaces(id);
+            done();
             if (result?.queued) {
                 toast('Looking for more faces. You’ll get a notification when it’s done.');
                 requestJobPoll();
@@ -2675,9 +2747,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 void fetchPeople();
             }
         } catch {
+            done();
             toast('Couldn’t look for more faces', undefined, undefined, 'error');
         }
-    }, [toast, openPerson, fetchPeople]);
+    }, [toast, pendingToast, openPerson, fetchPeople]);
 
     const renamePerson = useCallback((id: string, name: string) => {
         const trimmed = name.trim();
@@ -2688,13 +2761,16 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setPeople((prev) => prev.map((p) => (p.id === id ? { ...p, name: edit.name } : p)));
         setExtraPeople((prev) => (prev[id] ? { ...prev, [id]: { ...prev[id], name: edit.name } } : prev));
         invalidateLocalPeopleIndex();
+        const done = pendingToast('Saving name…');
         void faceService.labelPerson(id, trimmed).then(() => {
+            done();
             if (edit.scope !== pendingEditScope()) return;
             edit.saved = true;
             edit.previous = undefined;
             requestJobPoll();
             publishLibraryChange('person-renamed', ['people'], { itemCount: 1 });
         }).catch(() => {
+            done();
             // Mark this edit failed even if a later overlapping rename has
             // since superseded it -- that later edit's own failure handler
             // walks `previous` and must know to skip over it rather than
@@ -2733,7 +2809,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             invalidateLocalPeopleIndex();
             toast('Couldn’t save name', undefined, undefined, 'error');
         });
-    }, [people, extraPeople, toast]);
+    }, [people, extraPeople, toast, pendingToast]);
 
     const mergePeople = useCallback(
         (sourceId: string, targetId: string) => {
@@ -2770,13 +2846,16 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 });
             }
             invalidateLocalPeopleIndex();
+            const done = pendingToast('Merging people…');
             void faceService.mergePersons(targetId, [sourceId])
                 .then(() => {
+                    done();
                     publishLibraryChange('people-merged', ['people'], { itemCount: 2, entityIds: [sourceId] });
                     toast('People merged');
                     void fetchPeople();
                 })
                 .catch(() => {
+                    done();
                     deletedPeopleRef.current.delete(sourceId);
                     if (removed) setPeople((prev) => [...prev, removed]);
                     setPeopleTotal((prev) => prev + 1);
@@ -2785,7 +2864,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                     toast('Couldn’t merge people', undefined, undefined, 'error');
                 });
         },
-        [people, extraPeople, personPhotos, fetchPeople, toast],
+        [people, extraPeople, personPhotos, fetchPeople, toast, pendingToast],
     );
 
     // Multi-select merge from the People grid: several source clusters into
@@ -2834,13 +2913,16 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 return changed ? next : prev;
             });
             invalidateLocalPeopleIndex();
+            const done = pendingToast(`Merging ${ids.length + 1} people…`);
             void faceService.mergePersons(targetId, ids)
                 .then(() => {
+                    done();
                     publishLibraryChange('people-merged', ['people'], { itemCount: ids.length + 1, entityIds: ids });
                     toast(`Merged ${ids.length + 1} people`);
                     void fetchPeople();
                 })
                 .catch(() => {
+                    done();
                     ids.forEach((id) => deletedPeopleRef.current.delete(id));
                     if (removed.length) setPeople((prev) => [...prev, ...removed]);
                     setPeopleTotal((prev) => prev + ids.length);
@@ -2849,7 +2931,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                     toast('Couldn’t merge people', undefined, undefined, 'error');
                 });
         },
-        [people, fetchPeople, toast],
+        [people, fetchPeople, toast, pendingToast],
     );
 
     // Deletes a person cluster entirely (their faces become unassigned, not
@@ -2876,12 +2958,15 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             return next;
         });
         invalidateLocalPeopleIndex();
+        const done = pendingToast('Deleting person…');
         void faceService.deletePersons([id])
             .then(() => {
+                done();
                 publishLibraryChange('person-deleted', ['people'], { itemCount: 1, entityIds: [id] });
                 toast('Person deleted');
             })
             .catch(() => {
+                done();
                 deletedPeopleRef.current.delete(id);
                 if (removed) setPeople((prev) => [...prev, removed]);
                 if (removed) {
@@ -2891,7 +2976,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 invalidateLocalPeopleIndex();
                 toast('Couldn’t delete person', undefined, undefined, 'error');
             });
-    }, [people, extraPeople, toast]);
+    }, [people, extraPeople, toast, pendingToast]);
 
     const deletePeopleBatch = useCallback((ids: string[]) => {
         if (!ids.length) return;
@@ -2927,12 +3012,15 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             return changed ? next : prev;
         });
         invalidateLocalPeopleIndex();
+        const done = pendingToast(`Deleting ${removed.length === 1 ? '1 person' : `${removed.length} people`}…`);
         void faceService.deletePersons(ids)
             .then(() => {
+                done();
                 publishLibraryChange('people-deleted', ['people'], { itemCount: ids.length, entityIds: ids });
                 toast(`Deleted ${removed.length} ${removed.length === 1 ? 'person' : 'people'}`);
             })
             .catch(() => {
+                done();
                 idSet.forEach((id) => deletedPeopleRef.current.delete(id));
                 if (removed.length) setPeople((prev) => [...prev, ...removed]);
                 setPeopleTotal((prev) => prev + removed.length);
@@ -2940,7 +3028,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 invalidateLocalPeopleIndex();
                 toast('Couldn’t delete people', undefined, undefined, 'error');
             });
-    }, [people, extraPeople, toast]);
+    }, [people, extraPeople, toast, pendingToast]);
 
     const applyExternalPeopleRemoval = useCallback((ids: string[]) => {
         if (!ids.length) return;
@@ -2997,34 +3085,38 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const reloadMembers = useCallback(() => { void fetchMembers(); }, [fetchMembers]);
 
     const invite = useCallback((email: string, targetType: 'join' | 'fresh') => {
+        const done = pendingToast(`Sending invite to ${email}…`);
         void library.sendInvite(email, targetType)
-            .then(() => { toast(`Invite sent to ${email}`); void fetchMembers(); })
-            .catch((err) => toast(err instanceof Error ? err.message : 'Couldn’t send invite', undefined, undefined, 'error'));
-    }, [fetchMembers, toast]);
+            .then(() => { done(); toast(`Invite sent to ${email}`); void fetchMembers(); })
+            .catch((err) => { done(); toast(err instanceof Error ? err.message : 'Couldn’t send invite', undefined, undefined, 'error'); });
+    }, [fetchMembers, toast, pendingToast]);
 
     const revokeInvite = useCallback((inviteId: string) => {
         setPendingInvites((prev) => prev.filter((p) => p.inviteId !== inviteId));
+        const done = pendingToast('Revoking invitation…');
         void library.revokePendingInvite(inviteId)
-            .then(() => toast('Invitation revoked'))
-            .catch(() => { toast('Couldn’t revoke invite', undefined, undefined, 'error'); void fetchMembers(); });
-    }, [fetchMembers, toast]);
+            .then(() => { done(); toast('Invitation revoked'); })
+            .catch(() => { done(); toast('Couldn’t revoke invite', undefined, undefined, 'error'); void fetchMembers(); });
+    }, [fetchMembers, toast, pendingToast]);
 
     const removeMember = useCallback((userId: string) => {
         setMembers((prev) => prev.filter((m) => m.userId !== userId));
+        const done = pendingToast('Removing member…');
         void library.removeMember(userId)
-            .then(() => toast('Member removed'))
-            .catch(() => { toast('Couldn’t remove member', undefined, undefined, 'error'); void fetchMembers(); });
-    }, [fetchMembers, toast]);
+            .then(() => { done(); toast('Member removed'); })
+            .catch(() => { done(); toast('Couldn’t remove member', undefined, undefined, 'error'); void fetchMembers(); });
+    }, [fetchMembers, toast, pendingToast]);
 
     const renameLibrary = useCallback((name: string) => {
         const trimmed = name.trim();
         if (!trimmed) return;
         const previous = libraryName;
         setLibraryName(trimmed);
+        const done = pendingToast('Renaming library…');
         void library.renameLibrary(trimmed)
-            .then(() => toast('Library renamed'))
-            .catch(() => { setLibraryName(previous); toast('Couldn’t rename library', undefined, undefined, 'error'); });
-    }, [libraryName, toast]);
+            .then(() => { done(); toast('Library renamed'); })
+            .catch(() => { done(); setLibraryName(previous); toast('Couldn’t rename library', undefined, undefined, 'error'); });
+    }, [libraryName, toast, pendingToast]);
 
     // While the people list is unavailable (server still building it), retry quietly every 10 s.
     useEffect(() => {
@@ -3178,6 +3270,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             removeMember,
             renameLibrary,
             toast,
+            pendingToast,
             dismissToast,
         }),
         [
@@ -3194,7 +3287,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             createAlbum, autoCreateAlbum, renameAlbum, addPhotosToAlbum, removePhotosFromAlbum, deleteAlbum, deleteAlbums, shareAlbum, revokeAlbum,
             peopleLoading, peopleTotal, peopleUnnamedTotal, peopleHasMore, peopleUnavailable, loadMorePeople, searchPeople, reloadPeople, fetchPeople, openPerson, personPhotosById, personPhotosTotal, personPhotosHasMore, loadMorePersonPhotos, personPhotosLoading,
             renamePerson, findMoreFaces, mergePeople, mergePeopleBatch, deletePerson, deletePeopleBatch, applyExternalPeopleRemoval, reloadMembers, fetchMembers, invite, revokeInvite,
-            removeMember, renameLibrary, toast, dismissToast,
+            removeMember, renameLibrary, toast, pendingToast, dismissToast,
         ],
     );
 
