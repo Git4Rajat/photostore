@@ -1944,7 +1944,13 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
             // (was still '2' in bicep -- drift corrected 2026-10-30). Retest and
             // consider returning to 2 if apply/persistence gets much faster
             // under the same 2 vCPU quota.
-            { name: 'IPWORKER_CONCURRENCY', value: '3' }
+            // Raised to 5 on 2026-11-26 after matched Azure waves on 2 vCPU /
+            // 4 GiB (about 10k photos each): 3 -> ~7.3k photos/h, 4 -> ~8.7k,
+            // 5 -> ~9.2k, and 5 reproduced at 211 photos per attempt-minute on
+            // both 2 and 4 vCPU. 4 vCPU with 10/16/20 workers gave no more
+            // (the single vision process is the ceiling) and 16+ was slower
+            // from CLIP lock queueing, so 5 is the setting for 2 vCPU / 4 GiB.
+            { name: 'IPWORKER_CONCURRENCY', value: '5' }
             // Confirmed live 2026-08-27: this image's tesseract build spawns
             // multiple OS threads per image_to_string() call by default (no
             // prior thread cap existed anywhere in this Dockerfile/entrypoint).
