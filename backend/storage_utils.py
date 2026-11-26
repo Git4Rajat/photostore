@@ -1352,6 +1352,45 @@ def _face_filename_row(table, user_id: str, filename: str):
         return None
 
 
+class _OwnLookupRow(dict):
+    """The lookup row as this writer last wrote or read it, carrying the ETag that write or read returned."""
+    def __init__(self, row, etag):
+        super().__init__(row)
+        self.metadata = {'etag': etag}
+
+
+_OWN_LOOKUP_ROWS = threading.local()
+
+
+def _own_lookup_reuse_enabled() -> bool:
+    """IPWORK_FACE_LOOKUP_REUSE (default on): publishing a lookup row conditions its write on the ETag of this
+    writer's own last write or read instead of reading the row again."""
+    return os.getenv('IPWORK_FACE_LOOKUP_REUSE', 'true').lower() in ('1', 'true', 'yes')
+
+
+def _remember_own_lookup_row(user_id: str, filename: str, generation: str, row, result) -> None:
+    """Keep the row this thread holds the lease on, with the ETag the service returned for the write.
+
+    Only a writer holding the generation's lease reaches here, and only the thread that wrote it reads it back,
+    so the entry never outlives that writer's begin..finish. A write that returned no ETag leaves nothing."""
+    rows = getattr(_OWN_LOOKUP_ROWS, 'rows', None)
+    if rows is None:
+        rows = _OWN_LOOKUP_ROWS.rows = {}
+    etag = result.get('etag') if isinstance(result, dict) else None
+    key = (user_id, filename, generation)
+    if not _own_lookup_reuse_enabled() or not etag or etag == '*':
+        rows.pop(key, None)
+        return
+    if len(rows) > 64:
+        rows.clear()  # Abandoned attempts (a crash between begin and finish) cannot accumulate.
+    rows[key] = _OwnLookupRow(row, etag)
+
+
+def _own_lookup_row(user_id: str, filename: str, generation: str):
+    rows = getattr(_OWN_LOOKUP_ROWS, 'rows', None)
+    return rows.pop((user_id, filename, generation), None) if rows else None
+
+
 def _face_filename_etag(entity):
     etag = getattr(entity, 'metadata', {}).get('etag')
     if not etag:
@@ -1435,11 +1474,12 @@ def _begin_face_filename_write(user_id: str, filename: str, *, first_read=None):
             entity.update(fence.headers())
         try:
             if previous is None:
-                table.create_entity(entity)
+                written = table.create_entity(entity)
             else:
-                table.update_entity(entity, mode=UpdateMode.REPLACE,
-                                    etag=_face_filename_etag(previous),
-                                    match_condition=MatchConditions.IfNotModified)
+                written = table.update_entity(entity, mode=UpdateMode.REPLACE,
+                                              etag=_face_filename_etag(previous),
+                                              match_condition=MatchConditions.IfNotModified)
+            _remember_own_lookup_row(user_id, filename, generation, entity, written)
             # Absence is not proof of freshness: legacy faces and degraded
             # writers can predate the lookup. Only a valid complete generation
             # supplies authoritative IDs, including an explicit empty set.
@@ -1460,7 +1500,11 @@ def _finish_face_filename_write(user_id: str, filename: str, generation: str,
     if generation is None:
         return
     table = _CTX['face_by_filename_table_client']
-    current = _face_filename_row(table, user_id, filename)
+    # Publishing is conditional on the row's ETag. The one this writer got from its own last write or read of
+    # the row stands in for a read: if anyone changed the row since, the write below fails exactly as it
+    # would have after reading the changed row. A release (face_ids None) always reads.
+    remembered = _own_lookup_row(user_id, filename, generation) if face_ids is not None else None
+    current = remembered if remembered is not None else _face_filename_row(table, user_id, filename)
     allowed_states = {'writing', 'complete'} if face_ids is None else {'writing'}
     if (current is None or current.get('generation') != generation
             or current.get('state') not in allowed_states):
@@ -1477,9 +1521,16 @@ def _finish_face_filename_write(user_id: str, filename: str, generation: str,
     if fence:
         fence.check()
         entity.update(fence.headers())
-    table.update_entity(entity, mode=UpdateMode.REPLACE,
-                        etag=_face_filename_etag(current),
-                        match_condition=MatchConditions.IfNotModified)
+    try:
+        table.update_entity(entity, mode=UpdateMode.REPLACE,
+                            etag=_face_filename_etag(current),
+                            match_condition=MatchConditions.IfNotModified)
+    except ResourceModifiedError:
+        if remembered is None:
+            raise
+        # The row moved since this writer last saw it (a takeover, an expired lease): what reading it
+        # first would have reported.
+        raise FaceFilenameLookupRetryableError('Filename lookup generation lost')
 
 
 def _renew_face_filename_write(user_id: str, filename: str, generation: str, *, artifact_checks_source=False) -> None:
@@ -1509,8 +1560,11 @@ def _renew_face_filename_write(user_id: str, filename: str, generation: str, *, 
     if renewed:
         entity = dict(current)
         entity['leaseExpiresAt'] = (now + timedelta(seconds=_FACE_FILENAME_LEASE_SECONDS)).isoformat()
-        table.update_entity(entity, mode=UpdateMode.REPLACE, etag=etag,
-                            match_condition=MatchConditions.IfNotModified)
+        written = table.update_entity(entity, mode=UpdateMode.REPLACE, etag=etag,
+                                      match_condition=MatchConditions.IfNotModified)
+        _remember_own_lookup_row(user_id, filename, generation, entity, written)
+    else:
+        _remember_own_lookup_row(user_id, filename, generation, current, {'etag': etag})
     processing_diagnostics.file_event('face_index_lease_check', user_id, filename, renewed=renewed)
 
 

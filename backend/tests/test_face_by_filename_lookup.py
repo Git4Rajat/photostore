@@ -86,6 +86,7 @@ class FilenameLookupTable(AzureFaceTable):
             if (entity['PartitionKey'], entity['RowKey']) in self.rows:
                 raise ResourceExistsError('Already exists')
             self.upsert_entity(entity)
+            return {'etag': str(self.versions[(entity['PartitionKey'], entity['RowKey'])])}
 
     def submit_transaction(self, operations):
         operations=list(operations)
@@ -118,6 +119,7 @@ class FilenameLookupTable(AzureFaceTable):
                 raise ResourceModifiedError('ETag conflict')
             self.updates.append(dict(entity))
             self.upsert_entity(entity)
+            return {'etag': str(self.versions[key])}
 
 
 @pytest.fixture
@@ -681,6 +683,8 @@ def test_missing_etag_fails_closed(lookup_ctx, monkeypatch):
 
 
 def test_completion_etag_conflict_cannot_overwrite_new_writer(lookup_ctx, monkeypatch):
+    # Pins the read-then-CAS race itself; with own-ETag reuse the same takeover is reported as a lost generation.
+    monkeypatch.setenv('IPWORK_FACE_LOOKUP_REUSE', 'false')
     _, lookup = lookup_ctx
     generation, _ = storage_utils._begin_face_filename_write('u1', 'photo.jpg')
     original_update = lookup.update_entity
@@ -713,12 +717,15 @@ def test_expired_writer_cannot_renew_or_complete(lookup_ctx):
     assert storage_utils.get_face_ids_for_filename('u1', 'photo.jpg') is None
 
 
-def test_short_face_write_keeps_fences_without_redundant_renewal_puts(lookup_ctx, caplog):
+@pytest.mark.parametrize('reuse,gets', [('true', 5), ('false', 6)])
+def test_short_face_write_keeps_fences_without_redundant_renewal_puts(lookup_ctx, caplog, monkeypatch, reuse, gets):
+    monkeypatch.setenv('IPWORK_FACE_LOOKUP_REUSE', reuse)
     _, lookup = lookup_ctx
     with caplog.at_level('INFO', logger='processing_diagnostics'):
         storage_utils._store_client_face_entities('u1', 'photo.jpg', [_face(0), _face(100)])
-    # Acquire + two fresh checks per face + final CAS publication.
-    assert len(lookup.gets) == 6
+    # Acquire + two fresh checks per face; the final CAS publication reads the row again unless it is
+    # conditioned on the ETag of the writer's own last read (IPWORK_FACE_LOOKUP_REUSE, default on).
+    assert len(lookup.gets) == gets
     assert [row['state'] for row in lookup.writes] == ['writing', 'complete']
     assert len(lookup.updates) == 1
     events = [json.loads(record.getMessage().removeprefix('processing telemetry '))
