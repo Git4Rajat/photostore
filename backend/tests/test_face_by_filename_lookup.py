@@ -208,7 +208,7 @@ def test_storage_phase_timings_cover_full_lazy_enumeration(lookup_ctx, monkeypat
     existing = {'PartitionKey': 'u1', 'RowKey': 'rejected', 'filename': 'photo.jpg',
                 'bbox': json.dumps(_face(0)['bbox']), 'rejected': True}
 
-    def begin(*args):
+    def begin(*args, **kwargs):
         advance(.01)
         return 'generation', None if path == 'query' else ([] if path == 'indexed_zero' else ['rejected'])
 
