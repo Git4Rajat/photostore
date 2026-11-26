@@ -25,6 +25,7 @@ import { StoreProvider, useStore } from './store';
 import type { Route as AppRoute } from './types';
 import AppSidebar from './components/AppSidebar';
 import { Menu } from './components/bits';
+import { LibrarySwitcher } from './components/LibrarySwitcher';
 import CommandBar from './components/CommandBar';
 import PhotoViewer from './components/PhotoViewer';
 import Toasts from './components/Toasts';
@@ -183,6 +184,7 @@ const Topbar: React.FC<{ theme: Theme; onTheme: (t: Theme) => void; onSignOut: (
                             <button type="button" onClick={() => { navigate('trash'); close(); }}>Recently deleted</button>
                             <button type="button" onClick={() => { navigate('tools'); close(); }}>Tools</button>
                             <button type="button" onClick={() => { navigate('additional'); close(); }}>About Keepsake</button>
+                            <LibrarySwitcher onSwitched={close} />
                             <div className="pt-account-sep" />
                             <div className="pt-account-theme">
                                 <span>Theme</span>

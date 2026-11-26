@@ -212,6 +212,21 @@ export const leaveLibrary = async (libraryId: string): Promise<string> => {
     return String(body.activeLibraryId || '');
 };
 
+// Hand the active library to another member. Password mode sends the proof from
+// verifyLibraryPassword; otherwise the new owner's email is typed back to confirm.
+export const transferOwnership = async (
+    userId: string,
+    confirmation: { proof?: string; confirmEmail?: string },
+): Promise<void> => {
+    const response = await authedFetch('/api/library/transfer', {
+        method: 'POST',
+        body: JSON.stringify({ userId, ...confirmation }),
+    });
+    if (!response.ok) {
+        throw new Error(await parseError(response, 'Could not hand over the library.'));
+    }
+};
+
 export const deleteLibrary = async (): Promise<void> => {
     const response = await authedFetch('/api/library', { method: 'DELETE' });
     if (!response.ok) {

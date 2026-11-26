@@ -6,7 +6,7 @@ it.each([
     ['/api/library/switch', 'POST'], ['/api/library/rename', 'POST'],
     ['/api/library/invite', 'POST'], ['/api/library/invite/info?token=x', 'GET'],
     ['/api/library/invite/accept', 'POST'], ['/api/library/invite/revoke', 'POST'],
-    ['/api/library/members/remove', 'POST'], ['/api/library/leave', 'POST'],
+    ['/api/library/members/remove', 'POST'], ['/api/library/leave', 'POST'], ['/api/library/transfer', 'POST'],
     ['/api/photos/trash', 'GET'], ['/api/albums', 'GET'],
 ])('keeps management on core: %s %s', (path, method) => {
     expect(isArchiveRequest(path, method)).toBe(false);
