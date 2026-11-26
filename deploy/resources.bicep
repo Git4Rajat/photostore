@@ -96,6 +96,11 @@ param uploadConcurrentRequests int = 32
 @maxValue(30)
 param uploadMaxReplicas int = 2
 
+@description('Vision: intra-op threads per model call (IPWORK_MODEL_THREADS), also the OMP/OpenBLAS thread caps. 1 keeps each of the IPWORKER_CONCURRENCY source threads on one core; raise only after a live test on the vCPU quota.')
+@minValue(1)
+@maxValue(16)
+param visionModelThreads int = 1
+
 @description('Enable qualified wave execution after certificate seeding; fresh installs use deploy/fresh_wave.py.')
 param enableWaveExecution bool = true
 @description('Enroll newly created empty libraries only. Existing libraries never change ownership.')
@@ -1964,13 +1969,15 @@ resource vision 'Microsoft.App/containerApps@2025-01-01' = if (deployVision) {
             // thumbnail_status='done' done-delta method used to validate the
             // concurrency fix. No correctness impact -- purely how many OS
             // threads one call spawns, not what it returns.
-            { name: 'OMP_THREAD_LIMIT', value: '1' }
+            { name: 'OMP_THREAD_LIMIT', value: string(visionModelThreads) }
             // Separate from Tesseract's OpenMP cap: NumPy/SciPy/OpenCV use
             // OpenBLAS pools. Matched two-CPU runs measured 29.5% less stage
             // wall time at one BLAS thread, with identical outputs on 48 inputs.
             // Keep aligned with the Vision image default; this single-thread cap
             // is what makes IPWORKER_CONCURRENCY=3 safe on 2 vCPU.
-            { name: 'OPENBLAS_NUM_THREADS', value: '1' }
+            { name: 'OPENBLAS_NUM_THREADS', value: string(visionModelThreads) }
+            // Model intra-op threads (backend/model_threads.py): 1 unless a live test says otherwise.
+            { name: 'IPWORK_MODEL_THREADS', value: string(visionModelThreads) }
             // Run the per-image CLIP image/text encode through a one-thread FP32
             // ONNX session instead of PyTorch (backend/vision_utils.py). Same
             // weights, preprocessing, normalization and shared model lock; a
