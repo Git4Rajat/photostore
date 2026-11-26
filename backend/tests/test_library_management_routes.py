@@ -100,3 +100,52 @@ def test_new_account_invite_library_name_defaults_to_email_and_is_ignored_when_j
     join = store.create_invite(library_id='owner', email='b@example.com', target_type='join', invited_by='owner')
     assert client.post('/api/library/invite/accept', json={'token': join, 'password': 'long-enough-1', 'libraryName': 'Nope'}).status_code == 200
     assert store.get_library(store.get_user_by_email('b@example.com')['RowKey'])['name'] == 'b@example.com'
+
+
+def _transfer(client, store, proof=True, **body):
+    owner = headers('owner')
+    if proof:
+        body['proof'] = app._library_clean_reauth_proof('owner', 'owner')
+    return client.post('/api/library/transfer', headers=owner, json=body)
+
+
+def test_transfer_hands_library_over_and_old_owner_gets_a_new_one(management):
+    store, client = management
+    store.add_membership('bob', 'owner')
+    assert _transfer(client, store, userId='bob').status_code == 200
+    assert store.is_owner('bob', 'owner') and not store.is_owner('owner', 'owner')
+    assert store.library_owner_id('owner') == 'bob'
+    own = store.personal_library_id('owner')
+    assert own != 'owner' and store.is_owner('owner', own)
+    # Signing in again must not hand the old owner the library back.
+    store.ensure_personal_library('owner')
+    assert not store.is_owner('owner', 'owner')
+    assert store.get_current_library('owner') == own
+    # Old owner can now leave; the new owner can't.
+    left = client.post('/api/library/leave', headers=headers('owner', 'owner'), json={'libraryId': 'owner'})
+    assert left.status_code == 200 and left.get_json()['activeLibraryId'] == own
+    assert client.post('/api/library/leave', headers=headers('bob', 'owner'), json={'libraryId': 'owner'}).status_code == 400
+    # The new owner has owner powers immediately.
+    assert client.post('/api/library/rename', headers=headers('bob', 'owner'), json={'name': 'Bob'}).status_code == 200
+
+
+def test_transfer_guards(management):
+    store, client = management
+    store.add_membership('bob', 'owner')
+    assert _transfer(client, store, userId='outsider').status_code == 404
+    assert _transfer(client, store, userId='owner').status_code == 400
+    assert _transfer(client, store, proof=False, userId='bob').status_code == 401
+    member = client.post('/api/library/transfer', headers=headers('bob', 'owner'), json={'userId': 'bob'})
+    assert member.status_code == 403
+    assert store.is_owner('owner', 'owner')
+
+
+def test_transfer_retry_after_partial_failure_converges(management):
+    store, client = management
+    store.add_membership('bob', 'owner')
+    first = store.transfer_ownership('owner', 'owner', 'bob')
+    # Simulate a crash between promoting bob and demoting the old owner.
+    store.add_membership('owner', 'owner', is_owner=True)
+    second = store.transfer_ownership('owner', 'owner', 'bob')
+    assert first == second
+    assert store.is_owner('bob', 'owner') and not store.is_owner('owner', 'owner')
