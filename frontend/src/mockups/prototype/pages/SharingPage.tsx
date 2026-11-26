@@ -78,6 +78,30 @@ const SharingPage: React.FC = () => {
         });
         if (ok) removeMember(userId);
     };
+    // Handing the library over makes the other person its owner; the caller stays on as a member.
+    const makeOwner = async (userId: string, label: string) => {
+        const ok = await confirmDialog({
+            title: `Make ${label} the owner?`,
+            message: 'They will control this library, including inviting, removing people and deleting photos. You stay on as a member and get a new library of your own.',
+            confirmLabel: 'Make owner',
+            danger: true,
+        });
+        if (!ok) return;
+        try {
+            if (passwordMode) {
+                const password = await promptDialog({ title: 'Confirm your password', label: 'Password', type: 'password', confirmLabel: 'Continue' });
+                if (!password) return;
+                await library.transferOwnership(userId, { proof: await library.verifyLibraryPassword(password) });
+            } else {
+                const typed = await promptDialog({ title: 'Confirm new owner', label: `Type ${label} to confirm`, confirmLabel: 'Make owner' });
+                if (!typed) return;
+                await library.transferOwnership(userId, { confirmEmail: typed });
+            }
+            window.location.assign('/');
+        } catch (err) {
+            toast(err instanceof Error ? err.message : 'Couldn’t hand over the library', undefined, undefined, 'error');
+        }
+    };
     const [email, setEmail] = useState('');
     const [targetType, setTargetType] = useState<'join' | 'fresh'>('join');
     const valid = EMAIL_RE.test(email.trim());
@@ -183,7 +207,10 @@ const SharingPage: React.FC = () => {
                                 <span className="member-meta"><b>{m.email || m.userId}</b><span>{m.isSelf ? 'You' : 'Member'}</span></span>
                                 {m.isOwner && <span className="member-badge owner">Owner</span>}
                                 {isOwner && !m.isOwner && !m.isSelf && (
-                                    <button type="button" className="mock-link muted" onClick={() => void confirmRemove(m.userId, m.email || m.userId)}>Remove</button>
+                                    <>
+                                        <button type="button" className="mock-link muted" onClick={() => void makeOwner(m.userId, m.email || m.userId)}>Make owner</button>
+                                        <button type="button" className="mock-link muted" onClick={() => void confirmRemove(m.userId, m.email || m.userId)}>Remove</button>
+                                    </>
                                 )}
                             </div>
                         ))}

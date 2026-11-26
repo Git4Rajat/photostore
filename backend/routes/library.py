@@ -351,6 +351,33 @@ def library_verify_password():
         'expiresIn': app.LIBRARY_CLEAN_REAUTH_TTL_SECONDS,
     })
 
+@library_bp.route('/api/library/transfer', methods=['POST'])
+def library_transfer():
+    """Hand the active library to another member. The caller becomes a plain member and
+    gets a new personal library. Password mode needs the proof from /verify-password;
+    other modes (no password to check) need the new owner's email typed back."""
+    account_id, library_id, error = app._require_owner_context()
+    if error:
+        return error
+    if library_id == app.password_auth.OWNER_USER_ID:
+        return app.jsonify({'error': "This library can't be transferred."}), 400
+    data = app.request.get_json(silent=True) or {}
+    target = str(data.get('userId', '') or '').strip()
+    if not target or target == account_id:
+        return app.jsonify({'error': 'Choose another member to hand the library to.'}), 400
+    if not app.library_store.is_member(target, library_id):
+        return app.jsonify({'error': 'That person is not a member of this library.'}), 404
+    if app.AUTH_MODE == 'password':
+        if not app._library_clean_reauth_valid(str(data.get('proof', '') or ''), account_id, library_id):
+            return app.jsonify({'error': 'Please confirm your password again.'}), 401
+    else:
+        email = str((app.library_store.get_user(target) or {}).get('email') or '')
+        if not email or app.library_utils.normalize_email(data.get('confirmEmail')) != app.library_utils.normalize_email(email):
+            return app.jsonify({'error': "Type the new owner's email to confirm."}), 400
+    new_library = app.library_store.transfer_ownership(library_id, account_id, target)
+    app.library_store.audit(library_id, actor=account_id, action='transfer-ownership', target=target)
+    return app.jsonify({'status': 'ok', 'personalLibraryId': new_library})
+
 @library_bp.route('/api/library/members/remove', methods=['POST'])
 def library_remove_member():
     account_id, library_id, error = app._require_owner_context()
@@ -380,14 +407,15 @@ def library_leave():
     target_library = str(data.get('libraryId', '') or '').strip()
     if not target_library:
         return app.jsonify({'error': 'libraryId is required.'}), 400
-    if target_library == account_id or app.library_store.library_owner_id(target_library) == account_id:
+    if app.library_store.library_owner_id(target_library) == account_id or app.library_store.is_owner(account_id, target_library):
         return app.jsonify({'error': "You can't leave a library you own."}), 400
     if not app.library_store.is_member(account_id, target_library):
         return app.jsonify({'error': 'You are not a member of that library.'}), 404
     app.library_store.remove_membership(account_id, target_library)
     app.library_store.audit(target_library, actor=account_id, action='leave', target=account_id)
     # Drop the caller back into their own library.
-    app.library_store.set_current_library(account_id, account_id)
+    own_library = app.library_store.personal_library_id(account_id)
+    app.library_store.set_current_library(account_id, own_library)
     email = str((app.library_store.get_user(account_id) or {}).get('email') or '')
-    token = app._issue_session_for(account_id, library_id=account_id, email=email, mode=app.AUTH_MODE)
-    return app.jsonify({'status': 'ok', 'token': token, 'activeLibraryId': account_id})
+    token = app._issue_session_for(account_id, library_id=own_library, email=email, mode=app.AUTH_MODE)
+    return app.jsonify({'status': 'ok', 'token': token, 'activeLibraryId': own_library})

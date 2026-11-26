@@ -143,6 +143,12 @@
 .pt-account-head { padding: 6px 10px 10px; }
 .pt-account-head b { display: block; font-size: 0.9rem; }
 .pt-account-head span { font-size: 0.76rem; color: var(--muted); }
+.pt-account-libs { display: flex; flex-direction: column; }
+.pt-account-libs-title { padding: 2px 10px 4px; font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.pt-account-libs-confirm { display: flex; flex-direction: column; gap: 4px; }
+.pt-account-libs-confirm > span { padding: 4px 10px; font-size: 0.8rem; }
+.pt-account-libs-leave { color: var(--muted); }
+.pt-account-libs-error { padding: 4px 10px; font-size: 0.76rem; color: var(--danger, #c0392b); }
 .pt-account-sep { height: 1px; background: var(--lg-edge); margin: 6px 0; }
 .pt-account-theme { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 10px; font-size: 0.85rem; }
 .pt-linkish { background: none; border: 0; color: var(--accent); font: inherit; font-weight: 600; cursor: pointer; padding: 4px 2px; min-height: var(--tap-min); display: inline-flex; align-items: center; gap: 4px; }

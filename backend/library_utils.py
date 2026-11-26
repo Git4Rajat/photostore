@@ -344,7 +344,14 @@ class LibraryStore:
         stored = str((account or {}).get('currentLibraryId') or '').strip()
         if stored and stored != user_id and not self.is_member(user_id, stored):
             stored = ''
-        return stored or str(user_id)
+        return stored or self.personal_library_id(user_id)
+
+    def personal_library_id(self, user_id: str) -> str:
+        """The library an account falls back to as "its own". Normally the
+        user id; an account whose original library was handed to someone else
+        (see :meth:`transfer_ownership`) points at a replacement instead."""
+        account = self.get_user(user_id)
+        return str((account or {}).get('personalLibraryId') or '').strip() or str(user_id)
 
     def set_current_library(self, user_id: str, library_id: str) -> None:
         """Record the library a fresh sign-in should land the account in next
@@ -638,12 +645,53 @@ class LibraryStore:
 
     def ensure_personal_library(self, user_id: str, *, name: str = '') -> str:
         """Idempotently create a user's own library + owner membership."""
-        library_id = str(user_id)
-        if not self.get_library(library_id):
+        library_id = self.personal_library_id(user_id)
+        meta = self.get_library(library_id)
+        if not meta:
             self.create_library(library_id, name=name, owner_user_id=user_id)
+        elif str(meta.get('ownerUserId') or '') != str(user_id):
+            # Someone else owns it now (an ownership transfer); never re-add an owner row here.
+            return library_id
         if not self.get_membership(user_id, library_id):
             self.add_membership(user_id, library_id, is_owner=True)
         return library_id
+
+    def transfer_ownership(self, library_id: str, from_user_id: str, to_user_id: str) -> str:
+        """Hand a library to another member and give the previous owner a fresh
+        personal library. Every step is idempotent, so a retry after a partial
+        failure converges. Returns the previous owner's new personal library id."""
+        library_id, from_user_id, to_user_id = str(library_id), str(from_user_id), str(to_user_id)
+        meta = self.get_library(library_id) or {}
+        account = self.get_user(from_user_id) or {}
+        replacement = ''
+        if str(meta.get('ownerUserId') or '') == from_user_id:
+            replacement = str(account.get('personalLibraryId') or '').strip()
+            if not replacement or replacement == library_id:
+                replacement = new_user_id()
+        else:
+            replacement = self.personal_library_id(from_user_id)
+        if replacement != library_id:
+            self.create_library(replacement, name=str(account.get('email') or 'My Library'), owner_user_id=from_user_id)
+            if not self.get_membership(from_user_id, replacement):
+                self.add_membership(from_user_id, replacement, is_owner=True)
+            account = self.get_user(from_user_id) or {}
+            account['personalLibraryId'] = replacement
+            if str(account.get('currentLibraryId') or '').strip() in ('', library_id):
+                account['currentLibraryId'] = replacement
+            account['RowKey'] = from_user_id
+            account['PartitionKey'] = _USER_PK
+            self.users.upsert_entity(account)
+        meta = self.get_library(library_id) or {}
+        meta['ownerUserId'] = to_user_id
+        meta['PartitionKey'] = _LIBRARY_PK
+        meta['RowKey'] = library_id
+        self.libraries.upsert_entity(meta)
+        joined = lambda uid: int((self.get_membership(uid, library_id) or {}).get('joinedAt', 0) or 0)
+        for uid, owner in ((to_user_id, True), (from_user_id, False)):
+            joined_at = joined(uid) or _now()
+            for pk, rk in ((_MEMBER_LIB_PREFIX + library_id, uid), (_MEMBER_USR_PREFIX + uid, library_id)):
+                self.memberships.upsert_entity({'PartitionKey': pk, 'RowKey': rk, 'isOwner': owner, 'joinedAt': joined_at})
+        return replacement
 
     # -- invites --------------------------------------------------------------
     def pending_invites(self, library_id: str, *, target_type: Optional[str] = None) -> List[Dict]:
