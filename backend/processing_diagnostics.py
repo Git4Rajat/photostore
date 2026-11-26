@@ -66,17 +66,16 @@ def image_scope(member_key, phase):
 
 
 def vision_group_summary(function):
+    """Per-image summaries for one page. A page whose settlement was deferred (the function returned an
+    object with a `done` flag and a `summary` slot) is summarized when that settlement finishes."""
     @wraps(function)
     def wrapped(store, wave_id, members, *args, **kwargs):
         images = {member['RowKey']: io_metrics.Counters() for member in members}
         token = _IMAGES.set(images)
-        observations, outcome = [], 'error'
-        try:
-            observations = function(store, wave_id, members, *args, **kwargs)
-            outcome = 'success'
-            return observations
-        finally:
-            _IMAGES.reset(token)
+        result, outcome = [], 'error'
+
+        def emit():
+            observations = getattr(result, 'observations', result)
             qualified = {member['RowKey'] for member, completion, _ in observations if completion}
             for member in members:
                 counter = images[member['RowKey']]
@@ -90,6 +89,16 @@ def vision_group_summary(function):
                     receipt_qualified=member['RowKey'] in qualified, storage_attribution='image_context',
                     storage_tracing_enabled=storage_tracing_enabled(),
                     **counter.snapshot())
+        try:
+            result = function(store, wave_id, members, *args, **kwargs)
+            outcome = 'success'
+            return result
+        finally:
+            _IMAGES.reset(token)
+            if outcome == 'success' and hasattr(result, 'summary') and not result.done:
+                result.images, result.summary = images, emit
+            else:
+                emit()
     return wrapped
 
 

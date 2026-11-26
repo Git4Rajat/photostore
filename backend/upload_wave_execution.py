@@ -391,8 +391,12 @@ def _inspect_vision_member(store, wave_id, member, metadata_table, receipts):
 
 
 @processing_diagnostics.vision_group_summary
-def _process_vision_group(store, wave_id, members, metadata, process_source, renew, progressed, executor, receipts, inspection_failures=None, *, source_workers=1, expired=lambda: False, processed_members=None):
-    """Parallel source effects; the coordinator alone updates wave evidence."""
+def _process_vision_group(store, wave_id, members, metadata, process_source, renew, progressed, executor, receipts, inspection_failures=None, *, source_workers=1, expired=lambda: False, processed_members=None, carried=None, defer=False):
+    """Parallel source effects; the coordinator alone updates wave evidence.
+
+    `carried` is the previous page's unsettled _PageSettlement: the coordinator settles it a member at a time
+    while every source worker is busy, and always finishes it before returning. With `defer` this page's own
+    settlement is returned unstarted for the next call to carry; otherwise it is finished here."""
     from contextvars import copy_context
     from collections import deque
     from concurrent.futures import wait, FIRST_COMPLETED
@@ -500,9 +504,14 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
                 if (exhausted_members and not lookahead) or expired():
                     break
                 continue
-            # Every worker is busy: inspect upcoming members now so a freed
-            # worker is refilled without waiting on inspection. One member at a
-            # time, stopping as soon as any worker finishes.
+            # Every worker is busy: settle the previous page, then inspect
+            # upcoming members, so a freed worker is refilled without waiting on
+            # either. One member at a time, stopping as soon as any worker finishes.
+            if carried is not None and not carried.done:
+                settling = time.monotonic()
+                while not carried.done and not any(future.done() for future in futures):
+                    carried.step()
+                metrics.add(vision_settlement_overlap_ms=(time.monotonic() - settling) * 1000)
             ahead_started = time.monotonic()
             while (not exhausted_members and len(lookahead) < capacity and not expired()
                    and not any(future.done() for future in futures)):
@@ -531,79 +540,148 @@ def _process_vision_group(store, wave_id, members, metadata, process_source, ren
             wait(futures)
         elapsed_ms = (time.monotonic() - pool_started) * 1000
         metrics.add(vision_pool_ms=elapsed_ms, vision_pool_capacity_ms=elapsed_ms * capacity)
+    if carried is not None:
+        carried.finish()  # Before any error is raised below: its sources are already durable.
     for error in errors.values():
         if isinstance(error, (OwnershipLost, NotImplementedError)):
             raise error
     # Qualifying/settling drained source results is a durable batch boundary.
-    # Detect an intake reopen or lost release before interpreting those results.
-    settlement_started = time.monotonic()
+    # It is returned unsettled when the caller defers it behind the next page's
+    # sources; the caller then finishes it before committing or checkpointing.
     receipts.inspection = None  # Post-source qualification must see newly relayed inboxes.
-    getattr(renew, 'boundary', renew)()
-    # Rebuild mutable evidence only after the source pool has drained. These
-    # snapshots plan reads; qualification still rereads authoritative metadata.
-    from wave_source_batch import MetadataBatch, InspectionBatch
-    current_metadata = getattr(metadata, 'table', metadata)
-    runnable = [item['member'] for item in planned if item['runnable']]
-    qualification = None
-    if runnable:
+    settlement = _PageSettlement(store, wave_id, metadata, planned, counts, errors, receipts, renew)
+    if not defer:
+        settlement.finish()
+    return settlement
+
+
+class _PageSettlement:
+    """Qualifies one drained page's source results; its steps may run behind the next page's sources.
+
+    Only the coordinator thread calls this, so it shares the receipt cache safely. Nothing here advances
+    wave evidence: the caller commits `observations` and moves the checkpoint once `done`. Dropping an
+    unfinished settlement loses nothing durable; source results are already receipts and the checkpoint
+    still precedes the page, so the next attempt replays it without another model run."""
+    def __init__(self, store, wave_id, metadata, planned, counts, errors, receipts, renew):
+        self.store, self.wave_id, self.metadata, self.planned = store, wave_id, metadata, planned
+        self.counts, self.errors, self.receipts, self.renew = counts, errors, receipts, renew
+        self.observations, self.images, self.summary = [], None, None
+        self.spent = self.verifying = 0
+        self.items = iter(planned)
+        self.prepared = self.done = False
+        self.qualification = self.verify_metadata = None
+
+    def prepare(self):
+        import time
+        import processing_metrics as metrics
+        from wave_source_batch import MetadataBatch, InspectionBatch
+        from execution_lease import OwnershipLost
+        logger = logging.getLogger(__name__)
+        begun = time.monotonic()
+        self.prepared = True
+        getattr(self.renew, 'boundary', self.renew)()
+        # Rebuild mutable evidence only after the source pool has drained. These
+        # snapshots plan reads; qualification still rereads authoritative metadata.
+        store, metadata = self.store, self.metadata
+        current_metadata = getattr(metadata, 'table', metadata)
+        runnable = [item['member'] for item in self.planned if item['runnable']]
+        if runnable:
+            try:
+                with metrics.timer('vision_qualification_prefetch', count_name='vision_qualification_prefetch_calls'):
+                    post_metadata = MetadataBatch(current_metadata, store.library, runnable)
+                    self.qualification = InspectionBatch(store, runnable, post_metadata, self.receipts)
+            except (OwnershipLost, NotImplementedError):
+                raise
+            except Exception:
+                metrics.add(vision_qualification_fallback_members=len(runnable))
+                logger.exception('Vision qualification prefetch failed; using authoritative point reads')
+        self.verify_metadata = current_metadata
+        read_workers = _settlement_read_workers()
+        if runnable and read_workers > 1:
+            # Started after the prefetch so the rereads still see changes made during it; they run side by side, not member by member.
+            self.verify_metadata = _FreshRows(current_metadata, store.library,
+                                              [member['filename'] for member in runnable], read_workers)
+        getattr(self.renew, 'boundary', self.renew)()
+        self.spent += (time.monotonic() - begun) * 1000
+
+    def step(self):
+        """Settle the next member of the page; True once the whole page is settled."""
+        import time
+        import processing_metrics as metrics
+        from storage_utils import _processing_is_expired
+        from wave_settlement import exhausted, source_state
+        from processing_diagnostics import _IMAGES
+        if self.done:
+            return True
+        if not self.prepared:
+            self.prepare()
+        begun = time.monotonic()
+        item = next(self.items, None)
+        if item is None:
+            self._finish()
+            return True
+        token = _IMAGES.set(self.images) if self.images is not None else None
         try:
-            with metrics.timer('vision_qualification_prefetch', count_name='vision_qualification_prefetch_calls'):
-                post_metadata = MetadataBatch(current_metadata, store.library, runnable)
-                qualification = InspectionBatch(store, runnable, post_metadata, receipts)
-        except (OwnershipLost, NotImplementedError):
-            raise
-        except Exception:
-            metrics.add(vision_qualification_fallback_members=len(runnable))
-            logger.exception('Vision qualification prefetch failed; using authoritative point reads')
-    verify_metadata = current_metadata
-    read_workers = _settlement_read_workers()
-    if runnable and read_workers > 1:
-        # Started after the prefetch so the rereads still see changes made during it; they run side by side, not member by member.
-        verify_metadata = _FreshRows(current_metadata, store.library,
-                                     [member['filename'] for member in runnable], read_workers)
-    getattr(renew, 'boundary', renew)()
-    verification_started = time.monotonic()
-    observations = []
-    for item in planned:
+            self._settle(item, metrics, _processing_is_expired, exhausted, source_state)
+        finally:
+            if token is not None:
+                _IMAGES.reset(token)
+            self.spent += (time.monotonic() - begun) * 1000
+            self.verifying += (time.monotonic() - begun) * 1000
+        return False
+
+    def finish(self):
+        while not self.step():
+            pass
+        return self.observations
+
+    def _finish(self):
+        import processing_metrics as metrics
+        self.done = True
+        metrics.add(vision_settlement_ms=self.spent, vision_qualification_verify_ms=self.verifying)
+        if self.summary is not None:
+            summary, self.summary = self.summary, None
+            summary()
+
+    def _settle(self, item, metrics, _processing_is_expired, exhausted, source_state):
+        from execution_lease import OwnershipLost
+        store, wave_id, metadata, receipts, renew = self.store, self.wave_id, self.metadata, self.receipts, self.renew
+        logger = logging.getLogger(__name__)
         member = item['member']
         with processing_diagnostics.image_scope(member['RowKey'], 'qualification'):
             if item['runnable']:
                 renew()
                 metadata.invalidate(member['filename'])
-                from wave_settlement import source_state
-                if source_state(store, wave_id, member, verify_metadata,
-                        proofs=qualification.proofs if qualification is not None else None):
-                    continue
-                count, _ = counts[member['RowKey']]
-                error = errors.get(member['RowKey'])
+                if source_state(store, wave_id, member, self.verify_metadata,
+                        proofs=self.qualification.proofs if self.qualification is not None else None):
+                    return
+                count, _ = self.counts[member['RowKey']]
+                error = self.errors.get(member['RowKey'])
                 if error is not None and not exhausted(store, wave_id, member, metadata, count, error=error):
                     logger.error('Vision source failed for %s/%s; continuing wave', store.library,
                         member['filename'], exc_info=(type(error), error, error.__traceback__))
-                    continue
+                    return
                 try:
                     metrics.add(vision_qualification_fresh_metadata_reads=1)
-                    item['completion'], item['row'] = _observe_qualified(store, member, verify_metadata, receipts,
-                        inboxes=qualification.inboxes if qualification is not None else None)
+                    item['completion'], item['row'] = _observe_qualified(store, member, self.verify_metadata, receipts,
+                        inboxes=self.qualification.inboxes if self.qualification is not None else None)
                 except OwnershipLost:
                     raise
                 except Exception:
                     logger.exception('Vision receipt qualification failed for %s/%s; continuing wave',
                                      store.library, member['filename'])
                     exhausted(store, wave_id, member, metadata, count)
-                    continue
+                    return
                 if item['completion'] is None:
                     if exhausted(store, wave_id, member, metadata, count):
-                        continue
+                        return
             row, completion = item['row'], item['completion']
             leased = bool(row and any(row.get(k) for k in
                 ('processing_lease_owner', 'processing_lease', 'processing_lease_expires_at'))
                 and not _processing_is_expired(row))
-            observations.append((member, completion, leased))
+            self.observations.append((member, completion, leased))
             if completion is not None:
                 metrics.add(vision_qualification_completed=1)
-    metrics.add(vision_qualification_verify_ms=(time.monotonic() - verification_started) * 1000)
-    metrics.add(vision_settlement_ms=(time.monotonic() - settlement_started) * 1000)
-    return observations
 
 
 def _announce_queued(store, wave_id, wave):
@@ -696,7 +774,7 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
                        metadata_table, face_table, face_ids, cluster_send, *, process_source=None,
                        deadline=None, progress=None, before_freeze=None, source_workers=1, source_executor=None,
                        prepare_sources=None, inspection_failures=None, preview_loader=None,
-                       member_fetch_size=1000, page_overlap=None):
+                       member_fetch_size=1000, page_overlap=None, defer_settlement=None):
     """Resume bounded source/evaluation passes using qualified receipts.
 
     A checkpoint is a scan position, never proof of source completion. Each
@@ -721,6 +799,8 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
         raise ValueError('Vision source concurrency must be between 1 and the member page size')
     if page_overlap is None:
         page_overlap = os.getenv('IPWORK_VISION_PAGE_OVERLAP', 'true').lower() in ('1', 'true', 'yes')
+    if defer_settlement is None:
+        defer_settlement = os.getenv('IPWORK_VISION_DEFER_SETTLEMENT', 'true').lower() in ('1', 'true', 'yes')
     ownership, wave = claim_release(leases, store, library, wave_id, 'vision', outbox_key, 'vision')
     if ownership is None:
         return None
@@ -732,6 +812,7 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
         # use execution_scope's authoritative transaction guard below.
         stage_check(force=force)
     renew.boundary = lambda: renew(force=True)
+    deferred = [None]  # A drained page whose settlement and commit wait behind the next page's sources.
     counted = [0]  # Members finished in this wave's vision stage; rides the page checkpoint.
     def checkpoint(phase, after=''):
         position = dict(phase=phase, after=after)
@@ -782,59 +863,92 @@ def run_vision_release(leases, work_store, store, library, wave_id, outbox_key,
                 model_schedule='source_serial', clip_image_batch_size=int(os.getenv('IPWORK_CLIP_IMAGE_BATCH_SIZE', '1')))
             next_page = resources.enter_context(closing(_NextPage(window, store, metadata_table))) if page_overlap else None
             previous_names = ()
-            while phase == 'sources':
-                if expired(): return store._required(store.wave_key(wave_id))
-                renew(force=True)
-                with metrics.timer('vision_page_load', count_name='vision_page_load_calls'):
-                    loaded = next_page.take(cursor, previous_names) if next_page is not None else None
-                    if loaded is not None:
-                        members, page_done, metadata = loaded
-                    else:
-                        members = window.page(cursor)
-                        page_done = window.done
-                        with metrics.timer('vision_metadata_fetch', count_name='vision_metadata_fetch_calls'):
-                            metadata = MetadataBatch(metadata_table, store.library, members)
-                if next_page is not None and members and not page_done:
-                    next_page.start(members[-1]['RowKey'])
-                previous_names = {member['filename'] for member in members}
-                if members and prepare_sources is not None:
-                    progressed()
-                    with metrics.timer('vision_source_prepare', count_name='vision_source_prepare_calls'):
-                        from storage_utils import FaceReconciliationCancelled
-                        try:
-                            prepare_sources(members, metadata, renew, expired)
-                        except FaceReconciliationCancelled as error:
-                            if error.reason != 'caller_cancelled' or not expired():
-                                raise
-                            # No sources from this page have been admitted yet.
-                            checkpoint('sources', cursor)
-                            processing_diagnostics.emit('vision_deadline_yield', wave_id=wave_id,
-                                phase='source_prepare', reason='stage_deadline')
-                            return store._required(store.wave_key(wave_id))
-                    renew()
-                    progressed()
-                with metrics.timer('vision_inspection_prefetch', count_name='vision_inspection_prefetches'):
-                    receipts.inspection = InspectionBatch(store, members, metadata, receipts)
-                previews.prepare(members, metadata)
-                processed = []
-                observations = _process_vision_group(store, wave_id, members,
-                    metadata, process_source, renew, progressed, executor, receipts, inspection_failures,
-                    source_workers=source_workers, expired=expired, processed_members=processed)
-                if processed:
-                    cursor = processed[-1]['RowKey']
-                    counted[0] += len(processed)
-                    _report_vision_progress(progress_store, library, wave_id, counted[0], wave_total)
-                    progressed()
+
+            def commit_page(page):
                 # A checkpoint covers only drained groups. Source results are
                 # durable first; interruption before this commit is replayable
                 # through receipt qualification without another model attempt.
+                page['settlement'].finish()
+                counted[0] += page['count']
+                if page['count']:
+                    _report_vision_progress(progress_store, library, wave_id, counted[0], wave_total)
+                    progressed()
                 with metrics.timer('vision_page_commit', count_name='vision_page_commit_calls'):
-                    commit_observations(store, wave_id, observations)
-                checkpoint('sources', cursor)
-                if expired(): return store._required(store.wave_key(wave_id))
-                if page_done:
-                    phase = 'evaluate'
-                    checkpoint(phase)
+                    commit_observations(store, wave_id, page['settlement'].observations)
+                checkpoint('sources', page['cursor'])
+
+            def flush_deferred():
+                page, deferred[0] = deferred[0], None
+                if page is not None:
+                    commit_page(page)
+            try:
+                while phase == 'sources':
+                    if expired():
+                        flush_deferred()
+                        return store._required(store.wave_key(wave_id))
+                    renew(force=True)
+                    with metrics.timer('vision_page_load', count_name='vision_page_load_calls'):
+                        loaded = next_page.take(cursor, previous_names) if next_page is not None else None
+                        if loaded is not None:
+                            members, page_done, metadata = loaded
+                        else:
+                            members = window.page(cursor)
+                            page_done = window.done
+                            with metrics.timer('vision_metadata_fetch', count_name='vision_metadata_fetch_calls'):
+                                metadata = MetadataBatch(metadata_table, store.library, members)
+                    if next_page is not None and members and not page_done:
+                        next_page.start(members[-1]['RowKey'])
+                    previous_names = {member['filename'] for member in members}
+                    if members and prepare_sources is not None:
+                        progressed()
+                        with metrics.timer('vision_source_prepare', count_name='vision_source_prepare_calls'):
+                            from storage_utils import FaceReconciliationCancelled
+                            try:
+                                prepare_sources(members, metadata, renew, expired)
+                            except FaceReconciliationCancelled as error:
+                                if error.reason != 'caller_cancelled' or not expired():
+                                    raise
+                                # No sources from this page have been admitted yet.
+                                flush_deferred()
+                                checkpoint('sources', cursor)
+                                processing_diagnostics.emit('vision_deadline_yield', wave_id=wave_id,
+                                    phase='source_prepare', reason='stage_deadline')
+                                return store._required(store.wave_key(wave_id))
+                        renew()
+                        progressed()
+                    with metrics.timer('vision_inspection_prefetch', count_name='vision_inspection_prefetches'):
+                        receipts.inspection = InspectionBatch(store, members, metadata, receipts)
+                    previews.prepare(members, metadata)
+                    processed = []
+                    # The last page of a pass settles at once: evaluation needs every member settled.
+                    defer = defer_settlement and bool(members) and not page_done
+                    carried = deferred[0]['settlement'] if deferred[0] is not None else None
+                    settlement = _process_vision_group(store, wave_id, members,
+                        metadata, process_source, renew, progressed, executor, receipts, inspection_failures,
+                        source_workers=source_workers, expired=expired, processed_members=processed,
+                        carried=carried, defer=defer)
+                    if processed:
+                        cursor = processed[-1]['RowKey']
+                    page = dict(settlement=settlement, cursor=cursor, count=len(processed))
+                    flush_deferred()  # Settled during this page's sources; commit before this page's checkpoint.
+                    if defer and processed and not expired():
+                        deferred[0] = page
+                        continue
+                    commit_page(page)
+                    if expired(): return store._required(store.wave_key(wave_id))
+                    if page_done:
+                        phase = 'evaluate'
+                        checkpoint(phase)
+            except Exception as error:
+                from execution_lease import OwnershipLost
+                if deferred[0] is not None and not isinstance(error, (OwnershipLost, NotImplementedError)):
+                    # Ownership is intact, so keep the settled page; losing it would only cost a replay.
+                    try:
+                        flush_deferred()
+                    except Exception:
+                        logging.getLogger(__name__).warning('Deferred vision settlement flush failed for wave %s',
+                                                            wave_id, exc_info=True)
+                raise
             if before_freeze is not None:
                 if expired(): return store._required(store.wave_key(wave_id))
                 renew(force=True)
