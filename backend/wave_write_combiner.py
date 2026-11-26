@@ -13,6 +13,7 @@ A combined page fails as a unit, so a failed page is retried request by
 request: one request's binding conflict never fails another's.
 """
 import threading
+import time
 
 # Entries per combined commit; matches upload_waves.MAX_PAGE (one transaction).
 PAGE = 20
@@ -29,6 +30,10 @@ class _Request:
         self.done = threading.Event()
         self.result = None
         self.error = None
+        self.queued = time.perf_counter()
+        self.started = None   # when a commit carrying this chunk began
+        self.commit_ms = 0.0  # time spent in commits carrying it
+        self.page = None      # token of the combined page it rode on
 
 
 class _Queue:
@@ -37,12 +42,16 @@ class _Queue:
         self.committing = False
 
 
-def combine(key, entries, commit):
+def combine(key, entries, commit, timings=None):
     """commit(entries) -> result for 1..PAGE entries; returns this request's last result.
 
     key scopes coalescing (store table, library, session). Entries beyond one
     page are split across pages; the request finishes when all of them did.
+    When timings is a dict it receives wait_ms (queued until the first commit
+    carrying this request began), commit_ms (time in the commits carrying it),
+    pages (distinct commits it rode on) and total_ms.
     """
+    began = time.perf_counter()
     chunks = [_Request(entries[offset:offset + PAGE]) for offset in range(0, len(entries), PAGE)]
     if not chunks:
         raise ValueError('Nothing to resolve')
@@ -66,6 +75,12 @@ def combine(key, entries, commit):
             # The committer may finish without reaching this chunk; then
             # take over (wake periodically rather than per-queue signaling).
             next(chunk for chunk in chunks if not chunk.done.is_set()).done.wait(0.05)
+    if timings is not None:
+        started = [chunk.started for chunk in chunks if chunk.started is not None]
+        timings['wait_ms'] = round((min(started) - chunks[0].queued) * 1000) if started else 0
+        timings['commit_ms'] = round(sum({chunk.page: chunk.commit_ms for chunk in chunks}.values()))
+        timings['pages'] = len({chunk.page for chunk in chunks})
+        timings['total_ms'] = round((time.perf_counter() - began) * 1000)
     for chunk in chunks:
         if chunk.error is not None:
             raise chunk.error
@@ -82,6 +97,11 @@ def _drain(key, queue, commit):
                 size += len(request.entries)
         if not page:
             return
+        began = time.perf_counter()
+        token = object()
+        for request in page:
+            request.started = began
+            request.page = token
         try:
             result = commit([entry for request in page for entry in request.entries])
             for request in page:
@@ -96,5 +116,8 @@ def _drain(key, queue, commit):
                     except Exception as own:
                         request.error = own
         finally:
+            elapsed = (time.perf_counter() - began) * 1000
+            for request in page:
+                request.commit_ms = elapsed
             for request in page:
                 request.done.set()

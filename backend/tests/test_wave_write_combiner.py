@@ -80,3 +80,30 @@ def test_a_committer_hands_over_after_its_page_budget(monkeypatch):
     assert not errors
     assert len(committers) > 1
     assert not combiner._QUEUES
+
+
+def test_timings_split_queue_wait_from_commit():
+    gate = threading.Event()
+    def commit(page):
+        gate.wait(2)
+        time.sleep(0.03)
+        return len(page)
+    first, second = {}, {}
+    leader = threading.Thread(target=lambda: combiner.combine('t', ['a'], commit, first))
+    leader.start()
+    time.sleep(0.05)
+    follower = threading.Thread(target=lambda: combiner.combine('t', ['b'], commit, second))
+    follower.start()
+    time.sleep(0.05)
+    gate.set()
+    leader.join(5), follower.join(5)
+    assert first['pages'] == 1 and first['commit_ms'] >= 30 and first['wait_ms'] < 30
+    # The follower queued behind the leader's page, so it waited about one commit.
+    assert second['pages'] == 1 and second['commit_ms'] >= 30 and second['wait_ms'] >= 30
+    assert second['total_ms'] >= second['wait_ms'] + second['commit_ms'] - 5
+
+
+def test_timings_count_each_page_of_a_large_request_once():
+    timings = {}
+    combiner.combine('big', list(range(45)), lambda page: len(page), timings)
+    assert timings['pages'] == 3 and set(timings) == {'wait_ms', 'commit_ms', 'pages', 'total_ms'}
