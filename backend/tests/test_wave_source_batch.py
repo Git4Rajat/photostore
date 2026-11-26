@@ -439,7 +439,7 @@ def test_receipts_survive_page_boundary_but_inspection_snapshots_are_rebuilt(wor
     monkeypatch.setattr(wave_source_batch, 'InspectionBatch', inspect)
     def process(library, filename, revision, renew):
         publish_completion(store, metadata, filename=filename)
-    assert run(world, metadata, wave, key, process)['state'] == 'ready'
+    assert run(world, metadata, wave, key, process, defer_settlement=False)['state'] == 'ready'
     assert len(seen) == 4  # Selection and post-source snapshots for each page.
     assert seen[0][1] is not seen[1][1]
     assert set(seen[0][1].proofs).isdisjoint(seen[2][1].proofs)
