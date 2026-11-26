@@ -227,3 +227,15 @@ def test_index_wave_summary_emits_per_scope_phases_under_index_events(caplog):
     assert d._WAVE.get() is None  # Context restored after the stage.
     assert 'sdk_calls' not in summary  # No scope is not zero I/O.
     assert d._WAVE.get() is None
+
+
+def test_browser_batch_records_lane_count_and_a_slugged_reason(caplog):
+    batch = str(uuid.uuid4())
+    assert d.browser_batch('library', {'batchId': batch, 'phase': 'end', 'uploaded': 5, 'lanes': 20,
+                                       'laneReason': 'Reliable wired or strong wifi connection!'})
+    row, = records(caplog, 'browser_batch')
+    assert row['lanes'] == 20 and row['lane_reason'] == 'reliable_wired_or_strong_wifi_connection'
+    caplog.clear()
+    assert d.browser_batch('library', {'batchId': batch, 'phase': 'end', 'lanes': 'many', 'laneReason': 7})
+    row, = records(caplog, 'browser_batch')
+    assert 'lanes' not in row and 'lane_reason' not in row

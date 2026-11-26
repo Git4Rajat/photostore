@@ -617,8 +617,13 @@ def browser_batch(user, data):
     identifier = batch_id(data.get('batchId'))
     if not identifier or data.get('phase') not in ('start', 'end'):
         return False
-    fields = {key: value for key in ('selected', 'photos', 'videos', 'uploaded', 'failed', 'duplicates', 'elapsedMs')
+    fields = {key: value for key in ('selected', 'photos', 'videos', 'uploaded', 'failed', 'duplicates', 'elapsedMs', 'lanes')
               if type(value := data.get(key)) in (int, float) and math.isfinite(value) and 0 <= value <= 1e12}
+    # Why the browser chose that many lanes (getAdaptiveUploadProfile's reason): the lane count
+    # varies per run with what the browser reports about the network, so record it.
+    reason = data.get('laneReason')
+    if type(reason) is str and reason:
+        fields['lane_reason'] = re.sub(r'[^a-z0-9]+', '_', reason.lower()).strip('_')[:48]
     emit('browser_batch', library_id=file_id(user, ''), batch_id=identifier,
          phase=data['phase'], **fields)
     return True
