@@ -63,7 +63,7 @@ const InviteForm: React.FC<{
 /** Sharing — shared-library members, pending invites, and library settings. */
 const SharingPage: React.FC = () => {
     const {
-        members, pendingInvites, libraryName, isOwner, maxMembers, membersLoading,
+        members, pendingInvites, receivedInvites, libraryName, isOwner, maxMembers, membersLoading,
         fetchMembers, invite, revokeInvite, removeMember, renameLibrary, toast, totalPhotos, albums,
     } = useStore();
     const [inviteOpen, setInviteOpen] = useState(false);
@@ -100,6 +100,22 @@ const SharingPage: React.FC = () => {
             window.location.assign('/');
         } catch (err) {
             toast(err instanceof Error ? err.message : 'Couldn’t hand over the library', undefined, undefined, 'error');
+        }
+    };
+    // Invitations other libraries sent to this account. Accepting changes the active library, so reload.
+    const answerInvite = async (invite: library.ReceivedInvite, accept: boolean) => {
+        try {
+            if (accept) {
+                await library.acceptReceivedInvite(invite);
+                window.location.assign('/');
+            } else {
+                await library.declineReceivedInvite(invite);
+                toast('Invitation declined');
+                void fetchMembers();
+            }
+        } catch (err) {
+            toast(err instanceof Error ? err.message : 'Couldn’t answer that invitation', undefined, undefined, 'error');
+            void fetchMembers();
         }
     };
     const [email, setEmail] = useState('');
@@ -197,6 +213,25 @@ const SharingPage: React.FC = () => {
                             </button>
                         )}
                     </div>
+
+                    {receivedInvites.length > 0 && (
+                        <>
+                            <h2 className="pt-section-label">Invitations for you</h2>
+                            <div className="pt-list">
+                                {receivedInvites.map((r) => (
+                                    <div key={`${r.libraryId}:${r.inviteId}`} className="member-row pending">
+                                        <span className="pt-invite-icon" aria-hidden="true"><MailIcon /></span>
+                                        <span className="member-meta">
+                                            <b>{r.libraryName || 'A shared library'}</b>
+                                            <span>{r.invitedBy ? `From ${r.invitedBy} · ` : ''}{inviteEnds(r.expiresAt)}</span>
+                                        </span>
+                                        <button type="button" className="mock-link" onClick={() => void answerInvite(r, true)}>Join</button>
+                                        <button type="button" className="mock-link muted" onClick={() => void answerInvite(r, false)}>Decline</button>
+                                    </div>
+                                ))}
+                            </div>
+                        </>
+                    )}
 
                     <h2 className="pt-section-label">Members</h2>
                     <div className="pt-list">

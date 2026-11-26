@@ -23,7 +23,7 @@ import { publishLibraryChange } from '../../services/libraryChanges';
 import { chunk, measureGridCapacity, pageSizeForCapacity, runWithLimit } from '../../services/gridCapacity';
 import faceService from '../../services/faceService';
 import * as library from '../../services/libraryClient';
-import type { LibraryMember, PendingInvite } from '../../services/libraryClient';
+import type { LibraryMember, PendingInvite, ReceivedInvite } from '../../services/libraryClient';
 import type { PersonFace } from '../../types/people';
 import { isNamedLabel } from '../../utils/people';
 import { plural } from '../../utils/format';
@@ -385,6 +385,7 @@ interface Store {
     people: Person[];
     members: LibraryMember[];
     pendingInvites: PendingInvite[];
+    receivedInvites: ReceivedInvite[];
     libraryName: string;
     isOwner: boolean;
     maxMembers: number;
@@ -685,6 +686,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const [personPhotosLoading, setPersonPhotosLoading] = useState<boolean>(false);
     const [members, setMembers] = useState<LibraryMember[]>([]);
     const [pendingInvites, setPendingInvites] = useState<PendingInvite[]>([]);
+    const [receivedInvites, setReceivedInvites] = useState<ReceivedInvite[]>([]);
     const [libraryName, setLibraryName] = useState<string>('');
     const [isOwner, setIsOwner] = useState<boolean>(false);
     const [maxMembers, setMaxMembers] = useState<number>(15);
@@ -2975,6 +2977,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             const res = await library.getMembers();
             setMembers(res.members ?? []);
             setPendingInvites(res.pendingInvites ?? []);
+            setReceivedInvites(res.invitationsForYou ?? []);
             setLibraryName(res.name ?? '');
             setIsOwner(Boolean(res.isOwner));
             setMaxMembers(res.maxMembers ?? 15);
@@ -3070,6 +3073,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             people,
             members,
             pendingInvites,
+            receivedInvites,
             libraryName,
             isOwner,
             maxMembers,
@@ -3177,7 +3181,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             dismissToast,
         }),
         [
-            route, photos, albums, people, members, pendingInvites, libraryName, isOwner, maxMembers, membersLoading,
+            route, photos, albums, people, members, pendingInvites, receivedInvites, libraryName, isOwner, maxMembers, membersLoading,
             placesState, thingsState, trash, trashLoading, albumTrash, albumTrashLoading, selection, selectMode, viewer, toasts,
             photosLoading, hasMorePhotos, totalPhotos, overlayExtra.length, loadMorePhotos, reloadPhotos, applyPhotoDeleteCount,
             mediaFilter, setMediaFilter, galleryFilters, setGalleryRating, setGalleryLikedOnly, jumpToGalleryDate, captureRange, setCaptureRange, timeline,

@@ -62,7 +62,28 @@ def library_members():
             }
             for inv in app.library_store.pending_invites(library_id)
         ]
+    body['invitationsForYou'] = _received_invites(account_id)
     return app.jsonify(body)
+
+
+def _received_invites(account_id: str):
+    """Join invitations addressed to the caller's own email, from other libraries."""
+    email = str((app.library_store.get_user(account_id) or {}).get('email') or '')
+    out = []
+    for inv in app.library_store.invites_for_email(email):
+        library_id = str(inv.get('PartitionKey') or '')
+        if app.library_store.is_member(account_id, library_id):
+            continue
+        inviter = app.library_store.get_user(str(inv.get('invitedBy') or '')) or {}
+        out.append({
+            'inviteId': str(inv.get('RowKey') or ''),
+            'libraryId': library_id,
+            'libraryName': str((app.library_store.get_library(library_id) or {}).get('name') or ''),
+            'invitedBy': str(inviter.get('email') or ''),
+            'expiresAt': int(inv.get('expiresAt', 0) or 0),
+        })
+    return out
+
 
 def _invite_expiry():
     return datetime.now(timezone.utc) + timedelta(seconds=app.library_utils.INVITE_TTL_SECONDS)
@@ -182,6 +203,45 @@ def library_invite_revoke():
         return app.jsonify({'error': 'That invitation is no longer pending.'}), 404
     app.library_store.audit(library_id, actor=account_id, action='invite-revoked', target=invite_id)
     return app.jsonify({'status': 'ok'})
+
+@library_bp.route('/api/library/invitations/accept', methods=['POST'])
+def library_invitation_accept():
+    """Accept an invitation listed in the signed-in account's own Library and sharing page."""
+    account_id, _active, error = app._require_library_context(require_auth=True)
+    if error:
+        return error
+    data = app.request.get_json(silent=True) or {}
+    library_id = str(data.get('libraryId', '') or '').strip()
+    invite_id = str(data.get('inviteId', '') or '').strip()
+    email = str((app.library_store.get_user(account_id) or {}).get('email') or '')
+    invite = app.library_store.get_invite_for_email(library_id, invite_id, email)
+    if not invite:
+        return app.jsonify({'error': 'This invitation is no longer available.'}), 404
+    if not app.library_store.is_member(account_id, library_id):
+        if app.library_store.member_count(library_id) >= app.library_utils.MAX_LIBRARY_MEMBERS:
+            return app.jsonify({'error': f'This library is now full (max {app.library_utils.MAX_LIBRARY_MEMBERS}).'}), 409
+        app.library_store.add_membership(account_id, library_id, is_owner=False)
+    app.library_store.mark_invite_accepted(invite)
+    app.library_store.audit(library_id, actor=account_id, action='invite-accepted', target=invite.get('emailNorm'))
+    app.library_store.set_current_library(account_id, library_id)
+    return app.jsonify({'status': 'accepted', 'activeLibraryId': library_id})
+
+
+@library_bp.route('/api/library/invitations/decline', methods=['POST'])
+def library_invitation_decline():
+    account_id, _active, error = app._require_library_context(require_auth=True)
+    if error:
+        return error
+    data = app.request.get_json(silent=True) or {}
+    library_id = str(data.get('libraryId', '') or '').strip()
+    invite_id = str(data.get('inviteId', '') or '').strip()
+    email = str((app.library_store.get_user(account_id) or {}).get('email') or '')
+    if not app.library_store.get_invite_for_email(library_id, invite_id, email):
+        return app.jsonify({'error': 'This invitation is no longer available.'}), 404
+    app.library_store.revoke_invite(library_id, invite_id)
+    app.library_store.audit(library_id, actor=account_id, action='invite-declined', target=email)
+    return app.jsonify({'status': 'ok'})
+
 
 def _invite_probe_row() -> str:
     ip = app.request.remote_addr or ''
