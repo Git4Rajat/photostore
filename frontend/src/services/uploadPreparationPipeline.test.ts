@@ -7,7 +7,7 @@ vi.mock('./uploadAssetPreparation', () => ({UploadAssetPreparer: class {
     dispose = mocks.dispose;
 }}));
 vi.mock('../utils/browserExifTool', () => ({extractBrowserExif: mocks.exif, setBrowserExifWorkers: mocks.exifWorkers}));
-import {UploadPreparationPipeline, preparedThumbnail} from './uploadPreparationPipeline';
+import {BLOB_HOST_CONNECTIONS, BLOB_PRIORITY_SMALL, blobHostGate, UploadPreparationPipeline, preparedThumbnail} from './uploadPreparationPipeline';
 import {BASE_PREPARATION_LIMITS, FAST_PREPARATION_LIMITS} from './uploadPreparationLimits';
 
 const browserVerdict = {ok: true, result: {source: 'browser_exiftool', verifiedComplete: true, exifToolJson: {'EXIF:Make': 'Canon'}}};
@@ -555,4 +555,17 @@ test('the pipeline asks for the ExifTool worker count in its limits', () => {
     new UploadPreparationPipeline(BASE_PREPARATION_LIMITS).dispose();
     expect(mocks.exifWorkers).toHaveBeenLastCalledWith(1);
     expect(FAST_PREPARATION_LIMITS.exifWorkers).toBeGreaterThan(1);
+});
+
+test('a small PUT takes the next free blob connection ahead of queued block PUTs, and its budget starts then', async () => {
+    const signal = new AbortController().signal;
+    const held = await Promise.all(Array.from({length: BLOB_HOST_CONNECTIONS}, () => blobHostGate.acquire(signal)));
+    const order: string[] = [];
+    const block = blobHostGate.acquire(signal).then(r => { order.push('block'); return r; });
+    const small = blobHostGate.acquire(signal, BLOB_PRIORITY_SMALL).then(r => { order.push('small'); return r; });
+    held[0]!();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(order).toEqual(['small']);
+    held.slice(1).forEach(release => release!());
+    (await small)!(); (await block)!();
 });
