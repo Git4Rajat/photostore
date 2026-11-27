@@ -17,6 +17,13 @@ from azure.core.exceptions import ResourceNotFoundError
 from processing_artifacts import staging_name
 from upload_waves import digest
 
+class LibraryCleanupFence(RuntimeError):
+    """Processing is paused while a library cleanup runs; the stage resumes once the fence lifts.
+
+    Failure records keep only the exception class, so a distinct class is what tells an operator the cause.
+    """
+
+
 _SOURCE_POLICY = ContextVar('wave_source_policy_checks', default=None)
 _POLICY_BOUNDARY = ContextVar('source_policy_boundary', default=False)
 
@@ -246,7 +253,7 @@ def _check_source_policy(table, library):
     policy = store._get('policy')
     if policy and policy.get('protocol') == PROTOCOL and (
             policy.get('cleanupState') or policy.get('gcUntil', 0) > store.clock()):
-        raise RuntimeError('Processing is fenced by library cleanup')
+        raise LibraryCleanupFence('Processing is fenced by library cleanup')
 
 
 def _all_pages(store,prefix):
