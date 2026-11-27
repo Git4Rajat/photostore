@@ -52,7 +52,7 @@ param processingMode string = 'backend'
 param coreImage string = 'ghcr.io/git4rajat/photostore-backend@sha256:679efe1069d499f01e3b83aff45e988138783fa9b7c3fe960d75e9c47681c91d'
 
 @description('Public web (frontend) image. Defaults to an immutable @sha256 digest, never :latest, same as coreImage above.')
-param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:b8fa6382a34e6335f08f73b9ef7bd6e540a4ff86cacab2db8f9d57a0360e06b0'
+param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:fad9c1c8131514bb88cc5fdb5db0e34e2683acfde81bac1e9b2349cd4ad23a70'
 
 @description('Public vision (server-side image processing) image. Only pulled/deployed when processingMode is "backend" or "both". Same digest-pinning guidance as coreImage applies.')
 param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker@sha256:492c1b91e6b4f61dd950d81805adab4f7ef1fad2d73a76e990137f221c6e79d4'
@@ -100,7 +100,7 @@ param waveCapabilityId string = '7cba50a69ee4630bde1ca6ff2884648d24945512544f1df
 @description('Earlier release certificates this release may replace in place (set by the release pin job).')
 param waveCompatibleCapabilities string = '422055bd4b7e8a918342c255580baf369a3b32421c8b7444c7349cc0bd13ddf6,b111e2bfff409a536071bdbc89f0321c9249743c0dc4486e0009b1a0da6bba3a,b24701464e8a754d7a09b87e42f8f5a6f3e8e5504c727fdc97e370626b224006,d715bd1dfd346d8758cc94e858b187967f28ff1f69c048c5fa520293f07341ba,cbe86c3edb95a7ae4cf253c19ad8cecc6d3fbcc1bc022556606c4e9d0f2c27d5,e06541a00d63da1033a5eeaa163ad01f8c96436c4c63566477731ce580397b42,46a97224e1c89ab36103a0e450265e648118d4e9d6e8bc26682305ea50aa4458,4ad5fc0c0d53c75c063868846e002a900962745edaad0eae13beb05f001d4ccd'
 @description('Source commit of the pinned release (set by the release pin job).')
-param waveSourceCommit string = '8d5760904eb7c10450cd9e64e401a5fc49560c41'
+param waveSourceCommit string = 'dcb54139d2fd3731832807cb9ce65e243673fe05'
 param waveBootstrapPending bool = false
 param semanticTextEmbeddingEnabled bool = false
 
