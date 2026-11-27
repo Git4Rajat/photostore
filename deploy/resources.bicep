@@ -61,13 +61,13 @@ param processingMode string = 'backend'
 param browserUploadPreparation bool = true
 
 @description('Public core API image. Defaults to an immutable @sha256 digest (rewritten by the publish workflow after each qualified release), never :latest, so installs never auto-upgrade. To upgrade an EXISTING deployment, override with the new release digest.')
-param coreImage string = 'ghcr.io/git4rajat/photostore-backend@sha256:f1d9c79ff4da2402f7032b41e7c4c17098444201a223599af6b6240091ac4e09'
+param coreImage string = 'ghcr.io/git4rajat/photostore-backend@sha256:679efe1069d499f01e3b83aff45e988138783fa9b7c3fe960d75e9c47681c91d'
 
 @description('Public web (frontend) image. Defaults to an immutable @sha256 digest, never :latest, same as coreImage above.')
 param webImage string = 'ghcr.io/git4rajat/photostore-frontend@sha256:6f6c4846d6761e1350e2cf1cadc54ee90937ad7b2b9ede0bf15b1029a84643d1'
 
 @description('Public vision (server-side image processing) image. Only pulled/deployed when processingMode is "backend" or "both". Separate from coreImage (unlike the clustering `cluster` role, which reuses it) because vision needs torch/open_clip/onnxruntime/opencv/mediapipe/tesseract -- multiple GB of extra weight that would slow every core/cluster cold start if bundled into their shared image. Same digest-pinning guidance as coreImage applies.')
-param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker@sha256:31a17df66aa49f3baed20d6c059b6397574220868932797ab43fef0f78cc9bfb'
+param visionImage string = 'ghcr.io/git4rajat/photostore-ipworker@sha256:492c1b91e6b4f61dd950d81805adab4f7ef1fad2d73a76e990137f221c6e79d4'
 
 @description('Quota in GiB for the dedicated clustering FAISS checkpoint SMB share. Local SQLite/work files remain on ephemeral storage.')
 @minValue(1)
@@ -106,12 +106,12 @@ param enableWaveExecution bool = true
 @description('Enroll newly created empty libraries only. Existing libraries never change ownership.')
 param enableNewWaveLibraries bool = true
 @description('Exact-image capability ID. Fresh wave activation requires the seeded release certificate; never leave empty.')
-param waveCapabilityId string = '422055bd4b7e8a918342c255580baf369a3b32421c8b7444c7349cc0bd13ddf6'
+param waveCapabilityId string = '7cba50a69ee4630bde1ca6ff2884648d24945512544f1df76fc0b2f2ce9bfcb2'
 
 @description('Earlier release certificates this release may replace in place (set by the release pin job).')
-param waveCompatibleCapabilities string = 'b111e2bfff409a536071bdbc89f0321c9249743c0dc4486e0009b1a0da6bba3a,b24701464e8a754d7a09b87e42f8f5a6f3e8e5504c727fdc97e370626b224006,d715bd1dfd346d8758cc94e858b187967f28ff1f69c048c5fa520293f07341ba,cbe86c3edb95a7ae4cf253c19ad8cecc6d3fbcc1bc022556606c4e9d0f2c27d5,e06541a00d63da1033a5eeaa163ad01f8c96436c4c63566477731ce580397b42,46a97224e1c89ab36103a0e450265e648118d4e9d6e8bc26682305ea50aa4458,4ad5fc0c0d53c75c063868846e002a900962745edaad0eae13beb05f001d4ccd,a944595f8cbdc66f7a18ae9cb037def36d177fb209a2b4656e23efe2bbfe52c4'
+param waveCompatibleCapabilities string = '422055bd4b7e8a918342c255580baf369a3b32421c8b7444c7349cc0bd13ddf6,b111e2bfff409a536071bdbc89f0321c9249743c0dc4486e0009b1a0da6bba3a,b24701464e8a754d7a09b87e42f8f5a6f3e8e5504c727fdc97e370626b224006,d715bd1dfd346d8758cc94e858b187967f28ff1f69c048c5fa520293f07341ba,cbe86c3edb95a7ae4cf253c19ad8cecc6d3fbcc1bc022556606c4e9d0f2c27d5,e06541a00d63da1033a5eeaa163ad01f8c96436c4c63566477731ce580397b42,46a97224e1c89ab36103a0e450265e648118d4e9d6e8bc26682305ea50aa4458,4ad5fc0c0d53c75c063868846e002a900962745edaad0eae13beb05f001d4ccd'
 @description('Source commit of the pinned release (set by the release pin job).')
-param waveSourceCommit string = '0943a449043e3670c7e32f627fc30e9abda61724'
+param waveSourceCommit string = '5d92806484af3fc4f1c06ea14d476c0920fb1bf0'
 @description('Fresh-install preparation only: block upload intake and run certificate seeding as a manual recovery job. Activate only after that job succeeds.')
 param waveBootstrapPending bool = false
 @description('Have Vision encode a text vector of each photo description while processing (about 126 ms per photo). Off by default: search ranks on the image vector and the indexes rebuild any text vector they need.')
