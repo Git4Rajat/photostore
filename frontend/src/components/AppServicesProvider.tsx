@@ -4019,13 +4019,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
             // Put only a small startup window on the critical path. A rolling
             // producer below admits a bounded look-ahead as workers consume it;
             // init-batch remains the exact, fail-closed admission path.
-            let admittedFileCount = 0;
             let requestedAdmissionCount = 0;
             let rollingWaveAdmission: Promise<void> = Promise.resolve();
             if (waveLiveEnabled() && pendingFiles.length) {
                 const startupFiles=pendingFiles.slice(0,WAVE_STARTUP_ADMISSION_SIZE);
                 await registerWaveItemsBatch(normalized,startupFiles,false);
-                admittedFileCount = requestedAdmissionCount = startupFiles.length;
+                requestedAdmissionCount = startupFiles.length;
             }
             if (uploadRunGenerationRef.current !== uploadRunGeneration) return;
             admissionReady = true;
@@ -4050,7 +4049,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
             const refillWaveAdmission = (consumedThrough: number) => {
                 if (!waveLiveEnabled() || requestedAdmissionCount >= pendingFiles.length
-                    || admittedFileCount - consumedThrough > WAVE_ADMISSION_LOW_WATER) return;
+                    // Count what is already requested, not only what has
+                    // completed: while a refill is in flight the completed
+                    // count is stale, so every file a lane took would fire its
+                    // own one-file refill (about 150 small /items calls a
+                    // minute, queued ahead of init batches, 2026-11-27).
+                    || requestedAdmissionCount - consumedThrough > WAVE_ADMISSION_LOW_WATER) return;
                 // Keep refilling while finalizes are pending. This used to stop
                 // at the first finalize, which left the window empty for the
                 // rest of the run: every init batch then registered its own 24
@@ -4064,7 +4068,6 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                 rollingWaveAdmission = rollingWaveAdmission.then(async () => {
                     try {
                         await registerWaveItemsBatch(normalized, pendingFiles.slice(start, target), false);
-                        admittedFileCount = Math.max(admittedFileCount, target);
                     } catch {
                         // Do not reserve the failed range. Exact init admission
                         // remains fail-closed and retries only files workers use.
