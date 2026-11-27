@@ -1,3 +1,4 @@
+import { perf } from './perf';
 import { waveParentFor, recordWaveItemResolved, waveParentResolved, waveSelectionSession, waveFileBelongs, loadWaveOperation, retireWaveOperation, type Operation } from './uploadWaveOperations';
 import { sessionScope } from './sessionScope';
 import type { PersistedUploadFile, PersistedUploadSession } from '../types/browserProcessing';
@@ -157,12 +158,17 @@ export const registerWaveItemsBatch = async (
     // refill for future files.
     const needsRegistration = files.some(file => waveFileBelongs(session, file)
         && !state.registeredItems.has(file.waveItemKey || file.key));
+    const registerStartedAt = Date.now();
     const registration = needsRegistration ? state.registrationPending.then(async () => {
         // Compute this inside the chain. A preceding look-ahead or init batch
         // may have admitted some of the same files while this caller waited.
         const items = files.filter(file => waveFileBelongs(session, file))
             .map(file => ({ itemId: file.waveItemKey || file.key, filename: file.name }))
             .filter(item => !state.registeredItems.has(item.itemId));
+        const queuedMs = Date.now() - registerStartedAt;
+        // Who is registering and how much: the look-ahead (identities not
+        // requested) or an init batch falling back to its own files.
+        perf.recordSpan(`upload.wave.register.${includeIdentities ? 'init' : 'ahead'}`, queuedMs, { n: items.length, rows: files.length });
         for (let offset = 0; offset < items.length; offset += WAVE_REGISTER_MAX_BATCH) {
             const page = items.slice(offset, offset + WAVE_REGISTER_MAX_BATCH);
             let result;
