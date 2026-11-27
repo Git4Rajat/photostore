@@ -166,3 +166,38 @@ def test_new_init_does_not_reuse_blob_claimed_by_upload_cleanup(batch_ctx,batch)
         reserved=storage_utils.reset_upload_tracking_and_reserve_blob('lib-A','a.jpg',100,'same')
     assert reserved and reserved!='cleaning'
     assert json.loads(batch_ctx.get_entity('lib-A','a.jpg')['uploadCleanupBlobs'])==['cleaning']
+
+
+def test_deletion_tombstone_is_not_a_merely_trashed_row():
+    assert storage_utils._is_deletion_tombstone({'processing_state': 'deleted', 'processingDeletedAttempt': ''})
+    assert not storage_utils._is_deletion_tombstone({'processing_state': 'deleted', 'deletedAt': '2026-11-27T10:00:00+00:00'})
+    assert not storage_utils._is_deletion_tombstone({'processing_state': 'active', 'processingDeletedAttempt': 'x'})
+
+
+def _live_intake(monkeypatch, metadata):
+    import wave_policy
+    monkeypatch.setattr(wave_policy, 'finalization_check', lambda: True)
+
+    def transaction(operations, **_kwargs):
+        for _op, entity, *_rest in operations:
+            metadata.rows[(entity['PartitionKey'], entity['RowKey'])] = dict(entity)
+        return [{} for _ in operations]
+    monkeypatch.setattr(metadata, 'submit_transaction', transaction)
+
+
+def test_init_reclaims_the_name_of_a_trashed_photo(batch_ctx, monkeypatch):
+    batch_ctx.upsert_entity({'PartitionKey': 'lib-A', 'RowKey': 'IMG_1.HEIC', 'processing_state': 'deleted',
+                             'deletedAt': '2026-11-27T10:00:00+00:00'})
+    _live_intake(monkeypatch, batch_ctx)
+    result = storage_utils.reset_upload_tracking_and_reserve_blobs_batch('lib-A', [
+        {'filename': 'IMG_1.HEIC', 'total_size': 10, 'expected_hash': None, 'is_fresh': True}])
+    assert 'IMG_1.HEIC' in result
+
+
+def test_init_still_refuses_a_name_whose_permanent_delete_is_running(batch_ctx, monkeypatch):
+    batch_ctx.upsert_entity({'PartitionKey': 'lib-A', 'RowKey': 'IMG_1.HEIC', 'processing_state': 'deleted',
+                             'processingDeletedAttempt': ''})
+    _live_intake(monkeypatch, batch_ctx)
+    with pytest.raises(ValueError, match='deletion is in progress'):
+        storage_utils.reset_upload_tracking_and_reserve_blobs_batch('lib-A', [
+            {'filename': 'IMG_1.HEIC', 'total_size': 10, 'expected_hash': None, 'is_fresh': True}])

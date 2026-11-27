@@ -11965,7 +11965,7 @@ def finalize_uploaded_file(
     # Which write mode applies is known without reading the fence; the fence itself is checked once,
     # immediately before the write below, where it matters.
     live_finalization=finalization_active()
-    if live_finalization and metadata.get('processing_state')=='deleted':
+    if live_finalization and _is_deletion_tombstone(metadata):
         raise ValueError('Photo deletion is in progress; retry upload after deletion completes')
     finalize_etag=getattr(metadata,'metadata',{}).get('etag')
     from benchmark_upload import isolated
@@ -12034,6 +12034,8 @@ def finalize_uploaded_file(
     metadata['processing_metadata'] = json.dumps({})
     metadata.pop('uploadMetadataPacket', None)
     metadata['processing_state'] = 'active'
+    if metadata.get('deletedAt'):
+        metadata['deletedAt'] = ''  # reclaiming a Recently Deleted name: the row is live again
     metadata['processing_lease'] = ''
     metadata['processing_lease_expires_at'] = ''
     metadata['processing_lease_owner'] = ''
@@ -12637,6 +12639,14 @@ def _claim_filename_owner(user_id: str, filename: str, file_hash: str) -> bool:
         return True
 
 
+def _is_deletion_tombstone(row) -> bool:
+    """A row a permanent delete is tearing down (processing_cleanup writes
+    processingDeletedAttempt when it fences one). A merely trashed row is also
+    processing_state 'deleted' but has no such key, and its name can be reclaimed
+    by an upload, the same as _claim_filename_owner allows."""
+    return row.get('processing_state') == 'deleted' and 'processingDeletedAttempt' in row
+
+
 _INVALID_TABLE_KEY_CHARS = re.compile(r'[\x00-\x1f\x7f-\x9f/\\#?]')
 
 
@@ -13013,7 +13023,7 @@ def reset_upload_tracking_and_reserve_blob(
     from wave_policy import finalization_check
     live_intake=finalization_check()
     intake_etag=getattr(entity,'metadata',{}).get('etag')
-    if live_intake and entity.get('processing_state')=='deleted':
+    if live_intake and _is_deletion_tombstone(entity):
         raise ValueError('Photo deletion is in progress')
 
     # See reserve_pending_anonymous_blob's docstring: only the transient pending
@@ -13094,7 +13104,7 @@ def reset_upload_tracking_and_reserve_blobs_batch(
         filename = str(f['filename'])
         entity = existing_by_name.get(filename) or {'PartitionKey': user_id, 'RowKey': filename}
         intake_etag=getattr(entity,'metadata',{}).get('etag')
-        if live_intake and entity.get('processing_state')=='deleted':raise ValueError('Photo deletion is in progress')
+        if live_intake and _is_deletion_tombstone(entity):raise ValueError('Photo deletion is in progress')
         expected_hash = f.get('expected_hash')
 
         # See reserve_pending_anonymous_blob's docstring: never fall back to a
