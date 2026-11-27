@@ -144,6 +144,22 @@ async function advance(ms: number) {
     await act(async () => { await vi.advanceTimersByTimeAsync(ms); });
 }
 
+const liveStored = new Map<string, string>();
+
+// The live library holds the latest snapshot's photos and everything finalized so far.
+async function liveCheck(payload: { hashes: string[] }) {
+    const known: Record<string, string> = {};
+    for (const hash of payload.hashes) if (liveStored.has(hash)) known[hash] = liveStored.get(hash)!;
+    const snapshotCalls = Array.from(mocks.getUpload.mock.calls.keys())
+        .filter((index) => mocks.getUpload.mock.calls[index][0] === '/upload/known-hashes');
+    for (const index of snapshotCalls.slice(-1)) {
+        const settled = await Promise.race([Promise.resolve(mocks.getUpload.mock.results[index].value), Promise.resolve('pending')]);
+        const hashes = (settled as { hashes?: Record<string, string> } | undefined)?.hashes;
+        for (const hash of payload.hashes) if (hashes?.[hash]) known[hash] = hashes[hash];
+    }
+    return { known };
+}
+
 beforeEach(() => {
     vi.useFakeTimers();
     vi.clearAllMocks();
@@ -160,6 +176,7 @@ beforeEach(() => {
     vi.stubGlobal('sessionStorage', memoryStorage());
     localStorage.clear();
     sessionStorage.clear();
+    liveStored.clear();
     mocks.getUpload.mockImplementation(async () => ({ hashes: {} }));
     mocks.transferred.mockResolvedValue(undefined);
     mocks.committed.mockResolvedValue(undefined);
@@ -167,6 +184,7 @@ beforeEach(() => {
     mocks.idbDelete.mockResolvedValue(undefined);
     mocks.idbGet.mockResolvedValue(null);
     mocks.postUpload.mockImplementation(async (url: string, payload: { filename: string; files: Array<{ filename: string }> }) => {
+        if (url === '/upload/known-hashes/check') return liveCheck(payload as unknown as { hashes: string[] });
         if (url === '/upload/init') {
             return { uploadId: payload.filename, blobName: `blob-${payload.filename}`,
                 blobUrl: `https://test.blob.core.windows.net/images/${payload.filename}` };
@@ -182,6 +200,7 @@ beforeEach(() => {
             })) };
         }
         if (url === '/upload/finalize-batch') {
+            for (const file of payload.files as Array<{ filename: string; sha256?: string }>) if (file.sha256) liveStored.set(file.sha256, file.filename);
             return { results: payload.files.map((file) => ({ filename: file.filename, complete: true, duplicates: [] })) };
         }
         return {};
@@ -1176,6 +1195,7 @@ describe('browser upload selection and startup', () => {
         const failingNames = new Set(['original-3.heic', 'original-4.heic']);
         const failingNamesAtStart = new Set(failingNames);
         mocks.postUpload.mockImplementation(async (url: string, payload: { filename: string; files: Array<{ filename: string }> }) => {
+            if (url === '/upload/known-hashes/check') return liveCheck(payload as unknown as { hashes: string[] });
             if (url === '/upload/init') {
                 return { uploadId: payload.filename, blobName: `blob-${payload.filename}`,
                     blobUrl: `https://test.blob.core.windows.net/images/${payload.filename}` };
@@ -1276,9 +1296,13 @@ describe('browser upload selection and startup', () => {
 
     it('caches the finalized filename for later copies after the backend renames a source', async () => {
         const postUpload = mocks.postUpload.getMockImplementation()!;
-        mocks.postUpload.mockImplementation((url, payload) => url === '/upload/finalize-batch'
-            ? Promise.resolve({ results: payload.files.map(() => ({ filename: 'renamed.heic', complete: true, duplicates: [] })) })
-            : postUpload(url, payload));
+        mocks.postUpload.mockImplementation((url, payload) => {
+            if (url === '/upload/finalize-batch') {
+                for (const item of payload.files) if (item.sha256) liveStored.set(item.sha256, 'renamed.heic');
+                return Promise.resolve({ results: payload.files.map(() => ({ filename: 'renamed.heic', complete: true, duplicates: [] })) });
+            }
+            return postUpload(url, payload);
+        });
         const file = filesFor(1)[0];
         const input = select([file]);
         await advance(4000);
@@ -1301,6 +1325,21 @@ describe('browser upload selection and startup', () => {
         expect(mocks.postUpload.mock.calls.some(([url]) => String(url).startsWith('/upload/waves/'))).toBe(false);
         expect(services.pendingUploadSummary).toBeNull();
         expect(services.notifications.some((notification) => notification.progress?.skippedDuplicateCount === 1)).toBe(true);
+    });
+
+    it('uploads a file whose snapshot hash belongs to a trashed photo', async () => {
+        const file = filesFor(1)[0];
+        const hash = Array.from(new TextEncoder().encode(file.name)).join('-');
+        mocks.getUpload.mockResolvedValue({ hashes: { [hash]: 'trashed.heic' } });
+        const base = mocks.postUpload.getMockImplementation()!;
+        // The live lookup ignores trashed photos, so it does not confirm the snapshot hit.
+        mocks.postUpload.mockImplementation(async (url: string, payload: any, ...rest: unknown[]) => url === '/upload/known-hashes/check'
+            ? { known: {} }
+            : base(url, payload, ...rest));
+        select([file]);
+        await advance(4000);
+        expect(initFiles()).toHaveLength(1);
+        expect(mocks.transferred).toHaveBeenCalledTimes(1);
     });
 
     it('loads library hashes while the picker is open without downloading them twice', async () => {
