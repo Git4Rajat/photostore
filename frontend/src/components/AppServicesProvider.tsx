@@ -2578,8 +2578,12 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
     // registration made startup proportional to file count and an unbounded
     // background pass competed with finalization on the same Table rows.
     const WAVE_STARTUP_ADMISSION_SIZE = 48;
-    const WAVE_ADMISSION_LOW_WATER = 48;
-    const WAVE_ADMISSION_HIGH_WATER = 192;
+    // Refill early enough to outlast a slow registration call. On 2026-11-27
+    // /items calls of ~144 files took 2-9 s on average and up to ~20 s while
+    // finalizes ran; with 48 files of runway (~12 s at ~4 files/s) the window
+    // ran dry and init batches queued behind the call. 144 files is ~36 s.
+    const WAVE_ADMISSION_LOW_WATER = 144;
+    const WAVE_ADMISSION_HIGH_WATER = 288;
 
     const flushInitBatch = (force: boolean) => {
         if (batchInitDebounceTimerRef.current) {
