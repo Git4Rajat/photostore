@@ -78,7 +78,8 @@ def ranked_filenames(user_id: str, person_id: str, members_table, face_table, *,
                 return None                                   # no longer this person's face
             attrs = attributes_for_face(face)
             try:
-                members_table.upsert_entity({'PartitionKey': row['_owner'], 'RowKey': row['RowKey'], **attrs}, mode='merge')
+                # Update only, so a row removed since the query is not re-created without its userId.
+                members_table.update_entity({'PartitionKey': row['_owner'], 'RowKey': row['RowKey'], **attrs}, mode='merge')
             except Exception:
                 pass                                          # still usable this time; retried next open
             return attrs

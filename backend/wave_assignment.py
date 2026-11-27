@@ -33,6 +33,13 @@ from upload_waves import digest
 from table_reads import read_entities
 from wave_policy import source_change
 
+
+class MembershipConflict(ValueError):
+    """A person-membership row already exists for this face and is not this library's.
+
+    Failure records keep only the exception class, so a distinct class is what tells an operator the cause.
+    """
+
 JOURNAL_PAYLOAD_BYTES = 60_000
 
 
@@ -465,7 +472,7 @@ def _apply(assigner, library, face, decision, decision_id, guard, wave_id, obser
         except ResourceExistsError:
             member = _point(assigner.member_table, target, face['RowKey'])
             if member is None or member.get('userId') != library:
-                raise ValueError('Person membership belongs to another library')
+                raise MembershipConflict('Person membership belongs to another library')
     face_row = clean(live)
     face_row.update(personId=target, assignmentDecisionId=decision_id)
     _write(assigner.face_table, face_row, live, guard)

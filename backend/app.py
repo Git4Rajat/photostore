@@ -15748,13 +15748,18 @@ def _set_faces_source_deleted_for_filenames(user_id: str, filenames, deleted: bo
         member_updated = 0
         if person_id and person_members_table_client is not None:
             try:
-                person_members_table_client.upsert_entity({
+                # Update only: an upsert would re-create a member row that was
+                # already removed, leaving a row with no userId that the wave
+                # assignment later rejects as another library's.
+                person_members_table_client.update_entity({
                     'PartitionKey': person_id,
                     'RowKey': face_id,
                     'filename': filename,
                     'sourceDeleted': '1' if deleted else '',
                 }, mode=UpdateMode.MERGE)
                 member_updated = 1
+            except ResourceNotFoundError:
+                member_updated = 0
             except Exception:
                 member_updated = 0
             try:
