@@ -74,7 +74,7 @@ import { checkKnownUploadHashes, fetchKnownUploadHashes, requestUploadHashRefres
 import { perf } from '../services/perf';
 import { UploadSessionStore } from '../services/uploadSessionStore';
 import { uploadPreparationLimits } from '../services/uploadPreparationLimits';
-import { UploadPreparationPipeline, preparedThumbnail, type PreparedUpload, type UploadAssetTargets } from '../services/uploadPreparationPipeline';
+import { UploadPreparationPipeline, blobHostGate, BLOB_PRIORITY_SMALL, preparedThumbnail, type PreparedUpload, type UploadAssetTargets } from '../services/uploadPreparationPipeline';
 import type { UploadMetadataDescriptor } from '../utils/uploadMetadata';
 import { prewarmBrowserExifTool } from '../utils/browserExifTool';
 import {
@@ -3653,9 +3653,15 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                     let lastError: unknown = null;
                     for (let attempt = 0; attempt < 3; attempt += 1) {
                         try {
-                            await blockBlobClient.stageBlock(blockId, file.slice(start, end), end - start, {
-                                abortSignal: options?.signal,
-                            });
+                            const connection = await blobHostGate.acquire(options?.signal ?? new AbortController().signal);
+                            if (!connection) throw new Error(UPLOAD_STOPPED_ERROR);
+                            try {
+                                await blockBlobClient.stageBlock(blockId, file.slice(start, end), end - start, {
+                                    abortSignal: options?.signal,
+                                });
+                            } finally {
+                                connection();
+                            }
                             blockIds[blockIndex] = blockId;
                             // committedBytes is a running total (not a contiguous
                             // offset), so it stays monotonic even as blocks finish out
@@ -3714,7 +3720,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                             throw new Error(UPLOAD_STOPPED_ERROR);
                         }
                         try {
-                            await blockBlobClient.upload(file, file.size, commitOptions);
+                            const connection = await blobHostGate.acquire(options?.signal ?? new AbortController().signal);
+                            if (!connection) throw new Error(UPLOAD_STOPPED_ERROR);
+                            try {
+                                await blockBlobClient.upload(file, file.size, commitOptions);
+                            } finally {
+                                connection();
+                            }
                             break;
                         } catch (error) {
                             if (isAbortUploadError(error) || !isRetriableUploadError(error) || attempt >= 2) throw error;
@@ -3723,7 +3735,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
                         }
                     }
                 } else {
-                    await blockBlobClient.commitBlockList(finalBlockIds, commitOptions);
+                    const connection = await blobHostGate.acquire(options?.signal ?? new AbortController().signal, BLOB_PRIORITY_SMALL);
+                    if (!connection) throw new Error(UPLOAD_STOPPED_ERROR);
+                    try {
+                        await blockBlobClient.commitBlockList(finalBlockIds, commitOptions);
+                    } finally {
+                        connection();
+                    }
                 }
             } catch (commitErr) {
                 // abortSignal only tears down the client's view of the request --

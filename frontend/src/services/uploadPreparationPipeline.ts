@@ -20,7 +20,7 @@ export const preparedThumbnail = (prepared: object | undefined | null): Blob | u
 export interface UploadAssetTargets {previewBlobUrl?: string; thumbnailBlobUrl?: string; metadataBlobUrl?: string; uploadPreparationEnabled?: boolean; metadataPreparationReason?: string;}
 
 // Queued entries retain only File references; decoding and PUTs remain bounded.
-class PreparationGate {
+export class PreparationGate {
     private active = 0;
     private waiting: Array<{priority: number; grant: () => void}> = [];
     constructor(private limit: number) {}
@@ -52,6 +52,15 @@ class PreparationGate {
         });
     }
 }
+
+// Every request to the blob host shares the browser's ~6-connection HTTP/1.1 ceiling. Gating them
+// here, with the tiny preview/thumbnail/metadata PUTs and block-list commits ahead of the big block
+// PUTs, keeps the browser's own queue empty: a small PUT waits for the next block to finish (a few
+// seconds) instead of sitting behind every queued block, and its timeout only runs while it holds a
+// connection. Total in flight stays at 6, so large-file throughput is unchanged.
+export const BLOB_HOST_CONNECTIONS = 6;
+export const BLOB_PRIORITY_SMALL = 1;
+export const blobHostGate = new PreparationGate(BLOB_HOST_CONNECTIONS);
 
 const delay = (ms: number, signal: AbortSignal): Promise<void> => new Promise(resolve => {
     const done = () => { clearTimeout(timer); signal.removeEventListener('abort', done); resolve(); };
@@ -184,30 +193,20 @@ export class UploadPreparationPipeline {
         const started = performance.now();
         const controller = new AbortController();
         let timedOut = false;
+        let timer: ReturnType<typeof setTimeout> | undefined;
         const abort = () => controller.abort();
         signal.addEventListener('abort', abort, {once: true});
         if (signal.aborted) abort();
-        const timer = setTimeout(() => { timedOut = true; controller.abort(); }, 45_000);
         try {
             for (let attempt = 1; attempt <= 3 && !controller.signal.aborted; attempt++) {
                 diagnostic.attempts = attempt;
                 let retryMs = 500 * 2 ** (attempt - 1);
+                const connection = await blobHostGate.acquire(controller.signal, BLOB_PRIORITY_SMALL);
+                if (!connection) break;
+                // The 45 s budget (all attempts and Retry-After waits) starts once this PUT first holds
+                // one of the blob host's connections, so waiting behind big block PUTs cannot spend it.
+                timer ??= setTimeout(() => { timedOut = true; controller.abort(); }, 45_000);
                 try {
-                    // These PUTs (sub-1.5MB preview/thumbnail/metadata) share
-                    // *.blob.core.windows.net's real ~6-connection-per-origin
-                    // ceiling with the much larger, much slower original-file
-                    // chunk PUTs (which can legitimately run many more than 6
-                    // concurrent lanes for a big batch -- see
-                    // TARGET_CONCURRENT_UPLOAD_BLOCKS's lane-budget comment in
-                    // AppServicesProvider.tsx, that's deliberate, not a bug).
-                    // Without a priority hint, a tiny request that would finish
-                    // almost instantly can land behind a queue of multi-second
-                    // chunk PUTs with no way to jump ahead -- confirmed live via
-                    // HAR capture 2026-10-18: median 96% of a preview/thumbnail
-                    // PUT's wall time was spent purely queued for a connection,
-                    // not transferring. 'priority' (Fetch Priority API, Chrome/
-                    // Edge 101+) is a hint, not a guarantee, and simply ignored
-                    // by runtimes that predate it -- safe to set unconditionally.
                     const response = await fetch(url, {method: 'PUT', body: blob, signal: controller.signal,
                         priority: 'high',
                         headers: {'x-ms-blob-type': 'BlockBlob', 'Content-Type': blob.type}} as RequestInit);
@@ -224,6 +223,8 @@ export class UploadPreparationPipeline {
                 } catch {
                     delete diagnostic.httpStatus;
                     diagnostic.uploadReason = 'network_error';
+                } finally {
+                    connection();
                 }
                 if (attempt < 3 && !controller.signal.aborted) await delay(Math.min(45_000, retryMs), controller.signal);
             }
