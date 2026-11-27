@@ -4050,11 +4050,13 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
 
             const refillWaveAdmission = (consumedThrough: number) => {
                 if (!waveLiveEnabled() || requestedAdmissionCount >= pendingFiles.length
-                    || admittedFileCount - consumedThrough > WAVE_ADMISSION_LOW_WATER
-                    // Once Blob commits start completing, reserve Table capacity
-                    // for authoritative finalization. Init batches will admit
-                    // their exact files if the rolling window runs dry.
-                    || pendingFinalizeTasks.size > 0) return;
+                    || admittedFileCount - consumedThrough > WAVE_ADMISSION_LOW_WATER) return;
+                // Keep refilling while finalizes are pending. This used to stop
+                // at the first finalize, which left the window empty for the
+                // rest of the run: every init batch then registered its own 24
+                // files through one serial queue (about 2.5 s per batch on a
+                // 3.4k-file upload, 2026-11-27), and wrote the same shared wave
+                // rows ~8x as often as one 192-file refill does.
                 const target = Math.min(pendingFiles.length, consumedThrough + WAVE_ADMISSION_HIGH_WATER);
                 if (target <= requestedAdmissionCount) return;
                 const start = requestedAdmissionCount;
