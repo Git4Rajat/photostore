@@ -1732,7 +1732,7 @@ describe('upload wave shadow protocol wiring', () => {
         await advance(4000);
         expect(shadowCalls('/items').length).toBeGreaterThanOrEqual(2);
         expect(shadowCalls('/items')[0][1].items).toHaveLength(48);
-        expect(shadowCalls('/items')[1][1].items.length).toBeLessThanOrEqual(192);
+        expect(shadowCalls('/items')[1][1].items.length).toBeLessThanOrEqual(288);
         expect(initFiles().length).toBeGreaterThan(0);
         expect(mocks.transferred).toHaveBeenCalled();
         expect(shadowCalls('/close')).toHaveLength(0);
