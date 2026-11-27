@@ -193,10 +193,11 @@ export const registerWaveItemsBatch = async (
     // every item again for a return value its caller discards; init batches
     // derive their own small set of transport identities as they start.
     if (!includeIdentities) return out;
-    for (const file of files) {
-        if (!waveFileBelongs(session, file)) continue;
-        out.set(file.key, { waveSessionId: parent.id, waveItemId: await wireItemId(file.waveItemKey || file.key) });
-    }
+    // Hash all of them at once: awaiting one at a time costs an event-loop
+    // turn per file, which on a busy page added up to ~1.5 s per 24-file batch.
+    const members = files.filter(file => waveFileBelongs(session, file));
+    const itemIds = await Promise.all(members.map(file => wireItemId(file.waveItemKey || file.key)));
+    members.forEach((file, index) => out.set(file.key, { waveSessionId: parent.id, waveItemId: itemIds[index] }));
     // Hashing the transport identity yields to the event loop. Cancellation
     // or expiry while it was in flight must not hand back a late binding.
     if (state.expired) throw expiredAdmission();
