@@ -238,6 +238,6 @@ def test_new_owner_claim_reads_the_filename_lookup_once_before_stamping(boundary
         return original(*args, **kwargs)
     lookup.get_entity = counting
     assert storage_utils._claim_filename_owner('u1', 'photo.jpg', 'hash')
-    # One read to decide, one inside the publish that verifies its own generation.
-    assert reads == ['photo.jpg', 'photo.jpg']
+    # One read to decide; the publish is a single create, so it reads nothing.
+    assert reads == ['photo.jpg']
     assert storage_utils._validated_face_filename_ids(lookup.rows[('u1', 'photo.jpg')]) == []
