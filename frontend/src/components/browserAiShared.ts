@@ -365,7 +365,14 @@ export const getAdaptiveUploadProfile = (
     if (hasNetworkInfo && (effectiveRtt >= 400 || downlink < 1.5)) {
         return { fileParallelism: 1, chunkSizeBytes: 1 * MB, reason: 'high latency or congested network' };
     }
-    if (effectiveType === '3g' || connectionType === 'cellular') {
+    // effectiveType is a coarse Network Information estimate, and desktop Chrome/Edge report '3g'
+    // (downlink 1.5, rtt 300) on links that carry tens of Mbit/s. A 922-photo upload (avg 14 MB) on
+    // such a machine ran at 1 lane with 2 MB chunks for its whole duration (2026-11-27, forenklad2):
+    // ~3 PutBlocks in flight, ~7 Mbit/s each, the rest of the link idle. Only believe '3g' on a device
+    // that can really be on a cellular link; a desktop falls through to the tiers below, which still
+    // stop at one lane for downlink < 1.5 Mbps or rtt >= 400 ms.
+    const mobileForm = isMobileViewport || coarsePointer;
+    if (connectionType === 'cellular' || (effectiveType === '3g' && mobileForm)) {
         if (downlink >= 10 && effectiveType === '4g') {
             return withChunkFloor({ fileParallelism: 3, chunkSizeBytes: MAX_BACKEND_UPLOAD_CHUNK_BYTES, reason: 'fast cellular with moderate parallelism' });
         }
