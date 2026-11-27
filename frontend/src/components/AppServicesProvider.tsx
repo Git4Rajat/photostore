@@ -5701,6 +5701,9 @@ export const AppServicesProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
         const totalBytes = filesToUpload.reduce((sum, file) => sum + file.size, 0);
         const uploadProfile = getAdaptiveUploadProfile(filesToUpload, { measuredRttMs });
+        // Logged at the start (the batch telemetry only reports lanes when it ends): n = lanes, bytes = chunk size.
+        perf.recordSpan(`upload.profile.${uploadProfile.reason.toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 40)}`, measuredRttMs ?? 0,
+            { n: uploadProfile.fileParallelism, bytes: uploadProfile.chunkSizeBytes, rows: filesToUpload.length });
         const preparingNotificationId = dedupNotificationId;
         updateNotification(preparingNotificationId, {
             title: 'Preparing upload',

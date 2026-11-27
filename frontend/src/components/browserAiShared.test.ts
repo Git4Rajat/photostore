@@ -213,3 +213,42 @@ describe('getAdaptiveUploadProfile', () => {
         expect(getAdaptiveUploadProfile(bigFile(1 * MB)).fileParallelism).toBe(1);
     });
 });
+
+describe('getAdaptiveUploadProfile with an estimated 3g', () => {
+    afterEach(() => {
+        setConnection(undefined);
+        setDeviceMemory(undefined);
+        setMatchMedia({});
+        vi.restoreAllMocks();
+    });
+
+    it('does not treat a desktop 3g estimate as a slow link', () => {
+        setConnection({ effectiveType: '3g', downlink: 1.5, rtt: 300 });
+        setMatchMedia({});
+        setResourceTiming([]);
+        const profile = getAdaptiveUploadProfile(Array.from({ length: 50 }, () => ({ size: 14 * MB })));
+        expect(profile.fileParallelism).toBe(12);
+        expect(profile.chunkSizeBytes).toBeGreaterThanOrEqual(8 * MB);
+    });
+
+    it('still treats a 3g estimate on a phone or tablet as slow', () => {
+        setConnection({ effectiveType: '3g', downlink: 1.5, rtt: 300 });
+        setMatchMedia({ mobile: true });
+        setResourceTiming([]);
+        expect(getAdaptiveUploadProfile(bigFile(14 * MB)).fileParallelism).toBe(1);
+    });
+
+    it('still gives a cellular connection one lane on any device', () => {
+        setConnection({ effectiveType: '4g', downlink: 5, rtt: 100, type: 'cellular' });
+        setMatchMedia({});
+        setResourceTiming([]);
+        expect(getAdaptiveUploadProfile(bigFile(14 * MB)).fileParallelism).toBe(1);
+    });
+
+    it('still stops at one lane when a desktop 3g estimate is also below 1.5 Mbps', () => {
+        setConnection({ effectiveType: '3g', downlink: 1.0, rtt: 300 });
+        setMatchMedia({});
+        setResourceTiming([]);
+        expect(getAdaptiveUploadProfile(bigFile(14 * MB)).fileParallelism).toBe(1);
+    });
+});
