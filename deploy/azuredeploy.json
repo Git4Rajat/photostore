@@ -87,7 +87,7 @@
     },
     "webImage": {
       "type": "string",
-      "defaultValue": "ghcr.io/git4rajat/photostore-frontend@sha256:640157940536e421453a092e34abc21f1771779789b3694d2b002577dc0d18d8",
+      "defaultValue": "ghcr.io/git4rajat/photostore-frontend@sha256:6f6c4846d6761e1350e2cf1cadc54ee90937ad7b2b9ede0bf15b1029a84643d1",
       "metadata": {
         "description": "Public web (frontend) image. Defaults to an immutable @sha256 digest, never :latest, same as coreImage above."
       }
@@ -191,7 +191,7 @@
     },
     "waveSourceCommit": {
       "type": "string",
-      "defaultValue": "7d5599de02226049728a3261f9c7f6d1c428fec1",
+      "defaultValue": "0943a449043e3670c7e32f627fc30e9abda61724",
       "metadata": {
         "description": "Source commit of the pinned release (set by the release pin job)."
       }
@@ -478,7 +478,7 @@
             },
             "webImage": {
               "type": "string",
-              "defaultValue": "ghcr.io/git4rajat/photostore-frontend@sha256:640157940536e421453a092e34abc21f1771779789b3694d2b002577dc0d18d8",
+              "defaultValue": "ghcr.io/git4rajat/photostore-frontend@sha256:6f6c4846d6761e1350e2cf1cadc54ee90937ad7b2b9ede0bf15b1029a84643d1",
               "metadata": {
                 "description": "Public web (frontend) image. Defaults to an immutable @sha256 digest, never :latest, same as coreImage above."
               }
@@ -582,7 +582,7 @@
             },
             "waveSourceCommit": {
               "type": "string",
-              "defaultValue": "7d5599de02226049728a3261f9c7f6d1c428fec1",
+              "defaultValue": "0943a449043e3670c7e32f627fc30e9abda61724",
               "metadata": {
                 "description": "Source commit of the pinned release (set by the release pin job)."
               }
