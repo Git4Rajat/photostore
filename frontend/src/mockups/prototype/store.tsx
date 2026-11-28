@@ -1929,11 +1929,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     const purgeAllTrash = useCallback(() => {
         const snapshot = trash;
-        const filenames = snapshot.map((t) => t.photo.id);
-        if (!filenames.length) return;
+        if (!snapshot.length) return;
         setTrash([]);
         const done = pendingToast('Emptying Recently Deleted…');
-        void post('/photos/trash/purge', { filenames })
+        // The server empties everything in the trash, including photos this tab has not loaded.
+        void post('/photos/trash/purge-all', {})
             .then(() => { done(); toast('Recently Deleted emptied'); })
             .catch(() => {
                 done();

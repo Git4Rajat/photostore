@@ -1421,6 +1421,33 @@ def purge_trashed_photos():
     errors.extend(hard_errors)
     return app.jsonify({'deleted': deleted, 'errors': errors, 'success': len(deleted) > 0})
 
+@photos_bp.route('/photos/trash/purge-all', methods=['POST'])
+@photos_bp.route('/api/photos/trash/purge-all', methods=['POST'])
+def purge_all_trashed_photos():
+    """"Delete all" in Recently Deleted: every photo in the trash index, so the
+    caller's loaded page(s) never decide what is left behind (same shape as
+    /photos/trash/restore-all). Large sets run as the queued purge job."""
+    user_id, error = app._require_user_id()
+    if error:
+        return error
+
+    names = list(dict.fromkeys(e['RowKey'] for e in app._trash_index_entries(user_id) if e.get('RowKey')))
+    if not names:
+        return app.jsonify({'deleted': [], 'errors': [], 'success': True})
+    if len(names) > app.BULK_MUTATION_MAX_ITEMS:
+        # Oldest first, so what remains is what would have purged last; a repeat finishes the rest.
+        names = names[::-1][:app.BULK_MUTATION_MAX_ITEMS]
+
+    if len(names) >= app.BULK_MUTATION_ASYNC_THRESHOLD:
+        queued = app._enqueue_photo_hard_delete_job(user_id, names)
+        if queued.get('status') != 'queued':
+            return app.jsonify({'error': 'Could not queue photo purge', **queued, 'success': False}), 503
+        return app.jsonify({**queued, 'accepted': len(names), 'deleted': [], 'errors': [], 'success': True}), 202
+
+    deleted, errors = app._hard_delete_photos_now(user_id, names)
+    return app.jsonify({'deleted': deleted, 'errors': errors, 'success': True})
+
+
 @photos_bp.route('/photos/<filename>/rating', methods=['POST'])
 @photos_bp.route('/photos/<filename>/rating/', methods=['POST'])
 @photos_bp.route('/api/photos/<filename>/rating', methods=['POST'])
